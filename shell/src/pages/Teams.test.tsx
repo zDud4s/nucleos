@@ -356,8 +356,7 @@ describe("Teams - the table", () => {
     const table = await departments();
     // The unit moved out of the header cell into the legend row above the table.
     expect(within(table).getByRole("columnheader", { name: /Pulse/ })).toBeDefined();
-    const key = screen.getByRole("list", { name: "What the marks mean" });
-    expect(key.textContent).toContain("a bar per day");
+    expect(screen.getByText(/a bar per day/)).toBeDefined();
 
     // Oldest first, plural where the count earns it, and the day spelled out.
     const said = [...table.querySelectorAll("svg title")].map((node) => node.textContent);
@@ -685,5 +684,31 @@ describe("Teams - map-authored readings", () => {
     const gauge = meter.closest(".ui-gauge");
     expect(gauge?.className).toContain("ui-gauge-quantity");
     expect(gauge?.className).not.toContain("ui-gauge-active");
+  });
+});
+
+describe("Teams - reads that have not answered", () => {
+  it("shows a loading state, never 'No team yet', while the teams are still being read", async () => {
+    daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
+
+    await renderTeams();
+
+    expect(await screen.findByText("Loading the teams")).toBeDefined();
+    expect(screen.queryByText("No team yet")).toBeNull();
+  });
+
+  it("says unknown, not idle, when the task read failed", async () => {
+    const team = teamView({ id: "financas", name: "Finanças" });
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/team-runs") throw new Error("boom");
+      return teamsFetch({ teams: [team] })(path);
+    });
+
+    await renderTeams();
+
+    const table = await departments();
+    expect(await within(table).findByText("unknown")).toBeDefined();
+    expect(within(table).queryByText("idle")).toBeNull();
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeDefined();
   });
 });

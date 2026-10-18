@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import { NewDepartment, POWER_LABEL } from "../team/Charter";
 import { RosterMatrix, headcountOf, specialistsOf } from "../team/RosterMatrix";
@@ -18,19 +19,21 @@ import {
   type TeamView,
 } from "../data/teams";
 import {
+  Badge,
   Button,
   ErrorNote,
   Meter,
   Modal,
   PageHeader,
-  Panel,
   Quiet,
   RefusalNote,
   RelativeTime,
+  Skeleton,
   Sparkline,
   StaleNote,
   StateBadge,
   Teach,
+  Tip,
   usd,
 } from "../ui";
 import "./teams.css";
@@ -102,12 +105,17 @@ export function Teams() {
   const allTriggers = triggers.data ?? [];
   const openActions = actions.data ?? [];
   const stale = teams.isError && teams.data !== undefined;
+  // Tasks, routines and decisions are separate reads. While one has not answered (or failed), a
+  // figure drawn from it is "?" and never 0, and "idle" is never claimed on its behalf.
+  const runsKnown = runs.data !== undefined;
+  const actionsKnown = actions.data !== undefined;
+  const readFailed = runs.isError || triggers.isError || actions.isError;
 
   return (
     <>
       <PageHeader
         title="Teams"
-        headline={headlineFor(rows, allRuns, openActions, teams.data !== undefined)}
+        headline={headlineFor(rows, allRuns, openActions, teams.data !== undefined, runsKnown && actionsKnown)}
         actions={
           <Button
             variant="approve"
@@ -121,7 +129,21 @@ export function Teams() {
       />
 
       {stale && <StaleNote dataUpdatedAt={teams.dataUpdatedAt} />}
-      {teams.isError && teams.data === undefined && <ListError error={teams.error} />}
+      {teams.isError && teams.data === undefined && (
+        <ListError error={teams.error} onRetry={() => void teams.refetch()} />
+      )}
+      {readFailed && teams.data !== undefined && (
+        <ErrorNote
+          onRetry={() => {
+            void runs.refetch();
+            void triggers.refetch();
+            void actions.refetch();
+          }}
+        >
+          Could not read the tasks, routines or decisions, so figures marked "?" are unknown and the
+          others may be incomplete.
+        </ErrorNote>
+      )}
 
       {/* A dialog over the page rather than a panel above the list: the eleven-field form
           used to shove a list nobody had read yet down the screen. Creating navigates to
@@ -159,7 +181,11 @@ export function Teams() {
         <NewDepartment dialog={{ formId: NEW_TEAM_FORM, onState: setFormState }} />
       </Modal>
 
-      {rows.length === 0 ? (
+      {teams.data === undefined ? (
+        // Still reading, or the read failed (the error is drawn above): never "No team yet",
+        // which would say the teams are gone about a read that has not finished.
+        teams.isError ? null : <Skeleton label="Loading the teams" lines={4} />
+      ) : rows.length === 0 ? (
         <Teach title="No team yet">
           <p>
             A team is a permanent unit — Finance, Marketing, Security — not a task. It has a
@@ -177,10 +203,15 @@ export function Teams() {
             runs={allRuns}
             triggers={allTriggers}
             actions={openActions}
+            runsKnown={runsKnown}
+            actionsKnown={actionsKnown}
           />
-          <Panel title="Who works where">
+          {/* The staffing matrix repeats the table's Staff column in more detail; closed by
+              default so it does not push the live work and the table down the page. */}
+          <details className="teams-matrix-details">
+            <summary>Who works where</summary>
             <RosterMatrix teams={rows} />
-          </Panel>
+          </details>
         </div>
       )}
     </>
@@ -195,13 +226,17 @@ function headlineFor(
   runs: TeamRun[],
   actions: TeamAction[],
   answered: boolean,
+  readsAnswered: boolean,
 ): string | undefined {
   if (!answered) return undefined;
-  if (rows.length === 0) return "no team yet";
+  if (rows.length === 0) return "No team yet";
 
   const parts = [`${rows.length} ${rows.length === 1 ? "team" : "teams"}`];
   const people = specialistsOf(rows).length;
   parts.push(`${people} ${people === 1 ? "specialist" : "specialists"}`);
+
+  // Without the task and decision reads there is nothing true to say about work or waiting.
+  if (!readsAnswered) return parts.join(" · ");
 
   const live = runs.filter((run) => teamRunIsAlive(run.state)).length;
   parts.push(live === 0 ? "none at work" : `${live} at work`);
@@ -230,9 +265,13 @@ function waitingFor(teamId: string, actions: TeamAction[], runs: TeamRun[]): num
   return actions.filter((action) => runTeam(action, runs) === teamId).length;
 }
 
-function ListError({ error }: { error: unknown }) {
+function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the teams</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>
+      The {DAEMON_NAME} is not responding, so nothing is known about the teams.
+    </ErrorNote>
+  );
 }
 
 /* ------------------------------------------------------------ in flight -- */
@@ -310,7 +349,7 @@ function LiveTask({ run, team }: { run: TeamRun; team: TeamView | null }) {
         <RelativeTime at={run.created_at} />
       </p>
       {detail.data === undefined ? (
-        <Quiet says="reading what it has spent…" />
+        <Quiet says="Reading what it has spent…" />
       ) : (
         // The money meter lives here and only here: this is the one place in the pillar where a
         // spend and its ceiling both exist. Money taken is a fact, not work in flight.
@@ -343,11 +382,15 @@ function DepartmentTable({
   runs,
   triggers,
   actions,
+  runsKnown,
+  actionsKnown,
 }: {
   teams: TeamView[];
   runs: TeamRun[];
   triggers: TeamTrigger[];
   actions: TeamAction[];
+  runsKnown: boolean;
+  actionsKnown: boolean;
 }) {
   return (
     <section className="teams-table-block" aria-label="Teams">
@@ -367,8 +410,8 @@ function DepartmentTable({
         <li className="teams-key-item">
           <Mark mode="rule" /> routines armed
         </li>
-        <li className="teams-key-item teams-key-pulse">Pulse: a bar per day with runs, newest on the right</li>
       </ul>
+      <p className="teams-key-pulse">Pulse: a bar per day with runs, newest on the right.</p>
       <div className="teams-table-scroller">
       <table className="teams-table">
         <caption className="sr-only">Every team, with what it is doing now</caption>
@@ -383,7 +426,9 @@ function DepartmentTable({
               At work
             </th>
             <th scope="col" className="teams-col-num">
-              Waiting
+              <Tip tip="Up to this many team actions may be waiting for a decision. Some may already be in progress.">
+                Waiting
+              </Tip>
             </th>
             <th scope="col">On its own</th>
             {/* Right-aligned because the bars are flushed right: a left-aligned title over
@@ -400,7 +445,8 @@ function DepartmentTable({
               team={team}
               runs={runs.filter((run) => run.team_id === team.id)}
               triggers={triggers.filter((rule) => rule.team_id === team.id)}
-              waiting={waitingFor(team.id, actions, runs)}
+              waiting={actionsKnown ? waitingFor(team.id, actions, runs) : null}
+              runsKnown={runsKnown}
             />
           ))}
         </tbody>
@@ -415,19 +461,22 @@ function DepartmentRow({
   runs,
   triggers,
   waiting,
+  runsKnown,
 }: {
   team: TeamView;
   runs: TeamRun[];
   triggers: TeamTrigger[];
-  waiting: number;
+  /** `null` while the decisions read has not answered. */
+  waiting: number | null;
+  runsKnown: boolean;
 }) {
   const live = runs.filter((run) => teamRunIsAlive(run.state));
 
   return (
     <tr>
       <th scope="row" className="teams-row-name">
-        {/* The link's `::after` is stretched over this cell, so the whole name cell is the
-            target and the pointer says so. */}
+        {/* The link's `::after` is stretched over the whole row (`tr` is the positioned
+            ancestor), so the row is the target; the link stays the keyboard stop. */}
         <Link to={`/teams/${team.id}`}>{team.name}</Link>
         {/* Drawn whether or not there is one: a remit that appeared on some rows
             and not others would start the next line at two different heights,
@@ -437,17 +486,17 @@ function DepartmentRow({
           className={team.mission === "" ? "teams-row-remit teams-row-unwritten" : "teams-row-remit"}
           title={team.mission === "" ? undefined : team.mission}
         >
-          {team.mission === "" ? "no remit written" : team.mission}
+          {team.mission === "" ? "No description yet" : team.mission}
         </span>
       </th>
       <td>
-        <RowState live={live.length} waiting={waiting} />
+        <RowState live={runsKnown ? live.length : null} waiting={waiting} />
       </td>
       <td className="teams-col-num">
         <Headcount team={team} />
       </td>
       <td className="teams-col-num">
-        <Ratio value={live.length} ceiling={team.max_live_runs} />
+        <Ratio value={runsKnown ? live.length : null} ceiling={team.max_live_runs} />
       </td>
       {/* Upper bound — see the module header. The column says "Waiting", never a
           count the daemon would recognise. */}
@@ -458,7 +507,9 @@ function DepartmentRow({
         <OnItsOwn grants={team.grants} triggers={triggers} />
       </td>
       <td className="teams-row-pulse">
-        {runs.length === 0 ? (
+        {!runsKnown ? (
+          <span className="teams-pulse-none">?</span>
+        ) : runs.length === 0 ? (
           // Not the sparkline's dashed rail: that reads as a broken chart, and "no tasks" is a fact.
           <span className="teams-pulse-none">no tasks</span>
         ) : (
@@ -483,7 +534,9 @@ function DepartmentRow({
  * standing unit, not a state machine. Working beats waiting: a department can
  * be both, and the one that is spending money is the one worth the badge.
  */
-function RowState({ live, waiting }: { live: number; waiting: number }) {
+function RowState({ live, waiting }: { live: number | null; waiting: number | null }) {
+  // "idle" would be a claim about a read that has not answered.
+  if (live === null || waiting === null) return <Badge tone="off">unknown</Badge>;
   const state = live > 0 ? "working" : waiting > 0 ? "waiting" : "idle";
   return <StateBadge domain="department" state={state} />;
 }
@@ -501,7 +554,6 @@ function Headcount({ team }: { team: TeamView }) {
   return (
     <span
       className="teams-figure teams-figure-none"
-      title="nobody yet — a task cannot start without a roster"
     >
       0<span className="sr-only"> — nobody yet, so no task can start</span>
     </span>
@@ -518,7 +570,15 @@ function Headcount({ team }: { team: TeamView }) {
  * At the ceiling it is marked, because `1 / 1` and `0 / 1` are one glyph apart
  * and mean entirely different things.
  */
-function Ratio({ value, ceiling }: { value: number; ceiling: number }) {
+function Ratio({ value, ceiling }: { value: number | null; ceiling: number }) {
+  if (value === null) {
+    return (
+      <span className="teams-figure">
+        ?<span className="teams-figure-of"> / {ceiling}</span>
+        <span className="sr-only"> — not known yet</span>
+      </span>
+    );
+  }
   const full = ceiling > 0 && value >= ceiling;
   return (
     <span className={full ? "teams-figure teams-figure-full" : "teams-figure"}>
@@ -554,10 +614,12 @@ function OnItsOwn({ grants, triggers }: { grants: TeamGrant[]; triggers: TeamTri
           <li
             className={`teams-alone-item teams-alone-${mode}`}
             key={kind}
-            title={`${name}: ${said}`}
           >
             <Mark mode={mode} />
             <span aria-hidden="true">{name}</span>
+            <span aria-hidden="true" className="teams-alone-said">
+              {MODE_SHORT[mode]}
+            </span>
             <span className="sr-only">
               {name}: {said}
             </span>
@@ -576,7 +638,7 @@ function OnItsOwn({ grants, triggers }: { grants: TeamGrant[]; triggers: TeamTri
  * never heard of is possible and is its own answer — the same treatment
  * `StateBadge` gives an unmapped state. It used to fall through to "asks you",
  * which reads as a decision the daemon made rather than as a shell that is
- * behind its núcleo.
+ * behind its daemon.
  */
 type Mode = "allow" | "propose" | "none" | "unmapped";
 
@@ -604,6 +666,14 @@ function Mark({ mode }: { mode: Mode | "rule" | "rule-off" }) {
   return <span className={`teams-mark teams-mark-${mode}`} aria-hidden="true" />;
 }
 
+/** The visible word beside a mark; the full sentence stays in the screen-reader text. */
+const MODE_SHORT: Record<Mode, string> = {
+  allow: "does it",
+  propose: "asks first",
+  none: "asks you",
+  unmapped: "unknown",
+};
+
 const MODE_SAID: Record<Mode, string> = {
   allow: "does it",
   propose: "asks first",
@@ -626,7 +696,6 @@ function Routines({ armed, total }: { armed: number; total: number }) {
     return (
       <li
         className="teams-alone-item teams-alone-rule"
-        title={`${total} routine${total === 1 ? "" : "s"}, none armed`}
       >
         <Mark mode="rule-off" />
         <span aria-hidden="true">{total}</span>
@@ -639,7 +708,6 @@ function Routines({ armed, total }: { armed: number; total: number }) {
   return (
     <li
       className="teams-alone-item teams-alone-rule teams-alone-armed"
-      title={`${armed} armed routine${armed === 1 ? "" : "s"}`}
     >
       <Mark mode="rule" />
       <span aria-hidden="true">{armed}</span>
