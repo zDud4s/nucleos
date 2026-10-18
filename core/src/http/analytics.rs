@@ -234,12 +234,14 @@ async fn devtime_findings(
 /// literal constructors, and only these routes need it. No root (every test state) is the defaults.
 fn devtime_rules(
     state: &AppState,
-) -> (crate::config::DevtimeRulesConfig, crate::config::ThresholdsSource) {
+) -> (
+    crate::config::DevtimeRulesConfig,
+    crate::config::ThresholdsSource,
+) {
     match state.machine_config_root.as_deref() {
         Some(root) => {
-            let (config, source) = crate::config::devtime_config_now(
-                &root.join(crate::machine_config::DEVTIME_FILE),
-            );
+            let (config, source) =
+                crate::config::devtime_config_now(&root.join(crate::machine_config::DEVTIME_FILE));
             (config.rules, source)
         }
         None => Default::default(),

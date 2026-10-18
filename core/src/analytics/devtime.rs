@@ -1428,9 +1428,17 @@ mod tests {
         };
         let scope = Scope::Project("alpha");
         let source = ThresholdsSource::File;
-        let alpha = devtime_findings(&pool, &precision_cfg(), source, scope, window, now(), &query)
-            .await
-            .unwrap();
+        let alpha = devtime_findings(
+            &pool,
+            &precision_cfg(),
+            source,
+            scope,
+            window,
+            now(),
+            &query,
+        )
+        .await
+        .unwrap();
         assert_eq!(alpha.thresholds_source, ThresholdsSource::File);
         assert_eq!(alpha.items.len(), 1, "only alpha's finding is listed");
         // ...but the rule's precision is global (spec §4.5): beta's marked finding is its one case.

@@ -3442,20 +3442,31 @@ cycle_seconds: 30
         let cache = Default::default();
         // No file: the defaults, and the page is told so.
         let absent = cached_devtime_config(&path, &cache);
-        assert_eq!(absent, (DevtimeConfig::default(), ThresholdsSource::Default));
-        std::fs::write(&path, "rules:
+        assert_eq!(
+            absent,
+            (DevtimeConfig::default(), ThresholdsSource::Default)
+        );
+        std::fs::write(
+            &path,
+            "rules:
   thresholds:
     d3_search_burst: 8
-").unwrap();
+",
+        )
+        .unwrap();
         let first = cached_devtime_config(&path, &cache);
         assert_eq!((burst_of(&first), first.1), (8, ThresholdsSource::File));
         // Unchanged file: the cached parse comes back equal.
         assert_eq!(cached_devtime_config(&path, &cache), first);
         // A different length is a different file, whatever the mtime tick says.
-        std::fs::write(&path, "rules:
+        std::fs::write(
+            &path,
+            "rules:
   thresholds:
     d3_search_burst: 12
-").unwrap();
+",
+        )
+        .unwrap();
         let edited = cached_devtime_config(&path, &cache);
         assert_eq!((burst_of(&edited), edited.1), (12, ThresholdsSource::File));
         // Deleted: the defaults, not the old content.
@@ -3471,26 +3482,38 @@ cycle_seconds: 30
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("devtime.yaml");
         let cache = Default::default();
-        std::fs::write(&path, "rules:
+        std::fs::write(
+            &path,
+            "rules:
   thresholds:
     d3_search_burst: 8
-").unwrap();
+",
+        )
+        .unwrap();
         assert_eq!(burst_of(&cached_devtime_config(&path, &cache)), 8);
         // A typo does not drop the page back to the defaults: the last good file keeps applying,
         // and is labelled as such, on this call and the unchanged ones after it.
-        std::fs::write(&path, "rules:
+        std::fs::write(
+            &path,
+            "rules:
   thresholds:
     nope: 1
-").unwrap();
+",
+        )
+        .unwrap();
         for _ in 0..2 {
             let kept = cached_devtime_config(&path, &cache);
             assert_eq!((burst_of(&kept), kept.1), (8, ThresholdsSource::LastGood));
         }
         // Fixing the file makes it the file again.
-        std::fs::write(&path, "rules:
+        std::fs::write(
+            &path,
+            "rules:
   thresholds:
     d3_search_burst: 9
-").unwrap();
+",
+        )
+        .unwrap();
         let fixed = cached_devtime_config(&path, &cache);
         assert_eq!((burst_of(&fixed), fixed.1), (9, ThresholdsSource::File));
     }
@@ -3500,10 +3523,14 @@ cycle_seconds: 30
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("devtime.yaml");
         let cache = Default::default();
-        std::fs::write(&path, "rules:
+        std::fs::write(
+            &path,
+            "rules:
   thresholds:
     thrash_repeats: 0
-").unwrap();
+",
+        )
+        .unwrap();
         for _ in 0..2 {
             assert_eq!(
                 cached_devtime_config(&path, &cache),

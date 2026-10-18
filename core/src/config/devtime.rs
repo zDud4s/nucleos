@@ -504,14 +504,14 @@ pub enum ThresholdsSource {
 /// One file's cache slot: the (length, mtime) of the last stat that was read, the last config that
 /// parsed, and whether that read was a refusal (so an unchanged bad file is not re-read, or
 /// re-logged, on every request).
-struct DevtimeCacheEntry {
+pub(super) struct DevtimeCacheEntry {
     len: u64,
     modified: Option<std::time::SystemTime>,
     last_good: Option<DevtimeConfig>,
     invalid: bool,
 }
 
-type DevtimeCache =
+pub(super) type DevtimeCache =
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, DevtimeCacheEntry>>;
 
 /// A config and where it came from.
