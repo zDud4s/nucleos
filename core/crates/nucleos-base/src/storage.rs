@@ -121,7 +121,17 @@ pub struct TempDb {
 #[cfg(any(test, feature = "testkit"))]
 impl TempDb {
     pub async fn new() -> Self {
-        let dir = tempfile::tempdir().expect("create database tempdir");
+        // Under a parent of their own, swept of directories over an hour old by the first `new` of
+        // every process. A test that panics before `close` (or never calls it) leaves its directory
+        // behind — on Windows the open `nucleos.db` makes the TempDir's own removal fail silently —
+        // and unswept those piled up in %TEMP%: 2,312 directories, 2.6 GB, measured 2026-10-17.
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        let parent = std::env::temp_dir().join("nucleos-testdb-dirs");
+        std::fs::create_dir_all(&parent).expect("create database tempdir parent");
+        SWEEP.call_once(|| {
+            crate::testdb::sweep_dirs_older_than(&parent, std::time::Duration::from_secs(3600))
+        });
+        let dir = tempfile::tempdir_in(&parent).expect("create database tempdir");
         let path = dir.path().join("nucleos.db");
         // Seeded with the migrated image `testdb` caches, so `open` finds every migration applied
         // and only checks them instead of running the chain again.

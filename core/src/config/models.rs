@@ -219,14 +219,59 @@ pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
 /// typo in the YAML silently becoming defaults would drop a local routing and send turns to the
 /// cloud. So the failure is logged with its path and cause, and the last configuration that did
 /// parse keeps applying; only a daemon that never saw a good one falls back to defaults.
+///
+/// Handlers call this on the async path, so it costs one `metadata` call and re-reads the file only
+/// when its length or modification time moved.
 pub fn models_config_now() -> ModelsConfig {
-    static LAST_GOOD: std::sync::Mutex<Option<ModelsConfig>> = std::sync::Mutex::new(None);
-    let Some(path) = models_config_path() else {
+    static CACHE: std::sync::Mutex<Option<ModelsConfigCache>> = std::sync::Mutex::new(None);
+    match models_config_path() {
+        Some(path) => cached_models_config(&path, &CACHE),
+        None => ModelsConfig::default(),
+    }
+}
+
+/// A parsed file and the (path, length, mtime) it was parsed at.
+struct ModelsConfigCache {
+    path: std::path::PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    config: ModelsConfig,
+}
+
+/// The stat-checked read behind [`models_config_now`]. A missing (or unstat-able) file answers the
+/// default. A failed read or parse answers the last good configuration (the default if there is
+/// none) and is never cached as a hit, so the next call tries again.
+fn cached_models_config(
+    path: &Path,
+    cache: &std::sync::Mutex<Option<ModelsConfigCache>>,
+) -> ModelsConfig {
+    let Ok(meta) = std::fs::metadata(path) else {
         return ModelsConfig::default();
     };
-    let loaded = load_models_config(&path);
-    let mut last_good = LAST_GOOD.lock().unwrap_or_else(|e| e.into_inner());
-    resolve_models_config(loaded, &mut last_good, &path)
+    let (len, modified) = (meta.len(), meta.modified().ok());
+    if let Ok(guard) = cache.lock()
+        && let Some(hit) = guard.as_ref().filter(|hit| {
+            hit.path == path && hit.len == len && modified.is_some() && hit.modified == modified
+        })
+    {
+        return hit.config.clone();
+    }
+    let loaded = load_models_config(path);
+    let ok = loaded.is_ok();
+    let mut last_good = cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|hit| hit.config.clone()));
+    let config = resolve_models_config(loaded, &mut last_good, path);
+    if ok && let Ok(mut guard) = cache.lock() {
+        *guard = Some(ModelsConfigCache {
+            path: path.to_path_buf(),
+            len,
+            modified,
+            config: config.clone(),
+        });
+    }
+    config
 }
 
 /// The decision inside [`models_config_now`], apart from the file and the static so a test can drive it.
@@ -790,4 +835,58 @@ pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {
     let contents = std::fs::read_to_string(path)?;
     parse_models_config(&contents)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod stat_cache_tests {
+    use super::*;
+
+    #[test]
+    fn an_edited_models_file_is_re_read_and_an_unchanged_one_is_served_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_CONFIG_FILE);
+        let cache = std::sync::Mutex::new(None);
+
+        std::fs::write(
+            &path,
+            "claude_model: opus
+codex_model: gpt-a
+",
+        )
+        .unwrap();
+        let first = cached_models_config(&path, &cache);
+        assert_eq!(first.claude_model, "opus");
+        assert_eq!(cached_models_config(&path, &cache), first);
+
+        // A different length, so the check holds even on a coarse-mtime filesystem.
+        std::fs::write(
+            &path,
+            "claude_model: sonnet-long
+codex_model: gpt-a
+",
+        )
+        .unwrap();
+        assert_eq!(
+            cached_models_config(&path, &cache).claude_model,
+            "sonnet-long"
+        );
+    }
+
+    #[test]
+    fn a_missing_models_file_keeps_the_default_and_a_bad_one_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_CONFIG_FILE);
+        let cache = std::sync::Mutex::new(None);
+
+        assert_eq!(cached_models_config(&path, &cache), ModelsConfig::default());
+
+        std::fs::write(
+            &path,
+            "claude_model: [not, a, string
+",
+        )
+        .unwrap();
+        assert_eq!(cached_models_config(&path, &cache), ModelsConfig::default());
+        assert!(cache.lock().unwrap().is_none());
+    }
 }

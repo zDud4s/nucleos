@@ -695,6 +695,22 @@ pub async fn link_agent(
     Ok(done.rows_affected())
 }
 
+/// Whether the attempt a `tool_use` launched has been ingested. After [`link_agent`] has run, such a
+/// row carries its link, and since the link only ever fills NULLs it can no longer change.
+pub async fn attempt_exists(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+    tool_use_id: &str,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM devtime_attempts WHERE session_id = ? AND tool_use_id = ?)",
+    )
+    .bind(session_id)
+    .bind(tool_use_id)
+    .fetch_one(&mut *conn)
+    .await
+}
+
 /// Records which session and lane a file belongs to; `save_offset` knows neither.
 pub async fn set_file_identity(
     conn: &mut SqliteConnection,

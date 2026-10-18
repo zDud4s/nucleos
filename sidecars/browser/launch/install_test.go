@@ -270,3 +270,34 @@ func TestASymlinkMayOnlyPointDownIntoTheInstall(t *testing.T) {
 		}
 	}
 }
+
+// leftovers lists the staging files a download leaves in the install root.
+func leftovers(t *testing.T, root string) []string {
+	t.Helper()
+	found, err := filepath.Glob(filepath.Join(root, "chromium-download-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found
+}
+
+func TestTheStagedArchiveIsRemovedOnSuccessAndOnDigestFailure(t *testing.T) {
+	archive, digest := buildZip(t, map[string]string{"chrome-win/chrome.exe": "MZ real"})
+	tampered, _ := buildZip(t, map[string]string{"chrome-win/chrome.exe": "MZ evil"})
+
+	ok := installInto(t, digest)
+	if err := ok.Download(context.Background(), &fakeFetcher{body: archive}); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if left := leftovers(t, ok.Root); len(left) != 0 {
+		t.Errorf("staged archive left after success: %v", left)
+	}
+
+	bad := installInto(t, digest)
+	if err := bad.Download(context.Background(), &fakeFetcher{body: tampered}); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("got %v, want ErrDigestMismatch", err)
+	}
+	if left := leftovers(t, bad.Root); len(left) != 0 {
+		t.Errorf("staged archive left after a digest failure: %v", left)
+	}
+}

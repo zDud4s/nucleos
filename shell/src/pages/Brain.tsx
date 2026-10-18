@@ -12,7 +12,10 @@ import { ForceGraph } from "../brain/ForceGraph";
 import { buildModel } from "../brain/graph-model";
 import type { GFilters } from "../brain/graph-types";
 import { GraphFilters, defaultGraphFilters } from "../brain/GraphFilters";
-import { formatItem, itemOfNode, nodeIdOf, parseItem, parseView, type BrainView, type ItemRef } from "../brain/item-ref";
+import { formatItem, itemOfNode, nodeIdOf, parseItem, type BrainView, type ItemRef } from "../brain/item-ref";
+import { validateBrainSearch, type BrainSearch } from "../brain/search";
+
+export { validateBrainSearch, type BrainSearch };
 import { Segments } from "../brain/Segments";
 import { useOpenCaptures } from "../data/captures";
 import { useKnowledge, type Known } from "../data/knowledge";
@@ -123,32 +126,6 @@ const VIEWS: readonly (readonly [BrainView, string])[] = [
   ["list", "List"],
   ["graph", "Graph"],
 ];
-
-export interface BrainSearch {
-  capture?: number;
-  view: BrainView;
-  /** `note:<id>` | `knowledge:<id>`, already checked by `parseItem`. */
-  item?: string;
-}
-
-/**
- * The Brain's search params.
- *
- * `capture` is the stamp a shortcut puts in the address to say "take a note now": a number or
- * nothing, as `validateVoiceSearch` does for `talk` — anything else is the same as not asking.
- * `view` is `list` unless it says `graph`. `item` is kept only when `parseItem` accepts it, so a
- * malformed one (`knowledge:abc`) is dropped rather than opening a panel for nothing.
- */
-export function validateBrainSearch(search: Record<string, unknown>): BrainSearch {
-  const out: BrainSearch = { view: parseView(search.view) };
-  const capture = typeof search.capture === "number" ? search.capture : Number(search.capture);
-  if (Number.isFinite(capture) && search.capture !== undefined && search.capture !== "") {
-    out.capture = capture;
-  }
-  const item = parseItem(search.item);
-  if (item !== null) out.item = formatItem(item);
-  return out;
-}
 
 /** What goes back into the address: no empty keys, and the default view left out. */
 function brainSearch(search: BrainSearch): Record<string, unknown> {

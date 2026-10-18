@@ -1,15 +1,9 @@
 import { focusManager, type Query, type QueryClient } from "@tanstack/react-query";
-import { currentAttention } from "../data/poll";
+import { BLURRED_CADENCE, currentAttention } from "../data/poll";
 
-/**
- * How often a window that is on screen but not focused refreshes what it shows.
- *
- * Not zero: a conversation left open beside an editor is still being watched, and an answer
- * that stopped moving the moment somebody clicked elsewhere would read as a stuck turn. But it is
- * a glance, not a stare, and the 1.5–3 s cadences the pages ask for are for the window somebody
- * is working in.
- */
-export const BLURRED_CADENCE = 10_000;
+// Defined in `data/poll.ts` (which `backgroundCadence` needs, and which this module already imports);
+// re-exported so this stays the name the sweep and its tests use.
+export { BLURRED_CADENCE };
 
 /** How often the blurred window checks which of its queries have come due. */
 const SWEEP_MS = 1_000;
