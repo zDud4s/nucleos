@@ -416,7 +416,13 @@ mod tests {
     async fn a_capped_allow_counts_as_an_agreeing_allow() {
         let pool = crate::testdb::fresh_pool().await;
         let a = run(&pool, "a").await;
-        action_verdict(&pool, a, "x", ("allow", 1, "pending_approval", Some("approve"))).await;
+        action_verdict(
+            &pool,
+            a,
+            "x",
+            ("allow", 1, "pending_approval", Some("approve")),
+        )
+        .await;
 
         let judge = window_read(&pool, None).await.judge;
         assert_eq!((judge.reviewed, judge.agree), (1, Some(1.0)));
@@ -477,7 +483,10 @@ mod tests {
         let judge = window_read(&pool, Some("a")).await.judge;
         assert_eq!(judge.reviewed, gate.reviewed);
         let agree = judge.agree.unwrap();
-        assert!(close(agree, gate.agree as f64 / gate.reviewed as f64), "{judge:?}");
+        assert!(
+            close(agree, gate.agree as f64 / gate.reviewed as f64),
+            "{judge:?}"
+        );
     }
 
     /// Spec §11: refused actions by whatever statuses exist, no fixed list.
