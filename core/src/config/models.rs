@@ -135,8 +135,10 @@ pub struct ModelsConfig {
     /// `model_prices` exactly as the file wrote it, any shape. Read as a bare YAML value so that a
     /// wrong type in one price cannot fail the whole file: model routing must not depend on it
     /// (owner, 2026-10-18). Emptied by [`parse_models_config`] once converted.
+    /// `pub` only because the daemon binary builds this struct with `..Default::default()`.
     #[serde(default, rename = "model_prices")]
-    pub(crate) raw_model_prices: serde_yaml::Value,
+    #[doc(hidden)]
+    pub raw_model_prices: serde_yaml::Value,
     /// One `"<model id>: <reason>"` per price entry [`parse_models_config`] dropped, so the drop is
     /// visible where the cost is shown and not only in the daemon's log.
     #[serde(skip)]

@@ -1425,10 +1425,6 @@ mod tests {
         got.is_some_and(|got| (got - want).abs() < 1e-9)
     }
 
-    /// The tier keys on ONE request's prompt (input + cache reads + cache writes): a message at
-    /// 100,001 is billed whole at the long rates, one at 100,000 at the base, and a day holding both
-    /// sums them exactly — in the window total, the model row and the day series alike.
-
     /// The read splits by the thresholds of the models used in the window only: a tiered price for
     /// a model nobody ran adds no bucket, and so no extra walk of the day index.
     #[test]
@@ -1444,6 +1440,10 @@ mod tests {
             vec![100_001]
         );
     }
+
+    /// The tier keys on ONE request's prompt (input + cache reads + cache writes): a message at
+    /// 100,001 is billed whole at the long rates, one at 100,000 at the base, and a day holding both
+    /// sums them exactly — in the window total, the model row and the day series alike.
     #[tokio::test]
     async fn each_message_is_priced_at_the_tier_its_own_prompt_reaches() {
         let pool = pool().await;
