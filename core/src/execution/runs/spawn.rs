@@ -164,15 +164,22 @@ pub(super) async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdo
 
         // Observability must stay best-effort: a missing or temporarily unavailable history table
         // cannot turn successfully completed work into a failed run.
+        //
+        // A seq the run already has is skipped, not appended again: a cancel that lands while the
+        // gate runs finds `stdout` still NULL and records the cut stream, after this body already
+        // appended the same events — every row of the trajectory twice, before this guard.
         let _ = sqlx::query(
             "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
-             VALUES (?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?
+             WHERE NOT EXISTS (SELECT 1 FROM run_events WHERE run_id = ? AND seq = ?)",
         )
         .bind(run_id)
         .bind(seq as i64)
         .bind(kind)
         .bind(payload)
         .bind(&created_at)
+        .bind(run_id)
+        .bind(seq as i64)
         .execute(pool)
         .await;
     }
@@ -561,6 +568,7 @@ pub(super) fn spawn_run(
                     // writes a peak too, sampled every 500ms; this write comes after it and is the
                     // more exact of the two.
                     let context_peak = peak_of(&o.stdout);
+                    append_run_events(&pool, id, &o.stdout).await;
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
@@ -632,14 +640,6 @@ pub(super) fn spawn_run(
                     warn_on_terminal_write_err(&completed, id, terminal_status);
                     let terminal_write_won =
                         matches!(&completed, Ok(result) if result.rows_affected() == 1);
-                    // The events follow the write that won, never precede it. Appended before the
-                    // gate, they were already in the table when a cancel landed DURING the gate —
-                    // minutes, for a real one — and that cancel won the CAS, found `stdout` still
-                    // NULL and recorded the cut stream with its events a second time: every row of
-                    // the trajectory twice. A lost CAS means the terminator owns the record.
-                    if terminal_write_won {
-                        append_run_events(&pool, id, &o.stdout).await;
-                    }
                     // The router hears how this run ended, under the same CAS as every other
                     // announcement of it: the gate's verdict when there is one; `error` for a run
                     // its progress deadline killed; for a run no gate judges (a plan, a review),
@@ -916,6 +916,7 @@ pub(super) fn spawn_run(
                     // why only these two are written.
                     let context_peak = peak_of(&seen);
                     let tools_used = tools_of(&seen);
+                    append_run_events(&pool, id, &seen).await;
                     // A timeout is not a launch failure — retrying would likely time out again.
                     let timed_out = sqlx::query(
                         "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?, context_peak = ?, tools_used = ?, completed_at = ?, attempt = ? WHERE id = ? AND status = 'running'",
@@ -931,9 +932,6 @@ pub(super) fn spawn_run(
                     .await;
                     warn_on_terminal_write_err(&timed_out, id, "timed_out");
                     if matches!(&timed_out, Ok(result) if result.rows_affected() == 1) {
-                        // Only for the write that won, as in the branch above: a terminator that got
-                        // here first already recorded this stream and its events.
-                        append_run_events(&pool, id, &seen).await;
                         // A deadline is not a verdict on the work, so the router hears `error`
                         // (`route_advice::outcome_at_run_end` argues it), first and detached, so
                         // nothing below can hold it up.
