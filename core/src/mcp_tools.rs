@@ -1010,6 +1010,7 @@ mod tests {
                 "read_context",
                 "read_team_file",
                 "recall",
+                "record",
                 "reject_proposal",
                 "report_to_owner",
                 "request_tool",
@@ -2613,14 +2614,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worktree_box_server_announces_only_verify_and_verify_status() {
+    async fn a_worktree_box_server_announces_only_verify_verify_status_and_record() {
         let (_running, context) = served_request_context().await;
 
         let listed = worktree_server("/work/a")
             .list_tools(None, context)
             .await
             .unwrap();
-        assert_eq!(advertised(&listed), ["verify", "verify_status"]);
+        assert_eq!(advertised(&listed), ["record", "verify", "verify_status"]);
         assert!(!served_in_box(
             &McpBox::Worktree("/work/a".to_owned()),
             "note_finding"
@@ -2684,10 +2685,10 @@ mod tests {
     }
 
     /// `verify` is the one job-node tool that is not job-only: the owner's assistant verifies a
-    /// worktree it names, and a job node verifies its own.
+    /// worktree it names, and a job node verifies its own. `record` goes wherever `verify` goes.
     #[test]
     fn verify_is_served_in_both_boxes() {
-        assert_eq!(EVERY_BOX_TOOLS, ["verify", "verify_status"]);
+        assert_eq!(EVERY_BOX_TOOLS, ["record", "verify", "verify_status"]);
         for name in EVERY_BOX_TOOLS {
             assert!(
                 JOB_NODE_TOOLS.contains(name),
@@ -2715,7 +2716,64 @@ mod tests {
     #[test]
     fn verify_writes_own_and_verify_status_reads_own() {
         assert_eq!(tool_effect("verify"), ToolEffect::WritesOwn);
+        assert_eq!(tool_effect("record"), ToolEffect::WritesOwn);
         assert_eq!(tool_effect("verify_status"), ToolEffect::ReadsOwn);
+    }
+
+    /// `record` announces the fixed interface other workflow phases rely on, takes its payload as
+    /// an object, and — like `verify` — has no `project_id`: the daemon resolves the project from
+    /// the worktree, so a model cannot file under a project it named.
+    #[test]
+    fn record_announces_its_interface_and_no_project() {
+        let tool = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "record")
+            .expect("record is registered");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("record publishes its parameters");
+        let mut names: Vec<_> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "caught_by",
+                "kind",
+                "payload",
+                "phase",
+                "task_id",
+                "worktree"
+            ]
+        );
+        let mut required: Vec<_> = tool
+            .input_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("record has required parameters")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        required.sort_unstable();
+        assert_eq!(required, ["kind", "payload", "task_id"]);
+        assert_eq!(properties["payload"]["type"], "object");
+
+        let verify = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "verify")
+            .expect("verify is registered");
+        let verify_properties = verify
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("verify publishes its parameters");
+        assert!(
+            verify_properties.contains_key("task_id"),
+            "verify lost its task_id"
+        );
     }
 
     #[test]

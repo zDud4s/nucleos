@@ -1,4 +1,4 @@
-//! The `#[tool]`s that act on the browser, the owner's controls and the repository: browser sessions, proposals, budget and kill switch, the VCS queue, GitHub and verification.
+//! The `#[tool]`s that act on the browser, the owner's controls and the repository: browser sessions, proposals, budget and kill switch, the VCS queue, GitHub and verification, and the workflow ledger record that rides beside it.
 
 use super::*;
 
@@ -425,6 +425,7 @@ impl NucleosTools {
             worktree,
             files,
             base,
+            task_id,
         }): Parameters<VerifyParams>,
     ) -> String {
         let worktree = match worktree_for_call(&self.served, worktree.as_deref()) {
@@ -439,7 +440,45 @@ impl NucleosTools {
                     worktree.as_deref(),
                     files.as_deref(),
                     base.as_deref(),
+                    task_id.as_deref(),
                 )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Record one workflow ledger entry in the daemon instead of writing a ledger \
+                       file: kind is metric, rework, intent or event; task_id groups every record \
+                       and verify call of one task; for a rework, caught_by names the step that \
+                       caught it. payload is a JSON object of at most 16 KiB. The project is the \
+                       one the worktree belongs to; worktree is required outside a job node."
+    )]
+    pub(super) async fn record(
+        &self,
+        Parameters(RecordParams {
+            kind,
+            task_id,
+            phase,
+            caught_by,
+            payload,
+            worktree,
+        }): Parameters<RecordParams>,
+    ) -> String {
+        // The same fence as `verify`: the worktree box files only against its own worktree.
+        let worktree = match worktree_for_call(&self.served, worktree.as_deref()) {
+            Ok(worktree) => worktree,
+            Err(error) => return json_result::<serde_json::Value>(Err(error)),
+        };
+        json_result(
+            self.client
+                .record(&serde_json::json!({
+                    "kind": kind,
+                    "task_id": task_id,
+                    "phase": phase,
+                    "caught_by": caught_by,
+                    "payload": payload,
+                    "worktree": worktree,
+                }))
                 .await,
         )
     }

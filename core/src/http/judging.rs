@@ -1,4 +1,4 @@
-//! Shadow decisions, judge verdicts and the scoreboard (`/shadow-decisions/*`, `/judge-*`, `/scoreboard`, `/verify/*`).
+//! Shadow decisions, judge verdicts and the scoreboard (`/shadow-decisions/*`, `/judge-*`, `/scoreboard`, `/verify/*`, `/workflow/records`).
 
 use super::*;
 
@@ -8,6 +8,12 @@ pub(super) fn routes() -> Router<AppState> {
         // key is the main caller of these two.
         .route("/verify", post(crate::verify::post_verify))
         .route("/verify/status", post(crate::verify::post_verify_status))
+        // The `record` tool's route sits beside `verify` because it is reached by the same keys and
+        // resolves the caller's worktree the same way; POST for the same literal-path reason.
+        .route(
+            "/workflow/records",
+            post(crate::workflow_records::post_record),
+        )
         // Control/admin only, on purpose: absent from the `auth.rs` scope tables, so a run key
         // cannot keep a worktree's verify box alive.
         .route(
