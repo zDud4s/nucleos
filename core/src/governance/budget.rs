@@ -1113,6 +1113,76 @@ mod tests {
         );
     }
 
+    /// Migration 0213 gives a superseded run back the time it paused, so an unmeasured one is
+    /// priced for the four minutes it ran and not for the 30.9 hours its approval took (the shape
+    /// of run 900428). Seeded between 0212 and 0213: a fresh database reaches the UPDATE with no
+    /// rows in it. Only the repaired run is unmeasured, so the total is its price alone.
+    #[tokio::test]
+    async fn a_superseded_run_with_no_cost_is_priced_up_to_its_pause() {
+        let pool = crate::testdb::pool_migrated_through(212).await;
+        let approved = "2026-08-08T16:58:00Z";
+        for (id, status, cost) in [
+            (1, "superseded", None),
+            (2, "superseded", Some(0.0)),
+            (3, "completed", Some(0.0)),
+            (4, "superseded", Some(0.0)),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at)
+                 VALUES (?, 'p', ?, 'worktree', ?, '2026-08-07T10:00:00Z', ?)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(cost)
+            .bind(approved)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Run 1 asked twice and the later ask is its pause; mixed UTC spellings on purpose. Run 2
+        // has no proposal, run 3 did not supersede, and run 4's only proposal predates the run.
+        for (run_id, created_at) in [
+            (1, "2026-08-07T10:01:00+00:00"),
+            (1, "2026-08-07T10:04:00+00:00"),
+            (3, "2026-08-07T10:04:00+00:00"),
+            (4, "2026-08-07T09:00:00+00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO proposals (kind, status, run_id, reasoning, created_at, decided_at)
+                 VALUES ('action-approval', 'approved', ?, 'r', ?, ?)",
+            )
+            .bind(run_id)
+            .bind(created_at)
+            .bind(approved)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        crate::testdb::apply_migrations_after(&pool, 212).await;
+
+        let ends: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, completed_at FROM runs ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            ends,
+            vec![
+                (1, "2026-08-07T10:04:00+00:00".to_owned()),
+                (2, approved.to_owned()),
+                (3, approved.to_owned()),
+                (4, approved.to_owned()),
+            ]
+        );
+        let rows = autonomous_rows(&pool).await.unwrap();
+        // Four minutes at $3/h, where the approval time would have hit the four-hour cap ($12).
+        approx(
+            compute_spend(&rows, ts("2026-08-09T00:00:00Z"), &cfg(3.0)),
+            0.2,
+        );
+    }
+
     async fn insert_run(
         pool: &SqlitePool,
         mode: &str,
