@@ -18,11 +18,12 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { Web, looksLikeUrl } from "./Web";
+import { Web, clearWebDraft, looksLikeUrl } from "./Web";
 import { createAppQueryClient } from "../app/queryClient";
 import type { Page } from "../data/web";
 
 beforeEach(() => {
+  clearWebDraft();
   daemon.apiFetch.mockReset();
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();

@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Globe } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
@@ -375,12 +375,19 @@ function ChainDialogue({
   // reading the screen.
   const [writable, setWritable] = useState(false);
   const consequenceId = useId();
+  // The question outranks the list and arrives when the window closes, so a keyboard or
+  // screen-reader user who just held "Give the wheel back" is taken to it rather than left behind.
+  const dialogueRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    dialogueRef.current?.focus();
+  }, []);
   const origins = chain.length === 1 ? "origin" : "origins";
   const grantLabel = writable
     ? `Grant read on ${chain.length} ${origins}, and form submission on the site you ended on`
     : `Grant read on ${chain.length} ${origins}`;
 
   return (
+    <div ref={dialogueRef} className="browser-chain-dialogue" tabIndex={-1} role="group" aria-label="Keep these?">
     <Panel title="Keep these?">
       <p className="browser-note">
         The window closed, and this is where it went. Nothing is granted yet — say yes to the whole
@@ -432,6 +439,7 @@ function ChainDialogue({
       </div>
       {keepChain.isError && <MutationNote error={keepChain.error} what="that answer was not recorded" />}
     </Panel>
+    </div>
   );
 }
 
@@ -529,6 +537,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
         </label>
         {/* A plain Button and not a ConfirmButton: this write is additive and reversible — the
             window closes, and it grants nothing on its own. */}
+        <span className="browser-bar-buttons">
         <Button type="submit" variant="approve" disabled={!ready}>
           {open.isPending ? "Opening…" : "Open a window"}
         </Button>
@@ -543,6 +552,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
         >
           {withAgent.isPending ? "Opening…" : "Open with agent"}
         </Button>
+        </span>
       </form>
       <p id={hintId} className="browser-bar-hint">
         {unavailable

@@ -175,6 +175,11 @@
   opacity: 1;
 }
 
+/* A long value or placeholder ends in an ellipsis instead of being cut mid-letter. */
+.web-bar-field input {
+  text-overflow: ellipsis;
+}
+
 .web-bar .ui-button {
   height: 2.5rem;
   flex: none;

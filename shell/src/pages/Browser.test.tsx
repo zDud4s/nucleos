@@ -465,6 +465,8 @@ describe("Browser - the write grant", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Close the window and bring the chain back" }));
 
     fireEvent.click(await screen.findByRole("button", { name: "Keep them" }));
+    // The question takes keyboard focus when it appears.
+    expect(document.activeElement).toBe(screen.getByRole("group", { name: "Keep these?" }));
     await afterDwell();
     fireEvent.click(await screen.findByRole("button", { name: "Grant read on 2 origins" }));
 
