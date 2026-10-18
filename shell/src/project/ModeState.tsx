@@ -21,6 +21,7 @@ import { Settings } from "./Settings";
 import { TestsMap } from "./TestsMap";
 import { WorkflowSummary } from "./Workflows";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * "How is this now?"
@@ -291,7 +292,7 @@ function Readings({ projectId }: { projectId: string }) {
   const data = readings.data;
 
   if (readings.isError && data === undefined) {
-    return <ErrorNote>The núcleo did not answer for this project&rsquo;s readings.</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} gave no reply for this project&rsquo;s readings.</ErrorNote>;
   }
 
   return (

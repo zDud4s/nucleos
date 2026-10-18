@@ -267,7 +267,7 @@ describe("the readings", () => {
       new Set(["/projects/nucleos/readings"]),
     );
 
-    expect(await screen.findByText(/did not answer for this project.s readings/)).toBeTruthy();
+    expect(await screen.findByText(/gave no reply for this project.s readings/)).toBeTruthy();
     expect(screen.queryByText("—")).toBeNull();
   });
 });

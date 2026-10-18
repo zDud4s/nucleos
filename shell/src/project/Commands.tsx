@@ -20,6 +20,7 @@ import {
   usePaletteGroup,
   usePaletteOpen,
 } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * What this project can be asked to do to itself.
@@ -76,7 +77,7 @@ export function Commands({ projectId }: CommandsProps) {
   if (commands.data === undefined) {
     // A read that failed is not a read still coming, and must not keep saying it is.
     return commands.isError ? (
-      <ErrorNote>The núcleo did not say which commands this project declares.</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} did not say which commands this project declares.</ErrorNote>
     ) : (
       <p className="text-sm text-text-faint">Reading this project's commands…</p>
     );
@@ -337,20 +338,20 @@ const DECLARE_REFUSALS: Record<string, string> = {
   cwd_missing: "that folder is not in this project.",
   cwd_not_a_folder: "that path names a file, not a folder.",
   cwd_unsafe: "the folder must be inside the project.",
-  no_project_root: "the núcleo has no folder recorded for this project.",
-  internal: "the núcleo hit an error of its own while saving it.",
+  no_project_root: `the ${DAEMON_NAME} has no folder recorded for this project.`,
+  internal: `the ${DAEMON_NAME} hit an error of its own while saving it.`,
 };
 
 /** What each refusal means, in the page's words. */
 const REFUSALS: Record<string, string> = {
   kill_switch: "the emergency stop is engaged, so nothing here starts a process.",
   already_running: "that one is already going. One at a time, per command.",
-  no_such_command: "the núcleo has no such command for this project any more.",
-  no_project_root: "the núcleo has no folder recorded for this project.",
+  no_such_command: `the ${DAEMON_NAME} has no such command for this project any more.`,
+  no_project_root: `the ${DAEMON_NAME} has no folder recorded for this project.`,
   cwd_missing: "the folder that command runs in is not there.",
   cwd_not_a_folder: "what that command runs in is a file, not a folder.",
   person_only: "that command is marked for a person, and this is not one.",
-  internal: "the núcleo hit an error of its own trying to start it.",
+  internal: `the ${DAEMON_NAME} hit an error of its own trying to start it.`,
 };
 
 /**

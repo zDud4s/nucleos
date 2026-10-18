@@ -98,9 +98,9 @@ async function open(
 
 describe("the Code mode", () => {
   /** A daemon that is down leaves the reading undefined forever; "reading" over it is a lie. */
-  it("says the núcleo did not answer rather than reading forever", async () => {
+  it("says the background service gave no reply rather than reading forever", async () => {
     await open(reviewState(), "/projects/nucleos/code", { concurrencyDown: true });
-    expect(await screen.findByText(/did not answer, so there is no telling/)).toBeTruthy();
+    expect(await screen.findByText(/gave no reply, so there is no telling/)).toBeTruthy();
     expect(screen.queryByText("Reading what there is to review…")).toBeNull();
   });
 
@@ -194,6 +194,6 @@ describe("the Code mode", () => {
     opener.openUrl.mockRejectedValueOnce(new Error("no handler for vscode://"));
     await open(reviewState(), "/projects/nucleos/code?run=41");
     fireEvent.click(await screen.findByRole("button", { name: "Open the worktree in VS Code" }));
-    expect(await screen.findByText(/VS Code did not answer/)).toBeTruthy();
+    expect(await screen.findByText(/VS Code gave no reply/)).toBeTruthy();
   });
 });

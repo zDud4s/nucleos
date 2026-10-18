@@ -3,6 +3,7 @@ import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map";
 import { Button, ErrorNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Choosing what gets read, and by whom.
@@ -56,7 +57,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
   if (specs.isError) {
     return (
       <ErrorNote>
-        The núcleo could not say which specs this project keeps — its folder may have moved.
+        The {DAEMON_NAME} could not say which specs this project keeps — its folder may have moved.
       </ErrorNote>
     );
   }
@@ -78,7 +79,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
           is the whole map it can have, and it is not wrong, only thin.
         </p>
         <p className="max-w-prose text-xs text-text-faint">
-          The núcleo looks in <span className="font-mono">.ai/specs/</span>,{" "}
+          The {DAEMON_NAME} looks in <span className="font-mono">.ai/specs/</span>,{" "}
           <span className="font-mono">docs/specs/</span> and{" "}
           <span className="font-mono">docs/superpowers/specs/</span>. One document in any of them is
           all this needs.
@@ -201,20 +202,20 @@ function Failed({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        The núcleo did not answer, so nothing was read and nothing was recorded.
+        The {DAEMON_NAME} gave no reply, so nothing was read and nothing was recorded.
       </ErrorNote>
     );
   }
 
   const sentence =
     error.status === 503
-      ? "This machine has no local model configured, so the local brain has nothing to read with. The núcleo refuses rather than sending the document to a cloud you did not ask for — which is the whole reason the choice is yours to make."
+      ? `This machine has no local model configured, so the local brain has nothing to read with. The ${DAEMON_NAME} refuses rather than sending the document to a cloud you did not ask for — which is the whole reason the choice is yours to make.`
       : error.status === 502
         ? "A model was reached and the read failed. Nothing was recorded: an empty list would have claimed this document decides nothing, and nobody is in a position to claim that when nobody read it."
         : error.status === 404
           ? "That document is not there any more, or it cannot be read."
           : error.status === 422
-            ? "The núcleo could not read which brain was asked for."
+            ? `The ${DAEMON_NAME} could not read which brain was asked for.`
             : error.detail;
 
   return <ErrorNote>{sentence}</ErrorNote>;

@@ -6,6 +6,7 @@ import { heldBy } from "../data/roster";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
 import { RefusalNote } from "../ui/RefusalNote";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Deleting a project's folder from the disk.
@@ -147,7 +148,7 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
 
             {folder.isError ? (
               <p className="text-xs text-text-faint">
-                the núcleo did not say what is in that folder — nothing has been deleted
+                the {DAEMON_NAME} did not say what is in that folder — nothing has been deleted
               </p>
             ) : reading === undefined ? (
               <p className="text-xs text-text-faint">reading what is in that folder…</p>
@@ -169,7 +170,7 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
               <span className="flex flex-col gap-0.5">
                 <span className="font-medium text-text">Forget its history too</span>
                 <span>
-                  Its runs, proposals and stamps. Left unticked they stay in the núcleo, which is
+                  Its runs, proposals and stamps. Left unticked they stay in the {DAEMON_NAME}, which is
                   what happens by default.
                 </span>
               </span>
@@ -188,7 +189,7 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
                 />
               ) : (
                 <p className="text-xs text-text-faint">
-                  the núcleo did not answer — nothing was deleted
+                  the {DAEMON_NAME} gave no reply — nothing was deleted
                 </p>
               ))}
 

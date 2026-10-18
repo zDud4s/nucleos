@@ -3,6 +3,7 @@ import { isApiRefusal } from "../data/client";
 import { useDecideMapLine, useMapDecisions, type MapDecision } from "../data/project-map";
 import { useState } from "react";
 import { ErrorNote, Quiet, SectionTitle } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * The pile nobody has read, and the one gesture that is missing from it.
@@ -29,7 +30,7 @@ export function DecisionsWaiting({ projectId }: DecisionsWaitingProps) {
   const [open, setOpen] = useState(false);
 
   if (decisions.isError) {
-    return <ErrorNote>The núcleo could not say what is waiting to be read here.</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} could not say what is waiting to be read here.</ErrorNote>;
   }
   if (decisions.data === undefined) {
     return <p className="text-sm text-text-faint">Reading what is waiting…</p>;
@@ -189,7 +190,7 @@ function Line({ projectId, row, number }: { projectId: string; row: MapDecision;
  */
 function Refused({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>The núcleo did not answer, so this line is still waiting.</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} gave no reply, so this line is still waiting.</ErrorNote>;
   }
 
   return (

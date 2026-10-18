@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { useConcurrency } from "../data/fleet";
 import { ErrorNote, Quiet, StaleNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * How full this project is, as slots rather than as a number.
@@ -34,7 +35,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
   */
   if (!answered) {
     return concurrency.isError ? (
-      <ErrorNote>The núcleo did not say which worktree slots are in use.</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} did not say which worktree slots are in use.</ErrorNote>
     ) : (
       <p className="text-sm text-text-faint">Reading capacity…</p>
     );
