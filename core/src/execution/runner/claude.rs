@@ -28,13 +28,24 @@ pub(super) async fn next_line_unless_silent<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
+    unless_silent(lines.next_line(), silence, open_tools).await
+}
+
+/// `read`, given up after `silence` unless a tool call is open — the rule of
+/// [`next_line_unless_silent`], for any read of the next line.
+async fn unless_silent<F, T>(
+    read: F,
+    silence: Option<Duration>,
+    open_tools: &std::collections::HashSet<String>,
+) -> Result<T, Duration>
+where
+    F: std::future::Future<Output = T>,
+{
     match silence {
-        Some(deadline) if open_tools.is_empty() => {
-            tokio::time::timeout(deadline, lines.next_line())
-                .await
-                .map_err(|_| deadline)
-        }
-        _ => Ok(lines.next_line().await),
+        Some(deadline) if open_tools.is_empty() => tokio::time::timeout(deadline, read)
+            .await
+            .map_err(|_| deadline),
+        _ => Ok(read.await),
     }
 }
 
@@ -42,6 +53,47 @@ where
 /// the resolution is the daemon's own read-and-merge turn, and naming it lets the same
 /// `model_for_stage` seam route it without a second mechanism.
 pub const RESOLVE_STAGE: &str = "resolve";
+
+/// How long stdout and stderr are still drained once the CLI process itself has exited.
+///
+/// EOF on a pipe means every holder of its write end has closed it, not that the CLI has. A
+/// grandchild that inherited the pipe — a background shell, an MCP server — keeps it open after
+/// the CLI is gone, and waiting for EOF then waits on that grandchild: until the progress deadline,
+/// or forever for a run that has none. Whatever the CLI wrote before exiting is already in the pipe
+/// and reads back in well under this; anything after it is not the CLI's to report.
+const CHILD_EXIT_STDIO_GRACE: Duration = Duration::from_millis(1500);
+
+/// The next stdout line, or `Ok(None)` once the stream is over — which is EOF, or the direct child
+/// having exited `grace` ago, whichever comes first.
+///
+/// `child_exit` is polled only until it first completes, and `exited_at` records when; it must be
+/// cancel safe (tokio's `Child::wait` is), since a fresh one is passed on every call and dropped
+/// unfinished whenever a line arrives first. Lines win ties, so what is already buffered is read
+/// before the exit is even noticed.
+async fn next_line_until_exit_grace<R, E>(
+    lines: &mut tokio::io::Lines<R>,
+    child_exit: E,
+    exited_at: &mut Option<tokio::time::Instant>,
+    grace: Duration,
+) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    E: std::future::Future,
+{
+    if exited_at.is_none() {
+        tokio::select! {
+            biased;
+            line = lines.next_line() => return line,
+            _ = child_exit => *exited_at = Some(tokio::time::Instant::now()),
+        }
+    }
+    let deadline = (*exited_at).expect("set above") + grace;
+    match tokio::time::timeout_at(deadline, lines.next_line()).await {
+        Ok(line) => line,
+        // Treated as EOF: the CLI has gone, and nothing it wrote can still be on the way.
+        Err(_) => Ok(None),
+    }
+}
 
 #[async_trait]
 impl CommandRunner for ClaudeCliRunner {
@@ -245,11 +297,27 @@ impl CommandRunner for ClaudeCliRunner {
 
         // Drain stderr in a *concurrent* task — reading only stdout while the child writes stderr would
         // deadlock the moment the OS stderr pipe buffer fills (spec §3.3's explicit trap).
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = String::new();
-            let mut reader = BufReader::new(stderr);
-            let _ = reader.read_to_string(&mut buf).await;
-            buf
+        //
+        // Into a shared buffer, chunk by chunk, rather than one `read_to_string`: stderr can be held
+        // open by a grandchild exactly as stdout can (see `CHILD_EXIT_STDIO_GRACE`), and a task
+        // abandoned after the grace must still leave behind what it had read.
+        let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut stderr_task = tokio::spawn({
+            let stderr_buf = stderr_buf.clone();
+            async move {
+                let mut reader = stderr;
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match reader.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut buf) = stderr_buf.lock() {
+                                buf.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                    }
+                }
+            }
         });
 
         let mut lines = BufReader::new(stdout).lines();
@@ -277,18 +345,24 @@ impl CommandRunner for ClaudeCliRunner {
         // Tool calls the CLI has started and not yet answered. While any is open the stream is
         // quiet because a tool is working, not because the run stalled.
         let mut open_tools = std::collections::HashSet::new();
+        // When the CLI itself was seen to exit. From then on stdout is only drained, for at most
+        // `CHILD_EXIT_STDIO_GRACE`: a grandchild that inherited the pipe can hold it open forever.
+        let mut child_exited_at: Option<tokio::time::Instant> = None;
 
         loop {
-            let next_line =
-                match next_line_unless_silent(&mut lines, request.progress_timeout, &open_tools)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(deadline) => {
-                        progress_timeout_elapsed = Some(deadline);
-                        break;
-                    }
-                };
+            let read = next_line_until_exit_grace(
+                &mut lines,
+                child.wait(),
+                &mut child_exited_at,
+                CHILD_EXIT_STDIO_GRACE,
+            );
+            let next_line = match unless_silent(read, request.progress_timeout, &open_tools).await {
+                Ok(result) => result,
+                Err(deadline) => {
+                    progress_timeout_elapsed = Some(deadline);
+                    break;
+                }
+            };
             let line = match next_line {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
@@ -415,7 +489,18 @@ impl CommandRunner for ClaudeCliRunner {
             killer.disarm();
         }
 
-        let mut stderr_str = stderr_task.await.unwrap_or_default();
+        // The CLI has been reaped, so whatever still holds stderr open is a descendant of it; give the
+        // pipe the same grace stdout got and then stop listening.
+        if tokio::time::timeout(CHILD_EXIT_STDIO_GRACE, &mut stderr_task)
+            .await
+            .is_err()
+        {
+            stderr_task.abort();
+        }
+        let mut stderr_str = stderr_buf
+            .lock()
+            .map(|buf| String::from_utf8_lossy(&buf).into_owned())
+            .unwrap_or_default();
         if let Some(reason) = &policy_violation {
             if !stderr_str.is_empty() && !stderr_str.ends_with('\n') {
                 stderr_str.push('\n');
@@ -502,5 +587,142 @@ impl CommandRunner for ClaudeCliRunner {
             num_turns: usage.num_turns,
             compacted,
         })
+    }
+}
+
+#[cfg(test)]
+mod stdio_grace_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// The finding this guards: a pipe whose write end outlives the CLI, as it does when a
+    /// grandchild inherited it. The writer is kept alive to the end of the test, so EOF never comes.
+    #[tokio::test]
+    async fn a_pipe_held_open_after_the_child_exited_ends_after_the_grace() {
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        writer.write_all(b"first\nsecond\n").await.unwrap();
+        let mut lines = BufReader::new(reader).lines();
+        let mut exited_at = None;
+        let grace = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+
+        let mut read = Vec::new();
+        loop {
+            let next = next_line_until_exit_grace(
+                &mut lines,
+                std::future::ready(()),
+                &mut exited_at,
+                grace,
+            )
+            .await
+            .unwrap();
+            match next {
+                Some(line) => read.push(line),
+                None => break,
+            }
+        }
+
+        // Buffered lines are drained before the exit is noticed, and the stream then ends on its
+        // own, well before anything like a progress deadline.
+        assert_eq!(read, vec!["first".to_string(), "second".to_string()]);
+        assert!(exited_at.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(writer);
+    }
+
+    /// What the CLI wrote just before exiting can land a moment after the exit is seen; the grace
+    /// is there so it is still read.
+    #[tokio::test]
+    async fn a_line_arriving_within_the_grace_is_still_read() {
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        let mut lines = BufReader::new(reader).lines();
+        let mut exited_at = None;
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            writer.write_all(b"late\n").await.unwrap();
+            writer
+        });
+
+        let first = next_line_until_exit_grace(
+            &mut lines,
+            std::future::ready(()),
+            &mut exited_at,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.as_deref(), Some("late"));
+        drop(late.await.unwrap());
+    }
+
+    /// Normal EOF is unchanged: a closed pipe ends the stream at once, with the child still running.
+    #[tokio::test]
+    async fn eof_before_the_child_exits_ends_the_stream() {
+        let (reader, mut writer) = tokio::io::duplex(1024);
+        writer.write_all(b"only\n").await.unwrap();
+        drop(writer);
+        let mut lines = BufReader::new(reader).lines();
+        let mut exited_at = None;
+
+        let mut read = Vec::new();
+        for _ in 0..2 {
+            read.push(
+                next_line_until_exit_grace(
+                    &mut lines,
+                    std::future::pending::<()>(),
+                    &mut exited_at,
+                    Duration::from_secs(60),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert_eq!(read, vec![Some("only".to_string()), None]);
+        assert!(exited_at.is_none());
+    }
+
+    /// End to end, with a real process: the shell prints, leaves a sleeper holding its stdout and
+    /// exits. Needs `sh` on PATH (Git's under Git bash on Windows); skipped where there is none.
+    #[tokio::test]
+    async fn a_real_child_leaving_a_sleeper_on_its_stdout_does_not_stall_the_read() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo hi; sleep 30 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let Ok(mut child) = cmd.spawn() else {
+            eprintln!("no `sh` on PATH; skipping");
+            return;
+        };
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut exited_at = None;
+        let started = std::time::Instant::now();
+
+        let mut read = Vec::new();
+        while let Some(line) = next_line_until_exit_grace(
+            &mut lines,
+            child.wait(),
+            &mut exited_at,
+            CHILD_EXIT_STDIO_GRACE,
+        )
+        .await
+        .unwrap()
+        {
+            read.push(line);
+        }
+
+        assert_eq!(read, vec!["hi".to_string()]);
+        assert!(exited_at.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

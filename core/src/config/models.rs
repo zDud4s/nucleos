@@ -2,7 +2,8 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+// `PartialEq` only: `model_prices` holds `f64`, which has no `Eq`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ModelsConfig {
     pub claude_model: String,
     pub codex_model: String,
@@ -119,6 +120,15 @@ pub struct ModelsConfig {
     /// `catalogue` joins the two.
     #[serde(default = "default_assistant_choices")]
     pub assistant_choices: Vec<AssistantChoice>,
+    /// When `scripts/refresh-models.py` last read the vendors' price pages (`YYYY-MM-DD`), or `None`
+    /// when it never has. Shown beside every estimated cost so its age is visible (spec devtime §4.4).
+    #[serde(default)]
+    pub prices_as_of: Option<String>,
+    /// Vendor-published prices, USD per million tokens, keyed by normalised model id. Written by the
+    /// script, never by hand: there is no hand-kept price catalogue (owner, 2026-10-17). Read per
+    /// request like the rest of this file, so a refresh needs no restart.
+    #[serde(default)]
+    pub model_prices: std::collections::BTreeMap<String, ModelPrice>,
 }
 
 /// One row of the conversation's model picker.
@@ -770,6 +780,8 @@ impl Default for ModelsConfig {
             local_context_tokens: None,
             embedding_model: default_embedding_model(),
             assistant_choices: default_assistant_choices(),
+            prices_as_of: None,
+            model_prices: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -803,6 +815,58 @@ pub const MODELS_CONFIG_FILE: &str = "nucleos-models.yaml";
 /// [`crate::machine_config::ROOT_DISPLAY`].
 pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
 
+/// One model's published prices. A `None` field is a price the script could not read: tokens of that
+/// kind make the model "unpriced", never priced at zero.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+pub struct ModelPrice {
+    #[serde(default)]
+    pub input: Option<f64>,
+    #[serde(default)]
+    pub output: Option<f64>,
+    #[serde(default)]
+    pub cache_read: Option<f64>,
+    #[serde(default)]
+    pub cache_write: Option<f64>,
+    /// `anthropic` or `openrouter`; informational.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// The second lookup `price_of` tries, and the key the script writes (spec devtime §4.4): lowercase,
+/// no `[..]` context suffix, no `-YYYYMMDD`, no `-latest`, `.` -> `-` in `claude-*` ids. Mirrored by
+/// `normalise_id` in `scripts/refresh-models.py`; change both or neither.
+pub fn normalise_model_id(id: &str) -> String {
+    let mut text = id.trim().to_ascii_lowercase();
+    if text.ends_with(']')
+        && let Some(open) = text.rfind('[')
+    {
+        text.truncate(open);
+    }
+    if let Some((head, tail)) = text.rsplit_once('-')
+        && tail.len() == 8
+        && tail.bytes().all(|b| b.is_ascii_digit())
+    {
+        text = head.to_string();
+    }
+    if let Some(head) = text.strip_suffix("-latest") {
+        text = head.to_string();
+    }
+    if text.starts_with("claude-") {
+        text = text.replace('.', "-");
+    }
+    text
+}
+
+impl ModelsConfig {
+    /// Exact id, then normalised id. Never a prefix: a neighbour's price is a wrong cost, and a wrong
+    /// cost is worse than none (spec devtime §4.4). An unversioned alias (`sonnet`) has no price.
+    pub fn price_of(&self, model: &str) -> Option<&ModelPrice> {
+        self.model_prices
+            .get(model)
+            .or_else(|| self.model_prices.get(&normalise_model_id(model)))
+    }
+}
+
 /// Where the daemon reads [`MODELS_CONFIG_FILE`], or `None` when there is nowhere to read it from —
 /// which every reader treats as an absent file, i.e. [`ModelsConfig::default`].
 ///
@@ -825,7 +889,30 @@ pub fn models_config_path() -> Option<std::path::PathBuf> {
 /// buys no new strictness — it buys the write route a function with the shape every other claim's
 /// validator has, and it keeps the door and the loader reading one grammar rather than two.
 pub fn parse_models_config(contents: &str) -> Result<ModelsConfig, String> {
-    serde_yaml::from_str::<ModelsConfig>(contents).map_err(|error| error.to_string())
+    let mut config =
+        serde_yaml::from_str::<ModelsConfig>(contents).map_err(|error| error.to_string())?;
+    // A negative or non-finite price is a wrong cost. It drops that one model's entry (so the model
+    // reads "unpriced") and nothing else: one bad line must not take model routing down with it
+    // (owner, 2026-10-18).
+    config.model_prices.retain(|id, price| {
+        let bad = [
+            ("input", price.input),
+            ("output", price.output),
+            ("cache_read", price.cache_read),
+            ("cache_write", price.cache_write),
+        ]
+        .into_iter()
+        .find(|(_, value)| value.is_some_and(|v| !v.is_finite() || v < 0.0));
+        if let Some((field, _)) = bad {
+            tracing::warn!(
+                model = %id,
+                field,
+                "model_prices entry is not a finite, non-negative number; entry dropped"
+            );
+        }
+        bad.is_none()
+    });
+    Ok(config)
 }
 
 pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {

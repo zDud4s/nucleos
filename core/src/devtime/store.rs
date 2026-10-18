@@ -15,8 +15,10 @@ use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 /// The parser generation a file row is stamped with when this module creates it.
 pub use crate::devtime::parse::PARSER_VERSION;
 
+mod reads;
 mod rules;
 
+pub use self::reads::*;
 pub use self::rules::*;
 
 #[allow(dead_code)] // a table column or closed vocabulary that no reader asks for yet

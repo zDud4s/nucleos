@@ -2,7 +2,7 @@
 //! analytics-pipeline §5.2): `/analytics`' `days` rules and errors, one JSON per request whose
 //! blocks carry their own errors (D5), so the only refusals here are the 400 and the 404.
 
-use super::analytics::{DaysQuery, Refusal, project_known, window_of};
+use super::analytics::{DaysQuery, Refusal, known_project, window_of};
 use super::*;
 
 pub(super) fn routes() -> Router<AppState> {
@@ -35,7 +35,7 @@ async fn get_project_pipeline(
 ) -> Result<Json<crate::analytics_pipeline::PipelineReport>, Refusal> {
     let now = chrono::Utc::now();
     let window = window_of(&query, now)?;
-    project_known(&state.pool, &id).await?;
+    known_project(&state, &id, "project analytics").await?;
     Ok(Json(
         crate::analytics_pipeline::build(
             &state.pool,

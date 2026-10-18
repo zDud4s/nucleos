@@ -13,6 +13,7 @@
 
 pub mod cost;
 pub mod delivered;
+pub mod devtime;
 pub mod quota;
 pub mod sessions;
 

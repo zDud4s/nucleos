@@ -361,7 +361,6 @@ pub struct FeedbackRow {
 }
 
 /// One standing mark per finding: marking again replaces the earlier mark.
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
 pub async fn upsert_feedback(pool: &SqlitePool, row: &FeedbackRow) -> sqlx::Result<()> {
     let marked_at = if row.marked_at.is_empty() {
         now()
@@ -404,7 +403,6 @@ pub struct RuleCaseCounts {
 
 /// Per rule, over the findings that exist now: a mark whose finding was recomputed away is kept in
 /// `devtime_feedback` for history but is no longer a case, so the join runs from the findings.
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
 pub async fn rule_case_counts(
     pool: &SqlitePool,
     since: Option<&str>,
