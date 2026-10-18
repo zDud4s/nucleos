@@ -393,10 +393,6 @@
   }
 }
 
-.pj-filter {
-  margin-bottom: var(--space-3);
-}
-
 .pj-crumbs {
   display: flex;
   flex-wrap: wrap;
