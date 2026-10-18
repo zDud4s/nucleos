@@ -223,10 +223,20 @@ pub async fn devtime_overview(
     let since = stamp(window.previous().start());
     let current = stamp(window.start());
     let until = stamp(now.min(window.end()));
-    let thresholds = prompt_thresholds(models);
+    // One read per tier bucket, so the buckets are only the thresholds of models actually used in
+    // the window: a first base-only read names them, and a second read runs only when one of them
+    // is tiered. The price table can hold hundreds of models that never show up here.
+    let mut messages = store::message_day_rows(pool, project, &since, &until, &[]).await?;
+    let thresholds = prompt_thresholds(
+        models,
+        messages.iter().filter_map(|row| row.model.as_deref()),
+    );
+    if !thresholds.is_empty() {
+        messages = store::message_day_rows(pool, project, &since, &until, &thresholds).await?;
+    }
     let reads = Reads {
         spans: store::span_day_rows(pool, project, &since, &until).await?,
-        messages: store::message_day_rows(pool, project, &since, &until, &thresholds).await?,
+        messages,
         thresholds,
         turns: store::turn_day_rows(pool, project, &since, &until).await?,
         sessions: store::session_counts(pool, project, &current, &until).await?,
@@ -479,12 +489,12 @@ fn wasted_active(window: Window, spans: &[SpanDayRow]) -> impl Iterator<Item = &
 
 /* --------------------------------------------------------------- tokens -- */
 
-/// Every distinct prompt threshold of the price table, ascending: the buckets the day read splits
-/// messages by, so each can be priced at its own tier. A 0 threshold is the base, bucket 0 already.
-fn prompt_thresholds(models: &ModelsConfig) -> Vec<u64> {
-    let thresholds: std::collections::BTreeSet<u64> = models
-        .model_prices
-        .values()
+/// Every distinct prompt threshold of the used models' prices, ascending: the buckets the day read
+/// splits messages by, so each can be priced at its own tier. A 0 threshold is the base, bucket 0
+/// already.
+fn prompt_thresholds<'a>(models: &ModelsConfig, used: impl Iterator<Item = &'a str>) -> Vec<u64> {
+    let thresholds: std::collections::BTreeSet<u64> = used
+        .filter_map(|model| models.price_of(model))
         .flat_map(|price| price.tiers.iter().map(|tier| tier.min_prompt_tokens))
         .filter(|threshold| *threshold > 0)
         .collect();
@@ -578,7 +588,9 @@ fn tally<'a>(
         entry.messages += row.messages;
         // A NULL model is never priced, even if somebody wrote a price under "unknown".
         let price = row.model.as_deref().and_then(|m| models.price_of(m));
-        *cost = cost.zip(row_cost(price, row, thresholds)).map(|(a, b)| a + b);
+        *cost = cost
+            .zip(row_cost(price, row, thresholds))
+            .map(|(a, b)| a + b);
     }
     by.into_values()
         .map(|(mut entry, cost)| {
@@ -1412,6 +1424,22 @@ mod tests {
     /// The tier keys on ONE request's prompt (input + cache reads + cache writes): a message at
     /// 100,001 is billed whole at the long rates, one at 100,000 at the base, and a day holding both
     /// sums them exactly — in the window total, the model row and the day series alike.
+
+    /// The read splits by the thresholds of the models used in the window only: a tiered price for
+    /// a model nobody ran adds no bucket, and so no extra walk of the day index.
+    #[test]
+    fn only_the_used_models_bring_their_tier_thresholds() {
+        let models = priced(&[("claude-haiku-5-5", haiku())]);
+        assert!(prompt_thresholds(&models, ["claude-opus-5-5"].into_iter()).is_empty());
+        assert!(prompt_thresholds(&models, std::iter::empty()).is_empty());
+        assert_eq!(
+            prompt_thresholds(
+                &models,
+                ["claude-haiku-5-5", "claude-haiku-5-5"].into_iter()
+            ),
+            vec![100_001]
+        );
+    }
     #[tokio::test]
     async fn each_message_is_priced_at_the_tier_its_own_prompt_reaches() {
         let pool = pool().await;
@@ -1432,13 +1460,23 @@ mod tests {
         let small = (10.0 * 0.10 + 10.0 * 0.50) / 1e6;
         let want = long + base + small;
         let tokens = &report.tokens;
-        assert!(close(tokens.cost_usd, want), "{:?} vs {want}", tokens.cost_usd);
+        assert!(
+            close(tokens.cost_usd, want),
+            "{:?} vs {want}",
+            tokens.cost_usd
+        );
         assert!(close(tokens.by_model[0].cost_usd, want));
-        assert_eq!((tokens.cost_low, tokens.cost_high), (tokens.cost_usd, tokens.cost_usd));
+        assert_eq!(
+            (tokens.cost_low, tokens.cost_high),
+            (tokens.cost_usd, tokens.cost_usd)
+        );
         let day = report.days_series.iter().find(|d| d.day == "2026-10-15");
         assert!(close(day.unwrap().cost_usd, want));
         let flat = (100_001.0 * 0.10 + 100_000.0 * 0.01 + 2_010.0 * 0.50 + 10.0 * 0.10) / 1e6;
-        assert!(want > flat, "summing before pricing would have billed the base tier");
+        assert!(
+            want > flat,
+            "summing before pricing would have billed the base tier"
+        );
     }
 
     /// `speed: fast` replaces input and output (and scales the cache rates by the same factor);
@@ -1476,7 +1514,11 @@ mod tests {
             .await
             .tokens;
         let want = (8.0 + 4.0) * 1.1 + (5.0 + 2.5) * 1.1 + (5.0 + 2.5);
-        assert!(close(tokens.cost_usd, want), "{:?} vs {want}", tokens.cost_usd);
+        assert!(
+            close(tokens.cost_usd, want),
+            "{:?} vs {want}",
+            tokens.cost_usd
+        );
         assert_eq!(tokens.unpriced_models, ["claude-sonnet-5"]);
     }
 
@@ -1488,7 +1530,17 @@ mod tests {
         let at = "2026-10-15T09:00:00.000Z";
         let tokens = [0, 0, 1_000_000, 0];
         let model = "claude-sonnet-5";
-        billed_message(&pool, "s1", "m1", at, model, tokens, Some(600_000), STANDARD).await;
+        billed_message(
+            &pool,
+            "s1",
+            "m1",
+            at,
+            model,
+            tokens,
+            Some(600_000),
+            STANDARD,
+        )
+        .await;
         let sonnet = ModelPrice {
             cache_write_1h: Some(6.0),
             ..full(3.0, 15.0, 0.3, 3.75)
@@ -1498,8 +1550,15 @@ mod tests {
             .await
             .tokens;
         let want = 0.4 * 3.75 + 0.6 * 6.0;
-        assert!(close(tokens.cost_usd, want), "{:?} vs {want}", tokens.cost_usd);
-        assert_eq!((tokens.cost_low, tokens.cost_high), (tokens.cost_usd, tokens.cost_usd));
+        assert!(
+            close(tokens.cost_usd, want),
+            "{:?} vs {want}",
+            tokens.cost_usd
+        );
+        assert_eq!(
+            (tokens.cost_low, tokens.cost_high),
+            (tokens.cost_usd, tokens.cost_usd)
+        );
     }
 
     /// A message ingested before 0214 has no cache split: low prices its writes at 5 minutes, high
@@ -1511,8 +1570,18 @@ mod tests {
         session(&pool, "s1", "alpha", "2026-10-15T09:00:00.000Z", None).await;
         let model = "claude-sonnet-5";
         let rows = [
-            ("old", "2026-10-15T09:00:00.000Z", [0, 0, 1_000_000, 0], None),
-            ("new", "2026-10-15T10:00:00.000Z", [1_000_000, 0, 0, 0], Some(0)),
+            (
+                "old",
+                "2026-10-15T09:00:00.000Z",
+                [0, 0, 1_000_000, 0],
+                None,
+            ),
+            (
+                "new",
+                "2026-10-15T10:00:00.000Z",
+                [1_000_000, 0, 0, 0],
+                Some(0),
+            ),
         ];
         for (id, at, tokens, one_hour) in rows {
             billed_message(&pool, "s1", id, at, model, tokens, one_hour, STANDARD).await;
@@ -1531,7 +1600,11 @@ mod tests {
         assert!(row.cost_low < row.cost_high);
         assert_eq!(row.cost_usd, row.cost_high);
         let day = report.days_series.iter().find(|d| d.day == "2026-10-15");
-        assert_eq!(day.unwrap().cost_usd, tokens.cost_usd, "a day takes the estimate");
+        assert_eq!(
+            day.unwrap().cost_usd,
+            tokens.cost_usd,
+            "a day takes the estimate"
+        );
     }
 
     #[tokio::test]
@@ -1800,7 +1873,12 @@ mod tests {
         let pool = pool().await;
         let mut reads = vec![
             (SPAN_DAY_SQL.to_string(), false, "idx_devtime_spans_day", 1),
-            (SPAN_DAY_PROJECT_SQL.to_string(), true, "idx_devtime_spans_day", 1),
+            (
+                SPAN_DAY_PROJECT_SQL.to_string(),
+                true,
+                "idx_devtime_spans_day",
+                1,
+            ),
         ];
         for thresholds in 0..=2 {
             for project in [false, true] {

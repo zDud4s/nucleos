@@ -180,15 +180,16 @@ const MESSAGE_PROMPT: &str = "(m.input_tokens + m.cache_read_tokens + m.cache_cr
 /// window, as in `one_day` above.
 pub(crate) fn message_day_sql(project: bool, thresholds: usize) -> String {
     let first = if project { 4 } else { 3 };
-    let filter = if project { " AND ss.project_id = ?3" } else { "" };
+    let filter = if project {
+        " AND ss.project_id = ?3"
+    } else {
+        ""
+    };
     let arms: Vec<String> = (0..=thresholds)
         .map(|bucket| {
             let mut range = String::new();
             if bucket > 0 {
-                range.push_str(&format!(
-                    " AND {MESSAGE_PROMPT} >= ?{}",
-                    first + bucket - 1
-                ));
+                range.push_str(&format!(" AND {MESSAGE_PROMPT} >= ?{}", first + bucket - 1));
             }
             if bucket < thresholds {
                 range.push_str(&format!(" AND {MESSAGE_PROMPT} < ?{}", first + bucket));

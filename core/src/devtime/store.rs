@@ -1090,6 +1090,10 @@ mod tests {
                     "output_tokens",
                     "has_tool_use",
                     "parser_version",
+                    // 0214: the billing mode, NULL on rows ingested before it.
+                    "cache_creation_1h_tokens",
+                    "speed",
+                    "inference_geo",
                 ],
             ),
             (
