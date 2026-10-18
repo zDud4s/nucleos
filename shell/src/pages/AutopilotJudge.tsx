@@ -277,7 +277,7 @@ function JudgeRefusal({ error }: { error: unknown }) {
         not_ready: "the judge has not cleared the bar yet — review more of its verdicts below",
         unknown_project: "this project is not on the autopilot's roster",
         invalid: "off, observe and enforce are the only settings",
-        // A shell newer than its núcleo: until the núcleo has Task 9.5, the route still says this.
+        // A shell newer than its daemon: until the daemon has Task 9.5, the route still says this.
         enforce_unavailable: `this ${DAEMON_NAME} does not accept enforce yet — update it to one that shows the residual risk first`,
       }}
     />
