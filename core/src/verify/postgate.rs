@@ -353,10 +353,7 @@ struct Before {
     reverted: bool,
 }
 
-async fn read_before(
-    conn: &mut sqlx::SqliteConnection,
-    project_id: &str,
-) -> sqlx::Result<Before> {
+async fn read_before(conn: &mut sqlx::SqliteConnection, project_id: &str) -> sqlx::Result<Before> {
     let row: Option<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT red_groups, culprit_sha, revert_merge_sha, revert_sha \
          FROM postgate_state WHERE project_id = ?",
