@@ -81,6 +81,17 @@ pub trait CommandRunner: Send + Sync {
         None
     }
 
+    /// Whether this runner enforces `RunRequest::max_budget_usd` on the process it launches.
+    ///
+    /// Defaulted to `false`, and only the Anthropic CLI runner answers `true`: `cli_args` turns the
+    /// ceiling into `--max-budget-usd`, while `CodexCliRunner` refuses any request that carries one
+    /// (it has no counterpart and will not pretend). A launcher that would like to cap a run without
+    /// the run's owner having asked for it — a team seat — asks this first, so a daemon on Codex
+    /// keeps launching its seats instead of failing every one of them.
+    fn honours_max_budget(&self) -> bool {
+        false
+    }
+
     /// What this runner would itself write into the model's prompt for `request`, or `None` for a
     /// runner whose prompt this daemon does not author.
     ///

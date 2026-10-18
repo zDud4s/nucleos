@@ -50,6 +50,11 @@ impl CommandRunner for ClaudeCliRunner {
         Some(authored_prompt(request))
     }
 
+    /// `cli_args` writes the ceiling as `--max-budget-usd`, and the CLI stops itself at it.
+    fn honours_max_budget(&self) -> bool {
+        true
+    }
+
     async fn run_prompt(
         &self,
         request: RunRequest,

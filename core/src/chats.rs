@@ -2226,4 +2226,79 @@ mod tests {
             "a repository on no roster row stays unstamped"
         );
     }
+
+    /// Every column of `chats` as `(name, declared type, not null, default)`, in table order.
+    async fn chats_columns(pool: &SqlitePool) -> Vec<(String, String, bool, Option<String>)> {
+        sqlx::query_as(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('chats') ORDER BY cid",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Every stored value of `chats`, quoted, keyed by row and column.
+    async fn chats_values(pool: &SqlitePool) -> Vec<(String, String, String)> {
+        let mut values = Vec::new();
+        for (column, ..) in chats_columns(pool).await {
+            let rows: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT chat_id, quote(\"{column}\") FROM chats ORDER BY chat_id"
+            )))
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            values.extend(rows.into_iter().map(|(id, v)| (id, column.clone(), v)));
+        }
+        values.sort();
+        values
+    }
+
+    /// `0123` and `0132` rebuild `chats` from a column list written by hand, and `0123`'s header
+    /// records that list having been wrong here once. A dropped column loses everyone's data in it,
+    /// and a list whose `SELECT` disagrees with its `CREATE` fills the wrong column without a word,
+    /// so each rebuild is run alone over the schema it found and must come out with the same
+    /// columns, in the same order, holding the same values. Every column is filled with a value
+    /// named after itself so a shifted copy cannot pass for a faithful one. The CHECK each rebuild
+    /// widens is not in `pragma_table_info`, which is the point: it is the only thing that may move.
+    #[tokio::test]
+    async fn each_chats_rebuild_keeps_every_column_and_every_value() {
+        for rebuild in [123_i64, 132] {
+            let pool = crate::testdb::pool_migrated_through(rebuild - 1).await;
+            sqlx::query(
+                "INSERT INTO chats (chat_id, created_at) VALUES ('c', '2026-01-01T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let columns_before = chats_columns(&pool).await;
+            // The key and the timestamp are set already; `brain` and `permission_mode` carry a
+            // CHECK, and their defaults are values of their own.
+            let left_as_they_are = ["chat_id", "created_at", "brain", "permission_mode"];
+            for (column, ..) in &columns_before {
+                if left_as_they_are.contains(&column.as_str()) {
+                    continue;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE chats SET \"{column}\" = '{column}-value'"
+                )))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let values_before = chats_values(&pool).await;
+
+            crate::testdb::apply_migration(&pool, rebuild).await;
+
+            assert_eq!(
+                chats_columns(&pool).await,
+                columns_before,
+                "migration {rebuild} changed the columns of `chats`"
+            );
+            assert_eq!(
+                chats_values(&pool).await,
+                values_before,
+                "migration {rebuild} did not carry every value into the rebuilt table"
+            );
+        }
+    }
 }

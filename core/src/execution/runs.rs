@@ -8047,6 +8047,85 @@ tests:
         let _ = crate::execution::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
     }
 
+    /// A cancel that lands while the gate is running wins the terminal CAS and records the cut
+    /// stream, events included. The body had already appended the same events before starting the
+    /// gate, so every row of the trajectory was stored twice. The body's events now follow only its
+    /// own winning write.
+    #[tokio::test]
+    async fn a_cancel_during_the_gate_stores_the_trajectory_once() {
+        let _env_lock = crate::execution::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-runs-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (repo_container, repo) = init_contained_repo("nucleos-runs-gate-cancel-");
+        let home = repo_container.path().join("nucleos-home");
+        configure_gate(&home, r#"sh -c "sleep 5; exit 0""#);
+        let (mut state, runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        state.machine_config_root = Some(home);
+        *runner.canned.lock().unwrap() = Some(RunOutcome {
+            exit_code: 0,
+            stdout: [
+                r#"{"type":"system","subtype":"init"}"#,
+                r#"{"type":"assistant","message":{"content":[]}}"#,
+                r#"{"type":"result","result":"done"}"#,
+            ]
+            .join(
+                "
+",
+            ),
+            stderr: String::new(),
+            session_id: Some("gate-cancel-session".into()),
+            cost_usd: Some(0.01),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+            compacted: false,
+        });
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let id = create_worktree_run(&state, "do it", "proj", &project_root)
+            .await
+            .unwrap();
+        // The CLI answered; give the body time to reach the five-second gate.
+        for _ in 0..300 {
+            if *runner.calls.lock().unwrap() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(
+            finalize_termination(&state, id, "cancelled").await,
+            "the cancel must find the run still inside its gate"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let seqs: Vec<(i64,)> =
+            sqlx::query_as("SELECT seq FROM run_events WHERE run_id = ? ORDER BY seq")
+                .bind(id)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            seqs.into_iter().map(|(seq,)| seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "each event of the trajectory exactly once"
+        );
+
+        if let Ok(worktree_path) = sqlx::query_scalar::<_, String>(
+            "SELECT path FROM worktrees WHERE owner_kind = 'run' AND owner_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+        {
+            let _ =
+                crate::execution::worktree::remove(&repo, FsPath::new(&worktree_path), &[]).await;
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn an_unreadable_gate_config_fails_the_run_closed() {
         let _env_lock = crate::execution::worktree::test_env_lock();

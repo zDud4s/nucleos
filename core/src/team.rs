@@ -5429,4 +5429,81 @@ mod tests {
             assert_eq!(found, expected, "{what}");
         }
     }
+
+    /// A tick advances a snapshot of the live runs. A cancel that lands between that read and the
+    /// spawn finds no node to kill, marks the run cancelled and returns, and the tick then launches
+    /// a node for a run that has ended: an agent of a cancelled department, spending, with nobody
+    /// left to stop it. The launch re-reads the run once the node is registered and stops it.
+    #[tokio::test]
+    async fn a_node_launched_from_a_snapshot_the_cancel_outran_is_stopped() {
+        let (mut state, _root) = state_with_root().await;
+        let fake = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        *fake.delay.lock().unwrap() = Some(std::time::Duration::from_secs(30));
+        state.runner = fake.clone();
+        // The tick's snapshot, taken while the run is still `working`.
+        let run = team_run_for_member(&state, "tr-cancel-race").await;
+        super::lifecycle::cancel(&state, &run.id).await.unwrap();
+
+        let agent = crate::agent::Agent {
+            engine: "claude".to_owned(),
+            model: None,
+            ..local_member("unused")
+        };
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+        assert!(
+            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            "the node of a cancelled run is still registered, and still running"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    /// A seat is launched with what the run has left of its team's ceiling, and only by a runner
+    /// that enforces one: `CodexCliRunner` refuses any request carrying `max_budget_usd`, so a
+    /// daemon on Codex must keep launching its seats uncapped rather than failing every one.
+    #[tokio::test]
+    async fn a_seat_is_capped_at_what_its_run_has_left_only_by_a_runner_that_enforces_it() {
+        for (honours, expected) in [(true, Some(1.5)), (false, None)] {
+            let (mut state, _root) = state_with_root().await;
+            let fake = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner {
+                honours_budget: honours,
+                ..Default::default()
+            });
+            state.runner = fake.clone();
+            let run = team_run_for_member(&state, "tr-seat-budget").await;
+            sqlx::query("UPDATE teams SET budget_usd = 2.0 WHERE id = 'marketing'")
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, team_run_id, cost_usd, created_at)
+                 VALUES ('earlier seat', 'completed', 'team', ?, 0.5, '2026-08-26T00:00:00Z')",
+            )
+            .bind(&run.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            let agent = crate::agent::Agent {
+                engine: "claude".to_owned(),
+                model: None,
+                ..local_member("unused")
+            };
+            let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+            spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+            settled_run(&state, run_id).await;
+
+            assert_eq!(
+                *fake.last_max_budget_usd.lock().unwrap(),
+                Some(expected),
+                "honours_max_budget = {honours}"
+            );
+        }
+    }
 }

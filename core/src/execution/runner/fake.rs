@@ -84,6 +84,9 @@ pub struct FakeCommandRunner {
     /// call this daemon makes. The arithmetic itself is not on trial here; it is pinned against the
     /// real function in `runner`'s own tests.
     pub prices_its_prompt: bool,
+    /// Test-only: whether this double answers `honours_max_budget` the way `ClaudeCliRunner` does.
+    /// `false` by default, which is the trait's own answer and the one a Codex daemon gives.
+    pub honours_budget: bool,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -151,6 +154,10 @@ impl CommandRunner for FakeCommandRunner {
         request: &RunRequest,
     ) -> Option<crate::prompt_budget::AuthoredPrompt> {
         self.prices_its_prompt.then(|| authored_prompt(request))
+    }
+
+    fn honours_max_budget(&self) -> bool {
+        self.honours_budget
     }
 
     /// The live-process door, so a conversation that keeps its CLI is exercised in tests rather than

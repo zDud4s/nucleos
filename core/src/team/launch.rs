@@ -399,6 +399,7 @@ pub(super) async fn spawn_agent(
                 }
             }
         });
+        stop_if_the_run_ended(state, &run.id, run_id).await;
         return;
     }
 
@@ -429,6 +430,15 @@ pub(super) async fn spawn_agent(
     let (run_tools, block) =
         resolve_node_loadout(state, run, agent, run_id, with_tools, &prompt).await;
     let prompt = format!("{prompt}{block}");
+
+    // The run's money, held to the seat as well as between seats. Only for a runner that enforces
+    // it: `CodexCliRunner` refuses any request carrying a ceiling, so on a Codex daemon a seat with
+    // one would never launch at all.
+    let max_budget_usd = if state.runner.honours_max_budget() {
+        seat_budget_of(state, run).await
+    } else {
+        None
+    };
 
     let request = crate::execution::runner::RunRequest {
         prompt,
@@ -469,7 +479,7 @@ pub(super) async fn spawn_agent(
         effort: None,
         fallback_model: Vec::new(),
         add_dirs: Vec::new(),
-        max_budget_usd: None,
+        max_budget_usd,
         agents: Vec::new(),
         append_system_prompt: None,
         denied_tools: Vec::new(),
@@ -605,6 +615,54 @@ pub(super) async fn spawn_agent(
             Ok(Err(error)) => fail_run(&pool, run_id, &error.to_string()).await,
         }
     });
+    stop_if_the_run_ended(state, &run.id, run_id).await;
+}
+
+/// Stops a node whose team run ended while the tick that launched it was on its way here.
+///
+/// The tick advances a SNAPSHOT of the live runs, and nothing between that read and the spawn
+/// looks at the row again: a cancel that lands in between terminates what it can find (the nodes
+/// already holding an abort handle), marks the run cancelled, and finishes. The tick then opens a
+/// node for a run that has ended and spawns it, and nobody is left to kill it: the department
+/// reads cancelled while one of its agents goes on spending.
+///
+/// Asked AFTER `spawn_registered`, which is what closes the window rather than narrowing it. A
+/// cancel that marked the run before this read is seen here, and the handle exists, so the kill
+/// lands; a cancel that marks it after this read finds the node `running` with a handle in its
+/// second pass (`lifecycle::cancel`). An unreadable or missing row stops nothing: this is the
+/// guard against a race, not the authority over whether a node may run.
+async fn stop_if_the_run_ended(state: &AppState, team_run_id: &str, run_id: i64) {
+    let team_state = sqlx::query_scalar::<_, String>("SELECT state FROM team_runs WHERE id = ?")
+        .bind(team_run_id)
+        .fetch_optional(&state.pool)
+        .await;
+    match team_state {
+        Ok(Some(team_state)) if !is_live(&team_state) => {}
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(team_run = %team_run_id, run_id, %error, "could not re-read the team run after a launch");
+            return;
+        }
+    }
+    tracing::info!(team_run = %team_run_id, run_id, "the team run ended while this node was launched; stopping it");
+    crate::execution::runs::finalize_termination(state, run_id, "cancelled").await;
+    // The launch stamped these after the cancel cleared them, so a node that never got to work
+    // would otherwise read as still in flight on a run that has ended.
+    let _ = sqlx::query(
+        "UPDATE team_items SET state = 'failed'
+         WHERE team_run_id = ? AND run_id = ? AND state = 'running'",
+    )
+    .bind(team_run_id)
+    .bind(run_id)
+    .execute(&state.pool)
+    .await;
+    let _ = sqlx::query(
+        "UPDATE team_runs SET director_node = 'none' WHERE id = ? AND director_run_id = ?",
+    )
+    .bind(team_run_id)
+    .bind(run_id)
+    .execute(&state.pool)
+    .await;
 }
 
 /// The terminal write of a local agent's turn.
