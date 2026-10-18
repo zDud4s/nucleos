@@ -65,6 +65,7 @@ import {
 import { MachineSettings } from "./MachineSettings";
 import { NotificationsView } from "./NotificationsView";
 import "./system.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * System — the machine's own state, not a project's.
@@ -474,7 +475,7 @@ function RestartSidecar({ name }: { name: string }) {
             }}
           />
         ) : (
-          <ErrorNote>the núcleo did not answer — nothing was asked of it</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was asked of it</ErrorNote>
         ))}
     </>
   );
@@ -484,7 +485,7 @@ function HealthError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      the núcleo did not answer — nothing is known about the machine&apos;s
+      the {DAEMON_NAME} is not responding — nothing is known about the machine&apos;s
       health
     </ErrorNote>
   );
@@ -506,7 +507,7 @@ function SidecarCardsPanel({
       )}
       {sidecars.isError && sidecars.data === undefined && (
         <ErrorNote>
-          the núcleo did not answer — nothing is known about the sidecars
+          the {DAEMON_NAME} is not responding — nothing is known about the sidecars
         </ErrorNote>
       )}
       {sidecars.data !== undefined && sidecars.data.length > 0 && (
@@ -654,7 +655,7 @@ function ScopedKillsPanel() {
       )}
       {setKill.isError && (
         <ErrorNote>
-          that brake was not changed — the núcleo refused or did not answer
+          that brake was not changed — the {DAEMON_NAME} refused or is not responding
         </ErrorNote>
       )}
     </Panel>
@@ -932,7 +933,7 @@ function BudgetPanel() {
             )}
             {setBudget.isError && (
               <ErrorNote>
-                the budget was not changed — the núcleo refused or did not answer
+                the budget was not changed — the {DAEMON_NAME} refused or is not responding
               </ErrorNote>
             )}
           </section>
@@ -1022,7 +1023,7 @@ function BudgetPanel() {
               </div>
             )}
             {setQuotaBrake.isError && (
-              <ErrorNote>the quota brake was not changed — the núcleo refused or did not answer</ErrorNote>
+              <ErrorNote>the quota brake was not changed — the {DAEMON_NAME} refused or is not responding</ErrorNote>
             )}
           </section>
         )}
@@ -1093,11 +1094,11 @@ function BackupsPanel() {
         </p>
       )}
       <PanelNote empty={noBackups} says="no backup has been taken yet.">
-        Staging a restore changes nothing yet — the swap happens the next time the núcleo starts.
+        Staging a restore changes nothing yet — the swap happens the next time the {DAEMON_NAME} starts.
       </PanelNote>
       {takeBackup.isError && (
         <ErrorNote>
-          the backup was not taken — the núcleo refused or did not answer
+          the backup was not taken — the {DAEMON_NAME} refused or is not responding
         </ErrorNote>
       )}
       {backups.isError && backups.data === undefined && (
@@ -1167,15 +1168,15 @@ function RestoreError({ error }: { error: unknown }) {
           conflict:
             "a restore is already staged, or that snapshot name is taken — only one can be pending",
           not_found: "that snapshot is no longer there",
-          unprocessable: "the núcleo could not verify that snapshot",
-          bad_request: "that snapshot name is not one the núcleo will accept",
+          unprocessable: `the ${DAEMON_NAME} could not verify that snapshot`,
+          bad_request: `that snapshot name is not one the ${DAEMON_NAME} will accept`,
         }}
       />
     );
   }
   return (
     <ErrorNote>
-      the restore could not be staged — the núcleo did not answer
+      the restore could not be staged — the {DAEMON_NAME} is not responding
     </ErrorNote>
   );
 }
@@ -1412,7 +1413,7 @@ function MintError({ error }: { error: unknown }) {
     );
   }
   return (
-    <ErrorNote>the token was not minted — the núcleo did not answer</ErrorNote>
+    <ErrorNote>the token was not minted — the {DAEMON_NAME} is not responding</ErrorNote>
   );
 }
 
@@ -1464,7 +1465,7 @@ function RevokeError({ error }: { error: unknown }) {
   }
   return (
     <ErrorNote>
-      that token was not revoked — the núcleo did not answer
+      that token was not revoked — the {DAEMON_NAME} is not responding
     </ErrorNote>
   );
 }
@@ -1689,7 +1690,7 @@ function SystemListError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      the núcleo did not answer — nothing is known about {what}
+      the {DAEMON_NAME} is not responding — nothing is known about {what}
     </ErrorNote>
   );
 }

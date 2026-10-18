@@ -65,6 +65,7 @@ import {
   Tip,
 } from "../ui";
 import "./waiting.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Waiting — the one place a decision is asked for, whatever asked for it.
@@ -680,7 +681,7 @@ function ListError({ error, what }: { error: unknown; what: string }) {
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      the daemon did not answer — nothing is known about {what}
+      the {DAEMON_NAME} is not responding — nothing is known about {what}
     </ErrorNote>
   );
 }
@@ -729,7 +730,7 @@ export function DecisionRefusal({
 }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the daemon did not answer — nothing was decided</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>
     );
   }
   const sentences = trustProse

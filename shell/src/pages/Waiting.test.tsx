@@ -1458,7 +1458,7 @@ describe("Waiting - one verb pair", () => {
     await renderWaiting();
 
     const said = await screen.findByText(
-      /the daemon did not answer — nothing is known about the suggested merges/,
+      /the background service is not responding — nothing is known about the suggested merges/,
     );
     expect(said.textContent).not.toContain("núcleo");
   });

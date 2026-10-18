@@ -29,6 +29,7 @@ import {
   Teach,
 } from "../ui";
 import "./web.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Web — the local archive, one component serving `/web` and
@@ -275,7 +276,7 @@ function ReadRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ ...READ_SENTENCES, ...daemonProse(error) }} />;
   }
-  return <ErrorNote>the núcleo did not answer — nothing was read</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was read</ErrorNote>;
 }
 
 /* ------------------------------------------------------------------ search -- */
@@ -334,7 +335,7 @@ function SearchOutcome({ query, view }: { query: string; view: SearchView }) {
 
 function SearchRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing was searched</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was searched</ErrorNote>;
 }
 
 /* --------------------------------------------------------------- the list -- */
@@ -426,7 +427,7 @@ function ReaderError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "there is no page with that number" }} />;
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this page</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about this page</ErrorNote>;
 }
 
 /**

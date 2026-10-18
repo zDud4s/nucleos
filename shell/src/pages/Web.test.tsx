@@ -205,7 +205,7 @@ describe("Web — search", () => {
 
     // Never routed through the failure path — this is a 200 the daemon
     // answered on purpose, not a refusal and not a dropped request.
-    expect(screen.queryByText(/núcleo did not answer/)).toBeNull();
+    expect(screen.queryByText(/background service is not responding/)).toBeNull();
     expect(screen.queryByText(/the núcleo refused this/)).toBeNull();
     expect(document.querySelector(".ui-note-refusal")).toBeNull();
   });

@@ -43,6 +43,7 @@ import {
 import { VoiceOrb } from "./VoiceOrb";
 import { VoiceRoom } from "./VoiceRoom";
 import "./voice.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Voice — configuration, the capture pipeline, memos and dictations.
@@ -686,7 +687,7 @@ function CaptureOutcomeNote({ outcome }: { outcome: CaptureOutcome | null }) {
 
 function CaptureRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this capture was not sent</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — this capture was not sent</ErrorNote>;
 }
 
 /** `held` is one of the sentences the host sends verbatim — rendered as-is, never paraphrased. */
@@ -708,7 +709,7 @@ function DeliveryNote({ delivery }: { delivery: Delivery | null }) {
 
 function HotkeyConflictNote({ failed, registerFailed }: { failed: string[] | null; registerFailed: boolean }) {
   if (registerFailed) {
-    return <ErrorNote>the hotkeys could not be registered — the host did not answer</ErrorNote>;
+    return <ErrorNote>the hotkeys could not be registered — the host is not responding</ErrorNote>;
   }
   if (failed === null || failed.length === 0) return null;
   const noun = failed.length === 1 ? "this hotkey" : "these hotkeys";
@@ -783,7 +784,7 @@ function formatBytes(n: number): string {
 
 function ConfigError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the voice configuration</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the voice configuration</ErrorNote>;
 }
 
 /* ------------------------------------------------------------------ lists -- */
@@ -832,12 +833,12 @@ function MemoList({
 
 function MemosError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the memos</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the memos</ErrorNote>;
 }
 
 function DeleteMemoError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — that memo was not deleted</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — that memo was not deleted</ErrorNote>;
 }
 
 function DictationList({ dictations }: { dictations: ReturnType<typeof useDictations> }) {
@@ -872,7 +873,7 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
 
 function DictationsError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the dictations</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the dictations</ErrorNote>;
 }
 
 function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () => void; deleting?: boolean }) {
