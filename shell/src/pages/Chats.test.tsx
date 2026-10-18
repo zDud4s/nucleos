@@ -3688,11 +3688,11 @@ describe("Chats - what the page is about", () => {
     expect(screen.queryByRole("button", { name: /find a conversation/i })).toBeNull();
 
     // The tabs are the first row of the conversation pane, and the open one is selected.
-    const strip = await screen.findByRole("tablist", { name: "Open conversations" });
+    const strip = await screen.findByRole("navigation", { name: "Open conversations" });
     expect(strip.parentElement?.className).toBe("chats-topbar");
     expect(
-      within(strip).getByRole("tab", { name: /arranja o parser de datas/ }).getAttribute("aria-selected"),
-    ).toBe("true");
+      within(strip).getByRole("link", { name: /arranja o parser de datas/ }).getAttribute("aria-current"),
+    ).toBe("page");
     // The conversation's settings are at the end of its own head, not in the tabs row or the box.
     const more = await screen.findByRole("button", { name: "Conversation settings" });
     expect(more.closest(".chats-conv-head")).not.toBeNull();
@@ -5151,12 +5151,12 @@ describe("Chats - closing the list", () => {
     expect(hide.getAttribute("title")).toBe("Hide conversations");
     expect(hide.closest(".chats-topbar-side")).not.toBeNull();
     expect(
-      screen.getByRole("button", { name: "New session" }).closest(".chats-rail"),
+      screen.getByRole("button", { name: "New conversation" }).closest(".chats-rail"),
     ).not.toBeNull();
     fireEvent.click(hide);
 
     expect(screen.queryByRole("list", { name: "Conversations" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "New session" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "New conversation" })).toBeNull();
     // Five answers landed across two conversations, and the list they are in is shut. The way
     // back sits where the tabs strip starts, so a closed list is never a dead end.
     const show = await screen.findByRole("button", { name: "Show conversations, 5 unseen" });
@@ -6283,35 +6283,35 @@ describe("Chats - conversations as tabs", () => {
     );
 
     const { router } = await renderChats("/chats/c-1");
-    const strip = await screen.findByRole("tablist", { name: "Open conversations" });
-    expect(within(strip).getAllByRole("tab")).toHaveLength(1);
+    const strip = await screen.findByRole("navigation", { name: "Open conversations" });
+    expect(within(strip).getAllByRole("link")).toHaveLength(1);
 
     // Opening another one from the column adds a tab and keeps the first.
     fireEvent.click(await screen.findByRole("link", { name: /^beta, cloud/ }));
-    await waitFor(() => expect(within(strip).getAllByRole("tab")).toHaveLength(2));
+    await waitFor(() => expect(within(strip).getAllByRole("link")).toHaveLength(2));
     expect(router.state.location.pathname).toBe("/chats/c-2");
     expect(JSON.parse(localStorage.getItem("chats.tabs") ?? "[]")).toEqual(["c-1", "c-2"]);
 
     // A tab wears the same state mark as its row in the column.
     const markOf = (el: Element | null | undefined) => el?.querySelector(".chats-dot")?.className;
-    const tabMark = markOf(within(strip).getByRole("tab", { name: /beta/ }));
+    const tabMark = markOf(within(strip).getByRole("link", { name: /beta/ }));
     expect(tabMark).toBeTruthy();
     expect(markOf(screen.getByRole("link", { name: /^beta, cloud/ }))).toBe(tabMark);
 
     // Clicking a tab navigates back.
-    fireEvent.click(within(strip).getByRole("tab", { name: /alpha/ }));
+    fireEvent.click(within(strip).getByRole("link", { name: /alpha/ }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-1"));
 
     // Closing the open one moves to its neighbour, and the tab is gone.
     fireEvent.click(within(strip).getByRole("button", { name: "Close alpha" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats/c-2"));
-    expect(within(strip).getAllByRole("tab")).toHaveLength(1);
-    expect(within(strip).queryByRole("tab", { name: /alpha/ })).toBeNull();
+    expect(within(strip).getAllByRole("link")).toHaveLength(1);
+    expect(within(strip).queryByRole("link", { name: /alpha/ })).toBeNull();
 
     // Closing the last one goes back to the front door and the strip disappears.
     fireEvent.click(within(strip).getByRole("button", { name: "Close beta" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/chats"));
-    expect(screen.queryByRole("tablist", { name: "Open conversations" })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Open conversations" })).toBeNull();
   });
 });
 

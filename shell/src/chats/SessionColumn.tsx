@@ -96,7 +96,7 @@ export const DOT_NAME: Record<Dot, string> = {
 
 /** The title a row goes by. */
 export function sessionTitle(row: ChatSummary): string {
-  return row.title ?? row.first_message ?? "nothing said yet";
+  return row.title ?? row.first_message ?? "Untitled conversation";
 }
 
 /**
@@ -271,7 +271,7 @@ export function SessionColumn({
             while you type the first sentence and changeable after it. */}
         <button type="button" className="chats-rail-new" onClick={onNew}>
           <Plus className="chats-rail-icon" aria-hidden="true" />
-          New session
+          New conversation
         </button>
         <button
           type="button"
@@ -288,7 +288,7 @@ export function SessionColumn({
         <DropdownMenu>
           <DropdownMenuTrigger
             className="chats-session-filter"
-            aria-label="Filter sessions"
+            aria-label="Filter conversations"
             data-on={statuses.size + tabStates.size > 0 || !showEditor ? "" : undefined}
           >
             <ListFilter className="chats-rail-icon" aria-hidden="true" />
@@ -357,7 +357,7 @@ export function SessionColumn({
           <Search className="chats-rail-icon" aria-hidden="true" />
           <input
             type="text"
-            aria-label="Search sessions"
+            aria-label="Search conversations"
             placeholder="Search"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
@@ -390,14 +390,14 @@ export function SessionColumn({
         {!answered && <p className="chats-loading">reading your conversations…</p>}
         {answered && rows.length === 0 && editors.length === 0 && groups.length === 0 && (
           <Teach title="No conversations yet">
+            <p>Say something to start one: press New conversation above and write in the box.</p>
             <p>
-              Telegram&apos;s own conversations do not show up here — nothing has opened a row for
-              them, because the only door into this list is the button above. Start one to see it
-              appear.
+              Telegram&apos;s own conversations do not show up here — only the ones you start from
+              this app do.
             </p>
           </Teach>
         )}
-        {sessions.isError && <ErrorNote>your editor sessions could not be read</ErrorNote>}
+        {sessions.isError && <ErrorNote>Your editor sessions could not be read</ErrorNote>}
 
         {split.groups.map(({ group, rows: inGroup }) =>
           filtering && inGroup.length === 0 ? null : (
@@ -524,15 +524,15 @@ function ArchivedSection() {
         }}
       >
         <span className="chats-group-name-text">
-          Archived sessions{archived.data !== undefined && open ? ` (${list.length})` : ""}
+          Archived conversations{archived.data !== undefined && open ? ` (${list.length})` : ""}
         </span>
       </summary>
-      {open && archived.isError && <ErrorNote>archived sessions could not be read</ErrorNote>}
+      {open && archived.isError && <ErrorNote>archived conversations could not be read</ErrorNote>}
       {open && archived.data !== undefined && list.length === 0 && (
         <p className="chats-group-empty">Nothing archived.</p>
       )}
       {open && list.length > 0 && (
-        <ul className="chats-list" aria-label="Archived sessions">
+        <ul className="chats-list" aria-label="Archived conversations">
           {list.map((chat) => (
             <li key={chat.chat_id} className="chats-row chats-session-archived">
               <StateDot dot={null} />
