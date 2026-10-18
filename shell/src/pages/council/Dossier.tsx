@@ -261,6 +261,8 @@ function ConveneChips({ onPick }: { onPick: (who: Occupant) => void }) {
   const waiting = agents.data === undefined && models.data === undefined && !agents.isError && !models.isError;
   // One catalogue down still leaves the other's chips; both down would leave an empty panel that reads as "nobody".
   const unreadable = agents.isError && models.isError;
+  // Exactly one down: the other's chips stay, and the missing half is named so it does not read as "none exist".
+  const oneDown = agents.isError !== models.isError;
 
   return (
     <>
@@ -273,6 +275,15 @@ function ConveneChips({ onPick }: { onPick: (who: Occupant) => void }) {
           }}
         >
           Couldn't load who can sit.
+        </ErrorNote>
+      )}
+      {oneDown && (
+        <ErrorNote
+          onRetry={() => {
+            void (agents.isError ? agents.refetch() : models.refetch());
+          }}
+        >
+          {agents.isError ? "Couldn't load agents." : "Couldn't load models."}
         </ErrorNote>
       )}
       {seatable.length > 0 && (
