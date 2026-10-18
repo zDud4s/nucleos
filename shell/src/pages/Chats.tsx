@@ -4,6 +4,8 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type Dispatch,
@@ -155,6 +157,7 @@ import { ChatTabs } from "../chats/ChatTabs";
 import { ChatChips } from "../chats/AgentMap";
 import { ProjectPicker } from "../chats/ProjectPicker";
 import { holdMessage, takeHeld, useHeldMessage } from "../chats/held";
+import { clearDraft, readDraft, readScroll, saveDraft, saveScroll } from "../chats/drafts";
 import { useChatTabs } from "../chats/tabs";
 
 import "./chats.css";
@@ -611,7 +614,7 @@ function EditorDetail({
   // this machine any more. This door had no end-scroll AT ALL: a conversation opened from the
   // editor is exactly the one whose history is long and whose last line is the only one you have
   // not read, and it opened at somebody else's first sentence of the day.
-  useEffect(() => {
+  useLayoutEffect(() => {
     keepUp();
   }, [keepUp, sessionId, said.data]);
 
@@ -796,7 +799,13 @@ function useChatZoom() {
     // `null` handled before `Number` sees it. `Number(null)` is 0, which is a perfectly valid
     // index into the ladder — so a window that had never been zoomed opened every conversation at
     // the smallest setting there is, and the default was unreachable until you pressed the keys.
-    const kept = localStorage.getItem(ZOOM_KEY);
+    // A storage that throws (denied, or gone) is a window that opens at the default size.
+    let kept: string | null = null;
+    try {
+      kept = localStorage.getItem(ZOOM_KEY);
+    } catch {
+      kept = null;
+    }
     const asStep = kept === null ? Number.NaN : Number(kept);
     return Number.isInteger(asStep) && asStep >= 0 && asStep < ZOOMS.length
       ? asStep
@@ -824,7 +833,11 @@ function useChatZoom() {
           move === 0
             ? ZOOM_REST
             : Math.min(ZOOMS.length - 1, Math.max(0, was + move));
-        localStorage.setItem(ZOOM_KEY, String(next));
+        try {
+          localStorage.setItem(ZOOM_KEY, String(next));
+        } catch {
+          // Full or denied: the zoom still applies for as long as this window lives.
+        }
         return next;
       });
     };
@@ -889,6 +902,44 @@ function useFollowsItsEnd() {
     b.scrollTop = b.scrollHeight;
   }, []);
 
+  // Content grows with no render of the page: an image decoding, a code block rewrapping after a
+  // resize, a tool's output opening. Only the box's own content resizing says so, so each of its
+  // children is watched. The observers are built once per mounted element, not once per render
+  // (a streamed chunk renders the page every few milliseconds); a MutationObserver on the box
+  // picks up the children that come and go.
+  const watched = useRef<{ el: HTMLDivElement; teardown: () => void } | null>(null);
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const b = box.current;
+    if (watched.current?.el === b) return;
+    watched.current?.teardown();
+    watched.current = null;
+    if (b === null) return;
+    const watcher = new ResizeObserver(() => keepUp());
+    const attach = () => {
+      watcher.disconnect();
+      for (const child of Array.from(b.children)) watcher.observe(child);
+    };
+    attach();
+    const mutations =
+      typeof MutationObserver === "undefined" ? null : new MutationObserver(attach);
+    mutations?.observe(b, { childList: true });
+    watched.current = {
+      el: b,
+      teardown: () => {
+        mutations?.disconnect();
+        watcher.disconnect();
+      },
+    };
+  });
+  useEffect(
+    () => () => {
+      watched.current?.teardown();
+      watched.current = null;
+    },
+    [],
+  );
+
   return { box, follows, noteScroll, keepUp };
 }
 
@@ -944,9 +995,23 @@ function ChatDetail({
   // "thinking…" was grows the page without adding a row to it, and so does a question the run
   // starts waiting on. Running every poll costs nothing — at the end it is an assignment that
   // changes no pixel, and away from the end `keepUp` declines to do anything at all.
-  useEffect(() => {
+  // A layout effect, so the box is moved before the browser paints: as a passive effect it painted
+  // the top of the conversation first and the end a frame later. The first time the transcript is
+  // there, a position the reader left this conversation at (away from its end) is given back
+  // instead of the end.
+  const restored = useRef(false);
+  useLayoutEffect(() => {
+    if (!restored.current && transcript.data !== undefined) {
+      restored.current = true;
+      const kept = readScroll(chatId);
+      if (kept !== null && kept > 0 && box.current !== null) {
+        follows.current = false;
+        box.current.scrollTop = kept;
+        return;
+      }
+    }
     keepUp();
-  }, [keepUp, chatId, transcript.data]);
+  }, [keepUp, chatId, transcript.data, box, follows]);
 
   const stale = transcript.isError && transcript.data !== undefined;
 
@@ -963,7 +1028,11 @@ function ChatDetail({
       <div
         className={`chats-scroll ${zoom}`}
         ref={box}
-        onScroll={noteScroll}
+        onScroll={() => {
+          noteScroll();
+          // 0 stands for "at the end", which is where every conversation opens anyway.
+          saveScroll(chatId, follows.current ? 0 : (box.current?.scrollTop ?? 0));
+        }}
       >
         <Project chatId={chatId} picking={picking} onPicking={setPicking} />
 
@@ -1145,6 +1214,7 @@ function StartBox({
   const [effort, setEffort] = useState<string | null>(null);
   const [mode, setMode] = useState<PermissionMode>("auto");
   const [attached, setAttached] = useState<Attachment[]>([]);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const sayable = text.trim() !== "" && !pending;
 
@@ -1186,8 +1256,13 @@ function StartBox({
   const attach = async (files: FileList | File[] | null) => {
     const pictures = Array.from(files ?? []).filter(isPicture);
     if (pictures.length === 0) return;
-    const read = await Promise.all(pictures.map(attachmentFrom));
-    setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
+    try {
+      const read = await Promise.all(pictures.map(attachmentFrom));
+      setAttachError(null);
+      setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
+    } catch (error) {
+      setAttachError(error instanceof Error ? error.message : "could not read the picture");
+    }
   };
 
   // See the same function in `Composer`: the "+" menu's way of typing an `@`.
@@ -1286,6 +1361,8 @@ function StartBox({
             // typed is read from where it IS.
             onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
             onKeyDown={(event) => {
+              // The Enter that commits a candidate in an input method is not the person sending.
+              if (event.nativeEvent.isComposing) return;
               if (listTookTheKey(event, choices, highlight, setHighlight)) return;
               if ((choices.length > 0 || noFolderYet) && event.key === "Escape") {
                 event.preventDefault();
@@ -1355,6 +1432,11 @@ function StartBox({
             <ArrowUp className="chats-send-icon" aria-hidden="true" />
           </button>
         </div>
+        {attachError !== null && (
+          <p className="chats-mentions-none" role="status">
+            {attachError}
+          </p>
+        )}
       </form>
     </>
   );
@@ -1792,17 +1874,24 @@ function PermissionMenu({ chatId }: { chatId: string }) {
   /* Two different absences, and only one of them is actionable — which is why `cwd` travels beside
      `tools` at all. */
   const barred =
-    project.data?.cwd == null
-      ? "this conversation has no project directory"
-      : "the classifier hook is not wired in this project";
+    project.data === undefined
+      ? "not until this conversation's project has been read"
+      : project.data.cwd == null
+        ? "this conversation has no project directory"
+        : "the classifier hook is not wired in this project";
 
+  /* Never disabled whole, not even while the project read is on the wire: a trigger that ignores
+     the first press on a freshly opened conversation reads as a broken control. Until the read
+     lands the rungs that need tools are held back with a line that says why (`barred` above), and
+     the two that mean something anyway are a pick like any other — `useSetPermissionMode` cancels
+     the read in flight, so a late answer cannot put the old rung back. */
   return (
     <PermissionPicker
       mode={project.data?.permission_mode ?? "auto"}
       onPick={(picked) => set.mutate(picked)}
       tools={project.data?.tools ?? false}
       barred={barred}
-      disabled={project.data === undefined || set.isPending}
+      disabled={false}
     />
   );
 }
@@ -2071,7 +2160,8 @@ function ChatRename({
 
   const close = () => onOpenChange(false);
   const rename = () => {
-    if (draft.trim() === "") return;
+    // Not while the first one is in flight: a second Enter is a person unsure the first took.
+    if (draft.trim() === "" || patch.isPending) return;
     patch.mutate({ chatId, title: draft.trim() }, { onSuccess: close });
   };
 
@@ -2108,7 +2198,7 @@ function ChatRename({
           onChange={(event) => setDraft(event.target.value)}
           /* Enter commits; Escape is the dialog's own way out. */
           onKeyDown={(event) => {
-            if (event.key === "Enter") {
+            if (event.key === "Enter" && !event.nativeEvent.isComposing) {
               event.preventDefault();
               rename();
             }
@@ -2674,7 +2764,7 @@ function ChatModelControls({
     <>
       <ModelMenu
         model={model}
-        disabled={patch.isPending}
+        disabled={false}
         chatId={chatId}
         onPick={(picked) => patch.mutate({ chatId, model: picked })}
       >
@@ -2683,7 +2773,7 @@ function ChatModelControls({
       <EffortSlider
         model={model}
         effort={effort}
-        disabled={patch.isPending}
+        disabled={false}
         chatId={chatId}
         onPick={(picked) => patch.mutate({ chatId, effort: picked })}
       />
@@ -4076,9 +4166,24 @@ function Transcript({
     follows.current = false;
     at.scrollIntoView({ block: "center" });
     setLit(find.turnId);
+  }, [find, turns.length, follows]);
+
+  // The fade is keyed on the highlight alone. Tied to the effect above it was cancelled by any
+  // re-render that changed `turns.length` (a turn landing) and never set again, so the turn stayed
+  // lit for as long as the page was open.
+  useEffect(() => {
+    if (lit === null) return;
     const dim = setTimeout(() => setLit(null), 2500);
     return () => clearTimeout(dim);
-  }, [find, turns.length, follows]);
+  }, [lit]);
+
+  // Sorting and walking back are done once per change of the transcript and not on every render:
+  // a live turn re-renders this list on each chunk, and a long transcript made that quadratic.
+  const entries = useMemo(() => interleave(turns, notices), [turns, notices]);
+  const previous = useMemo(
+    () => entries.map((_, index) => previousTurn(entries, index)),
+    [entries],
+  );
 
   // "nothing has been said yet" is a claim about the whole conversation, and a picked-up
   // one is full of what was said in the editor. Saying it over that is the wrong answer.
@@ -4116,7 +4221,7 @@ function Transcript({
         </div>
       )}
       <ul className="chats-turns" aria-label="Transcript">
-        {interleave(turns, notices).map((entry, index, all) =>
+        {entries.map((entry, index) =>
           entry.kind === "notice" ? (
             <NoticeBlock
               key={`notice-${entry.notice.id}`}
@@ -4128,7 +4233,7 @@ function Transcript({
             <TurnBlock
               key={entry.turn.id}
               turn={entry.turn}
-              previous={previousTurn(all, index)}
+              previous={previous[index]}
               clearedAfter={clearedAfter}
               chatId={chatId}
               onReuse={onReuse}
@@ -4379,7 +4484,7 @@ const TurnBlock = memo(function TurnBlock({
         />
       ))}
       <p className="chats-turn-who">núcleo</p>
-      {live && <LiveAnswer turnId={turn.id} since={turn.createdAt} />}
+      {live && <LiveAnswer turnId={turn.id} chatId={chatId} since={turn.createdAt} />}
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
       {!live && <WhatItDid did={turn.did} turnId={turn.id} settled />}
@@ -4469,10 +4574,23 @@ function ContextFill({
 function useStopControl(
   chatId: string,
   turnId: number | null | undefined,
-): { onStop: () => void; pending: boolean } | undefined {
+): { onStop: () => void; pending: boolean; error: unknown } | undefined {
   const stop = useStopTurn(chatId);
   if (turnId == null) return undefined;
-  return { onStop: () => stop.mutate(turnId), pending: stop.isPending };
+  return {
+    onStop: () => stop.mutate(turnId),
+    pending: stop.isPending,
+    // Kept on the control so a refused Stop can say why beside the box: a button that does nothing
+    // and says nothing reads as broken.
+    error: stop.isError ? stop.error : null,
+  };
+}
+
+/** Why the daemon would not stop the turn, in its own sentence when it gave one. */
+function StopRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error))
+    return <ErrorNote>the núcleo did not answer — the turn was not stopped</ErrorNote>;
+  return <RefusalNote refusal={error} />;
 }
 
 /**
@@ -4487,11 +4605,40 @@ function useStopControl(
  * running is named, because "thinking" over a command that is compiling something is the wrong word
  * for the wait. And words already written are shown as they arrive.
  */
-function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
-  const live = useLiveTurn(turnId, true, { stream: true });
+function LiveAnswer({
+  turnId,
+  chatId,
+  since,
+}: {
+  turnId: number;
+  chatId: string;
+  since: string;
+}) {
+  const live = useLiveTurn(turnId, true, { stream: true, chatId });
   const text = live.data?.text ?? "";
   const doing = live.data?.doing ?? null;
   const keepUp = useContext(KeepsUp);
+
+  // The words drawn are the stream's latest at most once per animation frame: the stream can
+  // deliver far more than a screen can show, and each chunk used to re-parse the whole answer so
+  // far. The status line below keeps reading `text` itself, which costs nothing to redraw.
+  const [shown, setShown] = useState(text);
+  const latest = useRef(text);
+  latest.current = text;
+  const frame = useRef<number | null>(null);
+  useEffect(() => {
+    if (frame.current !== null) return;
+    frame.current = requestAnimationFrame(() => {
+      frame.current = null;
+      setShown(latest.current);
+    });
+  }, [text]);
+  useEffect(
+    () => () => {
+      if (frame.current !== null) cancelAnimationFrame(frame.current);
+    },
+    [],
+  );
 
   /*
    * Follows the words down, and its own here is the only place that can: the list above does not
@@ -4508,7 +4655,7 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
    */
   useEffect(() => {
     keepUp();
-  }, [keepUp, text, doing]);
+  }, [keepUp, shown, doing]);
 
   return (
     <>
@@ -4516,9 +4663,9 @@ function LiveAnswer({ turnId, since }: { turnId: number; since: string }) {
         thought={live.data?.thought ?? []}
         tokens={live.data?.thought_tokens ?? null}
       />
-      {text !== "" && (
+      {shown !== "" && (
         <div className="chats-turn-answer chats-turn-writing">
-          <Rich text={text} />
+          <Rich text={shown} />
         </div>
       )}
       <Plan todos={planOf(live.data?.did ?? [])} />
@@ -5069,12 +5216,8 @@ function RelayChain({ chatId, turnId }: { chatId: string; turnId: number }) {
 function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
-  const chats = useChats();
-  const forward = useForwardTurn();
 
   if (turn.answer === null) return null;
-
-  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId);
 
   return (
     <div className="chats-forward">
@@ -5090,6 +5233,43 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
         {open ? "cancel" : "hand to another conversation"}
       </button>
       {open && (
+        <ForwardPanel
+          chatId={chatId}
+          turn={turn}
+          text={text}
+          onText={setText}
+          onSent={() => setOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The open half of `ForwardTurn`. Its own component so the conversation list (and its poll) is
+ * subscribed to only while a panel is open: every settled turn used to subscribe from the moment it
+ * was drawn, hundreds of subscriptions on a long transcript, to fill a menu nobody had opened.
+ */
+function ForwardPanel({
+  chatId,
+  turn,
+  text,
+  onText,
+  onSent,
+}: {
+  chatId: string;
+  turn: Turn;
+  text: string;
+  onText: (text: string) => void;
+  onSent: () => void;
+}) {
+  const chats = useChats();
+  const forward = useForwardTurn();
+  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId);
+
+  return (
+    <>
+      {(
         <div className="chats-forward-panel">
           <label className="chats-forward-label" htmlFor={`forward-${turn.id}`}>
             What to send
@@ -5098,7 +5278,7 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
             id={`forward-${turn.id}`}
             className="chats-forward-text"
             value={text}
-            onChange={(event) => setText(event.target.value)}
+            onChange={(event) => onText(event.target.value)}
           />
           {elsewhere.length === 0 && (
             <p className="chats-forward-empty">there is no other conversation to hand this to.</p>
@@ -5113,7 +5293,7 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
                   onClick={() => {
                     forward.mutate(
                       { toChatId: row.chat_id, fromTurnId: turn.id, text },
-                      { onSuccess: () => setOpen(false) },
+                      { onSuccess: onSent },
                     );
                   }}
                 >
@@ -5134,7 +5314,7 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
           )}
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -5307,14 +5487,22 @@ function Composer({
   chips?: React.ReactNode;
 }) {
   const turnRunning = runningTurn != null;
-  const [text, setText] = useState("");
-  const [caret, setCaret] = useState(0);
+  // What was left in this conversation's box is still there when it is opened again: the draft is
+  // read once, when the box is made, and written back whenever it changes.
+  const [saved] = useState(() => readDraft(chatId));
+  const [text, setText] = useState(saved.text);
+  const [caret, setCaret] = useState(saved.text.length);
   // Escape closes the list without closing what is being typed: the sigil and what follows it stay
   // in the box. Held as the query it was dismissed AT, so the next letter — a different question —
   // opens it again rather than leaving somebody stuck with a feature they turned off.
   const [dismissed, setDismissed] = useState<string | null>(null);
   const [highlight, setHighlight] = useState(0);
-  const [attached, setAttached] = useState<Attachment[]>([]);
+  const [attached, setAttached] = useState<Attachment[]>(saved.images);
+  useEffect(() => {
+    saveDraft(chatId, { text, images: attached });
+  }, [chatId, text, attached]);
+  // A picture that could not be read: said beside the box, and the page left standing.
+  const [attachError, setAttachError] = useState<string | null>(null);
   // `/orchestrate` was typed where the workflow or the tools are missing: not sent, and said why.
   const [orchestrateBlocked, setOrchestrateBlocked] = useState(false);
   useEffect(() => setOrchestrateBlocked(false), [text]);
@@ -5367,8 +5555,13 @@ function Composer({
   const attach = async (files: FileList | File[] | null) => {
     const pictures = Array.from(files ?? []).filter(isPicture);
     if (pictures.length === 0) return;
-    const read = await Promise.all(pictures.map(attachmentFrom));
-    setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
+    try {
+      const read = await Promise.all(pictures.map(attachmentFrom));
+      setAttachError(null);
+      setAttached((was) => [...was, ...read].slice(0, MAX_PICTURES));
+    } catch (error) {
+      setAttachError(error instanceof Error ? error.message : "could not read the picture");
+    }
   };
 
   // Never both: a command is only ever the first character of the box, and a mention needs
@@ -5470,12 +5663,18 @@ function Composer({
       if (project.data !== undefined) onNeedsProject?.();
       return;
     }
+    // The box lets the words go at once and gives them back, as typed, if the daemon refuses: a
+    // person is not made to look at their own message sitting in a box that has already sent it.
+    const snapshot = { text, images: attached };
+    setText("");
+    setAttached([]);
+    clearDraft(chatId);
     send.mutate(
-      { text: outgoing, images: attached },
+      { text: outgoing, images: snapshot.images },
       {
-        onSuccess: () => {
-          setText("");
-          setAttached([]);
+        onError: () => {
+          setText((was) => (was === "" ? snapshot.text : `${snapshot.text}\n\n${was}`));
+          setAttached((was) => [...snapshot.images, ...was].slice(0, MAX_PICTURES));
         },
       },
     );
@@ -5677,6 +5876,12 @@ ${was}`));
       />
       {send.isError && <MessageRefusal error={send.error} />}
       {sayNow.isError && <MessageRefusal error={sayNow.error} />}
+      {stop?.error != null && <StopRefusal error={stop.error} />}
+      {attachError !== null && (
+        <p className="chats-mentions-none" role="status">
+          {attachError}
+        </p>
+      )}
     </form>
   );
 }

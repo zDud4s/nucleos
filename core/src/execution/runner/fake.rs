@@ -177,6 +177,15 @@ impl CommandRunner for FakeCommandRunner {
         // Taken before the request is handed over, because the request is what carries it.
         let mut later = request.messages.take();
         let mut unprompted = self.unprompted.lock().unwrap().take();
+        // A process started ahead of its first message, as the CLI runner does it: no opening line
+        // is written, so nothing answers and no `init` announces a session until a turn arrives.
+        let warmed = request.prompt.is_empty() && request.images.is_empty();
+        let session_tx = if warmed {
+            // Nobody hears the session id the launch would have announced.
+            tokio::sync::mpsc::unbounded_channel().0
+        } else {
+            session_tx
+        };
         let outcome = self.run_prompt(request, session_tx, transcript).await?;
 
         let Some(turn_events) = turn_events else {
@@ -209,7 +218,9 @@ impl CommandRunner for FakeCommandRunner {
             }
         };
 
-        answer(&outcome.stdout);
+        if !warmed {
+            answer(&outcome.stdout);
+        }
         if let Some(later) = later.as_mut() {
             // Stays alive until its stdin closes, exactly as the process does — which is what makes
             // a test of "the second turn reused the process" mean anything.

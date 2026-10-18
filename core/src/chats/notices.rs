@@ -131,6 +131,26 @@ pub async fn for_chat(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<Chat
     .await
 }
 
+/// The notices this conversation was told from `since` onward, oldest first.
+///
+/// What a transcript page needs: the notices that belong to the time its turns cover, rather than
+/// every one the conversation ever collected. `since` is compared as text against `created_at`,
+/// which is how both columns are written (RFC 3339).
+pub async fn for_chat_since(
+    pool: &SqlitePool,
+    chat_id: &str,
+    since: &str,
+) -> sqlx::Result<Vec<ChatNotice>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {NOTICE_COLUMNS} FROM chat_notices
+          WHERE chat_id = ? AND created_at >= ? ORDER BY id"
+    )))
+    .bind(chat_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

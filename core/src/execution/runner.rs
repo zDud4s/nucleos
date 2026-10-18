@@ -1252,6 +1252,63 @@ mod tests {
         );
     }
 
+    const TOOL_USE_LINE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}]}}"#;
+    const TOOL_RESULT_LINE: &str = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#;
+
+    /// A long tool call prints nothing until its result. The one-shot loop read that quiet as a
+    /// stalled run and killed it mid-tool; a kept process (`LiveChat::gather`) already knew better.
+    /// Driven through the loop's own read step over a pipe whose far end goes quiet for several
+    /// deadlines while the tool "runs".
+    #[tokio::test]
+    async fn a_one_shot_turn_with_an_open_tool_call_is_not_cut_off_for_silence() {
+        let silence = std::time::Duration::from_millis(20);
+        let (mut cli, stdout) = tokio::io::duplex(4096);
+        let mut lines = BufReader::new(stdout).lines();
+        let mut open = std::collections::HashSet::new();
+
+        cli.write_all(format!("{TOOL_USE_LINE}\n").as_bytes())
+            .await
+            .unwrap();
+        let opened = next_line_unless_silent(&mut lines, Some(silence), &open)
+            .await
+            .expect("the tool_use line is already there")
+            .unwrap()
+            .unwrap();
+        track_open_tools(&opened, &mut open);
+        assert!(!open.is_empty(), "the tool_use line opens a tool call");
+
+        let tool = tokio::spawn(async move {
+            tokio::time::sleep(silence * 5).await;
+            cli.write_all(format!("{TOOL_RESULT_LINE}\n").as_bytes())
+                .await
+                .unwrap();
+            cli
+        });
+        let answered = next_line_unless_silent(&mut lines, Some(silence), &open)
+            .await
+            .expect("an open tool call is work in progress, not silence")
+            .unwrap()
+            .unwrap();
+        track_open_tools(&answered, &mut open);
+        assert!(open.is_empty(), "the tool_result closes the call");
+        drop(tool.await.unwrap());
+    }
+
+    /// The other half: with nothing open, quiet past the deadline is still a stalled run.
+    #[tokio::test]
+    async fn a_one_shot_turn_with_no_open_tool_call_is_cut_off_for_silence() {
+        let silence = std::time::Duration::from_millis(20);
+        // The writer is held, so the stream neither ends nor speaks.
+        let (_cli, stdout) = tokio::io::duplex(4096);
+        let mut lines = BufReader::new(stdout).lines();
+
+        let read =
+            next_line_unless_silent(&mut lines, Some(silence), &std::collections::HashSet::new())
+                .await;
+
+        assert_eq!(read.err(), Some(silence));
+    }
+
     #[tokio::test]
     async fn fake_runner_emits_session_id_before_returning() {
         let runner = FakeCommandRunner::default();

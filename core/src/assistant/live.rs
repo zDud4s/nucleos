@@ -1,6 +1,8 @@
 //! The live-process pool, barriers, idle policy, and reaping.
 
 use super::*;
+// Lives with the runner's other stream readings, since the one-shot loop needs it too.
+use crate::execution::runner::track_open_tools;
 
 /// How long a conversation's process waits for a turn that may never come.
 ///
@@ -21,6 +23,10 @@ pub(super) const LIVE_CAP: usize = 5;
 /// blurred cadence (`BLURRED_CADENCE`, `shell/src/app/pacing.ts`), since a visible but unfocused
 /// window polls about every 10 seconds.
 pub(super) const OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a background task may pin a kept process past its idle window, counted from the later
+/// of the turn's end and the chat's last poll.
+pub(super) const BACKGROUND_PIN_CAP: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
 /// The cap `keep_live` enforces. Unbounded under test: `LIVE_CHATS` is one static shared by every
 /// test running in parallel, and a real cap there would evict other tests' processes. `make_room`
 /// is tested directly with `LIVE_CAP`.
@@ -92,6 +98,38 @@ impl SpawnShape {
             context_window: request.context_window,
             max_turns: request.max_turns,
             background_tasks: request.background_tasks,
+        }
+    }
+
+    /// The same shape, as if the process had been given `mcp_config` instead.
+    ///
+    /// For a process warmed ahead of its first turn, which reads its own copy of the config so that
+    /// a turn starting meanwhile cannot have its file removed: the contents are the same, only the
+    /// name differs, and the name is what a turn's shape is compared on.
+    pub(super) fn with_mcp_config(mut self, mcp_config: Option<std::path::PathBuf>) -> Self {
+        self.mcp_config = mcp_config;
+        self
+    }
+
+    /// A shape for a stand-in process that nothing will be compared against.
+    #[cfg(any(test, feature = "testkit"))]
+    pub(super) fn blank() -> Self {
+        Self {
+            tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
+            denied_tools: Vec::new(),
+            add_dirs: Vec::new(),
+            model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            ambient_mcp: false,
+            mcp_config: None,
+            allowed_mcp_tools: None,
+            classifier_governs_tools: false,
+            context_window: None,
+            max_turns: None,
+            background_tasks: false,
         }
     }
 }
@@ -175,6 +213,56 @@ pub(super) struct LiveChat {
     pub(super) background: HashSet<String>,
     /// The between-turns reader that owns this process, by token; 0 for none.
     pub(super) watcher: u64,
+    /// The fingerprint of the chat's settings this process was spawned with (K1), compared before a
+    /// later turn is written to it. The per-turn briefing never enters it.
+    pub(super) spawned_with: String,
+    /// The session this process was spawned to resume, if any (K2).
+    pub(super) resumed: Option<String>,
+    /// Tool calls the current turn has opened and not yet seen answered. While any is open the
+    /// silence deadline does not apply: a long command is not a hung process.
+    pub(super) open_tools: HashSet<String>,
+    /// An answer the CLI began on its own that a person's message arrived in the middle of: set
+    /// aside whole so it is not handed to that person, and moved to `SET_ASIDE` by `serve_turn` as
+    /// soon as the turn is back, to be recorded from there.
+    pub(super) preempted: Option<(String, crate::execution::runner::TurnOutcome)>,
+}
+
+impl LiveChat {
+    /// The one way a `LiveChat` is built.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        messages: tokio::sync::mpsc::UnboundedSender<crate::execution::runner::LaterTurn>,
+        events: tokio::sync::mpsc::UnboundedReceiver<crate::execution::runner::TurnEvent>,
+        session_id: std::sync::Arc<Mutex<Option<String>>>,
+        abort: tokio::task::AbortHandle,
+        stopped_because: tokio::sync::watch::Receiver<Option<String>>,
+        permission: crate::execution::runner::Permission,
+        cwd: Option<std::path::PathBuf>,
+        shape: SpawnShape,
+        spawned_with: String,
+        resumed: Option<String>,
+    ) -> Self {
+        Self {
+            messages,
+            events,
+            session_id,
+            abort,
+            stopped_because,
+            permission,
+            cwd,
+            shape,
+            idle_since: std::time::Instant::now(),
+            idle_for: LIVE_IDLE,
+            _counted: LiveCount::start(),
+            carried: std::collections::VecDeque::new(),
+            background: HashSet::new(),
+            watcher: 0,
+            spawned_with,
+            resumed,
+            open_tools: HashSet::new(),
+            preempted: None,
+        }
+    }
 }
 
 impl Drop for LiveChat {
@@ -187,10 +275,7 @@ impl Drop for LiveChat {
         if let Ok(mut ended) = ENDED_TASKS.lock() {
             ended.remove(&self.process_key());
         }
-        let ended = PROCESS_BARRIERS
-            .lock()
-            .ok()
-            .and_then(|mut held| held.remove(&self.process_key()));
+        let ended = relock(&PROCESS_BARRIERS).remove(&self.process_key());
         if let Some(ended) = ended {
             stop_tasks_of(ended);
         }
@@ -220,10 +305,9 @@ pub(super) fn stop_tasks_of(ended: ProcessBarrier) {
 /// `chat_tasks` row, is what lets a task act after its turn: a row can be written `running` after
 /// its process is gone.
 pub(crate) fn live_process_served(chat_id: &str, run_id: i64) -> bool {
-    PROCESS_BARRIERS.lock().is_ok_and(|held| {
-        held.values()
-            .any(|p| p.chat_id == chat_id && p.served.contains(&run_id))
-    })
+    relock(&PROCESS_BARRIERS)
+        .values()
+        .any(|p| p.chat_id == chat_id && p.served.contains(&run_id))
 }
 
 /// Test-only stand-in for a kept process that served `run_id`; dropping it ends the vouching.
@@ -233,9 +317,7 @@ pub(crate) struct HeldProcess(usize);
 #[cfg(test)]
 impl Drop for HeldProcess {
     fn drop(&mut self) {
-        if let Ok(mut held) = PROCESS_BARRIERS.lock() {
-            held.remove(&self.0);
-        }
+        relock(&PROCESS_BARRIERS).remove(&self.0);
     }
 }
 
@@ -244,17 +326,15 @@ impl Drop for HeldProcess {
 pub(crate) fn hold_process_serving(chat_id: &str, run_id: i64) -> HeldProcess {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let key = NEXT.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
-    if let Ok(mut held) = PROCESS_BARRIERS.lock() {
-        held.insert(
-            key,
-            ProcessBarrier {
-                mode: "auto",
-                served: vec![run_id],
-                chat_id: chat_id.to_owned(),
-                pool: None,
-            },
-        );
-    }
+    relock(&PROCESS_BARRIERS).insert(
+        key,
+        ProcessBarrier {
+            mode: "auto",
+            served: vec![run_id],
+            chat_id: chat_id.to_owned(),
+            pool: None,
+        },
+    );
     HeldProcess(key)
 }
 
@@ -287,16 +367,15 @@ pub(super) fn note_served(
     mode: &'static str,
     pool: &SqlitePool,
 ) {
-    if let Ok(mut barriers) = PROCESS_BARRIERS.lock() {
-        let entry = barriers.entry(key).or_insert_with(|| ProcessBarrier {
-            mode,
-            served: Vec::new(),
-            chat_id: chat_id.to_owned(),
-            pool: Some(pool.clone()),
-        });
-        entry.mode = mode;
-        entry.served.push(run_id);
-    }
+    let mut barriers = relock(&PROCESS_BARRIERS);
+    let entry = barriers.entry(key).or_insert_with(|| ProcessBarrier {
+        mode,
+        served: Vec::new(),
+        chat_id: chat_id.to_owned(),
+        pool: Some(pool.clone()),
+    });
+    entry.mode = mode;
+    entry.served.push(run_id);
 }
 
 /// `note_served` for the process a conversation has kept, if it kept one.
@@ -306,7 +385,7 @@ pub(super) fn note_served_by_kept(
     mode: &'static str,
     pool: &SqlitePool,
 ) {
-    let kept = LIVE_CHATS.lock().unwrap();
+    let kept = relock(&LIVE_CHATS);
     if let Some(live) = kept.get(chat_id) {
         note_served(live.process_key(), chat_id, run_id, mode, pool);
     }
@@ -371,6 +450,30 @@ impl LiveChat {
         transcript: &std::sync::Arc<Mutex<String>>,
         silence: Option<std::time::Duration>,
     ) -> LiveTurn {
+        // A process whose stdin is already closed, or that the supervisor has recorded as stopped
+        // while its stream is still open, is not written to: the turn never happened, so it can be
+        // started fresh. A recorded stop whose stream has ALSO closed falls through to the write and
+        // reads as `DiedMidTurn` with its reason, which is what a conversation shows. In production
+        // the supervisor records a reason only after the runner has dropped both ends, so the
+        // closed stdin is what decides there.
+        let recorded_stop = self.stopped_because.borrow().is_some();
+        if self.messages.is_closed() || (recorded_stop && !self.events.is_closed()) {
+            return LiveTurn::NotWritten;
+        }
+        // An answer the CLI began on its own before this message belongs to that answer. Set it
+        // aside whole, to its own end, so this turn gathers only what answers it.
+        if self.drain_idle() && self.answer_carried() {
+            let aside = std::sync::Arc::new(Mutex::new(String::new()));
+            match self.gather(&aside, silence).await {
+                LiveTurn::Answered(outcome) => {
+                    let stdout = aside.lock().map(|held| held.clone()).unwrap_or_default();
+                    self.preempted = Some((stdout, outcome));
+                }
+                // The earlier answer never finished: the process is gone or hung, and nothing of
+                // this message was written.
+                _ => return LiveTurn::NotWritten,
+            }
+        }
         let said = crate::execution::runner::LaterTurn {
             text: text.to_owned(),
             images: images.to_vec(),
@@ -410,11 +513,15 @@ impl LiveChat {
                 Some(event) => (Some(event), false),
                 None => {
                     let next = match silence {
-                        Some(d) => match tokio::time::timeout(d, self.events.recv()).await {
-                            Ok(event) => event,
-                            Err(_) => return LiveTurn::WentSilent(d),
-                        },
-                        None => self.events.recv().await,
+                        // A tool call still open is work in progress, not silence; the caller's
+                        // ceiling still bounds the wait.
+                        Some(d) if self.open_tools.is_empty() => {
+                            match tokio::time::timeout(d, self.events.recv()).await {
+                                Ok(event) => event,
+                                Err(_) => return LiveTurn::WentSilent(d),
+                            }
+                        }
+                        _ => self.events.recv().await,
                     };
                     (next, true)
                 }
@@ -426,6 +533,9 @@ impl LiveChat {
                     if fresh {
                         self.track(&line);
                     }
+                    // Tool calls are tracked for carried lines too: the between-turns reader does
+                    // not look at them.
+                    track_open_tools(&line, &mut self.open_tools);
                     // The same accumulation the runner does for a one-turn process, so a turn served
                     // this way leaves the transcript a turn served the other way would have.
                     if let Ok(mut shared) = transcript.lock() {
@@ -434,6 +544,7 @@ impl LiveChat {
                     }
                 }
                 crate::execution::runner::TurnEvent::Ended(outcome) => {
+                    self.open_tools.clear();
                     return LiveTurn::Answered(outcome);
                 }
             }
@@ -443,8 +554,9 @@ impl LiveChat {
 
     /// Reads whatever the process said since the last turn into `carried`, without waiting.
     ///
-    /// Returns whether that includes something a turn of its own should answer: a line that is not
-    /// task bookkeeping, or the end of an answer.
+    /// Returns whether that includes an answer begun: an assistant or stream-event line, or the end
+    /// of an answer. The CLI also echoes user lines, announces itself and reports limits between
+    /// turns, and none of that is something a turn of its own should be started on.
     pub(super) fn drain_idle(&mut self) -> bool {
         let was_working = !self.background.is_empty();
         while let Ok(event) = self.events.try_recv() {
@@ -458,9 +570,26 @@ impl LiveChat {
             self.idle_since = std::time::Instant::now();
         }
         self.carried.iter().any(|event| match event {
-            crate::execution::runner::TurnEvent::Line(line) => !is_task_bookkeeping(line),
+            crate::execution::runner::TurnEvent::Line(line) => is_answer_line(line),
             crate::execution::runner::TurnEvent::Ended(_) => true,
         })
+    }
+
+    /// Whether the first segment of `carried` — up to and including its first `Ended`, or all of it
+    /// when none has arrived — holds an answer line. That segment is what `turn` would set aside;
+    /// one with no answer line in it is not an answer the CLI began, and setting it aside would
+    /// record a spontaneous turn that says nothing.
+    fn answer_carried(&self) -> bool {
+        for event in &self.carried {
+            match event {
+                crate::execution::runner::TurnEvent::Line(line) if is_answer_line(line) => {
+                    return true;
+                }
+                crate::execution::runner::TurnEvent::Line(_) => {}
+                crate::execution::runner::TurnEvent::Ended(_) => return false,
+            }
+        }
+        false
     }
 
     /// What the process said on its way out, if it manages to say it in time.
@@ -485,7 +614,7 @@ impl LiveChat {
 /// handle is dropped with it and `Drop` takes the process down. Nothing has to remember to clean up
 /// on a path where nothing gets the chance to run.
 pub(super) fn take_live(chat_id: &str) -> Option<LiveChat> {
-    LIVE_CHATS.lock().unwrap().remove(chat_id)
+    relock(&LIVE_CHATS).remove(chat_id)
 }
 
 /// Puts a process back, having just finished a turn, for the next one to find.
@@ -493,15 +622,13 @@ pub(super) fn keep_live(chat_id: &str, mut live: LiveChat, idle_for: std::time::
     let now = std::time::Instant::now();
     live.idle_since = now;
     live.idle_for = idle_for;
-    let open: HashSet<String> = SEEN_CHATS
-        .lock()
-        .unwrap()
+    let open: HashSet<String> = relock(&SEEN_CHATS)
         .iter()
         .filter(|(_, at)| is_open(Some(**at), now))
         .map(|(id, _)| id.clone())
         .collect();
     let evicted = {
-        let mut kept = LIVE_CHATS.lock().unwrap();
+        let mut kept = relock(&LIVE_CHATS);
         kept.insert(chat_id.to_owned(), live);
         let alive = LIVE_PROCESSES.load(std::sync::atomic::Ordering::SeqCst);
         make_room(&mut kept, alive, chat_id, ENFORCED_CAP, &open)
@@ -604,7 +731,7 @@ pub fn ambient_mcp_for(policy: crate::execution::runner::ToolPolicy, opted_in: b
 /// Stops a conversation's process for good, if it has one.
 pub fn evict_live(chat_id: &str) {
     // The removed value is dropped here, which is what aborts it.
-    LIVE_CHATS.lock().unwrap().remove(chat_id);
+    relock(&LIVE_CHATS).remove(chat_id);
 }
 
 /// Keeps a stand-in process for a conversation, for the tests of modules that must see one stopped.
@@ -614,38 +741,18 @@ pub fn evict_live(chat_id: &str) {
 pub fn keep_a_process_for_testing(chat_id: &str) {
     let (messages, _said) = tokio::sync::mpsc::unbounded_channel();
     let (_events_tx, events) = tokio::sync::mpsc::unbounded_channel();
-    let live = LiveChat {
+    let live = LiveChat::new(
         messages,
         events,
-        session_id: std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
-        abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
-        stopped_because: tokio::sync::watch::channel(None).1,
-        permission: crate::execution::runner::Permission::Default,
-        cwd: None,
-        shape: SpawnShape {
-            tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
-            denied_tools: Vec::new(),
-            add_dirs: Vec::new(),
-            model: None,
-            effort: None,
-            fallback_model: Vec::new(),
-            max_budget_usd: None,
-            agents: Vec::new(),
-            ambient_mcp: false,
-            mcp_config: None,
-            allowed_mcp_tools: None,
-            classifier_governs_tools: false,
-            context_window: None,
-            max_turns: None,
-            background_tasks: false,
-        },
-        idle_since: std::time::Instant::now(),
-        idle_for: LIVE_IDLE,
-        _counted: LiveCount::start(),
-        carried: Default::default(),
-        background: HashSet::new(),
-        watcher: 0,
-    };
+        std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
+        tokio::spawn(std::future::pending::<()>()).abort_handle(),
+        tokio::sync::watch::channel(None).1,
+        crate::execution::runner::Permission::Default,
+        None,
+        SpawnShape::blank(),
+        String::new(),
+        None,
+    );
     LIVE_CHATS.lock().unwrap().insert(chat_id.to_owned(), live);
 }
 
@@ -682,15 +789,12 @@ pub(super) fn reap_now() {
     let now = std::time::Instant::now();
     // A poll older than the longest idle window can no longer move any anchor, so it is forgotten.
     let seen = {
-        let mut seen = SEEN_CHATS.lock().unwrap();
+        let mut seen = relock(&SEEN_CHATS);
         seen.retain(|_, at| now.saturating_duration_since(*at) < DEV_IDLE);
         seen.clone()
     };
     // `retain` drops what it removes, and dropping is what stops the process.
-    LIVE_CHATS
-        .lock()
-        .unwrap()
-        .retain(|id, live| worth_keeping(live, seen.get(id).copied(), now));
+    relock(&LIVE_CHATS).retain(|id, live| worth_keeping(live, seen.get(id).copied(), now));
 }
 
 /// Whether a kept process is still worth its memory at `now`, given when its chat was last polled.
@@ -706,10 +810,307 @@ pub(super) fn worth_keeping(
     let still_standing = !live.messages.is_closed();
     // A background task that has started and not reported its end is work the process is still
     // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
-    // own when it ends), so such a process is kept however long it has been idle.
+    // own when it ends), so such a process is kept past its idle window — but only for
+    // [`BACKGROUND_PIN_CAP`], or a task that never reports its end pins it for good.
     // The idle time is the chat's own, derived from its last turn, and it counts from the later of
     // that turn's end and the last time the chat was polled by a visible view.
     let anchor = seen.map_or(live.idle_since, |s| s.max(live.idle_since));
+    let since = now.saturating_duration_since(anchor);
     still_standing
-        && (!live.background.is_empty() || now.saturating_duration_since(anchor) < live.idle_for)
+        && ((!live.background.is_empty() && since < BACKGROUND_PIN_CAP) || since < live.idle_for)
+}
+
+/// Whether a stream line is part of an answer: its JSON `type` is `assistant` or `stream_event`.
+fn is_answer_line(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| matches!(kind, "assistant" | "stream_event"))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::runner::{LaterTurn, TurnEvent, TurnOutcome};
+    use std::time::{Duration, Instant};
+
+    /// A `LiveChat` with its far ends in hand: what the process "says" goes into `events`, and what
+    /// is written to it arrives on `said`.
+    struct Rig {
+        live: LiveChat,
+        events: tokio::sync::mpsc::UnboundedSender<TurnEvent>,
+        said: tokio::sync::mpsc::UnboundedReceiver<LaterTurn>,
+        stopped: tokio::sync::watch::Sender<Option<String>>,
+    }
+
+    fn rig() -> Rig {
+        let (messages, said) = tokio::sync::mpsc::unbounded_channel();
+        let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stopped, stopped_rx) = tokio::sync::watch::channel(None);
+        let live = LiveChat::new(
+            messages,
+            events_rx,
+            std::sync::Arc::new(Mutex::new(Some("s-1".to_owned()))),
+            tokio::spawn(async {}).abort_handle(),
+            stopped_rx,
+            crate::execution::runner::Permission::Default,
+            None,
+            SpawnShape::blank(),
+            String::new(),
+            None,
+        );
+        Rig {
+            live,
+            events,
+            said,
+            stopped,
+        }
+    }
+
+    fn assistant_text(text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    }
+
+    fn assistant_tool_use(id: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {}}]}
+        })
+        .to_string()
+    }
+
+    fn user_tool_result(id: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "ok"}]}
+        })
+        .to_string()
+    }
+
+    fn costing(usd: f64) -> TurnOutcome {
+        TurnOutcome {
+            cost_usd: Some(usd),
+            ..Default::default()
+        }
+    }
+
+    /// Between turns the kept process's stream carries more than answers: the CLI echoes the user
+    /// lines it was written, announces itself, reports limits. None of that is an answer, and a turn
+    /// of its own started on one is a turn that answers nothing.
+    #[tokio::test]
+    async fn between_turns_only_an_answer_line_starts_a_turn_of_its_own() {
+        let quiet = [
+            serde_json::json!({"type": "user", "message": {"content": "hi"}}).to_string(),
+            serde_json::json!({"type": "system", "subtype": "init"}).to_string(),
+            serde_json::json!({"type": "rate_limit_event"}).to_string(),
+            "not json at all".to_owned(),
+        ];
+        for line in quiet {
+            let mut rig = rig();
+            rig.events.send(TurnEvent::Line(line.clone())).unwrap();
+            assert!(
+                !rig.live.drain_idle(),
+                "a line that is not an answer began a turn: {line}"
+            );
+        }
+
+        for line in [
+            assistant_text("the build finished"),
+            serde_json::json!({"type": "stream_event", "event": {"type": "message_start"}})
+                .to_string(),
+        ] {
+            let mut rig = rig();
+            rig.events.send(TurnEvent::Line(line.clone())).unwrap();
+            assert!(
+                rig.live.drain_idle(),
+                "an answer line did not begin a turn: {line}"
+            );
+        }
+
+        let mut rig = rig();
+        rig.events.send(TurnEvent::Ended(costing(0.1))).unwrap();
+        assert!(
+            rig.live.drain_idle(),
+            "the end of an answer must begin a turn"
+        );
+    }
+
+    /// `track_open_tools` is what `gather` consults: a tool call opens on its `tool_use`, closes on
+    /// the matching `tool_result`, and nothing stays open past the end of the turn.
+    #[tokio::test]
+    async fn a_turn_with_an_open_tool_call_is_not_cut_off_for_silence() {
+        let mut open = HashSet::new();
+        track_open_tools(&assistant_tool_use("toolu_1"), &mut open);
+        assert_eq!(open, HashSet::from(["toolu_1".to_owned()]));
+        track_open_tools(&assistant_text("unrelated"), &mut open);
+        assert_eq!(open.len(), 1);
+        track_open_tools(&user_tool_result("toolu_1"), &mut open);
+        assert!(open.is_empty());
+
+        // The same through `gather`: silence is 100 ms, the tool runs for 600 ms, and the turn must
+        // still arrive whole.
+        let mut rig = rig();
+        let events = rig.events.clone();
+        tokio::spawn(async move {
+            events
+                .send(TurnEvent::Line(assistant_tool_use("toolu_2")))
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            events
+                .send(TurnEvent::Line(user_tool_result("toolu_2")))
+                .unwrap();
+            events
+                .send(TurnEvent::Line(assistant_text("done")))
+                .unwrap();
+            events.send(TurnEvent::Ended(costing(2.0))).unwrap();
+        });
+        let transcript = std::sync::Arc::new(Mutex::new(String::new()));
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            rig.live
+                .gather(&transcript, Some(Duration::from_millis(100))),
+        )
+        .await
+        .expect("the turn must finish");
+        match served {
+            LiveTurn::Answered(outcome) => assert_eq!(outcome.cost_usd, Some(2.0)),
+            LiveTurn::WentSilent(_) => panic!("a running tool call was cut off for silence"),
+            _ => panic!("the turn did not answer"),
+        }
+        assert!(transcript.lock().unwrap().contains("done"));
+
+        // And a turn with no tool open still goes silent, so the exemption is not a blanket one.
+        let mut quiet = self::rig();
+        let transcript = std::sync::Arc::new(Mutex::new(String::new()));
+        let served = quiet
+            .live
+            .gather(&transcript, Some(Duration::from_millis(100)))
+            .await;
+        assert!(matches!(served, LiveTurn::WentSilent(_)));
+    }
+
+    /// A spontaneous answer already under way when a person writes is that answer's, not theirs.
+    #[tokio::test]
+    async fn an_answer_begun_before_a_persons_message_is_not_handed_to_it() {
+        let rig = rig();
+        rig.events
+            .send(TurnEvent::Line(assistant_text(
+                "the background task finished",
+            )))
+            .unwrap();
+        rig.events.send(TurnEvent::Ended(costing(1.0))).unwrap();
+
+        // The process answers the person only once it has been written to.
+        let mut said = rig.said;
+        let events = rig.events.clone();
+        let responder = tokio::spawn(async move {
+            let heard = said
+                .recv()
+                .await
+                .expect("the person's message was never written");
+            events
+                .send(TurnEvent::Line(assistant_text("here is your answer")))
+                .unwrap();
+            events.send(TurnEvent::Ended(costing(2.0))).unwrap();
+            heard
+        });
+
+        let transcript = std::sync::Arc::new(Mutex::new(String::new()));
+        let mut live = rig.live;
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            live.turn("and now me", &[], &transcript, None),
+        )
+        .await
+        .expect("the turn must finish");
+
+        let LiveTurn::Answered(outcome) = served else {
+            panic!("the person's turn did not answer");
+        };
+        assert_eq!(
+            outcome.cost_usd,
+            Some(2.0),
+            "the person got the other answer's numbers"
+        );
+        let stdout = transcript.lock().unwrap().clone();
+        assert!(stdout.contains("here is your answer"));
+        assert!(
+            !stdout.contains("the background task finished"),
+            "the spontaneous answer leaked into the person's turn"
+        );
+        assert_eq!(responder.await.unwrap().text, "and now me");
+
+        let (kept_stdout, kept_outcome) = live
+            .preempted
+            .take()
+            .expect("the answer set aside was not kept for the watcher");
+        assert!(kept_stdout.contains("the background task finished"));
+        assert_eq!(kept_outcome.cost_usd, Some(1.0));
+    }
+
+    /// A process that already stopped is not written to: the turn is as if it never happened, so it
+    /// can be started fresh without running anything twice.
+    #[tokio::test]
+    async fn a_kept_process_that_already_stopped_is_not_written_to() {
+        // Its supervisor has recorded why it ended, though its stdin is not yet seen closed.
+        let mut rig = rig();
+        rig.stopped
+            .send(Some("killed by the tool policy".to_owned()))
+            .unwrap();
+        let transcript = std::sync::Arc::new(Mutex::new(String::new()));
+        let served = rig.live.turn("hello?", &[], &transcript, None).await;
+        assert!(matches!(served, LiveTurn::NotWritten));
+        assert!(
+            rig.said.try_recv().is_err(),
+            "a process known to be dead was written to"
+        );
+
+        // Its stdin is closed: the runner's future, which owns the far end, is gone.
+        let mut closed = self::rig();
+        drop(closed.said);
+        let transcript = std::sync::Arc::new(Mutex::new(String::new()));
+        let served = closed.live.turn("hello?", &[], &transcript, None).await;
+        assert!(matches!(served, LiveTurn::NotWritten));
+    }
+
+    /// A background task keeps a process alive past its idle window, but not forever: a task that
+    /// never reports its end would otherwise pin a few hundred megabytes for good.
+    #[tokio::test]
+    async fn background_tasks_pin_a_process_for_at_most_two_hours() {
+        assert_eq!(BACKGROUND_PIN_CAP, Duration::from_secs(2 * 60 * 60));
+        let mut rig = rig();
+        let started = Instant::now();
+        rig.live.idle_since = started;
+        rig.live.idle_for = LIVE_IDLE;
+        rig.live.background.insert("task-1".to_owned());
+
+        assert!(
+            worth_keeping(&rig.live, None, started + Duration::from_secs(3_600)),
+            "a task running for an hour must still pin its process"
+        );
+        assert!(
+            !worth_keeping(
+                &rig.live,
+                None,
+                started + BACKGROUND_PIN_CAP + Duration::from_secs(60)
+            ),
+            "a task running past the cap must stop pinning"
+        );
+        // The cap counts from the later of the turn's end and the last poll, like the idle window.
+        let polled = started + Duration::from_secs(100 * 60);
+        assert!(worth_keeping(
+            &rig.live,
+            Some(polled),
+            started + Duration::from_secs(121 * 60)
+        ));
+    }
 }

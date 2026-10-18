@@ -697,6 +697,10 @@ pub(super) async fn patch_chat(
         || body.system_prompt.is_some()
         || body.denied_tools.is_some();
 
+    // Every check first, every write after. This used to validate and write field by field, so a
+    // body with one good field and one bad one answered 400 with the good one already stored — a
+    // refusal that had half-happened. Nothing below this block's end touches the database until
+    // each field has been judged.
     if let Some(cwd) = body.cwd.as_deref() {
         // Absolute, and a directory that is there. Checked HERE rather than at the first turn: a
         // conversation pointed at a typo would look exactly like one pointed at a project until
@@ -716,191 +720,73 @@ pub(super) async fn patch_chat(
         if !path.is_absolute() || !is_directory {
             return Err(StatusCode::BAD_REQUEST.into());
         }
-
-        crate::chats::set_cwd(&state.pool, &chat_id, cwd)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "pointing a conversation at a project failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        // For the reason the brain does, and one more. The CLI keeps its transcripts as
-        // `<root>/<project>/<session>.jsonl` — one directory per project — so a session had in one
-        // tree is not somewhere a run in another tree would look for it. And its context is about
-        // the old tree regardless: continuing it here would answer questions about this project out
-        // of the last one's files.
-        crate::assistant::forget_session(&state.pool, &chat_id)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "forgetting a moved conversation's session failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
     }
 
-    if let Some(brain) = body.brain.as_deref() {
-        crate::chats::set_brain(&state.pool, &chat_id, crate::chats::Brain::from_wire(brain))
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "changing a chat's model failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        crate::assistant::forget_session(&state.pool, &chat_id)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "forgetting a chat's session failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
+    // A choice names its own route, so the brain a model implies is worked out here, before any
+    // write, and applied after the plain `brain` field below.
+    let model_brain = match &body.model {
+        Some(Some(id)) => Some(chosen_brain(&state, id, Asking::Chat).await?),
+        // Unpinning says nothing about the route. The conversation goes back to following the
+        // configured model, and `brain` keeps whatever it already had — changing it here would
+        // be this route inventing a decision nobody expressed.
+        _ => None,
+    };
 
-    // After the brain block above, and that order is the whole point: a choice names its own route,
-    // so when a client sends both and they disagree, the one that cannot be wrong is the one that
-    // lands last. A row saying `local` while naming a cloud model would be sent to Ollama under a
-    // name it has never heard.
-    if let Some(model) = &body.model {
-        let brain = match model {
-            Some(id) => Some(chosen_brain(&state, id, Asking::Chat).await?),
-            // Unpinning says nothing about the route. The conversation goes back to following the
-            // configured model, and `brain` keeps whatever it already had — changing it here would
-            // be this route inventing a decision nobody expressed.
-            None => None,
-        };
-
-        crate::chats::set_model(&state.pool, &chat_id, model.as_deref())
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "pinning a conversation to a model failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        if let Some(brain) = brain {
-            crate::chats::set_brain(&state.pool, &chat_id, brain)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(%error, "routing a conversation to its model's brain failed");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-        }
-
-        // For the reason the brain block gives: the model taking over has not seen the turns the
-        // other one answered, and resuming across that gap hands it a context missing them.
-        crate::assistant::forget_session(&state.pool, &chat_id)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "forgetting a re-modelled chat's session failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    // None of the three below joins the 409 guard above, and that is a per-column answer rather than
-    // an oversight. `cwd` and the brain are guarded because a live turn's record would come to
+    // None of the checks below joins the 409 guard above, and that is a per-column answer rather
+    // than an oversight. `cwd` and the brain are guarded because a live turn's record would come to
     // disagree with them — the chat row is the only note of where a turn ran, and `answered_by` is
-    // written when the row is born. Nothing records a run's fallback, its extra directories or its
-    // ceiling, and all three are read at LAUNCH, so a turn already running has its own copy and
-    // cannot be made to lie by changing them. Refusing here would only stop somebody setting up
-    // their next turn while waiting for this one.
-    if let Some(fallback) = &body.fallback_model {
-        let names = fallback.clone().unwrap_or_default();
-        checked_fallback(&names)?;
-        crate::chats::set_fallback(&state.pool, &chat_id, &names)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "naming a conversation's fallback model failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    if let Some(dirs) = &body.extra_dirs {
-        let paths = dirs.clone().unwrap_or_default();
-        checked_dirs(&paths).await?;
-        crate::chats::set_extra_dirs(&state.pool, &chat_id, &paths)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "widening what a conversation may reach failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    if let Some(ceiling) = &body.turn_budget_usd {
-        if let Some(amount) = ceiling {
-            checked_budget(*amount)?;
+    // written when the row is born. Nothing records a run's fallback, its extra directories, its
+    // ceiling or its helpers, and all of them are read at LAUNCH, so a turn already running has its
+    // own copy and cannot be made to lie by changing them. Refusing here would only stop somebody
+    // setting up their next turn while waiting for this one.
+    let fallback_names = match &body.fallback_model {
+        Some(fallback) => {
+            let names = fallback.clone().unwrap_or_default();
+            checked_fallback(&names)?;
+            Some(names)
         }
-        crate::chats::set_turn_budget(&state.pool, &chat_id, *ceiling)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "setting what a turn may spend failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    // Read at launch like the three above, so it stays out of the 409 for the reason they do. A
-    // turn already running holds the helper set it was spawned with; nothing here can reach in and
-    // change what it was given.
-    if let Some(agents) = &body.agents {
-        let defined = agents.clone().unwrap_or_default();
-        checked_agents(&defined)?;
-        crate::chats::set_agents(&state.pool, &chat_id, &defined)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "defining a conversation's helpers failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    if let Some(instructions) = &body.system_prompt {
-        if let Some(text) = instructions {
-            checked_instructions(text)?;
+        None => None,
+    };
+    let extra_dirs = match &body.extra_dirs {
+        Some(dirs) => {
+            let paths = dirs.clone().unwrap_or_default();
+            checked_dirs(&paths).await?;
+            Some(paths)
         }
-        crate::chats::set_system_prompt(&state.pool, &chat_id, instructions.as_deref())
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "writing a conversation's standing instructions failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        None => None,
+    };
+    if let Some(Some(amount)) = &body.turn_budget_usd {
+        checked_budget(*amount)?;
     }
-
-    if let Some(denied) = &body.denied_tools {
-        let names = denied.clone().unwrap_or_default();
-        checked_denials(&names)?;
-        crate::chats::set_denied_tools(&state.pool, &chat_id, &names)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "narrowing what a conversation may reach for failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    // No `forget_session`. Effort changes how hard the same model thinks, not who is thinking — the
-    // context the session holds is still that model's own, and dropping it would make a dial nobody
-    // considers destructive silently restart the conversation.
-    if let Some(effort) = &body.effort {
-        if let Some(level) = effort
-            && !crate::config::is_effort_level(&models_config(), level)
-        {
-            return Err(StatusCode::BAD_REQUEST.into());
+    let helpers = match &body.agents {
+        Some(agents) => {
+            let defined = agents.clone().unwrap_or_default();
+            checked_agents(&defined)?;
+            Some(defined)
         }
-        crate::chats::set_effort(&state.pool, &chat_id, effort.as_deref())
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "changing how hard a conversation thinks failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        None => None,
+    };
+    if let Some(Some(text)) = &body.system_prompt {
+        checked_instructions(text)?;
     }
-
-    if let Some(permission_mode) = body.permission_mode {
-        crate::chats::set_permission_mode(&state.pool, &chat_id, permission_mode)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "changing what a conversation may do without asking failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        // The running turn now decides with this rung; asks it allows are answered here.
-        crate::hooks::reconsider_asks(&state, &chat_id, permission_mode).await;
+    let denials = match &body.denied_tools {
+        Some(denied) => {
+            let names = denied.clone().unwrap_or_default();
+            checked_denials(&names)?;
+            Some(names)
+        }
+        None => None,
+    };
+    if let Some(Some(level)) = &body.effort
+        && !crate::config::is_effort_level(&models_config(), level)
+    {
+        return Err(StatusCode::BAD_REQUEST.into());
     }
-
-    if let Some(on) = body.ambient_mcp {
+    if let Some(true) = body.ambient_mcp {
         // Only a conversation with a project can use the ambient servers; one without a
-        // directory is `McpOnly`, which drops them whatever is stored here.
-        if on
+        // directory is `McpOnly`, which drops them whatever is stored here. A directory this same
+        // request sets counts.
+        if body.cwd.is_none()
             && crate::chats::cwd_of(&state.pool, &chat_id)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -908,26 +794,143 @@ pub(super) async fn patch_chat(
         {
             return Err(StatusCode::BAD_REQUEST.into());
         }
-        crate::chats::set_ambient_mcp(&state.pool, &chat_id, on)
+    }
+
+    fn failed(step: &'static str) -> impl FnOnce(sqlx::Error) -> StatusCode {
+        move |error| {
+            tracing::warn!(%error, step, "editing a conversation failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+
+    // One transaction: either every field lands or none does.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(failed("opening the edit"))?;
+    let mut forget = false;
+
+    if let Some(cwd) = body.cwd.as_deref() {
+        crate::chats::set_cwd(&mut *tx, &chat_id, cwd)
             .await
-            .map_err(|error| {
-                tracing::warn!(%error, "changing a conversation's ambient MCP servers failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        // The next turn respawns with or without `--strict-mcp-config`.
-        crate::assistant::evict_live(&chat_id);
+            .map_err(failed("pointing a conversation at a project"))?;
+        // For the reason the brain does, and one more. The CLI keeps its transcripts as
+        // `<root>/<project>/<session>.jsonl` — one directory per project — so a session had in one
+        // tree is not somewhere a run in another tree would look for it. And its context is about
+        // the old tree regardless: continuing it here would answer questions about this project out
+        // of the last one's files.
+        forget = true;
+    }
+
+    if let Some(brain) = body.brain.as_deref() {
+        crate::chats::set_brain(&mut *tx, &chat_id, crate::chats::Brain::from_wire(brain))
+            .await
+            .map_err(failed("changing a chat's model"))?;
+        forget = true;
+    }
+
+    // After the brain block above, and that order is the whole point: a choice names its own route,
+    // so when a client sends both and they disagree, the one that cannot be wrong is the one that
+    // lands last. A row saying `local` while naming a cloud model would be sent to Ollama under a
+    // name it has never heard.
+    if let Some(model) = &body.model {
+        crate::chats::set_model(&mut *tx, &chat_id, model.as_deref())
+            .await
+            .map_err(failed("pinning a conversation to a model"))?;
+        if let Some(brain) = model_brain {
+            crate::chats::set_brain(&mut *tx, &chat_id, brain)
+                .await
+                .map_err(failed("routing a conversation to its model's brain"))?;
+        }
+        // For the reason the brain block gives: the model taking over has not seen the turns the
+        // other one answered, and resuming across that gap hands it a context missing them.
+        forget = true;
+    }
+
+    if let Some(names) = &fallback_names {
+        crate::chats::set_fallback(&mut *tx, &chat_id, names)
+            .await
+            .map_err(failed("naming a conversation's fallback model"))?;
+    }
+
+    if let Some(paths) = &extra_dirs {
+        crate::chats::set_extra_dirs(&mut *tx, &chat_id, paths)
+            .await
+            .map_err(failed("widening what a conversation may reach"))?;
+    }
+
+    if let Some(ceiling) = &body.turn_budget_usd {
+        crate::chats::set_turn_budget(&mut *tx, &chat_id, *ceiling)
+            .await
+            .map_err(failed("setting what a turn may spend"))?;
+    }
+
+    if let Some(defined) = &helpers {
+        crate::chats::set_agents(&mut *tx, &chat_id, defined)
+            .await
+            .map_err(failed("defining a conversation's helpers"))?;
+    }
+
+    if let Some(instructions) = &body.system_prompt {
+        crate::chats::set_system_prompt(&mut *tx, &chat_id, instructions.as_deref())
+            .await
+            .map_err(failed("writing a conversation's standing instructions"))?;
+    }
+
+    if let Some(names) = &denials {
+        crate::chats::set_denied_tools(&mut *tx, &chat_id, names)
+            .await
+            .map_err(failed("narrowing what a conversation may reach for"))?;
+    }
+
+    // No `forget_session`. Effort changes how hard the same model thinks, not who is thinking — the
+    // context the session holds is still that model's own, and dropping it would make a dial nobody
+    // considers destructive silently restart the conversation.
+    if let Some(effort) = &body.effort {
+        crate::chats::set_effort(&mut *tx, &chat_id, effort.as_deref())
+            .await
+            .map_err(failed("changing how hard a conversation thinks"))?;
+    }
+
+    if let Some(permission_mode) = body.permission_mode {
+        crate::chats::set_permission_mode(&mut *tx, &chat_id, permission_mode)
+            .await
+            .map_err(failed("changing what a conversation may do without asking"))?;
+    }
+
+    if let Some(on) = body.ambient_mcp {
+        crate::chats::set_ambient_mcp(&mut *tx, &chat_id, on)
+            .await
+            .map_err(failed("changing a conversation's ambient MCP servers"))?;
     }
 
     if let Some(title) = body.title.as_deref() {
-        crate::chats::rename(&state.pool, &chat_id, Some(title))
+        crate::chats::rename(&mut *tx, &chat_id, Some(title))
+            .await
+            .map_err(failed("renaming a chat"))?;
+    }
+
+    tx.commit().await.map_err(failed("committing the edit"))?;
+
+    // Only now, once the rows say what the person asked for: forgetting a session on the strength
+    // of a write that was then rolled back would lose a context for nothing.
+    if forget {
+        crate::assistant::forget_session(&state.pool, &chat_id)
             .await
             .map_err(|error| {
-                tracing::warn!(%error, "renaming a chat failed");
+                tracing::warn!(%error, "forgetting a changed conversation's session failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     }
 
-    if respawns {
+    if let Some(permission_mode) = body.permission_mode {
+        // The running turn now decides with this rung; asks it allows are answered here.
+        crate::hooks::reconsider_asks(&state, &chat_id, permission_mode).await;
+    }
+
+    if respawns || body.ambient_mcp.is_some() {
+        // The next turn respawns (with or without `--strict-mcp-config` for `ambient_mcp`).
         crate::assistant::evict_live(&chat_id);
     }
 

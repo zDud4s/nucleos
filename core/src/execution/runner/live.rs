@@ -287,24 +287,52 @@ pub(super) fn cut_detail(text: &str) -> String {
 /// is one answer with a gap in it, and keeping only the newest message would silently drop
 /// everything the model said before it reached for anything.
 pub fn live_from_stream(stream: &str) -> LiveTurn {
-    let mut finished: Vec<String> = Vec::new();
-    let mut writing = String::new();
-    let mut thought: Vec<String> = Vec::new();
-    let mut thought_tokens: Option<i64> = None;
-    let mut pondering = String::new();
-    let mut doing: Option<String> = None;
-    let mut did: Vec<ToolCall> = Vec::new();
+    stream
+        .lines()
+        .fold(LiveStream::default(), |mut live, line| {
+            live.push_line(line);
+            live
+        })
+        .snapshot()
+}
+
+/// `live_from_stream`'s state, kept between lines so a reader that is handed a stream a piece at a
+/// time (the SSE tail, one per subscriber) distils only what is new instead of re-reading all of it
+/// on every tick. Fed every line in order, `snapshot` is exactly what `live_from_stream` answers for
+/// the whole text — which is the one definition, since `live_from_stream` is a fold over this.
+#[derive(Debug, Default, Clone)]
+pub struct LiveStream {
+    finished: Vec<String>,
+    writing: String,
+    thought: Vec<String>,
+    thought_tokens: Option<i64>,
+    pondering: String,
+    doing: Option<String>,
+    did: Vec<ToolCall>,
     // The `tool_use` id of each call in `did`, by the same index: the pairing key for answers and
     // task events, kept beside `ToolCall::id` so a call sent without an id still holds its place.
-    let mut called: Vec<Option<String>> = Vec::new();
-
+    called: Vec<Option<String>>,
     // Background task ids to the index of the call that launched them, learned from the task
     // events and from the launch's own answer.
-    let mut tasks: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    tasks: std::collections::HashMap<String, usize>,
+}
 
-    for line in stream.lines() {
+impl LiveStream {
+    /// Reads one line of the stream. A line that is not JSON changes nothing.
+    pub fn push_line(&mut self, line: &str) {
+        let Self {
+            finished,
+            writing,
+            thought,
+            thought_tokens,
+            pondering,
+            doing,
+            did,
+            called,
+            tasks,
+        } = self;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
+            return;
         };
         // Set on every line a subagent wrote: the `Task`/`Agent` call that spawned it.
         let parent = value
@@ -334,8 +362,8 @@ pub fn live_from_stream(stream: &str) -> LiveTurn {
                 {
                     pondering.push_str(text);
                 }
-                thought_tokens = larger(
-                    thought_tokens,
+                *thought_tokens = larger(
+                    *thought_tokens,
                     value.pointer("/event/delta/estimated_tokens"),
                 );
             }
@@ -345,9 +373,9 @@ pub fn live_from_stream(stream: &str) -> LiveTurn {
             Some("system")
                 if value.get("subtype").and_then(|s| s.as_str()) == Some("thinking_tokens") =>
             {
-                thought_tokens = larger(thought_tokens, value.get("estimated_tokens"));
+                *thought_tokens = larger(*thought_tokens, value.get("estimated_tokens"));
             }
-            Some("system") => task_event(&value, stamp, &mut did, &called, &mut tasks),
+            Some("system") => task_event(&value, stamp, did, called, tasks),
             Some("assistant") => {
                 let blocks = value
                     .pointer("/message/content")
@@ -424,7 +452,7 @@ pub fn live_from_stream(stream: &str) -> LiveTurn {
                     });
                     called.push(id);
                     if own {
-                        doing = Some(name.to_string());
+                        *doing = Some(name.to_string());
                     }
                 }
                 // The message that just completed is the one those deltas were writing — both
@@ -497,32 +525,34 @@ pub fn live_from_stream(stream: &str) -> LiveTurn {
                         .unwrap_or(false);
                 }
                 if returned {
-                    doing = None;
+                    *doing = None;
                 }
             }
             _ => {}
         }
     }
 
-    if !writing.trim().is_empty() {
-        finished.push(writing);
-    }
-    // A thought still being written when the stream was read is worth showing — that is most of
-    // what a live turn IS while it is hard.
-    if !pondering.trim().is_empty() {
-        thought.push(pondering);
-    }
+    /// What the stream read so far says: the answer, the thought and the tool calls.
+    ///
+    /// A thought or an answer still being typed is worth showing — that is most of what a live turn
+    /// IS while it is hard — so the open buffers count here without being closed.
+    pub fn snapshot(&self) -> LiveTurn {
+        let mut finished = self.finished.clone();
+        if !self.writing.trim().is_empty() {
+            finished.push(self.writing.clone());
+        }
+        let mut thought = self.thought.clone();
+        if !self.pondering.trim().is_empty() {
+            thought.push(self.pondering.clone());
+        }
 
-    LiveTurn {
-        text: finished.join(
-            "
-
-",
-        ),
-        thought_tokens,
-        thought,
-        doing,
-        did,
+        LiveTurn {
+            text: finished.join("\n\n"),
+            thought_tokens: self.thought_tokens,
+            thought,
+            doing: self.doing.clone(),
+            did: self.did.clone(),
+        }
     }
 }
 
@@ -567,4 +597,53 @@ pub(super) fn seen_at(stamp: Option<&str>, key: Option<String>) -> String {
         seen.clear();
     }
     seen.entry(key).or_insert(now).clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recorded stream: partial text, a thought estimate, a tool call and its answer, more text.
+    /// Every line carries a timestamp and every call an id, so that the two readers cannot differ
+    /// by the clock of the moment they read.
+    fn recorded() -> Vec<String> {
+        [
+            r#"{"type":"system","subtype":"init","timestamp":"2026-10-17T10:00:00Z"}"#,
+            r#"{"type":"stream_event","timestamp":"2026-10-17T10:00:01Z","event":{"delta":{"thinking":"","estimated_tokens":12}}}"#,
+            r#"{"type":"stream_event","timestamp":"2026-10-17T10:00:02Z","event":{"delta":{"text":"Looking at "}}}"#,
+            r#"{"type":"stream_event","timestamp":"2026-10-17T10:00:03Z","event":{"delta":{"text":"the file."}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-17T10:00:04Z","message":{"content":[{"type":"text","text":"Looking at the file."},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+            r#"this line is not json at all"#,
+            r#"{"type":"user","timestamp":"2026-10-17T10:00:05Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"fn main() {}"}]}}"#,
+            r#"{"type":"stream_event","timestamp":"2026-10-17T10:00:06Z","event":{"delta":{"text":"It is empty."}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-10-17T10:00:07Z","message":{"content":[{"type":"text","text":"It is empty."}]}}"#,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// The incremental reader that the live tail keeps per subscriber must read a stream exactly
+    /// as the one-shot reader reads it whole — at every prefix, not only at the end, since each
+    /// tick shows whatever has arrived so far.
+    #[test]
+    fn a_stream_fed_line_by_line_reads_as_the_whole_stream() {
+        let lines = recorded();
+        let mut stream = LiveStream::default();
+
+        for (n, line) in lines.iter().enumerate() {
+            stream.push_line(line);
+            let whole = lines[..=n].join("\n");
+            assert_eq!(
+                stream.snapshot(),
+                live_from_stream(&whole),
+                "after {} line(s)",
+                n + 1
+            );
+        }
+
+        let end = stream.snapshot();
+        assert!(!end.text.is_empty(), "the recorded stream says something");
+        assert_eq!(end, live_from_stream(&lines.join("\n")));
+    }
 }

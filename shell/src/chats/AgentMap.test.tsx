@@ -15,7 +15,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { AgentMapBody, durationText, groupAgents } from "./AgentMap";
+import { AgentMapBody, ChatChips, durationText, groupAgents } from "./AgentMap";
 import type { ToolCall, Turn } from "../lib/turns";
 import type { ChatTask } from "../data/chats";
 import { createAppQueryClient } from "../app/queryClient";
@@ -90,6 +90,23 @@ describe("groupAgents", () => {
   it("has nothing for a daemon that sends none of the new fields", () => {
     expect(groupAgents([turn([call({ name: "Read" })])]).total).toBe(0);
     expect(groupAgents(undefined).total).toBe(0);
+  });
+});
+
+describe("ChatChips", () => {
+  it("ChatChips does not poll the live route itself", async () => {
+    daemon.apiFetch.mockReset();
+    daemon.apiFetch.mockResolvedValue(undefined);
+    const running = [turn([call({ id: "a", name: "Task", detail: "explore" })], "running")];
+    render(
+      <QueryClientProvider client={createAppQueryClient()}>
+        <ChatChips chatId="c-live" turns={running} chatTitle="My chat" />
+      </QueryClientProvider>,
+    );
+    // Give any query enabled on mount the chance to fire its fetch.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const paths = daemon.apiFetch.mock.calls.map((args) => String(args[0]));
+    expect(paths.filter((path) => path.includes("/live"))).toEqual([]);
   });
 });
 

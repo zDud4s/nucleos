@@ -368,3 +368,43 @@ pub fn compacted_from_line(line: &str, current: bool) -> bool {
 /// is the one whose promise survives the daemon being killed rather than asked to stop.
 pub(super) static KEPT_ALIVE: std::sync::LazyLock<crate::process_tree::Litter> =
     std::sync::LazyLock::new(crate::process_tree::Litter::new);
+
+/// Where a pending tool call opens and closes in the stream: an assistant line's `tool_use` ids
+/// open, a user line's `tool_result.tool_use_id`s close. Pure, so both readers that exempt an open
+/// tool call from the silence deadline — the one-shot loop in `claude.rs` and a kept process's
+/// `LiveChat::gather` — share one reading of it.
+pub fn track_open_tools(line: &str, open: &mut std::collections::HashSet<String>) {
+    if !line.contains("tool_use") && !line.contains("tool_result") {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return;
+    };
+    let Some(items) = value
+        .pointer("/message/content")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("assistant") => {
+            for item in items {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                    && let Some(id) = item.get("id").and_then(serde_json::Value::as_str)
+                {
+                    open.insert(id.to_owned());
+                }
+            }
+        }
+        Some("user") => {
+            for item in items {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                    && let Some(id) = item.get("tool_use_id").and_then(serde_json::Value::as_str)
+                {
+                    open.remove(id);
+                }
+            }
+        }
+        _ => {}
+    }
+}

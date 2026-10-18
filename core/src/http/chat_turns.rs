@@ -922,9 +922,10 @@ pub(super) fn tail_len(tails: &crate::state::RunTails, run_id: i64) -> Option<us
 /// `get_assistant_live`: a chat bubble is not the place to learn what a `content_block_delta` is.
 ///
 /// The tail is polled every 100 ms rather than waited on, so the writers (`runner.rs`) stay as
-/// they are and nothing has to learn about subscribers. Only the length is read per tick; the
-/// stream is re-distilled when it changed, and an event goes out only if the state differs from
-/// the last one sent.
+/// they are and nothing has to learn about subscribers. Only the length is read per tick. When it
+/// grew, each subscriber reads just the new bytes from its own cursor and feeds the complete lines
+/// to its own `LiveStream`, so a long turn costs what was added and not what was written; an event
+/// goes out only if the state differs from the last one sent.
 ///
 /// `204` when no tail exists, same as `/live`: the run ended or this daemon never started it.
 pub(super) async fn get_assistant_live_stream(
@@ -940,7 +941,12 @@ pub(super) async fn get_assistant_live_stream(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut seen_len: Option<usize> = None;
+        // Where this subscriber has read to, what it has distilled so far, and the line the tail
+        // has begun and not yet ended. Per subscriber: each tick reads only what is new.
+        let mut cursor = 0usize;
+        let mut first = true;
+        let mut distilled = crate::execution::runner::LiveStream::default();
+        let mut pending = String::new();
         let mut last: Option<crate::execution::runner::LiveTurn> = None;
         let mut idle = 0u32;
         loop {
@@ -950,10 +956,26 @@ pub(super) async fn get_assistant_live_stream(
                 break;
             };
             let mut wrote = false;
-            if seen_len != Some(len) {
-                seen_len = Some(len);
-                if let Some(stream) = crate::execution::runs::read_tail(&tails, turn_id, 0) {
-                    let live = crate::execution::runner::live_from_stream(&stream);
+            if first || len != cursor {
+                first = false;
+                if let Some(chunk) = crate::execution::runs::read_tail(&tails, turn_id, cursor) {
+                    cursor += chunk.len();
+                    pending.push_str(&chunk);
+                    while let Some(newline) = pending.find('\n') {
+                        let line: String = pending.drain(..=newline).collect();
+                        distilled.push_line(&line);
+                    }
+                    // A last line that is already whole JSON counts before its newline arrives,
+                    // as it did when the stream was re-read from byte zero. Read on a copy, so
+                    // the line is not pushed twice once it ends.
+                    let whole = serde_json::from_str::<serde_json::Value>(pending.trim()).is_ok();
+                    let live = if whole {
+                        let mut view = distilled.clone();
+                        view.push_line(&pending);
+                        view.snapshot()
+                    } else {
+                        distilled.snapshot()
+                    };
                     if last.as_ref() != Some(&live) {
                         let Ok(json) = serde_json::to_string(&live) else {
                             break;
