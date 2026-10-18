@@ -32,6 +32,7 @@ use crate::state::AppState;
 
 mod admin;
 mod agents;
+mod analytics;
 mod brains;
 mod chat_edit;
 mod chat_turns;
@@ -111,6 +112,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .merge(admin::routes())
         .merge(agents::routes())
+        .merge(analytics::routes())
         .merge(brains::routes())
         .merge(chat_edit::routes())
         .merge(chat_turns::routes())
@@ -24272,6 +24274,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The analytics routes answer the documented shape (spec §6), globally and per project.
+    #[tokio::test]
+    async fn analytics_answers_the_documented_shape_globally_and_per_project() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'off')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let global = get_json(&state, "/analytics?days=7").await;
+        assert_eq!(global["scope"], "global", "{global}");
+        assert!(global["project_id"].is_null(), "{global}");
+        assert_eq!(global["days"], 7, "{global}");
+        assert_eq!(global["timezone"], "UTC", "{global}");
+        assert_eq!(global["counted"]["modes"], "all", "{global}");
+        assert_eq!(
+            global["cost"]["series"].as_array().unwrap().len(),
+            7,
+            "{global}"
+        );
+        assert_eq!(global["cost"]["by_label"], "project", "{global}");
+        assert_eq!(global["cost"]["keys"][0]["key"], "judge", "{global}");
+        assert_eq!(global["cost"]["total"]["judge_usd"], 0.0, "{global}");
+        assert!(
+            global["tokens"]["total"]["cache_hit_ratio"].is_null(),
+            "{global}"
+        );
+        assert_eq!(global["throughput"]["in_flight"], 0, "{global}");
+        assert!(
+            global["delivered"]["total"]["median_minutes"].is_null(),
+            "{global}"
+        );
+        assert_eq!(global["top_runs"], serde_json::json!([]), "{global}");
+        assert_eq!(
+            global["window"]["to"], global["cost"]["series"][6]["day"],
+            "{global}"
+        );
+        assert_eq!(global["cost"]["series"][6]["partial"], true, "{global}");
+
+        let project = get_json(&state, "/projects/alpha/analytics").await;
+        assert_eq!(project["scope"], "project", "{project}");
+        assert_eq!(project["project_id"], "alpha", "{project}");
+        assert_eq!(project["days"], 30, "{project}");
+        assert_eq!(project["cost"]["by_label"], "mode", "{project}");
+
+        let quota = get_json(&state, "/analytics/quota?days=90").await;
+        assert_eq!(quota["days"], 90, "{quota}");
+        assert!(quota["since"].is_null(), "{quota}");
+        assert_eq!(quota["series"], serde_json::json!([]), "{quota}");
+    }
+
+    /// `days` outside 7/30/90 is the client's error, not something to clamp; an unknown project
+    /// is a 404, not an empty answer.
+    #[tokio::test]
+    async fn analytics_refuses_an_unserved_window_and_an_unknown_project() {
+        let state = test_state().await;
+        for uri in [
+            "/analytics?days=14",
+            "/analytics?days=abc",
+            "/analytics/quota?days=14",
+            "/projects/alpha/analytics?days=0",
+        ] {
+            assert_eq!(
+                get_status(&state, uri).await,
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            get_status(&state, "/projects/nobody/analytics").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Through the production router: a read-only key reaches all three, no token reaches none.
+    #[tokio::test]
+    async fn analytics_is_readable_with_a_read_only_key_and_not_without_a_token() {
+        let (state, db) = file_test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'off')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+
+        for uri in [
+            "/analytics",
+            "/analytics/quota",
+            "/projects/alpha/analytics",
+        ] {
+            let response = api_token_request(state.clone(), "GET", uri, &token, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let anonymous = build_router(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        db.close().await;
     }
 }
 

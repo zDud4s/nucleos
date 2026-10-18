@@ -450,17 +450,19 @@ pub async fn judge_spend(
     }
 }
 
+/// One run timestamp, parsed the way every spend reader parses it. `pub(crate)` so the analytics
+/// read (`analytics/sessions.rs`) prices runs from the same instants the ceiling does.
+pub(crate) fn parse_run_timestamp(value: &str) -> sqlx::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|error| sqlx::Error::Protocol(format!("invalid run timestamp {value}: {error}")))
+}
+
 /// Spelled out twice above rather than assembled, because sqlx refuses SQL built at runtime — a
 /// guard worth keeping. What the two queries share is the parsing, and that lives here so a
 /// timestamp cannot come to mean two different things depending on which limit is asking.
 fn spend_rows(raw: Vec<RawRow>) -> sqlx::Result<Vec<SpendRow>> {
-    let parse = |value: &str| -> sqlx::Result<DateTime<Utc>> {
-        DateTime::parse_from_rfc3339(value)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|error| {
-                sqlx::Error::Protocol(format!("invalid run timestamp {value}: {error}"))
-            })
-    };
+    let parse = parse_run_timestamp;
 
     raw.into_iter()
         .map(

@@ -10,7 +10,9 @@ import {
 import { AppShell } from "./app/AppShell";
 import { RouteError } from "./app/RouteError";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
+import { validateAnalyticsSearch } from "./data/analytics";
 import { Agents } from "./pages/Agents";
+import { Analytics } from "./pages/Analytics";
 import { Calendar, validateCalendarSearch } from "./pages/Calendar";
 import { Contacts } from "./pages/Contacts";
 import { Feed, validateFeedSearch } from "./pages/Feed";
@@ -84,6 +86,7 @@ export const PAGES: Record<string, () => ReactNode> = {
   "/autopilot": Autopilot,
   "/waiting": Waiting,
   "/runs": Runs,
+  "/analytics": Analytics,
   "/feed": Feed,
   "/projects": Roster,
   "/chats": Chats,
@@ -111,6 +114,7 @@ export const PAGES: Record<string, () => ReactNode> = {
  */
 const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => object> = {
   "/runs": validateRunSearch,
+  "/analytics": validateAnalyticsSearch,
   "/feed": validateFeedSearch,
   "/calendar": validateCalendarSearch,
   "/waiting": validateWaitingSearch,

@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { AnalyticsView } from "../analytics/AnalyticsView";
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
@@ -47,10 +48,16 @@ import "../pages/workspace.css";
  * shell and where work lands, which a project that never touches GitHub has
  * too. The mode and ceiling in State › Settings are the same subject and are
  * meant to move here.
+ *
+ * **Analytics is the sixth (2026-10-17), on the same rule.** Its subject is this project over
+ * time — cost, tokens, gate results and deliveries by UTC day — which none of the others read:
+ * State is now, the rest are structure. Its shape is a column of daily series. It is the same
+ * `AnalyticsView` the `/analytics` page draws for every project, scoped here, with its window kept
+ * in the mode rather than in the address.
  */
 
-/** The five modes, in the order the tabs read. */
-const MODES = ["state", "map", "code", "workflows", "authority"] as const;
+/** The six modes, in the order the tabs read. Analytics is last: it reads time, which none of the others do. */
+const MODES = ["state", "map", "code", "workflows", "authority", "analytics"] as const;
 export type ProjectMode = (typeof MODES)[number];
 
 const MODE_LABEL: Record<ProjectMode, string> = {
@@ -59,6 +66,7 @@ const MODE_LABEL: Record<ProjectMode, string> = {
   code: "Code",
   workflows: "Workflows",
   authority: "Authority",
+  analytics: "Analytics",
 };
 
 /**
@@ -90,7 +98,7 @@ const RENAMED: Record<string, ProjectMode> = {
 };
 
 /**
- * A `$view` parameter as one of the five, or as one of the four it used to be.
+ * A `$view` parameter as one of the six, or as one of the four it used to be.
  *
  * Falls back to `state` rather than 404ing, which is the rule the inspector this
  * replaces already followed: a route parameter is a string, anybody can type
@@ -189,9 +197,9 @@ function typing(target: EventTarget | null): boolean {
 }
 
 /**
- * Ctrl+1…5 (Cmd on a Mac) opens the modes in the order the tabs read.
+ * Ctrl+1…6 (Cmd on a Mac) opens the modes in the order the tabs read.
  *
- * A desktop app with five fixed views and no way to reach them but the pointer is a keyboard user
+ * A desktop app with six fixed views and no way to reach them but the pointer is a keyboard user
  * tabbing through the whole header every time. The chord is the one every tabbed desktop app uses
  * for "the nth tab", and `aria-keyshortcuts` on each link says it to a screen reader. Anything that
  * already answered the chord keeps it (`defaultPrevented`), as with the switcher's Ctrl+P.
@@ -253,7 +261,7 @@ export function Workspace() {
       />
 
       {/*
-        The five modes, dressed as the vendored `Tabs` and still links.
+        The six modes, dressed as the vendored `Tabs` and still links.
 
         `ui-tab-list` and `ui-tab` are the shared classes Radix's Tabs wears, so this
         strip is the same object on screen as the tabs in the Bench. What it is NOT is
@@ -262,7 +270,7 @@ export function Workspace() {
         `Workspace.test.tsx` pins — carry an old segment's replacement (Portuguese, or
         `github`) in its `href` so the address canonicalises itself on the first press. A `role="tab"`
         button has none of that — Radix's `Trigger` would swap the link role and
-        `aria-current` for `role="tab"` and `aria-selected`, and collapse five tab stops
+        `aria-current` for `role="tab"` and `aria-selected`, and collapse six tab stops
         into one roving one. `pj-tabs` on the inspector is the same decision.
 
         What IS adopted is the rule underneath the appearance: **the active indicator is
@@ -332,6 +340,7 @@ export function Workspace() {
         ) : null}
         {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
         {mode === "authority" ? <ModeGithub projectId={projectId} /> : null}
+        {mode === "analytics" ? <AnalyticsView projectId={projectId} /> : null}
       </QuietTips.Provider>
     </>
   );

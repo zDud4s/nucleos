@@ -12,7 +12,7 @@ import {
   readings,
   renderApp,
   slot,
-  renderWithQuery,
+  renderWithRouter,
   type DaemonState,
 } from "../test/harness";
 import { ApiRefusal } from "../data/client";
@@ -94,12 +94,13 @@ function panelsOf2(container: HTMLElement): string[] {
 }
 
 describe("normaliseMode", () => {
-  it("takes the five modes as themselves", () => {
+  it("takes the six modes as themselves", () => {
     expect(normaliseMode("state")).toBe("state");
     expect(normaliseMode("map")).toBe("map");
     expect(normaliseMode("code")).toBe("code");
     expect(normaliseMode("workflows")).toBe("workflows");
     expect(normaliseMode("authority")).toBe("authority");
+    expect(normaliseMode("analytics")).toBe("analytics");
   });
 
   /**
@@ -366,9 +367,10 @@ describe("the project workspace", () => {
   it("says it is still reading before the roster answers, rather than saying all is well", async () => {
     // The mode on its own, not the app: `renderApp` waits behind the connection
     // gate, so by the time it paints the roster has already answered and this
-    // state is over. Mounting the mode directly is the only way to see it.
+    // state is over. Mounting the mode directly is the only way to see it. Inside a router
+    // because the Readings section now carries a "See trends" link.
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
-    const { container } = renderWithQuery(<ModeState projectId="nucleos" answered={false} />);
+    const { container } = await renderWithRouter(<ModeState projectId="nucleos" answered={false} />);
 
     const leading = container.querySelector('section[aria-label="Leading"]');
     expect(leading?.textContent).toBe("Reading nucleos…");
@@ -560,6 +562,29 @@ describe("the project workspace", () => {
     fireEvent.keyDown(field, { key: "1", ctrlKey: true });
     expect(screen.getByRole("link", { name: "Map" }).getAttribute("aria-current")).toBe("page");
     field.remove();
+  });
+
+  /**
+   * The sixth mode comes from `MODES` alone: its tab, its Ctrl+6 and its route. Scoped to the tab
+   * strip because the rail has an "Analytics" link of its own.
+   */
+  it("opens the project's analytics with Ctrl+6, scoped to this project", async () => {
+    await openWorkspace({ mode: "state" });
+    const modes = await screen.findByRole("navigation", { name: "Project modes" });
+    const tab = within(modes).getByRole("link", { name: "Analytics" });
+    expect(tab.getAttribute("aria-keyshortcuts")).toBe("Control+6 Meta+6");
+
+    fireEvent.keyDown(window, { key: "6", ctrlKey: true });
+
+    await waitFor(() =>
+      expect(within(modes).getByRole("link", { name: "Analytics" }).getAttribute("aria-current")).toBe("page"),
+    );
+    expect(await screen.findByRole("region", { name: "Spend per day" })).toBeTruthy();
+    expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain(
+      "/projects/nucleos/analytics?days=30",
+    );
+    // A project's view has no quota (§9.8).
+    expect(screen.queryByRole("region", { name: "Quota" })).toBeNull();
   });
 
   /**

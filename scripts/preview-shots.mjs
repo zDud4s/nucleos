@@ -555,6 +555,13 @@ const SHOTS_TO_TAKE = [
   ["58-calendar-dragging-light", { path: "/calendar?on=2026-08-24", drag: "Reconcile the ledger", theme: "light" }],
   ["59-calendar-week-dragging", { path: "/calendar?view=week&on=2026-08-25", drag: "Design review" }],
 
+  /* Analytics: the global page at its default window and at a week, and a project's sixth mode. */
+  ["60-analytics", { path: "/analytics" }],
+  ["61-analytics-light", { path: "/analytics", theme: "light" }],
+  ["62-analytics-week", { path: "/analytics?days=7" }],
+  ["63-analytics-project", { path: "/projects/alpha/analytics" }],
+  ["64-analytics-project-light", { path: "/projects/alpha/analytics", theme: "light" }],
+
   /* The floating quota notch (design D8): `NotchWindow`, mounted the way `?window=notch` mounts it
      in the packaged app (`main.tsx`, mirrored by `preview/main.tsx`) — a borderless window of its
      own, over everything, rather than a piece of some page. Folded is the state it spends almost

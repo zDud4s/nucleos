@@ -2245,6 +2245,277 @@ ol.ui-well {
   border: 0;
 }
 
+/* ----------------------------------------------------------------- charts -- */
+
+/*
+  `StepLine`, `AreaChart` and `ShareBar`. Colour reaches a mark through ONE custom property,
+  `--series`, set by a series class and read by the mark: a share segment fills with it, a line
+  strokes with it, a legend swatch paints its background with it. One class per series therefore colours all three, and no colour
+  is ever written inline — `style=` is what the CSP gate refuses.
+*/
+.ui-chart {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  min-width: 0;
+}
+
+.ui-chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+/* An empty window still draws its grid; this line says why there is nothing on it. */
+.ui-chart-empty {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.ui-chart-swatch {
+  display: inline-block;
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--series, var(--border-strong));
+}
+
+.ui-chart-s1 { --series: var(--chart-1); }
+.ui-chart-s2 { --series: var(--chart-2); }
+.ui-chart-s3 { --series: var(--chart-3); }
+.ui-chart-s4 { --series: var(--chart-4); }
+.ui-chart-s5 { --series: var(--chart-5); }
+.ui-chart-s6 { --series: var(--chart-6); }
+.ui-chart-s7 { --series: var(--chart-7); }
+.ui-chart-s8 { --series: var(--chart-8); }
+.ui-chart-judge { --series: var(--chart-judge); }
+.ui-chart-other { --series: var(--chart-other); }
+.ui-chart-estimated { --series: var(--chart-estimated); }
+/* Context beside the subject: `StepLine`'s second series, a dashed line in the muted text colour. */
+.ui-chart-muted { --series: var(--text-muted); }
+
+/* Gate states keep the tones `ModeState`'s gauge already gives them: failed and errored never share a red.
+   Passed is the exception: the raw active tone was the loudest mark on the page for the commonest
+   outcome, so it wears the runs area's quieter green instead. */
+.ui-chart-passed { --series: var(--chart-runs); }
+.ui-chart-failed { --series: var(--tone-danger-fg); }
+.ui-chart-errored { --series: var(--tone-paused-fg); }
+.ui-chart-ungated { --series: var(--tone-off-fg); }
+.ui-chart-unknown { --series: var(--border-strong); }
+
+/* One area per metric: `AreaChart`'s `tone`. A metric's colour, not a series' — never one of the eight. */
+.ui-chart-cost { --series: var(--chart-cost); }
+.ui-chart-runs { --series: var(--chart-runs); }
+.ui-chart-delivered { --series: var(--chart-delivered); }
+.ui-chart-tokens { --series: var(--chart-tokens); }
+
+/*
+  `AreaChart`. The svg is drawn 1:1 (its viewBox is its measured width), so these sizes are the
+  sizes on screen. Only the faint horizontal grid is drawn — no axis lines — and each value sits
+  just above its line at the left edge, so the plot keeps the full width.
+*/
+.ui-area-grid {
+  stroke: var(--border);
+  stroke-width: 1px;
+  shape-rendering: crispEdges;
+}
+
+.ui-area-tick,
+.ui-area-day {
+  fill: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The gradient's stops read the tone through `--series`: the fill is a class, never a colour inline. */
+.ui-area-stop-top {
+  stop-color: var(--series, var(--border-strong));
+  stop-opacity: 0.3;
+}
+
+.ui-area-stop-bottom {
+  stop-color: var(--series, var(--border-strong));
+  stop-opacity: 0;
+}
+
+.ui-area-line {
+  fill: none;
+  stroke: var(--series, var(--border-strong));
+  stroke-width: 1.75px;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* Today, which is not over: the segment into it is dashed, so it never reads as a whole day. */
+.ui-area-partial {
+  stroke-dasharray: 3 3;
+  stroke-linecap: butt;
+}
+
+.ui-area-end {
+  fill: var(--series, var(--border-strong));
+}
+
+.ui-area-hover {
+  pointer-events: none;
+}
+
+.ui-area-crosshair {
+  stroke: var(--border-strong);
+  stroke-width: 1px;
+}
+
+/* A ring of the card's own surface lifts the dot off the line it sits on. */
+.ui-area-dot {
+  fill: var(--series, var(--border-strong));
+  stroke: var(--surface);
+  stroke-width: 2px;
+}
+
+.ui-area-tip-bg {
+  fill: var(--surface-raised);
+  stroke: var(--border-strong);
+  stroke-width: 1px;
+}
+
+.ui-area-tip-head {
+  fill: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.ui-area-tip-label {
+  fill: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.ui-area-tip-value {
+  fill: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-area-tip-total .ui-area-tip-label,
+.ui-area-tip-total .ui-area-tip-value {
+  fill: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+.ui-area-tip-swatch {
+  fill: var(--series, var(--border-strong));
+}
+
+/* The swatch of a series drawn dashed (`StepLine`'s context lines). */
+.ui-area-tip-dash {
+  stroke: var(--series, var(--border-strong));
+  stroke-width: 2px;
+  stroke-dasharray: 3 2;
+}
+
+/* The overlay only catches the pointer and the keyboard; focus shows as a ring around the plot. */
+.ui-area-overlay {
+  outline: none;
+}
+
+.ui-area-overlay:focus-visible {
+  stroke: var(--focus-ring);
+  stroke-width: 2px;
+}
+
+/*
+  `StepLine`: the area chart's grid, labels and tooltip, with steps for a curve. The first series
+  is solid over a softer gradient than an area's; the others are dashed context. Its legend borrows
+  `ShareBar`'s keys, with a dashed stroke for the swatch of a dashed line.
+*/
+.ui-step-gradient .ui-area-stop-top {
+  stop-opacity: 0.2;
+}
+
+.ui-step-line {
+  fill: none;
+  stroke: var(--series, var(--border-strong));
+  stroke-width: 1.75px;
+  stroke-linejoin: round;
+}
+
+.ui-step-dashed {
+  stroke-width: 1.5px;
+  stroke-dasharray: 4 3;
+}
+
+.ui-step-dot {
+  fill: var(--series, var(--border-strong));
+}
+
+/* A reading the provider marked stale: hollow, so it is visibly not a fresh measurement. */
+.ui-step-dot.ui-step-stale {
+  fill: var(--surface);
+  stroke: var(--series, var(--border-strong));
+  stroke-width: 1.5px;
+}
+
+.ui-step-key-dash {
+  display: inline-block;
+  width: 0.75rem;
+  height: 0;
+  border-top: 2px dashed var(--series, var(--border-strong));
+}
+
+/*
+  `ShareBar`: the breakdown under an area chart, and its legend. The bar is an svg stretched to the
+  width (`preserveAspectRatio="none"`); the keys wrap, each a swatch and label over its value.
+*/
+.ui-share {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.ui-share-bar {
+  display: block;
+  width: 100%;
+  height: 8px;
+}
+
+.ui-share-seg {
+  fill: var(--series, var(--border-strong));
+}
+
+.ui-share-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.ui-share-key {
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  column-gap: var(--space-1);
+}
+
+.ui-share-value {
+  grid-column: 2;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-share-pct {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 /* ------------------------------------------------------------------ tabs -- */
 
 /**
@@ -3290,6 +3561,62 @@ ol.ui-well {
 /* Windows high-contrast replaces every colour, and a tone carried only by background or fill
    disappears with it. Each of these gets a system-colour edge or fill back. */
 @media (forced-colors: active) {
+  /* Data colours are content, not decoration: keep them, and give them an edge to be read by. */
+  .ui-chart-svg,
+  .ui-chart-swatch,
+  .ui-step-key-dash {
+    forced-color-adjust: none;
+  }
+
+  .ui-chart-swatch {
+    border: 1px solid CanvasText;
+  }
+
+  /* The area chart and the share bar keep their colours too (`.ui-chart-svg` above); what is not
+     data — labels, grid, crosshair, tooltip — gets system colours back. */
+  .ui-share-bar {
+    forced-color-adjust: none;
+  }
+
+  .ui-share-seg {
+    stroke: Canvas;
+    stroke-width: 1px;
+  }
+
+  .ui-area-tick,
+  .ui-area-day,
+  .ui-area-tip-head,
+  .ui-area-tip-label,
+  .ui-area-tip-value {
+    fill: CanvasText;
+  }
+
+  .ui-area-grid {
+    stroke: GrayText;
+  }
+
+  .ui-area-crosshair {
+    stroke: CanvasText;
+  }
+
+  .ui-area-dot {
+    stroke: Canvas;
+  }
+
+  .ui-area-tip-bg {
+    fill: Canvas;
+    stroke: CanvasText;
+  }
+
+  .ui-area-tip-swatch {
+    stroke: CanvasText;
+    stroke-width: 1px;
+  }
+
+  .ui-area-overlay:focus-visible {
+    stroke: Highlight;
+  }
+
   .ui-badge {
     border: 1px solid CanvasText;
   }

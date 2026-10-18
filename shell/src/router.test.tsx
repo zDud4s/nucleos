@@ -201,17 +201,37 @@ describe("the app router", () => {
     expect(screen.queryByRole("region", { name: "Readings" })).toBeNull();
   });
 
-  it("offers the fifth mode in the tab strip, beside the four that were there", async () => {
+  it("offers the sixth mode in the tab strip, after the five that were there", async () => {
     await renderApp({ initialPath: "/projects/nucleos/state" });
 
     const modes = await screen.findByRole("navigation", { name: "Project modes" });
     const links = within(modes).getAllByRole("link");
 
-    // Five and not four. Read by position rather than by name because two of the tabs carry a
-    // count beside their label once the query behind them has answered.
-    expect(links).toHaveLength(5);
+    // Read by position rather than by name because two of the tabs carry a count beside their
+    // label once the query behind them has answered.
+    expect(links).toHaveLength(6);
     expect(links[4].textContent).toContain("Authority");
     expect(links[4].getAttribute("href")).toBe("/projects/nucleos/authority");
+    expect(links[5].textContent).toContain("Analytics");
+    expect(links[5].getAttribute("href")).toBe("/projects/nucleos/analytics");
+  });
+
+  it("resolves /analytics with its window, and falls back to 30 for one the núcleo does not serve", async () => {
+    const { router } = await renderApp({ initialPath: "/analytics?days=7" });
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Analytics" })).toBeDefined();
+    expect((router.state.location.search as { days?: number }).days).toBe(7);
+    await waitFor(() =>
+      expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain("/analytics?days=7"),
+    );
+
+    daemon.apiFetch.mockClear();
+    // The harness types the router narrowly; this is the real one createAppRouter built.
+    const app = router as unknown as ReturnType<typeof createAppRouter>;
+    await app.navigate({ to: "/analytics", search: { days: 14 } as never });
+    await waitFor(() =>
+      expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain("/analytics?days=30"),
+    );
   });
 
   it("opens on Home", async () => {

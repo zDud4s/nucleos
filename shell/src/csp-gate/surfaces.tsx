@@ -17,7 +17,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/ui/vendor/dialog";
+import { AreaChart } from "@/ui/AreaChart";
+import { ShareBar } from "@/ui/ShareBar";
 import { Sparkline } from "@/ui/Sparkline";
+import { StepLine } from "@/ui/StepLine";
 import { ForceGraph } from "../brain/ForceGraph";
 import type { GModel } from "../brain/graph-types";
 import type { Placed } from "../brain/hit-test";
@@ -234,24 +237,101 @@ function PaletteSurface({ done }: { done: () => void }) {
 }
 
 /**
- * `@visx/*`, through the one chart this app draws.
+ * `@visx/*`, through every chart this app draws.
  *
  * A chart library is this gate's canonical case: it computes geometry at render time and the
  * question is always whether it writes the result into the CSSOM or into a `style` attribute in
  * markup. visx composes d3's scales into React elements rather than mutating the DOM, so it should
  * be clean — "should be" is precisely what a gate is for.
  *
- * Two sparklines rather than one, because the component has two branches and only one of them
- * emits an `<svg>`: a series with points, and the dashed rail it draws for a series too short to
- * plot. A surface that exercised only the happy branch would go green on half the component.
+ * Every chart twice, because each has two branches: with data, and empty (a rail for `Sparkline`,
+ * a grid plus a sentence for `StepLine` and for `AreaChart`, and nothing at all for `ShareBar`).
+ * `AreaChart` a third time, compact, its sparkline branch. The tooltips of `AreaChart` and
+ * `StepLine` are only drawn on hover, so the gate sees the resting charts and the unit tests
+ * (`AreaChart.test.tsx`, `StepLine.test.tsx`) hold the hovered ones to the same no-`style` rule.
+ * No chart uses `@visx/axis` any more: its tick labels go through `@visx/text`, which writes
+ * `style="overflow: visible"`, so every label here is a bare `<text>`.
  */
 function ChartSurface({ done }: { done: () => void }) {
   useDoneAfter(done);
+  const day = (n: number) => `2026-10-${String(10 + n).padStart(2, "0")}`;
+  const keys = [
+    { key: "alpha", label: "alpha" },
+    { key: "beta", label: "beta" },
+    { key: "judge", label: "Judge", className: "ui-chart-judge" },
+  ];
+  const usd = (value: number) => `$${value.toFixed(2)}`;
+  const pct = (value: number) => `${Math.round(value * 100)}%`;
+  const from = Date.parse("2026-10-10T00:00:00Z");
+  const to = Date.parse("2026-10-17T00:00:00Z");
 
   return (
     <div className="p-6">
       <Sparkline values={[0, 2, 1, 4, 3, 6, 2, 5]} label="the 8 runs in the window" />
       <Sparkline values={[]} label="no run in the window" />
+      <StepLine
+        series={[
+          {
+            key: "anthropic:5h",
+            label: "anthropic 5h",
+            points: [
+              { at: Date.parse("2026-10-11T08:00:00Z"), value: 0.2 },
+              { at: Date.parse("2026-10-12T08:00:00Z"), value: 0.6, stale: true },
+            ],
+          },
+          { key: "anthropic:7d", label: "anthropic 7d", points: [{ at: Date.parse("2026-10-13T00:00:00Z"), value: 0.41 }] },
+        ]}
+        from={from}
+        to={to}
+        label="Quota used, last 7 days"
+        format={pct}
+        empty="No quota history yet"
+      />
+      <StepLine series={[]} from={from} to={to} label="Quota, no history" format={pct} empty="No quota history yet" />
+      <AreaChart
+        data={Array.from({ length: 7 }, (_, n) => ({
+          day: day(n),
+          parts: [
+            { key: "alpha", value: n % 3 },
+            { key: "beta", value: (n + 1) % 2 },
+            { key: "estimate", value: 0.4 },
+          ],
+          partial: n === 6,
+        }))}
+        keys={[...keys, { key: "estimate", label: "Estimated", className: "ui-chart-estimated" }]}
+        label="Spend per day, last 7 days"
+        format={usd}
+        empty="No spend in this window"
+        tone="ui-chart-cost"
+        apart="estimate"
+      />
+      <AreaChart
+        data={Array.from({ length: 7 }, (_, n) => ({ day: day(n), parts: [] }))}
+        keys={keys}
+        label="Spend per day, nothing in it"
+        format={usd}
+        empty="No spend in this window"
+        tone="ui-chart-cost"
+      />
+      <AreaChart
+        data={Array.from({ length: 7 }, (_, n) => ({ day: day(n), parts: [{ key: "alpha", value: n % 4 }], partial: n === 6 }))}
+        keys={keys}
+        label="Runs per day, as a sparkline"
+        format={String}
+        empty="No runs"
+        tone="ui-chart-runs"
+        compact
+      />
+      <ShareBar
+        items={[
+          { key: "alpha", label: "alpha", value: 3.2 },
+          { key: "beta", label: "beta", value: 0 },
+          { key: "judge", label: "Judge", value: 0.8, className: "ui-chart-judge" },
+        ]}
+        format={usd}
+        label="Spend by project, last 7 days"
+      />
+      <ShareBar items={[]} format={usd} label="Spend by project, nothing in it" />
     </div>
   );
 }
@@ -357,7 +437,7 @@ export const SURFACES: Surface[] = [
   },
   {
     name: "charts",
-    why: "@visx/{group,scale,shape}, which compute geometry per render — both branches of Sparkline",
+    why: "@visx/{curve,group,scale,shape}, which compute geometry per render — Sparkline, StepLine, AreaChart (also compact) and ShareBar, each with data and empty",
     Component: ChartSurface,
   },
   {

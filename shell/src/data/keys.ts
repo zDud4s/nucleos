@@ -42,6 +42,15 @@ export const keys = {
 
   /** How much of each assistant's usage window is gone — `GET /quota`. */
   quota: ["quota"] as const,
+  /**
+   * Windowed series (spec analytics-fundacao §6). The window is part of the key: switching from 30
+   * to 7 days is a different answer, and keeping both cached makes switching back instant. A
+   * project's analytics live under `projects` instead, beside its readings.
+   */
+  analytics: {
+    global: (days: number) => ["analytics", "global", days] as const,
+    quota: (days: number) => ["analytics", "quota", days] as const,
+  },
 
   autopilot: {
     /** The prefix, for the rare caller that means *everything autopilot*. */
@@ -169,6 +178,8 @@ export const keys = {
       ["projects", projectId, "grep", q, path] as const,
     diff: (projectId: string, path: string) => ["projects", projectId, "diff", path] as const,
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
+    /** The project's analytics for one window — `GET /projects/{id}/analytics?days=`. */
+    analytics: (projectId: string, days: number) => ["projects", projectId, "analytics", days] as const,
     /**
      * What this project would lose by leaving, and what is holding it here.
      *

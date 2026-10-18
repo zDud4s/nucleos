@@ -680,10 +680,25 @@ fn from_reading(
 /// answer "what was the last real figure"; a provider whose token expired an hour ago has not
 /// changed its burn, it has stopped being readable, and forgetting the figure would turn a
 /// recoverable outage into a notch that has to start again from empty.
+///
+/// Each window that changed also gets a row in `quota_history` (0199), in the same transaction as
+/// its upsert, so the analytics page can draw the burn over time. An unchanged or unmeasured
+/// reading writes no history, by the same rule that spares the upsert.
 pub async fn record(
     pool: &SqlitePool,
     providers: &[Provider],
-    _now: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sqlx::Error> {
+    record_with_guard(pool, providers, now, &LAST_HISTORY_PRUNE).await
+}
+
+/// [`record`] with the prune guard passed in, so a test can own it instead of sharing the process
+/// static.
+async fn record_with_guard(
+    pool: &SqlitePool,
+    providers: &[Provider],
+    now: chrono::DateTime<chrono::Utc>,
+    guard: &std::sync::Mutex<Option<DateTime<Utc>>>,
 ) -> Result<(), sqlx::Error> {
     // What is already stored, read once. `GET /quota` is polled by the shell and the sidecar answers
     // `cached: true` with the very same reading until its own refresh, so most calls re-write the
@@ -704,6 +719,9 @@ pub async fn record(
             if reading_is_stored(&existing, provider, window) {
                 continue;
             }
+            // The upsert and its history row commit together: a history holding a change the table
+            // never took — or missing one it did — would draw a burn that never happened.
+            let mut tx = pool.begin().await?;
             sqlx::query(
                 "INSERT INTO quota_readings
                      (provider, window_name, used_fraction, resets_at, fidelity, stale, read_at)
@@ -725,11 +743,79 @@ pub async fn record(
             .bind(provider.fidelity.as_db_str())
             .bind(i64::from(window.stale))
             .bind(&provider.read_at)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+            sqlx::query(
+                "INSERT INTO quota_history
+                     (recorded_at, provider, window_name, used_fraction, resets_at, fidelity, stale)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (provider, window_name, recorded_at) DO UPDATE SET
+                     used_fraction = excluded.used_fraction,
+                     resets_at     = excluded.resets_at,
+                     fidelity      = excluded.fidelity,
+                     stale         = excluded.stale",
+            )
+            .bind(&provider.read_at)
+            .bind(&provider.provider)
+            .bind(&window.window)
+            .bind(window.used_fraction.clamp(0.0, 1.0))
+            .bind(window.resets_at.as_deref())
+            .bind(provider.fidelity.as_db_str())
+            .bind(i64::from(window.stale))
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+    }
+    if take_prune_turn(guard, now) {
+        // Best effort: the readings above are already committed, and a failed prune only leaves old
+        // rows for the next hour's turn.
+        if let Err(error) = prune_history(pool, now).await {
+            tracing::warn!(%error, "quota history prune failed");
         }
     }
     Ok(())
+}
+
+/// How long `quota_history` keeps a row (spec §7).
+pub const HISTORY_RETENTION_DAYS: i64 = 180;
+
+/// When this process last pruned `quota_history`.
+///
+/// In memory on purpose: the guard only spares a DELETE per poll, and a restart that prunes once
+/// more than strictly needed costs one cheap statement. Process-wide rather than per pool, which is
+/// why the tests go through `record_with_guard` with a guard of their own.
+static LAST_HISTORY_PRUNE: std::sync::Mutex<Option<DateTime<Utc>>> = std::sync::Mutex::new(None);
+
+/// PURE: whether an hour has passed since the last prune. A `last` in the future is a clock that
+/// moved back, and is treated as due rather than as a reason to never prune again.
+fn prune_due(last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last {
+        None => true,
+        Some(at) => now < at || now - at >= Duration::hours(1),
+    }
+}
+
+/// Claim this hour's prune: true at most once an hour per process.
+fn take_prune_turn(guard: &std::sync::Mutex<Option<DateTime<Utc>>>, now: DateTime<Utc>) -> bool {
+    let mut last = guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !prune_due(*last, now) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// Delete history older than [`HISTORY_RETENTION_DAYS`]. Returns how many rows went.
+pub(crate) async fn prune_history(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
+    let cutoff = (now - Duration::days(HISTORY_RETENTION_DAYS)).to_rfc3339();
+    sqlx::query("DELETE FROM quota_history WHERE recorded_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .map(|done| done.rows_affected())
 }
 
 /// Whether `existing` already holds exactly what `record` would write for this window.
@@ -2116,6 +2202,142 @@ mod tests {
         );
         let stored = stored(&pool, noon()).await.unwrap();
         assert!((stored[0].windows[0].used_fraction - 0.70).abs() < f64::EPSILON);
+    }
+
+    /// What the history holds, in the order it was written.
+    async fn history(pool: &SqlitePool) -> Vec<(String, String, f64)> {
+        sqlx::query_as(
+            "SELECT recorded_at, window_name, used_fraction FROM quota_history ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The history gets one row per CHANGE — the same rule that spares the upsert — and an
+    /// unmeasured reading, which writes no figure, writes no history either.
+    #[tokio::test]
+    async fn a_changed_reading_is_kept_in_the_history_and_an_identical_one_is_not() {
+        let pool = pool().await;
+
+        record(&pool, &measured(0.56), noon()).await.unwrap();
+        record(&pool, &measured(0.56), noon()).await.unwrap();
+        assert_eq!(
+            history(&pool).await.len(),
+            1,
+            "an identical reading was written to the history"
+        );
+
+        let mut later = measured(0.70);
+        later[0].read_at = "2026-09-19T06:00:00+00:00".into();
+        record(&pool, &later, noon()).await.unwrap();
+
+        let mut blind = measured(0.99);
+        blind[0].fidelity = Fidelity::Unmeasured;
+        blind[0].read_at = "2026-09-19T07:00:00+00:00".into();
+        record(&pool, &blind, noon()).await.unwrap();
+
+        assert_eq!(
+            history(&pool).await,
+            vec![
+                (
+                    "2026-09-19T05:00:00+00:00".to_string(),
+                    "5h".to_string(),
+                    0.56
+                ),
+                (
+                    "2026-09-19T06:00:00+00:00".to_string(),
+                    "5h".to_string(),
+                    0.70
+                ),
+            ]
+        );
+    }
+
+    /// The same `read_at` recorded twice, differing only in `stale`, is one history row (the series
+    /// key is unique) carrying the latest flag.
+    #[tokio::test]
+    async fn the_same_read_at_is_one_history_row_with_the_latest_stale_flag() {
+        let pool = pool().await;
+        let fresh = measured(0.56);
+        let mut stale = measured(0.56);
+        stale[0].windows[0].stale = true;
+
+        record(&pool, &fresh, noon()).await.unwrap();
+        record(&pool, &stale, noon()).await.unwrap();
+
+        let rows: Vec<i64> = sqlx::query_scalar("SELECT stale FROM quota_history")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![1]);
+    }
+
+    /// `record` -> turn -> prune is wired: a fresh guard takes the turn and drops an old row.
+    #[tokio::test]
+    async fn record_prunes_old_history_through_its_guard() {
+        let pool = pool().await;
+        let old = noon() - Duration::days(HISTORY_RETENTION_DAYS + 1);
+        sqlx::query(
+            "INSERT INTO quota_history (recorded_at, provider, window_name, used_fraction, fidelity)
+             VALUES (?, 'claude', '5h', 0.5, 'official')",
+        )
+        .bind(old.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let guard = std::sync::Mutex::new(None);
+        record_with_guard(&pool, &measured(0.56), noon(), &guard)
+            .await
+            .unwrap();
+
+        let kept = history(&pool).await;
+        assert_eq!(kept.len(), 1, "the 181-day-old row survived the prune");
+        assert_eq!(kept[0].0, "2026-09-19T05:00:00+00:00");
+    }
+
+    /// 180 days to the second: a row exactly at the edge stays, one a second older goes.
+    #[tokio::test]
+    async fn the_history_keeps_180_days_to_the_second() {
+        let pool = pool().await;
+        let now = noon();
+        let edge = now - Duration::days(HISTORY_RETENTION_DAYS);
+        for at in [edge - Duration::seconds(1), edge, now] {
+            sqlx::query(
+                "INSERT INTO quota_history (recorded_at, provider, window_name, used_fraction, fidelity)
+                 VALUES (?, 'claude', '5h', 0.5, 'official')",
+            )
+            .bind(at.to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(prune_history(&pool, now).await.unwrap(), 1);
+
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT recorded_at FROM quota_history ORDER BY recorded_at")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, vec![edge.to_rfc3339(), now.to_rfc3339()]);
+    }
+
+    /// `GET /quota` is polled every few seconds; the DELETE must not ride on every poll.
+    #[test]
+    fn the_history_is_pruned_at_most_once_an_hour() {
+        let now = noon();
+        assert!(
+            prune_due(None, now),
+            "a fresh process prunes on its first record"
+        );
+        assert!(!prune_due(Some(now - Duration::minutes(59)), now));
+        assert!(prune_due(Some(now - Duration::hours(1)), now));
+        assert!(
+            prune_due(Some(now + Duration::minutes(5)), now),
+            "a clock that went back must not stop the pruning for good"
+        );
     }
 
     /// The fallback is only worth having if it actually carries the figures across.
