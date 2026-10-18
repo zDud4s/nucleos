@@ -11322,7 +11322,15 @@ tests:
     #[tokio::test]
     async fn search_before_an_unknown_run_returns_nothing() {
         let pool = search_test_pool().await;
-        insert_search_run(&pool, "p", "completed", "worktree", "x", "2026-10-01T00:00:01Z").await;
+        insert_search_run(
+            &pool,
+            "p",
+            "completed",
+            "worktree",
+            "x",
+            "2026-10-01T00:00:01Z",
+        )
+        .await;
 
         let rows = search(
             &pool,
