@@ -62,6 +62,10 @@ export interface VcsRequestSummary {
   failure_reason?: string | null;
   resolution_run_id?: number | null;
   resolution_status?: string | null;
+  /** The resolution run's gate: a `completed` run lands only when this is absent or `passed`. */
+  resolution_gate_status?: string | null;
+  /** The resolution run's worktree was removed, so its resolution is never landed. */
+  resolution_worktree_gone?: boolean;
   /** This merge was itself a resolution's landing, so no agent will be minted for it. */
   from_resolution?: boolean;
 }

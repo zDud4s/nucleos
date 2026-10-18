@@ -1712,6 +1712,27 @@ describe("what a git request asks of the reader", () => {
     });
     expect(gitNextStep(merge({ from_resolution: true }))?.yours).toBe(true);
     expect(gitNextStep(merge({ status: "blocked" }))?.before).toBe("submit it again");
+  });
+
+  // Requests 688/689/699: the run `completed` but the resolver refused it, so "the queue lands it
+  // and this clears on its own" was a promise nobody would keep.
+  it("does not promise a landing the resolver will refuse", () => {
+    const done = { resolution_run_id: 7, resolution_status: "completed" } as const;
+    expect(gitNextStep(merge({ ...done, resolution_gate_status: "passed" }))).toMatchObject({
+      run: 7,
+      yours: false,
+    });
+    expect(gitNextStep(merge({ ...done, resolution_gate_status: null }))?.yours).toBe(false);
+    const red = gitNextStep(merge({ ...done, resolution_gate_status: "errored" }));
+    expect(red).toMatchObject({ run: 7, yours: true });
+    expect(red?.after).toContain("gate errored");
+    expect(red?.after).not.toContain("clears on its own");
+    const gone = gitNextStep(merge({ ...done, resolution_gate_status: "passed", resolution_worktree_gone: true }));
+    expect(gone).toMatchObject({ run: 7, yours: true });
+    expect(gone?.after).toContain("worktree is gone");
+  });
+
+  it("names no next step for a request that is not an escalated merge", () => {
     expect(gitNextStep(merge({ op: "push" }))).toBeNull();
   });
 });
