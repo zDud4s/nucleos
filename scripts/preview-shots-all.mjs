@@ -39,8 +39,13 @@ const OUT = join(SHELL, "dist-preview");
 const SHOTS = resolve(process.argv[2] ?? join(ROOT, "preview-shots"));
 const ONLY = process.argv[3];
 
-const WIDTH = 1440;
-const HEIGHT = 960;
+/* PREVIEW_WIDTHS="1280x800,800x600" photographs every shot at each size; default is one 1440x960. */
+const SIZES = (process.env.PREVIEW_WIDTHS ?? "1440x960")
+  .split(",")
+  .map((size) => size.trim().split("x").map(Number))
+  .filter(([w, h]) => w > 0 && h > 0);
+let WIDTH = SIZES[0][0];
+let HEIGHT = SIZES[0][1];
 const READY_TIMEOUT = 20_000;
 
 function die(why) {
@@ -60,14 +65,17 @@ if (browser === undefined) die("no Chromium found. Looked for Chrome and Edge in
 
 /* ------------------------------------------------------------------ build */
 
-console.log("preview: building the bundle…");
-const build = spawn(
-  process.execPath,
-  ["node_modules/vite/bin/vite.js", "build", "--config", "preview.vite.config.mjs"],
-  { cwd: SHELL, stdio: "inherit" },
-);
-const buildCode = await new Promise((ok) => build.on("close", ok));
-if (buildCode !== 0) die("the preview bundle did not build (vite exited " + buildCode + ")");
+/* PREVIEW_SKIP_BUILD=1 reuses the existing dist-preview instead of building. */
+if (process.env.PREVIEW_SKIP_BUILD !== "1") {
+  console.log("preview: building the bundle…");
+  const build = spawn(
+    process.execPath,
+    ["node_modules/vite/bin/vite.js", "build", "--config", "preview.vite.config.mjs"],
+    { cwd: SHELL, stdio: "inherit" },
+  );
+  const buildCode = await new Promise((ok) => build.on("close", ok));
+  if (buildCode !== 0) die("the preview bundle did not build (vite exited " + buildCode + ")");
+}
 if (!existsSync(join(OUT, "preview.html"))) die("the build produced no preview.html in " + OUT);
 
 /* ------------------------------------------------- the policy, and a server */
@@ -322,7 +330,7 @@ async function shoot(name, { path, tab, press, drag, theme = "dark" }) {
   }
   const height = tall;
 
-  const file = join(SHOTS, name + ".png");
+  const file = join(SHOTS, name + (SIZES.length > 1 ? `-${WIDTH}x${HEIGHT}` : "") + ".png");
   await writeFile(file, Buffer.from(data, "base64"));
   console.log(
     "  " + (pageErrors.length === 0 ? "ok  " : "err ") + name + "  " + Math.round(height) + "px" +
@@ -404,14 +412,24 @@ const SHOTS_TO_TAKE = [
   ["31-system-notifications", { path: "/system/notifications" }],
   ["31-system-notifications-open", { path: "/system/notifications", press: "3 kinds" }],
   ["31-system-settings", { path: "/system/settings" }],
+  // W4 capture additions: the voice archive drawer and the calendar day sheet.
+  ["90-voice-archive", { path: "/voice", press: "Archive" }],
+  ["91-calendar-daysheet", { path: "/calendar?on=2026-08-24", press: "24" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));
 if (wanted.length === 0) die(`no shot matches "${ONLY}"`);
 
 let clean = true;
-for (const [name, options] of wanted) {
-  clean = (await shoot(name, options)) && clean;
+for (const [width, height] of SIZES) {
+  WIDTH = width;
+  HEIGHT = height;
+  await send("Emulation.setDeviceMetricsOverride", {
+    width: WIDTH, height: HEIGHT, deviceScaleFactor: 2, mobile: false,
+  }, sessionId);
+  for (const [name, options] of wanted) {
+    clean = (await shoot(name, options)) && clean;
+  }
 }
 
 console.log("\npreview: " + wanted.length + " shots in " + SHOTS);
