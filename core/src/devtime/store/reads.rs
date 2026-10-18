@@ -24,6 +24,48 @@ pub struct SpanDayRow {
     pub ms: i64,
 }
 
+/// One read in its two forms (spec §6.5): `$global`, and `$project` with `$filter` spliced in after
+/// the window. One `(?3 IS NULL OR ss.project_id = ?3)` form was what these reads had, and EXPLAIN
+/// QUERY PLAN showed it `SCAN sp` for a single project too — SQLite plans the statement once, for
+/// either value of `?3`, so it cannot start from an index on `project_id`. The project form starts
+/// from `idx_devtime_sessions_project` (migration 0210) and reaches the rows by session; the
+/// global form names no `?3`, and is the same scan it always was.
+macro_rules! global_and_project {
+    ($global:ident, $project:ident, $head:literal, $filter:literal, $tail:literal $(,)?) => {
+        pub(crate) const $global: &str = concat!($head, $tail);
+        pub(crate) const $project: &str = concat!($head, $filter, $tail);
+    };
+}
+
+// Span time clipped to `[?1, ?2)` and split at each UTC midnight — see `span_day_rows`.
+global_and_project!(
+    SPAN_DAY_SQL,
+    SPAN_DAY_PROJECT_SQL,
+    "WITH RECURSIVE days(d) AS (
+         SELECT date(?1)
+         UNION ALL SELECT date(d, '+1 day') FROM days WHERE date(d, '+1 day') < ?2
+     ),
+     bounds AS (
+         SELECT d, d || 'T00:00:00.000Z' AS d0, date(d, '+1 day') || 'T00:00:00.000Z' AS d1 FROM days
+     ),
+     clipped AS (
+         SELECT sp.kind, sp.waste, sp.rule_id, sp.lever, sp.confidence,
+                CASE WHEN sp.lane = 'main' THEN 'main' ELSE 'other' END AS lane_class,
+                max(sp.started_at, ?1) AS s, min(sp.ended_at, ?2) AS e
+         FROM devtime_spans sp
+         JOIN devtime_sessions ss ON ss.session_id = sp.session_id
+         WHERE sp.started_at < ?2 AND sp.ended_at > ?1",
+    " AND ss.project_id = ?3",
+    "
+     )
+     SELECT b.d AS day, c.kind, c.waste, c.rule_id, c.lever, c.confidence, c.lane_class,
+            CAST(round(SUM((julianday(min(c.e, b.d1)) - julianday(max(c.s, b.d0))) * 86400000.0))
+                 AS INTEGER) AS ms
+     FROM clipped c JOIN bounds b ON c.s < b.d1 AND c.e > b.d0
+     GROUP BY b.d, c.kind, c.waste, c.rule_id, c.lever, c.confidence, c.lane_class
+     ORDER BY b.d",
+);
+
 /// Span time clipped to `[since, until)` and split at each UTC midnight (spec §4.2, §6.2): a span
 /// counts on the days it RUNS, so the per-day sum equals the clipped wall-clock length.
 ///
@@ -35,35 +77,15 @@ pub async fn span_day_rows(
     since: &str,
     until: &str,
 ) -> sqlx::Result<Vec<SpanDayRow>> {
-    sqlx::query_as::<_, SpanDayRow>(
-        "WITH RECURSIVE days(d) AS (
-             SELECT date(?1)
-             UNION ALL SELECT date(d, '+1 day') FROM days WHERE date(d, '+1 day') < ?2
-         ),
-         bounds AS (
-             SELECT d, d || 'T00:00:00.000Z' AS d0, date(d, '+1 day') || 'T00:00:00.000Z' AS d1 FROM days
-         ),
-         clipped AS (
-             SELECT sp.kind, sp.waste, sp.rule_id, sp.lever, sp.confidence,
-                    CASE WHEN sp.lane = 'main' THEN 'main' ELSE 'other' END AS lane_class,
-                    max(sp.started_at, ?1) AS s, min(sp.ended_at, ?2) AS e
-             FROM devtime_spans sp
-             JOIN devtime_sessions ss ON ss.session_id = sp.session_id
-             WHERE (?3 IS NULL OR ss.project_id = ?3)
-               AND sp.started_at < ?2 AND sp.ended_at > ?1
-         )
-         SELECT b.d AS day, c.kind, c.waste, c.rule_id, c.lever, c.confidence, c.lane_class,
-                CAST(round(SUM((julianday(min(c.e, b.d1)) - julianday(max(c.s, b.d0))) * 86400000.0))
-                     AS INTEGER) AS ms
-         FROM clipped c JOIN bounds b ON c.s < b.d1 AND c.e > b.d0
-         GROUP BY b.d, c.kind, c.waste, c.rule_id, c.lever, c.confidence, c.lane_class
-         ORDER BY b.d",
-    )
-    .bind(since)
-    .bind(until)
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
+    let sql = match project_id {
+        Some(_) => SPAN_DAY_PROJECT_SQL,
+        None => SPAN_DAY_SQL,
+    };
+    let query = sqlx::query_as::<_, SpanDayRow>(sql).bind(since);
+    match project_id {
+        Some(project) => query.bind(until).bind(project).fetch_all(pool).await,
+        None => query.bind(until).fetch_all(pool).await,
+    }
 }
 
 /// Tokens on one UTC day (of `first_at`, no split: a message is an instant), per model and effort.
@@ -80,30 +102,39 @@ pub struct MessageDayRow {
     pub messages: i64,
 }
 
+global_and_project!(
+    MESSAGE_DAY_SQL,
+    MESSAGE_DAY_PROJECT_SQL,
+    "SELECT date(m.first_at) AS day, m.model, m.effort,
+            COALESCE(SUM(COALESCE(m.input_tokens, 0)), 0) AS input,
+            COALESCE(SUM(COALESCE(m.cache_read_tokens, 0)), 0) AS cache_read,
+            COALESCE(SUM(COALESCE(m.cache_creation_tokens, 0)), 0) AS cache_creation,
+            COALESCE(SUM(COALESCE(m.output_tokens, 0)), 0) AS output,
+            COUNT(*) AS messages
+     FROM devtime_messages m
+     JOIN devtime_sessions ss ON ss.session_id = m.session_id
+     WHERE m.first_at >= ?1 AND m.first_at < ?2",
+    " AND ss.project_id = ?3",
+    "
+     GROUP BY day, m.model, m.effort
+     ORDER BY day, m.model, m.effort",
+);
+
 pub async fn message_day_rows(
     pool: &SqlitePool,
     project_id: Option<&str>,
     since: &str,
     until: &str,
 ) -> sqlx::Result<Vec<MessageDayRow>> {
-    sqlx::query_as::<_, MessageDayRow>(
-        "SELECT date(m.first_at) AS day, m.model, m.effort,
-                COALESCE(SUM(COALESCE(m.input_tokens, 0)), 0) AS input,
-                COALESCE(SUM(COALESCE(m.cache_read_tokens, 0)), 0) AS cache_read,
-                COALESCE(SUM(COALESCE(m.cache_creation_tokens, 0)), 0) AS cache_creation,
-                COALESCE(SUM(COALESCE(m.output_tokens, 0)), 0) AS output,
-                COUNT(*) AS messages
-         FROM devtime_messages m
-         JOIN devtime_sessions ss ON ss.session_id = m.session_id
-         WHERE (?3 IS NULL OR ss.project_id = ?3) AND m.first_at >= ?1 AND m.first_at < ?2
-         GROUP BY day, m.model, m.effort
-         ORDER BY day, m.model, m.effort",
-    )
-    .bind(since)
-    .bind(until)
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
+    let sql = match project_id {
+        Some(_) => MESSAGE_DAY_PROJECT_SQL,
+        None => MESSAGE_DAY_SQL,
+    };
+    let query = sqlx::query_as::<_, MessageDayRow>(sql).bind(since);
+    match project_id {
+        Some(project) => query.bind(until).bind(project).fetch_all(pool).await,
+        None => query.bind(until).fetch_all(pool).await,
+    }
 }
 
 /// Turns on one UTC day (of `started_at`). `correction_known` counts turns whose
@@ -117,27 +148,36 @@ pub struct TurnDayRow {
     pub correction_known: i64,
 }
 
+global_and_project!(
+    TURN_DAY_SQL,
+    TURN_DAY_PROJECT_SQL,
+    "SELECT date(t.started_at) AS day, COUNT(*) AS turns,
+            COALESCE(SUM(t.interrupted <> 0), 0) AS interrupted,
+            COALESCE(SUM(COALESCE(t.opens_with_correction, 0) <> 0), 0) AS corrections,
+            COALESCE(SUM(t.opens_with_correction IS NOT NULL), 0) AS correction_known
+     FROM devtime_turns t
+     JOIN devtime_sessions ss ON ss.session_id = t.session_id
+     WHERE t.started_at >= ?1 AND t.started_at < ?2",
+    " AND ss.project_id = ?3",
+    "
+     GROUP BY day ORDER BY day",
+);
+
 pub async fn turn_day_rows(
     pool: &SqlitePool,
     project_id: Option<&str>,
     since: &str,
     until: &str,
 ) -> sqlx::Result<Vec<TurnDayRow>> {
-    sqlx::query_as::<_, TurnDayRow>(
-        "SELECT date(t.started_at) AS day, COUNT(*) AS turns,
-                COALESCE(SUM(t.interrupted <> 0), 0) AS interrupted,
-                COALESCE(SUM(COALESCE(t.opens_with_correction, 0) <> 0), 0) AS corrections,
-                COALESCE(SUM(t.opens_with_correction IS NOT NULL), 0) AS correction_known
-         FROM devtime_turns t
-         JOIN devtime_sessions ss ON ss.session_id = t.session_id
-         WHERE (?3 IS NULL OR ss.project_id = ?3) AND t.started_at >= ?1 AND t.started_at < ?2
-         GROUP BY day ORDER BY day",
-    )
-    .bind(since)
-    .bind(until)
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
+    let sql = match project_id {
+        Some(_) => TURN_DAY_PROJECT_SQL,
+        None => TURN_DAY_SQL,
+    };
+    let query = sqlx::query_as::<_, TurnDayRow>(sql).bind(since);
+    match project_id {
+        Some(project) => query.bind(until).bind(project).fetch_all(pool).await,
+        None => query.bind(until).fetch_all(pool).await,
+    }
 }
 
 /// The window's sessions for the quality strip: how many overlap it, how many are `dirty`, how many
@@ -150,26 +190,34 @@ pub struct SessionCounts {
     pub unruled: i64,
 }
 
+global_and_project!(
+    SESSION_COUNTS_SQL,
+    SESSION_COUNTS_PROJECT_SQL,
+    "SELECT COUNT(*) AS sessions,
+            COALESCE(SUM(dirty <> 0), 0) AS dirty,
+            COALESCE(SUM(rules_version IS NULL), 0) AS unruled
+     FROM devtime_sessions
+     WHERE COALESCE(started_at, updated_at) < ?2
+       AND COALESCE(ended_at, updated_at) >= ?1",
+    " AND project_id = ?3",
+    "",
+);
+
 pub async fn session_counts(
     pool: &SqlitePool,
     project_id: Option<&str>,
     since: &str,
     until: &str,
 ) -> sqlx::Result<SessionCounts> {
-    sqlx::query_as::<_, SessionCounts>(
-        "SELECT COUNT(*) AS sessions,
-                COALESCE(SUM(dirty <> 0), 0) AS dirty,
-                COALESCE(SUM(rules_version IS NULL), 0) AS unruled
-         FROM devtime_sessions
-         WHERE (?3 IS NULL OR project_id = ?3)
-           AND COALESCE(started_at, updated_at) < ?2
-           AND COALESCE(ended_at, updated_at) >= ?1",
-    )
-    .bind(since)
-    .bind(until)
-    .bind(project_id)
-    .fetch_one(pool)
-    .await
+    let sql = match project_id {
+        Some(_) => SESSION_COUNTS_PROJECT_SQL,
+        None => SESSION_COUNTS_SQL,
+    };
+    let query = sqlx::query_as::<_, SessionCounts>(sql).bind(since);
+    match project_id {
+        Some(project) => query.bind(until).bind(project).fetch_one(pool).await,
+        None => query.bind(until).fetch_one(pool).await,
+    }
 }
 
 /// Findings per rule whose `started_at` falls in the window — the `findings` column of

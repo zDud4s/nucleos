@@ -24651,6 +24651,224 @@ mod tests {
         }
         db.close().await;
     }
+
+    /// One project on the roster, one ruled session and ten minutes of `main`-lane tool time inside
+    /// it. Raw SQL: the binary's tests build the library without `cfg(test)`, so
+    /// `devtime::store::fixture` is not reachable from here.
+    async fn seed_devtime(state: &AppState) {
+        for sql in [
+            "INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'off')",
+            "INSERT INTO devtime_sessions (session_id, project_id, started_at, dirty,
+                 parser_version, updated_at, rules_version)
+             VALUES ('s1', 'alpha', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours'), 0, 1,
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 hours'), 'v1')",
+            "INSERT INTO devtime_spans (session_id, lane, kind, started_at, ended_at, confidence,
+                 parser_version)
+             VALUES ('s1', 'main', 'tool', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 minutes'),
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-80 minutes'), 'exact', 1)",
+        ] {
+            sqlx::query(sql).execute(&state.pool).await.unwrap();
+        }
+    }
+
+    /// One finding of the first registered rule, an hour ago, in `alpha`'s session `s1`.
+    async fn seed_finding(state: &AppState, key: &str) {
+        sqlx::query(
+            "INSERT INTO devtime_findings (finding_key, project_id, session_id, scope, rule_id,
+                 rule_version, level, waste, lever, confidence, lane, started_at, ended_at, cost_ms,
+                 count, rules_version, parser_version)
+             VALUES (?, 'alpha', 's1', 'session', ?, 1, 'base', 'rework', 'spec_gap', 'inferred',
+                     'main', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 hour'),
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 hour'), 1000, 1, 'v1', 1)",
+        )
+        .bind(key)
+        .bind(crate::devtime::rules::RULES[0].id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// The mark as the shell sends it, with the control token.
+    async fn post_mark(
+        state: &AppState,
+        key: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
+        let uri = format!("/analytics/devtime/findings/{key}/mark");
+        api_token_request(state.clone(), "POST", &uri, "test-token", Some(body)).await
+    }
+
+    /// The devtime routes answer the pinned shape (plan "JSON contract"), globally and per project.
+    #[tokio::test]
+    async fn analytics_devtime_answers_the_documented_shape_globally_and_per_project() {
+        let state = test_state().await;
+        seed_devtime(&state).await;
+
+        let global = get_json(&state, "/analytics/devtime?days=7").await;
+        assert_eq!(global["scope"], "global", "{global}");
+        assert!(global["project_id"].is_null(), "{global}");
+        let series = global["days_series"].as_array().unwrap();
+        assert_eq!(series.len(), 7, "{global}");
+        assert_eq!(series[6]["partial"], true, "{global}");
+        assert_eq!(global["window"]["to"], series[6]["day"], "{global}");
+        assert_eq!(global["tokens"]["cost_estimated"], true, "{global}");
+        assert!(
+            global["tokens"]["cost_usd"].is_null(),
+            "no message, so nothing priced: {global}"
+        );
+        // `days_series[].cost_usd` is on every day, `null` rather than absent when unpriced.
+        let unpriced = |day: &serde_json::Value| day.get("cost_usd").is_some_and(|c| c.is_null());
+        assert!(series.iter().all(unpriced), "{global}");
+        assert_eq!(global["quality"]["ingest_enabled"], false, "{global}");
+        assert!(
+            global.get("tool_failures").is_none() && global.get("agents").is_none(),
+            "follow-up keys are absent, not null: {global}"
+        );
+        // The 10 minutes may straddle midnight UTC; they are in the window either way.
+        assert_eq!(global["totals"]["active_ms"], 600_000, "{global}");
+
+        let project = get_json(&state, "/projects/alpha/analytics/devtime").await;
+        assert_eq!(project["scope"], "project", "{project}");
+        assert_eq!(project["days"], 30, "{project}");
+        assert_eq!(project["project_id"], "alpha", "{project}");
+    }
+
+    /// F1's order: the window is checked before the roster, so `days=0` is a 400 for a project
+    /// that is not there either.
+    #[tokio::test]
+    async fn analytics_devtime_refuses_an_unserved_window_and_an_unknown_project() {
+        let state = test_state().await;
+        for uri in [
+            "/analytics/devtime?days=14",
+            "/analytics/devtime?days=abc",
+            "/projects/alpha/analytics/devtime?days=0",
+        ] {
+            assert_eq!(
+                get_status(&state, uri).await,
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            get_status(&state, "/projects/nobody/analytics/devtime").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_devtime_findings_list_and_refuse_bad_parameters() {
+        let state = test_state().await;
+        seed_devtime(&state).await;
+        seed_finding(&state, "k1").await;
+        let list = get_json(
+            &state,
+            "/analytics/devtime/findings?days=7&order=recent&limit=1",
+        )
+        .await;
+        assert_eq!(list["items"][0]["finding_key"], "k1", "{list}");
+        assert!(list["items"][0]["feedback"].is_null(), "{list}");
+        assert!(list["next_cursor"].is_null(), "{list}");
+        assert!(!list["rules"].as_array().unwrap().is_empty(), "{list}");
+        let project = get_json(&state, "/projects/alpha/analytics/devtime/findings").await;
+        assert_eq!(project["items"].as_array().unwrap().len(), 1, "{project}");
+        for uri in [
+            "/analytics/devtime/findings?order=loud",
+            "/analytics/devtime/findings?limit=0",
+            "/analytics/devtime/findings?limit=201",
+            "/analytics/devtime/findings?cursor=zz",
+            "/analytics/devtime/findings?days=14",
+        ] {
+            assert_eq!(
+                get_status(&state, uri).await,
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            get_status(&state, "/projects/nobody/analytics/devtime/findings").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_devtime_mark_maps_refusals_and_answers_the_new_state() {
+        let state = test_state().await;
+        seed_finding(&state, "k1").await;
+        let bad = post_mark(
+            &state,
+            "k1",
+            serde_json::json!({"verdict": "maybe", "cause": null}),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(bad).await,
+            serde_json::json!({"error": "bad_verdict"})
+        );
+        let cause = post_mark(
+            &state,
+            "k1",
+            serde_json::json!({"verdict": "confirmed", "cause": "vibes"}),
+        )
+        .await;
+        assert_eq!(cause.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(cause).await,
+            serde_json::json!({"error": "bad_cause"})
+        );
+        let unknown = post_mark(
+            &state,
+            "nope",
+            serde_json::json!({"verdict": "confirmed", "cause": null}),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json_body(unknown).await,
+            serde_json::json!({"error": "unknown_finding"})
+        );
+        for _ in 0..2 {
+            let ok = post_mark(
+                &state,
+                "k1",
+                serde_json::json!({"verdict": "not_rework", "cause": null}),
+            )
+            .await;
+            assert_eq!(ok.status(), StatusCode::OK, "idempotent");
+            let body = json_body(ok).await;
+            assert_eq!(body["finding_key"], "k1", "{body}");
+            assert_eq!(body["feedback"]["verdict"], "not_rework", "{body}");
+            assert_eq!(body["rule"]["n_not_rework"], 1, "{body}");
+        }
+    }
+
+    /// Spec §9: a read-only key gets 200 on every GET, global and per project, and 403 on the mark.
+    #[tokio::test]
+    async fn analytics_devtime_is_readable_with_a_read_only_key_and_the_mark_is_not() {
+        let (state, db) = file_test_state().await;
+        seed_devtime(&state).await;
+        seed_finding(&state, "k1").await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        for uri in [
+            "/analytics/devtime",
+            "/analytics/devtime/findings",
+            "/projects/alpha/analytics/devtime",
+            "/projects/alpha/analytics/devtime/findings",
+        ] {
+            let response = api_token_request(state.clone(), "GET", uri, &token, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        let post = api_token_request(
+            state.clone(),
+            "POST",
+            "/analytics/devtime/findings/k1/mark",
+            &token,
+            Some(serde_json::json!({"verdict": "confirmed", "cause": null})),
+        )
+        .await;
+        assert_eq!(post.status(), StatusCode::FORBIDDEN);
+        db.close().await;
+    }
 }
 
 /// The hook-barrier tests that need the real router. They lived in `triage.rs` beside the check they

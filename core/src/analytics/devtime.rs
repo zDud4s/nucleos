@@ -1482,4 +1482,120 @@ mod tests {
             Err(MarkError::UnknownFinding)
         ));
     }
+
+    /// `EXPLAIN QUERY PLAN` of a project read over 90 days for `alpha`, one `detail` per step.
+    async fn project_plan(pool: &sqlx::SqlitePool, sql: &str) -> Vec<String> {
+        use sqlx::Row as _;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+            .bind("2026-07-19T00:00:00.000Z")
+            .bind("2026-10-17T12:00:00.000Z")
+            .bind("alpha")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        rows.iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect()
+    }
+
+    fn mentions(plan: &[String], needle: &str) -> bool {
+        plan.iter().any(|line| line.contains(needle))
+    }
+
+    /// Spec §6.5: the planner's answer is recorded. Every project read starts from
+    /// `idx_devtime_sessions_project` (migration 0210) and reaches its rows through a session
+    /// index; no devtime table is scanned. The one-form `(?3 IS NULL OR ss.project_id = ?3)` reads
+    /// these replaced planned `SCAN sp` for a single project.
+    #[tokio::test]
+    async fn the_project_span_read_reaches_spans_through_an_index() {
+        let pool = pool().await;
+        for sql in [
+            crate::devtime::store::SPAN_DAY_PROJECT_SQL,
+            crate::devtime::store::MESSAGE_DAY_PROJECT_SQL,
+            crate::devtime::store::TURN_DAY_PROJECT_SQL,
+            crate::devtime::store::SESSION_COUNTS_PROJECT_SQL,
+        ] {
+            let plan = project_plan(&pool, sql).await;
+            println!("{plan:#?}");
+            assert!(
+                mentions(&plan, "idx_devtime_sessions_project"),
+                "the project's sessions are found by index: {plan:#?}"
+            );
+            // `SCAN days` and `SCAN CONSTANT ROW` are the recursive day list, not a table.
+            let table_scans: Vec<&String> = plan
+                .iter()
+                .filter(|line| line.starts_with("SCAN ") && !line.contains("days"))
+                .filter(|line| !line.contains("CONSTANT ROW"))
+                .collect();
+            assert!(
+                table_scans.is_empty(),
+                "no devtime table is scanned: {plan:#?}"
+            );
+        }
+        let plan = project_plan(&pool, crate::devtime::store::SPAN_DAY_PROJECT_SQL).await;
+        assert!(
+            mentions(&plan, "INDEX idx_devtime_spans_session"),
+            "spans must be reached by index: {plan:#?}"
+        );
+    }
+
+    /// Spec §9 performance: 90 days, 50,000 spans. Ignored by default — a timing test is not
+    /// evidence under load (CLAUDE.md, "Full-suite runs are not reliable under load"); run it
+    /// alone, on purpose, and read the printed timings.
+    #[tokio::test]
+    #[ignore]
+    async fn the_overview_of_ninety_days_stays_under_budget() {
+        let pool = pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        // 500 sessions x 100 spans of 3 minutes, spread over 90 days, 10 projects.
+        for s in 0..500_u32 {
+            let day = i64::from(s % 90);
+            let opened_at = now() - chrono::Duration::days(day) - chrono::Duration::hours(6);
+            let opened = stamp(opened_at);
+            sqlx::query(
+                "INSERT INTO devtime_sessions (session_id, project_id, started_at, dirty,
+                     parser_version, updated_at, rules_version)
+                 VALUES (?, ?, ?, 0, 1, ?, 'v1')",
+            )
+            .bind(format!("s{s}"))
+            .bind(format!("p{}", s % 10))
+            .bind(opened.clone())
+            .bind(opened)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            for k in 0..100_i64 {
+                let ago = chrono::Duration::days(day) + chrono::Duration::minutes(3 * (k + 1));
+                let start = now() - ago;
+                sqlx::query(
+                    "INSERT INTO devtime_spans (session_id, lane, kind, started_at, ended_at,
+                         waste, confidence, parser_version)
+                     VALUES (?, 'main', 'tool', ?, ?, CASE WHEN ? % 7 = 0 THEN 'rework' END,
+                             'exact', 1)",
+                )
+                .bind(format!("s{s}"))
+                .bind(stamp(start))
+                .bind(stamp(start + chrono::Duration::minutes(3)))
+                .bind(k)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+        let started = std::time::Instant::now();
+        let report = overview(&pool, Scope::Global, 90).await;
+        let global = started.elapsed();
+        let started = std::time::Instant::now();
+        overview(&pool, Scope::Project("p3"), 90).await;
+        let project = started.elapsed();
+        println!(
+            "global {global:?}, project {project:?}, active {}",
+            report.totals.active_ms
+        );
+        assert!(
+            global.as_millis() < 300 && project.as_millis() < 300,
+            "global {global:?} project {project:?}"
+        );
+    }
 }
