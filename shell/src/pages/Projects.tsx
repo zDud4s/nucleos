@@ -33,6 +33,7 @@ import {
   Count,
   Crumb,
   ErrorNote,
+  ListFilter,
   PageHeader,
   Panel,
   Quiet,
@@ -523,8 +524,6 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
   // Directories first, then files, each alphabetically: a listing sorted only by
   // name buries the folders among the files and makes a deep tree unwalkable.
   const [filter, setFilter] = useState("");
-  const filterField = useRef<HTMLInputElement>(null);
-  useSlashFocus(filterField);
   const needle = filter.trim().toLowerCase();
   const ordered = [...entries]
     .filter((entry) => needle === "" || entry.name.toLowerCase().includes(needle))
@@ -559,21 +558,22 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
           </p>
         )}
         {listing.data !== undefined && entries.length > 0 && (
-          <input
-            ref={filterField}
-            className="pj-field-input pj-filter"
-            type="search"
-            value={filter}
-            placeholder="Filter this folder (press / to focus)"
-            aria-label="Filter this folder by name"
-            spellCheck={false}
-            onChange={(event) => setFilter(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape" && filter !== "") {
-                event.stopPropagation();
-                setFilter("");
-              }
+          <ListFilter
+            noun="this folder"
+            query={filter}
+            onQueryChange={setFilter}
+            resultCount={needle === "" ? undefined : ordered.length}
+            onOpenOnly={() => {
+              const only = ordered[0];
+              if (only === undefined) return;
+              go(
+                only.is_dir
+                  ? { path: joinPath(path, only.name) || undefined }
+                  : { path: path || undefined, file: joinPath(path, only.name) },
+                !only.is_dir,
+              );
             }}
+            onClear={() => setFilter("")}
           />
         )}
         {listing.data !== undefined && entries.length === 0 && (
