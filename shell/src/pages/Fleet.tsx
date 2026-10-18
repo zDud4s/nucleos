@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Link } from "@tanstack/react-router";
 import { Plus } from "lucide-react";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useCancelSlotOwner,
@@ -36,13 +37,13 @@ import {
   Button,
   ErrorNote,
   Field,
-  IconButton,
   Meter,
   PageHeader,
   Panel,
   RefusalNote,
   RelativeTime,
   SlotPips,
+  Skeleton,
   StaleNote,
   StateBadge,
   Teach,
@@ -178,13 +179,13 @@ export function Fleet() {
     <FleetActionsProvider actions={actions}>
       <PageHeader
         title="Fleet"
-        // A status region, so a fact that lands while somebody is reading is said rather than
-        // only drawn. Always mounted: a live region that appears together with its first
-        // sentence is not announced.
+        // Two clauses at most are drawn and only the worst is a status region, so a fact that
+        // lands while somebody is reading is said without the whole ladder being read out on
+        // every change. The rest sits behind "+N more".
         headline={
-          <span role="status" aria-live="polite">
-            {headline({ capacity, totals: model.totals, engaged, stale, startable, waiting })}
-          </span>
+          <Headline
+            clauses={headlineClauses({ capacity, totals: model.totals, engaged, stale, startable, waiting })}
+          />
         }
         // Only the view switch: the spend and the can't-start notice live in the strip below, so
         // the header is a title, a headline and one control, aligned on the title's line.
@@ -246,8 +247,16 @@ export function Fleet() {
         />
       )}
 
+      {/* The first read is still on its way: a blank page after the title reads as a failed one. */}
+      {concurrency.isPending && capacity === undefined && !concurrency.isError && (
+        <Skeleton label="Loading the fleet" lines={3} />
+      )}
       {concurrency.isError && capacity === undefined && (
-        <CapacityError error={concurrency.error} at={concurrency.errorUpdatedAt} />
+        <CapacityError
+          error={concurrency.error}
+          at={concurrency.errorUpdatedAt}
+          onRetry={() => void concurrency.refetch()}
+        />
       )}
       {cancel.isError && <MutationNote error={cancel.error} what="that could not be cancelled" />}
       {revoke.isError && <MutationNote error={revoke.error} what="that rule could not be lifted" />}
@@ -256,7 +265,7 @@ export function Fleet() {
       {capacity !== undefined && capacity.projects.length === 0 && (
         <Teach title="No projects yet">
           <p>
-            The fleet is every project the núcleo looks after and the work each one has in flight.
+            The fleet is every project the {DAEMON_NAME} looks after and the work each one has in flight.
             Add one on <Link to="/projects">Projects</Link> and it appears here with how much it
             may run at once — empty to begin with, which is a different fact from not being here.
           </p>
@@ -413,9 +422,10 @@ function heldReadings(cards: FleetColumn["cards"]) {
 }
 
 /**
- * A project's New job, aimed, or the short reason there is none. A `+` rather than the words:
- * "New job" on every startable line was the loudest text on a strip that is meant to recede, and
- * it is named with the project because five buttons all called "New job" are five of one name.
+ * A project's New job, aimed, or the short reason there is none. A quiet button that says
+ * "New job" beside a `+`: the glyph alone did not tell a first-time reader what it starts. The
+ * project's name is spoken after the visible words (never before them, so a voice command
+ * "click New job" still lands), because five buttons all called "New job" are five of one name.
  */
 function ProjectAction({
   project,
@@ -435,12 +445,15 @@ function ProjectAction({
     return (
       <>
         {!stale && (
-          <IconButton
-            label={`New job in ${project.project_id}`}
-            icon={Plus}
+          <Button
+            variant="quiet"
+            intent="create"
             aria-controls={panelId}
             onClick={(event) => onNewJob(event.currentTarget, project.project_id)}
-          />
+          >
+            <Plus size={14} strokeWidth={1.5} aria-hidden="true" />
+            New job<span className="sr-only"> in {project.project_id}</span>
+          </Button>
         )}
       </>
     );
@@ -936,7 +949,7 @@ function NewJobForm({
           pressable yet. `Field` itself names the box by its label and describes it by the helper. */}
       <Field
         label="Prompt"
-        helper={<span id={hintId}>Start job waits until this says what the job should work on.</span>}
+        helper={<span id={hintId}>Describe the work to enable Start job.</span>}
       >
         <textarea
           ref={promptRef}
@@ -951,7 +964,6 @@ function NewJobForm({
         <Field label="Project">
           <select
             value={choice?.id ?? ""}
-            aria-label="Project for the new job"
             onChange={(event) => onPick(event.target.value)}
           >
             {choices.map((one) => (
@@ -970,10 +982,9 @@ function NewJobForm({
           <Field label="Team">
             <select
               value={team}
-              aria-label="Team to direct the job"
               onChange={(event) => setTeam(event.target.value)}
             >
-              <option value="">nobody — one checkout, one item at a time</option>
+              <option value="">No team (single checkout)</option>
               {roster.map((row) => (
                 <option key={row.id} value={row.id}>
                   {row.name} — up to {row.max_parallel} at once
@@ -990,7 +1001,6 @@ function NewJobForm({
             value={budget}
             inputMode="decimal"
             placeholder="none"
-            aria-label="Budget in dollars"
             onChange={(event) => setBudget(event.target.value)}
           />
         </Field>
@@ -999,7 +1009,6 @@ function NewJobForm({
             value={rounds}
             inputMode="numeric"
             placeholder="default"
-            aria-label="Rounds"
             onChange={(event) => setRounds(event.target.value)}
           />
         </Field>
@@ -1015,7 +1024,7 @@ function NewJobForm({
 
       {engaged && (
         <p className="fleet-hold" id={killId}>
-          The kill switch is engaged — the núcleo refuses every new job until it is released.
+          The kill switch is engaged — the {DAEMON_NAME} refuses every new job until it is released.
         </p>
       )}
 
@@ -1067,7 +1076,10 @@ function optionalNumber(raw: string): number | null {
  */
 function NewJobRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the job was not started</ErrorNote>;
+    return <ErrorNote>
+        The job was not started: the {DAEMON_NAME} did not respond. Check that it is running, then
+        try again.
+      </ErrorNote>;
   }
   return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
 }
@@ -1081,10 +1093,10 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
  * The capacity reading never arrived at all — so there is nothing to draw.
  *
  * The owner reads an error here as a bug report, so it carries what one needs: the route that
- * failed, when it last failed, and what the transport said. Without the route "did not answer"
+ * failed, when it last failed, and what the transport said. Without the route "no response"
  * sends somebody to guess which of this page's six polls it was.
  */
-function CapacityError({ error, at }: { error: unknown; at: number }) {
+function CapacityError({ error, at, onRetry }: { error: unknown; at: number; onRetry: () => void }) {
   // Wrapped so the time takes the note's own colour: the reading's faint grey is under the AA
   // floor on the error note's red fill.
   const when =
@@ -1102,6 +1114,9 @@ function CapacityError({ error, at }: { error: unknown; at: number }) {
           <code>GET /concurrency</code>
           {when}
         </p>
+        <div>
+          <Button onClick={onRetry}>Try again</Button>
+        </div>
       </div>
     );
   }
@@ -1109,9 +1124,10 @@ function CapacityError({ error, at }: { error: unknown; at: number }) {
   // One span inside the note: `.ui-note` is a flex row, and loose inline pieces each became a
   // flex item with a gap between them, so the sentence broke apart at every `<code>`.
   return (
-    <ErrorNote>
+    <ErrorNote onRetry={onRetry} retryLabel="Try again">
       <span>
-        the núcleo did not answer <code>GET /concurrency</code> — nothing is known about the fleet
+        Could not read the fleet, so its jobs and free slots are unknown. The {DAEMON_NAME} may be
+        stopped. <code>GET /concurrency</code>
         {when}
         {said !== null && (
           <>
@@ -1127,7 +1143,11 @@ function CapacityError({ error, at }: { error: unknown; at: number }) {
 /** A write that did not take, said next to the page rather than in a corner. */
 function MutationNote({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+  return (
+    <ErrorNote>
+      The {DAEMON_NAME} did not respond, so {what}. Check that it is running, then try again.
+    </ErrorNote>
+  );
 }
 
 /* --------------------------------------------------------------- headline -- */
@@ -1163,29 +1183,28 @@ function counted(count: number, one: string, many: string): string {
  * `ReactNode` and not `string` because of the colour and the door. Every clause is short and
  * counted; the page never says "attention" or "warning" — it says what is so.
  */
-function headline({
+function headlineClauses({
   capacity,
   totals,
   engaged,
   stale,
   startable,
   waiting,
-}: HeadlineFacts): ReactNode {
-  if (capacity === undefined) return undefined;
+}: HeadlineFacts): ReactNode[] {
+  if (capacity === undefined) return [];
   const clauses: ReactNode[] = [];
 
   if (totals.leaked > 0) {
     clauses.push(
       <span className="ui-wrong">
-        {counted(totals.leaked, "slot held by nothing", "slots held by nothing")}, awaiting
-        reconciliation
+        {counted(totals.leaked, "slot", "slots")} stuck with no job, being cleaned up
       </span>,
     );
   }
   if (totals.collided > 0) {
     clauses.push(
       <span className="ui-wrong">
-        {counted(totals.collided, "observed overlap", "observed overlaps")} between trees
+        {counted(totals.collided, "pair of jobs", "pairs of jobs")} changing the same files
       </span>,
     );
   }
@@ -1198,7 +1217,7 @@ function headline({
     );
   }
   if (totals.excluded > 0) {
-    clauses.push(`${counted(totals.excluded, "job", "jobs")} held by an exclusion`);
+    clauses.push(`${counted(totals.excluded, "job", "jobs")} paused by a rule`);
   }
   if (engaged) clauses.push("the kill switch is engaged — no new job starts");
   if (stale) clauses.push("the view is stale");
@@ -1217,10 +1236,39 @@ function headline({
     clauses.push(`${counted(waiting, "item", "items")} to review across projects`);
   }
 
-  return clauses.map((clause, index) => (
-    <Fragment key={index}>
-      {index > 0 && "; "}
-      {clause}
-    </Fragment>
-  ));
+  return clauses;
+}
+
+/**
+ * The headline as an instrument and not a paragraph: the two worst clauses are drawn and the rest
+ * sit behind a count. Only the first (the worst) is a status region, so a number changing deeper
+ * in the ladder does not make a screen reader read the whole sentence again. The region is always
+ * mounted, empty before the first reading: one that appears together with its first sentence is
+ * not announced.
+ */
+function Headline({ clauses }: { clauses: ReactNode[] }) {
+  const [open, setOpen] = useState(false);
+  const hidden = Math.max(0, clauses.length - 2);
+  const shown = open ? clauses.slice(1) : clauses.slice(1, 2);
+  return (
+    <span className="fleet-headline">
+      <span role="status" aria-live="polite">
+        {clauses[0]}
+      </span>
+      {shown.map((clause, index) => (
+        <Fragment key={index}>
+          {"; "}
+          {clause}
+        </Fragment>
+      ))}
+      {hidden > 0 && (
+        <>
+          {" "}
+          <Button variant="quiet" aria-expanded={open} onClick={() => setOpen((was) => !was)}>
+            {open ? "Show less" : `+${hidden} more`}
+          </Button>
+        </>
+      )}
+    </span>
+  );
 }
