@@ -17,26 +17,16 @@
 /* =============================================================== shared == */
 
 /**
- * The prose standing above a list, and the line that stands in for the list
- * while it is still being read.
+ * The prose standing above a list.
  *
- * Neither is an absence, which is why neither is `Quiet`. The note sits above a
- * list that has something in it and says what the reader is about to decide;
- * the loading line is a wait, and a wait wearing the vocabulary of an empty
- * section claims the roster is empty when in truth nobody has answered yet.
- * This page's two genuine empty states are `Teach` blocks and already were.
+ * It sits above a list that has something in it and says what the reader is
+ * about to decide.
  */
-.contacts-note,
-.contacts-loading {
+.contacts-note {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
-}
-
-.contacts-loading {
-  color: var(--text-faint);
-  font-style: italic;
 }
 
 /* Body type, not mono: this line is counts and relative times, prose with numbers in
@@ -46,8 +36,47 @@
   font-family: var(--font-body);
   font-variant-numeric: tabular-nums;
   font-size: var(--text-xs);
-  color: var(--text-faint);
+  color: var(--text-muted);
   overflow-wrap: anywhere;
+}
+
+.contacts-sameas {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* Search and the verdict filters above the grid. */
+.contacts-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+
+.contacts-search {
+  min-width: 14rem;
+  min-height: var(--hit-min);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+.contacts-search:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.contacts-more {
+  display: flex;
+  justify-content: center;
+  margin-top: var(--space-3);
 }
 
 .contacts-reasoning {
@@ -271,13 +300,8 @@
   font-size: var(--text-xs);
 }
 
-/* A verdict or unmerge that failed, said once above the grid so no card grows. */
+/* A verdict or unmerge that failed, said inside the card it belongs to. */
 .contacts-problem {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-2);
-  margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
   color: var(--text-muted);
   overflow-wrap: anywhere;
@@ -297,71 +321,4 @@
   margin-top: auto;
   padding-top: var(--space-3);
   border-top: 1px solid var(--border);
-}
-
-/* ============================================================ quiet line == */
-
-.contacts-quiet-says {
-  position: relative;
-  text-decoration: underline dotted;
-  text-underline-offset: 3px;
-  cursor: help;
-}
-
-.contacts-quiet-says:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-  border-radius: var(--radius-sm);
-  color: var(--text);
-}
-
-/* The tip is a transparent bridge: its top padding is the gap, drawn as part of the
-   tip, so the pointer can travel from the text onto the box without the hover being
-   lost. Hidden with `visibility` rather than `display`, so it stays in the
-   accessibility tree as the text's description. The box look is the inner span's. */
-.contacts-quiet-tip {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  z-index: 20;
-  width: max-content;
-  max-width: min(24rem, 80vw);
-  padding-top: var(--space-2);
-  cursor: auto;
-  visibility: hidden;
-  opacity: 0;
-}
-
-/* Reset what the tip would inherit from a badge it can sit inside. */
-.contacts-quiet-tip-box {
-  display: block;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-lg);
-  color: var(--text);
-  font-family: var(--font-body);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-regular);
-  letter-spacing: normal;
-  line-height: var(--leading-snug);
-  text-align: left;
-  text-transform: none;
-  white-space: normal;
-}
-
-.contacts-quiet-says:hover > .contacts-quiet-tip,
-.contacts-quiet-says:focus-visible > .contacts-quiet-tip {
-  visibility: visible;
-  opacity: 1;
-  transition: opacity 120ms ease;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .contacts-quiet-tip,
-  .contacts-quiet-says:hover > .contacts-quiet-tip,
-  .contacts-quiet-says:focus-visible > .contacts-quiet-tip {
-    transition: none;
-  }
 }
