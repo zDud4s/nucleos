@@ -1,4 +1,5 @@
 import type { ApiRefusal } from "../data/client";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Sentences for the refusals every page can meet.
@@ -20,18 +21,18 @@ const SENTENCES: Record<string, string> = {
   kill_switch: "the kill switch is engaged — nothing autonomous starts until it is released",
   turn_in_progress: "this conversation already has a turn in flight; it clears on its own",
   no_local_model: "no local model is available, and this asked for one",
-  internal: "the núcleo hit an error of its own handling this",
+  internal: `the ${DAEMON_NAME} hit an error of its own handling this`,
 
   // Derived from the status, for routes that refused without a name.
-  bad_request: "the núcleo would not accept that request",
-  unauthorized: "this window is not authorised — the daemon token may have rotated",
-  forbidden: "the núcleo refused this outright",
+  bad_request: `the ${DAEMON_NAME} would not accept that request`,
+  unauthorized: "this window is not authorised — the access token may have been replaced",
+  forbidden: `the ${DAEMON_NAME} refused this outright`,
   not_found: "there is nothing there to act on",
   conflict: "something about this has already changed",
-  unprocessable: "the núcleo understood the request and would not carry it out",
+  unprocessable: `the ${DAEMON_NAME} understood the request and would not carry it out`,
   locked: "this is locked right now",
   too_many_requests: "a ceiling is holding this back",
-  unavailable: "the part of the núcleo this needs is not available",
+  unavailable: `the part of the ${DAEMON_NAME} this needs is not available`,
 };
 
 export interface RefusalNoteProps {
@@ -68,7 +69,7 @@ export function RefusalNote({ refusal, sentences }: RefusalNoteProps) {
   // The daemon repeats the code as the detail when the code is all it sent;
   // showing it twice reads as a stutter rather than as information.
   const prose = detail !== "" && detail !== refusal.code ? detail : "";
-  const sentence = named ?? (prose !== "" ? prose : `the núcleo refused this: ${refusal.code}`);
+  const sentence = named ?? (prose !== "" ? prose : `the ${DAEMON_NAME} refused this: ${refusal.code}`);
 
   return (
     <p className="ui-note ui-note-refusal" role="status">

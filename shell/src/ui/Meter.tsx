@@ -73,6 +73,14 @@ export interface MeterProps {
   format?: (value: number) => string;
   /** Whether to draw the label and figures above the bar. `true` unless already written nearby. */
   head?: boolean;
+  /**
+   * A line drawn across the bar, in the same units as `value` and `ceiling` — a soft limit
+   * short of the ceiling ("warn me at 3 of 5"). Marks a tick on the track, and once `value`
+   * reaches it the fill takes the pending tone and the accessible name says so. Ignored when
+   * there is no ceiling or it lies outside `0..ceiling`. The 80% rule of a quantity still
+   * applies on top of it.
+   */
+  threshold?: number;
 }
 
 /**
@@ -82,7 +90,7 @@ export interface MeterProps {
  * anything that does not render — and because the exact figure is what somebody
  * acts on. `aria-label` carries the same sentence the eye gets.
  */
-export function Meter({ label, value, ceiling, tone, format, head = true }: MeterProps) {
+export function Meter({ label, value, ceiling, tone, format, head = true, threshold }: MeterProps) {
   const write = format ?? String;
 
   if (ceiling === null) {
@@ -117,12 +125,21 @@ export function Meter({ label, value, ceiling, tone, format, head = true }: Mete
   if (standing === "over") classes.push("ui-gauge-over");
   // The cue and its sentence ride with the head: a caller that hides the head (`head={false}`)
   // writes the figures itself, and a second percentage beside them would be said twice.
+  const marked = threshold !== undefined && ceiling > 0 && threshold > 0 && threshold < ceiling;
+  const pastThreshold = marked && value >= threshold && value < ceiling;
+  if (pastThreshold && standing === "under") classes.push("ui-gauge-past-threshold");
   const said =
     !head || standing === "under"
       ? ""
       : standing === "near"
         ? `, ${Math.round((value / ceiling) * 100)}% — near the ceiling`
         : ", at the ceiling";
+  // The threshold is a fact about the ceiling, not a cue, so it is spoken with the head or without it.
+  const thresholdSaid = marked
+    ? pastThreshold
+      ? `, past the threshold of ${write(threshold)}`
+      : `, threshold ${write(threshold)}`
+    : "";
 
   return (
     <p className={classes.join(" ")}>
@@ -134,8 +151,9 @@ export function Meter({ label, value, ceiling, tone, format, head = true }: Mete
           </span>
         </span>
       )}
-      <span className="ui-gauge-track" role="img" aria-label={`${label}: ${write(value)} of ${write(ceiling)}${said}`}>
+      <span className="ui-gauge-track" role="img" aria-label={`${label}: ${write(value)} of ${write(ceiling)}${said}${thresholdSaid}`}>
         <span className="ui-gauge-fill" style={{ width: `${percent}%` }} />
+        {marked && <span className="ui-gauge-threshold" style={{ left: `${(threshold / ceiling) * 100}%` }} />}
       </span>
       {head && standing !== "under" && (
         <span className="ui-gauge-cue">{Math.round((value / ceiling) * 100)}%</span>
