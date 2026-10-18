@@ -824,7 +824,7 @@ describe("System - budget", () => {
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
-    await renderSystem();
+    await renderSystemAt("/system/limits");
 
     const windowInput = await screen.findByLabelText("Window limit (USD)");
     fireEvent.change(windowInput, { target: { value: "" } });
@@ -902,7 +902,7 @@ describe("System - budget", () => {
       });
       daemon.apiFetch.mockImplementation(systemFetch(world));
 
-      await renderSystem();
+      await renderSystemAt("/system/limits");
 
       const windowInput = await screen.findByLabelText("Window limit (USD)");
       fireEvent.change(windowInput, { target: { value: garbage } });
@@ -938,7 +938,7 @@ describe("System - budget", () => {
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
-    await renderSystem();
+    await renderSystemAt("/system/limits");
 
     const hourlyInput = await screen.findByLabelText("Hourly limit (USD)");
     fireEvent.change(hourlyInput, { target: { value: "abc" } });
@@ -970,7 +970,7 @@ describe("System - quota brake", () => {
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
-    await renderSystem();
+    await renderSystemAt("/system/limits");
 
     const quotaBrake = await screen.findByRole("heading", { level: 3, name: "Quota brake" });
     const block = quotaBrake.closest("section");
