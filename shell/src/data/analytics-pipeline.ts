@@ -250,7 +250,10 @@ export interface JudgeBlock {
   cost_usd: number;
   error_rate: number | null;
   enforced_share: number | null;
+  /** Judge's opinion against the person's, per distinct action (`unit`), by `basis`. */
   agree: number | null;
+  basis: string;
+  unit: string;
 }
 
 export interface Refused {

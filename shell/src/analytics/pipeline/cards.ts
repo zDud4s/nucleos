@@ -151,7 +151,7 @@ function autopilotCard(autopilot: Autopilot): Metric<PipelineKey> {
     key: "autopilot",
     label: LABELS.autopilot,
     value: percentOr(judge.agree),
-    sub: empty ? EMPTY : clauses([`${judge.reviewed} with a human verdict`, `${refused.total} refused`]),
+    sub: empty ? EMPTY : clauses([`${judge.reviewed} actions with your verdict`, `${refused.total} refused`]),
   };
 }
 
