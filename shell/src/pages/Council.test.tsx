@@ -243,7 +243,7 @@ async function panelFor(headingText: string): Promise<HTMLElement> {
 /** The Case record panel is shut by default; the deliberation's columns live inside it. */
 async function openTheRecord() {
   const panel = await panelFor("Case record");
-  fireEvent.click(within(panel).getByRole("button", { name: "Show" }));
+  fireEvent.click(within(panel).getByRole("button", { name: "Show case record" }));
 }
 
 /** Click a chair by its accessible name prefix ("Seat 4"). */
@@ -1160,7 +1160,7 @@ describe("Council - the lectern", () => {
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
 
     const button = await screen.findByRole("button", { name: "Convene" });
-    const reason = "No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.";
+    const reason = "No roster in ~/.nucleos/council.yaml — add one and restart the background service.";
     // The id is stable, so the description is read once it holds the reason.
     const describedBy = () => document.getElementById(button.getAttribute("aria-describedby") ?? "")?.textContent;
     await waitFor(() => expect(describedBy()).toBe(reason));
@@ -2036,7 +2036,7 @@ describe("Council - the detail, redesigned", () => {
     expect(within(screen.getByRole("list", { name: "Process" })).getAllByRole("listitem")).toHaveLength(5);
     // The record is the last thing on the page and starts shut.
     const record = await panelFor("Case record");
-    const toggle = within(record).getByRole("button", { name: "Show" });
+    const toggle = within(record).getByRole("button", { name: "Show case record" });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     // Shut, the panel is its heading alone: no empty padded box underneath.
     expect(record.querySelector(".ui-panel-body")).toBeNull();
@@ -2046,7 +2046,7 @@ describe("Council - the detail, redesigned", () => {
 
     fireEvent.click(toggle);
     expect(await screen.findByRole("heading", { level: 2, name: "Deliberation" })).toBeDefined();
-    expect(within(record).getByRole("button", { name: "Hide" }).getAttribute("aria-expanded")).toBe("true");
+    expect(within(record).getByRole("button", { name: "Hide case record" }).getAttribute("aria-expanded")).toBe("true");
   });
 
   it("replaces the list and composer with a way back while a council is open", async () => {
@@ -2137,7 +2137,7 @@ describe("Council - the detail, redesigned", () => {
     );
 
     await renderCouncil("/council/c-1");
-    await screen.findByRole("button", { name: "Cancel" });
+    await screen.findByRole("button", { name: "Stop council" });
 
     expect(screen.queryByRole("button", { name: "Ask again" })).toBeNull();
   });
@@ -2337,7 +2337,7 @@ describe("Council - review rework", () => {
     );
 
     await renderCouncil("/council");
-    await screen.findAllByText("No roster in ~/.nucleos/council.yaml — add one and restart the núcleo.");
+    await screen.findAllByText("No roster in ~/.nucleos/council.yaml — add one and restart the background service.");
 
     expect(screen.getAllByRole("button", { name: /^Seat \d, empty$/ })).toHaveLength(8);
     expect(screen.getByRole("button", { name: "Chairman, empty" })).toBeDefined();
