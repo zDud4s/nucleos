@@ -4,7 +4,7 @@ import { AnalyticsView } from "../analytics/AnalyticsView";
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
-import { Count, PageHeader, QuietTips, StateBadge } from "../ui";
+import { Count, CopyButton, ErrorNote, PageHeader, QuietTips, StateBadge, Tip } from "../ui";
 import { ModeState } from "./ModeState";
 import { ModeMap } from "./ModeMap";
 import { ModeCode } from "./ModeCode";
@@ -23,7 +23,7 @@ import "../pages/workspace.css";
  * here it is *this worktree has been busy for 41 minutes*, which is a fact that
  * either blocks you or frees you.
  *
- * Five modes and not seven tabs, because each has a genuinely different shape —
+ * Six modes and not seven tabs, because each has a genuinely different shape —
  * a dense grid of panels, a graph of the repository, three columns with a tree
  * that persists, a graph of one workflow, a status line over five sections read
  * top to bottom.
@@ -60,12 +60,17 @@ import "../pages/workspace.css";
 const MODES = ["state", "map", "code", "workflows", "authority", "analytics"] as const;
 export type ProjectMode = (typeof MODES)[number];
 
+/**
+ * What each tab says, named for the task rather than for the author's model. The URL keys above are
+ * unchanged on purpose (see `RENAMED`): "Overview" is `state`, "Review" is `code` (a run's worktree
+ * to look over) and "Permissions" is `authority` (what this project's autonomous runs may do).
+ */
 const MODE_LABEL: Record<ProjectMode, string> = {
-  state: "State",
+  state: "Overview",
   map: "Map",
-  code: "Code",
+  code: "Review",
   workflows: "Workflows",
-  authority: "Authority",
+  authority: "Permissions",
   analytics: "Analytics",
 };
 
@@ -113,9 +118,15 @@ export function normaliseMode(candidate: string | undefined): ProjectMode {
 
 /** What a conditional mode is holding: how much, and what that number counts. */
 interface Holding {
-  count: number;
+  /** `undefined` when the daemon could not be asked (`unavailable`): never a zero in its place. */
+  count: number | undefined;
   means: string;
+  /** The query failed and nothing was cached: the tab shows a mark instead of a number. */
+  unavailable?: boolean;
 }
+
+/** What a tab says when the query behind its number failed. */
+const COULD_NOT_READ = "Could not read this just now.";
 
 /**
  * How much the two conditional modes are holding.
@@ -147,6 +158,9 @@ interface Holding {
  * The two queries are the ones `Occupancy` and `WorkflowSummary` already ask. React Query answers
  * both out of one cache entry apiece, so this is a second reader and never a second source: the
  * tab and the panel cannot disagree about whether a run is working here.
+ *
+ * `unavailable` is the third answer next to a number and nothing: the query failed and has nothing
+ * cached, so the tab says "could not read" rather than staying blank as if it had not asked yet.
  */
 function useHolding(projectId: string): Partial<Record<ProjectMode, Holding>> {
   const concurrency = useConcurrency();
@@ -171,6 +185,8 @@ function useHolding(projectId: string): Partial<Record<ProjectMode, Holding>> {
           ? "No run is working here, so there is nothing to review."
           : `${runs} run${runs === 1 ? "" : "s"} working here, with a worktree to review.`,
     };
+  } else if (concurrency.isError) {
+    holding.code = { count: undefined, means: COULD_NOT_READ, unavailable: true };
   }
 
   if (workflows.data !== undefined) {
@@ -182,6 +198,8 @@ function useHolding(projectId: string): Partial<Record<ProjectMode, Holding>> {
           ? "No workflow is installed here."
           : `${installed} workflow${installed === 1 ? "" : "s"} installed in this project.`,
     };
+  } else if (workflows.isError) {
+    holding.workflows = { count: undefined, means: COULD_NOT_READ, unavailable: true };
   }
 
   return holding;
@@ -191,6 +209,11 @@ function useHolding(projectId: string): Partial<Record<ProjectMode, Holding>> {
  * Whether a key press belongs to a field somebody is typing in — the switcher's own rule in
  * `Sidebar.tsx`, for the same reason: an editor may mean something by Ctrl+digit.
  */
+/** Whether the chord is Cmd rather than Ctrl, for the hint and for `aria-keyshortcuts`. */
+function onMac(): boolean {
+  return typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+}
+
 function typing(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
   return target.isContentEditable || target.matches("input, textarea, select");
@@ -208,7 +231,8 @@ function useModeShortcuts(projectId: string) {
   const navigate = useNavigate();
   useEffect(() => {
     function onKey(event: globalThis.KeyboardEvent) {
-      if (event.defaultPrevented || event.altKey || event.shiftKey) return;
+      // A held key repeats keydown; one press opens one mode.
+      if (event.defaultPrevented || event.repeat || event.altKey || event.shiftKey) return;
       if (!(event.ctrlKey || event.metaKey) || typing(event.target)) return;
       const index = Number(event.key) - 1;
       const mode = MODES[index];
@@ -235,11 +259,17 @@ export function Workspace() {
   const project = projects.data?.find((row) => row.project_id === projectId);
   const holding = useHolding(projectId);
   useModeShortcuts(projectId);
+  const mac = onMac();
+  // Known to be missing only once the roster has answered; until then the shell is drawn as usual.
+  const missing = projects.data !== undefined && project === undefined;
+  const folder = project?.project_root ?? null;
+  // The folder's name reads better than the slug; the slug stays beside it when they differ.
+  const name = folder === null ? projectId : (folder.split(/[\\/]/).filter(Boolean).pop() ?? projectId);
 
   return (
     <>
       <PageHeader
-        title={projectId}
+        title={name}
         /*
           The mode through the one non-collapsing map, never a literal: off,
           shadow and active are three different promises about what happens here
@@ -250,98 +280,152 @@ export function Workspace() {
         */
         headline={
           <span className="inline-flex min-w-0 max-w-full items-baseline gap-2">
-            <StateBadge domain="autopilot" state={project?.mode} />
-            {project?.project_root === null ? (
-              <span>no folder named</span>
+            {projects.isPending ? (
+              <span role="status">Loading project…</span>
+            ) : missing ? (
+              <span>Not found</span>
             ) : (
-              <span className="truncate font-mono text-xs">{project?.project_root}</span>
+              <>
+                {/* "shadow" alone does not say shadow of what. */}
+                <span>Autopilot</span>
+                <StateBadge domain="autopilot" state={project?.mode} />
+                {name !== projectId ? <span className="font-mono text-xs">{projectId}</span> : null}
+                {folder === null ? (
+                  <span>no folder named</span>
+                ) : (
+                  <>
+                    <span className="truncate font-mono text-xs" title={folder}>
+                      {folder}
+                    </span>
+                    <CopyButton value={folder} label="project folder" spoken={false} />
+                  </>
+                )}
+              </>
             )}
           </span>
         }
       />
 
-      {/*
-        The six modes, dressed as the vendored `Tabs` and still links.
+      {projects.isError && projects.data === undefined ? (
+        <ErrorNote onRetry={() => void projects.refetch()}>
+          Could not load the project list, so this project cannot be checked. Is the background service running?
+        </ErrorNote>
+      ) : null}
 
-        `ui-tab-list` and `ui-tab` are the shared classes Radix's Tabs wears, so this
-        strip is the same object on screen as the tabs in the Bench. What it is NOT is
-        Radix's `Tabs`, and that is deliberate: each mode is a URL, so a tab here has to
-        be an `<a href>` that can be copied, opened in a second window, and — the case
-        `Workspace.test.tsx` pins — carry an old segment's replacement (Portuguese, or
-        `github`) in its `href` so the address canonicalises itself on the first press. A `role="tab"`
-        button has none of that — Radix's `Trigger` would swap the link role and
-        `aria-current` for `role="tab"` and `aria-selected`, and collapse six tab stops
-        into one roving one. `pj-tabs` on the inspector is the same decision.
+      {missing ? (
+        <section className="ws-missing" aria-label="Project not found">
+          <p className="ui-note">
+            No project called <code>{projectId}</code> is registered. It may have been removed, or the link
+            is out of date.
+          </p>
+          <Link to="/projects">Back to Projects</Link>
+        </section>
+      ) : (
+        <>
+          {/*
+            The six modes, dressed as the vendored `Tabs` and still links.
 
-        What IS adopted is the rule underneath the appearance: **the active indicator is
-        `--text` and never `--accent`**, drawn by `.ui-tab[data-state="active"]`. `.ui-current`
-        does not fit here: it is an inset rule on the LEADING edge, and the mark a tab strip
-        needs is under the label.
-      */}
-      <nav aria-label="Project modes" className="ui-tab-list ws-tabs mb-6">
-        {MODES.map((candidate, index) => {
-          const holds = holding[candidate];
-          // Quiet is for a door somebody has not walked through. The tab they are standing in keeps
-          // full weight whatever it counts, or the strip's one "here" mark is the dimmest thing on it.
-          const quiet = holds !== undefined && holds.count === 0 && candidate !== mode;
-          return (
-            <Link
-              key={candidate}
-              to={`/projects/${projectId}/${candidate}`}
-              aria-current={candidate === mode ? "page" : undefined}
-              aria-keyshortcuts={`Control+${index + 1} Meta+${index + 1}`}
-              /* What the vendored trigger says about itself, said the same way, so one
-                 rule in `ui.css` draws the selected tab wherever it is. */
-              data-state={candidate === mode ? "active" : "inactive"}
-              title={holds?.means}
-              /* A colour and not an opacity: `--text-muted` at 0.7 measured 4.17:1 in dark and 3.18:1
-                 in light, under the 4.5:1 a 14px label needs. `.ui-tab[data-quiet]` stays above it. */
-              data-quiet={quiet ? "" : undefined}
-              className="ui-tab"
-            >
-              {MODE_LABEL[candidate]}
-              {/*
-                Said where the decision to press is taken rather than after the press. Absent until
-                the answer is in, so the strip never puts a nought on a tab it has not asked about —
-                which is `Count`'s own rule for an `undefined` reading, so the ternary this used to
-                spell out is now the component's. What the primitive adds over the hand-rolled span
-                is `tabular-nums` and `nowrap`: five of these sit on one line and a digit that
-                changes width under a poll would shift the labels beside it.
-              */}
-              <Count n={holds?.count} />
-            </Link>
-          );
-        })}
-      </nav>
+            `ui-tab-list` and `ui-tab` are the shared classes Radix's Tabs wears, so this
+            strip is the same object on screen as the tabs in the Bench. What it is NOT is
+            Radix's `Tabs`, and that is deliberate: each mode is a URL, so a tab here has to
+            be an `<a href>` that can be copied, opened in a second window, and — the case
+            `Workspace.test.tsx` pins — carry an old segment's replacement (Portuguese, or
+            `github`) in its `href` so the address canonicalises itself on the first press. A `role="tab"`
+            button has none of that — Radix's `Trigger` would swap the link role and
+            `aria-current` for `role="tab"` and `aria-selected`, and collapse six tab stops
+            into one roving one. `pj-tabs` on the inspector is the same decision.
 
-      {/* Every mode's ⓘ opens as a tip over the page, never as a paragraph inside its group. */}
-      <QuietTips.Provider value={true}>
-        {mode === "state" ? (
-          <ModeState projectId={projectId} answered={projects.data !== undefined} />
-        ) : null}
-        {mode === "map" ? <ModeMap projectId={projectId} /> : null}
-        {mode === "code" ? (
-          <ModeCode
-            projectId={projectId}
-            run={search.run ?? null}
-            /*
-            Replaces rather than pushes: choosing a different run to review is changing what you are
-            looking at, not going somewhere new, and a back button that walked through every run
-            somebody glanced at would be a worse back button.
-          */
-            onPickRun={(run) =>
-              void navigate({
-                to: `/projects/${projectId}/code`,
-                search: { run },
-                replace: true,
-              })
-            }
-          />
-        ) : null}
-        {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
-        {mode === "authority" ? <ModeGithub projectId={projectId} /> : null}
-        {mode === "analytics" ? <AnalyticsView projectId={projectId} /> : null}
-      </QuietTips.Provider>
+            What IS adopted is the rule underneath the appearance: **the active indicator is
+            `--text` and never `--accent`**, drawn by `.ui-tab[data-state="active"]`. `.ui-current`
+            does not fit here: it is an inset rule on the LEADING edge, and the mark a tab strip
+            needs is under the label.
+          */}
+          <nav aria-label="Project modes" className="ui-tab-list ws-tabs mb-6">
+            {MODES.map((candidate, index) => {
+              const holds = holding[candidate];
+              // Quiet is for a door somebody has not walked through. The tab they are standing in keeps
+              // full weight whatever it counts, or the strip's one "here" mark is the dimmest thing on it.
+              const quiet = holds !== undefined && holds.count === 0 && candidate !== mode;
+              return (
+                <Tip
+                  key={candidate}
+                  className="ws-tab-tip"
+                  persist
+                  tip={
+                    <>
+                      {holds === undefined ? null : <span className="ws-tab-means">{holds.means}</span>}
+                      <span className="ws-tab-keys">{`${mac ? "Cmd" : "Ctrl"} ${index + 1}`}</span>
+                    </>
+                  }
+                >
+                  {({ tipId }) => (
+                    <Link
+                      to={`/projects/${projectId}/${candidate}`}
+                      aria-current={candidate === mode ? "page" : undefined}
+                      /* Only the chord this machine answers; announcing both said a key that does nothing. */
+                      aria-keyshortcuts={`${mac ? "Meta" : "Control"}+${index + 1}`}
+                      aria-describedby={tipId}
+                      /* What the vendored trigger says about itself, said the same way, so one
+                         rule in `ui.css` draws the selected tab wherever it is. */
+                      data-state={candidate === mode ? "active" : "inactive"}
+                      /* A colour and not an opacity: `--text-muted` at 0.7 measured 4.17:1 in dark and 3.18:1
+                         in light, under the 4.5:1 a 14px label needs. `.ui-tab[data-quiet]` stays above it. */
+                      data-quiet={quiet ? "" : undefined}
+                      className="ui-tab"
+                    >
+                      {MODE_LABEL[candidate]}
+                      {/*
+                        Said where the decision to press is taken rather than after the press. Absent until
+                        the answer is in, so the strip never puts a nought on a tab it has not asked about —
+                        which is `Count`'s own rule for an `undefined` reading, so the ternary this used to
+                        spell out is now the component's. What the primitive adds over the hand-rolled span
+                        is `tabular-nums` and `nowrap`: five of these sit on one line and a digit that
+                        changes width under a poll would shift the labels beside it.
+                      */}
+                      {holds?.unavailable === true ? (
+                        <span className="ui-count" aria-hidden="true">
+                          ·
+                        </span>
+                      ) : (
+                        <Count n={holds?.count} />
+                      )}
+                    </Link>
+                  )}
+                </Tip>
+              );
+            })}
+          </nav>
+
+          {/* Every mode's ⓘ opens as a tip over the page, never as a paragraph inside its group. */}
+          <QuietTips.Provider value={true}>
+            {mode === "state" ? (
+              <ModeState projectId={projectId} answered={projects.data !== undefined} />
+            ) : null}
+            {mode === "map" ? <ModeMap projectId={projectId} /> : null}
+            {mode === "code" ? (
+              <ModeCode
+                projectId={projectId}
+                run={search.run ?? null}
+                /*
+                Replaces rather than pushes: choosing a different run to review is changing what you are
+                looking at, not going somewhere new, and a back button that walked through every run
+                somebody glanced at would be a worse back button.
+              */
+                onPickRun={(run) =>
+                  void navigate({
+                    to: `/projects/${projectId}/code`,
+                    search: { run },
+                    replace: true,
+                  })
+                }
+              />
+            ) : null}
+            {mode === "workflows" ? <ModeWorkflows projectId={projectId} /> : null}
+            {mode === "authority" ? <ModeGithub projectId={projectId} /> : null}
+            {mode === "analytics" ? <AnalyticsView projectId={projectId} /> : null}
+          </QuietTips.Provider>
+        </>
+      )}
     </>
   );
 }

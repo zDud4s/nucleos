@@ -121,7 +121,7 @@ describe("PipelineSection", () => {
     expect(within(red).getByRole("img", { name: "Red" })).toBeTruthy();
     expect(red.closest(".an-metric")?.classList.contains("an-metric-alert")).toBe(true);
     // Red opens first, and its project is a way into the state view.
-    expect(red.getAttribute("aria-expanded")).toBe("true");
+    expect(red.getAttribute("aria-pressed")).toBe("true");
     const link = screen.getByRole("link", { name: "nucleos" });
     expect(link.getAttribute("href")).toBe("/projects/nucleos/state");
   });
@@ -145,10 +145,10 @@ describe("PipelineSection", () => {
     expect(within(card("Jobs")).getByText("no data")).toBeTruthy();
   });
 
-  it("says once that the núcleo did not answer for the pipeline", async () => {
+  it("says once that the pipeline could not be read", async () => {
     await mount(withPipeline(busyReport()), new Set(["/analytics/pipeline"]));
-    expect(await screen.findByText("The núcleo did not answer for the pipeline.")).toBeTruthy();
-    expect(screen.getAllByText("The núcleo did not answer for the pipeline.")).toHaveLength(1);
+    expect(await screen.findByText("Could not read the pipeline: the background service may be stopped.")).toBeTruthy();
+    expect(screen.getAllByText("Could not read the pipeline: the background service may be stopped.")).toHaveLength(1);
     // F1's readout above it is not taken down.
     expect(await screen.findByRole("region", { name: "Spend per day" })).toBeTruthy();
   });
@@ -156,12 +156,12 @@ describe("PipelineSection", () => {
   it("opens the panel of the card clicked, one at a time, and lists what each holds", async () => {
     await mount(withPipeline(busyReport()));
     await section();
-    expect(card("Landing queue").getAttribute("aria-expanded")).toBe("true");
+    expect(card("Landing queue").getAttribute("aria-pressed")).toBe("true");
     expect(card("Landing queue").textContent).toContain("last attempt");
     expect(screen.getByRole("list", { name: "Landing times" })).toBeTruthy();
 
     fireEvent.click(card("Gate"));
-    expect(card("Landing queue").getAttribute("aria-expanded")).toBe("false");
+    expect(card("Landing queue").getAttribute("aria-pressed")).toBe("false");
     const gate = screen.getByRole("region", { name: "Gate duration per day" });
     expect(within(gate).getByText("core")).toBeTruthy();
     expect(within(gate).getByText("suspect")).toBeTruthy();

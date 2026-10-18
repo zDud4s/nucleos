@@ -139,15 +139,15 @@ describe("normaliseMode", () => {
 });
 
 describe("the project workspace", () => {
-  it("opens on State and offers the other three modes", async () => {
+  it("opens on Overview and offers the other modes", async () => {
     await openWorkspace();
 
-    expect(await screen.findByRole("link", { name: "State" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "State" }).getAttribute("aria-current")).toBe("page");
+    expect(await screen.findByRole("link", { name: "Overview" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("link", { name: "Map" })).toBeTruthy();
     // By prefix from here down: two of the four carry a count of what they hold, which is the next
     // test's subject and not this one's.
-    expect(screen.getByRole("link", { name: /^Code/ })).toBeTruthy();
+    expect(screen.getByRole("link", { name: /^Review/ })).toBeTruthy();
     expect(screen.getByRole("link", { name: /^Workflows/ })).toBeTruthy();
   });
 
@@ -170,14 +170,18 @@ describe("the project workspace", () => {
   it("says how much the two conditional modes are holding, and still opens them", async () => {
     await openWorkspace();
 
-    const code = await screen.findByRole("link", { name: /^Code/ });
-    await waitFor(() => expect(code.textContent).toBe("Code0"));
-    expect(code.getAttribute("title")).toMatch(/No run is working here/);
+    const code = await screen.findByRole("link", { name: /^Review/ });
+    await waitFor(() => expect(code.textContent).toBe("Review0"));
+    // The count's meaning and the chord live in a tip tied to the link, not in a native title.
+    expect(code.hasAttribute("title")).toBe(false);
+    const tip = document.getElementById(code.getAttribute("aria-describedby") ?? "");
+    expect(tip?.textContent).toMatch(/No run is working here/);
+    expect(tip?.textContent).toMatch(/Ctrl 3/);
     expect(screen.getByRole("link", { name: /^Workflows/ }).textContent).toBe("Workflows0");
 
     // The two that answer about the project itself are never numbered: both are true of a project
     // the moment it exists, whatever is or is not running in it.
-    expect(screen.getByRole("link", { name: "State" }).textContent).toBe("State");
+    expect(screen.getByRole("link", { name: "Overview" }).textContent).toBe("Overview");
     expect(screen.getByRole("link", { name: "Map" }).textContent).toBe("Map");
 
     // Quiet is drawn, and it is drawn by the tone rather than by taking anything away.
@@ -199,7 +203,7 @@ describe("the project workspace", () => {
   it("answers a kept github link on Authority, and hands back the new segment", async () => {
     await openWorkspace({ mode: "github" });
 
-    const authority = await screen.findByRole("link", { name: "Authority" });
+    const authority = await screen.findByRole("link", { name: "Permissions" });
     expect(authority.getAttribute("aria-current")).toBe("page");
     expect(authority.getAttribute("href")).toBe("/projects/nucleos/authority");
     // The mode's own region, which State (the fallback) does not have.
@@ -216,8 +220,8 @@ describe("the project workspace", () => {
   it("does not dim the current tab when it holds nothing", async () => {
     await openWorkspace({ mode: "code" });
 
-    const code = await screen.findByRole("link", { name: /^Code/ });
-    await waitFor(() => expect(code.textContent).toBe("Code0"));
+    const code = await screen.findByRole("link", { name: /^Review/ });
+    await waitFor(() => expect(code.textContent).toBe("Review0"));
     expect(code.getAttribute("aria-current")).toBe("page");
     expect(code.hasAttribute("data-quiet")).toBe(false);
 
@@ -228,10 +232,10 @@ describe("the project workspace", () => {
   it("answers a kept Portuguese link, and hands back English tabs", async () => {
     await openWorkspace({ mode: "codigo" });
 
-    const code = await screen.findByRole("link", { name: "Code" });
+    const code = await screen.findByRole("link", { name: "Review" });
     expect(code.getAttribute("aria-current")).toBe("page");
     expect(code.getAttribute("href")).toContain("/projects/nucleos/code");
-    expect(screen.getByRole("link", { name: "State" }).getAttribute("href")).toContain(
+    expect(screen.getByRole("link", { name: "Overview" }).getAttribute("href")).toContain(
       "/projects/nucleos/state",
     );
   });
@@ -250,13 +254,13 @@ describe("the project workspace", () => {
    */
   it("renders the same panels, in the same order, calm and demanding", async () => {
     const calm = await openWorkspace({ openProposals: 0 });
-    await screen.findByRole("link", { name: "State" });
+    await screen.findByRole("link", { name: "Overview" });
     const calmPanels = panelsOf(calm.container);
 
     calm.unmount();
 
     const loud = await openWorkspace({ openProposals: 2 });
-    await screen.findByRole("link", { name: "State" });
+    await screen.findByRole("link", { name: "Overview" });
     const loudPanels = panelsOf(loud.container);
 
     expect(calmPanels).toEqual(loudPanels);
@@ -550,7 +554,7 @@ describe("the project workspace", () => {
   it("opens a mode from the keyboard, and leaves a field's chord alone", async () => {
     await openWorkspace({ mode: "state" });
     const map = await screen.findByRole("link", { name: "Map" });
-    expect(map.getAttribute("aria-keyshortcuts")).toBe("Control+2 Meta+2");
+    expect(map.getAttribute("aria-keyshortcuts")).toBe("Control+2");
 
     fireEvent.keyDown(window, { key: "2", ctrlKey: true });
     await waitFor(() =>
@@ -572,7 +576,7 @@ describe("the project workspace", () => {
     await openWorkspace({ mode: "state" });
     const modes = await screen.findByRole("navigation", { name: "Project modes" });
     const tab = within(modes).getByRole("link", { name: "Analytics" });
-    expect(tab.getAttribute("aria-keyshortcuts")).toBe("Control+6 Meta+6");
+    expect(tab.getAttribute("aria-keyshortcuts")).toBe("Control+6");
 
     fireEvent.keyDown(window, { key: "6", ctrlKey: true });
 
@@ -1342,5 +1346,38 @@ describe("what this project can be asked to do", () => {
 
     fireEvent.click(forgets[0]);
     await waitFor(() => expect(state.commands.map((row) => row.id)).toEqual([2]));
+  });
+});
+
+describe("the workspace shell", () => {
+  it("says so when the project is not in the roster, and offers no mode strip", async () => {
+    await openState(daemonState({ projects: [project({ project_id: "nucleos", mode: "shadow" })] }), "/projects/ghost/state");
+
+    const missing = await screen.findByRole("region", { name: "Project not found" });
+    expect(within(missing).getByText("ghost")).toBeTruthy();
+    expect(within(missing).getByRole("link", { name: "Back to Projects" })).toBeTruthy();
+    expect(screen.queryByRole("navigation", { name: "Project modes" })).toBeNull();
+  });
+
+  it("titles the page with the folder's name and keeps the id beside it when they differ", async () => {
+    await openState(
+      daemonState({
+        projects: [project({ project_id: "nucleos", mode: "shadow", project_root: "C:/work/nucleos-app" })],
+      }),
+    );
+
+    const heading = await screen.findByRole("heading", { level: 1, name: "nucleos-app" });
+    const header = heading.closest("header") as HTMLElement;
+    expect(within(header).getByText("nucleos")).toBeTruthy();
+    expect(within(header).getByTitle("C:/work/nucleos-app")).toBeTruthy();
+    expect(within(header).getByRole("button", { name: /project folder/ })).toBeTruthy();
+  });
+
+  it("ignores a held key: one press opens one mode", async () => {
+    await openWorkspace({ mode: "state" });
+    await screen.findByRole("link", { name: "Map" });
+
+    fireEvent.keyDown(window, { key: "2", ctrlKey: true, repeat: true });
+    expect(screen.getByRole("link", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
   });
 });

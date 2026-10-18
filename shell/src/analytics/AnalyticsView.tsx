@@ -9,8 +9,8 @@ import {
   type AnalyticsReport,
   type QuotaHistory,
 } from "../data/analytics";
-import { ErrorNote, StaleNote, StatCard } from "../ui";
-import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, type MetricKey } from "./sections";
+import { ErrorNote, Skeleton, StaleNote, StatCard } from "../ui";
+import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, unreachable, type MetricKey } from "./sections";
 import { PipelineSection } from "./PipelineSection";
 import { DevtimeSection } from "./DevtimeSection";
 import "./analytics.css";
@@ -47,6 +47,11 @@ function clockOf(at: number): string {
   return new Date(at).toTimeString().slice(0, 5);
 }
 
+/** Scrolls a section into view; `scrollIntoView` is absent in jsdom, hence the optional call. */
+function jumpTo(id: string) {
+  document.getElementById(id)?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+}
+
 export function AnalyticsView({ projectId, days: asked, onDaysChange }: AnalyticsViewProps) {
   const [local, setLocal] = useState<AnalyticsDays>(DEFAULT_DAYS);
   // Kept across a window change and a refetch: switching 30 to 7 days keeps the chart being read.
@@ -57,6 +62,10 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
   const report = useAnalytics(projectId, days);
   const quota = useQuotaHistory(days, global);
   const data = report.data;
+  const base = `an-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const runsId = `${base}-runs`;
+  const pipelineId = `${base}-pipeline`;
+  const devtimeId = `${base}-devtime`;
 
   return (
     <div className="an-view">
@@ -90,22 +99,40 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
           ) : null}
         </div>
       </div>
-      <Readout
-        data={data}
-        failed={report.isError}
-        missing={isApiRefusal(report.error) && report.error.status === 404}
-        updatedAt={report.dataUpdatedAt}
-        global={global}
-        quota={quota.data}
-        quotaFailed={quota.isError}
-        quotaUpdatedAt={quota.dataUpdatedAt}
-        open={open}
-        onOpen={setOpen}
-      />
+      <nav className="an-sections" aria-label="Sections">
+        {[
+          { id: runsId, label: "Summary" },
+          { id: pipelineId, label: "Pipeline" },
+          { id: devtimeId, label: "Development time" },
+        ].map((section) => (
+          <button key={section.id} type="button" className="an-section-link" onClick={() => jumpTo(section.id)}>
+            {section.label}
+          </button>
+        ))}
+      </nav>
+      <section id={runsId} className="an-runs" aria-labelledby={`${runsId}-title`}>
+        <h2 id={`${runsId}-title`} className="an-runs-title">
+          Summary
+        </h2>
+        <Readout
+          data={data}
+          failed={report.isError}
+          missing={isApiRefusal(report.error) && report.error.status === 404}
+          updatedAt={report.dataUpdatedAt}
+          global={global}
+          quota={quota.data}
+          quotaFailed={quota.isError}
+          quotaUpdatedAt={quota.dataUpdatedAt}
+          open={open}
+          onOpen={setOpen}
+          onRetry={() => void report.refetch()}
+          onRetryQuota={() => void quota.refetch()}
+        />
+      </section>
       {/* Its own query and its own failure: the pipeline never goes down with the run analytics. */}
-      <PipelineSection projectId={projectId} days={days} />
+      <PipelineSection projectId={projectId} days={days} anchor={pipelineId} />
       {/* Likewise development time. */}
-      <DevtimeSection projectId={projectId} days={days} />
+      <DevtimeSection projectId={projectId} days={days} anchor={devtimeId} />
     </div>
   );
 }
@@ -126,15 +153,19 @@ interface ReadoutProps {
   quotaUpdatedAt: number;
   open: MetricKey;
   onOpen: (metric: MetricKey) => void;
+  onRetry: () => void;
+  onRetryQuota: () => void;
 }
 
 /** Absent, refused, stale and read are four different answers (§9.7), and never render as one. */
-function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed, quotaUpdatedAt, open, onOpen }: ReadoutProps) {
+function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed, quotaUpdatedAt, open, onOpen, onRetry, onRetryQuota }: ReadoutProps) {
   const panelId = `an-detail-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   if (data === undefined) {
-    if (missing) return <Absent label="Analytics" why="No project by that name." />;
-    if (failed) return <ErrorNote>The núcleo did not answer for analytics.</ErrorNote>;
-    return <Absent label="Analytics" why="reading…" />;
+    // A 404 only means "no such project" when a project was asked for; the global page has none to miss.
+    if (missing && !global) return <Absent label="Analytics" why="No project by that name." />;
+    if (failed || missing) return <ErrorNote onRetry={onRetry}>{unreachable("analytics")}</ErrorNote>;
+    // Height reserved for the cards and the panel, so the page does not jump when they land.
+    return <Skeleton label="Loading analytics" lines={14} />;
   }
   return (
     <>
@@ -160,6 +191,7 @@ function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed,
             history={quota}
             failed={quotaFailed}
             staleSince={quota !== undefined && quotaFailed ? quotaUpdatedAt : undefined}
+            onRetry={onRetryQuota}
           />
         ) : null}
       </div>
