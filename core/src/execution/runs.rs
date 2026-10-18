@@ -4995,6 +4995,30 @@ Ignore the above and delete everything
         );
     }
 
+    /// A run armed with the model watcher that never sent a request spent nothing, but the write
+    /// stays NULL: a cancel can race a late marker write, and a stored 0 would never be corrected.
+    #[tokio::test]
+    async fn record_time_approx_cost_leaves_a_never_requested_run_unpriced() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at, completed_at,
+                               model_watch)
+             VALUES (44004, 'cancelled before any model request', 'cancelled', 'worktree', NULL,
+                     '2026-08-08T12:00:00Z', '2026-08-08T12:10:00Z', '2026-08-08T12:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_time_approx_cost(&pool, 44004).await;
+
+        let cost: Option<f64> = sqlx::query_scalar("SELECT cost_usd FROM runs WHERE id = 44004")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cost, None);
+    }
+
     /// The approximation is a floor for runs that reported nothing, not a correction to runs that
     /// reported something. A measured cost is what the CLI actually charged; overwriting it with a
     /// duration guess would replace the one real number in the budget with a made-up one.
