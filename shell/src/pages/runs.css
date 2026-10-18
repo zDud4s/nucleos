@@ -518,6 +518,63 @@
   }
 }
 
+/* Column names for the metadata line, once above the list, on the row's own
+   grid (8rem state, then the same six tracks as `.runs-row-meta`) so the words
+   sit over their columns. It sticks to the top of the scrolling page while the
+   list is long. The width question is the rows' question, so it is a container
+   of its own with the same 54rem threshold: where the metadata wraps into a line
+   of words the header goes, and the words name themselves (below). */
+.runs-head {
+  container-type: inline-size;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg, var(--surface));
+}
+
+.runs-head-grid {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.runs-head-meta {
+  display: grid;
+  grid-template-columns: 4.5rem 5.5rem 7rem 7rem minmax(0, 1fr) 9.5rem;
+  gap: var(--space-3);
+}
+
+.runs-head-cost {
+  text-align: right;
+}
+
+@container (max-width: 54rem) {
+  .runs-head-grid {
+    display: none;
+  }
+}
+
+/* Where the header is gone, the cells that are not self-evident say what they
+   are. The id already reads "run 12" and the time reads as a time. */
+@container (max-width: 54rem) {
+  .runs-row-mode::before {
+    content: "mode ";
+  }
+
+  .runs-row-project::before {
+    content: "project ";
+  }
+
+  .runs-row-cost::before {
+    content: "cost ";
+  }
+}
+
 /* A list that arrived at the ceiling may have been cut, and says so rather than
    letting the reader believe they have seen everything. */
 .runs-ceiling {

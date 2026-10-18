@@ -233,28 +233,40 @@ describe("Runs - the filters live in the route", () => {
     expect(daemon.apiFetch).not.toHaveBeenCalledWith("/runs?mode=&limit=50");
   });
 
-  it("a scope writes its status into the route and says which one is in force", async () => {
+  it("a status chip writes its status into the route and says which one is in force", async () => {
     daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
 
     const { router } = await renderRuns();
-    const scopes = await screen.findByRole("group", { name: "Show" });
-    const all = within(scopes).getByRole("button", { name: "All" });
-    const failed = within(scopes).getByRole("button", { name: "Failed" });
-    expect(all.getAttribute("aria-pressed")).toBe("true");
+    const bar = await screen.findByRole("group", { name: "Filter runs" });
+    const failed = within(bar).getByRole("button", { name: "Failed" });
     expect(failed.getAttribute("aria-pressed")).toBe("false");
 
     fireEvent.click(failed);
 
-    // The same route model as every other filter — a scope is a status, not a
+    // The same route model as every other filter: a chip is a status, not a
     // second piece of state beside it.
     await waitFor(() => expect(searchOf(router)).toEqual({ status: "failed" }));
     expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=failed&group=chat&chat_turns=hide&limit=50");
     await waitFor(() => {
-      expect(within(scopes).getByRole("button", { name: "Failed" }).getAttribute("aria-pressed")).toBe(
+      expect(within(bar).getByRole("button", { name: "Failed" }).getAttribute("aria-pressed")).toBe(
         "true",
       );
     });
-    expect(within(scopes).getByRole("button", { name: "All" }).getAttribute("aria-pressed")).toBe("false");
+
+    // Pressing it again is "all".
+    fireEvent.click(within(bar).getByRole("button", { name: "Failed" }));
+    await waitFor(() => expect(searchOf(router)).toEqual({}));
+  });
+
+  it("the search box writes its text into the route once typing rests", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
+
+    const { router } = await renderRuns();
+    fireEvent.change(await screen.findByRole("searchbox", { name: "Search runs" }), {
+      target: { value: "gate" },
+    });
+
+    await waitFor(() => expect(searchOf(router)).toEqual({ q: "gate" }));
   });
 
   it("an exact status the scopes do not cover opens More filters on arrival", async () => {

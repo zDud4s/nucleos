@@ -297,6 +297,9 @@ export function useRuns(filters: RunFilters) {
   });
 }
 
+/** Loaded pages beyond which the run index stops polling itself. */
+const RUN_POLL_MAX_PAGES = 3;
+
 /**
  * The filtered index, a page at a time: the newest page first, and each older
  * page fetched on request ("Load older") through the daemon's `before` cursor.
@@ -318,7 +321,12 @@ export function useRunPages(filters: RunFilters) {
       apiFetch<RunSearchResult[]>(`/runs${runsQuery(filters, pageParam)}`),
     initialPageParam: undefined as number | undefined,
     getNextPageParam: (lastPage: RunSearchResult[]) => nextRunsCursor(lastPage),
-    refetchInterval: POLL.fast,
+    // A poll refetches every loaded page in sequence. Past a few pages that is a
+    // burst of requests every tick for rows nobody is watching change, so the
+    // poll rests once the reader has gone deep; a filter change or a focus
+    // refetch still refreshes it.
+    refetchInterval: (query) =>
+      (query.state.data?.pages.length ?? 0) > RUN_POLL_MAX_PAGES ? false : POLL.fast,
     placeholderData: keepPreviousData,
   });
 }

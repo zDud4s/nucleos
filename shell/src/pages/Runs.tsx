@@ -25,8 +25,10 @@ import { useKillSwitch, useProjects, type ProjectSummary } from "../data/system"
 import {
   Button,
   ConfirmButton,
+  Disclosure,
   ErrorNote,
   Field,
+  ListFilter,
   PageHeader,
   Panel,
   Quiet,
@@ -216,34 +218,32 @@ export function Runs() {
 /* -------------------------------------------------------------- filters -- */
 
 /**
- * The scopes a person reaches for, as one control.
- *
- * Four, because that is the whole of the verification read: everything, what
- * is moving, what awaits approval, what went wrong. `failed` alone and not
+ * The status chips a person reaches for: what is moving, what awaits approval,
+ * what went wrong. With none on, every run shows. `failed` alone and not
  * "failed, timed out or interrupted": `GET /runs` binds `status` to exactly one
- * value (`core/src/runs.rs`, `search` — `AND status = ?`), so a scope that
+ * value (`core/src/runs.rs`, `search` — `AND status = ?`), so a chip that
  * promised three would be a request the daemon cannot answer. The exact
  * statuses are one disclosure away.
  */
-const SCOPES: readonly { label: string; status: string | undefined }[] = [
-  { label: "All", status: undefined },
-  { label: "Running", status: "running" },
-  { label: "Awaiting approval", status: "awaiting_approval" },
-  { label: "Failed", status: "failed" },
+const SCOPES: readonly { id: string; label: string }[] = [
+  { id: "running", label: "Running" },
+  { id: "awaiting_approval", label: "Awaiting approval" },
+  { id: "failed", label: "Failed" },
 ];
 
-const SCOPE_STATUSES = new Set(
-  SCOPES.map((scope) => scope.status).filter((status) => status !== undefined),
-);
+const SCOPE_STATUSES = new Set(SCOPES.map((scope) => scope.id));
+
+/** How long the search box rests before it is written to the route. */
+const SEARCH_DEBOUNCE_MS = 350;
 
 /**
  * The filters, bound to the route.
  *
- * The selects and the scope commit on change and the text box on Enter, which
- * is the split a person expects: choosing from a list is a decision, typing is
- * not, and a navigation per keystroke would put a history entry behind every
- * letter. The Search button sits against the box it submits so it cannot read
- * as the button that applies everything.
+ * One `ListFilter`: the search box and the status chips (none on is "all"). The
+ * chips and the selects commit on change; the text commits once typing rests,
+ * since a navigation per keystroke would put a history entry behind every
+ * letter. Project, mode, the other statuses and the chat turns sit behind one
+ * `Disclosure`, open on arrival when any of them is in force.
  */
 function RunFilterBar({
   filters,
@@ -256,10 +256,9 @@ function RunFilterBar({
   projects: ProjectSummary[] | undefined;
   onChange: (patch: Partial<RunSearch>) => void;
 }) {
-  const moreId = useId();
   // Open on arrival when a filter it holds is in force: a project, a mode, chat
-  // turns shown, or a status the scope control has no segment for. Otherwise the
-  // list would be narrowed by a control nobody can see.
+  // turns shown, or a status the chips have no entry for. Otherwise the list
+  // would be narrowed by a control nobody can see.
   const otherStatus =
     filters.status !== undefined && !SCOPE_STATUSES.has(filters.status)
       ? filters.status
@@ -278,34 +277,48 @@ function RunFilterBar({
     if (needsMore) setMore(true);
   }
 
+  // The box is typed into locally and written to the route when it rests; the
+  // route stays the source of truth, so a change that comes from elsewhere
+  // (Clear, back button) replaces the draft.
+  const routeQ = filters.q ?? "";
+  const [draft, setDraft] = useState(routeQ);
+  const [sawQ, setSawQ] = useState(routeQ);
+  if (routeQ !== sawQ) {
+    setSawQ(routeQ);
+    setDraft(routeQ);
+  }
+  useEffect(() => {
+    if (draft.trim() === routeQ) return;
+    const timer = setTimeout(() => onChange({ q: draft }), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+    // `onChange` is a fresh closure every render; the draft and the route's
+    // value are what decide whether a write is due.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, routeQ]);
+
+  function clearAll() {
+    setDraft("");
+    onChange({ project: undefined, status: undefined, mode: undefined, q: undefined });
+  }
+
+  const chipsOn = filters.status !== undefined && SCOPE_STATUSES.has(filters.status);
+  const listFilterCovers = chipsOn || routeQ !== "";
+
   return (
-    <form
-      className="runs-filters"
-      role="search"
-      aria-label="Filter runs"
-      onSubmit={(event) => {
-        event.preventDefault();
-        const typed = new FormData(event.currentTarget).get("q");
-        onChange({ q: typeof typed === "string" ? typed : undefined });
-      }}
-    >
-      <div className="ui-switch runs-scope" role="group" aria-label="Show">
-        {SCOPES.map((scope) => (
-          <button
-            key={scope.label}
-            type="button"
-            className="ui-switch-seg"
-            aria-pressed={filters.status === scope.status}
-            onClick={() => onChange({ status: scope.status })}
-          >
-            {scope.label}
-          </button>
-        ))}
-      </div>
+    <div className="runs-filters">
+      <ListFilter
+        noun="runs"
+        query={draft}
+        onQueryChange={setDraft}
+        chips={SCOPES}
+        selected={chipsOn && filters.status !== undefined ? [filters.status] : []}
+        onToggleChip={(id) => onChange({ status: filters.status === id ? undefined : id })}
+        onClear={clearAll}
+      />
 
       {otherStatus !== undefined && (
-        // A status the four segments cannot show, kept in sight and removable,
-        // so the list is never narrowed by something that is not on screen.
+        // A status the chips cannot show, kept in sight and removable, so the
+        // list is never narrowed by something that is not on screen.
         <Button
           variant="quiet"
           aria-label={`Remove status filter: ${readState("run", otherStatus)?.label ?? otherStatus}`}
@@ -316,100 +329,77 @@ function RunFilterBar({
         </Button>
       )}
 
-      <div className="runs-search">
-        <Field label="Search prompts">
-          <input name="q" defaultValue={filters.q ?? ""} key={filters.q ?? ""} />
-        </Field>
-        <Button type="submit">Search</Button>
-      </div>
-
-      <span className="runs-filters-aside">
-        <Button
-          variant="quiet"
-          aria-expanded={more}
-          aria-controls={moreId}
-          onClick={() => setMore(!more)}
-        >
-          More filters
+      {isFiltered(filters) && !listFilterCovers && (
+        // The filter bar offers its own Clear only for what it holds (text and
+        // chips); a project or a mode alone still needs a way out.
+        <Button variant="quiet" onClick={clearAll}>
+          Clear filters
         </Button>
-        {isFiltered(filters) && (
-          <Button
-            variant="quiet"
-            onClick={() =>
-              onChange({
-                project: undefined,
-                status: undefined,
-                mode: undefined,
-                q: undefined,
-              })
-            }
-          >
-            Clear filters
-          </Button>
-        )}
-      </span>
+      )}
 
-      <div id={moreId} className="runs-more" hidden={!more}>
-        <Field label="Project">
-          <select
-            value={filters.project ?? ""}
-            onChange={(event) => onChange({ project: event.target.value })}
-          >
-            <option value="">any project</option>
-            {(projects ?? []).map((project) => (
-              <option key={project.project_id} value={project.project_id}>
-                {project.project_id}
-              </option>
-            ))}
-          </select>
-        </Field>
+      <Disclosure label="More filters" open={more} onOpenChange={setMore}>
+        <div className="runs-more">
+          <Field label="Project">
+            <select
+              value={filters.project ?? ""}
+              onChange={(event) => onChange({ project: event.target.value })}
+            >
+              <option value="">any project</option>
+              {(projects ?? []).map((project) => (
+                <option key={project.project_id} value={project.project_id}>
+                  {project.project_id}
+                </option>
+              ))}
+            </select>
+          </Field>
 
-        <Field label="Mode">
-          {/* `assistant` is offered here and not in the new-run form: the daemon
-              writes that mode, so runs carry it, but nobody may ask for one. */}
-          <select
-            value={filters.mode ?? ""}
-            onChange={(event) => onChange({ mode: event.target.value })}
-          >
-            <option value="">any mode</option>
-            {RUN_MODE_FILTERS.map((mode) => (
-              <option key={mode} value={mode}>
-                {mode}
-              </option>
-            ))}
-          </select>
-        </Field>
+          <Field label="Mode">
+            {/* `assistant` is offered here and not in the new-run form: the daemon
+                writes that mode, so runs carry it, but nobody may ask for one. */}
+            <select
+              value={filters.mode ?? ""}
+              onChange={(event) => onChange({ mode: event.target.value })}
+            >
+              <option value="">any mode</option>
+              {RUN_MODE_FILTERS.map((mode) => (
+                <option key={mode} value={mode}>
+                  {mode}
+                </option>
+              ))}
+            </select>
+          </Field>
 
-        <Field label="Other status">
-          {/* Only the statuses the four scopes above do not already offer, in
-              the badge's own words from the one table: choosing "failed" has one
-              place to be done, not two. */}
-          <select
-            value={otherStatus ?? ""}
-            onChange={(event) => onChange({ status: event.target.value })}
-          >
-            <option value="">none</option>
-            {RUN_STATUSES.filter((status) => !SCOPE_STATUSES.has(status)).map((status) => (
-              <option key={status} value={status}>
-                {readState("run", status)?.label ?? status}
-              </option>
-            ))}
-          </select>
-        </Field>
+          <Field label="Other status">
+            {/* Only the statuses the chips above do not already offer, in the
+                badge's own words from the one table: choosing "failed" has one
+                place to be done, not two. */}
+            <select
+              value={otherStatus ?? ""}
+              onChange={(event) => onChange({ status: event.target.value })}
+            >
+              <option value="">none</option>
+              {RUN_STATUSES.filter((status) => !SCOPE_STATUSES.has(status)).map((status) => (
+                <option key={status} value={status}>
+                  {readState("run", status)?.label ?? status}
+                </option>
+              ))}
+            </select>
+          </Field>
 
-        <label className="runs-check">
-          <input
-            type="checkbox"
-            checked={showChats}
-            disabled={filters.mode === "assistant"}
-            onChange={(event) =>
-              onChange({ chats: event.target.checked ? "show" : undefined })
-            }
-          />
-          Show chat turns
-        </label>
-      </div>
-    </form>
+          <label className="runs-check">
+            <input
+              type="checkbox"
+              checked={showChats}
+              disabled={filters.mode === "assistant"}
+              onChange={(event) =>
+                onChange({ chats: event.target.checked ? "show" : undefined })
+              }
+            />
+            Show chat turns
+          </label>
+        </div>
+      </Disclosure>
+    </div>
   );
 }
 
@@ -497,6 +487,7 @@ function RunList({
 
   return (
     <>
+      <RunsHead />
       <Rows label="Runs">
         {rows.map((row) =>
           row.chat_id != null && row.turns != null ? (
@@ -530,6 +521,31 @@ function RunList({
   );
 }
 
+/**
+ * Names the metadata columns once, above the list.
+ *
+ * Presentation only (`aria-hidden`): each row's cells carry `title`s for the same
+ * words, and below the container width where the columns collapse the header is
+ * hidden and the cells name themselves with a short prefix instead (`runs.css`).
+ */
+function RunsHead() {
+  return (
+    <div className="runs-head" aria-hidden="true">
+      <div className="runs-head-grid">
+        <span className="runs-head-state">State</span>
+        <span className="runs-head-meta">
+          <span>Run</span>
+          <span>Mode</span>
+          <span>Project</span>
+          <span>When</span>
+          <span>Model</span>
+          <span className="runs-head-cost">Cost</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 /** One run as a row: the old list's row, now also what a conversation's turns are drawn with. */
 function RunRow({ row }: { row: RunSearchResult }) {
   // What ran is a column of the metadata line, not a line of its own: it is a
@@ -545,14 +561,14 @@ function RunRow({ row }: { row: RunSearchResult }) {
         {row.prompt_excerpt}
       </Link>
       <p className="runs-row-meta">
-        <span className="runs-row-id">run {row.id}</span>
-        <span className="runs-row-mode">{row.mode}</span>
-        <span className="runs-row-project">
+        <span className="runs-row-id" title="Run">run {row.id}</span>
+        <span className="runs-row-mode" title="Mode">{row.mode}</span>
+        <span className="runs-row-project" title="Project">
           {row.project_id ?? "no project"}
         </span>
         <RelativeTime at={row.created_at} />
-        {ran !== null && <span className="runs-row-ran">{ran}</span>}
-        <span className="runs-row-cost">{costOf(row)}</span>
+        {ran !== null && <span className="runs-row-ran" title="Model">{ran}</span>}
+        <span className="runs-row-cost" title="Cost">{costOf(row)}</span>
       </p>
       {row.launched_by_chat_id != null && (
         <Link to={`/chats/${row.launched_by_chat_id}`} className="runs-row-origin">
@@ -1007,6 +1023,7 @@ function NewRunForm({
           ) : (
             <Button
               type="submit"
+              variant="primary"
               intent="go"
               disabled={blank || create.isPending}
               aria-describedby={describedBy}
