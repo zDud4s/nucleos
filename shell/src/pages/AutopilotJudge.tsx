@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import {
   JUDGE_ENFORCE_DIALOG,
@@ -149,7 +150,7 @@ export function JudgePanel({
         {TYPESAFE_DEFINITION}
       </p>
       {status.isError && status.data === undefined && (
-        <ErrorNote>The núcleo did not answer — nothing is known about the judge.</ErrorNote>
+        <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about the judge.</ErrorNote>
       )}
       {current !== undefined && (
         <p className="ap-reason">
@@ -266,7 +267,7 @@ export function JudgePanel({
 
 function JudgeRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — the judge was not changed</ErrorNote>;
+    return <ErrorNote>Could not reach the {DAEMON_NAME} — the judge was not changed.</ErrorNote>;
   }
   return (
     <RefusalNote
@@ -277,7 +278,7 @@ function JudgeRefusal({ error }: { error: unknown }) {
         unknown_project: "this project is not on the autopilot's roster",
         invalid: "off, observe and enforce are the only settings",
         // A shell newer than its núcleo: until the núcleo has Task 9.5, the route still says this.
-        enforce_unavailable: "this núcleo does not accept enforce yet — update it to one that shows the residual risk first",
+        enforce_unavailable: `this ${DAEMON_NAME} does not accept enforce yet — update it to one that shows the residual risk first`,
       }}
     />
   );

@@ -431,8 +431,10 @@
 .ap-fan-tick {
   position: relative;
   flex: 0 1 2.5rem;
-  min-width: 1.5rem;
-  height: 2rem;
+  /* A touch target of at least --hit-min on both sides; the bar inside stays thin. */
+  min-width: var(--hit-min);
+  min-height: var(--hit-min);
+  height: var(--hit-min);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -878,7 +880,6 @@
 }
 
 .ap-fan-focus-title strong {
-  margin-left: var(--space-1);
   font-family: var(--font-display);
   font-size: var(--text-lg);
   font-weight: var(--weight-bold);
@@ -1222,4 +1223,119 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: center;
+}
+
+/* ============================================ roster list, project bar, agreement == */
+
+/* The fan hidden: the stage goes and the control takes the whole width. */
+.ap-fan.ap-fan-nofan {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ap-fan-nofan .ap-fan-stage {
+  display: none;
+}
+
+/* The roster as a list, most urgent first: every project on one screen, no pointer needed. */
+.ap-roster {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 20rem;
+  overflow-y: auto;
+}
+
+.ap-roster-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 14rem) auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: var(--hit-min);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ap-roster-row:hover {
+  background: var(--surface-raised);
+}
+
+.ap-roster-row[aria-current="true"] {
+  background: var(--surface-raised);
+  box-shadow: inset 2px 0 0 var(--text-muted);
+}
+
+.ap-roster-name {
+  font-family: var(--font-display);
+  font-weight: var(--weight-semibold);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ap-roster-reading {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The project in focus, kept in view once the carousel has scrolled away. */
+.ap-project-bar {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-strong);
+  background: var(--bg);
+}
+
+.ap-project-bar-label {
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.ap-project-bar-name {
+  font-family: var(--font-display);
+  font-weight: var(--weight-bold);
+  color: var(--text);
+}
+
+/* Agreement: the figure, a bar to the readiness bar, and what is still missing. */
+.ap-score-agree {
+  min-width: 9rem;
+}
+
+.ap-agree {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ap-agree-figure {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.ap-agree-verdict,
+.ap-agree-none {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
 }
