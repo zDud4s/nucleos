@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 const shellSource = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Files that violate today. Each is removed by the W3 page batch that drops the aria-label. */
-const ALLOWED = new Set<string>(["pages/Files.tsx", "pages/Fleet.tsx", "pages/Mail.tsx", "pages/Runs.tsx"]);
+const ALLOWED = new Set<string>(["pages/Files.tsx"]);
 
 /** Source of every `<Field ...>...</Field>` block that has a `label` attribute, with its line. */
 export function fieldBlocks(source: string): { line: number; body: string }[] {
