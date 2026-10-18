@@ -258,8 +258,9 @@ Errors raised by the dispatch mechanism itself, before any phase logic runs. Pip
 
 | Situation | Action |
 |---|---|
-| `<state_dir>/models.yaml` missing | STOP — tell the user the project has no workflow state yet (the daemon creates it when the project joins the roster) |
-| `project_name` in `project.yaml` is `unknown` | STOP — tell user to run bootstrap skill |
+| `<state_dir>/models.yaml` or `project.yaml` missing, before bootstrap | Run bootstrap through the `wf-bootstrap` cockpit on the session's own model (orchestrate, "Pre-flight checks"): bootstrap writes both files, so there is no configured tool to read yet. The one exception to the never-substitute rule. |
+| `<state_dir>/models.yaml` still missing after bootstrap | STOP — tell the user bootstrap did not write it, and show its Handoff |
+| `project_name` in `project.yaml` is `unknown` after bootstrap | STOP — tell user to run bootstrap skill |
 | `executor` skill missing from the controller's discovery path | STOP — tell the user the workflow bundle is not materialized in this checkout. Do NOT substitute the `claude`/`codex` bridge skill: it is the controller's invocation manual, not the executor's instructions. |
 | Bridge skill for the configured `<execute.tool>` missing | STOP — same wording. The controller cannot dispatch a tool it has no invocation manual for. |
 | Tool from `models.yaml` unavailable | STOP — tell user to update `<state_dir>/models.yaml`. Never execute in-context as fallback. |
