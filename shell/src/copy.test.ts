@@ -22,7 +22,8 @@ function tsxFiles(dir: string): string[] {
 function withoutComments(source: string): string {
   return source
     .replace(/\/\*[\s\S]*?\*\//g, "")
-    .split("\n")
+    // A CRLF checkout (core.autocrlf) leaves a `\r` that `.` will not match, so the line comment would survive.
+    .split(/\r?\n/)
     .map((line) => line.replace(/(^|\s)\/\/.*$/, "$1"))
     .join("\n");
 }
@@ -44,7 +45,6 @@ function offenders(): string[] {
  */
 const STILL_TO_MIGRATE: readonly string[] = [
   "app/ConnectionGate.tsx",
-  "app/Dictation.tsx",
   "app/KillSwitchControl.tsx",
   "app/NotificationsDrawer.tsx",
   "app/Sidebar.tsx",
@@ -68,7 +68,6 @@ const STILL_TO_MIGRATE: readonly string[] = [
   "pages/DistillerModel.tsx",
   "pages/EmbeddingModel.tsx",
   "pages/Feed.tsx",
-  "pages/Files.tsx",
   "pages/LoadoutPreview.tsx",
   "pages/MachineSettings.tsx",
   "pages/NotificationsView.tsx",
@@ -104,7 +103,6 @@ const STILL_TO_MIGRATE: readonly string[] = [
   "team/Work.tsx",
   "ui/CopyOnce.tsx",
   "ui/RefusalNote.tsx",
-  "ui/RunPipeline.tsx",
 ];
 
 describe("copy glossary", () => {
