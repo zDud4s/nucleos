@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Query } from "@tanstack/react-query";
-import { attentionOf } from "../data/poll";
+import { POLL, attentionOf, backgroundCadence } from "../data/poll";
 import { BLURRED_CADENCE, dueWhileBlurred } from "./pacing";
 
 function query(
@@ -44,5 +44,28 @@ describe("dueWhileBlurred", () => {
     expect(
       dueWhileBlurred(query([{ refetchInterval: 3000, refetchIntervalInBackground: true }]), 1e9),
     ).toBe(false);
+  });
+});
+
+describe("backgroundCadence", () => {
+  function stage(visibility: DocumentVisibilityState, focused: boolean) {
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue(visibility);
+    vi.spyOn(document, "hasFocus").mockReturnValue(focused);
+  }
+  afterEach(() => vi.restoreAllMocks());
+
+  it("keeps the asked cadence while the window is focused", () => {
+    stage("visible", true);
+    expect(backgroundCadence(POLL.fast)()).toBe(POLL.fast);
+  });
+
+  it("slows to the blurred cadence while visible but unfocused", () => {
+    stage("visible", false);
+    expect(backgroundCadence(POLL.fast)()).toBe(BLURRED_CADENCE);
+  });
+
+  it("slows to the slow cadence while hidden", () => {
+    stage("hidden", false);
+    expect(backgroundCadence(POLL.fast)()).toBe(POLL.slow);
   });
 });

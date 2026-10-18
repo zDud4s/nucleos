@@ -209,31 +209,33 @@ pub async fn delete_team_run(
         )));
     }
 
-    if let Ok(root) = files_root(&state)
-        && let Ok(folder) = crate::files::resolve_within(&root, &workspace)
-        && folder.exists()
-    {
-        let _ = std::fs::remove_dir_all(&folder);
-    }
-
+    // One transaction for every row, and the folder only AFTER it commits: the folder used to go
+    // first, so a failing statement left a run whose files were gone and whose rows were not.
+    let mut transaction = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
     // The items before the run: the foreign key points that way, and `runs.team_run_id` is left
     // pointing at nothing on purpose — a run's cost stays in the ledger after the department that
     // spent it is gone.
     sqlx::query("UPDATE runs SET team_run_id = NULL WHERE team_run_id = ?")
         .bind(&id)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
     sqlx::query("DELETE FROM team_items WHERE team_run_id = ?")
         .bind(&id)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
     // Before the run, like the items and for the same reason: `team_notes.team_run_id` is a real
     // foreign key and `foreign_keys` is ON, so a note left behind does not become an orphan — it
     // makes the DELETE below fail. That is what the constraint is FOR, and it is only worth having
     // if somebody remembers the other half.
-    crate::team_notes::delete_for_run(&state.pool, &id)
+    sqlx::query("DELETE FROM team_notes WHERE team_run_id = ?")
+        .bind(&id)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
     // And the actions, which carried the identical reference since 0086 with nothing anywhere
@@ -249,14 +251,28 @@ pub async fn delete_team_run(
     // statement up.
     sqlx::query("DELETE FROM team_actions WHERE team_run_id = ?")
         .bind(&id)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
     sqlx::query("DELETE FROM team_runs WHERE id = ?")
         .bind(&id)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(TeamError::Db(error)))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| refuse(TeamError::Db(error)))?;
+
+    // After the commit, and best effort: the rows are gone either way, and a folder that cannot be
+    // removed is litter to log, not a reason to answer an error for a delete that happened.
+    if let Ok(root) = files_root(&state)
+        && let Ok(folder) = crate::files::resolve_within(&root, &workspace)
+        && folder.exists()
+        && let Err(error) = std::fs::remove_dir_all(&folder)
+    {
+        tracing::warn!(team_run = %id, %error, "the team run was deleted but its folder could not be removed");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

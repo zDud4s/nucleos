@@ -58,6 +58,14 @@ pub fn main_checkout_of(dir: &Path) -> Option<PathBuf> {
 /// Seeds the workflow into the worktree at `dir`, when it has none of it. Blocking: call it from
 /// `spawn_blocking`.
 pub fn seed_if_empty(dir: &Path) -> Result<Seeded, String> {
+    seed_with(dir, copy_tree)
+}
+
+/// [`seed_if_empty`] with the copy injected, so a test can make one entry fail.
+fn seed_with(
+    dir: &Path,
+    copy: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Seeded, String> {
     let Some(main) = main_checkout_of(dir) else {
         return Ok(Seeded::NotAWorktree);
     };
@@ -67,12 +75,26 @@ pub fn seed_if_empty(dir: &Path) -> Result<Seeded, String> {
     let mut copied = Vec::new();
     for entry in SEEDED {
         let source = main.join(entry);
-        if source.is_dir() {
-            copy_tree(&source, &dir.join(entry)).map_err(|error| {
-                format!("could not seed {entry} into {}: {error}", dir.display())
-            })?;
-            copied.push(entry.to_string());
+        if !source.is_dir() {
+            continue;
         }
+        if let Err(error) = copy(&source, &dir.join(entry)) {
+            // All or nothing: a half-copied `.claude` would read as `AlreadyHasWorkflow` on the
+            // next call and the hook would never be wired. The guard above proved the worktree
+            // had none of this before the call, so what is under these folders is ours to remove.
+            for done in SEEDED {
+                let _ = std::fs::remove_dir_all(dir.join(done));
+            }
+            for parent in [".claude", ".agents"] {
+                // Only an empty parent goes: `remove_dir` refuses a non-empty one.
+                let _ = std::fs::remove_dir(dir.join(parent));
+            }
+            return Err(format!(
+                "could not seed {entry} into {}: {error}",
+                dir.display()
+            ));
+        }
+        copied.push(entry.to_string());
     }
     let hook = crate::governance::autopilot::classifier_hook_is_wired(&main);
     if hook {
@@ -101,6 +123,24 @@ fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_seed_leaves_nothing_that_reads_as_a_workflow() {
+        let (_root, _main, tree) = checkout_and_worktree(true);
+        let calls = std::cell::Cell::new(0);
+        let result = seed_with(&tree, |source, target| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            copy_tree(source, target)
+        });
+
+        assert!(result.is_err());
+        assert!(!tree.join(".claude").exists(), "a partial seed was left");
+        assert!(!tree.join(".agents").exists(), "a partial seed was left");
+        assert!(matches!(seed_if_empty(&tree).unwrap(), Seeded::Done { .. }));
+    }
 
     /// A main checkout with the workflow and a linked worktree beside it, laid out the way git
     /// leaves them, without running git.

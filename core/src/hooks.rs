@@ -6424,6 +6424,38 @@ mod tests {
         );
     }
 
+    /// The provenance is copied onto the proposal and served to the screen, so a credential in the
+    /// arguments of a read (a token in a url's query) is redacted there too, while the host stays.
+    #[tokio::test]
+    async fn a_credential_in_what_the_turn_read_does_not_reach_the_provenance() {
+        let state = test_state().await;
+        let run_id = chat_bound_run(&state, "-1002003004:14").await;
+        let app = test_router(state.clone());
+        let token = format!("ghp_{}", "b".repeat(36));
+
+        orchestrator_tool(
+            &app,
+            run_id,
+            "web_read",
+            serde_json::json!({"url": format!("https://stand.example/anuncio?key={token}")}),
+        )
+        .await;
+        orchestrator_tool(
+            &app,
+            run_id,
+            "create_run",
+            serde_json::json!({"project_id": "proj", "prompt": "x"}),
+        )
+        .await;
+
+        let refused = crate::proposals::list_refused_actions(&state.pool)
+            .await
+            .unwrap();
+        let read_from = refused[0].read_from.as_deref().unwrap_or_default();
+        assert!(!read_from.contains(&token), "{read_from}");
+        assert!(read_from.contains("stand.example/anuncio"), "{read_from}");
+    }
+
     /// Every stranger, not the first one.
     ///
     /// A browsing turn opens, snapshots, acts and snapshots again, and the page that planted an idea
@@ -8734,5 +8766,127 @@ mod tests {
         assert_eq!(q.reason, VERIFY_GUARD_REFUSAL);
         assert_ne!(r.reason, VERIFY_GUARD_REFUSAL);
         assert_eq!(observed_rows(&state, run_r).await, 0);
+    }
+
+    /// `git` in `repo`, with an identity of its own so a commit needs no machine config.
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A repository whose one commit holds `TARGET_MAP`, recorded as the worktree of an in-flight
+    /// run of `project` born on that commit; answers the tree and the run.
+    async fn based_tree(state: &AppState, project: &str) -> (tempfile::TempDir, i64) {
+        let repo = map_dir(TARGET_MAP);
+        git_in(repo.path(), &["init", "-q"]);
+        git_in(repo.path(), &["add", "nucleos.tests.yaml"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "map"]);
+        let base = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        let path = repo.path().to_str().unwrap().to_owned();
+        let run_id = in_flight_run(state, "worktree", Some(project), Some(&path), None).await;
+        sqlx::query(
+            "INSERT INTO worktrees
+             (owner_kind, owner_id, project_id, project_root, path, branch, base_sha, created_at)
+             VALUES ('run', ?, ?, ?, ?, 'b', ?, '2026-07-17T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(project)
+        .bind(&path)
+        .bind(&path)
+        .bind(&base)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (repo, run_id)
+    }
+
+    /// Without a target map the worktree's own map is the guard, and it is the one the tree was
+    /// born with: deleting it, corrupting it, widening its `allow`, or committing the widening
+    /// does not switch the guard off — with no root recorded and with an invalid one alike.
+    #[tokio::test]
+    async fn verification_guard_without_a_target_map_reads_the_worktree_map_at_its_base() {
+        let mut state = test_state().await;
+        let config = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(config.path().to_path_buf());
+        for project in ["p", "q"] {
+            write_rules(config.path(), project, "verify_guard: refuse\n");
+        }
+        let invalid_q = map_dir(INVALID_MAP);
+        record_root(&state, "q", invalid_q.path()).await;
+        let widened = "version: 1\ntests:\n  tools:\n    cargo: { allow: [fmt, test] }\n";
+
+        let (deleted, run_deleted) = based_tree(&state, "p").await;
+        std::fs::remove_file(deleted.path().join("nucleos.tests.yaml")).unwrap();
+        let (corrupt, run_corrupt) = based_tree(&state, "q").await;
+        std::fs::write(corrupt.path().join("nucleos.tests.yaml"), INVALID_MAP).unwrap();
+        let (edited, run_edited) = based_tree(&state, "p").await;
+        std::fs::write(edited.path().join("nucleos.tests.yaml"), widened).unwrap();
+        let (committed, run_committed) = based_tree(&state, "q").await;
+        std::fs::write(committed.path().join("nucleos.tests.yaml"), widened).unwrap();
+        git_in(committed.path(), &["commit", "-q", "-am", "widen"]);
+
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+        for run_id in [run_deleted, run_corrupt, run_edited, run_committed] {
+            let answer = ask_tool(&app, run_id, "Bash", input.clone()).await;
+            assert_eq!(answer.decision, "deny", "run {run_id}");
+            assert_eq!(answer.reason, VERIFY_GUARD_REFUSAL, "run {run_id}");
+            assert_eq!(observed_rows(&state, run_id).await, 1, "run {run_id}");
+        }
+        // The base map still allows what it allowed.
+        let fmt = ask_tool(
+            &app,
+            run_edited,
+            "Bash",
+            serde_json::json!({ "command": "cargo fmt" }),
+        )
+        .await;
+        assert_ne!(fmt.reason, VERIFY_GUARD_REFUSAL);
+    }
+
+    /// A worktree whose base holds no map keeps the deliberate fallback: the working map alone
+    /// decides, so a map the run adds can only tighten the guard.
+    #[tokio::test]
+    async fn verification_guard_uses_the_working_map_when_the_base_has_none() {
+        let mut state = test_state().await;
+        let config = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(config.path().to_path_buf());
+        write_rules(config.path(), "p", "verify_guard: refuse\n");
+        let (tree, run_id) = based_tree(&state, "p").await;
+        git_in(tree.path(), &["rm", "-q", "nucleos.tests.yaml"]);
+        git_in(tree.path(), &["commit", "-q", "-m", "drop"]);
+        let base = git_in(tree.path(), &["rev-parse", "HEAD"]);
+        sqlx::query("UPDATE worktrees SET base_sha = ? WHERE owner_id = ?")
+            .bind(&base)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        std::fs::write(tree.path().join("nucleos.tests.yaml"), TARGET_MAP).unwrap();
+        let app = test_router(state.clone());
+
+        let answer = ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "cargo test -p x some_test" }),
+        )
+        .await;
+
+        assert_eq!(answer.reason, VERIFY_GUARD_REFUSAL);
     }
 }

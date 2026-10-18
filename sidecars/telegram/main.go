@@ -55,6 +55,7 @@ func main() {
 	offset := config.LoadOffset(offsetPath)
 
 	log.Printf("telegram sidecar started; long-polling updates from offset %d", offset)
+	retry := updatesRetryBase
 	for ctx.Err() == nil {
 		updates, err := bot.GetUpdatesContext(ctx, offset, 50)
 		if err != nil {
@@ -62,11 +63,13 @@ func main() {
 				break
 			}
 			log.Printf("getUpdates error: %v", err)
-			if !sleepUntil(ctx, 2*time.Second) {
+			if !sleepUntil(ctx, retry) {
 				break
 			}
+			retry = nextRetryDelay(retry, updatesRetryBase, updatesRetryMax)
 			continue
 		}
+		retry = updatesRetryBase
 		if len(updates) == 0 {
 			continue
 		}
@@ -91,6 +94,23 @@ func main() {
 
 	log.Printf("stopping; finishing updates already in flight")
 	dispatcher.Shutdown(shutdownGrace)
+}
+
+const (
+	updatesRetryBase = 2 * time.Second
+	updatesRetryMax  = 60 * time.Second
+)
+
+// nextRetryDelay doubles the delay after a failed getUpdates, within [base, max].
+func nextRetryDelay(cur, base, max time.Duration) time.Duration {
+	next := cur * 2
+	if next > max {
+		next = max
+	}
+	if next < base {
+		next = base
+	}
+	return next
 }
 
 func sleepUntil(ctx context.Context, d time.Duration) bool {

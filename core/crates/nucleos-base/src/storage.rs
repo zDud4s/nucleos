@@ -121,7 +121,17 @@ pub struct TempDb {
 #[cfg(any(test, feature = "testkit"))]
 impl TempDb {
     pub async fn new() -> Self {
-        let dir = tempfile::tempdir().expect("create database tempdir");
+        // Under a parent of their own, swept of directories over an hour old by the first `new` of
+        // every process. A test that panics before `close` (or never calls it) leaves its directory
+        // behind — on Windows the open `nucleos.db` makes the TempDir's own removal fail silently —
+        // and unswept those piled up in %TEMP%: 2,312 directories, 2.6 GB, measured 2026-10-17.
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        let parent = std::env::temp_dir().join("nucleos-testdb-dirs");
+        std::fs::create_dir_all(&parent).expect("create database tempdir parent");
+        SWEEP.call_once(|| {
+            crate::testdb::sweep_dirs_older_than(&parent, std::time::Duration::from_secs(3600))
+        });
+        let dir = tempfile::tempdir_in(&parent).expect("create database tempdir");
         let path = dir.path().join("nucleos.db");
         // Seeded with the migrated image `testdb` caches, so `open` finds every migration applied
         // and only checks them instead of running the chain again.
@@ -331,7 +341,7 @@ mod tests {
         assert_eq!(next, 4);
     }
 
-    /// Migration `0198` indexes the `runs` lookups that were full scans of a 229 MB table.
+    /// Migrations `0198` and `0202` index the `runs` lookups that were full scans of a 229 MB table.
     #[tokio::test]
     async fn the_runs_lookups_by_job_status_and_project_use_an_index() {
         let pool = crate::testdb::fresh_pool().await;
@@ -342,11 +352,11 @@ mod tests {
             ),
             (
                 "SELECT id FROM runs WHERE status = 'awaiting_approval'",
-                "idx_runs_awaiting_approval",
+                "runs_by_status_created",
             ),
             (
                 "SELECT 1 FROM runs WHERE project_id = 'p' AND status = 'running'",
-                "idx_runs_project_status",
+                "runs_by_project_status",
             ),
         ] {
             // `EXPLAIN QUERY PLAN` has four columns; the detail is the last.

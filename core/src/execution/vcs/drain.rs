@@ -117,6 +117,7 @@ pub(super) async fn requeue_after_moved_target(
     if requeued.rows_affected() != 1 {
         return Ok(MovedTargetRetry::RowGone);
     }
+    wake_worker();
     Ok(MovedTargetRetry::Requeued)
 }
 /// Claims, executes and finalizes exactly one request for one repository, and says whether it found
@@ -400,19 +401,29 @@ pub async fn drain_once(
     }
     true
 }
-/// How often the worker looks for repositories with queued work.
+/// The worker's safety net: how long it sleeps when nothing wakes it.
 ///
-/// Much shorter than this daemon's other background loops (`scheduler.rs` 30s, `repo_trigger.rs`
-/// 5min, `worktree::run_gc` 30min) because this is the only one a human is actively waiting on: they
-/// asked for a merge and are watching for it. The cost of the interval is one query that the
-/// `vcs_requests_queued` partial index covers exactly, over an index that is *empty* whenever
-/// nothing is queued — which is almost always.
+/// Every path that makes a request `queued` calls [`wake_worker`], so in the normal case the worker
+/// sleeps until woken and an idle daemon runs no query at all (it used to run one every 500ms,
+/// roughly 172,800 a day). This interval exists only for the writes that bypass the wake — a row
+/// written by another process, or a code path that forgot — which the poll then finds late rather
+/// than never. It is deliberately long: a path that needs promptness must call `wake_worker`.
+pub(super) const WORKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Process-level wake for [`run_queue_worker`]: a counter that every worker watches.
 ///
-/// A `tokio::sync::Notify` would remove the interval entirely and is the obvious next step if this
-/// ever shows up in a profile. It is not here yet because it has to be signalled from `submit`, which
-/// would give the queue a second way to be woken and a second way to be missed — worth it for real
-/// latency, not for 500ms.
-pub(super) const WORKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// A `watch` rather than a `Notify`, for two reasons. A change is remembered by each receiver until
+/// it has looked, so a wake fired while the worker is mid-pass is not lost. And it reaches EVERY
+/// worker, where `Notify::notify_one` hands its single permit to one waiter — in the test binary
+/// several workers share this static and one of them would swallow another's wake.
+static WORKER_WAKE: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+/// Tells the queue worker a request just became `queued`. Cheap and idempotent.
+pub(super) fn wake_worker() {
+    WORKER_WAKE.send_modify(|count| *count = count.wrapping_add(1));
+}
+
 /// Drains every repository with queued work, forever. Spawned once by `main.rs`.
 ///
 /// One task per repository per tick, rather than a loop over repositories: draining them in sequence
@@ -436,10 +447,11 @@ pub(super) const WORKER_POLL_INTERVAL: std::time::Duration = std::time::Duration
 /// Each spawned task drains until its repository is empty rather than taking one request, so the
 /// second of two queued merges does not wait a tick for no reason.
 pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<dyn VcsExecutor>) {
-    let mut interval = tokio::time::interval(WORKER_POLL_INTERVAL);
+    let mut wake = WORKER_WAKE.subscribe();
     loop {
-        interval.tick().await;
-
+        // Marked seen BEFORE the query: a wake fired after this point makes `changed()` return at
+        // once, so a request enqueued while this pass runs is never slept through.
+        wake.borrow_and_update();
         let repositories: Vec<String> = match sqlx::query_scalar(
             "SELECT DISTINCT repo_key FROM vcs_requests WHERE status = 'queued'",
         )
@@ -451,6 +463,7 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
             // tick's problem, not a reason to stop draining every repository for ever.
             Err(error) => {
                 tracing::warn!(%error, "vcs: could not look for repositories with queued work");
+                wait_for_wake(&mut wake, WORKER_POLL_INTERVAL).await;
                 continue;
             }
         };
@@ -462,5 +475,18 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
                 async move { while drain_once(&pool, &repo_key, executor.as_ref()).await {} },
             );
         }
+
+        wait_for_wake(&mut wake, WORKER_POLL_INTERVAL).await;
+    }
+}
+
+/// Sleeps until [`wake_worker`] fires or `fallback` elapses, whichever comes first.
+async fn wait_for_wake(
+    wake: &mut tokio::sync::watch::Receiver<u64>,
+    fallback: std::time::Duration,
+) {
+    tokio::select! {
+        _ = wake.changed() => {}
+        () = tokio::time::sleep(fallback) => {}
     }
 }

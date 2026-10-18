@@ -315,7 +315,9 @@ function chatsFetch(
     if (project !== null) {
       const chatId = decodeURIComponent(project[1]);
       const told = opts.projects?.[chatId];
-      if (told !== undefined) return told;
+      // A copy, as a real read would be: the POST handlers below mutate `told` in place, and
+      // handing react-query the very object it already holds reads as "nothing changed".
+      if (told !== undefined) return { ...told };
       const row = chats.find((chat) => chat.chat_id === chatId);
       return {
         cwd: row?.cwd ?? null,
@@ -1114,7 +1116,7 @@ describe("Chats - ambient MCP servers", () => {
 /* ------------------------------------------------------------- A5: cadence -- */
 
 describe("Chats - the transcript's cadence", () => {
-  it("asks again at 1.5s while a turn is running and at 3s once it has settled", async () => {
+  it("asks again at 1.5s while a turn is running and at 5s once it has settled", async () => {
     const summary = chatSummary({ chat_id: "c-1" });
     const transcripts: Record<string, AssistantTurnRow[]> = {
       "c-1": [turnRow({ id: 1, status: "running", answer: null })],
@@ -1154,7 +1156,7 @@ describe("Chats - the transcript's cadence", () => {
     });
     expect(await screen.findByText("done")).toBeDefined();
 
-    expect(computedInterval()).toBe(POLL.fast);
+    expect(computedInterval()).toBe(POLL.queue);
   });
 });
 

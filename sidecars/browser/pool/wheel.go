@@ -72,6 +72,13 @@ func (p *Pool) TakeWheel(ctx context.Context, req browser.WheelRequest) (browser
 	}
 
 	p.mu.Lock()
+	if p.running[holder.ref] != holder {
+		// Forgotten while the window was opening: Forget already stopped the browser and removed
+		// the entry, so registering a session here would resurrect it.
+		p.mu.Unlock()
+		_ = holder.driver.Close(ctx, session.ID)
+		return browser.Wheel{}, fmt.Errorf("%w: %s", ErrForgotten, req.Placement.Profile)
+	}
 	p.counter++
 	outer := browser.SessionID(fmt.Sprintf("h%d", p.counter))
 	holder.sessions[outer] = struct{}{}

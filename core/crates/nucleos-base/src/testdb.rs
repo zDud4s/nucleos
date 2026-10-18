@@ -99,6 +99,26 @@ fn sweep_older_than(dir: &std::path::Path, age: std::time::Duration) {
     }
 }
 
+/// `sweep_older_than` for directories: removes every child directory of `dir` last modified more
+/// than `age` ago. Best effort — one still held open by a live process just stays for next time.
+pub(crate) fn sweep_dirs_older_than(dir: &std::path::Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|meta| meta.is_dir())
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed > age);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// The migrated database as bytes, for a fixture that needs it as a file of its own
 /// (`storage::TempDb`).
 pub async fn migrated_image() -> &'static [u8] {
@@ -183,6 +203,24 @@ mod fresh_pool_tests {
         assert_eq!(migrations as usize, crate::storage::MIGRATOR.iter().count());
         drop(held);
         pool.close().await;
+    }
+
+    #[test]
+    fn a_dir_sweep_removes_stale_directories_and_leaves_files_alone() {
+        let parent = tempfile::tempdir().unwrap();
+        let stale = parent.path().join("stale");
+        std::fs::create_dir_all(stale.join("inner")).unwrap();
+        std::fs::write(stale.join("inner").join("nucleos.db"), b"x").unwrap();
+        let file = parent.path().join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        super::sweep_dirs_older_than(parent.path(), std::time::Duration::from_secs(3600));
+        assert!(stale.exists(), "a fresh directory is not stale");
+
+        super::sweep_dirs_older_than(parent.path(), std::time::Duration::ZERO);
+        assert!(!stale.exists(), "a directory older than the age is removed");
+        assert!(file.exists(), "files are not this sweep's business");
     }
 
     #[tokio::test]

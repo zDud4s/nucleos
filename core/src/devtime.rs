@@ -43,7 +43,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 /// The most bytes one transaction covers.
@@ -126,6 +126,21 @@ fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+/// Agent files whose launch link already sits on its attempt row, by [`path_key`]. Such a file needs
+/// neither its meta read again nor the link re-applied, so it is checked like any other file. Without
+/// this every agent file re-read its meta and re-ran the UPDATE on every cycle: 1949 of 2125 on the
+/// owner's machine (2026-10-17), all of them already linked.
+fn settled_links() -> &'static Mutex<HashSet<String>> {
+    static SETTLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SETTLED.get_or_init(Mutex::default)
+}
+
+fn link_settled(key: &str) -> bool {
+    settled_links()
+        .lock()
+        .is_ok_and(|settled| settled.contains(key))
+}
+
 fn read_meta(path: &Path) -> Option<AgentMeta> {
     let value: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
@@ -162,7 +177,11 @@ fn walk(projects_dir: &Path) -> Vec<Found> {
                     if !file.is_file() {
                         continue;
                     }
-                    let meta = read_meta(&subagents.join(format!("agent-{id}.meta.json")));
+                    let meta = if link_settled(&path_key(&file)) {
+                        None
+                    } else {
+                        read_meta(&subagents.join(format!("agent-{id}.meta.json")))
+                    };
                     found.push(Found {
                         lane: format!("agent:{id}"),
                         path: file,
@@ -211,8 +230,65 @@ fn cwd_in(path: &Path) -> Option<String> {
     }
 }
 
-fn find_cwd(paths: &[PathBuf]) -> Option<String> {
-    paths.iter().find_map(|path| cwd_in(path))
+/// What a past scan of one transcript's head learned. A found `cwd` never changes, so it is kept
+/// for good; a miss is only valid for the file length it was made at (the file may grow a `cwd`).
+#[derive(Clone)]
+enum CwdMemo {
+    Found(String),
+    Missing { len: u64 },
+}
+
+/// Process-level memory of the head scans, so an idle cycle does not reopen and re-parse up to a
+/// megabyte of every transcript it walks past.
+#[derive(Default)]
+struct CwdCache {
+    memo: std::sync::Mutex<HashMap<PathBuf, CwdMemo>>,
+    /// How many head scans actually ran; the tests read it.
+    scans: std::sync::atomic::AtomicUsize,
+}
+
+impl CwdCache {
+    fn global() -> &'static CwdCache {
+        static CACHE: std::sync::OnceLock<CwdCache> = std::sync::OnceLock::new();
+        CACHE.get_or_init(CwdCache::default)
+    }
+
+    /// The first `cwd` among the candidates, scanning one only when the cache cannot answer for it.
+    fn find(&self, paths: &[PathBuf]) -> Option<String> {
+        for path in paths {
+            let len = std::fs::metadata(path).map_or(0, |m| m.len());
+            let known = self
+                .memo
+                .lock()
+                .ok()
+                .and_then(|memo| memo.get(path).cloned());
+            match known {
+                Some(CwdMemo::Found(cwd)) => return Some(cwd),
+                Some(CwdMemo::Missing { len: seen }) if seen == len => continue,
+                _ => {}
+            }
+            self.scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let found = cwd_in(path);
+            if let Ok(mut memo) = self.memo.lock() {
+                let entry = match &found {
+                    Some(cwd) => CwdMemo::Found(cwd.clone()),
+                    None => CwdMemo::Missing { len },
+                };
+                memo.insert(path.clone(), entry);
+            }
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+}
+
+/// True when the stored state says this transcript was fully ingested at exactly this size and
+/// mtime, so nothing in it can have changed since.
+fn is_unchanged(state: &devtime_store::FileState, size: i64, mtime: &str) -> bool {
+    state.status == "ok" && state.size == size && state.mtime.as_deref() == Some(mtime)
 }
 
 // ---- reading ---------------------------------------------------------------------------------
@@ -665,11 +741,16 @@ async fn ingest_file(
         if changed > 0 {
             touched.insert(file.session.clone());
         }
+        if devtime_store::attempt_exists(&mut conn, &file.session, tool_use_id).await?
+            && let Ok(mut settled) = settled_links().lock()
+        {
+            settled.insert(key.clone());
+        }
     }
 
     let state = devtime_store::file_state(pool, &key).await?;
     if let Some(state) = &state {
-        if state.status == "ok" && state.size == size && state.mtime.as_deref() == Some(&mtime) {
+        if is_unchanged(state, size, &mtime) {
             return Ok(());
         }
         if size < state.offset {
@@ -781,11 +862,30 @@ pub async fn ingest_cycle(
     let vocab = Arc::new(ParseVocab::from_config(&cfg.rules.vocab));
 
     for file in &found {
+        // Cheapest check first: a file already ingested at this size and mtime needs neither its
+        // head scanned for a cwd nor anything else. An agent file with a launch link still goes
+        // on, because `ingest_file` records that link before it looks at the state.
+        let has_link = file
+            .meta
+            .as_ref()
+            .is_some_and(|link| link.tool_use_id.is_some());
+        if !has_link
+            && let Ok(meta) = std::fs::metadata(&file.path)
+            && let Ok(modified) = meta.modified()
+            && let Ok(Some(state)) = devtime_store::file_state(pool, &path_key(&file.path)).await
+            && is_unchanged(
+                &state,
+                i64::try_from(meta.len()).unwrap_or(i64::MAX),
+                &mtime_text(modified),
+            )
+        {
+            continue;
+        }
         let mapping = match mappings.get(&file.main) {
             Some(known) => known.clone(),
             None => {
                 let candidates = [file.main.clone(), file.path.clone()];
-                let cwd = tokio::task::spawn_blocking(move || find_cwd(&candidates))
+                let cwd = tokio::task::spawn_blocking(move || CwdCache::global().find(&candidates))
                     .await
                     .unwrap_or(None);
                 let resolved = match cwd {
@@ -951,6 +1051,50 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     const ROOT: &str = "C:/fixture/proj";
+
+    #[test]
+    fn a_found_cwd_is_scanned_once_and_a_miss_until_the_file_grows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let with_cwd = dir.path().join("a.jsonl");
+        std::fs::write(&with_cwd, "{\"type\":\"x\"}\n{\"cwd\":\"C:/p\"}\n").unwrap();
+        let cache = CwdCache::default();
+        let paths = [with_cwd.clone()];
+        assert_eq!(cache.find(&paths).as_deref(), Some("C:/p"));
+        assert_eq!(cache.find(&paths).as_deref(), Some("C:/p"));
+        assert_eq!(cache.scans.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let bare = dir.path().join("b.jsonl");
+        std::fs::write(&bare, "{\"type\":\"x\"}\n").unwrap();
+        let paths = [bare.clone()];
+        assert_eq!(cache.find(&paths), None);
+        assert_eq!(cache.find(&paths), None);
+        assert_eq!(cache.scans.load(std::sync::atomic::Ordering::Relaxed), 2);
+        std::fs::write(&bare, "{\"type\":\"x\"}\n{\"cwd\":\"C:/q\"}\n").unwrap();
+        assert_eq!(cache.find(&paths).as_deref(), Some("C:/q"));
+        assert_eq!(cache.scans.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn only_an_ok_file_at_the_same_size_and_mtime_counts_as_unchanged() {
+        let state = |status: &str| devtime_store::FileState {
+            path: "p".into(),
+            session_id: None,
+            lane: None,
+            offset: 10,
+            size: 10,
+            mtime: Some("t1".into()),
+            status: status.into(),
+            lines_read: 0,
+            lines_failed: 0,
+            unknown_records: 0,
+            parser_version: 1,
+            updated_at: String::new(),
+        };
+        assert!(is_unchanged(&state("ok"), 10, "t1"));
+        assert!(!is_unchanged(&state("ok"), 11, "t1"));
+        assert!(!is_unchanged(&state("ok"), 10, "t2"));
+        assert!(!is_unchanged(&state("unmapped"), 10, "t1"));
+    }
 
     async fn test_pool() -> SqlitePool {
         let pool = crate::testdb::fresh_pool().await;
@@ -1196,6 +1340,50 @@ mod tests {
         assert_eq!(from_files, inline);
         assert_eq!(files_agent.as_deref(), Some("a1"));
         assert_eq!(inline_agent.as_deref(), Some("a1"));
+    }
+
+    async fn agent_of(pool: &SqlitePool, tool_use_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT agent_id FROM devtime_attempts WHERE tool_use_id = ?")
+            .bind(tool_use_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_settled_agent_link_is_not_applied_again() {
+        let h = harness(&["background"]).await;
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(agent_of(&h.pool, "toolu_ag1").await.as_deref(), Some("a1"));
+
+        // Were the link re-applied each cycle, the next one would put this back.
+        sqlx::query("UPDATE devtime_attempts SET agent_id = NULL WHERE tool_use_id = 'toolu_ag1'")
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(agent_of(&h.pool, "toolu_ag1").await, None);
+    }
+
+    #[tokio::test]
+    async fn an_agent_link_waits_for_its_attempt_to_be_ingested() {
+        let h = harness(&["background"]).await;
+        let main = proj_file(&h, "s-bg.jsonl");
+        let full = std::fs::read_to_string(&main).unwrap();
+        let head: String = full.split_inclusive('\n').take(3).collect();
+        std::fs::write(&main, &head).unwrap();
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        let launched: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM devtime_attempts WHERE tool_use_id = 'toolu_ag1'",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        assert_eq!(launched, 0, "the launching call is not ingested yet");
+
+        std::fs::write(&main, &full).unwrap();
+        ingest_cycle(&h.pool, &cycle_config(), &h.projects).await;
+        assert_eq!(agent_of(&h.pool, "toolu_ag1").await.as_deref(), Some("a1"));
     }
 
     async fn dump(pool: &SqlitePool) -> Vec<String> {

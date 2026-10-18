@@ -262,7 +262,7 @@ pub async fn live(pool: &SqlitePool, project_id: Option<&str>) -> sqlx::Result<V
 /// Oldest first, like the approval queue and unlike the skipped-item record: this is a queue, worked
 /// front to back, and the request that has been waiting longest is the one holding somebody up.
 pub async fn pending_requests(pool: &SqlitePool) -> sqlx::Result<Vec<crate::proposals::Proposal>> {
-    sqlx::query_as::<_, crate::proposals::Proposal>(
+    sqlx::query_as::<_, crate::proposals::Proposal>(sqlx::AssertSqlSafe(format!(
         // "Jobs 18 and 19" is not something a person can decide on, so each job's task rides
         // along: the opening of its prompt, or the rule that started it.
         "SELECT p.id, p.kind, p.status, p.run_id, p.session_id, p.project_id, p.tool_name,
@@ -273,11 +273,25 @@ pub async fn pending_requests(pool: &SqlitePool) -> sqlx::Result<Vec<crate::prop
          FROM proposals p
          LEFT JOIN jobs lo ON lo.id = json_extract(p.tool_input, '$.job_low')
          LEFT JOIN jobs hi ON hi.id = json_extract(p.tool_input, '$.job_high')
-         WHERE p.status = 'pending' AND p.kind = 'fleet-exclusion'
-         ORDER BY p.id ASC",
-    )
+         WHERE {PENDING_REQUEST_WHERE}
+         ORDER BY p.id ASC"
+    )))
     .fetch_all(pool)
     .await
+}
+
+/// What makes a proposal an exclusion request still waiting; shared with `count_pending_requests`.
+const PENDING_REQUEST_WHERE: &str = "p.status = 'pending' AND p.kind = 'fleet-exclusion'";
+
+/// How many exclusion requests are waiting — the badge's number. The list's joins are LEFT onto
+/// `jobs` by primary key, so they neither filter nor multiply rows and are left out here.
+pub async fn count_pending_requests(pool: &SqlitePool) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM proposals p WHERE {PENDING_REQUEST_WHERE}"
+    )))
+    .fetch_one(pool)
+    .await?;
+    Ok(count as usize)
 }
 
 /// Lifts a rule, keeping it readable.
@@ -859,5 +873,30 @@ mod tests {
             approve(&pool, 404).await,
             Err(DecisionError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_exclusion_count_matches_the_pending_list() {
+        let pool = test_pool().await;
+        for (kind, status) in [
+            ("fleet-exclusion", "pending"),
+            ("fleet-exclusion", "pending"),
+            ("fleet-exclusion", "approved"),
+            ("action-approval", "pending"),
+        ] {
+            sqlx::query(
+                "INSERT INTO proposals (kind, status, tool_name, reasoning, tool_input, created_at)
+                 VALUES (?, ?, 't', 'r', '{\"job_low\":1,\"job_high\":2}', ?)",
+            )
+            .bind(kind)
+            .bind(status)
+            .bind("2026-08-15T00:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let listed = pending_requests(&pool).await.unwrap().len();
+        assert_eq!(listed, 2);
+        assert_eq!(count_pending_requests(&pool).await.unwrap(), listed);
     }
 }

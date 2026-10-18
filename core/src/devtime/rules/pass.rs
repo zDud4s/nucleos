@@ -22,7 +22,52 @@ pub async fn run_rules_pass(
     touched: &BTreeSet<String>,
     skip: &BTreeSet<String>,
 ) -> RulesPassStats {
-    run_rules_pass_with(pool, cfg, sources, touched, skip, FAMILIES).await
+    let fingerprint = rules_fingerprint(cfg);
+    run_rules_pass_gated(pool, cfg, sources, touched, skip, FAMILIES, |project_id| {
+        cross_due_now(project_id, &fingerprint)
+    })
+    .await
+}
+
+/// How long a project's cross-session findings stand before a cycle recomputes them.
+///
+/// The F families read every main-lane attempt of the project inside `f_window_days` (31 496 rows,
+/// 1.5–17 s, on this repository on 2026-10-17), and any session that moved touches its project —
+/// so with one live session the read ran every cycle, every minute, for patterns that span a
+/// month and cannot change meaningfully in one. A new rules fingerprint is a new key, so a config
+/// change recomputes at once.
+pub(super) const CROSS_PASS_EVERY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Whether `project_id`'s cross-session findings are due under `fingerprint`, recording now if so.
+fn cross_due_now(project_id: &str, fingerprint: &str) -> bool {
+    type Last = std::collections::HashMap<(String, String), std::time::Instant>;
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Last>> = std::sync::OnceLock::new();
+    let Ok(mut last) = LAST.get_or_init(Default::default).lock() else {
+        return true;
+    };
+    cross_due(
+        &mut last,
+        project_id,
+        fingerprint,
+        std::time::Instant::now(),
+    )
+}
+
+/// [`cross_due_now`] over an explicit table and clock.
+pub(super) fn cross_due(
+    last: &mut std::collections::HashMap<(String, String), std::time::Instant>,
+    project_id: &str,
+    fingerprint: &str,
+    now: std::time::Instant,
+) -> bool {
+    let key = (project_id.to_string(), fingerprint.to_string());
+    match last.get(&key) {
+        Some(at) if now.saturating_duration_since(*at) < CROSS_PASS_EVERY => false,
+        _ => {
+            last.insert(key, now);
+            true
+        }
+    }
 }
 
 /// What ruling one session produced, for the pass's tally.
@@ -87,6 +132,20 @@ pub(super) async fn run_rules_pass_with(
     skip: &BTreeSet<String>,
     families: &[(char, FamilyFn)],
 ) -> RulesPassStats {
+    run_rules_pass_gated(pool, cfg, sources, touched, skip, families, |_| true).await
+}
+
+/// [`run_rules_pass_with`] with the cross-session read asked first: a project `cross_due` turns
+/// down keeps the findings it has.
+pub(super) async fn run_rules_pass_gated(
+    pool: &SqlitePool,
+    cfg: &DevtimeRulesConfig,
+    sources: AdapterSources,
+    touched: &BTreeSet<String>,
+    skip: &BTreeSet<String>,
+    families: &[(char, FamilyFn)],
+    mut cross_due: impl FnMut(&str) -> bool,
+) -> RulesPassStats {
     let fingerprint = rules_fingerprint(cfg);
     let mut stats = RulesPassStats::default();
 
@@ -127,7 +186,7 @@ pub(super) async fn run_rules_pass_with(
     let since = format_ms(
         Utc::now().timestamp_millis() - i64::from(cfg.thresholds.f_window_days) * MS_PER_DAY,
     );
-    for project_id in &projects {
+    for project_id in projects.iter().filter(|id| cross_due(id)) {
         let rows = match devtime_store::cross_session_rows(pool, project_id, &since).await {
             Ok(rows) => rows,
             Err(error) => {

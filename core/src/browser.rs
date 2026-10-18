@@ -1043,6 +1043,18 @@ pub async fn close_session_row(
     close_row(pool, id, reason, now).await
 }
 
+/// How many open sessions are an agent's request for the wheel with a proposal behind it — the
+/// shell's `isWheelRequest`, counted in SQL instead of by loading every open session.
+pub async fn count_wheel_requests(pool: &SqlitePool) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM browser_sessions
+          WHERE closed_at IS NULL AND mode = 'wheel-requested' AND proposal_id IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count as usize)
+}
+
 /// The open sessions, oldest first.
 pub async fn open_sessions(pool: &SqlitePool) -> sqlx::Result<Vec<SessionRow>> {
     let rows =
@@ -2511,6 +2523,39 @@ mod tests {
         let row = session_row(&db.pool, id).await.unwrap().unwrap();
         assert_eq!(row.mode, "agent");
         assert_eq!(row.seat, None);
+        db.close().await;
+    }
+
+    /// The badge's wheel count must equal what the shell's `isWheelRequest` keeps of the open list.
+    #[tokio::test]
+    async fn the_wheel_count_matches_the_open_wheel_requests() {
+        let db = TempDb::new().await;
+        let asked = raw_session(&db.pool, "project", "acme", false).await;
+        let no_proposal = raw_session(&db.pool, "project", "acme", false).await;
+        let agent = raw_session(&db.pool, "project", "acme", false).await;
+        let closed = raw_session(&db.pool, "project", "acme", true).await;
+        for (id, mode, proposal) in [
+            (asked, "wheel-requested", Some(1_i64)),
+            (no_proposal, "wheel-requested", None),
+            (agent, "agent", Some(2)),
+            (closed, "wheel-requested", Some(3)),
+        ] {
+            sqlx::query("UPDATE browser_sessions SET mode = ?, proposal_id = ? WHERE id = ?")
+                .bind(mode)
+                .bind(proposal)
+                .bind(id)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        let listed = open_sessions(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|s| s.mode == "wheel-requested" && s.proposal_id.is_some())
+            .count();
+        assert_eq!(listed, 1);
+        assert_eq!(count_wheel_requests(&db.pool).await.unwrap(), listed);
         db.close().await;
     }
 }

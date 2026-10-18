@@ -160,6 +160,9 @@ struct LiveTree {
     project_id: String,
     path: String,
     base_sha: Option<String>,
+    /// Whether the owner may still be writing to the tree. A live owner's tree is measured every
+    /// pass; only a finished owner's tree may be skipped on an unchanged fingerprint.
+    live: bool,
 }
 
 /// PURE: the trees one pass takes, at most `cap`, dealt one per project in turn.
@@ -200,16 +203,121 @@ fn fair_share(trees: Vec<LiveTree>, cap: usize) -> Vec<LiveTree> {
     }
 }
 
+/// The longest a stored measurement is trusted without looking again.
+///
+/// The fingerprint below is cheap and therefore blind to some edits: modifying or creating a file
+/// inside a subdirectory touches neither the index nor the worktree root directory's mtime, so an
+/// unchanged fingerprint does not prove an unchanged tree. This ceiling is what bounds that
+/// staleness — the trade-off accepted for not running two `git` processes per tree on every 30
+/// second tick for trees nobody has touched in weeks.
+const REMEASURE_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+use std::time::Instant;
+
+/// A cheap summary of "has this worktree changed since I last measured it".
+///
+/// The path is part of it so a recycled `(owner_kind, owner_id)` pointing at another checkout can
+/// never be mistaken for the one that was measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    path: String,
+    base_sha: String,
+    index: (std::time::SystemTime, u64),
+    head: std::time::SystemTime,
+    root: std::time::SystemTime,
+}
+
+type FingerprintCache = std::collections::HashMap<(String, i64), (Fingerprint, Instant)>;
+
+/// Process-level, keyed by owner. Lost on restart, which only costs one measuring pass.
+fn fingerprint_cache() -> &'static std::sync::Mutex<FingerprintCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<FingerprintCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The git directory of a worktree: `<path>/.git` is a directory for a main checkout and a file
+/// reading `gitdir: <dir>` for a linked worktree.
+fn resolve_gitdir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dot_git = worktree.join(".git");
+    let meta = std::fs::metadata(&dot_git).ok()?;
+    if meta.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let dir = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    let dir = std::path::Path::new(dir);
+    Some(if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        worktree.join(dir)
+    })
+}
+
+/// BLOCKING: `None` when any stat fails, which the caller reads as "measure, to be safe".
+fn fingerprint(worktree: &std::path::Path, base_sha: &str) -> Option<Fingerprint> {
+    let gitdir = resolve_gitdir(worktree)?;
+    let index = std::fs::metadata(gitdir.join("index")).ok()?;
+    let head = std::fs::metadata(gitdir.join("HEAD")).ok()?;
+    let root = std::fs::metadata(worktree).ok()?;
+    Some(Fingerprint {
+        path: worktree.to_string_lossy().into_owned(),
+        base_sha: base_sha.to_string(),
+        index: (index.modified().ok()?, index.len()),
+        head: head.modified().ok()?,
+        root: root.modified().ok()?,
+    })
+}
+
+/// PURE: whether a tree has to be measured again.
+///
+/// Yes when there is nothing remembered, when the fingerprint could not be taken, when it differs
+/// from the remembered one, or when the memory is older than `REMEASURE_AFTER`.
+fn needs_measure(
+    prev: Option<&(Fingerprint, Instant)>,
+    now_fp: Option<&Fingerprint>,
+    now: Instant,
+) -> bool {
+    match (prev, now_fp) {
+        (Some((old, at)), Some(new)) => {
+            old != new || now.saturating_duration_since(*at) >= REMEASURE_AFTER
+        }
+        _ => true,
+    }
+}
+
 /// Measures every live worktree and stores the result. Called by the job tick.
+///
+/// A tree whose fingerprint is unchanged since its last successful measurement (and younger than
+/// `REMEASURE_AFTER`) keeps its stored row and spawns no `git`.
 ///
 /// Nothing here propagates an error: a measurement is a warning, and a warning that could not be
 /// computed must not stop the tick that drives the work. What was not measured is left without a
 /// row, and the read turns that into `not_measured`.
 pub async fn measure(pool: &sqlx::SqlitePool) {
     let trees: Vec<LiveTree> = match sqlx::query_as(
-        "SELECT owner_kind, owner_id, project_id, path, base_sha
-         FROM worktrees WHERE removed_at IS NULL
-         ORDER BY project_id, owner_kind, owner_id",
+        "SELECT w.owner_kind, w.owner_id, w.project_id, w.path, w.base_sha,
+                CASE w.owner_kind
+                  WHEN 'run' THEN NOT EXISTS (
+                    SELECT 1 FROM runs r WHERE r.id = w.owner_id
+                      AND r.status IN ('completed','failed','cancelled','timed_out',
+                                       'interrupted','superseded'))
+                  WHEN 'job' THEN NOT EXISTS (
+                    SELECT 1 FROM jobs j WHERE j.id = w.owner_id
+                      AND j.status IN ('completed','failed','gate_failed','gate_errored',
+                                       'expired','stopped','cancelled','interrupted'))
+                  WHEN 'item' THEN NOT EXISTS (
+                    SELECT 1 FROM job_items i JOIN jobs j ON j.id = i.job_id
+                     WHERE i.id = w.owner_id
+                      AND j.status IN ('completed','failed','gate_failed','gate_errored',
+                                       'expired','stopped','cancelled','interrupted'))
+                  ELSE 1
+                END AS live
+         FROM worktrees w WHERE w.removed_at IS NULL
+         ORDER BY w.project_id, w.owner_kind, w.owner_id",
     )
     .fetch_all(pool)
     .await
@@ -244,8 +352,26 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
     for tree in measurable {
         let path = std::path::PathBuf::from(&tree.path);
         let base = tree.base_sha.clone().expect("filtered to Some above");
-        let handle =
-            tokio::task::spawn_blocking(move || crate::inspect::changed_paths(&path, &base));
+        let key = (tree.owner_kind.clone(), tree.owner_id);
+        let live = tree.live;
+        // The fingerprint stats files, so it runs in the blocking pool with the `git` calls and
+        // never on the async thread. The closure answers `(fingerprint, None)` when the tree is
+        // unchanged and its stored row stands.
+        let handle = tokio::task::spawn_blocking(move || {
+            let now_fp = fingerprint(&path, &base);
+            // The terminal statuses are the ones `worktree::gc` collects on, so a tree skipped here
+            // is one nobody is writing to: what it touched can only change by hand.
+            let skip = !live && {
+                let cache = fingerprint_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                !needs_measure(cache.get(&key), now_fp.as_ref(), Instant::now())
+            };
+            if skip {
+                return (now_fp, None);
+            }
+            (now_fp, Some(crate::inspect::changed_paths(&path, &base)))
+        });
         pending.push((tree, handle));
     }
 
@@ -253,15 +379,36 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
         for (tree, handle) in pending {
             let owner = (tree.owner_kind.clone(), tree.owner_id);
             match handle.await {
-                Ok(Ok(paths)) => {
-                    if let Err(error) = store(pool, &tree, &paths).await {
+                // Unchanged since the last successful measurement: the stored row is left as-is.
+                Ok((_, None)) => {}
+                Ok((now_fp, Some(Ok(paths)))) => match store(pool, &tree, &paths).await {
+                    // Remembered only after the row is stored: a fingerprint without its row
+                    // would skip a tree that has no answer on record.
+                    Ok(()) => {
+                        let mut cache = fingerprint_cache()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        match now_fp {
+                            Some(fp) => {
+                                cache.insert(owner, (fp, Instant::now()));
+                            }
+                            None => {
+                                cache.remove(&owner);
+                            }
+                        }
+                    }
+                    Err(error) => {
                         tracing::warn!(?owner, %error, "could not store a collision measurement");
                     }
-                }
+                },
                 // A git that refused, or a thread that panicked. In both cases the previous answer
                 // stops being worth anything: keeping it would let a measurement no longer being
                 // taken carry on saying `clean`.
                 _ => {
+                    fingerprint_cache()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&owner);
                     if let Err(error) = forget(pool, &tree.owner_kind, tree.owner_id).await {
                         tracing::warn!(?owner, %error, "could not clear a stale measurement");
                     }
@@ -1282,6 +1429,7 @@ mod tests {
             project_id: project_id.to_string(),
             path: "C:/x".to_string(),
             base_sha: Some("a".repeat(40)),
+            live: true,
         }
     }
 
@@ -1523,6 +1671,60 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 0);
         db.close().await;
+    }
+
+    fn fingerprint_of(tag: u64) -> Fingerprint {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(tag);
+        Fingerprint {
+            path: "tree".to_string(),
+            base_sha: "a".repeat(40),
+            index: (at, 10),
+            head: at,
+            root: at,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_fresh_fingerprint_does_not_need_measuring() {
+        let now = Instant::now();
+        let prev = (fingerprint_of(1), now);
+        assert!(!needs_measure(Some(&prev), Some(&fingerprint_of(1)), now));
+    }
+
+    #[test]
+    fn a_changed_fingerprint_or_none_remembered_needs_measuring() {
+        let now = Instant::now();
+        let prev = (fingerprint_of(1), now);
+        assert!(needs_measure(Some(&prev), Some(&fingerprint_of(2)), now));
+        assert!(needs_measure(None, Some(&fingerprint_of(1)), now));
+    }
+
+    #[test]
+    fn a_fingerprint_that_could_not_be_taken_always_needs_measuring() {
+        let now = Instant::now();
+        let prev = (fingerprint_of(1), now);
+        assert!(needs_measure(Some(&prev), None, now));
+    }
+
+    #[test]
+    fn an_unchanged_fingerprint_older_than_the_ceiling_needs_measuring() {
+        let then = Instant::now();
+        let prev = (fingerprint_of(1), then);
+        let later = then + REMEASURE_AFTER;
+        assert!(needs_measure(Some(&prev), Some(&fingerprint_of(1)), later));
+        let sooner = then + REMEASURE_AFTER - std::time::Duration::from_secs(1);
+        assert!(!needs_measure(
+            Some(&prev),
+            Some(&fingerprint_of(1)),
+            sooner
+        ));
+    }
+
+    #[test]
+    fn a_real_checkout_has_a_fingerprint_and_a_missing_one_has_none() {
+        let (repo, base) = crate::inspect::test_support::seeded_repo();
+        assert!(fingerprint(repo.path(), &base).is_some());
+        assert!(fingerprint(std::path::Path::new("C:/nucleos-does-not-exist"), &base).is_none());
     }
 
     /// The ordinary case: two trees in one file.
