@@ -1,5 +1,6 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useParams } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useDownloadAttachment,
@@ -26,13 +27,15 @@ import {
   RelativeTime,
   Row,
   Rows,
+  Skeleton,
   StateBadge,
+  Tip,
 } from "../ui";
 import "./mail.css";
 
 /**
- * One message: its facts, its body, its attachments, a standing decision
- * about the sender, and a reply.
+ * One message: who sent it, its body, its attachments, a reply, a standing
+ * decision about the sender, and, folded away, what triage made of it.
  *
  * The shape follows `RunDetail.tsx` — a route-parameter guard, a not-found
  * guard, then the real page — for the same reason: `$emailId` is a string
@@ -75,8 +78,12 @@ function KnownEmail({ id }: { id: number }) {
     return (
       <>
         <Crumb to="/mail">Mail</Crumb>
-        <PageHeader title={`Message ${id}`} />
-        {email.isError ? <DetailError error={email.error} /> : <p className="mail-loading">reading message {id}…</p>}
+        <PageHeader title="Message" />
+        {email.isError ? (
+          <DetailError error={email.error} onRetry={() => void email.refetch()} />
+        ) : (
+          <Skeleton label="Loading the message" lines={6} />
+        )}
       </>
     );
   }
@@ -88,11 +95,14 @@ function KnownEmail({ id }: { id: number }) {
       <Crumb to="/mail">Mail</Crumb>
       <PageHeader title={detail.subject ?? "(no subject)"} headline={headline(detail)} />
 
-      <FactsPanel email={detail} />
+      {/* The message is what somebody came to read: who, when, then the text. The classifier's
+          reading of it is pipeline detail and stands last, folded. */}
+      <MessageMeta email={detail} />
       <BodyPanel email={detail} />
       {detail.has_attachments === 1 && <AttachmentsPanel emailId={id} attachments={detail.attachments} />}
-      <SenderVerdict email={detail} />
       <ReplyForm to={detail.from_addr} subject={detail.subject} />
+      <SenderVerdict email={detail} />
+      <TriagePanel email={detail} />
     </>
   );
 }
@@ -114,25 +124,50 @@ function classWords(triageClass: string | null): string {
   return readState("email_class", triageClass)?.label ?? `triaged as ${triageClass}`;
 }
 
-function DetailError({ error }: { error: unknown }) {
+function DetailError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "there is no message with that number" }} />;
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this message</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>
+      {`Could not reach the ${DAEMON_NAME}. Nothing is known about this message.`}
+    </ErrorNote>
+  );
 }
 
 /* ---------------------------------------------------------------- facts -- */
 
-function FactsPanel({ email }: { email: EmailDetail }) {
+/** Sender and time, as plain facts under the heading, with no panel of their own. */
+function MessageMeta({ email }: { email: EmailDetail }) {
+  return (
+    <dl className="mail-detail-facts mail-detail-meta">
+      <Fact label="From">
+        {email.from_name ?? email.from_addr}
+        {email.from_name !== null && <span className="mail-detail-address"> {email.from_addr}</span>}
+      </Fact>
+      <Fact label="Received">
+        <RelativeTime at={email.received_at} />
+      </Fact>
+    </dl>
+  );
+}
+
+/**
+ * What triage made of the message, and the way to run it again. Collapsed, because it
+ * is how the pipeline reached its answer and not what the message says.
+ */
+function TriagePanel({ email }: { email: EmailDetail }) {
   const requeue = useRequeue(email.id);
-  // Eligibility is `body_text IS NOT NULL`, never the triage class — a merely
+  // Eligibility is `body_text IS NOT NULL`, never the triage class: a merely
   // misclassified message is exactly as requeueable as one triage never
-  // reached. See `data/mail.ts`'s `EmailDetail` header.
+  // reached. See `data/mail.ts`'s `EmailDetail` header. A pruned body is said once, in the
+  // Body panel, and here the action is simply not offered.
   const eligible = email.body_text !== null;
 
   return (
     <Panel
-      title="This message"
+      title="Triage"
+      variant="dim"
       aside={
         eligible ? (
           <ConfirmButton
@@ -145,39 +180,28 @@ function FactsPanel({ email }: { email: EmailDetail }) {
         ) : undefined
       }
     >
-      <dl className="mail-detail-facts">
-        <Fact label="From">
-          {email.from_name ?? email.from_addr}
-          {email.from_name !== null && <span className="mail-detail-address"> {email.from_addr}</span>}
-        </Fact>
-        <Fact label="Received">
-          <RelativeTime at={email.received_at} />
-        </Fact>
-        <Fact label="Triage">
-          <StateBadge domain="email_class" state={email.triage_class} />
-        </Fact>
-        {/* Only when the two disagree. Said whenever it was present, it printed the badge's
-            own words a second time directly beside the badge — one fact under two names. What
-            is worth reading is the disagreement, and the rule that settled it. */}
-        {email.model_class !== null && email.model_class !== email.triage_class && (
-          <Fact label="Model said">
-            {classWords(email.model_class)}
-            <span className="mail-detail-address"> {email.model_class}</span>
+      <details className="mail-tech">
+        <summary>How it was sorted</summary>
+        <dl className="mail-detail-facts">
+          <Fact label="Class">
+            <StateBadge domain="email_class" state={email.triage_class} />
           </Fact>
-        )}
-        {email.priority_rule !== null && <Fact label="Overridden by">{email.priority_rule}</Fact>}
-      </dl>
-
-      {!eligible && (
-        <p className="mail-detail-pruned">
-          the body was pruned by retention — there is nothing left here for triage to read again, so
-          requeuing is not offered
-        </p>
-      )}
+          {/* Only when the two disagree. Said whenever it was present, it printed the badge's
+              own words a second time directly beside the badge: one fact under two names. What
+              is worth reading is the disagreement, and the rule that settled it. */}
+          {email.model_class !== null && email.model_class !== email.triage_class && (
+            <Fact label="Model said">
+              {classWords(email.model_class)}
+              <span className="mail-detail-address"> {email.model_class}</span>
+            </Fact>
+          )}
+          {email.priority_rule !== null && <Fact label="Overridden by">{email.priority_rule}</Fact>}
+        </dl>
+      </details>
       {requeue.isError && <RequeueError error={requeue.error} />}
       {requeue.isSuccess && (
         <p className="mail-outcome" role="status">
-          requeued for triage
+          Requeued for triage
         </p>
       )}
     </Panel>
@@ -208,7 +232,7 @@ function RequeueError({ error }: { error: unknown }) {
       />
     );
   }
-  return <ErrorNote>the núcleo did not answer — nothing was requeued</ErrorNote>;
+  return <ErrorNote>{`Could not reach the ${DAEMON_NAME}. Nothing was requeued; try again.`}</ErrorNote>;
 }
 
 /* ----------------------------------------------------------------- body -- */
@@ -218,7 +242,8 @@ function BodyPanel({ email }: { email: EmailDetail }) {
     <Panel title="Body">
       {typeof email.body_text !== "string" ? (
         <p className="mail-detail-pruned">
-          this message's body was pruned by retention — only the facts above remain
+          This message's body was pruned by retention, so only its details remain. It cannot be
+          requeued for triage.
         </p>
       ) : (
         <pre className="mail-detail-body">{email.body_text}</pre>
@@ -259,7 +284,7 @@ function SavedAllNote({ result }: { result: SavedAttachments }) {
   const noun = result.filenames.length === 1 ? "file" : "files";
   return (
     <p className="mail-outcome" role="status">
-      saved {result.filenames.length} {noun} to {where}: {result.filenames.join(", ")}
+      Saved {result.filenames.length} {noun} to {where}: {result.filenames.join(", ")}
     </p>
   );
 }
@@ -288,7 +313,7 @@ function AttachmentRow({ emailId, attachment }: { emailId: number; attachment: E
       >
         Download
       </Button>
-      <Button disabled={save.isPending} onClick={() => save.mutate(attachment.position)}>
+      <Button variant="quiet" disabled={save.isPending} onClick={() => save.mutate(attachment.position)}>
         Save to files
       </Button>
       {/* The name shown here is the one the DAEMON wrote it under — sanitised
@@ -305,7 +330,7 @@ function SavedOneNote({ result }: { result: SavedFile }) {
   const where = result.folder === "" ? "the files root" : result.folder;
   return (
     <p className="mail-outcome" role="status">
-      saved as <code>{result.filename}</code> in {where}
+      Saved as <code>{result.filename}</code> in {where}
     </p>
   );
 }
@@ -319,7 +344,7 @@ function AttachmentError({ error, what }: { error: unknown; what: string }) {
       />
     );
   }
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+  return <ErrorNote>{`Could not reach the ${DAEMON_NAME}: ${what}.`}</ErrorNote>;
 }
 
 function formatBytes(size: number): string {
@@ -340,7 +365,16 @@ function SenderVerdict({ email }: { email: EmailDetail }) {
   const standing = email.sender_verdict;
 
   return (
-    <Panel title="This sender" variant="dim">
+    <Panel
+      title="This sender"
+      variant="dim"
+      aside={
+        <Tip
+          name="About standing decisions"
+          tip="A standing decision is about the sender and covers every message from them. The triage class is about this one message only."
+        />
+      }
+    >
       <p className="mail-note">{standingSentence(email.from_addr, standing)}</p>
       <div className="mail-detail-verdict-actions" role="group" aria-label="Standing decision about this sender">
         {/* `aria-pressed` and a rung of the neutral ladder, never a tone: pinning a sender is a
@@ -402,24 +436,21 @@ function standingSentence(address: string, verdict: string | null): ReactNode {
   if (verdict === "pin") {
     return (
       <>
-        <code>{address}</code> is pinned — their mail keeps being surfaced in full. This is separate
-        from the triage class above, which is about this one message.
+        <code>{address}</code> is pinned — their mail keeps being surfaced in full.
       </>
     );
   }
   if (verdict === "mute") {
     return (
       <>
-        <code>{address}</code> is muted — their mail stops being surfaced. This is separate from the
-        triage class above, which is about this one message.
+        <code>{address}</code> is muted — their mail stops being surfaced.
       </>
     );
   }
   return (
     <>
       No standing decision about <code>{address}</code> — pin them to keep seeing their mail in full,
-      or mute them to stop it being surfaced. This is separate from the triage class above, which is
-      about this one message.
+      or mute them to stop it being surfaced.
     </>
   );
 }
@@ -436,7 +467,7 @@ function VerdictError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "no mail has ever arrived from that address" }} />;
   }
-  return <ErrorNote>the núcleo did not answer — that verdict was not recorded</ErrorNote>;
+  return <ErrorNote>{`Could not reach the ${DAEMON_NAME}. That decision was not recorded; try again.`}</ErrorNote>;
 }
 
 /* ---------------------------------------------------------------- reply -- */
@@ -444,63 +475,66 @@ function VerdictError({ error }: { error: unknown }) {
 /**
  * Reply to the sender.
  *
- * **There is no pre-flight.** The form is always open — see `useSendReply`'s
- * doc comment — and a daemon with nowhere to send from answers 503 only after
- * Send is pressed. That refusal, and every other one this route makes, is
- * bare prose the daemon wrote on purpose, and {@link daemonProse} is what
- * lets it through verbatim instead of being replaced by this shell's own
- * generic copy.
+ * The form is always open (see `useSendReply`'s doc comment), and a daemon with
+ * nowhere to send from answers 503 only after Send is pressed. That refusal, and every
+ * other one this route makes, is bare prose the daemon wrote on purpose, and
+ * {@link daemonProse} is what lets it through verbatim instead of being replaced by this
+ * shell's own generic copy.
  */
 function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
   const send = useSendReply();
   const [body, setBody] = useState("");
+  const sendRef = useRef<HTMLSpanElement>(null);
   // The daemon may omit a field the type says is always present; absent is not null.
   const replySubject = typeof subject !== "string" ? "Re:" : subject.startsWith("Re:") ? subject : `Re: ${subject}`;
 
+  // Ctrl/Cmd+Enter arms Send, the same first press a pointer makes; it never sends by itself.
+  const armOnChord = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      sendRef.current?.querySelector("button")?.click();
+    }
+  };
+
   return (
     <Panel title="Reply">
-      <p className="mail-note">
-        There is no pre-flight check here — the form is always open. If the daemon has nowhere to send
-        this from, that refusal arrives after Send is pressed, named below, not before.
-      </p>
       <form className="mail-detail-reply mail-stack" onSubmit={(event) => event.preventDefault()}>
-        {/* To and Subject are fixed by the message being answered. They stay
-            inputs, for their names, but are drawn as the facts they are — a
-            bordered box reads as a place to type. */}
-        <label className="mail-detail-reply-field">
-          <span>To</span>
-          <input value={to} readOnly aria-label="Reply recipient" />
-        </label>
-        <label className="mail-detail-reply-field">
-          <span>Subject</span>
-          <input value={replySubject} readOnly aria-label="Reply subject" />
-        </label>
+        {/* To and Subject are fixed by the message being answered, so they are facts and not
+            inputs: nothing to tab through, nothing that looks like a place to type. */}
+        <dl className="mail-detail-facts mail-detail-meta">
+          <Fact label="To">{to}</Fact>
+          <Fact label="Subject">{replySubject}</Fact>
+        </dl>
         <label className="mail-detail-reply-field">
           <span>Message</span>
           <textarea
             rows={6}
             value={body}
-            aria-label="Reply body"
             onChange={(event) => setBody(event.target.value)}
+            onKeyDown={armOnChord}
           />
         </label>
-        <ConfirmButton
-          label="Send"
-          confirmLabel="Send it now"
-          variant="approve"
-          intent="go"
-          disabled={body.trim() === "" || send.isPending}
-          onConfirm={() =>
-            send.mutate(
-              { to, subject: replySubject, body: body.trim() },
-              { onSuccess: () => setBody("") },
-            )
-          }
-        />
+        <span ref={sendRef}>
+          <ConfirmButton
+            label="Send"
+            confirmLabel="Send it now"
+            sayAs={`Send this reply to ${to}`}
+            variant="approve"
+            intent="go"
+            disabled={body.trim() === "" || send.isPending}
+            onConfirm={() =>
+              send.mutate(
+                { to, subject: replySubject, body: body.trim() },
+                { onSuccess: () => setBody("") },
+              )
+            }
+          />
+        </span>
+        <p className="mail-note">If no sending account is set up, Send will say so. Ctrl+Enter arms Send.</p>
       </form>
       {send.isSuccess && (
         <p className="mail-outcome" role="status">
-          sent
+          Sent to {to}
         </p>
       )}
       {send.isError && <SendError error={send.error} />}
@@ -510,7 +544,7 @@ function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
 
 function SendError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing was sent</ErrorNote>;
+  return <ErrorNote>{`Could not reach the ${DAEMON_NAME}. Nothing was sent; try again.`}</ErrorNote>;
 }
 
 /**
