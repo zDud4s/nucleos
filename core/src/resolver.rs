@@ -1011,6 +1011,9 @@ async fn land_finished(
             &row.branch,
             Some(target.as_str()),
             deadline,
+            // The daemon handing over what its own resolver finished: nobody typed this landing,
+            // and metric 2 reads the column to count the conflicts it closed alone.
+            crate::execution::vcs::Origin::Daemon,
         )
         .await;
         match outcome {
@@ -1797,6 +1800,35 @@ mod tests {
         );
     }
 
+    /// Nobody typed this landing: the daemon filed it on the consent the original merge was queued
+    /// with, so it says `daemon` — the column metric 2 reads to count the conflicts the daemon
+    /// closed alone — and, like a person's `--land`, it needs no approval of its own.
+    #[tokio::test]
+    async fn a_finished_resolution_is_handed_over_as_daemon_origin() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-origin-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+
+        let mut refused = Default::default();
+        land_finished(&pool, &mut refused).await;
+
+        let admitted = admitted_resolutions(&pool, &scenario).await;
+        assert_eq!(admitted.len(), 1, "one landing for one finished resolution");
+        let (origin, status): (String, String) =
+            sqlx::query_as("SELECT origin, status FROM vcs_requests WHERE id = ?")
+                .bind(admitted[0])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(origin, "daemon");
+        assert_eq!(status, "queued", "the handover waits for no approval");
+    }
+
     /// **AC3.** Each of these leaves something a person or the agent still owns, or nothing to land.
     #[tokio::test]
     async fn a_resolution_without_a_finished_merge_is_never_handed_over() {
@@ -2052,6 +2084,7 @@ mod tests {
             &scenario.branch,
             Some("feat/x"),
             std::time::Instant::now() + crate::execution::git_exec::OPERATION_TIMEOUT,
+            crate::execution::vcs::Origin::Shell,
         )
         .await;
         assert!(

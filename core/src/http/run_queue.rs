@@ -438,6 +438,7 @@ pub(super) async fn land_worktree(
         source.trim(),
         body.target.as_deref(),
         deadline,
+        crate::execution::vcs::Origin::Shell,
     )
     .await
     .map_err(|refusal| {
