@@ -107,7 +107,7 @@ describe("Feed - filter layout", () => {
     useLines([entry()]);
     await renderFeed();
 
-    const search = await screen.findByRole("button", { name: "Search", hidden: true });
+    const search = await screen.findByRole("button", { name: "Apply", hidden: true });
     expect(search.parentElement?.className).toBe("feed-filter-submit");
     expect(search.parentElement?.parentElement?.className).toContain("feed-filters");
   });
@@ -527,6 +527,58 @@ describe("Feed - what you have seen moves when you leave", () => {
   });
 });
 
+describe("Feed - taking a mark back, and one model for the filters", () => {
+  it("Mark everything seen says what it did and offers Undo, which restores this visit's shading", async () => {
+    const five = [1, 2, 3, 4, 5].map((id) =>
+      entry({ id, kind: "job_started", summary: `line ${id}`, minutesAgo: 60 - id * 5 }),
+    );
+    useLines(five, {
+      feedSeen: {
+        through: 2,
+        through_created_at: five[1].created_at,
+        seen_at: new Date(Date.parse(five[1].created_at) + 60_000).toISOString(),
+      },
+    });
+    await renderFeed();
+    await lines();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark everything seen" }));
+    expect(await screen.findByText(/Marked 3 lines seen/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    // The button that was gone comes back: the marker of this visit is the old one again.
+    expect(await screen.findByRole("button", { name: "Mark everything seen" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  it("applies every filter together on Apply, and none of them on change", async () => {
+    useLines([entry()]);
+    await renderFeed();
+    fireEvent.click(await screen.findByRole("button", { name: "More" }));
+
+    fireEvent.change(screen.getByLabelText("Since"), { target: { value: "2026-10-16T10:00" } });
+    fireEvent.change(screen.getByLabelText("Kind"), { target: { value: "job_failed" } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Nothing moved: no navigation, no search, the page is still live.
+    expect(screen.queryByText(/the page has stopped refreshing/)).toBeNull();
+    expect(feedCalls().some((path) => path.includes("since="))).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(await screen.findByText(/the page has stopped refreshing/)).toBeDefined();
+    await waitFor(() => {
+      const searched = feedCalls().find((path) => path.includes("since=")) ?? "";
+      expect(searched).toContain("kind=job_failed");
+    });
+  });
+
+  it("the lines that ask for you carry an action link, not a metadata link", async () => {
+    useLines([entry({ id: 1, kind: "email_urgent", project_id: null, summary: "the accountant asked twice", minutesAgo: 20 })]);
+    await renderFeed();
+    const list = await lines();
+    expect(within(list).getByRole("link", { name: "Open Mail" }).className).toContain("feed-link-action");
+  });
+});
+
 /* ---------------------------------------------------------------- states -- */
 
 describe("Feed - the window's states", () => {
@@ -733,7 +785,7 @@ describe("Feed - date bounds", () => {
     useLines([]);
     void renderFeed();
 
-    expect((await screen.findByLabelText("Only lines after")).getAttribute("lang")).toBe("en-GB");
-    expect(screen.getByLabelText("Only lines before").getAttribute("lang")).toBe("en-GB");
+    expect((await screen.findByLabelText("Since")).getAttribute("lang")).toBe("en-GB");
+    expect(screen.getByLabelText("Until").getAttribute("lang")).toBe("en-GB");
   });
 });
