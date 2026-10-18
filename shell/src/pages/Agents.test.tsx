@@ -687,3 +687,34 @@ describe("Agents - the route", () => {
     expect(screen.queryByText("Agents is not built yet")).toBeNull();
   });
 });
+
+describe("Agents - filtering the catalogue", () => {
+  it("narrows the table by a typed query and by the without-a-model chip", async () => {
+    daemon.apiFetch.mockImplementation(
+      agentsFetch([
+        agent({ id: "copywriter", name: "copywriter", model: "opus" }),
+        agent({ id: "auditor", name: "auditor", speciality: "checks the books", model: null }),
+      ]),
+    );
+    renderWithQuery(<Agents />);
+
+    await screen.findByRole("button", { name: "copywriter" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "books" } });
+    expect(screen.queryByRole("button", { name: "copywriter" })).toBeNull();
+    expect(screen.getByRole("button", { name: "auditor" })).toBeDefined();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /Without a model/ }));
+    expect(screen.queryByRole("button", { name: "copywriter" })).toBeNull();
+    expect(screen.getByRole("button", { name: "auditor" })).toBeDefined();
+  });
+
+  it("says so when nothing matches", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    await screen.findByRole("button", { name: "copywriter" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "zzz" } });
+    expect(screen.getByText("No agent matches that filter.")).toBeDefined();
+  });
+});

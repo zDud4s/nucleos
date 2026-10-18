@@ -25,7 +25,9 @@ import {
   Button,
   ConfirmButton,
   ErrorNote,
+  ListFilter,
   PageHeader,
+  Quiet,
   Modal,
   Panel,
   RefusalNote,
@@ -37,6 +39,10 @@ import {
 import { DAEMON_NAME } from "../copy";
 import "./agents.css";
 import { LoadoutPreview } from "./LoadoutPreview";
+
+// Ids of the two filter chips: the headline's own counts, made clickable.
+const NO_MODEL = "no-model";
+const NOBODY_USES = "nobody-uses";
 
 /**
  * Agents — the house catalogue.
@@ -86,6 +92,8 @@ export function Agents() {
   const teams = useTeams();
   const [creating, setCreating] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [chipsOn, setChipsOn] = useState<readonly string[]>([]);
 
   const rows = agents.data ?? [];
   const answered = agents.data !== undefined;
@@ -106,6 +114,21 @@ export function Agents() {
     itself instead of leaving a panel open over a row that is gone.
   */
   const chosen = rows.find((row) => row.id === selected) ?? null;
+
+  // The two counts the headline already states, made into filters. A chip that would match
+  // nothing still shows its zero; "nobody uses" exists only once the departments have answered.
+  const seatless = rows.filter((row) => !canTakeASeat(row)).length;
+  const idle = employmentKnown ? rows.filter((row) => unemployed(employmentOf(row.id, departments))).length : 0;
+  const needle = query.trim().toLowerCase();
+  const shown = rows.filter(
+    (row) =>
+      (needle === "" ||
+        row.name.toLowerCase().includes(needle) ||
+        row.id.toLowerCase().includes(needle) ||
+        row.speciality.toLowerCase().includes(needle)) &&
+      (!chipsOn.includes(NO_MODEL) || !canTakeASeat(row)) &&
+      (!chipsOn.includes(NOBODY_USES) || (employmentKnown && unemployed(employmentOf(row.id, departments)))),
+  );
 
   return (
     <>
@@ -144,8 +167,28 @@ export function Agents() {
 
       {rows.length > 0 && (
         <Panel title="Catalogue">
+          <ListFilter
+            noun="agents"
+            query={query}
+            onQueryChange={setQuery}
+            chips={[
+              { id: NO_MODEL, label: "Without a model", count: seatless },
+              ...(employmentKnown ? [{ id: NOBODY_USES, label: "Nobody uses", count: idle }] : []),
+            ]}
+            selected={chipsOn}
+            onToggleChip={(id) =>
+              setChipsOn((on) => (on.includes(id) ? on.filter((chip) => chip !== id) : [...on, id]))
+            }
+            resultCount={shown.length}
+            onOpenOnly={() => setSelected(shown[0].id)}
+            onClear={() => {
+              setQuery("");
+              setChipsOn([]);
+            }}
+          />
+          {shown.length === 0 && <Quiet says="No agent matches that filter." />}
           <Catalogue
-            rows={rows}
+            rows={shown}
             departments={departments}
             employmentKnown={employmentKnown}
             selected={chosen?.id ?? null}
