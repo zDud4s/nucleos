@@ -116,6 +116,13 @@ pub(super) async fn serve_turn_briefed(
             // goes back to the registry.
             let began = std::time::Instant::now();
             let steer = SteerGuard::open(chat_id, &live.messages);
+            // A kept process sent its `init` long ago, for some earlier turn, so the runner never
+            // fires this turn's signal: it is fired here, BEFORE the line is written. After would
+            // lose it to a turn cancelled mid-answer, pricing a sent prompt at zero; firing early
+            // only over-marks a `NotWritten` turn, which errs toward the estimate.
+            if let Some(request_tx) = request.request_tx.take() {
+                let _ = request_tx.send(());
+            }
             let served = tokio::time::timeout(
                 deadlines.ceiling,
                 live.turn(
@@ -163,7 +170,10 @@ pub(super) async fn serve_turn_briefed(
                 Ok(LiveTurn::NotWritten) => {}
                 // Silent for the whole deadline: dropping `live` stops the process.
                 Ok(LiveTurn::WentSilent(after)) => {
-                    return Ok(Ok(went_silent(transcript, after, Some(session_id))));
+                    // Its line was written to a process already talking to a model.
+                    let mut silent = went_silent(transcript, after, Some(session_id));
+                    silent.model_requested = true;
+                    return Ok(Ok(silent));
                 }
                 // Dropping `live` on the way out is what stops a process that stopped answering.
                 Err(elapsed) => return Err(elapsed),
@@ -449,6 +459,8 @@ pub(super) fn gathered(
         cache_creation_tokens: outcome.usage.cache_creation_tokens,
         num_turns: outcome.usage.num_turns,
         compacted: outcome.compacted,
+        // A turn that answered had its request read by a model, whichever door it took.
+        model_requested: true,
     }
 }
 
@@ -477,6 +489,7 @@ pub(super) fn went_silent(
         cache_creation_tokens: None,
         num_turns: None,
         compacted: false,
+        model_requested: false,
     }
 }
 

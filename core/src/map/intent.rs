@@ -854,6 +854,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             ..Default::default()
         }
@@ -979,6 +980,7 @@ mod tests {
             cache_creation_tokens: None,
             num_turns: None,
             compacted: false,
+            model_requested: false,
         });
 
         let failed = extract(Extractor::Cli(&runner), "slug", "body").await;

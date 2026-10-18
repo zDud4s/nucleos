@@ -727,6 +727,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             ..Default::default()
         };
@@ -1266,6 +1267,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             last_permission: std::sync::Mutex::new(None),
             ..Default::default()
@@ -1303,6 +1305,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             // The fake releases one canned event per interval. The complete run therefore lasts
             // well beyond the progress deadline while every individual quiet gap stays below it.

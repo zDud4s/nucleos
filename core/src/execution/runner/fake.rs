@@ -87,6 +87,13 @@ pub struct FakeCommandRunner {
     /// Test-only: whether this double answers `honours_max_budget` the way `ClaudeCliRunner` does.
     /// `false` by default, which is the trait's own answer and the one a Codex daemon gives.
     pub honours_budget: bool,
+    /// Test-only: whether this double answers `reports_model_request` the way `ClaudeCliRunner`
+    /// does. A launch handed a `request_tx` fires it where the CLI's `init` would arrive, beside
+    /// the session id; the outcome's `model_requested` stays whatever the canned one says, so a
+    /// test can tell the marker's recorder from the terminal write's repair.
+    pub reports_request: bool,
+    /// Test-only: drop `request_tx` unsent, as a marker write that never landed would lose it.
+    pub loses_request_signal: bool,
     /// Test-only: return an `Err` (simulated launch failure — no work done) for the first N calls.
     pub fail_times: std::sync::Mutex<u32>,
     /// Test-only: count of run_prompt invocations.
@@ -158,6 +165,10 @@ impl CommandRunner for FakeCommandRunner {
 
     fn honours_max_budget(&self) -> bool {
         self.honours_budget
+    }
+
+    fn reports_model_request(&self) -> bool {
+        self.reports_request
     }
 
     /// The live-process door, so a conversation that keeps its CLI is exercised in tests rather than
@@ -299,7 +310,7 @@ impl CommandRunner for FakeCommandRunner {
 
     async fn run_prompt(
         &self,
-        request: RunRequest,
+        mut request: RunRequest,
         session_tx: UnboundedSender<String>,
         transcript: std::sync::Arc<std::sync::Mutex<String>>,
     ) -> std::io::Result<RunOutcome> {
@@ -397,6 +408,7 @@ impl CommandRunner for FakeCommandRunner {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })
         };
         if outcome.session_id.is_none() {
@@ -408,6 +420,12 @@ impl CommandRunner for FakeCommandRunner {
         // Emit session_id *before* any simulated delay — mirrors the real CLI's early `init` message.
         if let Some(sid) = &outcome.session_id {
             let _ = session_tx.send(sid.clone());
+        }
+        // Where the CLI's `init` fires it. Taken either way, so a lost signal is dropped unsent.
+        if let Some(request_tx) = request.request_tx.take()
+            && !self.loses_request_signal
+        {
+            let _ = request_tx.send(());
         }
         let delay = *self.delay.lock().unwrap();
         let mut streamed = false;

@@ -1143,7 +1143,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                 }) as LateBriefing
             });
 
-        let request = chat_run_request(
+        let mut request = chat_run_request(
             text,
             images,
             env,
@@ -1178,6 +1178,10 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // claiming a zero.
         crate::execution::runs::record_authored_prompt(&pool, id, runner.authored_prompt(&request))
             .await;
+        // Armed after the permission snapshot and before the runner holds the sender, for that
+        // snapshot's reason: nothing the CLI does can precede what its row says about it.
+        request.request_tx =
+            crate::execution::runs::watch_model_request(&pool, id, runner.as_ref()).await;
 
         let result = serve_turn_briefed(
             &runner,
@@ -1275,7 +1279,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
                         .await;
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, model_requested_at = COALESCE(model_requested_at, CASE WHEN ? THEN ? END), cache_ttl = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(status)
                     .bind(o.exit_code)
@@ -1293,6 +1297,9 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     .bind(thought_tokens)
                     .bind(context_fill)
                     .bind(compacted)
+                    // Repairs a lost marker write: `COALESCE` keeps the recorder's own time.
+                    .bind(o.model_requested)
+                    .bind(&completed_at)
                     .bind(cache_ttl)
                     .bind(&model)
                     .bind(&completed_at)
@@ -1347,7 +1354,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     crate::chats::tasks::record_turn(&pool, &turn.slot.chat_id, id, &o.stdout)
                         .await;
                     let failed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, model_requested_at = COALESCE(model_requested_at, CASE WHEN ? THEN ? END), completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(status)
                     .bind(o.exit_code)
@@ -1359,6 +1366,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     .bind(o.cache_read_tokens)
                     .bind(o.cache_creation_tokens)
                     .bind(o.num_turns)
+                    .bind(o.model_requested)
+                    .bind(&completed_at)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)

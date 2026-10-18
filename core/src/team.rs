@@ -3449,6 +3449,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: Some(2),
                 compacted: true,
+                model_requested: false,
             })),
             ..Default::default()
         });

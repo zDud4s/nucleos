@@ -138,6 +138,12 @@ pub struct RunOutcome {
     /// indistinguishable from a short question. The stream says it outright and this carries what
     /// it said.
     pub compacted: bool,
+    /// Whether the run reached the point a model request may be in flight (the CLI's `init`).
+    ///
+    /// The terminal write repairs `runs.model_requested_at` from it, so a best-effort marker write
+    /// that was lost cannot leave an armed run priced at zero. `false` from every runner that
+    /// cannot tell, which is harmless: an unarmed run is priced by the estimate either way.
+    pub model_requested: bool,
 }
 
 /// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds

@@ -601,6 +601,7 @@ impl CommandRunner for ClaudeCliRunner {
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
             compacted,
+            model_requested: init_seen,
         })
     }
 }
