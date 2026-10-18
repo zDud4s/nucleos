@@ -226,8 +226,13 @@ describe("the readings", () => {
 
     await screen.findByText("85%");
     const readingsSection = container.querySelector('section[aria-label="Readings"]') as HTMLElement;
+    // The accessible name is the visible label, referenced by `aria-labelledby`.
     const order = Array.from(readingsSection.querySelectorAll("article")).map((card) =>
-      card.getAttribute("aria-label"),
+      (card.getAttribute("aria-labelledby") ?? "")
+        .split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent ?? "")
+        .join(" ")
+        .trim(),
     );
     expect(order).toEqual(["Gate", "Delivered", "Cost", "Token efficiency"]);
 

@@ -1,8 +1,8 @@
 import { Link } from "@tanstack/react-router";
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 
 export interface StatCardProps {
-  /** What is being counted. Also the card's accessible name. */
+  /** What is being counted. The card's accessible name, by reference (`aria-labelledby`), never a copy. */
   label: string;
   /**
    * The figure.
@@ -38,10 +38,12 @@ export interface StatCardProps {
  */
 export function StatCard({ label, value, detail, bar, to, unread }: StatCardProps) {
   const unreadFigure = value === undefined;
+  const labelId = useId();
+  const valueId = useId();
   const shown = unreadFigure && unread !== undefined ? unread : detail;
   const card = (
-    <article className="ui-stat" aria-label={label}>
-      <p className="ui-stat-value">
+    <article className="ui-stat" aria-labelledby={labelId} aria-describedby={valueId}>
+      <p className="ui-stat-value" id={valueId}>
         {unreadFigure ? (
           <>
             <span aria-hidden="true">—</span>
@@ -51,14 +53,14 @@ export function StatCard({ label, value, detail, bar, to, unread }: StatCardProp
           value
         )}
       </p>
-      <p className="ui-stat-label">{label}</p>
+      <p className="ui-stat-label" id={labelId}>{label}</p>
       {shown === undefined ? null : <p className="ui-stat-detail">{shown}</p>}
       {bar === undefined ? null : bar}
     </article>
   );
   if (to === undefined) return card;
   return (
-    <Link to={to} className="ui-stat-link" aria-label={label}>
+    <Link to={to} className="ui-stat-link" aria-labelledby={labelId}>
       {card}
     </Link>
   );
