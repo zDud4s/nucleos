@@ -908,6 +908,7 @@ mod tests {
             session_name: None,
             context_window: None,
             messages: None,
+            request_tx: None,
             allowed_mcp_tools: None,
             background_tasks: false,
         }
@@ -1110,6 +1111,7 @@ mod tests {
             session_name: None,
             context_window: None,
             messages: None,
+            request_tx: None,
             allowed_mcp_tools: None,
             background_tasks: false,
         }
@@ -1172,6 +1174,81 @@ mod tests {
         );
         assert_eq!(outcome.input_tokens, Some(11));
         assert_eq!(outcome.output_tokens, Some(22));
+    }
+
+    /// `system/init` is the earliest point a model request may be in flight, so it is where the
+    /// runner says so. The marker means "may have been sent", not "answered".
+    #[tokio::test]
+    async fn the_init_line_reports_the_model_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"init","session_id":"fake-session","tools":[]}"#,
+                r#"{"type":"result","subtype":"success","total_cost_usd":0.01,"num_turns":1,"session_id":"fake-session"}"#,
+            ]),
+        );
+        let _bin = FakeClaudeBin::set("sh");
+        let (request_tx, mut request_rx) = tokio::sync::oneshot::channel::<()>();
+        request.request_tx = Some(request_tx);
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns and prints its stream");
+
+        assert_eq!(
+            request_rx.try_recv(),
+            Ok(()),
+            "an init line must report that a model request may be in flight"
+        );
+    }
+
+    /// A stream that never reached `init` sent nothing to a model, so nothing is reported — even
+    /// when a `session_id` already arrived on an earlier line, which is why that is not the signal.
+    #[tokio::test]
+    async fn a_stream_ending_before_init_reports_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = fake_cli(
+            dir.path(),
+            &printing(&[
+                r#"{"type":"system","subtype":"hook_started","session_id":"fake-session"}"#,
+            ]),
+        );
+        let _bin = FakeClaudeBin::set("sh");
+        let (request_tx, mut request_rx) = tokio::sync::oneshot::channel::<()>();
+        request.request_tx = Some(request_tx);
+        let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await
+            .expect("the fake CLI spawns and prints its stream");
+
+        assert_eq!(
+            session_rx.try_recv().as_deref(),
+            Ok("fake-session"),
+            "the session is announced before init, and must not count as a request"
+        );
+        assert_eq!(
+            request_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+            "a stream that ended before init must drop the watcher without reporting"
+        );
+    }
+
+    /// Only a runner that fires the signal may be watched: arming a watcher on one that never
+    /// reports would read every run as "never requested" and price it at zero.
+    #[test]
+    fn a_runner_without_a_watcher_never_arms() {
+        assert!(claude_runner().reports_model_request());
+        let codex = CodexCliRunner {
+            model: "gpt-5.6-terra".to_string(),
+            sandbox_mode: None,
+        };
+        assert!(!codex.reports_model_request());
+        assert!(!FakeCommandRunner::default().reports_model_request());
     }
 
     #[tokio::test]

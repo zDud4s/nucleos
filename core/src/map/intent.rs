@@ -485,6 +485,7 @@ pub async fn ask_once(
         // Nothing to govern: the policy above leaves no tool for a classifier to judge a call to.
         classifier_governs_tools: false,
         messages: None,
+        request_tx: None,
         // The strict default. A spec is a document, and a document being read is not a reason to
         // open a connector to it.
         ambient_mcp: false,

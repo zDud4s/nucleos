@@ -474,6 +474,7 @@ pub(super) async fn spawn_agent(
         steerable: true,
         classifier_governs_tools: false,
         messages: None,
+        request_tx: None,
         ambient_mcp: false,
         model: agent.model.clone(),
         effort: None,

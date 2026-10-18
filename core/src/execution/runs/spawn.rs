@@ -471,6 +471,7 @@ pub(super) fn spawn_run(
                 steerable,
                 classifier_governs_tools,
                 messages: None,
+                request_tx: None,
                 // Autopilot runs pay for the ambient surface and call none of it.
                 ambient_mcp: false,
                 // Cloned rather than moved: the request is built once per attempt.

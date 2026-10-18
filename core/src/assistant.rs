@@ -4843,6 +4843,7 @@ mod tests {
             steerable: false,
             classifier_governs_tools: false,
             messages: None,
+            request_tx: None,
             ambient_mcp: false,
             model: Some("sonnet".to_owned()),
             effort: None,

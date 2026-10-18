@@ -241,6 +241,7 @@ impl Driver {
             // worktree a council does not have.
             classifier_governs_tools: false,
             messages: None,
+            request_tx: None,
             ambient_mcp: false,
             model: Some(seat.model_ref.clone()),
             effort: None,

@@ -459,6 +459,7 @@ pub(super) fn chat_run_request(
         // `McpOnly` besides, so the surface being argued over is nearly empty.
         classifier_governs_tools: false,
         messages: None,
+        request_tx: None,
         // The owner opts in per conversation (decision 2026-10-05), and only a turn that
         // is not `McpOnly` can use it: `McpOnly` pushes the strict flag unconditionally,
         // so an unrooted, Telegram or withheld relayed turn never gets the ambient servers.
