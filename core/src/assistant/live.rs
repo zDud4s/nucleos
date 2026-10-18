@@ -460,9 +460,13 @@ impl LiveChat {
         if self.messages.is_closed() || (recorded_stop && !self.events.is_closed()) {
             return LiveTurn::NotWritten;
         }
+        let began = self.drain_idle();
+        // Everything carried was said before this message, so an end in it can never be this
+        // turn's: one that closes no answer would otherwise be gathered as this turn's answer.
+        self.drop_answerless_ends();
         // An answer the CLI began on its own before this message belongs to that answer. Set it
         // aside whole, to its own end, so this turn gathers only what answers it.
-        if self.drain_idle() && self.answer_carried() {
+        if began && self.answer_carried() {
             let aside = std::sync::Arc::new(Mutex::new(String::new()));
             match self.gather(&aside, silence).await {
                 LiveTurn::Answered(outcome) => {
@@ -573,6 +577,24 @@ impl LiveChat {
             crate::execution::runner::TurnEvent::Line(line) => is_answer_line(line),
             crate::execution::runner::TurnEvent::Ended(_) => true,
         })
+    }
+
+    /// Drops each leading segment of `carried` that ends without an answer line in it: the end of
+    /// a turn that said nothing, which no turn of a person's may take for its own answer.
+    fn drop_answerless_ends(&mut self) {
+        while let Some(end) = self
+            .carried
+            .iter()
+            .position(|event| matches!(event, crate::execution::runner::TurnEvent::Ended(_)))
+        {
+            let answered = self.carried.iter().take(end).any(|event| {
+                matches!(event, crate::execution::runner::TurnEvent::Line(line) if is_answer_line(line))
+            });
+            if answered {
+                return;
+            }
+            self.carried.drain(..=end);
+        }
     }
 
     /// Whether the first segment of `carried` — up to and including its first `Ended`, or all of it
