@@ -25,7 +25,7 @@ async function spendRow(): Promise<HTMLElement> {
 
 /** The card with this label, once its query has landed. */
 async function card(label: string): Promise<HTMLElement> {
-  return await screen.findByRole("article", { name: label });
+  return await screen.findByRole("article", { name: new RegExp(`^${label}`) });
 }
 
 describe("Home", () => {
@@ -92,7 +92,7 @@ describe("Home", () => {
     );
     // The card is itself the door to the queue; the separate "Where to look next" sentence was
     // removed by the redesign.
-    expect(screen.getByRole("link", { name: "Waiting on you" }).getAttribute("href")).toBe("/waiting");
+    expect(screen.getByRole("link", { name: /^Waiting on you/ }).getAttribute("href")).toBe("/waiting");
   });
 
   it("reads an absent ceiling as no ceiling, never as zero", async () => {
@@ -142,14 +142,25 @@ describe("Home", () => {
   it("shows an em dash rather than a zero while nothing has been read", async () => {
     // A count nobody has managed to fetch and a count that is genuinely zero are
     // different pieces of news, and only one of them means you can go to lunch.
-    daemon.apiFetch.mockReturnValue(new Promise(() => {}));
+    // Only the budget answers; the rest never does, so the grid is real cards, not the skeleton.
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/autopilot/budget" ? daemonFetch(daemonState())(path, init) : new Promise(() => {}),
+    );
 
     await renderWithRouter(<Home />);
 
     for (const label of ["Projects", "Shadow decisions pending", "Waiting on you"]) {
       expect(within(await card(label)).getByText("—")).toBeDefined();
     }
-    expect(within(await spendRow()).getByText("—")).toBeDefined();
+  });
+
+  it("holds the grid with a card skeleton until the first read lands", async () => {
+    daemon.apiFetch.mockReturnValue(new Promise(() => {}));
+
+    await renderWithRouter(<Home />);
+
+    expect(await screen.findByText("Loading your readings")).toBeDefined();
+    expect(screen.queryAllByRole("article")).toHaveLength(0);
   });
 
   it("says out loud when a ceiling is holding autonomous work", async () => {
@@ -215,14 +226,14 @@ describe("Home", () => {
 
     // And the card that counts the same fact wears the same tone. The figure reads
     // "2/3" whether or not anything is wrong; the tone is what says which it is.
-    const subsystemsCard = screen.getByRole("article", { name: "Subsystems healthy" });
+    const subsystemsCard = screen.getByRole("article", { name: /^Subsystems healthy/ });
     expect(subsystemsCard.className).toBe("ui-stat");
     expect(subsystemsCard.querySelector(".ui-stat-value")?.className).toBe("ui-stat-value");
     // ui-wrong lands on the span StatCard's detail slot wraps, not on the slot's own
     // p.ui-stat-detail — Boundary.tsx's rule is that the whole sentence carries the tone.
     expect(
       screen
-        .getByRole("article", { name: "Subsystems healthy" })
+        .getByRole("article", { name: /^Subsystems healthy/ })
         .querySelector(".ui-stat-detail .ui-wrong"),
     ).not.toBeNull();
   });
@@ -246,7 +257,7 @@ describe("Home", () => {
 
     await renderWithRouter(<Home />);
 
-    const card_ = await screen.findByRole("article", { name: "Subsystems healthy" });
+    const card_ = await screen.findByRole("article", { name: /^Subsystems healthy/ });
     expect(card_.className).toBe("ui-stat");
     // The detail carries it too: one reading, one treatment — Boundary.tsx's rule.
     expect(card_.querySelector(".ui-stat-detail .ui-wrong")).not.toBeNull();
@@ -288,10 +299,10 @@ describe("Home", () => {
 
     // Nor does the healthy card wear the tone. A figure that is always red says nothing
     // when something actually goes wrong.
-    expect(screen.getByRole("article", { name: "Subsystems healthy" }).className).toBe("ui-stat");
+    expect(screen.getByRole("article", { name: /^Subsystems healthy/ }).className).toBe("ui-stat");
     expect(
       screen
-        .getByRole("article", { name: "Subsystems healthy" })
+        .getByRole("article", { name: /^Subsystems healthy/ })
         .querySelector(".ui-stat-detail .ui-wrong"),
     ).toBeNull();
   });
@@ -312,7 +323,7 @@ describe("Home", () => {
         .filter((b) => b.getAttribute("aria-describedby") === null && b.textContent !== "Retry"),
     ).toHaveLength(0);
     // Each reading is a link to its page (no more "Where to look next").
-    expect(screen.getByRole("link", { name: "Shadow decisions pending" }).getAttribute("href")).toBe("/autopilot");
-    expect(screen.getByRole("link", { name: "Waiting on you" }).getAttribute("href")).toBe("/waiting");
+    expect(screen.getByRole("link", { name: /^Shadow decisions pending/ }).getAttribute("href")).toBe("/autopilot");
+    expect(screen.getByRole("link", { name: /^Waiting on you/ }).getAttribute("href")).toBe("/waiting");
   });
 });

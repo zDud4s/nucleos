@@ -249,7 +249,7 @@ export function Fleet() {
 
       {/* The first read is still on its way: a blank page after the title reads as a failed one. */}
       {concurrency.isPending && capacity === undefined && !concurrency.isError && (
-        <Skeleton label="Loading the fleet" lines={3} />
+        <Skeleton label="Loading the fleet" variant="cards" count={3} />
       )}
       {concurrency.isError && capacity === undefined && (
         <CapacityError
