@@ -1861,7 +1861,7 @@ pub mod tests {
         crate::testdb::fresh_pool().await
     }
 
-    /// The IDE verify switch (spec 4.7, migration 0200) is on for a new project until somebody
+    /// The IDE verify switch (spec 4.7, migration 0203) is on for a new project until somebody
     /// turns it off, and a project the roster has never heard of reads as off rather than as an
     /// error.
     #[tokio::test]
