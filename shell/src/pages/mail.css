@@ -56,7 +56,6 @@
 
 .mail-loading {
   color: var(--text-faint);
-  font-style: italic;
 }
 
 /* A feed kind as a literal off the wire — `email_fetch_skipped`. Was
@@ -94,6 +93,57 @@
   color: var(--text);
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
+}
+
+/* The Queue heading's corner: the untriaged count and the button that resolves it. */
+.mail-aside {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* The live region is always mounted; with nothing in it it takes no room. */
+.mail-triage-status:empty {
+  display: none;
+}
+
+.mail-triage-status {
+  margin-bottom: var(--space-3);
+}
+
+.mail-triage-status > .mail-outcome {
+  margin: 0;
+}
+
+/* ----------------------------------------------------------------- filter -- */
+
+.mail-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.mail-filter-n {
+  margin-left: var(--space-1);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Configuration facts that only matter when something is wrong, folded away. */
+.mail-tech {
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.mail-tech > summary {
+  cursor: pointer;
+  min-height: var(--hit-min);
+}
+
+.mail-tech > .mail-config {
+  margin-top: var(--space-2);
 }
 
 /* ----------------------------------------------------------------- search -- */
@@ -191,6 +241,16 @@
   text-decoration: none;
 }
 
+/* What is the reader's own reads heavier; noise recedes. */
+.mail-row-head[data-class="urgent"] .mail-row-subject,
+.mail-row-head[data-class="action"] .mail-row-subject {
+  font-weight: var(--weight-medium);
+}
+
+.mail-row-head[data-class="noise"] .mail-row-subject {
+  color: var(--text-muted);
+}
+
 .mail-row-subject:hover {
   text-decoration: underline;
 }
@@ -243,7 +303,6 @@
   margin: var(--space-3) 0 0;
   color: var(--text-faint);
   font-size: var(--text-xs);
-  font-style: italic;
 }
 
 /* --------------------------------------------------------- configuration -- */
@@ -300,6 +359,11 @@
   color: var(--text-faint);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+}
+
+/* Sender and time under the heading: facts, not a panel. */
+.mail-detail-meta {
+  margin-bottom: var(--space-4);
 }
 
 /* A pruned body or a pruned-therefore-unrequeueable message — quiet, not the
@@ -380,6 +444,20 @@
   text-overflow: ellipsis;
 }
 
+/* Narrow window: the name takes the first line and the actions sit under it, rather than
+   the name being squeezed between three fixed tracks. */
+@media (max-width: 40rem) {
+  .mail-detail-attachment {
+    grid-template-columns: auto auto minmax(0, 1fr);
+  }
+
+  .mail-detail-attachment-name,
+  .mail-detail-attachment-meta {
+    grid-column: 1 / -1;
+    max-width: none;
+  }
+}
+
 .mail-detail-attachment > .mail-outcome,
 .mail-detail-attachment > .ui-error-note {
   grid-column: 1 / -1;
@@ -421,8 +499,7 @@
 }
 
 /* The search bar is a `Field` from `../ui`; the reply form still labels its own
-   three boxes, at the label rank — three stacked fields need the column of
-   uppercase words to scan down. */
+   message box, at the label rank. To and Subject are facts above it. */
 .mail-detail-reply-field {
   display: flex;
   flex-direction: column;
@@ -433,7 +510,6 @@
   color: var(--text-faint);
 }
 
-.mail-detail-reply-field input,
 .mail-detail-reply-field textarea {
   width: 100%;
   padding: var(--space-2);
@@ -452,15 +528,6 @@
   line-height: var(--leading-snug);
 }
 
-/* Fixed by the message being answered: drawn as the facts they are, with no
-   box, so the one box left on the form is the one that takes typing. */
-.mail-detail-reply-field input:read-only {
-  padding-inline: 0;
-  border-color: transparent;
-  background: none;
-}
-
-.mail-detail-reply-field input:focus-visible,
 .mail-detail-reply-field textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;

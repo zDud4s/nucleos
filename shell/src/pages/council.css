@@ -36,10 +36,6 @@
   color: var(--text-muted);
 }
 
-.council-loading {
-  color: var(--text-faint);
-}
-
 .council-note code {
   padding: 0 var(--space-1);
   border-radius: var(--radius-sm);
@@ -113,7 +109,28 @@
   white-space: nowrap;
 }
 
+/* A council deliberating is what a returning reader wants first, so the list is ordered ahead of the setup. */
+.council-index {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.council-index[data-running] .council-list-slot {
+  order: -1;
+}
+
 /* ================================================================= detail == */
+
+/* "Stopped early" is a deviation from the plan, so it is a chip and not faint prose. */
+.council-early {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--tone-awaiting-border);
+  border-radius: var(--radius-sm, 4px);
+  background: var(--tone-awaiting-bg);
+  color: var(--tone-awaiting-fg);
+  font-size: var(--text-xs);
+}
 
 .council-facts {
   display: flex;
@@ -709,7 +726,7 @@
 }
 
 .council-court-svg .council-court-small {
-  font-size: 8.5px;
+  font-size: 10px;
   fill: var(--text-faint);
   letter-spacing: var(--tracking-wide);
 }
@@ -721,7 +738,7 @@
 }
 
 .council-court-svg .council-court-balance-label {
-  font-size: 9.5px;
+  font-size: 10px;
   fill: var(--text-muted);
 }
 
@@ -874,7 +891,7 @@
 
 .council-court-svg .council-court-lectern-text {
   font-family: var(--font-display);
-  font-size: 9px;
+  font-size: 10px;
 }
 
 .council-court-svg .council-court-link {
@@ -929,7 +946,7 @@
 }
 
 .council-court-svg .council-court-seat-name {
-  font-size: 9px;
+  font-size: 10px;
   fill: var(--text);
 }
 
@@ -942,7 +959,7 @@
 
 /* A masked chair shows its letter, and its name only while it is pointed at. */
 .council-court-svg .council-court-reveal {
-  font-size: 8.5px;
+  font-size: 10px;
   display: none;
 }
 
@@ -955,12 +972,12 @@
 }
 
 .council-court-svg .council-court-role {
-  font-size: 8.5px;
+  font-size: 10px;
   fill: var(--tone-shadow-fg);
 }
 
 .council-court-svg .council-court-rank {
-  font-size: 8.5px;
+  font-size: 10px;
   fill: var(--text-muted);
 }
 
@@ -969,7 +986,7 @@
 }
 
 .council-court-svg .council-court-tick {
-  font-size: 9px;
+  font-size: 10px;
   fill: var(--text-muted);
 }
 

@@ -121,6 +121,32 @@ describe("Contacts — the roster", () => {
   });
 });
 
+describe("Contacts — finding people", () => {
+  it("narrows the roster by search text and by verdict filter", async () => {
+    const rows = [
+      correspondent({ address: "ana@example.com", contact_id: 1, display_name: "Ana", verdict: "pin" }),
+      correspondent({ address: "bob@example.com", contact_id: 3, display_name: "Bob" }),
+    ];
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/contacts") return rows;
+      if (path === "/contacts/merges") return [];
+      return undefined;
+    });
+
+    renderWithQuery(<Contacts />);
+    await screen.findByText("bob@example.com");
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search people" }), { target: { value: "bob" } });
+    expect(screen.queryByText("ana@example.com")).toBeNull();
+    expect(screen.getByText("bob@example.com")).toBeDefined();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search people" }), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Urgent" }));
+    expect(screen.queryByText("bob@example.com")).toBeNull();
+    expect(screen.getByText("ana@example.com")).toBeDefined();
+  });
+});
+
 /* ---------------------------------------------------- identity questions -- */
 
 describe("Contacts — identity questions", () => {
@@ -133,9 +159,9 @@ describe("Contacts — identity questions", () => {
 
     renderWithQuery(<Contacts />);
 
-    // The head is "A ↔ B" (display names, else the first address) and no longer carries the
-    // proposal number.
-    expect(await screen.findByText("Ana ↔ Ana Silva")).toBeDefined();
+    // The head names who stays and who is merged in (display names, else the first address)
+    // and no longer carries the proposal number.
+    expect(await screen.findByText("Ana (stays) + Ana Silva (merged in)")).toBeDefined();
     expect(screen.queryByText("question #21")).toBeNull();
   });
 

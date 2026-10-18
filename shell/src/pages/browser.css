@@ -59,6 +59,13 @@
   overflow-wrap: anywhere;
 }
 
+/* The record of what agents submitted is the evidence of unasked-for action, so it reads one step
+   up from the other meta lines. `.browser-files` below still wins for the danger tone. */
+.browser-write-meta {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 /**
  * An origin or a url, read character by character — the same posture Waiting
  * takes: a punycode host is only distinguishable from what it imitates if
@@ -260,6 +267,14 @@
   flex: none;
 }
 
+.browser-bar-project {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 .browser-bar-field {
   position: relative;
   display: flex;
@@ -337,7 +352,8 @@
    the four above that is a grid rather than a wrapping line. */
 .browser-row-head {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  column-gap: var(--space-3);
 }
 
 /**

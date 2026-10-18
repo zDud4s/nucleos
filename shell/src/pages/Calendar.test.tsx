@@ -337,7 +337,7 @@ describe("the page", () => {
     answering([]);
     const { container, router } = await page();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Next ›" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Next month" }));
 
     /*
       The selection follows, which is the defect this avoids: paging forward
@@ -445,7 +445,7 @@ describe("the page", () => {
     });
   });
 
-  it("says the núcleo did not answer rather than drawing an empty month", async () => {
+  it("says the background service could not be reached rather than drawing an empty month", async () => {
     daemon.apiFetch.mockImplementation(async (path: string) => {
       if (path.startsWith("/calendar/events")) throw new Error("connection refused");
       if (path === "/calendar/config") return CONFIG;
@@ -453,7 +453,7 @@ describe("the page", () => {
     });
     await page();
 
-    expect(await screen.findByText(/nothing is known about this month/)).toBeDefined();
+    expect(await screen.findByText(/nothing is known about this period/)).toBeDefined();
   });
 
   it("quotes a refusal on the events route instead of replacing it with generic copy", async () => {

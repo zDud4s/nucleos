@@ -291,13 +291,14 @@ function SessionRow({
             </Button>
             {nonce === undefined && (
               // The shell lost its nonce (restart, reload, a Telegram approval): the core re-issues one.
-              <ConfirmButton
-                label="Drive here"
-                confirmLabel="Take the wheel again and drive it here"
+              // Reversible, so a plain button: a hold is kept for what loses state (Give back, Close).
+              <Button
                 variant="approve"
                 disabled={takeWheel.isPending}
-                onConfirm={() => takeWheel.mutate(session.id, { onSuccess: () => onOpenView() })}
-              />
+                onClick={() => takeWheel.mutate(session.id, { onSuccess: () => onOpenView() })}
+              >
+                Drive here
+              </Button>
             )}
             <ConfirmButton
               label="Give back to the agent"
@@ -313,13 +314,9 @@ function SessionRow({
               disabled={returnPending}
               onConfirm={() => onReturn("close")}
             />
-            <ConfirmButton
-              label="Open real window"
-              confirmLabel="Swap to a real window here"
-              variant="ghost"
-              disabled={openRealWindow.isPending}
-              onConfirm={() => openRealWindow.mutate(session.id)}
-            />
+            <Button variant="ghost" disabled={openRealWindow.isPending} onClick={() => openRealWindow.mutate(session.id)}>
+              Open real window
+            </Button>
           </>
         )}
         {(session.mode === "agent" || session.mode === "wheel-requested") && (
@@ -376,6 +373,11 @@ function ChainDialogue({
   // that has to be chosen; a box that arrived ticked would make writing something granted by not
   // reading the screen.
   const [writable, setWritable] = useState(false);
+  const consequenceId = useId();
+  const origins = chain.length === 1 ? "origin" : "origins";
+  const grantLabel = writable
+    ? `Grant read on ${chain.length} ${origins}, and form submission on the site you ended on`
+    : `Grant read on ${chain.length} ${origins}`;
 
   return (
     <Panel title="Keep these?">
@@ -395,21 +397,24 @@ function ChainDialogue({
           type="checkbox"
           checked={writable}
           disabled={keepChain.isPending}
+          aria-describedby={consequenceId}
           onChange={(event) => setWritable(event.target.checked)}
         />
         <span>Let agents submit forms here, as you</span>
       </label>
-      <p className="browser-note">
-        The second half of the same question, and a narrower one. Keeping the chain lets an agent
-        READ these sites; this lets it press Send on a form it can see — a reply, a ticket, a saved
-        filter — on the site you just logged into, and never on the identity providers the login
-        passed through. It works without asking you again, so what you get instead is a record: every
-        submission is listed under Site grants, by the names of the fields and never their contents.
+      {/* The consequence sits right under the box that causes it, and says what the answer covers:
+          reading reaches every origin above, identity providers included. */}
+      <p className="browser-note" id={consequenceId}>
+        Agents will read all {chain.length} {origins} above, identity providers included.{" "}
+        {writable
+          ? "They may also submit forms on the site you ended on, never on the identity providers, without asking you again."
+          : "They will not submit any form."}{" "}
+        Every submission is listed under Site grants, by field names and never contents.
       </p>
       <div className="browser-actions">
         <ConfirmButton
           label="Keep them"
-          confirmLabel="Grant these origins"
+          confirmLabel={grantLabel}
           variant="approve"
           disabled={keepChain.isPending}
           onConfirm={() => keepChain.mutate({ sessionId, keep: true, writable }, { onSuccess: onSettled })}
@@ -496,24 +501,25 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
           open.mutate({ projectId, url: url.trim() === "" ? BLANK_PAGE : url.trim() });
         }}
       >
-        <select
-          aria-label="Project for the new window"
-          value={projectId ?? ""}
-          onChange={(event) => setChosen(event.target.value)}
-        >
-          {options.map((option) => (
-            <option key={option.project_id} value={option.project_id}>
-              {option.project_id}
-            </option>
-          ))}
-        </select>
+        {/* A visible label: the window opens on this project's profile, logins included, and the
+            first project is selected until somebody chooses, so the choice has to be readable. */}
+        <label className="browser-bar-project">
+          <span>Project</span>
+          <select value={projectId ?? ""} onChange={(event) => setChosen(event.target.value)}>
+            {options.map((option) => (
+              <option key={option.project_id} value={option.project_id}>
+                {option.project_id}
+              </option>
+            ))}
+          </select>
+        </label>
         <label className="browser-bar-field">
           <Globe aria-hidden="true" size={16} strokeWidth={1.75} />
           <input
             type="text"
             aria-label="Address to open"
             aria-describedby={hintId}
-            placeholder="Address to open — required with the agent, optional for a plain window"
+            placeholder="Address to open"
             autoComplete="off"
             spellCheck={false}
             value={url}
@@ -542,7 +548,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
           ? subsystem.status === "disabled"
             ? "The browser is not configured on this machine, so no window can open."
             : "The browser is not running, so no window can open until it restarts."
-          : "Open a window: a real window on the project's profile, driven by you; when you give it back, you choose which sites it keeps. Open with agent: the project's profile for a site you logged into there, a throwaway otherwise, with the agent's chat on the right — it drives until you take the wheel."}
+          : "Open a window: you drive, on the project's profile; the address is optional. Open with agent: the agent drives and you can take over; it needs an address."}
       </p>
       {unavailable && <SidecarTrouble health={health} />}
 
@@ -626,7 +632,14 @@ function SiteGrants() {
         className="browser-head-select"
         aria-label="Project whose grants are shown"
         value={projectId ?? ""}
-        onChange={(event) => setChosen(event.target.value)}
+        onChange={(event) => {
+          setChosen(event.target.value);
+          // Outcomes and errors belong to the project that produced them; left standing they read
+          // as if the newly chosen project had just been revoked or forgotten.
+          revoke.reset();
+          readonly.reset();
+          forget.reset();
+        }}
       >
         {options.map((project) => (
           <option key={project.project_id} value={project.project_id}>
@@ -672,12 +685,12 @@ function SiteGrants() {
             <MutationNote error={readonly.error} what="that grant could not be narrowed" />
           )}
 
-          <WriteRecord projectId={projectId} />
+          <WriteRecord projectId={projectId} anyWritable={rows.some((site) => site.writable)} />
 
           <div className="browser-forget">
             <ConfirmButton
               label="Forget this profile"
-              confirmLabel="Forget everything — every site, every session"
+              confirmLabel={`Forget ${projectId}: every site, every login, every session`}
               variant="danger"
               disabled={forget.isPending}
               onConfirm={() => forget.mutate(projectId)}
@@ -725,11 +738,11 @@ function SiteRow({
       </div>
       {site.granted_for !== null && <p className="browser-meta">brought in by {site.granted_for}</p>}
       <div className="browser-actions">
-        <ConfirmButton label="Revoke" confirmLabel="Revoke this origin" variant="danger" disabled={pending} onConfirm={onRevoke} />
+        <ConfirmButton label="Revoke" confirmLabel={`Revoke ${site.origin}`} variant="danger" disabled={pending} onConfirm={onRevoke} />
         {site.writable && (
           <ConfirmButton
-            label="Read-only"
-            confirmLabel="Stop agents submitting forms here"
+            label="Stop submitting"
+            confirmLabel={`Stop agents submitting forms on ${site.origin}`}
             variant="ghost"
             disabled={pending}
             onConfirm={onReadonly}
@@ -753,12 +766,21 @@ function SiteRow({
  * text, and the record deliberately cannot say what was typed — only that
  * something was.
  */
-function WriteRecord({ projectId }: { projectId: string }) {
+function WriteRecord({ projectId, anyWritable }: { projectId: string; anyWritable: boolean }) {
   const writes = useBrowserWrites(projectId);
   const rows = writes.data ?? [];
   // Nothing submitted is the usual state, and a heading between two rules to say so was the
   // heaviest thing in an empty panel. The record appears once there is something in it.
-  if (rows.length === 0 && !writes.isError) return null;
+  // With a site that may submit and nothing in the record, "nothing yet" is information, and its
+  // absence cannot be told from a record that did not load.
+  if (rows.length === 0 && !writes.isError) {
+    if (!anyWritable || writes.data === undefined) return null;
+    return (
+      <div className="browser-writes">
+        <Quiet says="nothing has been submitted yet." />
+      </div>
+    );
+  }
 
   return (
     // The rule above the heading is this page's; the heading and the rhythm
@@ -795,7 +817,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
         <Badge tone="info">{wrote.method}</Badge>
         <RelativeTime at={wrote.written_at} />
       </div>
-      <p className="browser-meta">
+      <p className="browser-meta browser-write-meta">
         {wrote.field_count} field{wrote.field_count === 1 ? "" : "s"}
         {shown !== "" && <>: {shown}</>}
         {more > 0 && <> and {more} more</>}
@@ -804,13 +826,13 @@ function WriteRow({ wrote }: { wrote: Written }) {
         // Its own line, and toned as a warning rather than as detail. "A comment was posted" and
         // "a document was posted" are not the same event, and a person scanning this list for
         // something they did not expect is looking for exactly this difference.
-        <p className="browser-meta browser-files">
+        <p className="browser-meta browser-write-meta browser-files">
           with {wrote.files.length === 1 ? "a file" : `${wrote.files.length} files`}:{" "}
           {wrote.files.join(", ")}
         </p>
       )}
       {wrote.verb !== "" && (
-        <p className="browser-meta">
+        <p className="browser-meta browser-write-meta">
           sent by a {wrote.verb}
           {wrote.element_ref !== "" && <> on {wrote.element_ref}</>}
         </p>

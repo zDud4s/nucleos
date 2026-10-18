@@ -173,7 +173,7 @@ describe("Voice — not armed", () => {
 
     await renderVoice();
 
-    expect(await screen.findByText("Voice is not armed")).toBeDefined();
+    expect(await screen.findByText("Voice needs a transcriber")).toBeDefined();
     expect(screen.queryByRole("button", { name: "Start dictation" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Start memo" })).toBeNull();
   });
@@ -327,7 +327,7 @@ describe("Voice — the spoken conversation", () => {
 
     await renderVoice();
 
-    expect(await screen.findByText("not armed — nothing here can transcribe a spoken turn")).toBeDefined();
+    expect(await screen.findByText("no transcriber is set up — spoken turns cannot be understood yet")).toBeDefined();
     expect(screen.queryByRole("button", { name: "Start talking" })).toBeNull();
   });
 
@@ -400,10 +400,16 @@ describe("Voice — the spoken conversation", () => {
 
     const { container } = await renderVoice();
 
-    await screen.findByRole("meter", { name: "microphone level" });
+    const meter = await screen.findByRole("meter", { name: "microphone level" });
+    // 0.9 is past the 0.85 bar: the fill changes tone to say a turn is open.
+    expect(meter.hasAttribute("data-open")).toBe(true);
     const orb = container.querySelector("canvas.voice-orb");
     expect(orb?.getAttribute("aria-hidden")).toBe("true");
     expect(orb?.hasAttribute("data-hearing")).toBe(true);
+    // The phase is a plain attribute too, so reduced motion can tell phases apart in CSS.
+    expect(orb?.getAttribute("data-phase")).toBe("hearing");
+    // A live conversation keeps the dock showing even when the archive is open on a narrow window.
+    expect(container.querySelector(".voice-room")?.hasAttribute("data-live")).toBe(true);
   });
 
   /* A segment dropped in silence looks exactly like a microphone that failed. Saying it was the
@@ -655,12 +661,12 @@ describe("Voice — the room", () => {
     expect(opener.getAttribute("aria-expanded")).toBe("false");
     expect(opener.getAttribute("aria-controls")).toBe("voice-archive");
     // Closed, the drawer is not on the page at all, so nothing in it can be tabbed to.
-    expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Voice archive" })).toBeNull();
     expect(container.querySelector("#voice-archive")).toBeNull();
 
     fireEvent.click(opener);
 
-    const drawer = await screen.findByRole("complementary", { name: "Voice archive" });
+    const drawer = await screen.findByRole("dialog", { name: "Voice archive" });
     expect(drawer.id).toBe("voice-archive");
     expect(opener.getAttribute("aria-expanded")).toBe("true");
     // Focus moves in, onto the way out.
@@ -679,20 +685,23 @@ describe("Voice — the room", () => {
     expect(within(drawer).queryByText("call the plumber")).toBeNull();
     expect(within(drawer).getByRole("tab", { name: /Configuration/ })).toBeDefined();
 
-    // Escape anywhere closes it and hands focus back to the button that opened it.
+    // Escape inside the drawer closes it and hands focus back to the button that opened it; one aimed
+    // at the window does not (it belongs to whatever else is on the page).
     fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull());
+    expect(screen.queryByRole("dialog", { name: "Voice archive" })).not.toBeNull();
+    fireEvent.keyDown(drawer, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Voice archive" })).toBeNull());
     expect(document.activeElement).toBe(opener);
     expect(opener.getAttribute("aria-expanded")).toBe("false");
 
     // And so does its own Close button, with the same hand-back.
     fireEvent.click(opener);
     fireEvent.click(
-      within(await screen.findByRole("complementary", { name: "Voice archive" })).getByRole("button", {
+      within(await screen.findByRole("dialog", { name: "Voice archive" })).getByRole("button", {
         name: "Close",
       }),
     );
-    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Voice archive" })).toBeNull());
     expect(document.activeElement).toBe(opener);
   });
 
@@ -704,11 +713,13 @@ describe("Voice — the room", () => {
     expect(room?.getAttribute("data-archive")).toBeNull();
 
     fireEvent.click(opener);
-    await screen.findByRole("complementary", { name: "Voice archive" });
+    const drawer = await screen.findByRole("dialog", { name: "Voice archive" });
     expect(room?.getAttribute("data-archive")).toBe("open");
+    // Idle, so the narrow layout may hide the dock; no `data-live` to keep it showing.
+    expect(room?.getAttribute("data-live")).toBeNull();
 
-    fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(screen.queryByRole("complementary", { name: "Voice archive" })).toBeNull());
+    fireEvent.keyDown(drawer, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Voice archive" })).toBeNull());
     expect(room?.getAttribute("data-archive")).toBeNull();
   });
 

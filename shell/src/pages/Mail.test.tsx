@@ -139,7 +139,7 @@ describe("Mail — the headline", () => {
 
     await renderMail();
 
-    expect(await screen.findByText("triage is not armed — mail arrives, nothing reads it")).toBeDefined();
+    expect(await screen.findByText("Triage is off. Mail arrives, but nothing sorts it.")).toBeDefined();
   });
 
   it("leads with the reader's own share of the queue, not the daemon's backlog", async () => {
@@ -177,7 +177,7 @@ describe("Mail — the headline", () => {
     // The same rows, now known to be old: the sentence must stop claiming they are the present.
     await queryClient.refetchQueries({ queryKey: keys.mail.all });
     await waitFor(() => {
-      expect(screen.getByText("last known: 1 in the queue; nothing needs you")).toBeDefined();
+      expect(screen.getByText("Last known: 1 in the queue; nothing needs you")).toBeDefined();
     });
   });
 });
@@ -233,10 +233,47 @@ describe("Mail — a triage refusal", () => {
     // `reason` — never an `ApiRefusal`, so it must never land inside the
     // error or refusal chrome.
     const note = await screen.findByText("the email pillar is not armed");
-    expect(note.getAttribute("role")).toBe("status");
+    // The note sits in the page's persistent live region rather than carrying the role itself.
+    expect(note.closest('[role="status"]')).not.toBeNull();
     expect(note.closest(".ui-note-error")).toBeNull();
     expect(note.closest(".ui-note-refusal")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+/* ----------------------------------------------- the action and the filter -- */
+
+describe("Mail — the triage button and the class filter", () => {
+  it("keeps the triage button in the Queue heading, above the list", async () => {
+    daemon.apiFetch.mockImplementation(mailFetch(mailWorld({ queue: [queuedEmail({ id: 1 })] })));
+
+    await renderMail();
+
+    const button = await screen.findByRole("button", { name: "Run triage now" });
+    expect(button.closest("section")?.querySelector("h2")?.textContent).toBe("Queue");
+    expect(screen.queryByRole("heading", { level: 2, name: "Triage" })).toBeNull();
+  });
+
+  it("narrows the queue to the reader's own mail and counts each segment", async () => {
+    const world = mailWorld({
+      queue: [
+        queuedEmail({ id: 1, subject: "server down", triage_class: "urgent" }),
+        queuedEmail({ id: 2, subject: "newsletter", triage_class: "noise" }),
+        queuedEmail({ id: 3, subject: "who knows", triage_class: null }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(mailFetch(world));
+
+    await renderMail();
+
+    const forYou = await screen.findByRole("button", { name: /For you/ });
+    expect(forYou.textContent).toContain("1");
+    fireEvent.click(forYou);
+
+    expect(forYou.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByText("server down")).toBeDefined();
+    expect(screen.queryByText("newsletter")).toBeNull();
+    expect(screen.queryByText("who knows")).toBeNull();
   });
 });
 
@@ -351,7 +388,7 @@ describe("Mail search field", () => {
     expect(field).not.toBeNull();
     const label = field?.querySelector("label");
     expect(label?.className).toContain("ui-field-label");
-    expect(label?.textContent).toBe("Search");
+    expect(label?.textContent).toBe("Search sender, subject or summary");
     expect(label?.htmlFor).toBe(input.id);
     fireEvent.change(input, { target: { value: "invoice" } });
     fireEvent.submit(screen.getByRole("search", { name: "Search the mail queue" }));

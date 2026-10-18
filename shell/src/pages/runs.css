@@ -116,6 +116,17 @@
   cursor: pointer;
 }
 
+/* `real` is the one mode that acts on files with nothing isolating it, so it
+   wears Held Ember's whole triple beside its name, as a tag and not a colour. */
+.runs-mode-tag {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--tone-paused-border);
+  border-radius: var(--radius-md);
+  background: var(--tone-paused-bg);
+  color: var(--tone-paused-fg);
+  font-size: var(--text-xs);
+}
+
 .runs-mode-says {
   grid-column: 2;
   max-width: var(--measure-prose);
@@ -382,6 +393,30 @@
   text-decoration: underline;
 }
 
+/* The whole row opens the run, not only its excerpt: the link's ::after covers
+   the row, and the things inside a row that are their own targets (the chat it
+   came from, the turns toggle and the expanded turns) sit above it. */
+.runs-row {
+  position: relative;
+}
+
+.runs-row-name::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.runs-row-origin,
+.runs-row-turns,
+.runs-turns {
+  position: relative;
+  z-index: 1;
+}
+
+.runs-row:hover {
+  background: color-mix(in srgb, var(--text) 4%, var(--surface));
+}
+
 /* One metadata line under the name, on fixed columns so id, mode, project, time
    and cost line up down the list instead of moving with every excerpt. */
 .runs-row-meta {
@@ -564,6 +599,26 @@
   margin: var(--space-3) 0 0;
   font-size: var(--text-sm);
   color: var(--text-muted);
+}
+
+/* The run's exit code and where it went next, one strip under the pipeline: the
+   facts a verification read arrives for, at reading size and not muted. */
+.runs-outcome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.runs-outcome-exit {
+  font-family: var(--font-mono);
+}
+
+.runs-jump {
+  margin: var(--space-2) 0 0;
 }
 
 .runs-gate-line {

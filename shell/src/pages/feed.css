@@ -254,19 +254,11 @@
 
 /* ---------------------------------------------------------------- states -- */
 
-/**
- * The feed while it is still being read.
- *
- * A wait, and deliberately not `Quiet`. An absence and a wait are two different
- * facts, and a wait wearing the vocabulary of an empty section claims the
- * núcleo has done nothing when in truth it has not answered yet.
+/*
+ * The feed while it is still being read is `ui/Skeleton`: a wait, deliberately not `Quiet`.
+ * An absence and a wait are two different facts, and a wait wearing the vocabulary of an empty
+ * section claims the núcleo has done nothing when in truth it has not answered yet.
  */
-.feed-loading {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: var(--text-sm);
-  font-style: italic;
-}
 
 /* More lines than the route will send. Said in words, above the trace it limits. */
 .feed-truncated {
@@ -1228,6 +1220,29 @@
 
 .feed-link:hover {
   text-decoration: underline;
+}
+
+/*
+ * The two links that ARE the notification's answer — "Review in Autopilot", "Open Mail". Not
+ * metadata: body size, medium weight, an underline at rest and a target that meets --hit-min.
+ */
+.feed-link-action {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--hit-min);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* "Marked 14 lines seen. Undo" — beside the button it replaces, for a few seconds. */
+.feed-undo {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 .feed-link-run {

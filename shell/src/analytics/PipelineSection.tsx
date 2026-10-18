@@ -3,7 +3,7 @@ import { isApiRefusal } from "../data/client";
 import type { AnalyticsDays } from "../data/analytics";
 import { isBlockError, usePipelineAnalytics } from "../data/analytics-pipeline";
 import { ErrorNote, StaleNote } from "../ui";
-import { Card, MetricCard } from "./sections";
+import { Card, MetricCard, unreachable } from "./sections";
 import { pendingMetrics, pipelineMetrics, type PipelineKey } from "./pipeline/cards";
 import { pipelinePanel } from "./pipeline/panels";
 import "./analytics.css";
@@ -21,9 +21,11 @@ import "./analytics.css";
 export interface PipelineSectionProps {
   projectId?: string;
   days: AnalyticsDays;
+  /** The section's id, for the page's section links. */
+  anchor?: string;
 }
 
-export function PipelineSection({ projectId, days }: PipelineSectionProps) {
+export function PipelineSection({ projectId, days, anchor }: PipelineSectionProps) {
   const report = usePipelineAnalytics(projectId, days);
   const [picked, setPicked] = useState<PipelineKey | undefined>(undefined);
   const headingId = `an-pipeline-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
@@ -39,12 +41,12 @@ export function PipelineSection({ projectId, days }: PipelineSectionProps) {
   const cards = data === undefined ? pendingMetrics() : pipelineMetrics(data);
 
   return (
-    <section className="an-pipeline" aria-labelledby={headingId}>
+    <section id={anchor} className="an-pipeline" aria-labelledby={headingId}>
       <h2 id={headingId} className="an-pipeline-title">
         Pipeline
       </h2>
       {data === undefined && report.isError ? (
-        <ErrorNote>The núcleo did not answer for the pipeline.</ErrorNote>
+        <ErrorNote onRetry={() => void report.refetch()}>{unreachable("the pipeline")}</ErrorNote>
       ) : (
         <>
           {report.isError ? <StaleNote dataUpdatedAt={report.dataUpdatedAt} /> : null}

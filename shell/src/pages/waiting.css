@@ -69,58 +69,20 @@
   color: var(--text-muted);
 }
 
-.waiting-quiet-name {
-  position: relative;
+/**
+ * Each name is a `Tip`: it opens on hover, on keyboard focus and on a press (touch), and Escape
+ * closes it. The dotted underline is the web's usual sign for "there is more on this word".
+ */
+.waiting-quiet-name .ui-tip-text {
   text-decoration: underline dotted;
   text-underline-offset: 3px;
-  cursor: help;
-}
-
-.waiting-quiet-name:focus-visible {
-  outline: none;
-  color: var(--text);
-}
-
-/**
- * The reasoning behind a name, drawn under it on hover and on focus. Hidden with `visibility`
- * rather than `display` so it stays in the accessibility tree as the name's description.
- */
-.waiting-quiet-tip {
-  position: absolute;
-  top: calc(100% + var(--space-2));
-  left: 0;
-  z-index: 20;
-  width: max-content;
-  max-width: min(24rem, 80vw);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  background: var(--surface);
-  box-shadow: 0 6px 20px rgb(0 0 0 / 0.25);
+}
+
+.waiting-quiet-name .ui-tip-text:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
   color: var(--text);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-  text-decoration: none;
-  white-space: normal;
-  cursor: auto;
-  visibility: hidden;
-  opacity: 0;
-  transition: opacity 120ms ease, visibility 0s linear 120ms;
-}
-
-.waiting-quiet-name:hover > .waiting-quiet-tip,
-.waiting-quiet-name:focus-visible > .waiting-quiet-tip {
-  visibility: visible;
-  opacity: 1;
-  transition: opacity 120ms ease;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .waiting-quiet-tip,
-  .waiting-quiet-name:hover > .waiting-quiet-tip,
-  .waiting-quiet-name:focus-visible > .waiting-quiet-tip {
-    transition: none;
-  }
 }
 
 /* =================================================================== lists == */
@@ -244,6 +206,19 @@
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-muted);
+}
+
+/* A warning that changes what a button does ("approving resumes nothing"): the awaiting tone of
+   the system, not the muted help-line a hint gets. Its first word is a fact, so colour is not
+   the only signal. */
+.waiting-notice {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--tone-awaiting-border);
+  border-radius: var(--radius-sm);
+  background: var(--tone-awaiting-bg);
+  color: var(--tone-awaiting-fg);
+  font-size: var(--text-sm);
 }
 
 /* The line that asks the reader to act, against the ones that say somebody else is acting. */
@@ -803,6 +778,22 @@
    specificity. */
 .waiting-recruit-input-careful {
   border-color: var(--border-strong);
+}
+
+/* The caution for the engine and tool policy fields, always drawn under them. It turns into the
+   awaiting tone, with its sentence, once either field differs from what was proposed. */
+.waiting-recruit-careful {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.waiting-recruit-careful-changed {
+  color: var(--tone-awaiting-fg);
+}
+
+.waiting-recruit-changed {
+  margin-bottom: var(--space-3);
 }
 
 /* ==================================================================== rows == */

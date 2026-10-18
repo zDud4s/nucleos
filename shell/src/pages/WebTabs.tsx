@@ -1,5 +1,6 @@
 import { Navigate, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui";
+import { useBrowserSessions } from "../data/browser";
+import { Count, Tabs, TabsContent, TabsList, TabsTrigger } from "../ui";
 import { Browser, SessionsHeader } from "./Browser";
 import { Web, WebHeader } from "./Web";
 
@@ -16,6 +17,11 @@ import { Web, WebHeader } from "./Web";
  * (owner, 2026-10-08): what somebody opens Web for is a browser. /web/sessions was the
  * Sessions tab's own address until then and now forwards to /web, as /browser does.
  *
+ * The Sessions panel stays mounted (hidden) while the Archive is open: its "keep these?" question
+ * is held in local state and outranks everything, because the window it asks about has already
+ * closed, so switching tabs must not throw it away. A session asking for the wheel is counted on
+ * its tab, and the sidecar's badge shows in both headers, so neither is invisible from Archive.
+ *
  * Only the header swaps per tab; the tab list and panels sit in one stable tree, because a
  * list that was remounted on every switch dropped keyboard focus from the tab just selected.
  */
@@ -27,15 +33,24 @@ export function WebTabs() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navigate = useNavigate();
   const tab = webTabOf(pathname);
+  const asking = (useBrowserSessions().data ?? []).filter((row) => row.mode === "wheel-requested").length;
 
   return (
     <Tabs className="web-tabs" value={tab} onValueChange={(next) => void navigate({ to: next === "sessions" ? "/web" : "/web/archive" })}>
       {tab === "archive" ? <WebHeader /> : <SessionsHeader />}
       <TabsList aria-label="Web views">
-        <TabsTrigger value="sessions">Sessions</TabsTrigger>
+        <TabsTrigger value="sessions">
+          Sessions
+          {asking > 0 && (
+            <>
+              {" "}
+              <Count n={asking} noun="asking" />
+            </>
+          )}
+        </TabsTrigger>
         <TabsTrigger value="archive">Archive</TabsTrigger>
       </TabsList>
-      <TabsContent value="sessions">
+      <TabsContent value="sessions" forceMount hidden={tab !== "sessions"}>
         <Browser embedded />
       </TabsContent>
       <TabsContent value="archive">

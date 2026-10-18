@@ -31,6 +31,7 @@ vi.mock("../brain/ForceGraph", () => ({
 }));
 
 beforeEach(() => {
+  window.sessionStorage.clear();
   daemon.apiFetch.mockReset();
 });
 
@@ -200,5 +201,36 @@ describe("Brain", () => {
     expect(await screen.findByRole("list", { name: "Graph nodes" })).toBeTruthy();
     expect(await screen.findByText(/knowledge did not answer/i)).toBeTruthy();
     expect(screen.queryByText(/the graph is not known/)).toBeNull();
+  });
+  it("Escape typed in a field does not close the open item; elsewhere it does", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith());
+    await renderWithRouter(<Brain />, { initialPath: "/brain?item=note:1" });
+    await screen.findByRole("complementary", { name: "Selected" });
+
+    const box = screen.getByRole("textbox", { name: "Capture a note" });
+    box.focus();
+    fireEvent.keyDown(box, { key: "Escape" });
+    expect(screen.getByRole("complementary", { name: "Selected" })).toBeTruthy();
+
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(await screen.findByRole("complementary", { name: "For you" })).toBeTruthy();
+  });
+
+  it("a failed lessons read shows a dash and a Retry, never an empty queue", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith({ knowledge: new Error("down") }));
+    await renderWithRouter(<Brain />, { initialPath: "/brain" });
+
+    const aside = await screen.findByRole("complementary", { name: "For you" });
+    expect(await within(aside).findByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(within(aside).queryByText("Nothing open")).toBeNull();
+    expect(screen.getAllByTitle(/could not be read/i)[0]!.textContent).toContain("—");
+  });
+
+  it("saving a note announces it", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith({ listed: [note()] }));
+    await renderWithRouter(<Brain />, { initialPath: "/brain" });
+    fireEvent.change(await screen.findByRole("textbox", { name: "Capture a note" }), { target: { value: "x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("Note saved")).toBeTruthy();
   });
 });

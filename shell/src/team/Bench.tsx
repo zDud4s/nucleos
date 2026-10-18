@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useNavigate, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import {
   TEAM_RUN_LIST_LIMIT,
@@ -14,6 +14,7 @@ import {
   type TeamView,
 } from "../data/teams";
 import {
+  Button,
   ConfirmButton,
   Count,
   Crumb,
@@ -21,6 +22,7 @@ import {
   Panel,
   Quiet,
   RefusalNote,
+  Skeleton,
   Tabs,
   TabsContent,
   TabsList,
@@ -60,8 +62,22 @@ import "../pages/teams.css";
 export function Bench() {
   const params = useParams({ strict: false }) as { teamId?: string };
   const teamId = params.teamId ?? "";
+  // The tab lives in the address (`?tab=`), so a reload or Back keeps it and "decisions waiting"
+  // can be linked. A value this page does not know falls back to Work.
+  const search = useSearch({ strict: false }) as Record<string, unknown>;
+  const tab = benchTab(search.tab);
+  const navigate = useNavigate();
   // Controlled so that a tab can send the reader to another one (Roster -> Charter).
-  const [tab, setTab] = useState("work");
+  const setTab = (next: string) =>
+    void navigate({
+      to: "/teams/$teamId",
+      params: { teamId },
+      search: ((prev: Record<string, unknown>) => ({
+        ...prev,
+        tab: next === "work" ? undefined : next,
+      })) as never,
+      replace: true,
+    });
 
   const team = useTeam(teamId);
   const runs = useTeamRuns();
@@ -73,6 +89,9 @@ export function Bench() {
   const teamRuns = allRuns.filter((run) => run.team_id === teamId);
   const teamTriggers = (triggers.data ?? []).filter((rule) => rule.team_id === teamId);
   const waiting = waitingFor(teamId, actions.data ?? [], allRuns);
+  // Until the task and decision reads have answered, "idle" would be a guess shown as a fact.
+  const unknown = runs.data === undefined || actions.data === undefined;
+  const readFailed = runs.isError || actions.isError || triggers.isError;
 
   if (detail === undefined) {
     return (
@@ -80,9 +99,9 @@ export function Bench() {
         <Crumb to="/teams">Teams</Crumb>
         <Panel title="Team">
           {team.isError ? (
-            <BenchError error={team.error} />
+            <BenchError error={team.error} onRetry={() => void team.refetch()} />
           ) : (
-            <Quiet says="reading the team…" />
+            <Skeleton label="Loading the team" lines={3} />
           )}
         </Panel>
       </>
@@ -94,10 +113,27 @@ export function Bench() {
   return (
     <>
       <Crumb to="/teams">Teams</Crumb>
-      <BenchHead team={detail} live={live.length} waiting={waiting} />
+      <BenchHead
+        team={detail}
+        live={live.length}
+        waiting={waiting}
+        unknown={unknown}
+        onReview={() => setTab("decisions")}
+      />
+      {readFailed && (
+        <ErrorNote
+          onRetry={() => {
+            void runs.refetch();
+            void actions.refetch();
+            void triggers.refetch();
+          }}
+        >
+          Could not read this team's tasks, decisions or routines, so the numbers here may be incomplete.
+        </ErrorNote>
+      )}
 
       <Tabs value={tab} onValueChange={setTab} className="teams-bench-tabs">
-        <TabsList aria-label={`${detail.name} — what to do about it`}>
+        <TabsList aria-label="Team sections">
           <TabsTrigger value="work">Work</TabsTrigger>
           <TabsTrigger value="decisions">
             Decisions
@@ -140,60 +176,119 @@ export function Bench() {
           <Charter team={detail} runs={teamRuns} />
         </TabsContent>
       </Tabs>
+
+      <DeleteTeam team={detail} live={live.length} />
     </>
   );
+}
+
+const BENCH_TABS: readonly string[] = ["work", "decisions", "roster", "routines", "charter"];
+
+function benchTab(raw: unknown): string {
+  return typeof raw === "string" && BENCH_TABS.includes(raw) ? raw : "work";
 }
 
 /**
  * The team's identity and its standing, above the tabs.
  *
- * Deleting lives here rather than in the Charter: the Charter is about what
- * this team IS, and removing it is not an edit of that — it is the end of
- * it. `ConfirmButton` because it is a destructive write, which is the standing
- * rule for the interlock.
+ * Deleting used to sit here at the title's weight. It is the end of the team, not part of its
+ * identity, so it now lives at the foot of the page ({@link DeleteTeam}).
  */
-function BenchHead({ team, live, waiting }: { team: TeamView; live: number; waiting: number }) {
-  const del = useDeleteTeam();
-  const navigate = useNavigate();
-
+function BenchHead({
+  team,
+  live,
+  waiting,
+  unknown,
+  onReview,
+}: {
+  team: TeamView;
+  live: number;
+  waiting: number;
+  unknown: boolean;
+  onReview: () => void;
+}) {
   return (
     <header className="teams-bench-head">
       <div className="teams-bench-title">
         <h1 className="teams-bench-name">{team.name}</h1>
         {/* "waiting on you" belongs to Waiting's decision count; this is open team action. */}
-        <StateBadge domain="department" state={live > 0 ? "working" : waiting > 0 ? "waiting" : "idle"} />
+        {unknown ? (
+          <StateBadge domain="department" state="unknown" />
+        ) : (
+          <StateBadge domain="department" state={live > 0 ? "working" : waiting > 0 ? "waiting" : "idle"} />
+        )}
+        {waiting > 0 && (
+          <Button type="button" onClick={onReview}>
+            {waiting === 1 ? "Up to 1 decision is waiting" : `Up to ${waiting} decisions are waiting`} — review
+          </Button>
+        )}
       </div>
-      <p className="teams-bench-remit">{team.mission}</p>
-      <div className="teams-bench-aside">
-        <ConfirmButton
-          label="Delete team"
-          confirmLabel="Delete it now"
-          variant="danger"
-          intent="stop"
-          disabled={del.isPending}
-          onConfirm={() => del.mutate(team.id, { onSuccess: () => void navigate({ to: "/teams" }) })}
-        />
-      </div>
-      {del.isError && <DeleteRefusal error={del.error} />}
+      {team.mission.trim() === "" ? (
+        <Quiet says="No description yet — the Charter tab holds the mission." />
+      ) : (
+        <p className="teams-bench-remit">{team.mission}</p>
+      )}
     </header>
   );
 }
 
-function BenchError({ error }: { error: unknown }) {
+/**
+ * Removing the team, kept away from the title and said in terms of what happens. Unavailable
+ * while tasks are running: the hold would otherwise end work in progress on one gesture.
+ */
+function DeleteTeam({ team, live }: { team: TeamView; live: number }) {
+  const del = useDeleteTeam();
+  const navigate = useNavigate();
+  const noteId = `bench-delete-${team.id}`;
+  const them = live === 1 ? "it" : "them";
+
+  return (
+    <section className="teams-bench-danger" aria-label="Delete this team">
+      <p id={noteId} className="teams-bench-danger-note">
+        {live > 0
+          ? `${live === 1 ? "1 task is" : `${live} tasks are`} still running. Let ${them} finish, or cancel ${them}, before deleting this team.`
+          : "Deleting this team removes it for good. This cannot be undone."}
+      </p>
+      <ConfirmButton
+        label="Delete team"
+        confirmLabel="Delete it now"
+        subject={team.name}
+        variant="danger"
+        intent="stop"
+        disabled={del.isPending}
+        unavailable={live > 0}
+        describedBy={noteId}
+        onConfirm={() => del.mutate(team.id, { onSuccess: () => void navigate({ to: "/teams" }) })}
+      />
+      {del.isError && <DeleteRefusal error={del.error} />}
+    </section>
+  );
+}
+
+function BenchError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) {
     return (
-      <RefusalNote
-        refusal={error}
-        sentences={{ not_found: "there is no team with that id", ...daemonProse(error) }}
-      />
+      <>
+        <RefusalNote
+          refusal={error}
+          sentences={{ not_found: "There is no team with that id.", ...daemonProse(error) }}
+        />
+        <p>
+          <Link to="/teams">Back to teams</Link>
+        </p>
+      </>
     );
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this team</ErrorNote>;
+  return (
+    <ErrorNote onRetry={onRetry}>
+      The {DAEMON_NAME} is not responding, so nothing is known about this team.
+    </ErrorNote>
+  );
 }
 
 function DeleteRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this team was not deleted</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding, so this team was not deleted.</ErrorNote>;
 }
 
 /**

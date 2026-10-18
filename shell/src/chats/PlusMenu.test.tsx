@@ -59,32 +59,26 @@ async function open() {
 }
 
 describe("PlusMenu", () => {
-  it("offers upload, add context and browse the web", async () => {
-    renderMenu("c-1");
+  it("offers only what goes into this message: upload and mention a file", async () => {
+    const onMention = vi.fn();
+    renderMenu("c-1", { onMention });
     await open();
 
     expect(await screen.findByRole("menuitem", { name: /Upload from computer/ })).toBeDefined();
-    expect(await screen.findByRole("menuitem", { name: /Add context/ })).toBeDefined();
-    const web = await screen.findByRole("menuitemcheckbox", { name: /Browse the web/ });
-    // Nothing denied yet, so the web is on.
-    expect(web.getAttribute("aria-checked")).toBe("true");
-
-    fireEvent.click(web);
-    await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
-        method: "PATCH",
-        body: JSON.stringify({ denied_tools: ["WebSearch", "WebFetch"] }),
-      });
-    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Mention a file/ }));
+    expect(onMention).toHaveBeenCalled();
+    // Folders and the web are the "⋯" menu's alone.
+    expect(screen.queryByRole("menuitem", { name: /Add context/ })).toBeNull();
+    expect(screen.queryByRole("menuitemcheckbox", { name: /Browse the web/ })).toBeNull();
   });
 
-  it("disables context and the web with no conversation, and says why", async () => {
+  it("disables mentioning with no conversation, and says why", async () => {
     renderMenu(null);
     await open();
 
-    const web = await screen.findByRole("menuitemcheckbox", { name: /Browse the web/ });
-    expect(web.getAttribute("aria-disabled")).toBe("true");
-    expect((await screen.findAllByText(/open a conversation first/)).length).toBe(2);
+    const mention = await screen.findByRole("menuitem", { name: /Mention a file/ });
+    expect(mention.getAttribute("aria-disabled")).toBe("true");
+    expect((await screen.findAllByText(/open a conversation first/)).length).toBe(1);
     expect(
       (await screen.findByRole("menuitem", { name: /Upload from computer/ })).getAttribute(
         "aria-disabled",

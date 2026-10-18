@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { File as FileIcon, Folder as FolderIcon } from "lucide-react";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import {
@@ -98,28 +99,28 @@ import "./files.css";
 
 /** `GET /files` — a 409 here means the path named a file, not a folder. */
 const LIST_SENTENCES: Record<string, string> = {
-  bad_request: "that path leaves the files root, which the núcleo will not follow",
+  bad_request: `that path leaves the files root, which the ${DAEMON_NAME} will not follow`,
   not_found: "there is nothing at that path",
   conflict: "that path names a file, not a folder — there is nothing to list inside it",
-  internal: "the núcleo could not read that folder from disk",
+  internal: `the ${DAEMON_NAME} could not read that folder from disk`,
 };
 
 const SEARCH_SENTENCES: Record<string, string> = {
-  bad_request: "that path leaves the files root, which the núcleo will not follow",
-  internal: "the núcleo could not search that folder",
+  bad_request: `that path leaves the files root, which the ${DAEMON_NAME} will not follow`,
+  internal: `the ${DAEMON_NAME} could not search that folder`,
 };
 
 /** `POST /files/folder` — the only refusal it can give beyond 503 is 400. */
 const CREATE_FOLDER_SENTENCES: Record<string, string> = {
   bad_request:
-    "that path leaves the files root, is unsafe, or names the root itself — none of which the núcleo will create",
+    `that path leaves the files root, is unsafe, or names the root itself — none of which the ${DAEMON_NAME} will create`,
 };
 
 const UPLOAD_SENTENCES: Record<string, string> = {
-  bad_request: "that folder leaves the files root, which the núcleo will not follow",
+  bad_request: `that folder leaves the files root, which the ${DAEMON_NAME} will not follow`,
   conflict: "that folder is not actually a folder — there is a file there instead",
   http_413: `that file is larger than the ${String(MAX_UPLOAD_BYTES / (1024 * 1024))} MB the daemon will accept in one upload`,
-  internal: "the núcleo could not write that file to disk",
+  internal: `the ${DAEMON_NAME} could not write that file to disk`,
 };
 
 /** `POST /files/move` — the 409 a person meets most often on this page. */
@@ -128,13 +129,13 @@ const MOVE_SENTENCES: Record<string, string> = {
     "that move leaves the files root, is unsafe, targets the root itself, or moves a folder into itself",
   not_found: "the folder the destination would live in does not exist — a typo is never turned into a new folder",
   conflict: "there is already something there — a move never overwrites",
-  internal: "the núcleo could not make that move on disk",
+  internal: `the ${DAEMON_NAME} could not make that move on disk`,
 };
 
 const DELETE_SENTENCES: Record<string, string> = {
   bad_request: "the files root itself cannot be deleted",
   conflict: "that folder has something in it — deleting it too means deleting everything inside",
-  internal: "the núcleo could not move that to the trash, so it is still where it was",
+  internal: `the ${DAEMON_NAME} could not move that to the trash, so it is still where it was`,
 };
 
 /** `POST /files/restore` — held to the move rule, so its 409 and 404 read like the move's. */
@@ -142,12 +143,12 @@ const RESTORE_SENTENCES: Record<string, string> = {
   bad_request: "that is not something the trash holds",
   not_found: "the folder it came from is gone — a restore never makes one up; recreate it, then restore",
   conflict: "something else now sits where it came from — a restore never overwrites; move that aside first",
-  internal: "the núcleo could not move it back out of the trash",
+  internal: `the ${DAEMON_NAME} could not move it back out of the trash`,
 };
 
 /** `GET /files/trash` — the one refusal it can give beyond 503. */
 const TRASH_SENTENCES: Record<string, string> = {
-  internal: "the núcleo could not read its trash folder",
+  internal: `the ${DAEMON_NAME} could not read its trash folder`,
 };
 
 const DOWNLOAD_SENTENCES: Record<string, string> = {
@@ -172,7 +173,7 @@ function RefusalOrError({
   const clock = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   return (
     <ErrorNote>
-      the núcleo did not answer at {clock}
+      The {DAEMON_NAME} could not be reached at {clock}
       {said} — {what}
     </ErrorNote>
   );
@@ -1154,7 +1155,7 @@ export function Files() {
         >
           {dragActive && (
             <div className="fi-drop-overlay" role="status">
-              drop to upload into {path === "" ? "the files root" : path}
+              Drop to upload into {path === "" ? "the files root" : path}
             </div>
           )}
 
@@ -1237,6 +1238,7 @@ export function Files() {
                         removes. One click, however many are picked: a delete lands
                         in the trash with an undo beside it, which is the protection
                         a second click was standing in for. */}
+                    <div className="fi-sel-actions">
                     <Button
                       variant="ghost"
                       disabled={selectedEntries.length === 0}
@@ -1254,6 +1256,7 @@ export function Files() {
                     <Button variant="quiet" onClick={() => setSelected(new Set())}>
                       Clear selection
                     </Button>
+                    </div>
                     {/* The undo, kept within reach while something is picked: the
                         selection took the whole slot, and the only way back left
                         was a Ctrl+Z nothing on screen mentioned. */}
@@ -1435,7 +1438,7 @@ export function Files() {
             {/* Under the rows, as their footnote: over them it was one more line
                 between the rule and the first file. */}
             {!searching && !hintRetired && (
-              <p className="fi-hint">Double-click a file to open it in Windows · drop files here to upload</p>
+              <p className="fi-hint">Double-click a file to open it in Windows · drop files here to upload · Ctrl- or Shift-click to select several</p>
             )}
           </div>
         </div>
@@ -1448,8 +1451,8 @@ export function Files() {
           aria-hidden="true"
           style={{ transform: ghostTransform(ghostAt.current.x, ghostAt.current.y) }}
         >
-          move {drag.label}
-          {drag.over !== null && ` to ${drag.over === "" ? "files/" : `files/${drag.over}/`}`}
+          Move {drag.label}
+          {drag.over !== null && ` to ${drag.over === "" ? "Files" : drag.over}`}
         </div>
       )}
 
@@ -1627,16 +1630,31 @@ function pageHeadline(rootUnavailable: boolean, entries: Entry[] | undefined, fa
  * to check, and leaves the route count and the pillar vocabulary to the code.
  */
 function FilesUnavailableTeach() {
+  const path = "%LOCALAPPDATA%\\nucleos\\NucleOS\\data\\files";
+  const [copied, setCopied] = useState(false);
   return (
     <Teach title="The files folder could not be opened">
       <p>
-        The núcleo keeps one folder for everything this page holds — your uploads, drops from Windows, filed
-        mail and team workspaces. When it started, it could not create or open that folder, so every action
-        here is refused rather than pointed at somewhere else.
+        Check that <code>{path}</code> exists and can be written to, then restart NucleOS. Until then every
+        action on this page is refused rather than pointed at somewhere else.
       </p>
       <p>
-        The folder belongs at <code>%LOCALAPPDATA%\nucleos\NucleOS\data\files</code>. Check that the path
-        exists and can be written to, then restart the núcleo — its log names the error it hit.
+        <Button
+          variant="quiet"
+          onClick={() => {
+            void navigator.clipboard?.writeText(path).then(
+              () => setCopied(true),
+              () => setCopied(false),
+            );
+          }}
+        >
+          {copied ? "Path copied" : "Copy path"}
+        </Button>
+      </p>
+      <p>
+        The {DAEMON_NAME} keeps one folder for everything this page holds — your uploads, drops from Windows,
+        filed mail and team workspaces. It could not create or open that folder when it started; its log names
+        the error it hit.
       </p>
     </Teach>
   );
@@ -1653,7 +1671,7 @@ function FolderTree({
   dropTargets = false,
 }: {
   currentPath: string;
-  onSelect: (path: string) => void;
+  onSelect: (path: string, byKey: boolean) => void;
   /** Whether a dragged row can be let go on its folders — the side tree's, not the move form's copy. */
   dropTargets?: boolean;
   /** The landmark's name — the side column's tree, or the one the move form picks from. */
@@ -1678,7 +1696,7 @@ function FolderTree({
         <div role="tree" aria-label={label} onKeyDown={handleTreeKey}>
           <TreeNode
             path=""
-            label="files"
+            label="Files"
             currentPath={currentPath}
             marked={marked}
             herePath={herePath}
@@ -1699,6 +1717,11 @@ function FolderTree({
  * Space go to the folder. Expanding and choosing go through the same buttons
  * the pointer uses, so there is one path for each.
  */
+// True only while handleTreeKey forwards Enter/Space to a folder button, so
+// the select handler can tell a keyboard pick from a pointer click (the click
+// runs synchronously inside `.click()`).
+let keyboardPick = false;
+
 function handleTreeKey(event: React.KeyboardEvent<HTMLDivElement>) {
   const item = (event.target as HTMLElement).closest<HTMLElement>('[role="treeitem"]');
   if (item === null) return;
@@ -1730,7 +1753,12 @@ function handleTreeKey(event: React.KeyboardEvent<HTMLDivElement>) {
       break;
     case "Enter":
     case " ":
-      item.querySelector<HTMLElement>(":scope > .fi-tree-row [data-tree-select]")?.click();
+      keyboardPick = true;
+      try {
+        item.querySelector<HTMLElement>(":scope > .fi-tree-row [data-tree-select]")?.click();
+      } finally {
+        keyboardPick = false;
+      }
       break;
     default:
       return;
@@ -1767,7 +1795,7 @@ function TreeNode({
   currentPath: string;
   marked: boolean;
   herePath: string | undefined;
-  onSelect: (path: string) => void;
+  onSelect: (path: string, byKey: boolean) => void;
   dropTargets: boolean;
   depth: number;
 }) {
@@ -1790,6 +1818,13 @@ function TreeNode({
     if (isOnTheWay(path, currentPath) && currentPath !== path) setOpen(true);
   }, [path, currentPath]);
 
+  // The one Tab stop of the tree. Normally the folder on screen; but when that
+  // node is not rendered (an ancestor folded by hand, the folder deleted, its
+  // parent's listing failed) the deepest visible node on the way to it takes
+  // over, so the tree is never left without a stop.
+  const childOnTheWay = open && dirs.some((dir) => isOnTheWay(joinPath(path, dir.name), currentPath));
+  const tabStop = path === currentPath || (isOnTheWay(path, currentPath) && !childOnTheWay);
+
   const spoken = [label, here ? "here" : null, fault].filter((part): part is string => part !== null).join(", ");
 
   return (
@@ -1800,7 +1835,7 @@ function TreeNode({
       aria-level={depth + 1}
       aria-expanded={leaf ? undefined : open}
       aria-selected={active}
-      tabIndex={path === currentPath ? 0 : -1}
+      tabIndex={tabStop ? 0 : -1}
     >
       {/* Depth as a custom property and the step as a token, rather than a
           pixel count multiplied inline. */}
@@ -1829,7 +1864,7 @@ function TreeNode({
           tabIndex={-1}
           data-tree-select
           aria-current={active ? "location" : undefined}
-          onClick={() => onSelect(path)}
+          onClick={() => onSelect(path, keyboardPick)}
         >
           <span className="fi-tree-label" title={label}>
             {label}
@@ -1841,7 +1876,7 @@ function TreeNode({
             className={fault === "unread" ? "fi-tree-fault fi-tree-fault-unread" : "fi-tree-fault"}
             title={
               fault === "unread"
-                ? "the núcleo could not list this folder — open it to see why"
+                ? `the ${DAEMON_NAME} could not list this folder — open it to see why`
                 : "this branch is the last listing that loaded; the latest one failed"
             }
           >
@@ -2022,6 +2057,7 @@ function ClashNote({
   onCancel: () => void;
 }) {
   const headingId = useId();
+  const thenId = useId();
   const noteRef = useRef<HTMLDivElement>(null);
   // Focus on the answer that loses nothing, as the not-empty note lands on
   // Leave: Enter pressed on arrival keeps both files rather than replacing one.
@@ -2045,6 +2081,7 @@ function ClashNote({
       className="fi-ask"
       role="group"
       aria-labelledby={headingId}
+      aria-describedby={thenId}
       onKeyDown={(event) => {
         if (event.key === "Escape") onCancel();
       }}
@@ -2080,7 +2117,7 @@ function ClashNote({
       </div>
       {/* Under the buttons, as their footnote: above them it was one more
           paragraph to read before the choice it explains came into view. */}
-      <p className="fi-ask-then">
+      <p id={thenId} className="fi-ask-then">
         Replace moves the {one ? "old one" : "old ones"} to Recently deleted. Keep both saves the new{" "}
         {one ? "file" : "files"} under a numbered name.
         {others > 0 && ` The other ${String(others)} ${others === 1 ? "file goes" : "files go"} up either way.`}
@@ -2500,7 +2537,7 @@ function FileTable(props: FileTableProps) {
         {folder.isError && entries === undefined && (
           <RefusalOrError error={folder.error} sentences={LIST_SENTENCES} what="nothing is known about this folder" />
         )}
-        {!folder.isError && entries === undefined && <p className="fi-loading">reading the folder…</p>}
+        {!folder.isError && entries === undefined && <p className="fi-loading">Reading the folder…</p>}
         {/* `Teach` is for a place nothing has ever been — the root, empty. A
             subfolder that is empty is an ordinary answer, and says so in one line. */}
         {entries !== undefined && entries.length === 0 && path === "" && (
@@ -2512,7 +2549,7 @@ function FileTable(props: FileTableProps) {
           </Teach>
         )}
         {entries !== undefined && entries.length === 0 && path !== "" && (
-          <Quiet says="nothing in this folder yet — upload, drop or make a folder here." />
+          <Quiet says="Nothing in this folder yet — upload, drop or make a folder here." />
         )}
 
         {/* `fi-table-picking` once anything is picked: until then the row boxes
@@ -2929,7 +2966,7 @@ function SearchResults({
           marks a stale listing — they may no longer be where they say. */}
       {result.isError && result.data !== undefined && <StaleNote dataUpdatedAt={result.dataUpdatedAt} />}
       {result.isError && <RefusalOrError error={result.error} sentences={SEARCH_SENTENCES} what="that search did not go through" />}
-      {!result.isError && result.data === undefined && <p className="fi-loading">searching…</p>}
+      {!result.isError && result.data === undefined && <p className="fi-loading">Searching…</p>}
       {/* The one-line absence, and `Quiet` rather than `.fi-loading`'s faint:
           here the sentence IS what the panel has to say, and an answer set
           fainter than the labels around it reads as failure rather than as
@@ -3052,6 +3089,7 @@ function MoveForm({
   const [busy, setBusy] = useState(false);
   // Read by the second pick, which can come before the render `busy` would.
   const busyRef = useRef(false);
+  const movedNames = useRef(new Set<string>());
   const headingId = useId();
   const formRef = useRef<HTMLFormElement>(null);
   useEffect(() => {
@@ -3080,11 +3118,14 @@ function MoveForm({
     setBusy(true);
     const failed: { name: string; error: unknown }[] = [];
     const done: MoveDone[] = [];
-    for (const entry of entries) {
+    // After a partial failure only what is still where it was is tried again:
+    // the ones already moved would fail with "not found" on the second Move.
+    for (const entry of entries.filter((item) => !movedNames.current.has(item.name))) {
       const from = joinPath(path, entry.name);
       const to = joinPath(destination, entry.name);
       try {
         await move.mutateAsync({ from, to });
+        movedNames.current.add(entry.name);
         done.push({ from, to, is_dir: entry.is_dir });
       } catch (error) {
         failed.push({ name: entry.name, error });
@@ -3125,10 +3166,11 @@ function MoveForm({
           currentPath={destination}
           marked={picked}
           herePath={path}
-          onSelect={(next) => {
-            // Picking the picked folder again is the go-ahead: Enter twice, or a
-            // double-click, moves without the trip down to the button.
-            if (picked && next === destination) {
+          onSelect={(next, byKey) => {
+            // Clicking the picked folder again is the go-ahead, without the trip
+            // down to the button. Enter only picks: two Enters in a row are how
+            // a person walks and expands the tree, and must not move files.
+            if (picked && next === destination && !byKey) {
               void submit();
               return;
             }
@@ -3155,7 +3197,7 @@ function MoveForm({
                   , as <span className="fi-move-what">{joinPath(where, one.name)}</span>
                 </>
               )}
-              <span className="fi-move-again"> — Enter or click it again to move</span>
+              <span className="fi-move-again"> — click it again, or press Move</span>
             </>
           )}
         </p>
@@ -3510,8 +3552,23 @@ function ContextMenu({
     function handlePointerDown() {
       onCloseRef.current(false);
     }
+    // The menu is `position: fixed` at the spot it was opened: a scroll under
+    // it, a resize, or the window losing focus would leave it floating over the
+    // wrong row. None of them hands focus back to the opener, as Escape does.
+    function handleDrift(event: Event) {
+      if (event.target instanceof Node && menuRef.current?.contains(event.target)) return;
+      onCloseRef.current(false);
+    }
     document.addEventListener("mousedown", handlePointerDown);
-    return () => document.removeEventListener("mousedown", handlePointerDown);
+    document.addEventListener("scroll", handleDrift, true);
+    window.addEventListener("resize", handleDrift);
+    window.addEventListener("blur", handleDrift);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("scroll", handleDrift, true);
+      window.removeEventListener("resize", handleDrift);
+      window.removeEventListener("blur", handleDrift);
+    };
   }, []);
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {

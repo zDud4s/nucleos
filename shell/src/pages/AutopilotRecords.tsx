@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import type { Proposal } from "../data/system";
 import {
@@ -84,7 +85,7 @@ function RecordPanel({
           <RefusalNote refusal={error} />
         ) : (
           <ErrorNote>
-            the daemon did not answer — nothing is known about {what}
+            Could not reach the {DAEMON_NAME} — nothing is known about {what}
           </ErrorNote>
         )}
       </Section>

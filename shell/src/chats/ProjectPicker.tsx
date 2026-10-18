@@ -1,6 +1,7 @@
 import { useId, useState, type ReactNode } from "react";
 import { Check, FolderRoot } from "lucide-react";
 import { Button, Modal } from "../ui";
+import { DAEMON_NAME } from "../copy";
 import { useHome, useProjects } from "../data/system";
 
 /** One row in the picker: a project, or Root. */
@@ -99,7 +100,7 @@ export function ProjectPicker({
       <div className="chats-picker" role="radiogroup" aria-label="Where this conversation runs">
         {projects.isPending && <p className="chats-loading">reading the projects…</p>}
         {projects.isError && projects.data === undefined && (
-          <p className="chats-picker-none">the núcleo did not answer with its projects</p>
+          <p className="chats-picker-none">The {DAEMON_NAME} did not list its projects</p>
         )}
         {projects.data !== undefined && choices.length === 0 && (
           <p className="chats-picker-none">
@@ -122,7 +123,7 @@ export function ProjectPicker({
               root ??
               (home.isPending
                 ? "reading where NucleOS lives…"
-                : "the núcleo did not say where it lives")
+                : "The background service did not say where it lives")
             }
           />
         )}

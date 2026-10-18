@@ -110,16 +110,12 @@ describe("MailDetail — a pruned body", () => {
 
     await renderMailDetail("/mail/42");
 
-    // The body panel says what happened to it. Both the body panel and the
-    // facts panel explain "pruned by retention" in their own words, at the
-    // two places a person would otherwise look for what is missing — so the
-    // assertions below match each panel's own sentence rather than the
-    // shared phrase, which resolves to two elements.
-    expect(await screen.findByText(/only the facts above remain/)).toBeDefined();
+    // The body panel says what happened to it, once, and says why there is no requeue.
+    expect(await screen.findByText(/body was pruned by retention/)).toBeDefined();
+    expect(screen.getByText(/cannot be\s+requeued for triage/)).toBeDefined();
     // ...and eligibility is read off `body_text`, never the triage class —
     // this message is `action`-classified and would otherwise look
     // requeueable by every other signal on the page.
-    expect(await screen.findByText(/requeuing is not offered/)).toBeDefined();
     expect(screen.queryByRole("button", { name: "Requeue for triage" })).toBeNull();
   });
 });
@@ -189,7 +185,7 @@ describe("MailDetail — the model's own class", () => {
     const { unmount } = await renderMailDetail("/mail/42");
     // The badge above already says "needs a reply, not today"; printing the model's identical
     // answer beside it is one fact under two names.
-    expect(await screen.findByText("Triage")).toBeDefined();
+    expect(await screen.findByText("Class")).toBeDefined();
     expect(screen.queryByText("Model said")).toBeNull();
     unmount();
 
@@ -238,6 +234,22 @@ describe("MailDetail — attachments", () => {
   });
 });
 
+/* ------------------------------------------------------- the page's order -- */
+
+describe("MailDetail — what comes first", () => {
+  it("puts the body before the triage detail and draws the reply's recipient and subject as text", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => (path === "/email/42" ? emailDetail() : undefined));
+
+    await renderMailDetail("/mail/42");
+
+    await screen.findByText("Here are the numbers.");
+    const headings = [...document.querySelectorAll("h2")].map((heading) => heading.textContent);
+    expect(headings.indexOf("Body")).toBeLessThan(headings.indexOf("Triage"));
+    expect(headings.indexOf("Reply")).toBeLessThan(headings.indexOf("Triage"));
+    expect(document.querySelector("form input")).toBeNull();
+  });
+});
+
 /* -------------------------------------------------------------- sending -- */
 
 describe("MailDetail — sending a reply", () => {
@@ -259,7 +271,7 @@ describe("MailDetail — sending a reply", () => {
 
     await renderMailDetail("/mail/42");
 
-    fireEvent.change(await screen.findByLabelText("Reply body"), { target: { value: "on it, will send tomorrow" } });
+    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "on it, will send tomorrow" } });
 
     // Arm, then confirm — two separate gestures, genuinely apart in time so
     // the second click does not land inside the interlock's 300ms dwell.
@@ -288,6 +300,6 @@ describe("MailDetail — an absent subject", () => {
     await renderMailDetail("/mail/42");
 
     expect(await screen.findByText("Reply")).toBeDefined();
-    expect((screen.getByLabelText("Reply subject") as HTMLInputElement).value).toBe("Re:");
+    expect(screen.getByText("Subject").nextElementSibling?.textContent).toBe("Re:");
   });
 });

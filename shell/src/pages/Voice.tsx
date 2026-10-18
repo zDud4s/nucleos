@@ -21,6 +21,7 @@ import {
   Badge,
   Button,
   ConfirmButton,
+  CopyButton,
   Count,
   ErrorNote,
   PageHeader,
@@ -80,7 +81,7 @@ function headline(
   registerFailed: boolean,
 ): string | undefined {
   if (config === undefined) return undefined;
-  if (!config.armed) return "not armed — no transcriber is configured";
+  if (!config.armed) return "no transcriber is set up yet";
   if (registerFailed) return "armed, but the hotkeys did not register — use the buttons below";
   if (conflicts !== null && conflicts.length > 0) {
     return `armed — ${conflicts.length} hotkey${conflicts.length === 1 ? "" : "s"} is taken by another app`;
@@ -165,15 +166,6 @@ export function Voice() {
     archiveButton.current?.focus();
   }
 
-  useEffect(() => {
-    if (!archiveOpen) return undefined;
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") closeArchive();
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [archiveOpen]);
-
   const memoCount = memos.data?.length;
   const dictationCount = dictations.data?.length;
   const counts = [
@@ -186,6 +178,7 @@ export function Voice() {
       className="voice-room"
       data-phase={voice.phase}
       data-archive={archiveOpen ? "open" : undefined}
+      data-live={on || phase !== "idle" ? "" : undefined}
     >
       <VoiceRoom phase={voice.phase} level={voice.level} threshold={voice.threshold} tap={voice.answerTap} />
       <VoiceOrb phase={voice.phase} tap={voice.answerTap} />
@@ -294,7 +287,7 @@ function plural(n: number, noun: string): string {
  * The drawer: what has been captured, and how the pillar is configured.
  *
  * Mounted only while open, so nothing in it is reachable by keyboard when it is shut. It takes focus
- * onto its Close button as it mounts; closing — that button or Escape, both handled by the page — gives
+ * onto its Close button as it mounts; closing — that button, or Escape pressed inside the drawer — gives
  * focus back to the button that opened it.
  */
 function Archive({
@@ -316,7 +309,20 @@ function Archive({
   }, []);
 
   return (
-    <aside id="voice-archive" className="voice-archive" aria-label="Voice archive">
+    <div
+      id="voice-archive"
+      className="voice-archive"
+      role="dialog"
+      aria-modal="false"
+      aria-label="Voice archive"
+      onKeyDown={(event) => {
+        // Escape belongs to this drawer, not to the window: inside an armed or held ConfirmButton it
+        // stands that control down and nothing more, so the confirmation is not lost half-way.
+        if (event.key !== "Escape" || event.defaultPrevented) return;
+        if ((event.target as HTMLElement).closest(".ui-confirm-armed, .ui-confirm-holding") !== null) return;
+        onClose();
+      }}
+    >
       <div className="voice-archive-head">
         <h2>Archive</h2>
         <button type="button" className="ui-button ui-button-ghost" ref={closeButton} onClick={onClose}>
@@ -345,7 +351,7 @@ function Archive({
           </TabsContent>
         </Tabs>
       </div>
-    </aside>
+    </div>
   );
 }
 
@@ -395,24 +401,38 @@ function Captions({ voice, hotkey }: { voice: ConversationView; hotkey: string }
   );
 }
 
+/** The smallest voice.yaml that turns the pillar on; any speech-to-text program that takes a WAV path works. */
+const MINIMAL_VOICE_YAML = "enabled: true\nstt_command: whisper-cli -m model.bin\n";
+const VOICE_YAML_PATH = "~/.nucleos/voice.yaml";
+
 /** What stands in the room's middle instead of the captions, on a machine that cannot transcribe. */
 function NotArmed() {
   return (
     <div className="voice-notarmed">
-      <Quiet says="not armed — nothing here can transcribe a spoken turn" />
-      <Teach title="Voice is not armed">
+      <Quiet says="no transcriber is set up — spoken turns cannot be understood yet" />
+      <Teach title="Voice needs a transcriber">
         <p>
-          Armed means a transcriber is configured on this machine —{" "}
-          <code>armed = enabled &amp;&amp; (stt_command != "" || stt_url != "")</code>. Either engine
-          arms it, since 2026-09-20: a machine pointed at a resident whisper server is the
-          configuration that is six times faster, and naming only the command would have reported no
-          voice at all on it. It reflects configuration, not
-          whether a GPU or a model is actually present: the shell is set up to try, which is not the
-          same fact as a capture succeeding.
+          Voice turns your speech into text with a transcriber program that runs on this machine. None is
+          set up yet, so the talk and capture buttons are hidden.
         </p>
         <p>
-          Configuration for this pillar lives in <code>~/.nucleos/voice.yaml</code>.
+          Add one to <code>{VOICE_YAML_PATH}</code>, then reopen this page. The smallest file that works:
         </p>
+        <pre className="voice-notarmed-code">
+          <code>{MINIMAL_VOICE_YAML}</code>
+        </pre>
+        <p className="voice-notarmed-copy">
+          <CopyButton value={VOICE_YAML_PATH} label="the voice.yaml path" />
+        </p>
+        <details className="voice-notarmed-details">
+          <summary>Technical details</summary>
+          <p>
+            Either <code>stt_command</code> (a program that reads a WAV file) or <code>stt_url</code> (a
+            resident speech server, which is faster) is enough. This reflects configuration, not whether a
+            GPU or a model is actually present: the shell tries, which is not the same as a capture
+            succeeding.
+          </p>
+        </details>
       </Teach>
     </div>
   );
@@ -511,6 +531,7 @@ function ConversationStatus({ voice }: { voice: ConversationView }) {
           aria-valuenow={voice.level}
           aria-valuetext={`level ${Math.round(voice.level * 100)}%, a turn opens at ${Math.round(voice.threshold * 100)}%`}
           className="voice-meter"
+          data-open={voice.level >= voice.threshold ? "" : undefined}
         >
           <span
             aria-hidden="true"
@@ -589,24 +610,29 @@ function CaptureButtons({
 
   if (phase === "idle") {
     return (
-      <div className="voice-capture-buttons">
-        <Button intent="go" disabled={pending} onClick={() => onPress(false)}>
-          Start dictation
-          {hotkey !== "" && (
-            <kbd aria-hidden="true" className="voice-kbd">
-              {hotkey}
-            </kbd>
-          )}
-        </Button>
-        <Button intent="go" disabled={pending} onClick={() => onPress(true)}>
-          Start memo
-          {memoHotkey !== "" && (
-            <kbd aria-hidden="true" className="voice-kbd">
-              {memoHotkey}
-            </kbd>
-          )}
-        </Button>
-      </div>
+      <>
+        <div className="voice-capture-buttons">
+          {/* Secondary on purpose: "Start talking" is the room's one primary action. These two are the
+              other ways to capture speech, and the hint below says how they differ. */}
+          <Button disabled={pending} onClick={() => onPress(false)}>
+            Start dictation
+            {hotkey !== "" && (
+              <kbd aria-hidden="true" className="voice-kbd">
+                {hotkey}
+              </kbd>
+            )}
+          </Button>
+          <Button disabled={pending} onClick={() => onPress(true)}>
+            Start memo
+            {memoHotkey !== "" && (
+              <kbd aria-hidden="true" className="voice-kbd">
+                {memoHotkey}
+              </kbd>
+            )}
+          </Button>
+        </div>
+        <p className="voice-capture-hint">Dictation is pasted into the app in focus. A memo is saved as a note.</p>
+      </>
     );
   }
 

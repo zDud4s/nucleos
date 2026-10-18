@@ -14,6 +14,7 @@ import {
   type CreateEventRequest,
   type EventOccurrence,
 } from "../data/calendar";
+import { DAEMON_NAME } from "../copy";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
 import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, TimeField } from "../ui";
@@ -167,7 +168,13 @@ export function DraftEventForm({
   }
 
   const stamp = stampFromInput(`${date}T${time}`);
-  const canSubmit = title.trim() !== "" && stamp !== null && duration > 0 && !create.isPending;
+  // Not a whole positive number of minutes: the button would grey out with no reason given.
+  const durationBad = !Number.isFinite(duration) || duration < 1;
+  const durationHint = useId();
+  /* What was just added, by name and time. Cleared as soon as the title is edited, so the
+     line never outlives the moment it confirms. */
+  const [added, setAdded] = useState<string | null>(null);
+  const canSubmit = title.trim() !== "" && stamp !== null && !durationBad && !create.isPending;
 
   function submit() {
     if (stamp === null || title.trim() === "") return;
@@ -178,7 +185,13 @@ export function DraftEventForm({
       // Absent, not null, for a one-off — `JSON.stringify` drops the key.
       freq: repeats ? freq : undefined,
     };
-    create.mutate(input, { onSuccess: () => setTitle("") });
+    const summary = `${input.title} at ${time}`;
+    create.mutate(input, {
+      onSuccess: () => {
+        setTitle("");
+        setAdded(summary);
+      },
+    });
   }
 
   return (
@@ -194,7 +207,10 @@ export function DraftEventForm({
         <input
           className="calendar-draft-title"
           value={title}
-          onChange={(event) => setTitle(event.target.value)}
+          onChange={(event) => {
+            setTitle(event.target.value);
+            setAdded(null);
+          }}
           placeholder="Add an event to this day"
           aria-label="Title"
         />
@@ -225,6 +241,8 @@ export function DraftEventForm({
             value={duration}
             onChange={(event) => setDuration(Number(event.target.value))}
             aria-label="Duration (minutes)"
+            aria-invalid={durationBad || undefined}
+            aria-describedby={durationBad ? durationHint : undefined}
           />
           <span>min</span>
         </label>
@@ -247,19 +265,24 @@ export function DraftEventForm({
           </label>
         )}
       </div>
-      {create.isSuccess && (
-        <p className="calendar-outcome" role="status">
-          added — event {create.data.id}
+      {durationBad && (
+        <p id={durationHint} className="calendar-draft-hint">
+          Duration must be at least 1 minute.
         </p>
       )}
-      {create.isError && <DraftError error={create.error} />}
+      {added !== null && !create.isError && (
+        <p className="calendar-outcome" role="status">
+          Added: {added}
+        </p>
+      )}
+      {create.isError && <DraftError error={create.error} onRetry={submit} />}
     </form>
   );
 }
 
-function DraftError({ error }: { error: unknown }) {
+function DraftError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing was added</ErrorNote>;
+  return <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME} — nothing was added</ErrorNote>;
 }
 
 /**
@@ -450,5 +473,9 @@ function localInput(at: Date): string {
 
 function OccurrenceError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — {what}</ErrorNote>;
+  return (
+    <ErrorNote>
+      Could not reach the {DAEMON_NAME} — {what}
+    </ErrorNote>
+  );
 }

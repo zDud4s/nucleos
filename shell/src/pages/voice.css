@@ -268,7 +268,7 @@
 .voice-meter {
   position: relative;
   width: 6rem;
-  height: 4px;
+  height: 6px;
   flex: none;
   border-radius: var(--radius-md);
   background: var(--surface-sunken);
@@ -284,6 +284,11 @@
   background: var(--text-muted);
 }
 
+/* The level has crossed the bar: a turn is open, and the fill says so in the active tone. */
+.voice-meter[data-open] .voice-meter-fill {
+  background: var(--tone-active-border);
+}
+
 /* Overflows the track by a pixel at each end so the bar reads as a mark ON the scale rather than as
    a segment of the fill. */
 .voice-meter-bar {
@@ -291,7 +296,33 @@
   top: -1px;
   width: 2px;
   height: calc(100% + 2px);
-  background: var(--border-strong);
+  background: var(--text);
+}
+
+/* Windows High Contrast neutralises background and box-shadow, which is all the meter is made of:
+   give the track a real border and the fill and the mark system colours. */
+@media (forced-colors: active) {
+  .voice-meter {
+    border: 1px solid CanvasText;
+    box-shadow: none;
+    background: Canvas;
+  }
+
+  .voice-meter-fill {
+    background: Highlight;
+    forced-color-adjust: none;
+  }
+
+  .voice-meter-bar {
+    background: CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .voice-outcome,
+  .voice-delivery,
+  .voice-delivery-held {
+    border-left-color: CanvasText;
+  }
 }
 
 /* The conversation's orb. Its strokes take the canvas's own `color`, so the theme and the hearing
@@ -316,6 +347,28 @@
    DESIGN.md reserves that for links, and `reserved-cyan.test.ts` holds it. */
 .voice-orb[data-hearing] {
   color: var(--tone-pending-fg);
+}
+
+/* Reduced motion draws the orb once per phase with no loop, so the phase has to be told apart by
+   something that is not movement: the stroke colour, and a ring while the microphone is open. Opacity
+   alone (`DIM`) was a 5-30% difference on a decorative shape. `hearing` keeps its own colour above. */
+@media (prefers-reduced-motion: reduce) {
+  .voice-orb[data-phase="listening"] {
+    color: var(--tone-active-fg);
+    border-radius: 50%;
+    box-shadow: 0 0 0 2px var(--tone-active-border);
+  }
+
+  .voice-orb[data-phase="hearing"] {
+    border-radius: 50%;
+    box-shadow: 0 0 0 2px var(--tone-pending-fg);
+  }
+
+  .voice-orb[data-phase="thinking"] {
+    color: var(--tone-info-fg);
+    border-radius: 50%;
+    outline: 2px dashed var(--tone-info-fg);
+  }
 }
 
 /* ------------------------------------------------------------------- room -- */
@@ -544,6 +597,32 @@
   justify-content: flex-end;
 }
 
+.voice-capture-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-align: right;
+}
+
+.voice-notarmed-code {
+  margin: var(--space-2) 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  overflow-x: auto;
+}
+
+.voice-notarmed-copy {
+  margin: 0 0 var(--space-3);
+}
+
+.voice-notarmed-details summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
 .voice-dock-capture .voice-hotkey-conflict,
 .voice-dock-capture .voice-outcome,
 .voice-dock-capture .voice-delivery {
@@ -562,9 +641,22 @@
     justify-items: center;
   }
 
-  /* No room left beside the drawer: hide the dock so Tab cannot reach what the drawer covers. */
-  .voice-room[data-archive="open"] .voice-dock {
+  /* No room left beside the drawer: hide an idle dock so Tab cannot reach what the drawer covers.
+     While the microphone is open (`data-live`) the dock is NOT hidden: Stop and Abandon must stay
+     visible and reachable, so it rises above the drawer on a ground of its own instead. */
+  .voice-room[data-archive="open"]:not([data-live]) .voice-dock {
     visibility: hidden;
+  }
+
+  .voice-room[data-archive="open"][data-live] .voice-dock {
+    z-index: 6;
+    right: 0;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+  }
+
+  .voice-room[data-archive="open"][data-live] .voice-archive-body {
+    padding-bottom: 14rem;
   }
 
   .voice-dock-diag {

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import {
   RESOLVE_DATA_WARNING,
@@ -197,7 +198,7 @@ function ResolutionCard({
 
 function ResolveRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>The núcleo did not answer — the resolver was not changed.</ErrorNote>;
+    return <ErrorNote>Could not reach the {DAEMON_NAME} — the resolver was not changed.</ErrorNote>;
   }
   return (
     <RefusalNote
@@ -209,7 +210,7 @@ function ResolveRefusal({ error }: { error: unknown }) {
         invalid: "off, observe and enforce are the only settings",
         // A shell newer than its núcleo: until the núcleo shows the risk, the route still says this.
         enforce_unavailable:
-          "this núcleo does not accept enforce for the resolver yet — update it to one that shows the risk first",
+          `this ${DAEMON_NAME} does not accept enforce for the resolver yet — update it to one that shows the risk first`,
       }}
     />
   );

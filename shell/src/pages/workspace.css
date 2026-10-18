@@ -679,10 +679,51 @@ a.ws-lead-door:hover {
 
 /* ------------------------------------------------------------------- controls -- */
 
-/* The mode tabs share the row between them, as a segmented control does, instead of huddling left. */
-.ws-tabs > .ui-tab {
-  flex: 1 1 0;
-  justify-content: center;
+/*
+  The mode tabs keep their own width and start at the left, where the rest of the app starts.
+  Each sits in a `Tip` root, so the rule is on that wrapper; it stretches so the tab's rule still
+  reaches the strip's bottom line.
+*/
+.ws-tabs > .ws-tab-tip {
+  flex: 0 0 auto;
+  align-self: stretch;
+  scroll-snap-align: start;
+}
+
+.ws-tabs .ui-tab {
+  min-height: 2.25rem;
+}
+
+/* What a tab's tip says: the count's meaning, then the chord on its own line, quieter. */
+.ws-tab-means,
+.ws-tab-keys {
+  display: block;
+}
+
+.ws-tab-keys {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.ws-tab-means + .ws-tab-keys {
+  margin-top: var(--space-1);
+}
+
+/* Narrow: one scrolling line with snap points, instead of wrapping into two and breaking the rule. */
+@media (max-width: 560px) {
+  .ws-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+  }
+}
+
+.ws-missing {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
 }
 
 /*

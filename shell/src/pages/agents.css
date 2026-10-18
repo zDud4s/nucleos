@@ -24,24 +24,6 @@
 
 /* ================================================================ shared == */
 
-/**
- * The catalogue has not answered yet — and deliberately **not** `Quiet`.
- *
- * `Quiet` is the one-line *absence*, and it is muted because in an empty region
- * the sentence is the content: an answer set fainter than the labels around it
- * reads as failure rather than as emptiness. A wait is the other case. This line
- * is a placeholder for the table about to replace it, it is never what the page
- * has to say, and faint is the rung for something standing beside content rather
- * than being it. The absence this page does have is the empty catalogue, and
- * that one has something to teach, so it is `Teach`.
- */
-.agents-loading {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-faint);
-}
-
 /* ------------------------------------------------------------ type roles -- */
 
 /**
@@ -395,6 +377,14 @@
   resize: vertical;
 }
 
+/* The Model hint: help text beside the control, readable as prose rather than as a caption. */
+.agents-hint {
+  font-size: var(--text-xs);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-muted);
+}
+
 /* One of the app's four local rings, and it changes only the offset: at 2px a
    ring around a field inside a twelve-column grid touches its neighbour. */
 .agents-field input:focus-visible,
@@ -434,5 +424,44 @@
   margin: 0;
   font-size: var(--text-xs);
   line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/* The editor's sections: one tablist above the panel, so the dialog holds one task at a time. */
+.agents-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--border);
+}
+
+.agents-tab {
+  min-height: var(--hit-min);
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.agents-tab[aria-selected="true"] {
+  border-bottom-color: var(--text);
+  color: var(--text);
+}
+
+.agents-tab:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* Why Save is off, or that it worked: pushed to the footer's left edge, beside the buttons. */
+.agents-save-status {
+  margin-right: auto;
+  align-self: center;
+  font-size: var(--text-sm);
   color: var(--text-muted);
 }

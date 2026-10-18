@@ -284,7 +284,7 @@ describe("RunDetail — what it was told", () => {
 
     await renderApp({ initialPath: "/runs/5" });
 
-    expect(await screen.findByText("Gate")).toBeDefined();
+    expect(await screen.findByText("Test gate")).toBeDefined();
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/runs/5/knowledge"));
     expect(screen.queryByText("What it was told")).toBeNull();
   });
@@ -451,7 +451,7 @@ describe("RunDetail — why it stopped", () => {
 
     expect(await screen.findByText("Why it stopped")).toBeDefined();
     // The deterministic gate keeps its own panel and its own name beside this one.
-    expect(screen.getByText("Gate")).toBeDefined();
+    expect(screen.getByText("Test gate")).toBeDefined();
     expect(screen.getByText(/approve a tool call/)).toBeDefined();
     expect(screen.getByText(/unrecognized shell commands/)).toBeDefined();
   });
@@ -572,7 +572,7 @@ describe("RunDetail — why it stopped", () => {
     await renderApp({ initialPath: "/runs/5" });
 
     // The page itself is there.
-    expect(await screen.findByText("Gate")).toBeDefined();
+    expect(await screen.findByText("Test gate")).toBeDefined();
     expect(screen.queryByText("Why it stopped")).toBeNull();
   });
 });
@@ -596,6 +596,8 @@ describe("RunDetail — the live tail", () => {
 
     const { queryClient } = await renderApp({ initialPath: "/runs/5" });
     expect(await screen.findByText(/olá/)).toBeDefined();
+    // A scrolling box a keyboard can reach and a screen reader can name.
+    expect(screen.getByRole("log", { name: "Live output" }).getAttribute("tabindex")).toBe("0");
     expect(asked[0]).toBe("/runs/5/tail?since=0");
 
     await act(async () => {
@@ -635,7 +637,7 @@ describe("RunDetail — the live tail", () => {
     // A read that failed says nothing at all about where the output is, which is
     // the opposite of what the 204 above says. Collapsing them would either hide
     // an outage or invent one.
-    expect(await screen.findByText(/the live tail is unreachable/)).toBeDefined();
+    expect(await screen.findByText(/Could not read the live tail/)).toBeDefined();
     expect(screen.queryByText(/^recorded/)).toBeNull();
   });
 });
@@ -661,6 +663,18 @@ describe("RunDetail — steering", () => {
     expect(screen.queryByRole("button", { name: /End the turns/ })).toBeNull();
   });
 
+  it("offers a finished run only a way to close its turns, not a box to type in", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(detail({ status: "completed", steerable: true }), NO_TAIL, []),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect(await screen.findByRole("button", { name: /End the turns/ })).toBeDefined();
+    expect(screen.queryByLabelText("Say something to this run")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Send turn" })).toBeNull();
+  });
+
   it("gives a run that did opt in a composer and a way to close its turns", async () => {
     const asked: string[] = [];
     daemon.apiFetch.mockImplementation(
@@ -678,6 +692,28 @@ describe("RunDetail — steering", () => {
 });
 
 /* -------------------------------------------------------------- handoff -- */
+
+describe("RunDetail — the outcome strip", () => {
+  it("says the run's exit code once, and a missing one as missing", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail({ exit_code: 2 }), NO_TAIL, [], stopReport({ exit_code: 2 })));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const strip = await screen.findByLabelText("Outcome");
+    expect(strip.textContent).toContain("Exit code 2");
+    // Not again in the facts or in the stop explanation.
+    await screen.findByText("Why it stopped");
+    expect(screen.getAllByText(/Exit code 2/)).toHaveLength(1);
+  });
+
+  it("does not turn a missing exit code into a zero", async () => {
+    daemon.apiFetch.mockImplementation(detailFetch(detail({ exit_code: null }), NO_TAIL, []));
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    expect((await screen.findByLabelText("Outcome")).textContent).toContain("No exit code recorded");
+  });
+});
 
 describe("RunDetail — the handoff", () => {
   it("links the successor a context handoff created", async () => {

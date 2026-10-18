@@ -50,13 +50,15 @@ afterEach(() => {
 });
 
 describe("ForceGraph", () => {
-  it("renders a focusable canvas named by its node count, and paints it", async () => {
+  it("renders a canvas named by its node count that takes no focus, points to List, and paints it", async () => {
     const model: GModel = { nodes: [node("n:1"), node("n:2")], edges: [] };
     render(<ForceGraph model={model} selected={null} onSelect={() => {}} />);
 
     const canvas = screen.getByRole("img", { name: "Brain graph, 2 nodes" });
     expect(canvas.tagName).toBe("CANVAS");
-    expect(canvas.getAttribute("tabindex")).toBe("0");
+    expect(canvas.getAttribute("tabindex")).toBeNull();
+    expect(canvas.getAttribute("aria-describedby")).toBeTruthy();
+    expect(screen.getByText(/Switch to List/)).toBeTruthy();
     await waitFor(() => expect(recorded).toContain("arc"));
   });
 

@@ -90,5 +90,6 @@ describe("ScopedTools - own tools", () => {
     await renderWithRouter(<ScopedTools ownerKind="agent" ownerId="scout" />);
 
     expect(await screen.findByText(/did not answer/)).toBeDefined();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeDefined();
   });
 });

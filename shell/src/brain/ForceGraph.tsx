@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useId, useRef } from "react";
 import {
   forceCenter,
   forceCollide,
@@ -454,15 +454,21 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
     engineRef.current?.resize();
   }, [resolvedHeight]);
 
+  const hintId = useId();
   return (
     <div ref={wrapRef} className="brain-force">
       <canvas
         ref={canvasRef}
         className="brain-force-canvas"
-        tabIndex={0}
         role="img"
         aria-label={`Brain graph, ${model.nodes.length} nodes`}
+        aria-describedby={hintId}
       />
+      {/* The map answers the pointer only. It used to take focus and do nothing with it, a trap
+          for keyboard users; the List view is the keyboard route to the same nodes. */}
+      <span id={hintId} className="sr-only">
+        The graph is visual and pointer-only. Switch to List to read and open the same items by keyboard.
+      </span>
       {!compact && (
         <div className="brain-force-controls">
           <button

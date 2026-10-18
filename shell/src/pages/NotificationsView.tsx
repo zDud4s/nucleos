@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   NOTIFY_FAMILIES,
@@ -37,18 +37,26 @@ export function NotificationsView() {
   // polls. `stored.data` is a new object per fetch, so the effect keys on the
   // fetch rather than on a deep compare nobody would maintain.
   const [draft, setDraft] = useState<NotifyPolicy | null>(null);
+  // The policy the draft was last seeded from. A refetch that brings the SAME content (window
+  // focus, say) must not wipe edits made meanwhile; only a policy that differs re-seeds.
+  const seeded = useRef<NotifyPolicy | null>(null);
   useEffect(() => {
-    if (stored.data) setDraft(stored.data);
+    if (!stored.data) return;
+    if (seeded.current !== null && samePolicy(seeded.current, stored.data)) return;
+    seeded.current = stored.data;
+    setDraft(stored.data);
   }, [stored.data]);
+  const [saved, setSaved] = useState(false);
 
   if (stored.isError) return <NotificationsError error={stored.error} what="the notification policy" />;
   if (observed.isError) return <NotificationsError error={observed.error} what="the kinds this machine writes" />;
-  if (!draft || !observed.data) return <p className="sy-note">reading the notification policy…</p>;
+  if (!draft || !observed.data) return <p className="sy-note" role="status">reading the notification policy…</p>;
 
   const { families, loose } = groupKinds(observed.data, draft);
   const dirty = !samePolicy(draft, stored.data);
 
   function setFamily(selector: string, on: boolean) {
+    setSaved(false);
     // Read off the NÚCLEO's policy, not the draft. By the time somebody flips a
     // switch back the draft already holds the `false` they just wrote, so asking
     // the draft what was there originally always answers `false` — and the
@@ -76,6 +84,7 @@ export function NotificationsView() {
   }
 
   function setKind(kind: string, verdict: KindVerdict) {
+    setSaved(false);
     setDraft((current) => {
       if (!current) return current;
       const kinds = current.kinds.filter((k) => k.selector !== kind);
@@ -91,17 +100,27 @@ export function NotificationsView() {
       aside={
         <div className="sy-notify-actions">
           {dirty && <span className="sy-meta">unsaved changes</span>}
-          <Button onClick={() => save.mutate(draft)} disabled={!dirty || save.isPending}>
+          <span className="sy-meta" role="status">
+            {saved && !dirty ? "saved" : null}
+          </span>
+          <Button
+            onClick={() => {
+              save.mutate(draft, { onSuccess: () => setSaved(true) });
+            }}
+            disabled={!dirty || save.isPending}>
             {save.isPending ? "saving…" : "Save"}
           </Button>
         </div>
       }
     >
+      <p className="sy-note sy-notify-never">
+        Proposals, the kill switch and budget alerts are never silenced by these switches, whatever
+        you set here.
+      </p>
       <p className="sy-note">
         A family is a prefix, and a kind can override its family. Anything no rule claims is sent —
         so a machine nobody has configured behaves exactly as it did before this screen existed.
-        Proposals, the kill switch and budget alerts are never silenced by these switches, whatever
-        you set here. The sidecar re-reads this on its next round: nothing needs restarting.
+        The sidecar re-reads this on its next round: nothing needs restarting.
       </p>
 
       {save.isError &&
@@ -171,6 +190,8 @@ function FamilyItem({
 }) {
   const [open, setOpen] = useState(false);
   const card = useRef<HTMLLIElement>(null);
+  const disclose = useRef<HTMLButtonElement>(null);
+  const popId = useId();
 
   /*
     The kinds open OVER the page, not inside the card: grown in place, one open family pushed
@@ -183,7 +204,11 @@ function FamilyItem({
       if (card.current !== null && !card.current.contains(event.target as Node)) setOpen(false);
     }
     function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") {
+        setOpen(false);
+        // The kinds unmount with the popover; without this the focus falls to the body.
+        disclose.current?.focus();
+      }
     }
     document.addEventListener("pointerdown", onPointer);
     document.addEventListener("keydown", onKey);
@@ -215,8 +240,10 @@ function FamilyItem({
         {!known && <span className="sy-note">unknown family</span>}
         <button
           type="button"
+          ref={disclose}
           className="sy-notify-disclose"
           aria-expanded={open}
+          aria-controls={open ? popId : undefined}
           onClick={() => setOpen(!open)}
         >
           {family.kinds.length} kind{family.kinds.length === 1 ? "" : "s"}{" "}
@@ -224,14 +251,14 @@ function FamilyItem({
         </button>
       </div>
       {open && family.kinds.length > 0 && (
-        <ul className="sy-notify-kinds sy-notify-pop">
+        <ul id={popId} className="sy-notify-kinds sy-notify-pop">
           {family.kinds.map((row) => (
             <KindItem key={row.kind} row={row} onKind={onKind} />
           ))}
         </ul>
       )}
       {open && family.kinds.length === 0 && (
-        <p className="sy-note sy-notify-pop">
+        <p id={popId} className="sy-note sy-notify-pop">
           This machine has written none of these in the last 90 days. The switch still covers the
           ones it writes next.
         </p>
@@ -253,12 +280,14 @@ function KindItem({
   // The only thing the state map's `feed` domain is used for on this screen, and
   // the one place its gaps are harmless: `readFeedKind` falls back to the literal.
   const label = readFeedKind(row.kind)?.label ?? row.kind;
+  // The visible name IS the control's name (WCAG 2.5.3): a real label, not a second string.
+  const controlId = useId();
 
   return (
     <li className="sy-notify-kind">
-      <span className="sy-notify-kind-name" title={row.kind}>
+      <label className="sy-notify-kind-name" htmlFor={controlId} title={row.kind}>
         {label}
-      </span>
+      </label>
       {!row.recentlySeen && (
         // Kept on screen rather than hidden. It is a rule somebody wrote; hiding
         // it would leave it silencing with nowhere to undo it.
@@ -267,8 +296,8 @@ function KindItem({
       {inFamily ? (
         <select
           className="sy-notify-select"
+          id={controlId}
           value={row.verdict}
-          aria-label={row.kind}
           onChange={(event) => onKind(row.kind, event.target.value as KindVerdict)}
         >
           <option value="inherit">follows its family</option>
@@ -283,7 +312,7 @@ function KindItem({
         <input
           type="checkbox"
           className="sy-switch"
-          aria-label={row.kind}
+          id={controlId}
           checked={row.verdict !== "never"}
           onChange={(event) => onKind(row.kind, event.target.checked ? "inherit" : "never")}
         />
