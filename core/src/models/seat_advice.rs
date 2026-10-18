@@ -471,6 +471,7 @@ mod tests {
             session_name: None,
             context_window: None,
             messages: None,
+            request_tx: None,
             allowed_mcp_tools: None,
             background_tasks: false,
         }

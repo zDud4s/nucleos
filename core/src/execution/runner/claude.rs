@@ -131,6 +131,11 @@ impl CommandRunner for ClaudeCliRunner {
         true
     }
 
+    /// The stream loop below fires `request_tx` on the CLI's `system/init` line.
+    fn reports_model_request(&self) -> bool {
+        true
+    }
+
     async fn run_prompt(
         &self,
         request: RunRequest,
@@ -339,6 +344,9 @@ impl CommandRunner for ClaudeCliRunner {
         let mut post_launch_error: Option<std::io::Error> = None;
         let mut policy_violation: Option<String> = None;
         let mut init_seen = false;
+        // Taken out of the request so the first `init` can consume it: one signal at most, and a
+        // stream that ends before any `init` drops it unsent.
+        let mut request_tx = request.request_tx.take();
         let mut progress_timeout_elapsed: Option<Duration> = None;
         let mut turns = TurnCounter::default();
         let mut turns_exceeded: Option<i64> = None;
@@ -409,6 +417,13 @@ impl CommandRunner for ClaudeCliRunner {
                     && v.get("subtype").and_then(|x| x.as_str()) == Some("init")
                 {
                     init_seen = true;
+                    // The earliest point a model request may be in flight — not `session_id`
+                    // above, which a `hook_started` line can carry before any request. Sent before
+                    // the policy check, since a run stopped by it may already have asked.
+                    // Best-effort, like `session_tx`: the watcher may be gone.
+                    if let Some(request_tx) = request_tx.take() {
+                        let _ = request_tx.send(());
+                    }
                     let advertised = advertised_tools_from_init(&v);
                     if let Some(reason) =
                         advertised_tools_violate(request.tool_policy, advertised.as_deref())
@@ -586,6 +601,7 @@ impl CommandRunner for ClaudeCliRunner {
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
             compacted,
+            model_requested: init_seen,
         })
     }
 }

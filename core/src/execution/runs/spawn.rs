@@ -218,6 +218,62 @@ pub async fn record_authored_prompt(
         .await;
 }
 
+/// Arms `runs.model_watch` and hands back the sender a runner fires once a model request may be
+/// in flight, with a task that records it in `runs.model_requested_at`.
+///
+/// Armed only for a runner that reports the request: an armed run that never records one is
+/// priced at zero, so arming one whose runner cannot say would read every such run as free. Armed
+/// HERE rather than on insert, because a launcher that forgot to arm stays "unknown" and keeps the
+/// estimate, while one that forgot to wire the sender would be the free one. The write lands before
+/// the sender exists, so no request can precede its watch; a failed write hands back `None`, which
+/// leaves the run unknown. Called once per attempt — a oneshot fires once — and `COALESCE` keeps
+/// the first attempt's arming time.
+pub async fn watch_model_request(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    runner: &dyn crate::execution::runner::CommandRunner,
+) -> Option<tokio::sync::oneshot::Sender<()>> {
+    if !runner.reports_model_request() {
+        return None;
+    }
+    let armed = sqlx::query("UPDATE runs SET model_watch = COALESCE(model_watch, ?) WHERE id = ?")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(pool)
+        .await;
+    if let Err(error) = armed {
+        tracing::warn!(
+            run_id,
+            %error,
+            "could not arm the model-request watch; the run keeps the time estimate"
+        );
+        return None;
+    }
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel::<()>();
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        // `Err` is a stream that ended before any request: there is nothing to record.
+        if request_rx.await.is_err() {
+            return;
+        }
+        let marked = sqlx::query(
+            "UPDATE runs SET model_requested_at = ? WHERE id = ? AND model_requested_at IS NULL",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(&pool)
+        .await;
+        if let Err(error) = marked {
+            tracing::warn!(
+                run_id,
+                %error,
+                "could not record that the run requested a model; its terminal write repairs it"
+            );
+        }
+    });
+    Some(request_tx)
+}
+
 /// How often a LIVE run's context fill is copied from the stream mirror into its row.
 ///
 /// Throttled on purpose. The mirror is rewritten on every streamed line — many per second — and the
@@ -471,6 +527,7 @@ pub(super) fn spawn_run(
                 steerable,
                 classifier_governs_tools,
                 messages: None,
+                request_tx: None,
                 // Autopilot runs pay for the ambient surface and call none of it.
                 ambient_mcp: false,
                 // Cloned rather than moved: the request is built once per attempt.
@@ -508,6 +565,9 @@ pub(super) fn spawn_run(
                 run_messages.lock().unwrap().insert(id, messages_tx);
                 request.messages = Some(messages_rx);
             }
+            // Armed before the runner holds the sender, so no request can precede its watch. A
+            // fresh channel per attempt, for the reason the two above give: a oneshot fires once.
+            request.request_tx = watch_model_request(&pool, id, runner.as_ref()).await;
             // What this launch itself wrote into the model's prompt, priced from the request that is
             // about to become an argument vector — and priced HERE, in the last statement before the
             // spawn, because `request` is moved into the runner on the very next line and nothing
@@ -612,7 +672,7 @@ pub(super) fn spawn_run(
                         None => (None, None, None),
                     };
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, context_fill = ?, context_peak = ?, compacted = ?, tools_used = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, context_fill = ?, context_peak = ?, compacted = ?, model_requested_at = COALESCE(model_requested_at, CASE WHEN ? THEN ? END), tools_used = ?, completed_at = ?, attempt = ?, gate_status = ?, gate_exit_code = ?, gate_output = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(terminal_status)
                     .bind(o.exit_code)
@@ -628,6 +688,9 @@ pub(super) fn spawn_run(
                     .bind(context_fill)
                     .bind(context_peak)
                     .bind(o.compacted)
+                    // Repairs a lost marker write: `COALESCE` keeps the recorder's own time.
+                    .bind(o.model_requested)
+                    .bind(&completed_at)
                     .bind(&tools_used)
                     .bind(&completed_at)
                     .bind(attempt as i64)

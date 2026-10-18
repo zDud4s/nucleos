@@ -335,6 +335,7 @@ impl CommandRunner for OllamaRunner {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             });
         }
 
@@ -350,6 +351,7 @@ impl CommandRunner for OllamaRunner {
             cache_creation_tokens: None,
             num_turns: None,
             compacted: false,
+            model_requested: false,
         })
     }
 }

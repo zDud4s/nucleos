@@ -138,6 +138,12 @@ pub struct RunOutcome {
     /// indistinguishable from a short question. The stream says it outright and this carries what
     /// it said.
     pub compacted: bool,
+    /// Whether the run reached the point a model request may be in flight (the CLI's `init`).
+    ///
+    /// The terminal write repairs `runs.model_requested_at` from it, so a best-effort marker write
+    /// that was lost cannot leave an armed run priced at zero. `false` from every runner that
+    /// cannot tell, which is harmless: an unarmed run is priced by the estimate either way.
+    pub model_requested: bool,
 }
 
 /// Barrier 1 of the two-barrier tool model: a restriction the CLI enforces on itself, so it holds
@@ -321,6 +327,12 @@ pub struct RunRequest {
     /// stdin as a `user` line, and stdin then closes, which is exactly the one-turn run the argv path
     /// performs. What it costs is the ability to say anything more.
     pub messages: Option<tokio::sync::mpsc::UnboundedReceiver<LaterTurn>>,
+    /// Fired once, at the first point a model request may be in flight; `None` watches nothing.
+    ///
+    /// "May have been sent", never "answered": pricing reads its absence on a finished, watched
+    /// run as a run that cost nothing. Only a runner whose `reports_model_request` is `true` ever
+    /// fires it, so a caller arms one only after asking. A stream that ends first drops it unsent.
+    pub request_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Whether this run opts in to the operator's ambient MCP surface.
     ///
     /// `false` everywhere today, and that is the point: the strict default closes the exfiltration

@@ -214,37 +214,50 @@ pub(super) async fn record_handoff_if_needed(
 /// terminated either way, and an approximation that failed to land leaves the budget exactly as it
 /// was before this existed, not the run broken.
 pub(super) async fn record_time_approx_cost(pool: &sqlx::SqlitePool, id: i64) {
-    let timestamps: (String, Option<String>) =
-        match sqlx::query_as("SELECT created_at, completed_at FROM runs WHERE id = ?")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-        {
-            Ok(timestamps) => timestamps,
-            Err(error) => {
-                tracing::warn!(
-                    run_id = id,
-                    %error,
-                    "could not read the terminated run's timestamps to approximate its cost"
-                );
-                return;
-            }
-        };
+    let (created, completed, model_watch, model_requested_at): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = match sqlx::query_as(
+        "SELECT created_at, completed_at, model_watch, model_requested_at FROM runs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(
+                run_id = id,
+                %error,
+                "could not read the terminated run's timestamps to approximate its cost"
+            );
+            return;
+        }
+    };
+
+    // Armed and never requested: nothing was spent, but write nothing rather than a 0. A cancel
+    // can race a late marker write, and a stored 0 would never be corrected; left NULL, the
+    // readers price the row through `unmeasured_usd`, which flips back to the estimate then.
+    if model_watch.is_some() && model_requested_at.is_none() {
+        return;
+    }
 
     let parse = |value: &str| {
         chrono::DateTime::parse_from_rfc3339(value).map(|when| when.with_timezone(&chrono::Utc))
     };
-    let Ok(created_at) = parse(&timestamps.0) else {
+    let Ok(created_at) = parse(&created) else {
         tracing::warn!(
             run_id = id,
-            created_at = timestamps.0,
+            created_at = created,
             "could not parse the terminated run's start time to approximate its cost"
         );
         return;
     };
     // No `completed_at` means the terminal write lost its race or never landed; the run is over
     // regardless, so `now` is the end of the only duration this can still measure.
-    let end = match timestamps.1.as_deref().map(parse).transpose() {
+    let end = match completed.as_deref().map(parse).transpose() {
         Ok(end) => end.unwrap_or_else(chrono::Utc::now),
         Err(_) => {
             tracing::warn!(

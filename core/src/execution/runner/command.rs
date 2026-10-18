@@ -92,6 +92,15 @@ pub trait CommandRunner: Send + Sync {
         false
     }
 
+    /// Whether this runner fires `RunRequest::request_tx` when a model request may be in flight.
+    ///
+    /// Defaulted to `false`, and only the Anthropic CLI runner answers `true`. A caller arms a
+    /// watcher only when this says so: armed on a runner that never fires, a run that did reach a
+    /// model would read as never having asked one, and be priced at nothing.
+    fn reports_model_request(&self) -> bool {
+        false
+    }
+
     /// What this runner would itself write into the model's prompt for `request`, or `None` for a
     /// runner whose prompt this daemon does not author.
     ///

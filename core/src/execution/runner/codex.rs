@@ -735,6 +735,7 @@ impl CommandRunner for CodexCliRunner {
             cache_creation_tokens: usage.cache_creation_tokens,
             num_turns: usage.num_turns,
             compacted: false,
+            model_requested: false,
         })
     }
 }

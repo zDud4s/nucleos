@@ -87,6 +87,10 @@ pub struct SpendRow {
     pub num_turns: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// When the model-request watcher was armed; `None` means unknown (see `unmeasured_usd`).
+    pub model_watch: Option<String>,
+    /// The first point a model request may have been in flight; `None` while none is known.
+    pub model_requested_at: Option<String>,
 }
 
 /// A run with an unknown cost still consumed at least this much wall time for approximation, so a
@@ -119,10 +123,36 @@ pub fn time_approx_usd(created_at: DateTime<Utc>, end: DateTime<Utc>, rate_per_h
     (seconds as f64 / 3600.0) * rate_per_hour
 }
 
+/// PURE: what a run that reported no cost is priced at. `time_approx_usd`, except that $0 is
+/// allowed when we MEASURED that no model request was sent (spec §8.5, decision of 2026-07-20:
+/// an unmeasured cost is never free).
+///
+/// - `model_watch` NULL: the watcher was never armed, so nothing is known; the estimate, as before.
+/// - armed and a request marked: the estimate.
+/// - armed, no request, `terminal`: nothing was ever sent, so 0.
+/// - armed, no request, still open: the estimate, because the marker write may lag the request.
+///   A late marker also flips an ended run back to the estimate, since this is recomputed on read.
+pub(crate) fn unmeasured_usd(
+    created_at: DateTime<Utc>,
+    end: DateTime<Utc>,
+    model_watch: Option<&str>,
+    model_requested_at: Option<&str>,
+    terminal: bool,
+    rate_per_hour: f64,
+) -> f64 {
+    if model_watch.is_some() && model_requested_at.is_none() && terminal {
+        return 0.0;
+    }
+    time_approx_usd(created_at, end, rate_per_hour)
+}
+
 fn time_approx(row: &SpendRow, now: DateTime<Utc>, rate_per_hour: f64) -> f64 {
-    time_approx_usd(
+    unmeasured_usd(
         row.created_at,
         row.completed_at.unwrap_or(now),
+        row.model_watch.as_deref(),
+        row.model_requested_at.as_deref(),
+        row.completed_at.is_some(),
         rate_per_hour,
     )
 }
@@ -209,6 +239,8 @@ type RawRow = (
     Option<i64>,
     String,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 /// The modes that count as autonomy spend, and this list IS the definition of the phrase.
@@ -253,7 +285,7 @@ type RawRow = (
 async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
-                created_at, completed_at
+                created_at, completed_at, model_watch, model_requested_at
          FROM runs
          WHERE mode IN ('shadow', 'worktree', 'email_triage', 'council', 'team')
             OR from_relay_id IS NOT NULL",
@@ -272,7 +304,7 @@ async fn autonomous_rows(pool: &SqlitePool) -> sqlx::Result<Vec<SpendRow>> {
 async fn job_rows(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Vec<SpendRow>> {
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
-                created_at, completed_at
+                created_at, completed_at, model_watch, model_requested_at
          FROM runs
          WHERE job_id = ?",
     )
@@ -300,7 +332,7 @@ async fn relay_chain_rows(pool: &SqlitePool, root_run_id: i64) -> sqlx::Result<V
                JOIN chain ON c.sending_run_id = chain.id
          )
          SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
-                created_at, completed_at
+                created_at, completed_at, model_watch, model_requested_at
          FROM runs
          WHERE id IN chain AND from_relay_id IS NOT NULL",
     )
@@ -359,7 +391,7 @@ pub async fn project_spend(
     let cfg = load_budget_config(pool).await?;
     let raw: Vec<RawRow> = sqlx::query_as(
         "SELECT session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens, num_turns,
-                created_at, completed_at
+                created_at, completed_at, model_watch, model_requested_at
          FROM runs
          WHERE project_id = ? AND created_at >= ? AND created_at < ?",
     )
@@ -490,6 +522,8 @@ fn spend_rows(raw: Vec<RawRow>) -> sqlx::Result<Vec<SpendRow>> {
                 num_turns,
                 created_at,
                 completed_at,
+                model_watch,
+                model_requested_at,
             )| {
                 Ok(SpendRow {
                     session_id,
@@ -500,6 +534,8 @@ fn spend_rows(raw: Vec<RawRow>) -> sqlx::Result<Vec<SpendRow>> {
                     num_turns,
                     created_at: parse(&created_at)?,
                     completed_at: completed_at.as_deref().map(parse).transpose()?,
+                    model_watch,
+                    model_requested_at,
                 })
             },
         )
@@ -712,6 +748,8 @@ mod tests {
             num_turns: Some(12),
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:00:30Z")),
+            model_watch: None,
+            model_requested_at: None,
         };
         let now = ts("2026-07-20T11:00:00Z");
 
@@ -730,6 +768,8 @@ mod tests {
             num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:05:00Z")),
+            model_watch: None,
+            model_requested_at: None,
         }];
         approx(
             compute_spend(&rows, ts("2026-07-20T11:00:00Z"), &cfg(3.0)),
@@ -752,6 +792,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
             SpendRow {
                 session_id: Some("s1".into()),
@@ -762,6 +804,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:40:00Z"),
                 completed_at: Some(ts("2026-07-20T10:50:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
         ];
         approx(
@@ -786,6 +830,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
             SpendRow {
                 session_id: Some("s1".into()),
@@ -796,6 +842,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:40:00Z"),
                 completed_at: Some(ts("2026-07-20T10:50:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
         ];
         approx(
@@ -816,6 +864,8 @@ mod tests {
             num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:30:00Z")),
+            model_watch: None,
+            model_requested_at: None,
         }];
         let spent = compute_spend(&rows, ts("2026-07-20T11:00:00Z"), &cfg(3.0));
         assert!(spent > 0.0);
@@ -835,6 +885,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
             SpendRow {
                 session_id: Some("s1".into()),
@@ -845,6 +897,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:40:00Z"),
                 completed_at: Some(ts("2026-07-20T11:10:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
         ];
         approx(
@@ -865,6 +919,8 @@ mod tests {
             num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: Some(ts("2026-07-20T10:00:00Z")),
+            model_watch: None,
+            model_requested_at: None,
         }];
         approx(
             compute_spend(&rows, ts("2026-07-20T11:00:00Z"), &cfg(3.0)),
@@ -885,6 +941,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:05:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
             SpendRow {
                 session_id: None,
@@ -895,6 +953,8 @@ mod tests {
                 num_turns: None,
                 created_at: ts("2026-07-20T10:00:00Z"),
                 completed_at: Some(ts("2026-07-20T10:30:00Z")),
+                model_watch: None,
+                model_requested_at: None,
             },
         ];
         approx(
@@ -915,6 +975,8 @@ mod tests {
             num_turns: None,
             created_at: ts("2026-07-20T10:00:00Z"),
             completed_at: None,
+            model_watch: None,
+            model_requested_at: None,
         }];
         approx(
             compute_spend(&rows, ts("2026-07-20T10:30:00Z"), &cfg(3.0)),
@@ -936,9 +998,13 @@ mod tests {
             num_turns: None,
             created_at: ts("2026-10-15T20:10:41Z"),
             completed_at: Some(ts("2026-10-17T16:44:50Z")),
+            model_watch: None,
+            model_requested_at: None,
         };
         let open = SpendRow {
             completed_at: None,
+            model_watch: None,
+            model_requested_at: None,
             ..ended.clone()
         };
         let now = ts("2026-10-18T00:00:00Z");
@@ -964,10 +1030,86 @@ mod tests {
             num_turns: None,
             created_at: ts("2026-07-20T09:00:00Z"),
             completed_at: Some(ts("2026-07-20T12:00:00Z")),
+            model_watch: None,
+            model_requested_at: None,
         }];
         approx(
             compute_spend(&rows, ts("2026-07-20T13:00:00Z"), &cfg(3.0)),
             9.0,
+        );
+    }
+
+    fn unwatched_or_armed(watch: Option<&str>, requested: Option<&str>, terminal: bool) -> f64 {
+        unmeasured_usd(
+            ts("2026-10-01T10:00:00Z"),
+            ts("2026-10-01T11:00:00Z"),
+            watch,
+            requested,
+            terminal,
+            3.0,
+        )
+    }
+
+    #[test]
+    fn an_unwatched_run_keeps_the_time_estimate() {
+        approx(unwatched_or_armed(None, None, true), 3.0);
+        approx(unwatched_or_armed(None, None, false), 3.0);
+    }
+
+    #[test]
+    fn an_armed_run_that_ended_before_any_request_costs_nothing() {
+        approx(
+            unwatched_or_armed(Some("2026-10-01T10:00:00Z"), None, true),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn an_armed_run_still_open_is_still_estimated() {
+        approx(
+            unwatched_or_armed(Some("2026-10-01T10:00:00Z"), None, false),
+            3.0,
+        );
+    }
+
+    #[test]
+    fn a_requested_run_without_a_cost_is_still_estimated() {
+        approx(
+            unwatched_or_armed(
+                Some("2026-10-01T10:00:00Z"),
+                Some("2026-10-01T10:00:05Z"),
+                true,
+            ),
+            3.0,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ceiling_counts_nothing_for_a_run_that_never_requested() {
+        let pool = test_pool().await;
+        for (watch, requested) in [
+            (Some("2026-07-10T09:00:00Z"), None),
+            (Some("2026-07-10T09:00:00Z"), Some("2026-07-10T09:00:05Z")),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, created_at, completed_at, model_watch,
+                                   model_requested_at)
+                 VALUES ('p', 'cancelled', 'worktree', '2026-07-10T09:00:00Z',
+                         '2026-07-10T10:00:00Z', ?, ?)",
+            )
+            .bind(watch)
+            .bind(requested)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let rows = autonomous_rows(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Only the run that may have reached the model is priced: one hour at the default $3/h.
+        approx(
+            compute_spend(&rows, ts("2026-07-10T12:00:00Z"), &cfg(3.0)),
+            3.0,
         );
     }
 

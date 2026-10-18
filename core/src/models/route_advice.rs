@@ -1060,6 +1060,10 @@ impl CommandRunner for RoutedRunner {
         self.inner.honours_max_budget()
     }
 
+    fn reports_model_request(&self) -> bool {
+        self.inner.reports_model_request()
+    }
+
     fn router(&self) -> Option<Arc<Router>> {
         Some(Arc::clone(&self.router))
     }
@@ -1118,6 +1122,7 @@ mod tests {
             cache_creation_tokens: None,
             num_turns: None,
             compacted: false,
+            model_requested: false,
         }
     }
 
@@ -1173,6 +1178,10 @@ mod tests {
         ) -> Option<crate::prompt_budget::AuthoredPrompt> {
             Some(crate::execution::runner::authored_prompt(request))
         }
+
+        fn reports_model_request(&self) -> bool {
+            true
+        }
     }
 
     fn request() -> RunRequest {
@@ -1206,6 +1215,7 @@ mod tests {
             session_name: None,
             context_window: None,
             messages: None,
+            request_tx: None,
             allowed_mcp_tools: None,
             background_tasks: false,
         }
@@ -1405,6 +1415,7 @@ mod tests {
             fronted.authored_prompt(&request()),
             inner.authored_prompt(&request())
         );
+        assert!(fronted.reports_model_request());
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = Arc::new(std::sync::Mutex::new(String::new()));

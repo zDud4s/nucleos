@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use sqlx::SqlitePool;
 
 use super::{TopRun, Window};
-use crate::governance::budget::{parse_run_timestamp, time_approx_usd};
+use crate::governance::budget::{parse_run_timestamp, unmeasured_usd};
 
 /// One finished run, as the analytics reads it.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -24,6 +24,9 @@ pub struct RunRow {
     pub cache_creation_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub gate_status: Option<String>,
+    /// When the model-request watcher was armed, and the first possible request (`unmeasured_usd`).
+    pub model_watch: Option<String>,
+    pub model_requested_at: Option<String>,
 }
 
 impl RunRow {
@@ -67,7 +70,8 @@ pub async fn finished_runs(
 ) -> sqlx::Result<Vec<RunRow>> {
     sqlx::query_as::<_, RunRow>(
         "SELECT id, project_id, mode, session_id, created_at, completed_at, cost_usd,
-                input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, gate_status
+                input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, gate_status,
+                model_watch, model_requested_at
            FROM runs
           WHERE completed_at IS NOT NULL AND completed_at >= ?1 AND completed_at < ?2
             AND (?3 IS NULL OR project_id = ?3)
@@ -107,12 +111,17 @@ pub fn price(rows: &[RunRow], rate_per_hour: f64) -> sqlx::Result<Vec<Priced<'_>
             }),
             None => Ok(Priced {
                 row,
-                usd: time_approx_usd(
+                // Armed and never requested: a measured zero, not an estimate.
+                estimated: row.model_watch.is_none() || row.model_requested_at.is_some(),
+                usd: unmeasured_usd(
                     parse_run_timestamp(&row.created_at)?,
                     parse_run_timestamp(&row.completed_at)?,
+                    row.model_watch.as_deref(),
+                    row.model_requested_at.as_deref(),
+                    // Finished runs only: `completed_at` is not optional here.
+                    true,
                     rate_per_hour,
                 ),
-                estimated: true,
             }),
         })
         .collect()
@@ -240,6 +249,8 @@ mod tests {
             cache_creation_tokens,
             output_tokens,
             gate_status: None,
+            model_watch: None,
+            model_requested_at: None,
         }
     }
 
@@ -352,5 +363,30 @@ mod tests {
             "four hours at $3/h, got {}",
             priced[0].usd
         );
+    }
+
+    /// Armed and never requested is a measurement, so the page shows $0 and does not mark it as
+    /// an estimate; an unwatched run keeps the duration price.
+    #[test]
+    fn price_marks_a_never_requested_run_as_measured_zero() {
+        let mut never = row(1, None, "2026-10-02T10:00:00Z", None, None);
+        never.created_at = "2026-10-02T09:00:00Z".into();
+        never.model_watch = Some("2026-10-02T09:00:00Z".into());
+        let mut requested = never.clone();
+        requested.id = 2;
+        requested.model_requested_at = Some("2026-10-02T09:01:00Z".into());
+        let mut unwatched = never.clone();
+        unwatched.id = 3;
+        unwatched.model_watch = None;
+        let rows = vec![never, requested, unwatched];
+
+        let priced = price(&rows, 3.0).unwrap();
+
+        assert_eq!(priced[0].usd, 0.0);
+        assert!(!priced[0].estimated);
+        assert!((priced[1].usd - 3.0).abs() < 1e-9);
+        assert!(priced[1].estimated);
+        assert!((priced[2].usd - 3.0).abs() < 1e-9);
+        assert!(priced[2].estimated);
     }
 }

@@ -1484,6 +1484,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             ..Default::default()
         });
@@ -1552,6 +1553,7 @@ mod tests {
             cache_creation_tokens: Some(15),
             num_turns: Some(2),
             compacted: false,
+            model_requested: false,
         }
     }
 
@@ -1636,6 +1638,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             ..Default::default()
         });
@@ -2050,6 +2053,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             ..Default::default()
         });
@@ -3350,6 +3354,7 @@ mod tests {
                 cache_creation_tokens: None,
                 num_turns: None,
                 compacted: false,
+                model_requested: false,
             })),
             ..Default::default()
         })
@@ -4534,6 +4539,149 @@ mod tests {
         }
     }
 
+    /// The two watcher columns of a settled turn. With `wait_for_marker`, it also waits for
+    /// `model_requested_at`, which the recorder task writes on its own and may land after the
+    /// terminal write.
+    async fn turn_watcher_columns(
+        pool: &SqlitePool,
+        id: i64,
+        wait_for_marker: bool,
+    ) -> (Option<String>, Option<String>) {
+        let mut last: (Option<String>, Option<String>) = (None, None);
+        for _ in 0..200 {
+            last = sqlx::query_as("SELECT model_watch, model_requested_at FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if !wait_for_marker || last.1.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        last
+    }
+
+    /// A chat turn on a runner that reports the request is armed before the runner starts, and the
+    /// request lands in its row. The canned outcome reports nothing, so the recorder wrote it.
+    #[tokio::test]
+    async fn a_watched_chat_turn_is_armed_before_the_runner_starts() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner {
+            reports_request: true,
+            ..Default::default()
+        });
+
+        let id = send_message(&state, "watched-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+        let (model_watch, model_requested_at) = turn_watcher_columns(&state.pool, id, true).await;
+
+        assert!(
+            model_watch.is_some(),
+            "a turn whose runner reports was not armed"
+        );
+        assert!(
+            model_requested_at.is_some(),
+            "the reported request was not recorded"
+        );
+    }
+
+    /// Arming a turn whose runner never reports would price every such turn at zero.
+    #[tokio::test]
+    async fn a_chat_turn_whose_runner_never_reports_is_never_armed() {
+        let state = test_state().await;
+
+        let id = send_message(&state, "unwatched-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+        let (model_watch, model_requested_at) = turn_watcher_columns(&state.pool, id, false).await;
+
+        assert_eq!(model_watch, None, "an unreporting runner's turn was armed");
+        assert_eq!(model_requested_at, None);
+    }
+
+    /// The marker write is best-effort, so the outcome's own account repairs a lost one — here on
+    /// the arm for a turn that answered nothing, which writes its own terminal row.
+    #[tokio::test]
+    async fn a_chat_turns_terminal_write_repairs_a_lost_request_marker() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner {
+            reports_request: true,
+            loses_request_signal: true,
+            canned: Mutex::new(Some(crate::execution::runner::RunOutcome {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                session_id: Some("s".to_string()),
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+                model_requested: true,
+            })),
+            ..Default::default()
+        });
+
+        let id = send_message(&state, "lost-marker-chat", "hello", Origin::Shell)
+            .await
+            .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+        let (model_watch, model_requested_at) = turn_watcher_columns(&state.pool, id, false).await;
+
+        assert_eq!(
+            status, "failed",
+            "the premise: a turn with no result answered nothing"
+        );
+        assert!(model_watch.is_some(), "the premise: this turn was armed");
+        assert!(
+            model_requested_at.is_some(),
+            "the terminal write must record the request the outcome reports"
+        );
+    }
+
+    /// A kept process sent its `init` for an earlier turn, so a later turn is marked by the turn
+    /// itself, before it writes its line, rather than by the runner.
+    #[tokio::test]
+    async fn a_kept_processs_later_turn_is_armed_and_marked() {
+        let fake = Arc::new(FakeCommandRunner {
+            reports_request: true,
+            ..Default::default()
+        });
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let _root = rooted_chat(&state, "watched-warm").await;
+
+        let first = send_message(&state, "watched-warm", "primeiro", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, first).await;
+        let second = send_message(&state, "watched-warm", "segundo", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, second).await;
+
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            1,
+            "the premise: the second turn went to the kept process"
+        );
+        for (turn, id) in [("first", first), ("second", second)] {
+            let (model_watch, model_requested_at) =
+                turn_watcher_columns(&state.pool, id, true).await;
+            assert!(model_watch.is_some(), "the {turn} turn was not armed");
+            assert!(
+                model_requested_at.is_some(),
+                "the {turn} turn's request was not recorded"
+            );
+        }
+    }
+
     /// What waited is answered by the process that was busy when it was typed.
     ///
     /// The two halves of this branch meet here and nowhere else. A message typed while a
@@ -4843,6 +4991,7 @@ mod tests {
             steerable: false,
             classifier_governs_tools: false,
             messages: None,
+            request_tx: None,
             ambient_mcp: false,
             model: Some("sonnet".to_owned()),
             effort: None,
@@ -5391,6 +5540,7 @@ mod tests {
             cache_creation_tokens: None,
             num_turns: None,
             compacted: false,
+            model_requested: false,
         });
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         *fake.unprompted.lock().unwrap() = Some(rx);
@@ -5602,6 +5752,7 @@ mod tests {
             cache_creation_tokens: None,
             num_turns: None,
             compacted: false,
+            model_requested: false,
         });
         let (unprompted, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         *fake.unprompted.lock().unwrap() = Some(rx);
@@ -7167,6 +7318,7 @@ mod tests {
             cache_creation_tokens: None,
             num_turns: None,
             compacted: false,
+            model_requested: false,
         }
     }
 
