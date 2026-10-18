@@ -246,6 +246,118 @@ def cases():
            ).splitlines()[-1], True)
 
 
+    # --- prices: Anthropic's page ------------------------------------------------
+    prices, tiered, problems = refresh_models.anthropic_prices(PRICING_MD)
+    yield ("pricing_markdown_fixture_parses_to_per_million_prices",
+           prices["claude-opus-4-7"],
+           {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25, "source": "anthropic"})
+    yield ("a footnote marker does not stop a price from parsing",
+           prices["claude-sonnet-5"]["input"], 2.0)
+    yield ("a retired model's link is not part of its id",
+           "claude-opus-4-1" in prices, True)
+    yield ("a tiered model is named, written without price, and is not a problem",
+           (sorted(tiered), "claude-haiku-5-5" in prices, problems), (["claude-haiku-5-5"], False, []))
+    broken = PRICING_MD.replace("| $25 / MTok |", "| ask sales |")
+    prices, _, problems = refresh_models.anthropic_prices(broken)
+    yield ("price_unreadable_is_written_without_price_and_exits_1 (parser half)",
+           (prices["claude-opus-4-7"], len(problems)),
+           ({"input": None, "output": None, "cache_read": None, "cache_write": None, "source": "anthropic"}, 1))
+    renamed = PRICING_MD.replace("Output tokens", "Output")
+    yield ("pricing_page_format_change_fails_loudly (parser half): a renamed column is None, not a guess",
+           refresh_models.anthropic_prices(renamed), None)
+    yield ("a page with no Model pricing section is None",
+           refresh_models.anthropic_prices("# Pricing\n\nnothing here\n"), None)
+    yield ("normalise_id drops context and date suffixes and dots in claude ids",
+           [refresh_models.normalise_id(i) for i in
+            ["Claude-Sonnet-5[1m]", "claude-sonnet-5-20261001", "claude-opus-4.6", "gpt-5.5", "claude-x-latest"]],
+           ["claude-sonnet-5", "claude-sonnet-5", "claude-opus-4-6", "gpt-5.5", "claude-x"])
+
+    # --- prices: OpenRouter ---------------------------------------------------------
+    catalogue = served(
+        {"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001",
+                                              "input_cache_read": "0.000000125"}},
+        {"id": "openai/gpt-5.5:batch", "pricing": {"prompt": "0.0000006", "completion": "0.000005"}},
+        {"id": "openai/gpt-6-tiered", "pricing": {"prompt": "0.000002", "completion": "0.00001",
+                                                   "overrides": [{"min_prompt_tokens": 272000}]}},
+        {"id": "anthropic/claude-opus-4.7", "pricing": {"prompt": "0.000005", "completion": "0.000025",
+                                                         "input_cache_read": "0.0000005",
+                                                         "input_cache_write": "0.00000625"}},
+        {"id": "google/gemini-x", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+    )
+    openai, tiered, crosscheck = refresh_models.openrouter_prices(catalogue)
+    yield ("openrouter_pricing_sample_converts_per_token_to_per_million",
+           openai["gpt-5.5"],
+           {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": None, "source": "openrouter"})
+    yield ("batch variants and other vendors are not priced; tiered ones are named",
+           (sorted(openai), sorted(tiered)), (["gpt-5.5"], ["gpt-6-tiered"]))
+    yield ("anthropic entries come back apart, normalised, for the cross-check only",
+           crosscheck["claude-opus-4-7"]["output"], 25.0)
+    vendor = {"claude-opus-4-7": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25,
+                                  "source": "anthropic"}}
+    other = {"claude-opus-4-7": {"input": 5.2, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25}}
+    merged, warnings = refresh_models.crosscheck(vendor, other)
+    yield ("crosscheck_divergence_is_warned_and_vendor_price_wins",
+           (merged["claude-opus-4-7"]["input"], len(warnings)), (5.0, 1))
+    merged, warnings = refresh_models.crosscheck(vendor, {"claude-opus-4-7": {"input": 5.04}})
+    yield ("a divergence under 1% is not warned", warnings, [])
+
+    # --- prices: rendering and splicing ----------------------------------------------
+    original = ('local_assistant_model: "qwen"\n\n# banner\nassistant_choices:\n  - { id: "opus" }\n\n'
+                'prices_as_of: "2026-01-01"\nmodel_prices:\n  old: { input: 1.0 }\n\nembedding_model: x\n')
+    block = refresh_models.render_prices(
+        {"claude-opus-4-7": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25,
+                             "source": "anthropic"}}, "2026-10-18")
+    spliced = refresh_models.splice(original, "model_prices", block["model_prices"])
+    spliced = refresh_models.splice(spliced, "prices_as_of", block["prices_as_of"])
+    yield ("splice_replaces_model_prices_block_and_leaves_other_keys_intact",
+           ("old:" in spliced, 'prices_as_of: "2026-10-18"' in spliced,
+            'local_assistant_model: "qwen"' in spliced, "assistant_choices:" in spliced,
+            "embedding_model: x" in spliced, spliced.count("model_prices:")),
+           (False, True, True, True, True, 1))
+    yield ("a price row is flow-style with explicit nulls",
+           refresh_models.render_price_row("gpt-5.5", {"input": 1.25, "output": 10.0, "cache_read": 0.125,
+                                                       "cache_write": None, "source": "openrouter"}),
+           '  gpt-5.5: { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: null, source: openrouter }')
+    good = '{"data": [{"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001"}}]}'
+    with fake_bodies({refresh_models.PRICING_DOC: PRICING_MD, refresh_models.OPENROUTER_MODELS: good}):
+        blocks, complained = refresh_models.refresh_prices("2026-10-18")
+    yield ("a clean read writes both sources and does not complain",
+           ("claude-opus-4-7:" in blocks["model_prices"], "gpt-5.5:" in blocks["model_prices"], complained),
+           (True, True, False))
+    with fake_bodies({refresh_models.PRICING_DOC: broken, refresh_models.OPENROUTER_MODELS: good}):
+        blocks, complained = refresh_models.refresh_prices("2026-10-18")
+    yield ("price_unreadable_is_written_without_price_and_exits_1",
+           ("claude-opus-4-7: { input: null" in blocks["model_prices"], complained), (True, True))
+    with fake_bodies({refresh_models.PRICING_DOC: renamed, refresh_models.OPENROUTER_MODELS: good}):
+        yield ("pricing_page_format_change_fails_loudly: nothing written, complained",
+               refresh_models.refresh_prices("2026-10-18"), (None, True))
+    with no_network():
+        yield ("an unreachable pricing page writes nothing and complains",
+               refresh_models.refresh_prices("2026-10-18"), (None, True))
+
+
+PRICING_MD = """---
+title: Pricing
+---
+
+## Model pricing
+
+| Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| Claude Opus 4.7 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
+| Claude Sonnet 5 | $2 / MTok<sup>3</sup> | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok<sup>3</sup> |
+| Claude Opus 4.1 ([retired, except on Bedrock](https://example/deprecations)) | $15 / MTok | $18.75 / MTok | $30 / MTok | $1.50 / MTok | $75 / MTok |
+| Claude Haiku 5.5 (for prompts up to 100,000 tokens) | $0.10 / MTok | $0.125 / MTok | $0.20 / MTok | $0.01 / MTok | $0.50 / MTok |
+| Claude Haiku 5.5 (for prompts over 100,000 tokens) | $0.50 / MTok | $0.625 / MTok | $1 / MTok | $0.05 / MTok | $2.50 / MTok |
+
+## Cloud platform pricing
+
+| Concept | Details |
+| --- | --- |
+| **Billing unit** | CCU |
+"""
+
+
 def refresh_hosted_one(model_id, name):
     """The one-row case, which most of the label assertions are."""
     return refresh_models.refresh_hosted(
@@ -279,6 +391,11 @@ class _Patch:
 
 def no_network():
     return _Patch(lambda _url: None)
+
+
+def fake_bodies(by_url):
+    """Answer each URL with its own body; an unknown URL is unreachable."""
+    return _Patch(lambda url: by_url.get(url))
 
 
 def fake_body(text):

@@ -3458,4 +3458,81 @@ embedding_model: mxbai-embed-large
         .unwrap();
         assert_eq!(named.embedding_model, "mxbai-embed-large");
     }
+
+    const PRICED: &str = "claude_model: opus\ncodex_model: gpt\n\
+prices_as_of: \"2026-10-18\"\n\
+model_prices:\n  claude-sonnet-5: { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75, source: anthropic }\n  \
+gpt-5.5: { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: null, source: openrouter }\n";
+
+    #[test]
+    fn model_prices_parse_with_their_date_and_nulls() {
+        let config = parse_models_config(PRICED).unwrap();
+        assert_eq!(config.prices_as_of.as_deref(), Some("2026-10-18"));
+        let gpt = &config.model_prices["gpt-5.5"];
+        assert_eq!((gpt.input, gpt.cache_write), (Some(1.25), None));
+        // A file the script never touched has neither key, and that is not an error.
+        let bare = parse_models_config("claude_model: opus\ncodex_model: gpt\n").unwrap();
+        assert!(bare.model_prices.is_empty() && bare.prices_as_of.is_none());
+    }
+
+    #[test]
+    fn model_prices_drop_only_a_bad_entry() {
+        // Owner, 2026-10-18 (open decision 3): one bad price must not take model routing down with it.
+        for bad in ["-1.0", ".nan", ".inf"] {
+            let text = format!(
+                "claude_model: opus\ncodex_model: gpt\nmodel_prices:\n  m: {{ input: {bad}, output: 1.0 }}\n  \
+ok: {{ input: 2.0, output: 8.0 }}\n"
+            );
+            let config = parse_models_config(&text).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert!(
+                !config.model_prices.contains_key("m"),
+                "{bad}: the bad entry is dropped"
+            );
+            assert!(
+                config.price_of("m").is_none(),
+                "{bad}: and is unpriced, never priced at zero"
+            );
+            assert_eq!(
+                config.price_of("ok").unwrap().input,
+                Some(2.0),
+                "{bad}: its sibling still loads"
+            );
+            assert_eq!(
+                (config.claude_model.as_str(), config.codex_model.as_str()),
+                ("opus", "gpt"),
+                "{bad}: routing still loads"
+            );
+        }
+    }
+
+    #[test]
+    fn model_id_matches_exact_then_normalised_never_by_prefix() {
+        let config = parse_models_config(PRICED).unwrap();
+        for hit in [
+            "claude-sonnet-5",
+            "claude-sonnet-5-20261001",
+            "claude-sonnet-5[1m]",
+            "Claude-Sonnet-5-latest",
+        ] {
+            assert!(config.price_of(hit).is_some(), "{hit} should be priced");
+        }
+        for miss in ["claude-sonnet-5-x", "sonnet", "claude-sonnet", "gpt-5"] {
+            assert!(
+                config.price_of(miss).is_none(),
+                "{miss} must not borrow a neighbour's price"
+            );
+        }
+    }
+
+    #[test]
+    fn model_prices_are_reread_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_CONFIG_FILE);
+        std::fs::write(&path, PRICED).unwrap();
+        let first = load_models_config(&path).unwrap();
+        std::fs::write(&path, PRICED.replace("input: 3.0", "input: 4.0")).unwrap();
+        let second = load_models_config(&path).unwrap();
+        assert_eq!(first.price_of("claude-sonnet-5").unwrap().input, Some(3.0));
+        assert_eq!(second.price_of("claude-sonnet-5").unwrap().input, Some(4.0));
+    }
 }
