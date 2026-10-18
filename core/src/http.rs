@@ -33,6 +33,7 @@ use crate::state::AppState;
 mod admin;
 mod agents;
 mod analytics;
+mod analytics_pipeline;
 mod brains;
 mod chat_edit;
 mod chat_turns;
@@ -113,6 +114,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(admin::routes())
         .merge(agents::routes())
         .merge(analytics::routes())
+        .merge(analytics_pipeline::routes())
         .merge(brains::routes())
         .merge(chat_edit::routes())
         .merge(chat_turns::routes())
@@ -24641,6 +24643,70 @@ mod tests {
             "/analytics/quota",
             "/projects/alpha/analytics",
         ] {
+            let response = api_token_request(state.clone(), "GET", uri, &token, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let anonymous = build_router(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        db.close().await;
+    }
+
+    /// Spec §5.2 and §7.1: the envelope and the MVP blocks, globally and per project.
+    #[tokio::test]
+    async fn analytics_pipeline_answers_the_envelope_globally_and_per_project() {
+        let state = test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'off')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let global = get_json(&state, "/analytics/pipeline?days=7").await;
+        assert_eq!(global["scope"], "global", "{global}");
+        assert_eq!(global["days"], 7, "{global}");
+        assert_eq!(global["landing"]["total"], 0, "{global}");
+        assert!(
+            global["gate"]["pass_rate"].is_null(),
+            "an empty window has no rate: {global}"
+        );
+        assert!(global["history"].is_object(), "{global}");
+        let project = get_json(&state, "/projects/alpha/analytics/pipeline").await;
+        assert_eq!(project["scope"], "project", "{project}");
+        assert_eq!(project["days"], 30, "days defaults to 30: {project}");
+    }
+
+    /// Spec §11: the same validation and errors as `/analytics`.
+    #[tokio::test]
+    async fn analytics_pipeline_rejects_days_outside_7_30_90_and_unknown_projects() {
+        let state = test_state().await;
+        for uri in [
+            "/analytics/pipeline?days=14",
+            "/analytics/pipeline?days=abc",
+            "/projects/alpha/analytics/pipeline?days=0",
+        ] {
+            assert_eq!(
+                get_status(&state, uri).await,
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            get_status(&state, "/projects/nobody/analytics/pipeline").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Spec §9: through the production router, a read-only key reaches both and no token neither.
+    #[tokio::test]
+    async fn analytics_pipeline_is_readable_with_a_read_only_key_and_not_without_a_token() {
+        let (state, db) = file_test_state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('alpha', 'off')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        for uri in ["/analytics/pipeline", "/projects/alpha/analytics/pipeline"] {
             let response = api_token_request(state.clone(), "GET", uri, &token, None).await;
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
             let anonymous = build_router(state.clone())

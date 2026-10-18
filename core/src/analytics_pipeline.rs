@@ -4,6 +4,7 @@
 //! `{"error": ...}` and the others still come (spec D5). Write side lives in `sampler` (slot
 //! samples) and in `verify::postgate::record_transition` (colour changes).
 
+pub mod gate;
 pub mod landing;
 pub mod sampler;
 pub mod stats;
@@ -60,6 +61,7 @@ pub struct PipelineReport {
     pub previous: Span,
     pub history: History,
     pub landing: Block<landing::Landing>,
+    pub gate: Block<gate::Gate>,
 }
 
 fn rfc3339(at: DateTime<Utc>) -> String {
@@ -143,6 +145,7 @@ pub async fn build(
         previous: window.previous().span(),
         history: history(pool).await,
         landing: block("landing", landing::read(pool, project, window, now).await),
+        gate: block("gate", gate::read(pool, project, window).await),
     }
 }
 
