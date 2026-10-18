@@ -34,7 +34,13 @@ pub fn snapshot_of(readout: &crate::execution::concurrency::Readout) -> Snapshot
         projects: readout
             .projects
             .iter()
-            .map(|project| (project.project_id.clone(), project.slots.len() as i64, project.limit))
+            .map(|project| {
+                (
+                    project.project_id.clone(),
+                    project.slots.len() as i64,
+                    project.limit,
+                )
+            })
             .collect(),
     }
 }
@@ -242,8 +248,14 @@ async fn daily_maintenance(pool: &SqlitePool, now: DateTime<Utc>) {
     }
     for (what, result) in [
         ("raw slot samples", prune_raw(pool, now, PRUNE_BATCH).await),
-        ("daily slot samples", prune_daily(pool, now, PRUNE_BATCH).await),
-        ("post-merge gate transitions", prune_transitions(pool, now, PRUNE_BATCH).await),
+        (
+            "daily slot samples",
+            prune_daily(pool, now, PRUNE_BATCH).await,
+        ),
+        (
+            "post-merge gate transitions",
+            prune_transitions(pool, now, PRUNE_BATCH).await,
+        ),
     ] {
         match result {
             Ok(0) => {}
@@ -349,10 +361,22 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let mut last = Last::new();
         let ticks = [
-            ("2026-10-17T10:00:00Z", snapshot(1, &[("busy", 1, 2), ("idle", 0, 1)])),
-            ("2026-10-17T10:01:00Z", snapshot(1, &[("busy", 1, 2), ("idle", 0, 1)])),
-            ("2026-10-17T10:02:00Z", snapshot(0, &[("busy", 0, 2), ("idle", 0, 1)])),
-            ("2026-10-17T10:03:00Z", snapshot(0, &[("busy", 0, 2), ("idle", 0, 1)])),
+            (
+                "2026-10-17T10:00:00Z",
+                snapshot(1, &[("busy", 1, 2), ("idle", 0, 1)]),
+            ),
+            (
+                "2026-10-17T10:01:00Z",
+                snapshot(1, &[("busy", 1, 2), ("idle", 0, 1)]),
+            ),
+            (
+                "2026-10-17T10:02:00Z",
+                snapshot(0, &[("busy", 0, 2), ("idle", 0, 1)]),
+            ),
+            (
+                "2026-10-17T10:03:00Z",
+                snapshot(0, &[("busy", 0, 2), ("idle", 0, 1)]),
+            ),
         ];
         for (moment, reading) in ticks {
             write_tick(&pool, at(moment), Ok(reading), &mut last).await;
@@ -364,13 +388,20 @@ mod tests {
             .iter()
             .filter(|row| row.1.as_deref() == Some("idle"))
             .count();
-        assert_eq!(idle, 1, "an idle project is written when it goes idle, then skipped");
+        assert_eq!(
+            idle, 1,
+            "an idle project is written when it goes idle, then skipped"
+        );
         let busy: Vec<i64> = written
             .iter()
             .filter(|row| row.1.as_deref() == Some("busy"))
             .map(|row| row.2)
             .collect();
-        assert_eq!(busy, [1, 1, 0], "busy every tick, then once when it went idle");
+        assert_eq!(
+            busy,
+            [1, 1, 0],
+            "busy every tick, then once when it went idle"
+        );
         for row in &written {
             assert!(row.0.ends_with('Z') && row.0.len() == 20, "{row:?}");
         }

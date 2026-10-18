@@ -31,7 +31,9 @@ pub(crate) fn block<T>(name: &'static str, result: sqlx::Result<T>) -> Block<T> 
         Ok(value) => Block::Ready(value),
         Err(error) => {
             tracing::warn!(%error, block = name, "analytics pipeline: block failed");
-            Block::Failed { error: BLOCK_FAILED }
+            Block::Failed {
+                error: BLOCK_FAILED,
+            }
         }
     }
 }
@@ -128,7 +130,11 @@ pub async fn build(
 ) -> PipelineReport {
     let project = scope.project();
     PipelineReport {
-        scope: if project.is_some() { "project" } else { "global" },
+        scope: if project.is_some() {
+            "project"
+        } else {
+            "global"
+        },
         project_id: project.map(str::to_owned),
         days: window.days,
         timezone: "UTC",
@@ -192,14 +198,19 @@ pub(crate) mod tests {
         assert_eq!(project["project_id"], "p");
         assert_eq!(project["history"]["slots_since"], "2026-10-16T10:00:00Z");
         // Recording started when the transitions migration ran, whether or not any red happened.
-        assert!(project["history"]["postgate_since"].is_string(), "{project}");
+        assert!(
+            project["history"]["postgate_since"].is_string(),
+            "{project}"
+        );
     }
 
     /// `Block<T>` serialises as the block itself or as `{"error": code}` (spec §7.1, D5).
     #[test]
     fn a_block_is_its_value_or_an_error_object() {
         let ready: Block<i64> = Block::Ready(3);
-        let failed: Block<i64> = Block::Failed { error: BLOCK_FAILED };
+        let failed: Block<i64> = Block::Failed {
+            error: BLOCK_FAILED,
+        };
         assert_eq!(serde_json::to_value(ready).unwrap(), serde_json::json!(3));
         assert_eq!(
             serde_json::to_value(failed).unwrap(),
