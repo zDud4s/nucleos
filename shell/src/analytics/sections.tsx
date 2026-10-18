@@ -48,7 +48,7 @@ const percent = (fraction: number) => `${Math.round(fraction * 100)}%`;
  * part named by `apart` (the estimate) is never folded into the total or the peak: it is stated on
  * its own.
  */
-function summary(data: ChartDatum[], format: (value: number) => string, apart?: string): ReactNode {
+export function summary(data: ChartDatum[], format: (value: number) => string, apart?: string): ReactNode {
   const days = data.map((datum) => ({
     day: datum.day,
     total: datum.parts.reduce((sum, part) => (part.key === apart ? sum : sum + part.value), 0),
@@ -62,17 +62,17 @@ function summary(data: ChartDatum[], format: (value: number) => string, apart?: 
   return <p className="sr-only">{`${head}; peak ${format(peak.total)} on ${peak.day}.`}</p>;
 }
 
-function plural(n: number, one: string, many: string): string {
+export function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
 /** The clauses of a line, the empty ones dropped. */
-function joined(parts: string[]): string {
+export function joined(parts: string[]): string {
   return parts.filter((part) => part !== "").join(" · ");
 }
 
 /** An em dash for a figure nobody read — never a zero standing in for it (`StatCard`'s reading). */
-function Unread() {
+export function Unread() {
   return (
     <>
       <span aria-hidden="true">—</span>
@@ -83,13 +83,14 @@ function Unread() {
 
 /* --------------------------------------------------------------- the cards -- */
 
-export interface Metric {
-  key: MetricKey;
+export interface Metric<K extends string = MetricKey> {
+  key: K;
   label: string;
   /** `undefined` is absent, drawn as an em dash. */
   value: ReactNode | undefined;
   sub: string;
-  spark: { data: ChartDatum[]; keys: ChartKey[]; tone: string; apart?: string; format: (value: number) => string };
+  /** Absent draws no sparkline (a metric with no series, e.g. devtime cost with no priced day). */
+  spark?: { data: ChartDatum[]; keys: ChartKey[]; tone: string; apart?: string; format: (value: number) => string };
 }
 
 /** The tokens the window measured, or `null` when no session reported usage — absent, never 0. */
@@ -148,7 +149,7 @@ export function metrics(report: AnalyticsReport): Metric[] {
 }
 
 export interface MetricCardProps {
-  metric: Metric;
+  metric: Metric<string>;
   open: boolean;
   /** The detail panel's id: every card controls the same one. */
   controls: string;
@@ -174,16 +175,18 @@ export function MetricCard({ metric, open, controls, onOpen }: MetricCardProps) 
         <span className="an-metric-value">{metric.value === undefined ? <Unread /> : metric.value}</span>
         <span className="an-metric-sub">{metric.sub}</span>
       </button>
-      <AreaChart
-        data={spark.data}
-        keys={spark.keys}
-        label={metric.label}
-        format={spark.format}
-        empty=""
-        tone={spark.tone}
-        apart={spark.apart}
-        compact
-      />
+      {spark === undefined ? null : (
+        <AreaChart
+          data={spark.data}
+          keys={spark.keys}
+          label={metric.label}
+          format={spark.format}
+          empty=""
+          tone={spark.tone}
+          apart={spark.apart}
+          compact
+        />
+      )}
     </div>
   );
 }
@@ -199,7 +202,7 @@ interface CardProps {
 }
 
 /** A titled card; its title is its region's name, so a screen reader can jump to it by that name. */
-function Card({ label, aside, id, className, children }: CardProps) {
+export function Card({ label, aside, id, className, children }: CardProps) {
   const titleId = `an-card-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   return (
     <section id={id} className={className === undefined ? "an-card" : `an-card ${className}`} aria-labelledby={titleId}>

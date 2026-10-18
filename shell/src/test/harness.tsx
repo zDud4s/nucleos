@@ -36,7 +36,8 @@ import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
 import type { Detected } from "../data/detect";
 import type { Onboarding } from "../data/onboarding";
 import type { ProjectReadings } from "../data/project-readings";
-import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
+import type { AnalyticsDays, AnalyticsReport, QuotaHistory } from "../data/analytics";
+import type { DevtimeDay, DevtimeFindings, DevtimeOverview, RuleView, Verdict as DevtimeVerdict } from "../data/devtime";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
 /**
@@ -117,6 +118,14 @@ export interface DaemonState {
   analytics: AnalyticsReport;
   /** `GET /analytics/quota`. Empty by default: a history that has not started (`since: null`). */
   analyticsQuota: QuotaHistory;
+  /** `GET /analytics/devtime` and `/projects/{id}/analytics/devtime` — one payload for both, like `analytics`. */
+  devtime: DevtimeOverview;
+  /** `GET …/analytics/devtime/findings` — one page; the fake ignores `order`/`cursor`. */
+  devtimeFindings: DevtimeFindings;
+  /** Every `POST …/mark`, in order. */
+  devtimeMarks: { findingKey: string; verdict: string; cause: string | null }[];
+  /** What `POST …/mark` refuses with, or `null` to accept. */
+  devtimeMarkRefusal: { status: number; code: string; detail: string } | null;
   /** A project's local branches and the one they are measured against. */
   branches: Branches;
   /** A project's recent commits. */
@@ -361,6 +370,10 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     readings: readings(),
     analytics: analyticsReport(),
     analyticsQuota: quotaHistory(),
+    devtime: devtimeOverview(),
+    devtimeFindings: devtimeFindings({ items: [] }),
+    devtimeMarks: [],
+    devtimeMarkRefusal: null,
     branches: { integration: "master", branches: [], omitted: 0 },
     log: [],
     changed: { paths: [], tracked: 0 },
@@ -768,6 +781,52 @@ export function analyticsReport(overrides: Partial<AnalyticsReport> = {}): Analy
   };
 }
 
+/**
+ * A devtime answer with nothing in it: `days` zeroed days (today partial), ratios and cost `null`, no
+ * prices, ingest never run (`ingest_enabled: false`, last-cycle counts `null`). Overrides replace whole blocks.
+ */
+export function devtimeOverview(overrides: Partial<DevtimeOverview> = {}): DevtimeOverview {
+  const days = overrides.days ?? 30;
+  const both = analyticsDays(days * 2);
+  const list = both.slice(days);
+  const zeroDay = (day: string, partial: boolean): DevtimeDay => ({
+    day, partial, active_ms: 0, wasted_ms: 0,
+    by_kind: { model: 0, tool: 0, subagent: 0, wait_background: 0, wait_machine: 0 },
+    by_waste: { useful: 0, rework: 0, avoidable: 0 },
+    turns: 0, interrupted: 0, corrections: 0, cost_usd: null,
+  });
+  const previous = { active_ms: 0, wasted_ms: 0, waste_ratio: null, interruption_rate: null, correction_rate: null };
+  return {
+    scope: "global", project_id: null, days: days as AnalyticsDays, timezone: "UTC",
+    now: `${list[list.length - 1]}T12:00:00Z`,
+    window: { from: list[0], to: list[list.length - 1] },
+    previous: { from: both[0], to: both[days - 1] },
+    quality: { ingest_enabled: false, last_cycle_at: null, unmapped_sessions_last_cycle: null,
+               skipped_daemon_sessions_last_cycle: null, sessions: 0, dirty_sessions: 0, unruled_sessions: 0 },
+    days_series: list.map((day, index) => zeroDay(day, index === list.length - 1)),
+    totals: { ...previous, wait_human_ms: 0, idle_ms: 0, inferred_waste_ms: 0, turns: 0,
+              correction_coverage: null, previous },
+    waste_by_rule: [], waste_by_lever: [],
+    tokens: { by_model: [], cache_hit_ratio: null, cost_usd: null, cost_estimated: true, prices_as_of: null,
+              unpriced_models: [], previous: { cost_usd: null, cache_hit_ratio: null } },
+    ...overrides,
+  };
+}
+
+/** One page with one unmarked inferred finding of a rule with too few cases to judge. */
+export function devtimeFindings(overrides: Partial<DevtimeFindings> = {}): DevtimeFindings {
+  const rule: RuleView = { rule_id: "A1", level: "base", n_cases: 3, n_not_rework: 0, precision: null,
+                           prior: 0.7, eligible: false, low_precision: false };
+  return {
+    items: [{ finding_key: "f-1", session_id: "s-1", project_id: "nucleos", day: "2026-08-23", rule_id: "A1",
+              scope: "session", level: "base", waste: "rework", lever: "spec_gap", confidence: "inferred",
+              count: 2, cost_ms: 91_000, feedback: null, rule }],
+    next_cursor: null,
+    rules: [rule],
+    ...overrides,
+  };
+}
+
 /** `GET /analytics/quota` before anything was recorded (§8: `points: []`, `since: null`). */
 export function quotaHistory(overrides: Partial<QuotaHistory> = {}): QuotaHistory {
   return { days: 30, timezone: "UTC", since: null, series: [], ...overrides };
@@ -996,6 +1055,22 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       return state.feedSeen;
     }
 
+    const markRoute = /^\/analytics\/devtime\/findings\/([^/?]+)\/mark(?:\?|$)/.exec(path);
+    if (markRoute !== null && init?.method === "POST" && typeof init.body === "string") {
+      if (state.devtimeMarkRefusal !== null) {
+        const { status, code, detail } = state.devtimeMarkRefusal;
+        throw new ApiRefusal(status, code, detail);
+      }
+      const findingKey = decodeURIComponent(markRoute[1]);
+      const { verdict, cause } = JSON.parse(init.body) as { verdict: DevtimeVerdict; cause: string | null };
+      state.devtimeMarks.push({ findingKey, verdict, cause });
+      const found = state.devtimeFindings.items.find((item) => item.finding_key === findingKey);
+      if (found === undefined) throw new ApiRefusal(404, "unknown_finding", "unknown_finding");
+      const feedback = { verdict, cause, marked_at: "2026-08-24T12:00:00Z" };
+      found.feedback = feedback;   // applied, so a refetch reads it back
+      return { finding_key: findingKey, feedback, rule: found.rule };
+    }
+
     if (init?.method === "POST") {
       /*
         The one door both GitHub tools come through, first inside this block because it is the only
@@ -1203,6 +1278,17 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     // `switch` over literals cannot express.
     // Analytics (spec analytics-fundacao §6). Matched on the path before its `?days=`: the window is
     // the caller's business, and the fake answers whatever the test put in the state.
+    // Devtime analytics (spec analytics-devtime; core plan "JSON contract (pinned)"). Ahead of the F1
+    // matchers because `/analytics/devtime` also starts with `/analytics`.
+    const devtimeRoute = /^(?:\/projects\/([^/?]+))?\/analytics\/devtime(\/findings)?(?:\?|$)/.exec(path);
+    if (devtimeRoute !== null && (init?.method ?? "GET") === "GET") {
+      const projectId = devtimeRoute[1] === undefined ? undefined : decodeURIComponent(devtimeRoute[1]);
+      if (projectId !== undefined && !state.projects.some((row) => row.project_id === projectId)) {
+        throw new ApiRefusal(404, "not_found", "no such project");
+      }
+      if (devtimeRoute[2] !== undefined) return state.devtimeFindings;
+      return projectId === undefined ? state.devtime : { ...state.devtime, scope: "project", project_id: projectId };
+    }
     if (path.startsWith("/analytics/quota")) return state.analyticsQuota;
     if (path === "/analytics" || path.startsWith("/analytics?")) return state.analytics;
     const projectAnalytics = /^\/projects\/([^/?]+)\/analytics(?:\?|$)/.exec(path);

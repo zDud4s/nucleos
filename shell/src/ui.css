@@ -2306,6 +2306,11 @@ ol.ui-well {
 .ui-chart-ungated { --series: var(--tone-off-fg); }
 .ui-chart-unknown { --series: var(--border-strong); }
 
+/* Devtime's waste classes: aliases of existing tokens, no new colour. */
+.ui-chart-useful { --series: var(--chart-runs); }
+.ui-chart-rework { --series: var(--tone-danger-fg); }
+.ui-chart-avoidable { --series: var(--tone-paused-fg); }
+
 /* One area per metric: `AreaChart`'s `tone`. A metric's colour, not a series' — never one of the eight. */
 .ui-chart-cost { --series: var(--chart-cost); }
 .ui-chart-runs { --series: var(--chart-runs); }

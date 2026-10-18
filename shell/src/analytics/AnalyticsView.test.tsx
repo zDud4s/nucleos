@@ -428,3 +428,18 @@ describe("refused and stale", () => {
     expect(screen.getByText("$12.34")).toBeTruthy();
   });
 });
+
+describe("development time", () => {
+  it("shows development time under the run analytics, and survives their failure", async () => {
+    await mount(busy(), undefined, new Set(["/analytics?", "/analytics/quota"]));
+    expect(await screen.findByRole("region", { name: "Development time" })).toBeTruthy();
+    expect(await screen.findByText("The núcleo did not answer for analytics.")).toBeTruthy();
+    expect(asked().some((path) => path.startsWith("/analytics/devtime?days=30"))).toBe(true);
+  });
+
+  it("asks a project's development time in a project's view", async () => {
+    await mount(busy("project"), "nucleos");
+    await screen.findByRole("region", { name: "Development time" });
+    expect(asked()).toContain("/projects/nucleos/analytics/devtime?days=30");
+  });
+});

@@ -50,6 +50,9 @@ export const keys = {
   analytics: {
     global: (days: number) => ["analytics", "global", days] as const,
     quota: (days: number) => ["analytics", "quota", days] as const,
+    devtime: (days: number) => ["analytics", "devtime", days] as const,
+    devtimeFindings: (days: number, order: string, cursor: string) =>
+      ["analytics", "devtime-findings", days, order, cursor] as const,
   },
 
   autopilot: {
@@ -180,6 +183,9 @@ export const keys = {
     readings: (projectId: string) => ["projects", projectId, "readings"] as const,
     /** The project's analytics for one window — `GET /projects/{id}/analytics?days=`. */
     analytics: (projectId: string, days: number) => ["projects", projectId, "analytics", days] as const,
+    devtime: (projectId: string, days: number) => ["projects", projectId, "devtime", days] as const,
+    devtimeFindings: (projectId: string, days: number, order: string, cursor: string) =>
+      ["projects", projectId, "devtime-findings", days, order, cursor] as const,
     /**
      * What this project would lose by leaving, and what is holding it here.
      *
