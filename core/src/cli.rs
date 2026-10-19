@@ -747,9 +747,14 @@ pub(super) fn version_output(args: &[String]) -> Option<&'static str> {
 }
 
 pub(super) async fn run_subcommand() -> bool {
-    // First of all, before anything that could open a database, bind a port or touch the
-    // autostart entry: asking for the version must start nothing.
+    // First, and positional on purpose: an argv-mode command may itself contain `--print-token`
+    // or `--version`.
     let args: Vec<String> = std::env::args().collect();
+    if let Some(rest) = crate::execution::output_filter::run::filter_run_args(&args) {
+        std::process::exit(crate::execution::output_filter::run::main(rest));
+    }
+    // Then, before anything that could open a database, bind a port or touch the autostart
+    // entry: asking for the version must start nothing.
     if let Some(version) = version_output(&args) {
         println!("{version}");
         return true;

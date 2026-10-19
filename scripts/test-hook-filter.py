@@ -260,6 +260,137 @@ def report_outcome_silence_cases():
     return cases
 
 
+def _fake_response(body):
+    """A stand-in for what `urllib.request.urlopen` yields: a context manager with `.read()`."""
+    response = mock.MagicMock()
+    response.read.return_value = body if isinstance(body, bytes) else json.dumps(body).encode()
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    return response
+
+
+_ADMIT_PAYLOAD = {
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_1",
+    "tool_input": {"command": "cargo test"},
+}
+
+
+def admit_cases():
+    """`admit_heavy`: the one fail-open leg on the PreToolUse path.
+
+    Every case is judged on the same two things: it stayed silent (it never prints a decision) and
+    it did not raise, plus the specific behaviour the label names. Returns `(label, failure)` pairs.
+    """
+    cases = []
+
+    def admit(payload, urlopen):
+        return _silent_and_did_not_raise(
+            lambda: hook.admit_heavy("http://127.0.0.1:1", "secret", 7, payload)
+        )
+
+    # A light or unidentified call never asks: not a shell tool, or no usable tool_use_id.
+    for label, payload in (
+        ("a non-shell tool", dict(_ADMIT_PAYLOAD, tool_name="Read")),
+        ("a missing tool_use_id", {k: v for k, v in _ADMIT_PAYLOAD.items() if k != "tool_use_id"}),
+        ("an empty tool_use_id", dict(_ADMIT_PAYLOAD, tool_use_id="")),
+        ("a non-string tool_use_id", dict(_ADMIT_PAYLOAD, tool_use_id=5)),
+    ):
+        with mock.patch("urllib.request.urlopen", return_value=_fake_response({"admission": "granted"})) as opened:
+            failure = admit(payload, opened)
+            if not failure and opened.call_count != 0:
+                failure = f"asked the daemon {opened.call_count} time(s)"
+        cases.append((f"admit_heavy, a_light_or_unidentified_call_never_asks ({label})", failure))
+
+    # An unreachable daemon lets the command run, silently, after exactly one attempt.
+    with mock.patch("urllib.request.urlopen", side_effect=OSError("connection refused")) as opened:
+        failure = admit(_ADMIT_PAYLOAD, opened)
+        if not failure and opened.call_count != 1:
+            failure = f"expected one attempt, got {opened.call_count}"
+    cases.append(("admit_heavy, an_unreachable_daemon_lets_the_command_run_silently", failure))
+
+    # waiting, waiting, granted: polled until granted, then stopped.
+    answers = [
+        _fake_response({"admission": "waiting"}),
+        _fake_response({"admission": "waiting"}),
+        _fake_response({"admission": "granted"}),
+    ]
+    with mock.patch("urllib.request.urlopen", side_effect=answers) as opened:
+        failure = admit(_ADMIT_PAYLOAD, opened)
+        if not failure and opened.call_count != 3:
+            failure = f"expected 3 polls, got {opened.call_count}"
+        if not failure:
+            request = opened.call_args_list[0][0][0]
+            if not request.full_url.endswith("/hooks/admit"):
+                failure = f"polled {request.full_url!r}"
+            else:
+                sent = json.loads(request.data)
+                want = {
+                    "run_id": 7,
+                    "tool_use_id": "toolu_1",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test"},
+                }
+                if sent != want:
+                    failure = f"sent {sent!r}"
+    cases.append(("admit_heavy, waiting_then_granted_polls_until_granted", failure))
+
+    # gave_up (and any answer that is not "waiting") lets the command run after one call.
+    for answer in ({"admission": "gave_up"}, {"admission": "something-new"}, {}, ["waiting"], b"not json"):
+        with mock.patch("urllib.request.urlopen", return_value=_fake_response(answer)) as opened:
+            failure = admit(_ADMIT_PAYLOAD, opened)
+            if not failure and opened.call_count != 1:
+                failure = f"expected one call, got {opened.call_count}"
+        cases.append((f"admit_heavy, gave_up_lets_the_command_run ({answer!r})", failure))
+
+    # The hook budget ends the wait: a daemon that always says waiting is not polled forever.
+    ticks = iter(range(0, 10_000_000, 1000))
+    limit = 60
+    state = {"calls": 0}
+
+    def always_waiting(*_args, **_kwargs):
+        state["calls"] += 1
+        if state["calls"] > limit:
+            return _fake_response({"admission": "granted"})
+        return _fake_response({"admission": "waiting"})
+
+    with mock.patch("urllib.request.urlopen", side_effect=always_waiting), mock.patch.object(
+        hook.time, "monotonic", side_effect=lambda: next(ticks)
+    ):
+        failure = admit(_ADMIT_PAYLOAD, None)
+    if not failure and state["calls"] >= limit:
+        failure = f"kept polling past the budget ({state['calls']} calls)"
+    if not failure and hook.ADMIT_HOOK_BUDGET_SECONDS >= hook.ADMIT_POLL_TIMEOUT_SECONDS * 100:
+        failure = "budget constant is implausible"
+    cases.append(("admit_heavy, the_hook_budget_ends_the_wait", failure))
+
+    # report_outcome carries the tool_use_id to the daemon.
+    sent_bodies = []
+
+    def capture(request, timeout=None):
+        sent_bodies.append(json.loads(request.data))
+        return _fake_response({})
+
+    with mock.patch.dict(
+        os.environ,
+        {
+            "NUCLEOS_RUN_ID": "1",
+            "NUCLEOS_DAEMON_URL": "http://127.0.0.1:1",
+            "NUCLEOS_DAEMON_TOKEN": "secret",
+        },
+        clear=True,
+    ), mock.patch("urllib.request.urlopen", side_effect=capture):
+        failure = _silent_and_did_not_raise(
+            lambda: hook.report_outcome(dict(_OUTCOME_PAYLOAD, tool_use_id="toolu_9"))
+        )
+    if not failure and (not sent_bodies or sent_bodies[0].get("tool_use_id") != "toolu_9"):
+        failure = f"body was {sent_bodies!r}"
+    cases.append(("report_outcome_sends_the_tool_use_id", failure))
+
+    return cases
+
+
 def binary_candidate_cases():
     """Where `control_token` looks for the daemon binary, and in what order, per platform.
 
@@ -763,6 +894,110 @@ def interactive_follow_up_cases():
     return cases
 
 
+def _run_main_gate(replies):
+    """Runs `main()` as a governed run (NUCLEOS_RUN_ID=7); returns `(exit_code, printed)`.
+
+    `replies` are the daemon's JSON bodies, served in order to each urlopen call: the first is
+    the pretooluse-decision answer, the second (if any) the ask-wait answer.
+    """
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "rewrite",
+        "tool_name": "Bash",
+        "tool_input": {"command": "cargo test"},
+        "cwd": "/work/repo",
+    }
+    queue = list(replies)
+
+    def urlopen(_request, timeout=None):
+        return _Reply(queue.pop(0))
+
+    env = {
+        "NUCLEOS_RUN_ID": "7",
+        "NUCLEOS_DAEMON_URL": "http://127.0.0.1:1",
+        "NUCLEOS_DAEMON_TOKEN": "tok",
+    }
+    captured = io.StringIO()
+    code = "no exit"
+    with mock.patch.dict(os.environ, env):
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+            with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                with mock.patch("sys.stdout", captured):
+                    try:
+                        hook.main()
+                    except SystemExit as exit_:
+                        code = exit_.code
+    return code, captured.getvalue()
+
+
+def _special_of(printed):
+    try:
+        return json.loads(printed)["hookSpecificOutput"]
+    except Exception:  # noqa: BLE001 - the caller reports what was printed
+        return None
+
+
+def run_rewrite_cases():
+    """A run's allow forwards the daemon's `updated_input` as `updatedInput`; nothing else does."""
+    cases = []
+
+    code, printed = _run_main_gate(
+        [{"decision": "allow", "reason": "ok", "updated_input": {"command": "X"}}]
+    )
+    special = _special_of(printed)
+    good = (
+        code in (0, None)
+        and special is not None
+        and special.get("permissionDecision") == "allow"
+        and special.get("updatedInput") == {"command": "X"}
+    )
+    cases.append((
+        "an allow with updated_input prints updatedInput",
+        _verdict(good, f"{code!r} {printed!r}"),
+    ))
+
+    code, printed = _run_main_gate(
+        [{"decision": "allow", "reason": "ok", "updated_input": "junk"}]
+    )
+    special = _special_of(printed)
+    good = (
+        code in (0, None)
+        and special is not None
+        and special.get("permissionDecision") == "allow"
+        and "updatedInput" not in special
+    )
+    cases.append((
+        "an allow with a malformed updated_input prints no updatedInput",
+        _verdict(good, f"{code!r} {printed!r}"),
+    ))
+
+    code, printed = _run_main_gate(
+        [{"decision": "deny", "reason": "no", "updated_input": {"command": "X"}}]
+    )
+    good = '"block"' in printed and "updatedInput" not in printed
+    cases.append((
+        "a deny with updated_input prints the block contract and no updatedInput",
+        _verdict(good, f"{code!r} {printed!r}"),
+    ))
+
+    code, printed = _run_main_gate([
+        {"decision": "asking", "updated_input": {"command": "X"}},
+        {"decision": "allow", "reason": "approved"},
+    ])
+    special = _special_of(printed)
+    good = (
+        code in (0, None)
+        and special is not None
+        and special.get("permissionDecision") == "allow"
+        and special.get("updatedInput") == {"command": "X"}
+    )
+    cases.append((
+        "asking then allow keeps the first answer's updatedInput",
+        _verdict(good, f"{code!r} {printed!r}"),
+    ))
+    return cases
+
+
 HINT_TEXT = (
     "this project verifies through the daemon: call mcp__nucleos__verify to run this "
     "worktree's build, test and gate commands in its queue and cache, and wait on it with "
@@ -1073,6 +1308,8 @@ def main() -> int:
         + pending_follow_up_cases()
         + interactive_follow_up_cases()
         + verify_hint_cases()
+        + run_rewrite_cases()
+        + admit_cases()
         + one_source_cases()
         + session_start_cases()
     ):

@@ -6,8 +6,66 @@ pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
     Json(payload): Json<PreToolUsePayload>,
-) -> Json<Decision> {
-    pretooluse_decision_from(state, scope, payload, Instant::now()).await
+) -> Json<PreToolUseAnswer> {
+    let run_id = match &scope {
+        Scope::Run(id) => *id,
+        _ => payload.run_id,
+    };
+    let tool_name = payload.tool_name.clone();
+    let tool_input = payload.tool_input.clone();
+    let Json(decision) =
+        pretooluse_decision_from(state.clone(), scope, payload, Instant::now()).await;
+    let updated_input = if matches!(decision.decision.as_str(), "allow" | "asking") {
+        filter_rewrite(&state, run_id, &tool_name, &tool_input).await
+    } else {
+        None
+    };
+    Json(PreToolUseAnswer {
+        decision,
+        updated_input,
+    })
+}
+
+/// The replacement input that routes a recognized test/check/build command of an in-flight run
+/// through `--filter-run`, or `None` for anything else. Best effort: never panics, and a failure
+/// to read anything simply leaves the command untouched.
+pub(super) async fn filter_rewrite(
+    state: &AppState,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Option<Value> {
+    if !state.run_handles.lock().ok()?.contains_key(&run_id) {
+        return None;
+    }
+    let project_id: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()?
+            .flatten();
+    let kinds = match project_id.as_deref() {
+        Some(pid) => crate::config::load_schedule_rules(state.machine_config_root.as_deref(), pid)
+            .map(|r| r.command_kinds)
+            .unwrap_or_default(),
+        None => crate::config::CommandKinds::default(),
+    };
+    let command = tool_input.get("command").and_then(Value::as_str)?;
+    if crate::governance::command_kind::kind_of(command, classifier::shell_for(tool_name), &kinds)
+        == crate::governance::command_kind::Kind::Other
+    {
+        return None;
+    }
+    // A replaced binary names a path that no longer exists (Linux: "<path> (deleted)"): fail open.
+    let exe = std::env::current_exe().ok().filter(|p| p.is_file())?;
+    let data = crate::daemon_client::data_dir()?;
+    crate::execution::output_filter::rewrite_input(
+        tool_name,
+        tool_input,
+        &exe,
+        &crate::execution::output_filter::run_log_dir(&data, run_id),
+    )
 }
 
 /// Whether `tool_name` is one of the job-node tools: `mcp__nucleos__<name>` for a `<name>` in
