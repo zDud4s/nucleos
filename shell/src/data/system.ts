@@ -225,7 +225,7 @@ export function useBudget() {
   return useQuery({
     queryKey: keys.autopilot.budget,
     queryFn: () => apiFetch<BudgetView>("/autopilot/budget"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.queue,
   });
 }
 
@@ -267,12 +267,12 @@ export function useSetBudget() {
   });
 }
 
-/** The quota brake is independent from spend budget and polls at the same cadence. */
+/** The quota brake is independent from spend budget and polls at the same (queue) cadence. */
 export function useQuotaBrake() {
   return useQuery({
     queryKey: keys.autopilot.quotaBrake,
     queryFn: () => apiFetch<QuotaBrakeView>("/autopilot/quota-brake"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.queue,
   });
 }
 
@@ -307,7 +307,7 @@ export function useProjects() {
   return useQuery({
     queryKey: keys.projects.all,
     queryFn: () => apiFetch<ProjectSummary[]>("/projects"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.queue,
     placeholderData: keepPreviousData,
   });
 }
@@ -466,7 +466,7 @@ export function useSidecars({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: keys.system.sidecars,
     queryFn: () => apiFetch<SidecarState[]>("/sidecars"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.queue,
     enabled,
   });
 }

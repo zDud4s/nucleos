@@ -88,3 +88,38 @@ describe("backgroundCadence", () => {
     expect(backgroundCadence(POLL.fast)()).toBe(POLL.slow);
   });
 });
+
+describe("installPacing sweep timer", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("runs the one-second sweep only while the window is blurred", async () => {
+    const { QueryClient } = await import("@tanstack/react-query");
+    const { installPacing } = await import("./pacing");
+    vi.useFakeTimers();
+    let focused = true;
+    vi.spyOn(document, "hasFocus").mockImplementation(() => focused);
+    const client = new QueryClient();
+    const refetch = vi.spyOn(client, "refetchQueries").mockResolvedValue();
+
+    const teardown = installPacing(client);
+    expect(vi.getTimerCount()).toBe(0);
+
+    focused = false;
+    window.dispatchEvent(new Event("blur"));
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(1_000);
+    expect(refetch).toHaveBeenCalledTimes(1);
+
+    focused = true;
+    window.dispatchEvent(new Event("focus"));
+    expect(vi.getTimerCount()).toBe(0);
+
+    focused = false;
+    window.dispatchEvent(new Event("blur"));
+    teardown();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});

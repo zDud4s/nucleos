@@ -72,17 +72,35 @@ export function installPacing(client: QueryClient): () => void {
     };
   });
 
-  const sweep = window.setInterval(() => {
-    if (currentAttention() !== "blurred") return;
-    const now = Date.now();
-    void client.refetchQueries({
-      type: "active",
-      predicate: (query) => dueWhileBlurred(query, now),
-    });
-  }, SWEEP_MS);
+  // The sweep only has work while the window is blurred, so the timer exists only then: a focused
+  // window (the usual state) carries no permanent one-second wake-up.
+  let sweep: number | undefined;
+  const syncSweep = () => {
+    const blurred = currentAttention() === "blurred";
+    if (blurred && sweep === undefined) {
+      sweep = window.setInterval(() => {
+        if (currentAttention() !== "blurred") return;
+        const now = Date.now();
+        void client.refetchQueries({
+          type: "active",
+          predicate: (query) => dueWhileBlurred(query, now),
+        });
+      }, SWEEP_MS);
+    } else if (!blurred && sweep !== undefined) {
+      window.clearInterval(sweep);
+      sweep = undefined;
+    }
+  };
+  window.addEventListener("focus", syncSweep);
+  window.addEventListener("blur", syncSweep);
+  document.addEventListener("visibilitychange", syncSweep);
+  syncSweep();
 
   return () => {
-    window.clearInterval(sweep);
+    window.removeEventListener("focus", syncSweep);
+    window.removeEventListener("blur", syncSweep);
+    document.removeEventListener("visibilitychange", syncSweep);
+    if (sweep !== undefined) window.clearInterval(sweep);
     // Back to react-query's own visibility listener.
     focusManager.setEventListener((setFocused) => {
       const update = () => setFocused(undefined);

@@ -373,15 +373,18 @@ pub(super) const DUE_ACTIONS_SQL: &str =
 ///
 /// Claimed by compare-and-swap BEFORE the work, so two passes overlapping cannot send one email
 /// twice. `ingest_director` uses the identical pattern for the identical reason.
-pub async fn execute_due_actions(state: &AppState) {
+///
+/// Says whether it found anything to do, which is what lets the loop slow down while nothing is.
+pub async fn execute_due_actions(state: &AppState) -> bool {
     let due: Vec<TeamAction> = match sqlx::query_as(DUE_ACTIONS_SQL).fetch_all(&state.pool).await {
         Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(%error, "could not read the team actions waiting to be done");
-            return;
+            return false;
         }
     };
 
+    let any_due = !due.is_empty();
     for action in due {
         // The claim. A row moved to `working` by another pass is skipped here, and the pass that
         // moved it owns it — an email that may already have gone must not be sent again.
@@ -438,6 +441,7 @@ pub async fn execute_due_actions(state: &AppState) {
         )
         .await;
     }
+    any_due
 }
 
 /// The four lines that actually touch the world. Everything above decides whether to reach here.
