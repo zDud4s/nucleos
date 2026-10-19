@@ -754,6 +754,39 @@ describe("System - sidecar cards", () => {
     expect(within(webCard).getByText("started")).toBeDefined();
     expect(webCard.textContent).not.toMatch(/exited/);
     expect(within(webCard).queryByRole("alert")).toBeNull();
+
+    // The liveness word comes from the sidecar domain of the state map.
+    expect(within(webCard).getByText("running")).toBeDefined();
+    expect(within(browserCard).getByText("down")).toBeDefined();
+  });
+});
+
+describe("System - unsaved limits", () => {
+  it("warns on unload only while a limit edit is unsaved", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+    await renderSystemAt("/system/limits");
+
+    const input = await screen.findByLabelText("Window limit (USD)");
+    const unload = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    expect(unload()).toBe(false);
+
+    fireEvent.change(input, { target: { value: "987" } });
+    await waitFor(() => {
+      expect(unload()).toBe(true);
+    });
+  });
+});
+
+describe("System - appearance", () => {
+  it("keeps the quota notch preference under Appearance on the Machine tab", async () => {
+    daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
+    await renderSystemAt("/system/settings");
+
+    expect(await screen.findByRole("region", { name: "Appearance" })).toBeDefined();
   });
 });
 

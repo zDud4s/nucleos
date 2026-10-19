@@ -23,6 +23,7 @@ import { useLoadoutTools } from "../data/loadout-tools";
 import { useNotesGraph, useCreateNote, useOwnerNotes } from "../data/owner-notes";
 import { useProjects } from "../data/system";
 import { Button, ErrorNote, PageHeader, Quiet } from "../ui";
+import { DAEMON_NAME } from "../copy";
 import "./brain.css";
 
 /**
@@ -230,7 +231,7 @@ function Capture() {
       />
       <div className="brain-compose-foot">
         {create.isError ? (
-          <ErrorNote>the núcleo did not answer — the note was not saved. Your text is still here: press Save to retry.</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding — the note was not saved. Your text is still here: press Save to retry.</ErrorNote>
         ) : (
           <span className="brain-compose-hint" id="brain-capture-hint">
             <kbd>{IS_MAC ? "⌘" : "Ctrl"}</kbd> <kbd>{IS_MAC ? "Return" : "Enter"}</kbd> saves
@@ -259,9 +260,9 @@ function missingSentence(
   projects: { isError: boolean; data: unknown },
 ): string | null {
   const parts: string[] = [];
-  if (knowledge.isError) parts.push("knowledge did not answer — its rows are not drawn");
+  if (knowledge.isError) parts.push("knowledge is not responding — its rows are not drawn");
   else if (knowledge.data === undefined) parts.push("knowledge is still loading — its rows are not drawn yet");
-  if (projects.isError) parts.push("the project roster did not answer — projects show their ids");
+  if (projects.isError) parts.push("the project roster is not responding — projects show their ids");
   else if (projects.data === undefined) parts.push("the project roster is still loading — projects show their ids");
   if (parts.length === 0) return null;
   const sentence = parts.join("; ");
@@ -305,7 +306,7 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
   };
 
   if (graph.isError)
-    return <ErrorNote onRetry={() => void graph.refetch()}>the núcleo did not answer — the graph is not known</ErrorNote>;
+    return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding — the graph is not known</ErrorNote>;
   if (graph.data === undefined || model === null) return <Quiet says="Loading the graph…" />;
   const missing = missingSentence(knowledge, projects);
 
@@ -450,7 +451,7 @@ function ItemPanel({ item, onItem }: { item: ItemRef; onItem: (item: string) => 
   if (item.kind === "capture") return <CapturePanel key={item.id} id={item.id} onSelect={onItem} />;
   if (item.kind === "knowledge") return <KnowledgePanel key={item.id} id={item.id} onSelect={select} />;
   if (graph.isError)
-    return <ErrorNote onRetry={() => void graph.refetch()}>the núcleo did not answer — the note is not known</ErrorNote>;
+    return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding — the note is not known</ErrorNote>;
   if (graph.data === undefined || model === null) return <Quiet says="Loading…" />;
   return <BrainPanel nodeId={nodeIdOf(item)} graph={graph.data} model={model} onSelect={select} />;
 }

@@ -299,6 +299,30 @@
   font-style: italic;
 }
 
+/* A sortable column title: a button dressed as the header text it replaces. */
+.teams-sort {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.teams-sort:hover,
+.teams-sort[data-active] {
+  color: var(--text);
+}
+
+.teams-sort-glyph {
+  font-size: var(--text-xs);
+}
+
 /* Figures line up under each other, which is the whole reason this is a table. */
 .teams-col-num {
   width: 1%;
@@ -1458,11 +1482,21 @@
   color: var(--text);
 }
 
+/* Fixed name and badge tracks: with `auto` the task text started at a different x on every
+   row, because each agent name and each badge was a different width. */
 .teams-item-row {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(6rem, 9rem) 7.5rem minmax(0, 1fr);
   align-items: baseline;
   gap: var(--space-2) var(--space-3);
+}
+
+.teams-item-row > .teams-item-agent {
+  overflow-wrap: anywhere;
+}
+
+.teams-item-row > .teams-item-output {
+  grid-column: 3;
 }
 
 .teams-item-output {
@@ -1982,4 +2016,11 @@
   gap: var(--space-2);
   font-size: var(--text-sm);
   color: var(--text);
+}
+
+/* The full request when the page title had to be cut. */
+.teams-run-request {
+  margin: 0 0 var(--space-4);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }

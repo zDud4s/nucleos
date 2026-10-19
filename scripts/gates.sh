@@ -437,12 +437,6 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     echo "python missing — the hook filter and eval approver need it (scripts/doctor.sh reports this)" >&2
     failures="$failures  hooks: python not installed"$'\n'
   else
-    # F5: the packet-gate and cross-tool usage-accounting tests moved out of this target along
-    # with the tools they cover, to `.ai/scripts/`: they are workflow tooling, not product
-    # tooling, and this target — unlike `workflow` in `.ai/tests/catalog.yaml` — is a
-    # `scripts/gates.sh` leg that CI can run on a fresh, gitignore-respecting clone. They are
-    # covered by the `workflow` catalog group's own command instead (see
-    # `.ai/tests/catalog.yaml`), which is why only product tests remain below.
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
@@ -451,6 +445,12 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
     # runs green on a machine with no route to OpenRouter at all.
     run "models: refresh"   . "$py" scripts/test-refresh-models.py
+    # The scripts of the bundled `nucleos-dev` workflow, which the daemon packages and every
+    # project's controller runs from its library copy. Their tests used to run only from the
+    # gitignored `.ai/` catalog, which a fresh clone does not have.
+    for bundle_test in core/assets/nucleos-dev/scripts/test_*.py; do
+      run "workflow: $(basename "$bundle_test" .py)" . "$py" "$bundle_test"
+    done
   fi
 fi
 

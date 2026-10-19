@@ -1,3 +1,5 @@
+import { DAEMON_NAME } from "../copy";
+import { Mark } from "./marks";
 import { useState, type Dispatch, type SetStateAction } from "react";
 import { Check, Search, X } from "lucide-react";
 import { useAllCaptures } from "../data/captures";
@@ -114,7 +116,7 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
   return (
     <>
       {(allNotes.isError || knowledge.isError || captureRows.isError) && (
-        <ErrorNote>the núcleo did not answer — part of what is known is missing</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} is not responding — part of what is known is missing</ErrorNote>
       )}
       <div className="unified-bar">
         <Segments label="Type" value={type} options={TYPE_FILTERS} onChange={setType} />
@@ -197,8 +199,8 @@ function itemRef(item: BrainItem): string {
 }
 
 /**
- * What a row says it is, and which identity hue its mark takes — the same hue its node takes on
- * the graph (`force-graph.css`), so the list and the map share one key. A knowledge row names its
+ * What a row says it is, and which identity shape its mark takes — the same shape its node takes on
+ * the graph (`marks.tsx`), so the list and the map share one key. A knowledge row names its
  * layer, which is what decides how it is used; "knowledge" alone would say nothing a reader can act on.
  */
 const LAYER_WORD: Record<KnownLayer, string> = {
@@ -229,7 +231,7 @@ function ItemRow({ item, current, onSelect, deciding, onApprove, onReject }: Ite
     <Row layout="line" current={current} className="unified-row">
       <button type="button" className="unified-open" aria-current={current ? "true" : undefined} onClick={() => onSelect(ref)}>
         <span className="unified-kind">
-          <span className={`unified-mark unified-mark-${kind.hue}`} aria-hidden="true" />
+          <Mark hue={kind.hue} />
           {kind.word}
         </span>
         <span className="unified-title">{title}</span>

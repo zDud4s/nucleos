@@ -4048,7 +4048,7 @@ describe("where a subagent worked", () => {
     // No speaker. A note is about the conversation, not a line of it, and labelling it "nucleo"
     // would attribute to the model words it did not say.
     const row = note.closest("li") as HTMLElement;
-    expect(within(row).queryByText("núcleo")).toBeNull();
+    expect(within(row).queryByText("background service")).toBeNull();
     expect(row.className).toContain("aside");
   });
 });
@@ -4731,7 +4731,7 @@ describe("reading a transcript back", () => {
 
     const turn = (await screen.findByText("que horas sao")).closest("li") as HTMLElement;
     expect(within(turn).getByText("you")).toBeTruthy();
-    expect(within(turn).getByText("núcleo")).toBeTruthy();
+    expect(within(turn).getByText("service")).toBeTruthy();
   });
 
   it("draws a fenced block as code rather than as three backticks", async () => {

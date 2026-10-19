@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../copy";
 import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
@@ -51,7 +52,7 @@ export function Settings({ projectId }: SettingsProps) {
     // A roster that refused is not a roster still being read, and must not keep saying it is.
     return projects.isError && projects.data === undefined ? (
       <ErrorNote>
-        The núcleo did not answer, so this project&rsquo;s settings are unknown.
+        The {DAEMON_NAME} gave no reply, so this project&rsquo;s settings are unknown.
       </ErrorNote>
     ) : (
       <p className="text-sm text-text-faint">Reading settings…</p>
@@ -376,7 +377,7 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
       {setLimit.isError ? (
         <ErrorNote>
           {refused === null
-            ? "The ceiling was not changed — the núcleo did not answer."
+            ? `The ceiling was not changed — the ${DAEMON_NAME} gave no reply.`
             : `The ceiling was not changed — ${refused.detail}`}
         </ErrorNote>
       ) : null}
@@ -441,7 +442,7 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
     <Block label="Action classes">
       {scoreboard.data === undefined ? (
         scoreboard.isError ? (
-          <ErrorNote>The núcleo did not say what the classifier has been judged on here.</ErrorNote>
+          <ErrorNote>The {DAEMON_NAME} did not say what the classifier has been judged on here.</ErrorNote>
         ) : (
           <p className="text-xs text-text-faint">Reading…</p>
         )

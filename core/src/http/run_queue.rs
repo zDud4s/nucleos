@@ -110,6 +110,9 @@ pub(super) struct RunsQuery {
     pub(super) group: Option<String>,
     /// `hide` leaves conversation turns out; `show`, or absent, keeps them. Anything else is a 400.
     pub(super) chat_turns: Option<String>,
+    /// Keyset cursor: the id of the last row of the page already shown; the answer is the page
+    /// older than it. Absent, the newest page, as before the cursor existed.
+    pub(super) before: Option<i64>,
 }
 
 /// Every operation the shared git queue performs, and whether a project may declare it.
@@ -278,6 +281,7 @@ pub(super) async fn get_runs(
             chat_id: query.chat_id,
             group_by_chat,
             hide_chat_turns,
+            before: query.before,
         },
     )
     .await

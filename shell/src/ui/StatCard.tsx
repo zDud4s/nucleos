@@ -2,7 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { useId, type ReactNode } from "react";
 
 export interface StatCardProps {
-  /** What is being counted. The card's accessible name, by reference (`aria-labelledby`), never a copy. */
+  /** What is being counted. Leads the card's accessible name, which is composed by reference (`aria-labelledby`: label, figure, detail), never a copy. */
   label: string;
   /**
    * The figure.
@@ -40,9 +40,13 @@ export function StatCard({ label, value, detail, bar, to, unread }: StatCardProp
   const unreadFigure = value === undefined;
   const labelId = useId();
   const valueId = useId();
+  const detailId = useId();
   const shown = unreadFigure && unread !== undefined ? unread : detail;
+  // Name = label, figure, detail, in that order, so one pass reads "Waiting 3 since noon" and the
+  // figure is never also a description (which would say it twice).
+  const nameIds = [labelId, valueId, ...(shown === undefined ? [] : [detailId])].join(" ");
   const card = (
-    <article className="ui-stat" aria-labelledby={labelId} aria-describedby={valueId}>
+    <article className="ui-stat" aria-labelledby={nameIds}>
       <p className="ui-stat-value" id={valueId}>
         {unreadFigure ? (
           <>
@@ -54,13 +58,13 @@ export function StatCard({ label, value, detail, bar, to, unread }: StatCardProp
         )}
       </p>
       <p className="ui-stat-label" id={labelId}>{label}</p>
-      {shown === undefined ? null : <p className="ui-stat-detail">{shown}</p>}
+      {shown === undefined ? null : <p className="ui-stat-detail" id={detailId}>{shown}</p>}
       {bar === undefined ? null : bar}
     </article>
   );
   if (to === undefined) return card;
   return (
-    <Link to={to} className="ui-stat-link" aria-labelledby={labelId}>
+    <Link to={to} className="ui-stat-link" aria-labelledby={nameIds}>
       {card}
     </Link>
   );

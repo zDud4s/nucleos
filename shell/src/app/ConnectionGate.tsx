@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { DAEMON_URL, apiText, isApiRefusal, isApiUnavailable } from "../data/client";
+import { DAEMON_NAME } from "../copy";
 import { keys } from "../data/keys";
 import { POLL, backgroundCadence } from "../data/poll";
 import { useHealth } from "../data/system";
@@ -83,7 +84,7 @@ export function ConnectionGate({ children }: ConnectionGateProps) {
     return (
       <div className="app-takeover app-takeover-quiet">
         <div className="app-takeover-card">
-          <p className="app-takeover-body">reaching the núcleo…</p>
+          <p className="app-takeover-body">reaching the {DAEMON_NAME}…</p>
         </div>
       </div>
     );
@@ -95,7 +96,7 @@ export function ConnectionGate({ children }: ConnectionGateProps) {
         <div className="app-takeover-card">
           <h1 className="app-takeover-title">daemon unreachable</h1>
           <p className="app-takeover-body">
-            The núcleo is not answering on {DAEMON_URL}. Nothing here is lost — the shell keeps asking, and
+            The {DAEMON_NAME} is not responding on {DAEMON_URL}. Nothing here is lost — the shell keeps asking, and
             this window comes back on its own the moment the daemon does.
           </p>
           <p className="app-takeover-hint">retrying every {POLL.fast / 1000} seconds</p>
@@ -110,7 +111,7 @@ export function ConnectionGate({ children }: ConnectionGateProps) {
         <div className="app-takeover-card">
           <h1 className="app-takeover-title">reachable — not authorised</h1>
           <p className="app-takeover-body">
-            The núcleo answered and refused this window's credential. The daemon token is rotated when the
+            The {DAEMON_NAME} replied and refused this window's credential. The daemon token is rotated when the
             daemon restarts, and this window is still holding the one it read at startup.
           </p>
           <p className="app-takeover-hint">

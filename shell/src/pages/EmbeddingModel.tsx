@@ -2,6 +2,7 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useEmbeddingModel, useSetEmbeddingModel } from "../data/embedding";
 import { Button, ErrorNote, RefusalNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * The Ollama model that embeds knowledge rows, as a labelled text field under the distiller's.
@@ -43,7 +44,7 @@ export function EmbeddingModel() {
       {refusal ? (
         <RefusalNote refusal={refusal} />
       ) : set.error ? (
-        <ErrorNote>the núcleo did not answer — the embedding model was not changed</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} is not responding — the embedding model was not changed</ErrorNote>
       ) : null}
     </div>
   );

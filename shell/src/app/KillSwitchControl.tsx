@@ -126,7 +126,7 @@ export function KillSwitchControl() {
       {failure === null ? null : isApiRefusal(failure) ? (
         <RefusalNote refusal={failure} />
       ) : (
-        <ErrorNote>the kill switch could not be set — the daemon did not answer</ErrorNote>
+        <ErrorNote>the kill switch could not be set — the daemon is not responding</ErrorNote>
       )}
     </div>
   );

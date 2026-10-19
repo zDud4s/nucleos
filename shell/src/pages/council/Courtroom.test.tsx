@@ -159,8 +159,19 @@ describe("Courtroom", () => {
     });
     renderSession(v);
     const first = screen.getByRole("button", { name: "Seat 1, A, thinking" });
-    expect(first.querySelector("title")?.textContent).toBe("gpt-5");
-    expect(first.getAttribute("data-masked")).toBe("true");
+    expect(first.getAttribute("title")).toBe("gpt-5");
+    // The accessible name stays masked; the mask flag lives on the aria-hidden drawing, not the button.
+    expect(document.querySelector(".council-court-seat")?.getAttribute("data-masked")).toBe("true");
+  });
+
+  it("is made of real buttons that Space also selects", () => {
+    const onSelect = vi.fn();
+    renderSetup({ onSelect });
+    const seatButton = screen.getByRole("button", { name: "Seat 1, opus" });
+    expect(seatButton.tagName).toBe("BUTTON");
+    expect(screen.getByRole("button", { name: /^Chairman, / }).tagName).toBe("BUTTON");
+    fireEvent.keyDown(seatButton, { key: " " });
+    expect(onSelect).toHaveBeenCalledWith({ kind: "seat", index: 0 });
   });
 
   it("moves along the arc with the arrow keys and selects with Enter", () => {

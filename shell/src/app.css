@@ -119,6 +119,21 @@
   padding-right: 4.5rem;
 }
 
+/**
+ * Below 60rem the strip is reserved on EVERY route.
+ *
+ * A page may opt out of the strip (the chats route does, so its list runs to the edge), and on a
+ * wide window that is fine: the notch floats over slack. Narrow, there is none, and the folded
+ * notch sat over the Send button and the right-hand chat bubbles at 800, 850 and 940px. The extra
+ * type selector only outranks those per-page `:has()` opt-outs, so the shell can win without
+ * reaching into a page's stylesheet.
+ */
+@media (max-width: 60rem) {
+  .app-shell > main.app-main.app-main-notched {
+    padding-right: 4.5rem;
+  }
+}
+
 /*
   The rail: the flared top, the rings, the flared bottom, flush against the edge.
 
@@ -1454,6 +1469,26 @@
 /* WebKit's spelling of the same decision: no bar, and so nothing for it to take from the rail. */
 .nav-scroll::-webkit-scrollbar {
   display: none;
+}
+
+/* On a short window the rail's list is cut by the footer and the fade alone does not say how much
+   is left (the cost the note above names). Only there, and only while the rail is open, a thin bar
+   comes back; the collapsed rail keeps none, so its icons stay on their axis. */
+@media (max-height: 46rem) {
+  .nav:not(.nav-narrow):not(.nav-collapsed) .nav-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+
+  .nav:not(.nav-narrow):not(.nav-collapsed) .nav-scroll::-webkit-scrollbar {
+    display: block;
+    width: 4px;
+  }
+
+  .nav:not(.nav-narrow):not(.nav-collapsed) .nav-scroll::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 2px;
+  }
 }
 
 .nav-group + .nav-group {

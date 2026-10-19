@@ -236,7 +236,7 @@ describe("Agents - the name and the id", () => {
     const cell = (await screen.findByRole("button", { name: "tradutor" })).closest("th") as HTMLElement;
     // Everything separating the name from the id on screen is spatial, and none
     // of it is read out. Without this the row is the same word, twice.
-    expect(cell.textContent).toContain("known to the núcleo as tradutor");
+    expect(cell.textContent).toContain("known to the background service as tradutor");
   });
 
   it("marks the id once a rename has left it behind, and says what still points at it", async () => {
@@ -685,5 +685,36 @@ describe("Agents - the route", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Agents" })).toBeDefined();
     expect(router.state.location.pathname).toBe("/agents");
     expect(screen.queryByText("Agents is not built yet")).toBeNull();
+  });
+});
+
+describe("Agents - filtering the catalogue", () => {
+  it("narrows the table by a typed query and by the without-a-model chip", async () => {
+    daemon.apiFetch.mockImplementation(
+      agentsFetch([
+        agent({ id: "copywriter", name: "copywriter", model: "opus" }),
+        agent({ id: "auditor", name: "auditor", speciality: "checks the books", model: null }),
+      ]),
+    );
+    renderWithQuery(<Agents />);
+
+    await screen.findByRole("button", { name: "copywriter" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "books" } });
+    expect(screen.queryByRole("button", { name: "copywriter" })).toBeNull();
+    expect(screen.getByRole("button", { name: "auditor" })).toBeDefined();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: /Without a model/ }));
+    expect(screen.queryByRole("button", { name: "copywriter" })).toBeNull();
+    expect(screen.getByRole("button", { name: "auditor" })).toBeDefined();
+  });
+
+  it("says so when nothing matches", async () => {
+    daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
+    renderWithQuery(<Agents />);
+
+    await screen.findByRole("button", { name: "copywriter" });
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agents" }), { target: { value: "zzz" } });
+    expect(screen.getByText("No agent matches that filter.")).toBeDefined();
   });
 });

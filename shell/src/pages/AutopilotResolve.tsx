@@ -51,7 +51,7 @@ export function ResolvePanel({
   }
   const mode = status.data?.judge_resolve ?? "off";
   const readiness = status.data?.readiness;
-  // The núcleo refuses enforce off Active or under the bar; the button is shut to match (spec B D11).
+  // The daemon refuses enforce off Active or under the bar; the button is shut to match (spec B D11).
   const enforceShut = project?.mode !== "active" || readiness?.ready !== true;
   const rows = queue.data ?? [];
   return (
@@ -208,7 +208,7 @@ function ResolveRefusal({ error }: { error: unknown }) {
         not_ready: "the resolver has not cleared its bar yet — review more of its blocks below",
         unknown_project: "this project is not on the autopilot's roster",
         invalid: "off, observe and enforce are the only settings",
-        // A shell newer than its núcleo: until the núcleo shows the risk, the route still says this.
+        // A shell newer than its daemon: until the daemon shows the risk, the route still says this.
         enforce_unavailable:
           `this ${DAEMON_NAME} does not accept enforce for the resolver yet — update it to one that shows the risk first`,
       }}

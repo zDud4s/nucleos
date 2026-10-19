@@ -7,6 +7,7 @@ import { Button } from "../ui/Button";
 import { ConfirmButton } from "../ui/ConfirmButton";
 import { ErrorNote } from "../ui/ErrorNote";
 import { RefusalNote } from "../ui/RefusalNote";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Taking a project off the roster, asked for from inside the project's own State mode.
@@ -133,7 +134,7 @@ export function RemoveProject({
         )}
         {forgetting ? (
           <>
-            Its {has} will be deleted from the núcleo and cannot be brought back; adding it again
+            Its {has} will be deleted from the {DAEMON_NAME} and cannot be brought back; adding it again
             starts with no history.
           </>
         ) : projectRoot === null ? (
@@ -150,7 +151,7 @@ export function RemoveProject({
       */}
       {record.isError ? (
         <p className="text-xs text-text-muted">
-          the núcleo did not say what {projectId} has on record — removing it still works, and the
+          the {DAEMON_NAME} did not say what {projectId} has on record — removing it still works, and the
           history is kept
         </p>
       ) : record.data === undefined ? (
@@ -206,7 +207,7 @@ export function RemoveProject({
         ) : (
           // The app tried and could not: the error rung, next to the button that caused it. It was
           // faint 12px text — the one failure on this page that read quieter than a column label.
-          <ErrorNote>the núcleo did not answer — nothing was removed</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was removed</ErrorNote>
         ))}
 
       {/* Drawn inside a modal: the answer row on its bottom edge, right-aligned, the act last. */}

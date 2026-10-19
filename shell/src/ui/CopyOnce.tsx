@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { DAEMON_NAME } from "../copy";
 import { Button } from "./Button";
 
 export interface CopyOnceProps {
@@ -48,7 +49,7 @@ export function CopyOnce({ value, label, onDismiss }: CopyOnceProps) {
   return (
     <div className="ui-copy-once" role="group" aria-label="a secret shown once">
       <p className="ui-copy-once-warning">
-        Shown once — the núcleo will not show {label} again. Copy it now or write it down.
+        Shown once — the {DAEMON_NAME} will not show {label} again. Copy it now or write it down.
       </p>
       <input
         className="ui-copy-once-field"

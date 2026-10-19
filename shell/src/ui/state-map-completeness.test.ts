@@ -11,6 +11,7 @@ const jobRs = moduleSource("core/src/execution/job");
 const teamRs = readFileSync(`${repoRoot}core/src/team.rs`, "utf8");
 const concurrencyRs = readFileSync(`${repoRoot}core/src/execution/concurrency.rs`, "utf8");
 const runsRs = moduleSource("core/src/execution/runs");
+const sidecarRs = readFileSync(`${repoRoot}core/src/sidecar.rs`, "utf8");
 const quotaRs = readFileSync(`${repoRoot}core/src/quota.rs`, "utf8");
 
 /**
@@ -242,6 +243,15 @@ describe("state-map completeness", () => {
    * `StateBadge` then renders the bare literal, and a ring falls back to a neutral tone. A quota
    * that is spent would be painted the same as one that is fine.
    */
+  it("both liveness states a sidecar row can carry have a reading", () => {
+    const states = ["RUNNING", "DOWN"].map((name) => sidecarRs.match(new RegExp(`const ${name}: &str = "([a-z_]+)";`))?.[1]);
+
+    expect(states).toEqual(["running", "down"]);
+    expect(new Set(statesOf("sidecar"))).toEqual(new Set(states));
+    expect(readState("sidecar", "down")?.tone).toBe("danger");
+    expect(readState("sidecar", "running")?.tone).toBe("active");
+  });
+
   it("every quota state the núcleo can produce has a reading", () => {
     const states = literals(quotaRs, /pub const QUOTA_STATES: \[&str; \d+\] = \[([^\]]*)\];/);
 

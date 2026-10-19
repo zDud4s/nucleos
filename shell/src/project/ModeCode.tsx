@@ -30,6 +30,7 @@ import {
 } from "../ui";
 // By its own path until the barrel exports it — `ui/index.ts` is not this change's file.
 import { Diff, type LineLink } from "../ui/Diff";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * "What is this?" — a review surface, not an IDE.
@@ -89,7 +90,7 @@ export function ModeCode({ projectId, run, onPickRun }: ModeCodeProps) {
   if (concurrency.data === undefined && concurrency.isError && selected === null) {
     return (
       <ErrorNote>
-        The núcleo did not answer, so there is no telling which runs have anything to review here.
+        The {DAEMON_NAME} gave no reply, so there is no telling which runs have anything to review here.
       </ErrorNote>
     );
   }
@@ -389,7 +390,7 @@ function useEditorDoor(): EditorDoor {
 function DoorFailed() {
   return (
     <ErrorNote>
-      VS Code did not answer. Is it installed, and does it open <code>vscode://</code> links on this
+      VS Code gave no reply. Is it installed, and does it open <code>vscode://</code> links on this
       machine?
     </ErrorNote>
   );
@@ -484,7 +485,7 @@ function ChangedBody({
           422: "This worktree has no recorded branch point, so what it changed cannot be measured.",
           404: "That worktree is gone — the run may have finished and given its slot back. Its own page says how it ended.",
         }}
-        otherwise="The núcleo could not read this worktree."
+        otherwise={`The ${DAEMON_NAME} could not read this worktree.`}
       />
     );
   }
@@ -865,7 +866,7 @@ function ViewRefusal({ what, error }: { what: string; error: unknown }) {
         404: `No ${what} — that path is not in this run's worktree, or the worktree is gone. A file this run deleted has no ${what} to read; its diff says what it held.`,
         400: "That path was refused.",
       }}
-      otherwise={`The núcleo could not read the ${what}.`}
+      otherwise={`The ${DAEMON_NAME} could not read the ${what}.`}
     />
   );
 }

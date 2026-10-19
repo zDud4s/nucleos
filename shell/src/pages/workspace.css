@@ -122,7 +122,9 @@
  */
 .ws-slots {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  /* 4.5rem and not 7rem: a ceiling of four fits one row down to a narrow column instead of three
+     cells and an orphaned "free" beneath them. A taken cell's kind and number wrap inside it. */
+  grid-template-columns: repeat(auto-fit, minmax(4.5rem, 1fr));
   gap: 2px;
   margin: 0;
   padding: 0;
@@ -172,6 +174,33 @@
 .ws-slot-kind {
   color: var(--text-muted);
   text-transform: capitalize;
+}
+
+/*
+  A branch line is one row, left-aligned: name, standing, then the last subject taking what is left
+  and truncating, and the age at the far end. The shared line wraps, which on a narrow page set the
+  message on its own line under a centred name and left the rows ragged.
+*/
+.ui-rows-row.ws-branch-line {
+  flex-wrap: nowrap;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.ws-branch-name {
+  flex: 0 1 auto;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-branch-subject {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* --------------------------------------------------------- the primitives, in this page -- */
@@ -595,83 +624,6 @@ a.ws-lead-door:hover {
   text-transform: none;
 }
 
-/**
- * The ⓘ beside a group title, and its tip. Pure CSS: the sentence is always in the document (a
- * screen reader reaches it through `aria-describedby`) and is shown on hover or keyboard focus,
- * floating, so reading it moves nothing on the page.
- */
-.ws-tip {
-  position: relative;
-  display: inline-flex;
-}
-
-.ws-tip-mark {
-  display: inline-grid;
-  place-items: center;
-  width: 1.125rem;
-  height: 1.125rem;
-  padding: 0;
-  border: 1.5px solid var(--text-faint);
-  border-radius: var(--radius-pill);
-  background: none;
-  font-family: var(--font-display);
-  font-size: 0.625rem;
-  font-weight: var(--weight-bold);
-  line-height: 1;
-  color: var(--text-faint);
-  cursor: help;
-}
-
-.ws-tip:hover .ws-tip-mark,
-.ws-tip-mark:focus-visible {
-  border-color: var(--text-muted);
-  color: var(--text-muted);
-}
-
-.ws-tip-box {
-  position: absolute;
-  top: calc(100% + var(--space-2));
-  left: 50%;
-  z-index: 30;
-  width: max-content;
-  max-width: min(22rem, 80vw);
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-lg);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-regular);
-  line-height: var(--leading-normal);
-  color: var(--text);
-  visibility: hidden;
-  opacity: 0;
-  transform: translateX(-50%);
-  transition: opacity 120ms ease;
-  pointer-events: none;
-}
-
-/* The gap between mark and tip, bridged so the pointer can travel onto the tip. */
-.ws-tip-box::before {
-  content: "";
-  position: absolute;
-  inset: calc(-1 * var(--space-2) - 1px) 0 auto;
-  height: var(--space-2);
-}
-
-.ws-tip:hover .ws-tip-box,
-.ws-tip:focus-within .ws-tip-box {
-  visibility: visible;
-  opacity: 1;
-  pointer-events: auto;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .ws-tip-box {
-    transition: none;
-  }
-}
-
 /* The leading line's reserved height was sized for the old band; a sentence needs only its own. */
 .ws-page > section[aria-label="Leading"] {
   min-height: 2rem;
@@ -710,12 +662,28 @@ a.ws-lead-door:hover {
   margin-top: var(--space-1);
 }
 
-/* Narrow: one scrolling line with snap points, instead of wrapping into two and breaking the rule. */
-@media (max-width: 560px) {
+/*
+  Narrow: one scrolling line with snap points, instead of wrapping into two and breaking the rule.
+  Six labelled tabs with counts outgrow the strip well before a phone (they wrapped at 800 and 850),
+  so the line scrolls from 900px down. A scroller clips whatever floats out of it, and a tip is
+  exactly that, so the pop is not drawn here: it opened clipped to the strip's height. The chord it
+  carries is a keyboard hint and the count's meaning is on the tab's accessible description, which
+  stays (`aria-describedby` reads hidden content).
+*/
+@media (max-width: 900px) {
   .ws-tabs {
     flex-wrap: nowrap;
     overflow-x: auto;
     scroll-snap-type: x proximity;
+  }
+
+  .ws-tabs .ui-tab {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .ws-tabs .ui-tip-pop {
+    display: none;
   }
 }
 

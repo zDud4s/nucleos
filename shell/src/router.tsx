@@ -185,6 +185,9 @@ function someText(raw: unknown): string | undefined {
   return typeof raw === "string" && raw !== "" ? raw : undefined;
 }
 
+/** The Bench's tab values (`team/Bench.tsx`), the only ones `?tab=` may carry. */
+const BENCH_TAB_VALUES: readonly string[] = ["work", "decisions", "roster", "routines", "charter"];
+
 const DETAIL_ROUTES: {
   path: string;
   component: () => ReactNode;
@@ -257,7 +260,19 @@ const DETAIL_ROUTES: {
   },
   { path: "/chats/$chatId", component: Chats },
   { path: "/council/$councilId", component: Council },
-  { path: "/teams/$teamId", component: Bench },
+  {
+    path: "/teams/$teamId",
+    component: Bench,
+    /*
+      Which Bench tab is open, so "3 decisions" can link to `?tab=decisions` and a reload or Back
+      keeps the tab. Only the Bench's real tabs count; anything else is dropped, which is the same
+      as not asking (the Bench then opens on Work).
+    */
+    validateSearch: (search) => {
+      const raw = search.tab;
+      return typeof raw === "string" && BENCH_TAB_VALUES.includes(raw) ? { tab: raw } : {};
+    },
+  },
   { path: "/team-runs/$runId", component: TeamRunDetail },
   { path: "/mail/$emailId", component: MailDetail },
   { path: "/web/pages/$pageId", component: WebTabs },

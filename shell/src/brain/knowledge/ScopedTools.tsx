@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../../copy";
 import type { ReactNode } from "react";
 import { isApiRefusal } from "../../data/client";
 import {
@@ -27,7 +28,7 @@ export function ScopedTools({ ownerKind, ownerId }: ScopedToolsProps) {
   let body: ReactNode;
   if (active.isError) {
     body = (
-      <ErrorNote onRetry={() => void active.refetch()}>the núcleo did not answer — these tools are unknown</ErrorNote>
+      <ErrorNote onRetry={() => void active.refetch()}>the {DAEMON_NAME} is not responding — these tools are unknown</ErrorNote>
     );
   } else if (active.data === undefined) {
     body = <Skeleton label="Loading tools…" lines={2} />;
@@ -107,14 +108,14 @@ const TOOL_SENTENCES: Record<string, string> = {
   conflict:
     "this one was already decided, or is no longer active — the list clears it on the next read",
   not_found: "that one is gone; there is nothing left to decide",
-  unprocessable: "the núcleo found no such team — nothing was changed",
-  internal: "the núcleo failed while carrying the decision out — nothing was changed",
+  unprocessable: `the ${DAEMON_NAME} found no such team — nothing was changed`,
+  internal: `the ${DAEMON_NAME} failed while carrying the decision out — nothing was changed`,
 };
 
 /** What the tool doors say when they say no; shared by the section and the Brain's queue. */
 export function ToolRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>;
+    return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>;
   }
   return <RefusalNote refusal={error} sentences={TOOL_SENTENCES} />;
 }

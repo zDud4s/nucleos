@@ -7,6 +7,7 @@ import {
   type BranchStanding,
 } from "../data/project-git";
 import { ErrorNote, Quiet, RelativeTime, Row, Rows, StaleNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Where the work is, and how far it is from landing.
@@ -46,7 +47,7 @@ export function Branches({ projectId }: BranchesProps) {
   if (branches.isError && branches.data === undefined) {
     return (
       <ErrorNote>
-        The núcleo could not read this project&rsquo;s branches — its folder may have moved.
+        The {DAEMON_NAME} could not read this project&rsquo;s branches — its folder may have moved.
       </ErrorNote>
     );
   }
@@ -128,13 +129,13 @@ function Line({ row, integration }: { row: BranchRow; integration: string | null
   const tone = STANDING_TONE[standing];
 
   return (
-    <Row layout="line">
+    <Row layout="line" className="ws-branch-line">
       <span
         className="h-1.5 w-1.5 shrink-0 rounded-pill"
         style={{ background: `var(--tone-${tone}-fg)` }}
         aria-hidden="true"
       />
-      <span className="shrink-0 font-mono text-sm text-text">{row.name}</span>
+      <span className="ws-branch-name font-mono text-sm text-text">{row.name}</span>
 
       {/*
         The numbers, and only when there are numbers to give. An unmeasured branch shows the word
@@ -148,7 +149,7 @@ function Line({ row, integration }: { row: BranchRow; integration: string | null
             }`}
       </span>
 
-      <span className="truncate text-sm text-text-muted">{row.last_subject}</span>
+      <span className="ws-branch-subject text-sm text-text-muted">{row.last_subject}</span>
       <span className="ml-auto shrink-0 text-xs text-text-faint">
         <RelativeTime at={row.last_commit_at} />
       </span>

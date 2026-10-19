@@ -14,6 +14,7 @@ import { select } from "d3-selection";
 
 import type { GEdgeType, GModel, GNode } from "./graph-types";
 import { colorToken, neighbours, nodeRadius } from "./graph-util";
+import { MARK_PATHS, markKey } from "./marks";
 import { hitTest, labelVisible, type Placed } from "./hit-test";
 import "./force-graph.css";
 
@@ -60,6 +61,45 @@ interface Engine {
 }
 
 /** jsdom and a not-yet-laid-out container both measure 0; draw at something rather than nothing. */
+const shapeCache = new Map<string, Path2D>();
+
+/** The node's silhouette as a unit Path2D, or null where the runtime has none (a circle is drawn instead). */
+function markPath(n: GNode): Path2D | null {
+  if (typeof Path2D === "undefined") return null;
+  const key = markKey(n);
+  let p = shapeCache.get(key);
+  if (!p) {
+    p = new Path2D(MARK_PATHS[key]);
+    shapeCache.set(key, p);
+  }
+  return p;
+}
+
+/** Draws `shape` centred at x,y scaled by r; `stroke` keeps the current line width in screen units. */
+function paintShape(c: CanvasRenderingContext2D, shape: Path2D | null, x: number, y: number, r: number, stroke: boolean) {
+  if (!shape) {
+    c.beginPath();
+    c.arc(x, y, r, 0, Math.PI * 2);
+    if (stroke) c.stroke();
+    else c.fill();
+    return;
+  }
+  c.save();
+  c.translate(x, y);
+  c.scale(r, r);
+  if (stroke) {
+    c.lineWidth = c.lineWidth / r;
+    c.stroke(shape);
+  } else {
+    c.fill(shape);
+  }
+  c.restore();
+}
+const strokeShape = (c: CanvasRenderingContext2D, s: Path2D | null, x: number, y: number, r: number) =>
+  paintShape(c, s, x, y, r, true);
+const fillShape = (c: CanvasRenderingContext2D, s: Path2D | null, x: number, y: number, r: number) =>
+  paintShape(c, s, x, y, r, false);
+
 const FALLBACK_WIDTH = 600;
 /** Fit the view once the layout has had this many ticks to settle. */
 const FIT_AFTER_TICKS = 120;
@@ -206,21 +246,21 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         const r = nodeRadius(n.degree);
         const fill = colour(colorToken(n), "#8b94a3");
         c.globalAlpha = lit && !lit.has(n.id) ? 0.15 : 1;
-        c.beginPath();
-        c.arc(x, y, r, 0, Math.PI * 2);
+        // The node's silhouette is its identity (`marks.tsx`); one neutral fill serves them all.
+        const shape = markPath(n);
         if (n.missing) {
           c.setLineDash([3 / k, 2 / k]);
           c.strokeStyle = colour("--brain-missing", "#808a9a");
           c.lineWidth = 1.5 / k;
-          c.stroke();
+          strokeShape(c, shape, x, y, r);
           c.setLineDash([]);
         } else if (n.bucket === "proposed") {
           c.strokeStyle = fill;
           c.lineWidth = 1.5 / k;
-          c.stroke();
+          strokeShape(c, shape, x, y, r);
         } else {
           c.fillStyle = fill;
-          c.fill();
+          fillShape(c, shape, x, y, r);
         }
         if (n.id === sel) {
           c.beginPath();

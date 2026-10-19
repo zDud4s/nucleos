@@ -44,14 +44,10 @@ describe("nodeRadius", () => {
 });
 
 describe("colorToken", () => {
-  it("names a knowledge row by its layer", () => {
-    expect(colorToken(node("k:1", { kind: "knowledge", layer: "procedural" }))).toBe("--brain-k-procedural");
-    expect(colorToken(node("k:2", { kind: "knowledge", layer: "episodic" }))).toBe("--brain-k-episodic");
-  });
-  it("falls back to semantic for a knowledge row with no layer", () => {
-    expect(colorToken(node("k:3", { kind: "knowledge" }))).toBe("--brain-k-semantic");
-  });
-  it.each(["note", "project", "contact", "mail", "file"] as const)("names a %s by its kind", (kind) => {
-    expect(colorToken(node("x", { kind }))).toBe(`--brain-${kind}`);
-  });
+  it.each(["note", "knowledge", "project", "contact", "mail", "file"] as const)(
+    "gives a %s the one neutral node token",
+    (kind) => {
+      expect(colorToken(node("x", { kind }))).toBe("--brain-node");
+    },
+  );
 });

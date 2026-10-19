@@ -5,10 +5,12 @@ export function nodeRadius(degree: number): number {
   return Math.min(16, 4 + 2 * Math.sqrt(Math.max(0, degree)));
 }
 
-/** The CSS custom property NAME that colours this node; the canvas reads its value, never writes style. */
-export function colorToken(node: GNode): string {
-  if (node.kind === "knowledge") return `--brain-k-${node.layer ?? "semantic"}`;
-  return `--brain-${node.kind}`;
+/**
+ * The CSS custom property NAME that colours this node; the canvas reads its value, never writes style.
+ * One neutral token for every kind: identity is the node's shape (`markKey` in `marks.tsx`), not its hue.
+ */
+export function colorToken(_node: GNode): string {
+  return "--brain-node";
 }
 
 /** `id` and every node within `depth` edges of it, edges taken in both directions. */

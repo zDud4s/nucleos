@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useSetLayer, type Layering, type ProjectMap } from "../data/project-map";
 import { buildBands, isolate, maxLayer, type Band, type LayerBlock } from "./layers-model";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * The modules stacked by layer, highest first: what may import what, and which imports break it.
@@ -13,7 +14,7 @@ import { buildBands, isolate, maxLayer, type Band, type LayerBlock } from "./lay
 export function AtlasLayers({ projectId, data }: { projectId: string; data: ProjectMap }) {
   const layering = data.layers;
   if (layering === undefined) {
-    return <p className="text-sm text-text-muted">This núcleo does not report layers.</p>;
+    return <p className="text-sm text-text-muted">This {DAEMON_NAME} does not report layers.</p>;
   }
   return <Stack projectId={projectId} data={data} layering={layering} />;
 }

@@ -1,5 +1,5 @@
 // §spec alcada-por-projecto
-import { useId, useState, type FormEvent, type ReactNode } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -42,8 +42,10 @@ import {
   Quiet,
   RefusalNote,
   Section,
+  Tip,
   Well,
 } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * "What may this project do without asking?" — the Authority mode.
@@ -188,7 +190,7 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
   return (
     <div className="flex flex-col gap-3" aria-label="Standing" role="group">
       <Quiet says="Changes here reach the very next tool call of every run already working in this project.">
-        The núcleo reads these tables at the moment it decides, with no cache and no restart, so
+        The {DAEMON_NAME} reads these tables at the moment it decides, with no cache and no restart, so
         this is a live control and not a preference. Narrowing takes effect at the first press;
         anything that widens what runs may do on their own asks you to press twice.
       </Quiet>
@@ -301,7 +303,7 @@ function Remote({ projectId }: { projectId: string }) {
     return isApiRefusal(mapping.error) ? (
       <RefusalNote refusal={mapping.error} sentences={MAPPING_SENTENCES} />
     ) : (
-      <Quiet says="the núcleo did not answer which repository this project is">
+      <Quiet says={`the ${DAEMON_NAME} gave no reply about which repository this project is`}>
         The daemon is reachable or this window would be showing nothing at all, so this is the one
         read failing rather than the connection. Reopening the page asks again.
       </Quiet>
@@ -394,7 +396,7 @@ const WHY_NO_REPOSITORY: Record<
   root_missing: {
     says: "the folder this project points at is not there",
     because:
-      "The núcleo has a root recorded for this project and nothing is at it, which is what a checkout somebody moved or deleted looks like. Nothing here is lost: point the project at where the folder is now.",
+      `The ${DAEMON_NAME} has a root recorded for this project and nothing is at it, which is what a checkout somebody moved or deleted looks like. Nothing here is lost: point the project at where the folder is now.`,
   },
   not_a_repository: {
     says: "this project's folder is not a git repository",
@@ -415,8 +417,8 @@ const WHY_NO_REPOSITORY: Record<
 
 /** The one refusal `GET /projects/{id}/github-repo` makes, in this page's voice. */
 const MAPPING_SENTENCES: Record<string, string> = {
-  not_found: "the núcleo has no project by this name.",
-  internal: "the núcleo hit an error of its own working out which repository this is.",
+  not_found: `the ${DAEMON_NAME} has no project by this name.`,
+  internal: `the ${DAEMON_NAME} hit an error of its own working out which repository this is.`,
 };
 
 /** The one loading line, so the page does not grow a third size and a fourth wording for it. */
@@ -463,7 +465,7 @@ function ListingBody({ read, ci }: { read: UseQueryResult<ReadOutcome>; ci: bool
       <RefusalNote refusal={read.error} sentences={sentencesFor(read.error)} />
     ) : (
       <p className="text-sm text-text-muted">
-        The núcleo did not answer this read at all. That is the daemon and not GitHub, and asking
+        The {DAEMON_NAME} gave no reply to this read at all. That is the daemon and not GitHub, and asking
         again is the whole treatment.
       </p>
     );
@@ -480,7 +482,7 @@ function ListingBody({ read, ci }: { read: UseQueryResult<ReadOutcome>; ci: bool
         <p className="text-sm text-text-muted">
           gh ran and did not succeed
           {outcome.exit_code === null ? "" : ` (exit ${outcome.exit_code})`}. This is GitHub's
-          answer rather than the núcleo's, and it is printed whole below.
+          answer rather than the {DAEMON_NAME}'s, and it is printed whole below.
         </p>
         {said === "" ? (
           <p className="text-sm text-text-muted">And it printed nothing at all while failing.</p>
@@ -636,7 +638,7 @@ function sentencesFor(refusal: ApiRefusal): Record<string, string> {
 const ADVICE: Record<number, string> = {
   403: "The token lives in this machine's Credential Manager and the daemon reads it there at every call, so pasting one and asking again is all this needs.",
   503: "Either GitHub is switched off for this machine (enabled in ~/.nucleos/github.yaml, on the System page) or gh is not installed where the daemon can find it. The sentence before this says which; fix it, then restart the daemon.",
-  504: "GitHub or the network took longer than the núcleo waits. Asking again should settle it.",
+  504: `GitHub or the network took longer than the ${DAEMON_NAME} waits. Asking again should settle it.`,
 };
 
 /**
@@ -679,16 +681,16 @@ function ReadFailed({ read, says }: { read: UseQueryResult<unknown>; says: strin
     return <RefusalNote refusal={read.error} sentences={{ not_found: NO_SUCH_PROJECT }} />;
   }
   return (
-    <Quiet says={`the núcleo did not answer ${says}`}>
+    <Quiet says={`the ${DAEMON_NAME} gave no reply ${says}`}>
       The daemon is reachable or this window would be showing nothing at all, so this is the one
-      read failing rather than the connection. Nothing here is lost: the tables are the núcleo's,
+      read failing rather than the connection. Nothing here is lost: the tables are the {DAEMON_NAME}'s,
       and it is still enforcing them; this is only the picture of them. Reopening the page asks
       again.
     </Quiet>
   );
 }
 
-const NO_SUCH_PROJECT = "the núcleo has no project by this name.";
+const NO_SUCH_PROJECT = `the ${DAEMON_NAME} has no project by this name.`;
 
 /**
  * A group's name inside a section, as a heading.
@@ -699,38 +701,14 @@ const NO_SUCH_PROJECT = "the núcleo has no project by this name.";
  * one rank under the section title so the two do not read as siblings.
  */
 function GroupTitle({ children, about }: { children: ReactNode; about?: ReactNode }) {
-  const tipId = useId();
   // The tip sits beside the heading and not in it, so the heading's name stays the group's name.
   return (
     <div className="ws-subhead">
       <h3 className="ws-subtitle">{children}</h3>
       {about === undefined ? null : (
-        <Tip id={tipId} name={`About ${String(children).trim()}`}>
-          {about}
-        </Tip>
+        <Tip name={`About ${String(children).trim()}`} tip={about} persist />
       )}
     </div>
-  );
-}
-
-/**
- * A group's one-sentence caption, behind an ⓘ beside its title.
- *
- * The owner's words for the inline captions were "fdd de ler": every group opened with a small grey
- * paragraph before its first row. The sentence is kept — tests and screen readers still find it,
- * because it is always in the document and the mark is described by it — and it shows on hover or
- * focus, floating over the page so nothing moves. Pure CSS: there is no state to keep.
- */
-function Tip({ id, name, children }: { id: string; name: string; children: ReactNode }) {
-  return (
-    <span className="ws-tip">
-      <button type="button" className="ws-tip-mark" aria-label={name} aria-describedby={id}>
-        i
-      </button>
-      <span className="ws-tip-box" role="tooltip" id={id}>
-        {children}
-      </span>
-    </span>
   );
 }
 
@@ -814,7 +792,7 @@ function RowFailure({ error, sentences }: { error: unknown; sentences: Record<st
       {isApiRefusal(error) ? (
         <RefusalNote refusal={error} sentences={sentences} />
       ) : (
-        <ErrorNote>The núcleo did not answer this write. Nothing on screen changed.</ErrorNote>
+        <ErrorNote>The {DAEMON_NAME} gave no reply to this write. Nothing on screen changed.</ErrorNote>
       )}
     </div>
   );
@@ -916,7 +894,7 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
         this project's worktrees, and only while GitHub is switched on for this machine:{" "}
         <span className="font-mono">enabled: false</span> in{" "}
         <span className="font-mono">~/.nucleos/github.yaml</span> (System › Settings) makes the
-        núcleo ignore every project's grants, and nothing on this page overrides that. A granted
+        {DAEMON_NAME} ignore every project's grants, and nothing on this page overrides that. A granted
         action is stored and does nothing yet. An operation this build does not allow is listed so
         you know it exists; nothing on this machine can grant it.
       </Quiet>
@@ -1004,17 +982,17 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
 const OP_SENTENCES: Record<string, string> = {
   kill_switch:
     "the emergency stop is engaged, and granting an operation widens what runs on its own. Withdrawing one is never blocked by it.",
-  no_such_project: "the núcleo has no project by this name.",
+  no_such_project: `the ${DAEMON_NAME} has no project by this name.`,
   no_such_op: "this project had not granted that one.",
-  internal: "the núcleo hit an error of its own writing it down.",
+  internal: `the ${DAEMON_NAME} hit an error of its own writing it down.`,
 };
 
 const GIT_OP_SENTENCES: Record<string, string> = {
   kill_switch:
     "the emergency stop is engaged, and granting a queue operation widens what autonomous runs may do. Withdrawing one is never blocked by it.",
-  no_such_project: "the núcleo has no project by this name.",
+  no_such_project: `the ${DAEMON_NAME} has no project by this name.`,
   no_such_op: "this project had not granted that git operation.",
-  internal: "the núcleo hit an error of its own writing it down.",
+  internal: `the ${DAEMON_NAME} hit an error of its own writing it down.`,
 };
 
 /**
@@ -1348,8 +1326,8 @@ function ShellRules({ projectId, stopped }: { projectId: string; stopped: boolea
         rule; the worked example behind "why?" is the half nobody guesses, and it stays one press
         away rather than one paragraph in the way of every opening.
       */}
-      <Quiet says="A refusal here beats a permission here, and beats one compiled into the núcleo. A permission never lifts a refusal.">
-        A permission only widens what the núcleo would otherwise have <em>asked</em> about. So{" "}
+      <Quiet says={`A refusal here beats a permission here, and beats one compiled into the ${DAEMON_NAME}. A permission never lifts a refusal.`}>
+        A permission only widens what the {DAEMON_NAME} would otherwise have <em>asked</em> about. So{" "}
         <span className="font-mono">rm</span> allowed here leaves{" "}
         <span className="font-mono">rm -rf /</span> refused, and a line carrying{" "}
         <span className="font-mono">$( )</span> stays refused whatever these lists say. A project
@@ -1401,7 +1379,7 @@ function ShellRules({ projectId, stopped }: { projectId: string; stopped: boolea
 
       {/*
         The one mutation, handed down rather than made again inside the form. `useDeclareShellRule`
-        is one hook because the núcleo has one operation — the identity of a rule is its folded
+        is one hook because the {DAEMON_NAME} has one operation — the identity of a rule is its folded
         prefix, so declaring and re-verdicting are the same POST.
       */}
       <DeclareRule projectId={projectId} rows={rows} declare={declare} stopped={stopped} />
@@ -1427,9 +1405,9 @@ const RULE_SENTENCES: Record<string, string> = {
   kill_switch:
     "the emergency stop is engaged, so nothing here may widen what runs on its own. Declaring the same prefix as a refusal is not blocked: the stop never stands in the way of narrowing.",
   empty_prefix: "a rule has to name a prefix.",
-  no_such_project: "the núcleo has no project by this name.",
+  no_such_project: `the ${DAEMON_NAME} has no project by this name.`,
   no_such_rule: "no rule of that name was declared here.",
-  internal: "the núcleo hit an error of its own writing the rule.",
+  internal: `the ${DAEMON_NAME} hit an error of its own writing the rule.`,
 };
 
 /**
@@ -1489,7 +1467,7 @@ function RuleList({
             return (
               <li
                 /*
-                  The tool and the prefix, because that pair is the rule's identity in the núcleo's
+                  The tool and the prefix, because that pair is the rule's identity in the {DAEMON_NAME}'s
                   own unique index. Keyed on the prefix alone, a project holding both kinds of rule
                   for one name hands React two children with one key — which it resolves by drawing
                   one of them.
@@ -1731,7 +1709,7 @@ function DeclareRule({
         <div className="flex flex-wrap items-end gap-3">
           {/*
             What KIND of rule this is, asked before the prefix because it changes what the prefix
-            means: a command to run, or a path to write into. The tools the núcleo can govern are
+            means: a command to run, or a path to write into. The tools the {DAEMON_NAME} can govern are
             `classifier::WRITE_TOOLS`, and the route refuses anything else by name — an option
             here that is not on that list would be a control whose only answer is `unknown_tool`.
 
@@ -1776,7 +1754,7 @@ function DeclareRule({
         </div>
 
         {/*
-          What the núcleo will actually store, shown only where it differs from what was typed. The
+          What the {DAEMON_NAME} will actually store, shown only where it differs from what was typed. The
           fold happens on the way IN — whitespace collapsed, ASCII lower-cased — so a form that could
           not say this is a form that surprises people.
         */}
@@ -1840,12 +1818,12 @@ function DeclareRule({
             <Quiet says="A refusal can name a pipe or a redirection; a permission cannot.">
               A refusal answers at the whole line and needs no shape the classifier can read, so a
               pipe, a redirection or an <span className="font-mono">-exec</span> is fine in one. A
-              permission has to match a command the núcleo can take apart. Enter declares a refusal;
+              permission has to match a command the {DAEMON_NAME} can take apart. Enter declares a refusal;
               allowing always asks for a second press.
             </Quiet>
           ) : (
             <Quiet says="A rule about a tool can only refuse.">
-              There is nothing to allow: a write the núcleo does not refuse is already local work it
+              There is nothing to allow: a write the {DAEMON_NAME} does not refuse is already local work it
               does not stop for, so a permission here would widen nothing and be enforced by
               nothing. The path is read from the project root, and everything under it is refused
               with it.
@@ -1856,7 +1834,7 @@ function DeclareRule({
         {failed === null ? null : isApiRefusal(failed) ? (
           <RefusalNote refusal={failed} sentences={RULE_SENTENCES} />
         ) : (
-          <ErrorNote>The núcleo did not answer this declaration. Nothing was stored.</ErrorNote>
+          <ErrorNote>The {DAEMON_NAME} gave no reply to this declaration. Nothing was stored.</ErrorNote>
         )}
       </Inset>
     </form>
@@ -1937,7 +1915,7 @@ function LandTargets({ projectId }: { projectId: string }) {
                   Only the `declared` arm gets the claim. A fact and not a row: the integration
                   branch needs no entry in the table to stay admissible, so there is nothing to
                   withdraw and no button is offered — and in the other two arms nothing lands by
-                  default at all, so borrowing the caption would assert exactly what the núcleo would
+                  default at all, so borrowing the caption would assert exactly what the {DAEMON_NAME} would
                   refuse.
                 */}
                 <span className="text-xs text-text-muted">{CAPTION[integration.state]}</span>
@@ -2014,8 +1992,8 @@ const CAPTION: Record<"declared" | "stale" | "derived", string> = {
 };
 
 const TARGET_SENTENCES: Record<string, string> = {
-  no_such_project: "the núcleo has no project by this name.",
+  no_such_project: `the ${DAEMON_NAME} has no project by this name.`,
   no_such_target:
     "no target of that name was added here. The integration branch is admissible without a row, so there is never one of those to withdraw.",
-  internal: "the núcleo hit an error of its own writing it down.",
+  internal: `the ${DAEMON_NAME} hit an error of its own writing it down.`,
 };

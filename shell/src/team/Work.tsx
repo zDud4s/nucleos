@@ -182,7 +182,7 @@ function Composer({ teamId, runs }: { teamId: string; runs: TeamRun[] }) {
       {started !== undefined && !runs.some((run) => run.id === started.id) && (
         <p className="teams-note">
           Started — <Link to={`/team-runs/${started.id}`}>{start.variables?.request ?? "this task"}</Link>{" "}
-          has nothing in it yet; the núcleo has not picked it up.
+          has nothing in it yet; the {DAEMON_NAME} has not picked it up.
         </p>
       )}
     </form>

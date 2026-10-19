@@ -727,7 +727,9 @@ describe("Council - a chairman that failed", () => {
     // the error note in the dossier, opened on the bench.
     expect(await screen.findByRole("button", { name: /^Seat 1,/ })).toBeDefined();
     expect(screen.getByRole("button", { name: /^Seat 2,/ })).toBeDefined();
-    expect(screen.getByRole("button", { name: /^Chairman,/ }).getAttribute("data-state")).toBe("failed");
+    // The picture is aria-hidden, so the judge's state is read off the drawing itself.
+    expect(screen.getByRole("button", { name: /^Chairman,/ })).toBeDefined();
+    expect(document.querySelector(".council-court-judge")?.getAttribute("data-state")).toBe("failed");
     expect(await within(dossier()).findByText(/ended in timeout/)).toBeDefined();
     // The seats' own answers are still on the record.
     await openTheRecord();
@@ -1243,10 +1245,16 @@ describe("Council - the verdict in the room", () => {
     // The names come from the chairs' accessible names, not from a table.
     const first = await screen.findByRole("button", { name: /^Seat 2, the sceptic/ });
     const last = screen.getByRole("button", { name: /^Seat 1, gpt-5/ });
-    expect(first.querySelector("circle")?.getAttribute("r")).toBe("24");
-    expect(last.querySelector("circle")?.getAttribute("r")).toBe("14");
-    expect(first.textContent).toContain("1st");
-    expect(last.textContent).toContain("2nd");
+    // The drawn chairs are aria-hidden SVG groups, in seat order, under the HTML buttons.
+    const groups = document.querySelectorAll(".council-court-seat");
+    const firstDisc = groups[1]?.querySelector(".council-court-seat-disc");
+    const lastDisc = groups[0]?.querySelector(".council-court-seat-disc");
+    expect(firstDisc?.getAttribute("r")).toBe("24");
+    expect(lastDisc?.getAttribute("r")).toBe("14");
+    expect(first).toBeDefined();
+    expect(last).toBeDefined();
+    expect(groups[1]?.textContent).toContain("1st");
+    expect(groups[0]?.textContent).toContain("2nd");
   });
 });
 
@@ -2031,7 +2039,7 @@ describe("Council - the detail, redesigned", () => {
     await renderCouncil("/council/c-1");
     await panelFor("Synthesis");
 
-    expect(screen.getByRole("group", { name: "Courtroom" })).toBeDefined();
+    expect(screen.getByRole("region", { name: "Court" })).toBeDefined();
     expect(within(dossier()).getByRole("heading", { level: 2, name: "Synthesis" })).toBeDefined();
     expect(within(screen.getByRole("list", { name: "Process" })).getAllByRole("listitem")).toHaveLength(5);
     // The record is the last thing on the page and starts shut.
@@ -2175,8 +2183,10 @@ describe("Council - the detail, redesigned", () => {
     await renderCouncil("/council/c-1");
 
     const chair = await screen.findByRole("button", { name: /^Seat 1,/ });
-    expect(chair.querySelector("circle")?.getAttribute("r")).toBe("18");
-    expect(chair.textContent).not.toMatch(/\d(st|nd|rd|th)/);
+    const disc = document.querySelector(".council-court-seat .council-court-seat-disc");
+    expect(disc?.getAttribute("r")).toBe("18");
+    expect(chair).toBeDefined();
+    expect(document.querySelector(".council-court-seat")?.textContent).not.toMatch(/\d(st|nd|rd|th)/);
   });
 
   it("going back: a phase shows that round's masks and its scales, and the live phase returns to live", async () => {
@@ -2200,10 +2210,11 @@ describe("Council - the detail, redesigned", () => {
     daemon.apiFetch.mockImplementation(councilFetch([councilSummary()], { "c-1": view }));
 
     await renderCouncil("/council/c-1");
-    const room = await screen.findByRole("group", { name: "Courtroom" });
+    const room = await screen.findByRole("region", { name: "Court" });
     const process = screen.getByRole("list", { name: "Process" });
     // Live: the verdict, with the real names and the final scales.
-    expect(within(room).getByText("strong consensus · τ 0.90")).toBeDefined();
+    // The scale reads twice in the room (the drawn balance and the summary), so ask for all of them.
+    expect(within(room).getAllByText("strong consensus · τ 0.90").length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: /^Seat 1, alpha/ })).toBeDefined();
     expect(within(process).getByRole("button", { name: "Verdict" }).getAttribute("aria-current")).toBe("step");
 
@@ -2211,12 +2222,12 @@ describe("Council - the detail, redesigned", () => {
 
     // Round 1: the critique masks the seats and the scales are that round's own.
     expect(await screen.findByRole("button", { name: /^Seat 1, A/ })).toBeDefined();
-    expect(within(room).getByText("split · τ 0.30")).toBeDefined();
+    expect(within(room).getAllByText("split · τ 0.30").length).toBeGreaterThan(0);
     expect(within(process).getByRole("button", { name: "Deliberation I" }).getAttribute("aria-current")).toBe("step");
 
     fireEvent.click(within(process).getByRole("button", { name: "Verdict" }));
     expect(await screen.findByRole("button", { name: /^Seat 1, alpha/ })).toBeDefined();
-    expect(within(room).getByText("strong consensus · τ 0.90")).toBeDefined();
+    expect(within(room).getAllByText("strong consensus · τ 0.90").length).toBeGreaterThan(0);
   });
 
   it("the verdict opens the structured synthesis in the dossier", async () => {

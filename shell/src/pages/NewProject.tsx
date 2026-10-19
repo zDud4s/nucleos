@@ -607,6 +607,7 @@ function Found({
 
   return (
     <fieldset disabled={locked} className="m-0 flex min-w-0 flex-col gap-5 border-0 p-0">
+      <legend className="sr-only">Project setup</legend>
       <Step n={2} label="What is already there" headingRef={foundHeading}>
         <dl className="np-repo">
           <Row label="Folder" value={found.root} mono />

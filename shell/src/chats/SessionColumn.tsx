@@ -37,7 +37,7 @@ import {
   type ChatSummary,
   type IdeSession,
 } from "../data/chats";
-import { ErrorNote, RelativeTime, Teach, relativeText } from "../ui";
+import { ConfirmButton, ErrorNote, RelativeTime, Teach, relativeText } from "../ui";
 import { stillGoing } from "../lib/editor";
 import { BAND_TITLE, inBands } from "../lib/when";
 import {
@@ -496,7 +496,16 @@ function GroupSection({
               Rename
             </DropdownMenuItem>
             {/* Ungroups its sessions, never archives them — see `useDeleteChatGroup`. */}
-            <DropdownMenuItem onSelect={() => remove.mutate(group.id)}>Delete</DropdownMenuItem>
+            {/* Content and not an item, like `ArchiveControl`: a menu item would close the menu on
+                the first click and collapse the two-step interlock into one. */}
+            <div className="chats-context-row">
+              <ConfirmButton
+                label="Delete group"
+                confirmLabel="Keep holding to delete"
+                variant="quiet"
+                onConfirm={() => remove.mutate(group.id)}
+              />
+            </div>
           </DropdownMenuContent>
         </DropdownMenu>
       </summary>

@@ -18,11 +18,12 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { Web, looksLikeUrl } from "./Web";
+import { Web, clearWebDraft, looksLikeUrl } from "./Web";
 import { createAppQueryClient } from "../app/queryClient";
 import type { Page } from "../data/web";
 
 beforeEach(() => {
+  clearWebDraft();
   daemon.apiFetch.mockReset();
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();
@@ -134,7 +135,7 @@ describe("Web — the one field", () => {
     await renderWeb("/web");
 
     const field = screen.getByRole("textbox", { name: "Read an address or filter the archive" });
-    expect(field.getAttribute("placeholder")).toMatch(/address/);
+    expect(field.getAttribute("placeholder")).toMatch(/address/i);
     expect(field.getAttribute("placeholder")).toMatch(/filter/);
     // One field, not three: the read form and the filter box are gone.
     expect(screen.getAllByRole("textbox")).toHaveLength(1);
@@ -205,7 +206,7 @@ describe("Web — search", () => {
 
     // Never routed through the failure path — this is a 200 the daemon
     // answered on purpose, not a refusal and not a dropped request.
-    expect(screen.queryByText(/núcleo did not answer/)).toBeNull();
+    expect(screen.queryByText(/background service is not responding/)).toBeNull();
     expect(screen.queryByText(/the núcleo refused this/)).toBeNull();
     expect(document.querySelector(".ui-note-refusal")).toBeNull();
   });

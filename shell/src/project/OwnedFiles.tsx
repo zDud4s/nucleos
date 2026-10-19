@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../copy";
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import {
@@ -46,7 +47,7 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
   if (ownership.data === undefined) {
     // Refused is its own answer, not a read that is taking a while.
     return ownership.isError ? (
-      <ErrorNote>The núcleo did not say which files this app may write here.</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} did not say which files this app may write here.</ErrorNote>
     ) : (
       <p className="text-sm text-text-faint">Reading the write boundary…</p>
     );
@@ -64,7 +65,7 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
       <>
         <Quiet says="none">
           Every file in this project belongs to the repository, so all of it is read here and edited
-          where code is edited. Which files the app may write is answered by the núcleo rather than
+          where code is edited. Which files the app may write is answered by the {DAEMON_NAME} rather than
           decided by this page, so an empty list is a fence rather than a gap.
         </Quiet>
         {stale}
@@ -100,13 +101,13 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
 const REFUSALS: Record<string, string> = {
   kill_switch:
     "the emergency stop is engaged, so nothing writes — including this. The file is still editable in an editor.",
-  no_project_root: "the núcleo has no folder recorded for this project.",
-  not_ours: "the núcleo does not consider this app the author of that file.",
+  no_project_root: `the ${DAEMON_NAME} has no folder recorded for this project.`,
+  not_ours: `the ${DAEMON_NAME} does not consider this app the author of that file.`,
   unwritable: "that path does not land inside the folder it belongs in.",
   no_machine_root: "this machine has no home directory, so there is nowhere to keep the file.",
   bad_project_id:
-    "this project's id cannot name a folder, so the núcleo has nowhere to keep its files. Re-add the project under a simpler id.",
-  internal: "the núcleo hit an error of its own while writing.",
+    `this project's id cannot name a folder, so the ${DAEMON_NAME} has nowhere to keep its files. Re-add the project under a simpler id.`,
+  internal: `the ${DAEMON_NAME} hit an error of its own while writing.`,
 };
 
 function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {

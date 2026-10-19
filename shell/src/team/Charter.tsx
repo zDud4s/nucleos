@@ -1,6 +1,7 @@
 // §spec alcada-por-equipa
 import { useEffect, useId, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import { useAgents } from "../data/agents";
 import { ContextRefs } from "../context/ContextRefs";
 import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
@@ -9,7 +10,9 @@ import { isApiRefusal } from "../data/client";
 import {
   GRANTABLE_ACTIONS,
   GRANT_MODES,
+  teamRunIsAlive,
   useCreateTeam,
+  useDeleteTeam,
   useTeam,
   useTeams,
   useUpdateTeam,
@@ -18,7 +21,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Button, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote } from "../ui";
 import { detectDrift, snapshotFromView, type Drift, type DriftField } from "./drift";
 import { daemonProse } from "./prose";
 
@@ -246,8 +249,47 @@ export function Charter({ team, runs }: CharterProps) {
       <ContextRefs ownerKind="team" ownerId={team.id} />
       <ScopedMemory scopeKind="team" scopeId={team.id} />
       <ScopedTools ownerKind="team" ownerId={team.id} />
+      <DeleteTeam team={team} live={runs.filter((run) => teamRunIsAlive(run.state)).length} />
     </>
   );
+}
+
+/**
+ * Removing the team, kept away from the title and said in terms of what happens. Unavailable
+ * while tasks are running: the hold would otherwise end work in progress on one gesture.
+ */
+function DeleteTeam({ team, live }: { team: TeamView; live: number }) {
+  const del = useDeleteTeam();
+  const navigate = useNavigate();
+  const noteId = `bench-delete-${team.id}`;
+  const them = live === 1 ? "it" : "them";
+
+  return (
+    <section className="teams-bench-danger" aria-label="Delete this team">
+      <p id={noteId} className="teams-bench-danger-note">
+        {live > 0
+          ? `${live === 1 ? "1 task is" : `${live} tasks are`} still running. Let ${them} finish, or cancel ${them}, before deleting this team.`
+          : "Deleting this team removes it for good. This cannot be undone."}
+      </p>
+      <ConfirmButton
+        label="Delete team"
+        confirmLabel="Delete it now"
+        subject={team.name}
+        variant="danger"
+        intent="stop"
+        disabled={del.isPending}
+        unavailable={live > 0}
+        describedBy={noteId}
+        onConfirm={() => del.mutate(team.id, { onSuccess: () => void navigate({ to: "/teams" }) })}
+      />
+      {del.isError && <DeleteRefusal error={del.error} />}
+    </section>
+  );
+}
+
+function DeleteRefusal({ error }: { error: unknown }) {
+  if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
+  return <ErrorNote>The {DAEMON_NAME} is not responding, so this team was not deleted.</ErrorNote>;
 }
 
 /**

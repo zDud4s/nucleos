@@ -55,6 +55,7 @@ import {
   PageHeader,
   Panel,
   Quiet,
+  Skeleton,
   RefusalNote,
   RelativeTime,
   Row,
@@ -65,6 +66,7 @@ import {
   Tip,
 } from "../ui";
 import "./waiting.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Waiting — the one place a decision is asked for, whatever asked for it.
@@ -109,19 +111,27 @@ interface Reading<T> {
   /** Non-null only while the query is failing; `null` while it is fine. */
   error: unknown;
   dataUpdatedAt: number;
+  /** The first read has not finished: nothing is known yet, which is not the same as empty. */
+  pending: boolean;
+  /** Tries the read again; offered beside a failure that left nothing to show. */
+  retry: () => void;
 }
 
 function reading<T>(query: {
   data: T[] | undefined;
   isError: boolean;
+  isPending: boolean;
   error: unknown;
   dataUpdatedAt: number;
+  refetch: () => unknown;
 }): Reading<T> {
   return {
     rows: query.data,
     stale: query.isError && query.data !== undefined,
     error: query.isError ? query.error : null,
     dataUpdatedAt: query.dataUpdatedAt,
+    pending: query.isPending,
+    retry: () => void query.refetch(),
   };
 }
 
@@ -307,11 +317,11 @@ function has(rows: unknown[] | undefined): boolean {
  * ride along as "N to read and put away", which made a quiet morning with nine skipped items
  * read as a page with something on it; they are on the Autopilot page now.
  */
-function headlineFor(decisions: number | undefined): string | undefined {
+function headlineFor(decisions: number | undefined): ReactNode {
   if (decisions === undefined) return undefined;
-  return decisions === 0
-    ? "nothing is waiting on a decision"
-    : `${decisions} waiting on a decision`;
+  if (decisions === 0) return "nothing is waiting on a decision";
+  // The system's awaiting tone, so the one count that asks for a person is not neutral.
+  return <span className="ui-awaiting">{decisions} waiting on a decision</span>;
 }
 
 /* ------------------------------------------------------- the ordering freeze -- */
@@ -639,9 +649,9 @@ function Queue({
     body = (
       <Section label={title}>
         {view.error === null ? (
-          <Quiet says={`reading ${what}…`} />
+          <Skeleton label={`Loading ${what}`} />
         ) : (
-          <ListError error={view.error} what={what} />
+          <ListError error={view.error} what={what} onRetry={view.retry} />
         )}
       </Section>
     );
@@ -675,12 +685,20 @@ function Queue({
   );
 }
 
-function ListError({ error, what }: { error: unknown; what: string }) {
+function ListError({
+  error,
+  what,
+  onRetry,
+}: {
+  error: unknown;
+  what: string;
+  onRetry: () => void;
+}) {
   if (isApiRefusal(error))
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
-    <ErrorNote>
-      the daemon did not answer — nothing is known about {what}
+    <ErrorNote onRetry={onRetry}>
+      the {DAEMON_NAME} is not responding — nothing is known about {what}
     </ErrorNote>
   );
 }
@@ -729,7 +747,7 @@ export function DecisionRefusal({
 }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the daemon did not answer — nothing was decided</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>
     );
   }
   const sentences = trustProse
@@ -1234,7 +1252,8 @@ function ActionApprovalSection({ view }: { view: Reading<Proposal> }) {
                 ) : (
                   <Link
                     className="waiting-row-link"
-                    to={`/runs/${proposal.run_id}`}
+                    to="/runs/$runId"
+                    params={{ runId: String(proposal.run_id) }}
                   >
                     run {proposal.run_id}
                   </Link>
@@ -2148,7 +2167,7 @@ function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                   confirmLabel="Approve — keep these two apart"
                   subject={`#${proposal.id}`}
                   variant="approve"
-                  disabled={approve.isPending}
+                  disabled={approve.isPending || pair.low === null || pair.high === null}
                   onArmedChange={onArmedChange}
                   onConfirm={() => approve.mutate(proposal.id)}
                 />
@@ -2386,7 +2405,7 @@ function VcsRow({
         <p className={next.yours ? "waiting-hint waiting-hint-yours" : "waiting-hint"}>
           {next.before}
           {next.run !== undefined && (
-            <Link to="/runs/$runId" params={{ runId: String(next.run) }}>
+            <Link className="waiting-row-link" to="/runs/$runId" params={{ runId: String(next.run) }}>
               run #{next.run}
             </Link>
           )}

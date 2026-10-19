@@ -247,7 +247,7 @@ describe("the workflow canvas", () => {
    * A núcleo that went away between the blur and the answer is a failure, not a refusal, and it was
    * dropped: the field kept a value that was never saved and nothing said so.
    */
-  it("says so when a change could not be saved because the núcleo did not answer", async () => {
+  it("says so when a change could not be saved because the background service gave no reply", async () => {
     const { ApiUnavailable } = await import("../data/client");
     const state = daemonState({ graph: graph() });
     const answer = daemonFetch(state);

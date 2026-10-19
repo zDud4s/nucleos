@@ -124,6 +124,12 @@ pub struct SearchFilter {
     /// Leave chat turns out entirely (`GET /runs?chat_turns=hide`). The runs a chat LAUNCHED stay:
     /// they are not turns (decision of 2026-10-11).
     pub hide_chat_turns: bool,
+    /// Keyset cursor (`GET /runs?before=<id>`): only the rows that sort strictly after run `id` in
+    /// this listing's own `created_at DESC, id DESC` order, which is how the index loads an older
+    /// page. Keyset rather than an offset because the list polls and new runs land at its head: an
+    /// offset would shift under them and repeat rows on the next page, a cursor does not. Absent,
+    /// the answer is the newest page, byte for byte what it was before the cursor existed.
+    pub before: Option<i64>,
 }
 
 /// Keep search results useful without turning the index into a prompt or output retrieval endpoint.
@@ -163,6 +169,11 @@ pub async fn search(
     push_search_filters(&mut query, filter);
     if filter.group_by_chat {
         query.push(GROUPED_BY_CHAT);
+        // The cursor goes on the folded rows, outside the CTE: inside it would cut a conversation's
+        // older turns away from its row and change the counts the row reports.
+        push_before_cursor(&mut query, filter.before, " WHERE ");
+    } else {
+        push_before_cursor(&mut query, filter.before, " AND ");
     }
     query
         .push(" ORDER BY created_at DESC, id DESC LIMIT ")
@@ -172,6 +183,28 @@ pub async fn search(
         .build_query_as::<RunSearchResult>()
         .fetch_all(pool)
         .await
+}
+
+/// Appends the keyset cursor: rows strictly older than run `before` in `created_at DESC, id DESC`
+/// order, the tie on `created_at` broken by `id`. A `before` naming no run compares against NULL and
+/// matches nothing — an empty page, not a restart from the newest one.
+fn push_before_cursor(
+    query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    before: Option<i64>,
+    joiner: &str,
+) {
+    let Some(before) = before else {
+        return;
+    };
+    query
+        .push(joiner)
+        .push("(created_at < (SELECT anchor.created_at FROM runs AS anchor WHERE anchor.id = ")
+        .push_bind(before)
+        .push(") OR (created_at = (SELECT anchor.created_at FROM runs AS anchor WHERE anchor.id = ")
+        .push_bind(before)
+        .push(") AND id < ")
+        .push_bind(before)
+        .push("))");
 }
 
 /// Every filter `search` honours, appended to a query that ends in `WHERE 1 = 1`. In the grouped

@@ -226,7 +226,8 @@ describe("Charter - the form's own checks", () => {
     expect(screen.getByText(/^2 sections changed/)).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
-    expect((await screen.findByRole("status")).textContent).toBe("Saved");
+    // The delete button's hold-to-confirm keeps its own empty status region, so match by text.
+    expect((await screen.findByText("Saved")).getAttribute("role")).toBe("status");
   });
 
   it("saves on Ctrl+S by the same road as the button", async () => {

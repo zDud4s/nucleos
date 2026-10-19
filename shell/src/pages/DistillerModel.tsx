@@ -6,6 +6,7 @@ import {
   type DistillerModel as Choice,
 } from "../data/distiller";
 import { ErrorNote, RefusalNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 const LABELS: Record<Choice, string> = {
   cloud: "Cloud — the agent CLI",
@@ -51,7 +52,7 @@ export function DistillerModel() {
       {refusal ? (
         <RefusalNote refusal={refusal} />
       ) : set.error ? (
-        <ErrorNote>the núcleo did not answer — the distiller's model was not changed</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} is not responding — the distiller's model was not changed</ErrorNote>
       ) : null}
     </div>
   );

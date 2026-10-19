@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../../copy";
 import { useState } from "react";
 import { isApiRefusal } from "../../data/client";
 import {
@@ -234,15 +235,15 @@ const DECISION_SENTENCES: Record<string, string> = {
     "this one was already decided, or is no longer in force — the list clears it on the next read",
   not_found: "that one is gone; there is nothing left to decide",
   unprocessable:
-    "the núcleo found nothing usable inside the proposal to act on",
+    `the ${DAEMON_NAME} found nothing usable inside the proposal to act on`,
   internal:
-    "the núcleo failed while carrying the decision out — nothing was changed",
+    `the ${DAEMON_NAME} failed while carrying the decision out — nothing was changed`,
 };
 
 export function DecisionRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the núcleo did not answer — nothing was decided</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>
     );
   }
   return <RefusalNote refusal={error} sentences={DECISION_SENTENCES} />;

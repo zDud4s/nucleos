@@ -116,3 +116,38 @@ describe("Meter near and over the ceiling", () => {
     expect(container.querySelector(".ui-gauge-cue")).toBeNull();
   });
 });
+
+describe("Meter threshold", () => {
+  it("draws a tick at the threshold and names it while the value is under it", () => {
+    const { container } = render(<Meter label="at work" value={1} ceiling={5} tone="active" threshold={3} />);
+
+    const tick = container.querySelector(".ui-gauge-threshold") as HTMLElement;
+    expect(tick.style.left).toBe("60%");
+    expect(container.querySelector(".ui-gauge-past-threshold")).toBeNull();
+    expect(screen.getByRole("img", { name: "at work: 1 of 5, threshold 3" })).toBeDefined();
+  });
+
+  it("takes the pending tone and says so once the value reaches the threshold", () => {
+    const { container } = render(<Meter label="at work" value={3} ceiling={5} tone="active" threshold={3} />);
+
+    expect(container.querySelector(".ui-gauge-past-threshold")).not.toBeNull();
+    expect(screen.getByRole("img", { name: "at work: 3 of 5, past the threshold of 3" })).toBeDefined();
+  });
+
+  it("ignores a threshold that is not inside the ceiling, and a bar with no ceiling", () => {
+    const { container, rerender } = render(<Meter label="at work" value={1} ceiling={5} tone="active" threshold={9} />);
+    expect(container.querySelector(".ui-gauge-threshold")).toBeNull();
+
+    rerender(<Meter label="at work" value={1} ceiling={null} tone="active" threshold={3} />);
+    expect(container.querySelector(".ui-gauge-threshold")).toBeNull();
+  });
+
+  it("leaves the near-ceiling sentence of a quantity intact beside a threshold", () => {
+    render(<Meter label="window spend" value={4.1} ceiling={5} tone="quantity" format={usd} threshold={2.5} />);
+    expect(
+      screen.getByRole("img", {
+        name: "window spend: $4.10 of $5.00, 82% — near the ceiling, past the threshold of $2.50",
+      }),
+    ).toBeDefined();
+  });
+});

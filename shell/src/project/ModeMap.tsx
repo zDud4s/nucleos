@@ -14,6 +14,7 @@ import { TriagePanel } from "./TriagePanel";
 import { SequenceView } from "./SequenceView";
 import { StatesView } from "./StatesView";
 import { Button, ErrorNote, StaleNote, StatCard, relativeText } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * "What is in here, what did nobody ask for, and what did this project actually decide?"
@@ -161,7 +162,7 @@ export function ModeMap({ projectId }: ModeMapProps) {
         <StatesView projectId={projectId} />
       ) : map.isError && map.data === undefined ? (
         <ErrorNote>
-          The núcleo could not read this project&rsquo;s map — its folder may have moved.{" "}
+          The {DAEMON_NAME} could not read this project&rsquo;s map — its folder may have moved.{" "}
           <Button variant="quiet" onClick={readAgain} disabled={map.isFetching}>
             {map.isFetching ? "reading…" : "read it again"}
           </Button>

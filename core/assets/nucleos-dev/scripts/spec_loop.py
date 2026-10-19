@@ -205,7 +205,7 @@ def prompt_context(payload: dict) -> str | None:
                 "Stop hook holds the session until it is done or legitimately parked.")
     if _SPEC_PROMPT.search(payload.get("prompt") or ""):
         return ("If this prompt asks you to work on a spec or plan (not merely to discuss one), "
-                f"open a spec loop first: `python {Path(__file__).resolve().as_posix()} start "
+                f"open a spec loop first: `python \"{Path(__file__).resolve().as_posix()}\" start "
                 "<spec-path> \"<deliverable>\" ...` -- one item per deliverable the spec asks for. The Stop "
                 "hook then holds the session until every item is `- [x]`, or one is `- [!]` with "
                 "`status: blocked`, or `status: handoff` at the context ceiling, and requires the "

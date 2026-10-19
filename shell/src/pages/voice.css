@@ -108,13 +108,13 @@
 }
 
 .voice-config-fact {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(7rem, 10rem) 1fr;
   gap: var(--space-2);
   font-size: var(--text-sm);
 }
 
 .voice-config-fact dt {
-  flex: 0 0 10rem;
   color: var(--text-faint);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
@@ -238,8 +238,8 @@
   margin: 0;
   padding-left: var(--space-3);
   border-left: 2px solid var(--border-strong);
-  color: var(--text-muted);
-  font-size: var(--text-xs);
+  color: var(--text);
+  font-size: var(--text-sm);
   line-height: var(--leading-snug);
   overflow-wrap: anywhere;
 }
@@ -334,7 +334,7 @@
   position: absolute;
   z-index: 1;
   left: 50%;
-  top: calc(50% + 8px);
+  top: calc(50% + 56px - var(--voice-dock-h) / 2);
   width: var(--voice-orb-size);
   height: var(--voice-orb-size);
   transform: translate(-50%, -50%);
@@ -409,7 +409,8 @@
   isolation: isolate;
   container-type: size;
   background: var(--surface-sunken);
-  --voice-orb-size: max(140px, min(0.44 * (100cqh - 208px), 50cqw));
+  --voice-dock-h: 96px;
+  --voice-orb-size: max(140px, min(0.44 * (100cqh - 112px - var(--voice-dock-h)), 50cqw));
 }
 
 /* Without a size the canvas measures zero and draws nothing. */
@@ -479,7 +480,7 @@
   z-index: 3;
   left: 50%;
   transform: translateX(-50%);
-  top: min(calc(50% + 8px + 0.5655 * var(--voice-orb-size)), calc(100% - 150px));
+  top: min(calc(50% + 56px - var(--voice-dock-h) / 2 + 0.5655 * var(--voice-orb-size)), calc(100% - var(--voice-dock-h) - 54px));
   width: min(46rem, calc(100% - 2 * var(--space-5)));
   display: flex;
   flex-direction: column;
@@ -549,7 +550,7 @@
   left: 50%;
   transform: translateX(-50%);
   top: 5rem;
-  bottom: 9rem;
+  bottom: calc(var(--voice-dock-h) + 3rem);
   width: min(46rem, calc(100% - 2 * var(--space-5)));
   overflow-y: auto;
   padding: var(--space-4);

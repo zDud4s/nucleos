@@ -3,11 +3,11 @@ import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
-  RUN_LIST_LIMIT,
   RUN_MODE_FILTERS,
   RUN_STATUSES,
   runIsAlive,
   useCreateRun,
+  useRunPages,
   useRuns,
   type RUN_MODES,
   type RunFilters,
@@ -25,8 +25,10 @@ import { useKillSwitch, useProjects, type ProjectSummary } from "../data/system"
 import {
   Button,
   ConfirmButton,
+  Disclosure,
   ErrorNote,
   Field,
+  ListFilter,
   PageHeader,
   Panel,
   Quiet,
@@ -114,7 +116,7 @@ export function Runs() {
   // read: hiding the turns is the page's default, not a filter somebody set.
   // Asking for the `assistant` mode is asking for turns, so it shows them.
   const showChats = search.chats === "show" || search.mode === "assistant";
-  const runs = useRuns({
+  const runs = useRunPages({
     ...filters,
     group: "chat",
     chatTurns: showChats ? undefined : "hide",
@@ -129,10 +131,17 @@ export function Runs() {
    *
    * A query that succeeded once keeps its rows when a later refetch fails, which
    * is what this page wants — a list that blanks reads as *nothing has run*.
-   * The note is how the page says the rows are old.
+   * The note is how the page says the rows are old. A failed "Load older" is
+   * not that — the rows on screen are current — and says so beside its button.
    */
-  const stale = runs.isError && runs.data !== undefined;
-  const rows = runs.data;
+  const stale = runs.isRefetchError && runs.data !== undefined;
+  const rows = runs.data === undefined ? undefined : joinPages(runs.data.pages);
+  const older: OlderPages = {
+    more: runs.hasNextPage,
+    loading: runs.isFetchingNextPage,
+    failed: runs.isFetchNextPageError,
+    load: () => void runs.fetchNextPage(),
+  };
 
   function applyFilters(patch: Partial<RunSearch>) {
     void navigate({
@@ -159,7 +168,7 @@ export function Runs() {
         // region around this sentence read every changed count aloud. What is
         // announced is the failure itself, through the stale and error notes
         // below, which carry their own roles.
-        headline={headline(rows, filters)}
+        headline={headline(rows, filters, older.more)}
         actions={
           <Button
             id={openerId}
@@ -196,6 +205,7 @@ export function Runs() {
       {(rows !== undefined || !runs.isError) && (
         <RunList
           rows={rows}
+          older={older}
           filtered={isFiltered(filters)}
           filters={filters}
           onCompose={composing ? undefined : () => setComposing(true)}
@@ -208,34 +218,32 @@ export function Runs() {
 /* -------------------------------------------------------------- filters -- */
 
 /**
- * The scopes a person reaches for, as one control.
- *
- * Four, because that is the whole of the verification read: everything, what
- * is moving, what awaits approval, what went wrong. `failed` alone and not
+ * The status chips a person reaches for: what is moving, what awaits approval,
+ * what went wrong. With none on, every run shows. `failed` alone and not
  * "failed, timed out or interrupted": `GET /runs` binds `status` to exactly one
- * value (`core/src/runs.rs`, `search` — `AND status = ?`), so a scope that
+ * value (`core/src/runs.rs`, `search` — `AND status = ?`), so a chip that
  * promised three would be a request the daemon cannot answer. The exact
  * statuses are one disclosure away.
  */
-const SCOPES: readonly { label: string; status: string | undefined }[] = [
-  { label: "All", status: undefined },
-  { label: "Running", status: "running" },
-  { label: "Awaiting approval", status: "awaiting_approval" },
-  { label: "Failed", status: "failed" },
+const SCOPES: readonly { id: string; label: string }[] = [
+  { id: "running", label: "Running" },
+  { id: "awaiting_approval", label: "Awaiting approval" },
+  { id: "failed", label: "Failed" },
 ];
 
-const SCOPE_STATUSES = new Set(
-  SCOPES.map((scope) => scope.status).filter((status) => status !== undefined),
-);
+const SCOPE_STATUSES = new Set(SCOPES.map((scope) => scope.id));
+
+/** How long the search box rests before it is written to the route. */
+const SEARCH_DEBOUNCE_MS = 350;
 
 /**
  * The filters, bound to the route.
  *
- * The selects and the scope commit on change and the text box on Enter, which
- * is the split a person expects: choosing from a list is a decision, typing is
- * not, and a navigation per keystroke would put a history entry behind every
- * letter. The Search button sits against the box it submits so it cannot read
- * as the button that applies everything.
+ * One `ListFilter`: the search box and the status chips (none on is "all"). The
+ * chips and the selects commit on change; the text commits once typing rests,
+ * since a navigation per keystroke would put a history entry behind every
+ * letter. Project, mode, the other statuses and the chat turns sit behind one
+ * `Disclosure`, open on arrival when any of them is in force.
  */
 function RunFilterBar({
   filters,
@@ -248,10 +256,9 @@ function RunFilterBar({
   projects: ProjectSummary[] | undefined;
   onChange: (patch: Partial<RunSearch>) => void;
 }) {
-  const moreId = useId();
   // Open on arrival when a filter it holds is in force: a project, a mode, chat
-  // turns shown, or a status the scope control has no segment for. Otherwise the
-  // list would be narrowed by a control nobody can see.
+  // turns shown, or a status the chips have no entry for. Otherwise the list
+  // would be narrowed by a control nobody can see.
   const otherStatus =
     filters.status !== undefined && !SCOPE_STATUSES.has(filters.status)
       ? filters.status
@@ -270,34 +277,48 @@ function RunFilterBar({
     if (needsMore) setMore(true);
   }
 
+  // The box is typed into locally and written to the route when it rests; the
+  // route stays the source of truth, so a change that comes from elsewhere
+  // (Clear, back button) replaces the draft.
+  const routeQ = filters.q ?? "";
+  const [draft, setDraft] = useState(routeQ);
+  const [sawQ, setSawQ] = useState(routeQ);
+  if (routeQ !== sawQ) {
+    setSawQ(routeQ);
+    setDraft(routeQ);
+  }
+  useEffect(() => {
+    if (draft.trim() === routeQ) return;
+    const timer = setTimeout(() => onChange({ q: draft }), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+    // `onChange` is a fresh closure every render; the draft and the route's
+    // value are what decide whether a write is due.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, routeQ]);
+
+  function clearAll() {
+    setDraft("");
+    onChange({ project: undefined, status: undefined, mode: undefined, q: undefined });
+  }
+
+  const chipsOn = filters.status !== undefined && SCOPE_STATUSES.has(filters.status);
+  const listFilterCovers = chipsOn || routeQ !== "";
+
   return (
-    <form
-      className="runs-filters"
-      role="search"
-      aria-label="Filter runs"
-      onSubmit={(event) => {
-        event.preventDefault();
-        const typed = new FormData(event.currentTarget).get("q");
-        onChange({ q: typeof typed === "string" ? typed : undefined });
-      }}
-    >
-      <div className="ui-switch runs-scope" role="group" aria-label="Show">
-        {SCOPES.map((scope) => (
-          <button
-            key={scope.label}
-            type="button"
-            className="ui-switch-seg"
-            aria-pressed={filters.status === scope.status}
-            onClick={() => onChange({ status: scope.status })}
-          >
-            {scope.label}
-          </button>
-        ))}
-      </div>
+    <div className="runs-filters">
+      <ListFilter
+        noun="runs"
+        query={draft}
+        onQueryChange={setDraft}
+        chips={SCOPES}
+        selected={chipsOn && filters.status !== undefined ? [filters.status] : []}
+        onToggleChip={(id) => onChange({ status: filters.status === id ? undefined : id })}
+        onClear={clearAll}
+      />
 
       {otherStatus !== undefined && (
-        // A status the four segments cannot show, kept in sight and removable,
-        // so the list is never narrowed by something that is not on screen.
+        // A status the chips cannot show, kept in sight and removable, so the
+        // list is never narrowed by something that is not on screen.
         <Button
           variant="quiet"
           aria-label={`Remove status filter: ${readState("run", otherStatus)?.label ?? otherStatus}`}
@@ -308,100 +329,77 @@ function RunFilterBar({
         </Button>
       )}
 
-      <div className="runs-search">
-        <Field label="Search prompts">
-          <input name="q" defaultValue={filters.q ?? ""} key={filters.q ?? ""} />
-        </Field>
-        <Button type="submit">Search</Button>
-      </div>
-
-      <span className="runs-filters-aside">
-        <Button
-          variant="quiet"
-          aria-expanded={more}
-          aria-controls={moreId}
-          onClick={() => setMore(!more)}
-        >
-          More filters
+      {isFiltered(filters) && !listFilterCovers && (
+        // The filter bar offers its own Clear only for what it holds (text and
+        // chips); a project or a mode alone still needs a way out.
+        <Button variant="quiet" onClick={clearAll}>
+          Clear filters
         </Button>
-        {isFiltered(filters) && (
-          <Button
-            variant="quiet"
-            onClick={() =>
-              onChange({
-                project: undefined,
-                status: undefined,
-                mode: undefined,
-                q: undefined,
-              })
-            }
-          >
-            Clear filters
-          </Button>
-        )}
-      </span>
+      )}
 
-      <div id={moreId} className="runs-more" hidden={!more}>
-        <Field label="Project">
-          <select
-            value={filters.project ?? ""}
-            onChange={(event) => onChange({ project: event.target.value })}
-          >
-            <option value="">any project</option>
-            {(projects ?? []).map((project) => (
-              <option key={project.project_id} value={project.project_id}>
-                {project.project_id}
-              </option>
-            ))}
-          </select>
-        </Field>
+      <Disclosure label="More filters" open={more} onOpenChange={setMore}>
+        <div className="runs-more">
+          <Field label="Project">
+            <select
+              value={filters.project ?? ""}
+              onChange={(event) => onChange({ project: event.target.value })}
+            >
+              <option value="">any project</option>
+              {(projects ?? []).map((project) => (
+                <option key={project.project_id} value={project.project_id}>
+                  {project.project_id}
+                </option>
+              ))}
+            </select>
+          </Field>
 
-        <Field label="Mode">
-          {/* `assistant` is offered here and not in the new-run form: the daemon
-              writes that mode, so runs carry it, but nobody may ask for one. */}
-          <select
-            value={filters.mode ?? ""}
-            onChange={(event) => onChange({ mode: event.target.value })}
-          >
-            <option value="">any mode</option>
-            {RUN_MODE_FILTERS.map((mode) => (
-              <option key={mode} value={mode}>
-                {mode}
-              </option>
-            ))}
-          </select>
-        </Field>
+          <Field label="Mode">
+            {/* `assistant` is offered here and not in the new-run form: the daemon
+                writes that mode, so runs carry it, but nobody may ask for one. */}
+            <select
+              value={filters.mode ?? ""}
+              onChange={(event) => onChange({ mode: event.target.value })}
+            >
+              <option value="">any mode</option>
+              {RUN_MODE_FILTERS.map((mode) => (
+                <option key={mode} value={mode}>
+                  {mode}
+                </option>
+              ))}
+            </select>
+          </Field>
 
-        <Field label="Other status">
-          {/* Only the statuses the four scopes above do not already offer, in
-              the badge's own words from the one table: choosing "failed" has one
-              place to be done, not two. */}
-          <select
-            value={otherStatus ?? ""}
-            onChange={(event) => onChange({ status: event.target.value })}
-          >
-            <option value="">none</option>
-            {RUN_STATUSES.filter((status) => !SCOPE_STATUSES.has(status)).map((status) => (
-              <option key={status} value={status}>
-                {readState("run", status)?.label ?? status}
-              </option>
-            ))}
-          </select>
-        </Field>
+          <Field label="Other status">
+            {/* Only the statuses the chips above do not already offer, in the
+                badge's own words from the one table: choosing "failed" has one
+                place to be done, not two. */}
+            <select
+              value={otherStatus ?? ""}
+              onChange={(event) => onChange({ status: event.target.value })}
+            >
+              <option value="">none</option>
+              {RUN_STATUSES.filter((status) => !SCOPE_STATUSES.has(status)).map((status) => (
+                <option key={status} value={status}>
+                  {readState("run", status)?.label ?? status}
+                </option>
+              ))}
+            </select>
+          </Field>
 
-        <label className="runs-check">
-          <input
-            type="checkbox"
-            checked={showChats}
-            disabled={filters.mode === "assistant"}
-            onChange={(event) =>
-              onChange({ chats: event.target.checked ? "show" : undefined })
-            }
-          />
-          Show chat turns
-        </label>
-      </div>
-    </form>
+          <label className="runs-check">
+            <input
+              type="checkbox"
+              checked={showChats}
+              disabled={filters.mode === "assistant"}
+              onChange={(event) =>
+                onChange({ chats: event.target.checked ? "show" : undefined })
+              }
+            />
+            Show chat turns
+          </label>
+        </div>
+      </Disclosure>
+    </div>
   );
 }
 
@@ -413,13 +411,43 @@ function isFiltered(filters: RunFilters): boolean {
 
 /* ----------------------------------------------------------------- list -- */
 
+/** The index's "Load older" state, read off the paged query. */
+interface OlderPages {
+  /** The last page came back full, so an older one may exist. */
+  more: boolean;
+  loading: boolean;
+  /** The last "Load older" failed; the pages already on screen are still current. */
+  failed: boolean;
+  load: () => void;
+}
+
+/**
+ * The loaded pages as one list. Each row once, by id: the pages are contiguous
+ * by construction (keyset cursor, refetched in order), and this only keeps a
+ * row that a poll moved between two pages from being drawn twice in between.
+ */
+function joinPages(pages: RunSearchResult[][]): RunSearchResult[] {
+  const seen = new Set<number>();
+  const rows: RunSearchResult[] = [];
+  for (const page of pages) {
+    for (const row of page) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
 function RunList({
   rows,
+  older,
   filtered,
   filters,
   onCompose,
 }: {
   rows: RunSearchResult[] | undefined;
+  older: OlderPages;
   filtered: boolean;
   filters: RunFilters;
   /** Opens the New run panel; absent while it is already open. */
@@ -459,6 +487,7 @@ function RunList({
 
   return (
     <>
+      <RunsHead />
       <Rows label="Runs">
         {rows.map((row) =>
           row.chat_id != null && row.turns != null ? (
@@ -468,13 +497,52 @@ function RunList({
           ),
         )}
       </Rows>
-      {rows.length >= RUN_LIST_LIMIT && (
-        <p className="runs-ceiling">
-          showing the newest {RUN_LIST_LIMIT} — older runs are not listed here;
-          narrow the filters or search to reach them
-        </p>
+      {older.failed ? (
+        <ErrorNote onRetry={older.load} retryLabel="Load older">
+          Could not load older runs — the ones above are still current.
+        </ErrorNote>
+      ) : (
+        older.more && (
+          <div className="runs-older">
+            <Button
+              onClick={older.load}
+              disabled={older.loading}
+              aria-busy={older.loading}
+            >
+              {older.loading ? "Loading older…" : "Load older"}
+            </Button>
+            <span className="runs-older-count">
+              showing the newest {rows.length}
+            </span>
+          </div>
+        )
       )}
     </>
+  );
+}
+
+/**
+ * Names the metadata columns once, above the list.
+ *
+ * Presentation only (`aria-hidden`): each row's cells carry `title`s for the same
+ * words, and below the container width where the columns collapse the header is
+ * hidden and the cells name themselves with a short prefix instead (`runs.css`).
+ */
+function RunsHead() {
+  return (
+    <div className="runs-head" aria-hidden="true">
+      <div className="runs-head-grid">
+        <span className="runs-head-state">State</span>
+        <span className="runs-head-meta">
+          <span>Run</span>
+          <span>Mode</span>
+          <span>Project</span>
+          <span>When</span>
+          <span>Model</span>
+          <span className="runs-head-cost">Cost</span>
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -493,14 +561,14 @@ function RunRow({ row }: { row: RunSearchResult }) {
         {row.prompt_excerpt}
       </Link>
       <p className="runs-row-meta">
-        <span className="runs-row-id">run {row.id}</span>
-        <span className="runs-row-mode">{row.mode}</span>
-        <span className="runs-row-project">
+        <span className="runs-row-id" title="Run">run {row.id}</span>
+        <span className="runs-row-mode" title="Mode">{row.mode}</span>
+        <span className="runs-row-project" title="Project">
           {row.project_id ?? "no project"}
         </span>
         <RelativeTime at={row.created_at} />
-        {ran !== null && <span className="runs-row-ran">{ran}</span>}
-        <span className="runs-row-cost">{costOf(row)}</span>
+        {ran !== null && <span className="runs-row-ran" title="Model">{ran}</span>}
+        <span className="runs-row-cost" title="Cost">{costOf(row)}</span>
       </p>
       {row.launched_by_chat_id != null && (
         <Link to={`/chats/${row.launched_by_chat_id}`} className="runs-row-origin">
@@ -955,6 +1023,7 @@ function NewRunForm({
           ) : (
             <Button
               type="submit"
+              variant="primary"
               intent="go"
               disabled={blank || create.isPending}
               aria-describedby={describedBy}
@@ -1285,6 +1354,7 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 function headline(
   rows: RunSearchResult[] | undefined,
   filters: RunFilters,
+  more: boolean,
 ): ReactNode | undefined {
   if (rows === undefined) return undefined;
   const live = rows.filter((row) => runIsAlive(row.status)).length;
@@ -1295,17 +1365,11 @@ function headline(
   const filtered = isFiltered(filters);
   if (rows.length === 0)
     return filtered ? "nothing matching these filters" : "nothing in the index";
-  // At the ceiling the count is the page size, not the size of the index, and
-  // "50 in the index" said the second.
-  const count =
-    rows.length >= RUN_LIST_LIMIT
-      ? `the newest ${rows.length}`
-      : `${rows.length}`;
+  // While an older page may exist the count is what is loaded, not the size
+  // of the index, and "50 in the index" said the second.
+  const count = more ? `the newest ${rows.length}` : `${rows.length}`;
   const scope = filtered ? "matching these filters" : "in the index";
-  const said =
-    rows.length >= RUN_LIST_LIMIT && !filtered
-      ? count
-      : `${count} ${scope}`;
+  const said = more && !filtered ? count : `${count} ${scope}`;
   const moving =
     live === 0 ? "none of them still moving" : `${live} still moving`;
   // Failures are counted because they are what the verification read is

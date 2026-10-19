@@ -18,8 +18,12 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
  * hovered, for a control that has to be on every row of a table and must not
  * compete with the readings in it. Reach for `quiet` whenever the control acts
  * rather than goes somewhere.
+ *
+ * `primary` is the one filled button a screen is for: it spends the identity accent as a fill,
+ * and a view should carry at most one. It is not `approve` — that is the green of "let this
+ * through" and means a decision; `primary` means "do the thing this form or page exists for".
  */
-export type ButtonVariant = "approve" | "ghost" | "danger" | "danger-solid" | "link" | "quiet";
+export type ButtonVariant = "approve" | "ghost" | "danger" | "danger-solid" | "link" | "quiet" | "primary";
 
 /**
  * Which way the action points.

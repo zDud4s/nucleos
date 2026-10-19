@@ -12,6 +12,7 @@ import {
 } from "../data/feed";
 import { useNotifyPolicy, useObservedKinds, useSetNotifyPolicy } from "../data/system";
 import { Button, ErrorNote, Panel, RefusalNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Which notifications reach Telegram.
@@ -127,7 +128,7 @@ export function NotificationsView() {
         (isApiRefusal(save.error) ? (
           <RefusalNote refusal={save.error} />
         ) : (
-          <ErrorNote>the núcleo did not answer — nothing was saved</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was saved</ErrorNote>
         ))}
 
       <ul className="sy-notify-families">
@@ -176,7 +177,7 @@ function samePolicy(a: NotifyPolicy, b: NotifyPolicy | undefined): boolean {
 
 function NotificationsError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about {what}</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about {what}</ErrorNote>;
 }
 
 function FamilyItem({

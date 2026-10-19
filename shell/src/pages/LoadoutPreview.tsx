@@ -3,6 +3,7 @@ import { useMutation } from "@tanstack/react-query";
 import { apiFetch } from "../data/client";
 import { Button, ErrorNote, Field, Quiet } from "../ui";
 import "./loadout-preview.css";
+import { DAEMON_NAME } from "../copy";
 
 type PreviewBox = "team" | "job_node";
 
@@ -84,7 +85,7 @@ export function LoadoutPreview({ agentId }: { agentId: string }) {
           Preview
         </Button>
       </form>
-      {preview.isError && <ErrorNote>The núcleo did not answer the preview.</ErrorNote>}
+      {preview.isError && <ErrorNote>The {DAEMON_NAME} gave no reply to the preview.</ErrorNote>}
       {preview.data !== undefined && <PreviewResult answer={preview.data} />}
     </section>
   );

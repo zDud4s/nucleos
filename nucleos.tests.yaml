@@ -33,6 +33,7 @@ tests:
         - scripts/test-run-daemon.py
         - scripts/refresh-models.py
         - scripts/test-refresh-models.py
+        - core/assets/nucleos-dev/scripts/
       command: bash scripts/gates.sh hooks
     broker:
       # The machine-wide build broker, its classifier and hook, and their tests.

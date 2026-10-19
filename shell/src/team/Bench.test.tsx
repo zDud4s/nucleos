@@ -463,11 +463,14 @@ describe("Bench - honest status and deep links", () => {
     expect(await screen.findByRole("tab", { name: /Decisions/, selected: true })).toBeDefined();
   });
 
-  it("keeps Delete away from the title and unavailable while a task is running", async () => {
+  it("keeps Delete in the Charter, away from the title, and unavailable while a task is running", async () => {
     const run = teamRun({ state: "working" });
     await renderBench({ team: teamView(), runs: [run] });
 
-    const remove = await screen.findByRole("button", { name: "Delete team" });
+    // Delete lives at the foot of the Charter tab, not on the page for every tab.
+    expect(screen.queryByRole("button", { name: "Delete team" })).toBeNull();
+    const charter = await openTab("Charter");
+    const remove = await within(charter).findByRole("button", { name: "Delete team" });
     expect(remove.closest("header")).toBeNull();
     await waitFor(() => expect(remove.getAttribute("aria-disabled")).toBe("true"));
     expect(screen.getByText(/1 task is still running/)).toBeDefined();

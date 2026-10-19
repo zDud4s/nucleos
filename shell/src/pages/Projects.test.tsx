@@ -1113,7 +1113,7 @@ describe("Projects - a search hit is a way to the line", () => {
     );
     await renderProjects("/projects/alpha/browse");
 
-    const box = await screen.findByRole("searchbox", { name: "Filter this folder by name" });
+    const box = await screen.findByRole("searchbox", { name: "Search this folder" });
     fireEvent.change(box, { target: { value: "GA" } });
     const list = screen.getByRole("list", { name: "Folder contents" });
     expect(within(list).getAllByRole("link").map((link) => link.textContent)).toEqual(["gate.rs"]);
