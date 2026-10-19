@@ -137,8 +137,9 @@ describe("MODE_SENTENCES", () => {
  * The 422 as it read before it became a list, pasted byte for byte from `MODE_SENTENCES`.
  *
  * A surface that still prints a sentence must print this one, not a re-join of the list that has
- * drifted by a comma. Two of its characters are not ASCII, and a paste that lost either would pass
- * against itself — hence the two guards at the top of the case.
+ * drifted by a comma. Its one non-ASCII character is the em dash, and a paste that lost it would pass
+ * against itself — hence the guard at the top of the case. The shell composes this sentence itself
+ * (the daemon sends no prose), so the copy migration to DAEMON_NAME legitimately dropped the old daemon name.
  */
 const OLD_UNPROCESSABLE =
   "the background service would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, the project onboarded to NucleOS, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.";
@@ -147,7 +148,6 @@ describe("MODE_REFUSAL_PROSE", () => {
   it("the prose form is byte-identical to the sentence it replaces", () => {
     // Escapes, not the characters: a guard spelled with the same bytes as the paste proves nothing.
     expect(OLD_UNPROCESSABLE).toContain("\u2014");
-    expect(OLD_UNPROCESSABLE).toContain("n\u00facleo");
 
     expect(MODE_REFUSAL_PROSE).toBeDefined();
     expect(MODE_REFUSAL_PROSE.unprocessable).toBe(OLD_UNPROCESSABLE);

@@ -573,6 +573,12 @@
   .runs-row-cost::before {
     content: "cost ";
   }
+
+  /* An empty cell has nothing to label, and "cost not recorded" already names itself. */
+  .runs-row-cost:empty::before,
+  .runs-row-cost[data-unrecorded]::before {
+    content: none;
+  }
 }
 
 /* A list that arrived at the ceiling may have been cut, and says so rather than

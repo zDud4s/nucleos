@@ -568,7 +568,13 @@ function RunRow({ row }: { row: RunSearchResult }) {
         </span>
         <RelativeTime at={row.created_at} />
         {ran !== null && <span className="runs-row-ran" title="Model">{ran}</span>}
-        <span className="runs-row-cost" title="Cost">{costOf(row)}</span>
+        <span
+          className="runs-row-cost"
+          title="Cost"
+          data-unrecorded={costOf(row) === "cost not recorded" ? "" : undefined}
+        >
+          {costOf(row)}
+        </span>
       </p>
       {row.launched_by_chat_id != null && (
         <Link to={`/chats/${row.launched_by_chat_id}`} className="runs-row-origin">
@@ -605,7 +611,7 @@ function ConversationRow({ row, filters }: { row: RunSearchResult; filters: RunF
         <span className="runs-row-mode">chat</span>
         <span className="runs-row-project">{row.project_id ?? "no project"}</span>
         <RelativeTime at={row.created_at} />
-        <span className="runs-row-cost">
+        <span className="runs-row-cost" data-unrecorded={row.cost_usd === null ? "" : undefined}>
           {row.cost_usd === null ? "cost not recorded" : money(row.cost_usd)}
         </span>
       </p>

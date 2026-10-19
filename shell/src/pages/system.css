@@ -197,13 +197,17 @@
  */
 .sy-tabs {
   display: flex;
-  flex-wrap: wrap;
+  /* One line always; a window too narrow for all three scrolls the strip. */
+  flex-wrap: nowrap;
+  overflow-x: auto;
   gap: var(--space-1);
   margin-bottom: var(--space-4);
   border-bottom: 1px solid var(--border);
 }
 
 .sy-tab {
+  flex: none;
+  white-space: nowrap;
   padding: var(--space-2) var(--space-3);
   font-size: var(--text-sm);
   color: var(--text-muted);
@@ -324,9 +328,26 @@
    wider than a healthy one. */
 .ui-rows-row.sy-sidecar-row {
   display: grid;
-  grid-template-columns: 9rem 13rem minmax(0, 1fr);
+  grid-template-columns: minmax(0, 9rem) minmax(0, 13rem) minmax(0, 1fr);
   align-items: baseline;
   column-gap: var(--space-4);
+}
+
+/* Every cell may shrink below its content, so nothing pushes the tools out of the card. */
+.ui-rows-row.sy-sidecar-row > * {
+  min-width: 0;
+}
+
+/* Narrow window: the output drops under name and facts and takes the full row. */
+@media (max-width: 64rem) {
+  .ui-rows-row.sy-sidecar-row {
+    grid-template-columns: minmax(0, 9rem) minmax(0, 1fr);
+    row-gap: var(--space-1);
+  }
+
+  .ui-rows-row.sy-sidecar-row > .sy-sidecar-out {
+    grid-column: 1 / -1;
+  }
 }
 
 .sy-sidecar-name {
@@ -338,7 +359,8 @@
 
 .sy-sidecar-facts {
   display: flex;
-  gap: var(--space-4);
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
   margin: 0;
 }
 
@@ -379,6 +401,7 @@
 
 .sy-sidecar-tools {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
 }
 
@@ -400,8 +423,12 @@
    one name at the left edge and one button at the right. */
 .sy-brakes {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
+  /* min(15rem, 100%) lets a single track shrink below 15rem in a narrow panel,
+     so the grid never pushes the card wider than its column. */
+  grid-template-columns: repeat(auto-fill, minmax(min(15rem, 100%), 1fr));
   gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -409,6 +436,7 @@
 
 .sy-brake {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   min-width: 0;
@@ -419,7 +447,9 @@
 }
 
 .sy-brake .sy-project-brake-name {
-  flex: 1 1 auto;
+  /* A small basis so the badge and button stay on the name's line until the
+     tile is truly narrow; the name ellipsizes before anything wraps. */
+  flex: 1 1 6rem;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -954,8 +984,31 @@
   gap: var(--space-2);
 }
 
+/* Narrow windows: the controls wrap instead of pushing Forget past the card edge. */
+.sy-secret {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .sy-secret .sy-setting-controls {
   margin-top: var(--space-1);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.sy-secret .sy-setting-controls > button,
+.sy-secret .sy-setting-controls > :not(input) {
+  flex: 0 0 auto;
+}
+
+.sy-secret-head {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.sy-secret-key {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .sy-secret-key {
@@ -965,7 +1018,7 @@
 }
 
 .sy-secret-input {
-  flex: 1 1 auto;
+  flex: 1 1 10rem;
   min-width: 0;
   padding: var(--space-2);
   border: 1px solid var(--border);
