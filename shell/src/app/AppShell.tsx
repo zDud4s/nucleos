@@ -12,6 +12,7 @@ import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
 import { CaptureChord } from "./CaptureChord";
 import { ConversationChord } from "./ConversationChord";
+import { DesktopNotifier } from "./DesktopNotifier";
 import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
@@ -104,6 +105,7 @@ function Frame() {
       <DictationProvider>
       <div className="app-shell">
         <AttentionHeartbeat />
+        <DesktopNotifier />
         <ConversationChord />
         <CaptureChord />
         <Destinations />

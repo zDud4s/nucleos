@@ -35,3 +35,12 @@ export class Resource {
 export class Channel<T = unknown> {
   onmessage: (message: T) => void = () => {};
 }
+
+/*
+ * `addPluginListener`, for `@tauri-apps/plugin-notification`, which imports it by name. Toasts are
+ * only sent inside the desktop host, so the preview never subscribes; this only has to exist for
+ * the bundle to link.
+ */
+export async function addPluginListener(): Promise<never> {
+  throw new Error("the preview has no plugin listeners");
+}
