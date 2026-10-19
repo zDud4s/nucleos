@@ -13,6 +13,11 @@
 //! files all read the same way, and the enclosing function is whichever `fn`, `def`, `function` or
 //! `func` came last before the statement. No parser, no per-repository configuration.
 //!
+//! **Enum machines.** A Rust enum named `*State` whose variants' docs say "Arrives from `A`" or
+//! "Leaves for `B`" draws its declared edges too ([`enum_machines`]), listed under the enum's name
+//! with the column `enum`. Those edges are the docs' words and not executed code, and they carry
+//! no function; the SQL machines stay the ones read off statements.
+//!
 //! **What is not read.** A Rust `#[cfg(test)]` module tail, test files, and lines that start as a
 //! comment.
 //!
@@ -334,6 +339,141 @@ pub fn transitions(path: &str, source: &str) -> Vec<(String, String, Transition)
     found
 }
 
+static ENUM_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?enum[ \t]+(\w+State)[ \t]*\{")
+        .expect("the enum pattern")
+});
+
+static DOC_EDGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:arrives from|leaves for)\b").expect("the doc-edge pattern")
+});
+
+static BACKTICKED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"`(\w+)`").expect("the backticked-name pattern"));
+
+static VARIANT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([A-Z]\w*)").expect("the variant pattern"));
+
+/// One variant of an enum as written: its name, its line and its doc comment on one line.
+struct EnumVariant {
+    name: String,
+    line: usize,
+    doc: String,
+}
+
+/// The variants of the enum whose head sits on line `head_line` (0-based): whatever starts a line
+/// at brace depth one. Fields of a struct-like variant sit deeper and are not read.
+fn enum_variants(text: &str, head_line: usize) -> Vec<EnumVariant> {
+    let mut variants = Vec::new();
+    let mut depth = 1usize;
+    let mut doc: Vec<String> = Vec::new();
+    for (offset, line) in text.lines().enumerate().skip(head_line + 1) {
+        let trimmed = line.trim();
+        if let Some(doc_line) = trimmed.strip_prefix("///") {
+            if !doc_line.starts_with('/') {
+                doc.push(doc_line.trim().to_string());
+            }
+            continue;
+        }
+        if trimmed.is_empty() {
+            doc.clear();
+            continue;
+        }
+        if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+            continue;
+        }
+        if depth == 1
+            && let Some(caps) = VARIANT.captures(trimmed)
+        {
+            variants.push(EnumVariant {
+                name: caps[1].to_string(),
+                line: offset + 1,
+                doc: doc.join(" "),
+            });
+        }
+        doc.clear();
+        for character in trimmed.chars() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return variants;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    variants
+}
+
+/// The Rust enums named `*State` whose variants' docs declare edges: "Arrives from `A`" is the
+/// edge A -> this variant, "Leaves for `B`, `C`" the edges this variant -> B and C. Each is
+/// (enum name, every variant in declaration order, edges); an edge is anchored at the variant
+/// whose doc says it and carries no function. A name in backticks that is not a variant of the
+/// same enum is not a state, and an enum that declares no edge is not a machine.
+///
+/// **Accepted approximation:** a clause runs to the next `;` or sentence end, so a prose detour
+/// ("Leaves for `Running` and from there back to `Merging`") reads every variant it names as a
+/// target of this one. These are the docs' own words, and the edge's anchor is where to check.
+pub fn enum_machines(path: &str, source: &str) -> Vec<(String, Vec<String>, Vec<Transition>)> {
+    if !path.ends_with(".rs") {
+        return Vec::new();
+    }
+    let text = production_part(path, source);
+    let mut found = Vec::new();
+    for caps in ENUM_HEAD.captures_iter(text) {
+        let head = caps.get(0).expect("the whole match");
+        let head_line = text[..head.start()].matches('\n').count();
+        let variants = enum_variants(text, head_line);
+        let names: Vec<String> = variants.iter().map(|v| v.name.clone()).collect();
+
+        let mut transitions: Vec<Transition> = Vec::new();
+        for variant in &variants {
+            let keywords: Vec<_> = DOC_EDGE.find_iter(&variant.doc).collect();
+            for (index, keyword) in keywords.iter().enumerate() {
+                let rest = &variant.doc[keyword.end()..];
+                let next = keywords
+                    .get(index + 1)
+                    .map_or(rest.len(), |next| next.start() - keyword.end());
+                let stop = [rest.find(';'), rest.find(". ")]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or(rest.len())
+                    .min(next);
+                let arrives = keyword.as_str().to_ascii_lowercase().starts_with("arrives");
+                for named in BACKTICKED.captures_iter(&rest[..stop]) {
+                    let other = &named[1];
+                    if other == variant.name || !names.iter().any(|name| name == other) {
+                        continue;
+                    }
+                    let (from, to) = if arrives {
+                        (other.to_string(), variant.name.clone())
+                    } else {
+                        (variant.name.clone(), other.to_string())
+                    };
+                    if transitions.iter().any(|t| t.from == from && t.to == to) {
+                        continue;
+                    }
+                    transitions.push(Transition {
+                        from,
+                        to,
+                        function: None,
+                        path: path.to_string(),
+                        line: variant.line,
+                    });
+                }
+            }
+        }
+        if !transitions.is_empty() {
+            found.push((caps[1].to_string(), names, transitions));
+        }
+    }
+    found
+}
+
 fn is_test_path(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     path.starts_with("tests/")
@@ -351,6 +491,7 @@ pub fn machines(root: &Path) -> std::io::Result<States> {
     super::collect(root, root, &mut files)?;
     files.sort();
     let mut grouped: BTreeMap<(String, String), Vec<Transition>> = BTreeMap::new();
+    let mut variants: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     let mut files_read = 0;
     for path in files {
         if !super::scanned(&path) || is_test_path(&path) {
@@ -361,6 +502,11 @@ pub fn machines(root: &Path) -> std::io::Result<States> {
         for (table, column, transition) in transitions(&path, &source) {
             grouped.entry((table, column)).or_default().push(transition);
         }
+        for (name, names, edges) in enum_machines(&path, &source) {
+            let key = (name, "enum".to_string());
+            variants.entry(key.clone()).or_default().extend(names);
+            grouped.entry(key).or_default().extend(edges);
+        }
     }
     let machines = grouped
         .into_iter()
@@ -369,11 +515,14 @@ pub fn machines(root: &Path) -> std::io::Result<States> {
                 (&a.path, a.line, &a.from, &a.to).cmp(&(&b.path, b.line, &b.from, &b.to))
             });
             transitions.dedup();
-            let states: BTreeSet<String> = transitions
+            let mut states: BTreeSet<String> = transitions
                 .iter()
                 .flat_map(|t| [t.from.clone(), t.to.clone()])
                 .filter(|state| state != ANY && state != COMPUTED)
                 .collect();
+            if let Some(declared) = variants.remove(&(table.clone(), column.clone())) {
+                states.extend(declared);
+            }
             Machine {
                 table,
                 column,
@@ -523,6 +672,98 @@ mod tests {
         );
 
         assert_eq!(pairs("db/migrate.sql", sql), vec![pair("draft", "open")]);
+    }
+
+    /// (from, to) pairs of the one enum machine a source gives.
+    fn enum_pairs(source: &str) -> Vec<(String, String)> {
+        let found = enum_machines("core/src/job.rs", source);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let mut out: Vec<(String, String)> = found[0]
+            .2
+            .iter()
+            .map(|t| (t.from.clone(), t.to.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// An enum named `*State` draws its edges from what its variants' docs say: "Arrives from"
+    /// and "Leaves for", read as the edges they name, anchored at the variant that says it.
+    #[test]
+    fn an_enum_state_draws_the_edges_its_docs_declare() {
+        let source = "pub enum ItemState {\n    /// Waiting.\n    Pending,\n    /// Arrives from `Pending`; leaves for `Passed` (green) or `Failed` (red).\n    Running,\n    Passed,\n    /// Terminal.\n    Failed,\n}\n";
+
+        let found = enum_machines("core/src/job.rs", source);
+
+        assert_eq!(found.len(), 1, "{found:?}");
+        let (name, variants, transitions) = &found[0];
+        assert_eq!(name, "ItemState");
+        assert_eq!(variants, &["Pending", "Running", "Passed", "Failed"]);
+        assert_eq!(
+            enum_pairs(source),
+            vec![
+                pair("Pending", "Running"),
+                pair("Running", "Failed"),
+                pair("Running", "Passed"),
+            ]
+        );
+        let arrives = transitions
+            .iter()
+            .find(|t| t.from == "Pending")
+            .expect("the arrival");
+        assert_eq!(arrives.function, None);
+        assert_eq!(arrives.path, "core/src/job.rs");
+        assert_eq!(arrives.line, 5, "the line of `Running`");
+    }
+
+    /// Two variants naming one edge from both ends give it once, and a name that is not a variant
+    /// of the enum (a function, another type) is not a state.
+    #[test]
+    fn an_enum_edge_named_from_both_ends_is_one_and_a_non_variant_is_no_state() {
+        let source = "enum JobState {\n    /// Leaves for `Done`, and `next_step` picks it up. Also see `Other::Thing`.\n    Open,\n    /// Arrives from `Open`.\n    Done,\n}\n";
+
+        assert_eq!(enum_pairs(source), vec![pair("Open", "Done")]);
+    }
+
+    /// An enum with no declared edge, one not named `*State`, and a test-module tail are nothing;
+    /// struct-like variants keep their name and not their fields.
+    #[test]
+    fn an_enum_without_edges_or_without_the_name_or_in_a_test_tail_is_not_a_machine() {
+        let quiet = "enum PanelState {\n    Open,\n    Closed,\n}\n";
+        let unnamed = "enum Mode {\n    /// Leaves for `B`.\n    A,\n    B,\n}\n";
+        let tail = "fn real() {}\n\n#[cfg(test)]\nmod tests {\n    enum FixtureState {\n        /// Leaves for `B`.\n        A,\n        B,\n    }\n}\n";
+        let shaped = "enum RunState {\n    /// Leaves for `Stopped`.\n    Live { pid: u32 },\n    Stopped(i32),\n}\n";
+
+        assert!(enum_machines("a.rs", quiet).is_empty());
+        assert!(enum_machines("a.rs", unnamed).is_empty());
+        assert!(enum_machines("a.rs", tail).is_empty());
+        assert!(enum_machines("a.ts", shaped).is_empty(), "Rust only");
+
+        let found = enum_machines("a.rs", shaped);
+        assert_eq!(found[0].1, ["Live", "Stopped"]);
+    }
+
+    /// The walk lists an enum machine beside the SQL ones: table = the enum, column = `enum`, and
+    /// every variant is a state, edges or not.
+    #[test]
+    fn the_walk_lists_an_enum_machine_with_every_variant_as_a_state() {
+        let root = scratch("enum");
+        write(
+            &root,
+            "core/src/job.rs",
+            "pub enum JobState {\n    /// Leaves for `Done`.\n    Open,\n    Done,\n    Lonely,\n}\n",
+        );
+
+        let found = machines(&root).expect("the scratch folder should be readable");
+
+        let machine = found
+            .machines
+            .iter()
+            .find(|m| m.table == "JobState" && m.column == "enum")
+            .unwrap_or_else(|| panic!("{:#?}", found.machines));
+        assert_eq!(machine.states, ["Done", "Lonely", "Open"]);
+        assert_eq!(machine.transitions.len(), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// AC7
@@ -699,5 +940,41 @@ mod tests {
             "{:#?}",
             runs.transitions
         );
+    }
+
+    /// The job queue's own state enum, read from this repository's docs: an item reaches
+    /// `Merging` from `Implemented`, and every variant is listed as a state.
+    #[test]
+    fn this_repository_s_item_state_enum_is_a_machine_with_its_declared_edges() {
+        let root = repository();
+
+        let found = machines(&root).expect("the repository should be readable");
+
+        let item = found
+            .machines
+            .iter()
+            .find(|m| m.table == "ItemState" && m.column == "enum")
+            .expect("the ItemState enum machine");
+        assert!(item.states.len() >= 15, "{:?}", item.states);
+        for (from, to) in [
+            ("Implemented", "Merging"),
+            ("Merging", "Conflicted"),
+            ("Reverted", "GateRetriable"),
+        ] {
+            let hit = item
+                .transitions
+                .iter()
+                .find(|t| t.from == from && t.to == to)
+                .unwrap_or_else(|| panic!("missing {from} -> {to}: {:#?}", item.transitions));
+            let text = fs::read_to_string(root.join(&hit.path)).expect("the anchor's file");
+            let line = text.lines().nth(hit.line - 1).expect("the anchor's line");
+            assert!(
+                line.trim_start().starts_with(hit.to.as_str())
+                    || line.trim_start().starts_with(hit.from.as_str()),
+                "{} line {} is not a variant: {line}",
+                hit.path,
+                hit.line
+            );
+        }
     }
 }
