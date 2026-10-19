@@ -149,4 +149,29 @@ describe("AtlasLayers", () => {
       ),
     );
   });
+
+  it("draws a line between the layers an upward import joins, and none when there is none", () => {
+    renderLayers();
+    expect(screen.queryByRole("img", { name: /Upward imports/ })).toBeNull();
+
+    const data = map();
+    data.layers = {
+      modules: data.layers!.modules,
+      overridden: [],
+      violations: [
+        {
+          from: "core/src/low/a.rs",
+          to: "core/src/top/d.rs",
+          from_layer: 0,
+          to_layer: 2,
+          new: false,
+        },
+      ],
+    };
+    renderLayers(data);
+    const svg = screen.getByRole("img", { name: /Upward imports/ });
+    expect(svg.querySelectorAll("path.ws-layer-line")).toHaveLength(1);
+    expect(svg.querySelector("path.ws-layer-line")!.getAttribute("data-new")).toBe("false");
+    expect(svg.querySelectorAll("text")).toHaveLength(3);
+  });
 });

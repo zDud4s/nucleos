@@ -1,7 +1,7 @@
 // §spec mapa-do-projeto
 import { useEffect, useMemo, useState } from "react";
 import { useAcceptLayers, useSetLayer, type Layering, type ProjectMap } from "../data/project-map";
-import { buildBands, isolate, maxLayer, type Band, type LayerBlock } from "./layers-model";
+import { buildBands, isolate, ladder, maxLayer, type Band, type LayerBlock } from "./layers-model";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -70,6 +70,8 @@ function Stack({
         ) : null}
       </p>
 
+      {upward === 0 ? null : <LayerLines bands={bands} layering={layering} />}
+
       {shown.map((band) => (
         <section key={band.layer} className="ws-layer-band">
           <button
@@ -124,6 +126,56 @@ function Stack({
         </ul>
       )}
     </div>
+  );
+}
+
+const ROW = 22;
+const LABEL = 150;
+const WIDTH = 260;
+
+/**
+ * Every upward import drawn as a line between the rows of the layers it joins, danger-coloured
+ * when it is new. A deep stack folds its quiet layers into one row (see {@link ladder}).
+ */
+function LayerLines({ bands, layering }: { bands: Band[]; layering: Layering }) {
+  const { rows, lines } = useMemo(
+    () => ladder(bands, layering.violations),
+    [bands, layering.violations],
+  );
+  const y = (row: number) => row * ROW + ROW / 2;
+  return (
+    <svg
+      role="img"
+      aria-label="Upward imports between layers"
+      width={WIDTH}
+      height={rows.length * ROW}
+      className="ws-layer-lines"
+    >
+      {rows.map((row, index) => (
+        <text key={`${row.top}-${row.bottom}`} x={0} y={y(index) + 4} fontSize={11}>
+          {row.top === row.bottom
+            ? `Layer ${row.top}`
+            : `Layers ${row.top}–${row.bottom} · ${row.files} files`}
+        </text>
+      ))}
+      {lines.map((line) => {
+        const bulge = LABEL + 12 * Math.abs(line.fromRow - line.toRow);
+        const from = y(line.fromRow);
+        const to = y(line.toRow);
+        return (
+          <path
+            key={`${line.fromRow}-${line.toRow}`}
+            className="ws-layer-line"
+            data-new={line.newCount > 0 ? "true" : "false"}
+            d={`M ${LABEL} ${from} C ${bulge} ${from}, ${bulge} ${to}, ${LABEL} ${to}`}
+            fill="none"
+            strokeWidth={1 + Math.min(line.count, 4)}
+          >
+            <title>{`${line.count} upward imports, ${line.newCount} new`}</title>
+          </path>
+        );
+      })}
+    </svg>
   );
 }
 

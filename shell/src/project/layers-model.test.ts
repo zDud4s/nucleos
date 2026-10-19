@@ -1,6 +1,6 @@
 // §spec mapa-do-projeto
 import { describe, expect, it } from "vitest";
-import { buildBands, isolate, maxLayer } from "./layers-model";
+import { buildBands, isolate, ladder, maxLayer } from "./layers-model";
 import type { Layering, MapImport, MapModule } from "../data/project-map";
 
 function mod(path: string): MapModule {
@@ -106,5 +106,50 @@ describe("layers-model", () => {
     // edges inside layer 0 never touch layer 1
     expect(view.into.has(1)).toBe(false);
     expect(view.outOf.has(1)).toBe(false);
+  });
+
+  it("the ladder draws one line per pair of layers that an upward import joins", () => {
+    const bands = buildBands(modules, layering);
+    const { rows, lines } = ladder(bands, layering.violations);
+    // three bands, below the limit: one row each, highest first
+    expect(rows.map((row) => [row.top, row.bottom])).toEqual([
+      [2, 2],
+      [1, 1],
+      [0, 0],
+    ]);
+    expect(lines).toEqual([
+      { fromRow: 1, toRow: 0, count: 1, newCount: 0 },
+      { fromRow: 2, toRow: 1, count: 1, newCount: 1 },
+    ]);
+  });
+
+  it("the ladder merges quiet neighbours only once the stack is deeper than the limit", () => {
+    const deep: Layering = { modules: {}, overridden: [], violations: [] };
+    const deepModules: MapModule[] = [];
+    for (let layer = 0; layer < 10; layer += 1) {
+      const path = `core/src/m${layer}/f.rs`;
+      deep.modules[path] = layer;
+      deepModules.push(mod(path));
+    }
+    // two upward imports from layer 1 to layer 8, one of them new
+    deep.violations = [
+      { from: "core/src/m1/f.rs", to: "core/src/m8/f.rs", from_layer: 1, to_layer: 8, new: true },
+      { from: "core/src/m1/f.rs", to: "core/src/m8/f.rs", from_layer: 1, to_layer: 8, new: false },
+    ];
+    const bands = buildBands(deepModules, deep);
+
+    const whole = ladder(bands, deep.violations, 12);
+    expect(whole.rows).toHaveLength(10);
+
+    const compact = ladder(bands, deep.violations, 4);
+    // 9 | 8 | 7..2 | 1 | 0  -> layers 8 and 1 are the line's ends and stay alone
+    expect(compact.rows.map((row) => [row.top, row.bottom, row.files])).toEqual([
+      [9, 9, 1],
+      [8, 8, 1],
+      [7, 2, 6],
+      [1, 1, 1],
+      [0, 0, 1],
+    ]);
+    expect(compact.lines).toEqual([{ fromRow: 3, toRow: 1, count: 2, newCount: 1 }]);
   });
 });
