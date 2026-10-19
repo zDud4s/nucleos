@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,7 +23,14 @@ type Process struct {
 	Port int
 	// ProfileDir is kept so Stop knows which tree it is reaping.
 	ProfileDir string
+
+	// stopOnce makes Stop idempotent: the first call waits the child, which frees its pid, so any later
+	// call would signal a pid the OS may already have handed to an unrelated program.
+	stopOnce sync.Once
 }
+
+// killGroupFn is killGroup behind a variable so tests can count signals without sending any.
+var killGroupFn = killGroup
 
 // portFile is where Chromium writes the port it actually chose.
 const portFile = "DevToolsActivePort"
@@ -126,13 +134,24 @@ func DebuggerURL(port int, timeout time.Duration) (string, error) {
 // profile stays locked, and the next launch silently inherits it (see ErrInheritedInstance). Spec
 // §9.3 says "mata-se a árvore" and this is the line that has to mean it.
 func (p *Process) Stop() {
-	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+	if p == nil {
+		return
+	}
+	p.stopOnce.Do(p.stop)
+}
+
+func (p *Process) stop() {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	// Already waited by another path: the pid is free and may belong to someone else now.
+	if p.cmd.ProcessState != nil {
 		return
 	}
 	pid := p.cmd.Process.Pid
 	// The group Start made Chromium lead on Unix, or the whole tree on Windows: see killGroup in
 	// procattr_unix.go and procattr_windows.go.
-	killGroup(pid)
+	killGroupFn(pid)
 	_ = p.cmd.Process.Kill()
 	_, _ = p.cmd.Process.Wait()
 }
