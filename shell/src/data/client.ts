@@ -327,3 +327,33 @@ export async function probeHealth(): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * What `GET /system/update-readiness` answers: the daemon's version, how many
+ * runs are live (`running` or `awaiting_approval`), and whether it is already
+ * draining for an update. The updater waits for `live_runs` to reach zero.
+ */
+export interface UpdateReadiness {
+  version: string;
+  live_runs: number;
+  draining: boolean;
+}
+
+/**
+ * Which version is the daemon?
+ *
+ * Read from the `X-Nucleos-Version` header of `/health`, which keeps its plain
+ * `ok` body for the callers that read it. Like {@link probeHealth} it carries
+ * no token and turns "not there" into a value rather than an exception: `null`
+ * means the daemon is silent or too old to name itself, and the shell treats
+ * both as "not the version I was built with".
+ */
+export async function probeDaemonVersion(): Promise<string | null> {
+  try {
+    const res = await fetch(`${DAEMON_URL}/health`);
+    if (!res.ok) return null;
+    return res.headers.get("x-nucleos-version");
+  } catch {
+    return null;
+  }
+}

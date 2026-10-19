@@ -257,3 +257,30 @@ describe("probeHealth", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 });
+
+describe("probeDaemonVersion", () => {
+  it("reads the version the daemon names in X-Nucleos-Version", async () => {
+    const { probeDaemonVersion } = await freshClient();
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "X-Nucleos-Version": "1.2.3" }),
+    } as unknown as Response);
+
+    await expect(probeDaemonVersion()).resolves.toBe("1.2.3");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("is null when the daemon is silent, refuses, or is too old to name itself", async () => {
+    const { probeDaemonVersion } = await freshClient();
+
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    await expect(probeDaemonVersion()).resolves.toBeNull();
+
+    fetchMock.mockResolvedValue({ ok: false, status: 503, headers: new Headers() } as unknown as Response);
+    await expect(probeDaemonVersion()).resolves.toBeNull();
+
+    fetchMock.mockResolvedValue({ ok: true, status: 200, headers: new Headers() } as unknown as Response);
+    await expect(probeDaemonVersion()).resolves.toBeNull();
+  });
+});
