@@ -28,6 +28,8 @@ pub const TURN_CEILING_EXIT_CODE: i32 = i32::MIN + 1;
 /// like this gets switched off for good. Twice the largest thing ever measured is a limit only a
 /// run that is not converging can reach.
 ///
+/// A project may move it for its own runs with `max_turns` in its autopilot rules, never remove it.
+///
 /// A ceiling, not a target: nothing is expected to approach it, and a run that does is a result
 /// worth reading rather than a quota to spend.
 pub const DEFAULT_MAX_TURNS: i64 = 200;

@@ -36,6 +36,10 @@ pub struct FakeCommandRunner {
     pub last_mcp_config: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub last_job_mcp: std::sync::Mutex<Option<JobMcpLaunch>>,
     pub last_tool_policy: std::sync::Mutex<Option<ToolPolicy>>,
+    /// The turn ceiling the launch was handed. Recorded because it is the brake on a run nobody is
+    /// watching, and a project that moved it has no other way to observe that its value arrived:
+    /// the effect is a run that does NOT stop, which no assertion can wait for.
+    pub last_max_turns: std::sync::Mutex<Option<Option<i64>>>,
     pub last_session_id: std::sync::Mutex<Option<String>>,
     pub last_fork_session: std::sync::Mutex<Option<bool>>,
     pub last_include_partial_messages: std::sync::Mutex<Option<bool>>,
@@ -381,6 +385,7 @@ impl CommandRunner for FakeCommandRunner {
             request.allowed_mcp_tools.clone(),
         ));
         *self.last_tool_policy.lock().unwrap() = Some(request.tool_policy);
+        *self.last_max_turns.lock().unwrap() = Some(request.max_turns);
         *self.last_session_id.lock().unwrap() = request.session_id.clone();
         *self.last_fork_session.lock().unwrap() = Some(request.fork_session);
         *self.last_include_partial_messages.lock().unwrap() =

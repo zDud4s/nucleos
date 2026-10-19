@@ -281,6 +281,26 @@ pub struct AutopilotRules {
     pub repo_triggers: Vec<RepoTrigger>,
     #[serde(default)]
     pub gate_command: Option<String>,
+    /// How many turns one autonomous run of this project's work may take before it is stopped.
+    ///
+    /// **Absent means [`crate::execution::runner::DEFAULT_MAX_TURNS`]**, which is what every project
+    /// got before this key existed and what every project that says nothing still gets. The ceiling
+    /// itself is not new; being able to say it per project is.
+    ///
+    /// It exists because the ceiling is a house rule about runaway runs, while whether a given
+    /// project's work FITS under it is a fact about that project's tasks. A repository whose items
+    /// are routinely large was choosing between a ceiling too low to finish and no brake at all,
+    /// because the only dial was a constant shared by every run on the machine.
+    ///
+    /// **Raising it is not free and is not a fix for an item that is too big.** A run's cost grows
+    /// with the square of its length, because every turn re-reads the whole window, so a doubled
+    /// ceiling buys a run that may still fail, later and for more. The reason to raise it is that
+    /// the work genuinely needs the turns; the reason not to is that the plan should have been
+    /// smaller.
+    ///
+    /// Refused rather than clamped when it is not positive: see [`validate_rules`].
+    #[serde(default)]
+    pub max_turns: Option<i64>,
     /// Whether a breached health readout should be written as a new intent record.
     ///
     /// **Absent and off by default**: a repository that says nothing behaves exactly as it did
@@ -560,6 +580,20 @@ pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
 ///   that can never be reached is not a ceiling, and a rule that wants no ceiling of its own says so
 ///   by leaving the key out, which is what `None` already means.
 fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
+    // Refused rather than clamped, on `budget_usd`'s reasoning below. `over_turn_ceiling` compares
+    // `turns >= ceiling`, so a zero or negative ceiling is already blown before the first turn: the
+    // project would stop every run at its start while the file read as though it had asked for a
+    // limit. A project that wants the house ceiling leaves the key out, which is what `None` means.
+    if let Some(max_turns) = rules.max_turns
+        && max_turns <= 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "max_turns must be positive, got `{max_turns}`; a ceiling that is already reached                  before the first turn stops every run at its start - leave the key out to run                  under the default ceiling"
+            ),
+        ));
+    }
     if rules.verify_disk_cap_gb == Some(0) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1422,6 +1456,39 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         )
         .unwrap();
         load_schedule_rules(Some(dir.path()), "p")
+    }
+
+    #[test]
+    fn a_named_turn_ceiling_is_read_from_the_file() {
+        let rules = rules_from("max_turns: 500
+").expect("a positive ceiling is valid");
+        assert_eq!(rules.max_turns, Some(500));
+    }
+
+    /// The compatibility promise, in the parser: a file written before this key existed asks for
+    /// nothing, and `None` is what the run path turns into the house ceiling.
+    #[test]
+    fn a_file_that_says_nothing_about_turns_asks_for_no_ceiling_of_its_own() {
+        let rules = rules_from("schedules: []
+").expect("an unrelated file still parses");
+        assert_eq!(rules.max_turns, None);
+    }
+
+    /// Refused rather than clamped, and the message has to say so. `over_turn_ceiling` compares
+    /// `turns >= ceiling`, so zero is already blown before the first turn: clamped, the project
+    /// would stop every run at its start while the file read as though it had asked for a limit.
+    #[test]
+    fn a_ceiling_already_reached_before_the_first_turn_is_refused() {
+        for asked in ["0", "-1"] {
+            let error = rules_from(&format!("max_turns: {asked}
+"))
+                .expect_err("a ceiling no run can start under must not load");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains("max_turns"),
+                "the refusal must name the key: {error}"
+            );
+        }
     }
 
     #[test]

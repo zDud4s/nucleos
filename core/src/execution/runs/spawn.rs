@@ -425,6 +425,11 @@ pub(super) fn spawn_run(
     // triage run, whose mail must not leave the machine, and a handoff successor).
     route: Option<crate::models::route_advice::RouteQuery>,
     job_mcp: Option<JobNodeMcp>,
+    // The project's own turn ceiling, or `None` for the house one. Resolved by the caller for
+    // `gate_config`'s reason: both come off the same `AutopilotRules`, and the caller is where that
+    // file is already read. Reading it here would mean loading the project's configuration once per
+    // attempt, from inside a retry loop, to answer a question that cannot change between attempts.
+    max_turns: Option<i64>,
 ) {
     let pool = state.pool.clone();
     let feed_project_id = project_id.clone();
@@ -520,7 +525,11 @@ pub(super) fn spawn_run(
                 // wall clock above is a poor guard against the failure that matters here: a run
                 // looping quickly costs little per turn and reaches neither the clock nor the job's
                 // money ceiling, which is only checked between nodes.
-                max_turns: Some(crate::execution::runner::DEFAULT_MAX_TURNS),
+                //
+                // Always `Some`: the project may move the ceiling, never remove it. `None` here
+                // would mean no brake at all, and that is not a state any configuration can ask for
+                // - an absent `max_turns` in the file means "the house ceiling", not "no ceiling".
+                max_turns: Some(max_turns.unwrap_or(crate::execution::runner::DEFAULT_MAX_TURNS)),
                 session_id: Some(session_id.clone()),
                 fork_session,
                 include_partial_messages: false,
@@ -852,6 +861,7 @@ pub(super) fn spawn_run(
                             classifier_governs_tools,
                             model.clone(),
                             effort.clone(),
+                            max_turns,
                         ))
                         .await;
                     }
