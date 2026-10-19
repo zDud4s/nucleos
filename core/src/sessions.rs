@@ -213,10 +213,33 @@ pub struct Said {
 /// written twice. The id arrives from a client: a path BUILT from `../../` reaches wherever it
 /// likes, while a name COMPARED against a directory listing can only ever be one of the names that
 /// were there.
+///
+/// It probes `<project>/<id>.jsonl` in each project directory instead of listing every transcript,
+/// which on a machine with years of sessions was a directory walk and a `stat` per file to find one.
+/// Probing builds a path from the id, so the id is first held to a single plain file name: anything
+/// that is not exactly one name (a separator, a drive, `.`/`..`) finds nothing, which keeps the
+/// property above — the result is always a file directly inside one of the store's own project
+/// directories.
 fn path_of(root: &Path, session_id: &str) -> Option<(PathBuf, std::time::SystemTime)> {
-    transcripts(root)
-        .into_iter()
-        .find(|(path, _)| path.file_stem().and_then(|s| s.to_str()) == Some(session_id))
+    let plain = !session_id.is_empty()
+        && session_id != "."
+        && session_id != ".."
+        && !session_id.contains(['/', '\\', ':', '\0']);
+    if !plain {
+        return None;
+    }
+    let name = format!("{session_id}.jsonl");
+    for project in std::fs::read_dir(root).ok()?.flatten() {
+        let path = project.path().join(&name);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        return Some((path, meta.modified().unwrap_or(std::time::UNIX_EPOCH)));
+    }
+    None
 }
 
 /// Every `<project>/<session>.jsonl` under the root, with its modification time.
@@ -1053,6 +1076,9 @@ mod tests {
 
         assert!(find(&store.root(), "../elsewhere/secret").is_none());
         assert!(find(&store.root(), "..\\elsewhere\\secret").is_none());
+        assert!(find(&store.root(), "..").is_none());
+        assert!(find(&store.root(), "").is_none());
+        assert!(find(&store.root(), "C:secret").is_none());
     }
 
     /// An assistant row that ran one command and said nothing.
