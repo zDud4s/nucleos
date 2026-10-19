@@ -678,6 +678,13 @@
   margin: var(--space-2) 0 0;
 }
 
+/* The test gate and the stop reason share one panel; the rhythm between them is the panel's. */
+.runs-end {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
 .runs-gate-line {
   display: flex;
   flex-wrap: wrap;

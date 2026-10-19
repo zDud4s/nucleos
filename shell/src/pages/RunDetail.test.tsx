@@ -562,6 +562,26 @@ describe("RunDetail — why it stopped", () => {
   });
 
   /**
+   * The critique merged the two panels so a failed run reads top to bottom in one place. The two
+   * names survive as sub-headings, which is what keeps the test gate and the tool gate apart.
+   */
+  it("keeps the test gate and the stop reason as two sub-sections of one panel", async () => {
+    daemon.apiFetch.mockImplementation(
+      detailFetch(detail({ status: "awaiting_approval" }), NO_TAIL, [], stopReport({ status: "awaiting_approval", kind: "gate" })),
+    );
+
+    await renderApp({ initialPath: "/runs/5" });
+
+    const stopped = (await screen.findByText("Why it stopped")).closest("section") as HTMLElement;
+    const gate = screen.getByText("Test gate").closest("section") as HTMLElement;
+    expect(stopped).not.toBe(gate);
+    const panel = screen.getByRole("heading", { level: 2, name: "How it ended" }).closest("section") as HTMLElement;
+    expect(panel.contains(stopped)).toBe(true);
+    expect(panel.contains(gate)).toBe(true);
+    expect(screen.getAllByRole("heading", { name: "How it ended" })).toHaveLength(1);
+  });
+
+  /**
    * The block explains something already on the page, so a daemon that will not
    * answer this one route must cost a reader nothing. An error strip here would
    * be a second failure report about a page that rendered fine.
