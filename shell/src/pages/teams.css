@@ -1503,7 +1503,22 @@
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-faint);
-  overflow-wrap: anywhere;
+  /* Break between words first; `anywhere` only splits a word when nothing else fits (a long
+     path or hash). `anywhere` alone cut ordinary sentences mid-word. */
+  overflow-wrap: break-word;
+  word-break: normal;
+  line-height: var(--leading-snug);
+}
+
+/* Narrow window: stack the output under the name and badge so it gets the full row width. */
+@media (max-width: 60rem) {
+  .teams-item-row {
+    grid-template-columns: minmax(6rem, 9rem) minmax(0, 1fr);
+  }
+
+  .teams-item-row > .teams-item-output {
+    grid-column: 1 / -1;
+  }
 }
 
 /* ================================================================= acts == */

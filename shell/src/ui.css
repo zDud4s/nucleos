@@ -535,7 +535,10 @@ a.ui-button:not(.ui-button-link):is(:hover, :focus-visible) {
 }
 
 .ui-button-primary:hover:not(:disabled) {
-  filter: brightness(1.08);
+  /* The fill is --text, near-white or near-black, so brightness() had nothing to move. Mixing
+     toward the page colour steps the fill visibly in both themes. */
+  background: color-mix(in srgb, var(--text) 82%, var(--bg));
+  border-color: color-mix(in srgb, var(--text) 82%, var(--bg));
 }
 
 .ui-button-primary:disabled {
@@ -1588,7 +1591,9 @@ ol.ui-well {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: var(--space-5);
+  /* Below 60rem the actions drop under the title instead of squeezing it into a column. */
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-5);
   padding-bottom: var(--space-3);
   /* More below the rule than above it. The rule belongs to the title, and a gap
      equal on both sides makes it float between the heading and the page instead
@@ -1602,6 +1607,8 @@ ol.ui-well {
   flex-direction: column;
   gap: var(--space-1);
   min-width: 0;
+  /* Take the free row width, but wrap the actions once the title would need under 20rem. */
+  flex: 1 1 20rem;
 }
 
 /* Display type takes tight leading. At the inherited 1.55 a 28px title reserved 43px for a
@@ -1621,7 +1628,7 @@ ol.ui-well {
 
 .ui-page-actions {
   display: flex;
-  flex: none;
+  flex: 0 0 auto;
   align-items: center;
   gap: var(--space-2);
 }
