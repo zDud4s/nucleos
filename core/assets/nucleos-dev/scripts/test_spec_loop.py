@@ -124,7 +124,7 @@ class SpecLoop(unittest.TestCase):
 
     def test_prompt_hook_nudges_only_spec_prompts_without_a_loop(self):
         ask = lambda p: sl.prompt_context({"session_id": "s1", "cwd": str(self.root), "prompt": p})
-        self.assertIn("spec_loop.py start", ask("trabalha na spec specs/x.md"))
+        self.assertIn('spec_loop.py" start', ask("trabalha na spec specs/x.md"))
         self.assertIsNone(ask("corrige o botão"))
         self.write("- [ ] a\n")
         self.assertIn("1 open", ask("segue"))

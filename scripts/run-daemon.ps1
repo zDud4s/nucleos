@@ -24,7 +24,8 @@
 # inherit that slot's CARGO_TARGET_DIR into every build it runs.
 #
 # This script never kills anything. If the daemon is already running from the copy, it refuses
-# (exit 3) and says so; stopping it is the owner's decision.
+# (exit 3) and says so; stopping it is the owner's decision. When only `--mcp-tools` servers hold
+# the copy, it says that instead, since the daemon itself is then already stopped.
 #
 # Exit codes: 2 bad arguments, 3 the daemon is already running (or the port is taken),
 # 4 build output missing; a build failure exits with the build's own code; otherwise the
@@ -99,13 +100,29 @@ if (Test-Path -LiteralPath $RunDir) {
     }
 }
 if ($held.Count -gt 0) {
-    $pids = @()
-    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
-        $path = $null
-        try { $path = $p.Path } catch { }
-        if ($path -and ($held | Where-Object { $_ -ieq $path })) { $pids += $p.Id }
+    # The same exe also runs as `--mcp-tools`, the stdio MCP server a Claude session spawns. It
+    # holds the image just as the daemon does, but naming it "the daemon" sends the owner looking
+    # for a daemon that is already stopped.
+    $daemons = @()
+    $tools = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+        $path = $p.ExecutablePath
+        if (-not $path -or -not ($held | Where-Object { $_ -ieq $path })) { continue }
+        if ([string]$p.CommandLine -match '(^|\s)--mcp-tools(\s|$)') { $tools += $p } else { $daemons += $p }
     }
-    $who = if ($pids.Count -gt 0) { " (pid " + ($pids -join ', ') + ")" } else { "" }
+    if ($daemons.Count -eq 0 -and $tools.Count -gt 0) {
+        $byPid = @{}
+        foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $byPid[[int]$p.ProcessId] = $p }
+        $who = @($tools | ForEach-Object {
+                $parent = $byPid[[int]$_.ParentProcessId]
+                if ($parent) { "pid $($_.ProcessId) under $($parent.Name) $($parent.ProcessId)" } else { "pid $($_.ProcessId)" }
+            }) -join ', '
+        $ids = @($tools | ForEach-Object { $_.ProcessId }) -join ','
+        Fail 3 ("the daemon is not running, but $($tools.Count) MCP tool server(s) (--mcp-tools) hold " +
+            "the copy in $RunDir ($who), and a running image cannot be replaced. Stop them -- " +
+            "Stop-Process -Id $ids -- then reconnect those sessions with /mcp. Nothing was built or copied.")
+    }
+    $who = if ($daemons.Count -gt 0) { " (pid " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ', ') + ")" } else { "" }
     Fail 3 ("the daemon is running from $RunDir$who; stop it first -- Ctrl+C its terminal, " +
         "or schtasks /End /TN ""NucleOS Daemon"". Nothing was built or copied.")
 }
