@@ -659,7 +659,7 @@ mod tests {
     /// A server is built once per turn on the MCP path (a fresh `claude` process starts its own) and
     /// a `LocalToolBox` is built once per turn on the local one. Each owns the value, so two of them
     /// - two turns - can never share one, whatever else the process has been doing. A value learned
-    /// from a page in one turn is therefore a dead string in the next.
+    ///   from a page in one turn is therefore a dead string in the next.
     #[test]
     fn two_servers_in_one_process_do_not_share_a_boundary() {
         let first = unboxed_server();
