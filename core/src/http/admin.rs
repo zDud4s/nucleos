@@ -409,6 +409,15 @@ pub(super) async fn post_machine_config(
         ));
     }
 
+    // The models file has a second writer in this process, the price refresh, and the two share
+    // one lock (see `crate::config::MODELS_FILE_WRITE`): without it the refresh could splice the
+    // text this write replaced and put it back, and both would race for the one temporary
+    // `write_atomically` stages beside the file. Held until the write has landed.
+    let models_file_write = if setting.path == crate::config::MODELS_CONFIG_FILE {
+        Some(crate::config::MODELS_FILE_WRITE.lock().await)
+    } else {
+        None
+    };
     let contents = body.contents;
     tokio::task::spawn_blocking(move || {
         crate::project::state::write_atomically(&target, &contents)
@@ -419,6 +428,7 @@ pub(super) async fn post_machine_config(
         tracing::warn!(%error, path = %setting.path, "writing a machine settings file failed");
         refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
     })?;
+    drop(models_file_write);
 
     // `None` for the project, because there is not one — this is the machine's own line. After the
     // write and loudly on failure, for the reason `post_project_write` gives: a feed line about a

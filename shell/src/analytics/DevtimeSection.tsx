@@ -4,13 +4,15 @@ import {
   useDevtime,
   useDevtimeFindings,
   useMarkFinding,
+  useRefreshPrices,
   type DevtimeFinding,
   type DevtimeOverview,
   type ModelTokens,
+  type PriceRefreshStatus,
   type Verdict,
 } from "../data/devtime";
 import { compactTokens, humanMinutes } from "../data/project-readings";
-import { AreaChart, Badge, ErrorNote, ShareBar, Skeleton, StaleNote, usd } from "../ui";
+import { AreaChart, Badge, Button, ErrorNote, ShareBar, Skeleton, StaleNote, usd } from "../ui";
 import {
   COST_KEYS,
   KIND_KEYS,
@@ -223,8 +225,19 @@ function InterruptionsPanel({ report }: { report: DevtimeOverview }) {
   );
 }
 
+/** What the last price refresh has to say, or `null` when it ran clean (or none ran). A refresh
+ * can succeed and still have problems worth a look — a model written without a price, say — so
+ * those show too, without the word "failed". */
+function priceRefreshNote(status: PriceRefreshStatus | null | undefined): string | null {
+  if (!status) return null;
+  if (!status.ok) return `Last price refresh failed: ${status.problems.join("; ")}`;
+  return status.problems.length > 0 ? `Last price refresh: ${status.problems.join("; ")}` : null;
+}
+
 function TokensPanel({ report }: { report: DevtimeOverview }) {
   const { tokens } = report;
+  const refresh = useRefreshPrices();
+  const refreshNote = priceRefreshNote(tokens.price_refresh);
   const range = costRange(tokens.cost_low, tokens.cost_high);
   const sum = (row: ModelTokens) => row.input + row.cache_read + row.cache_creation + row.output;
   const hit = (row: ModelTokens) => {
@@ -267,9 +280,14 @@ function TokensPanel({ report }: { report: DevtimeOverview }) {
       ) : null}
       <p className="an-note">
         {tokens.prices_as_of === null
-          ? "No prices yet: run scripts/refresh-models.py."
-          : `Estimated, prices of ${tokens.prices_as_of}. Never compared with an invoice.`}
+          ? "No prices yet."
+          : `Estimated, prices of ${tokens.prices_as_of}. Never compared with an invoice.`}{" "}
+        <Button variant="quiet" disabled={refresh.isPending} onClick={() => refresh.mutate()}>
+          {refresh.isPending ? "Refreshing…" : "Refresh prices"}
+        </Button>
       </p>
+      {refreshNote !== null ? <p className="an-note">{refreshNote}</p> : null}
+      {refresh.isError ? <ErrorNote>The price refresh could not be started.</ErrorNote> : null}
     </>
   );
 }

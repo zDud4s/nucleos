@@ -116,6 +116,81 @@ describe("DevtimeSection", () => {
     expect(within(panel).getByText("spec_gap")).toBeTruthy();
   });
 
+  it("offers a price refresh button instead of a developer command", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens, prices_as_of: null };
+    await mount(state);
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    expect(screen.getByText(/No prices yet\./)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refresh prices" })).toBeTruthy();
+    expect(screen.queryByText(/refresh-models/)).toBeNull();
+  });
+
+  it("POSTs the refresh, shows it pending, and re-reads the overview", async () => {
+    const state = busy();
+    await mount(state);
+    const answer = daemonFetch(state);
+    let release: (status: unknown) => void = () => {};
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/analytics/devtime/prices/refresh") return new Promise((resolve) => { release = resolve; });
+      return answer(path, init);
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh prices" }));
+    const pending = await screen.findByRole("button", { name: "Refreshing…" });
+    expect((pending as HTMLButtonElement).disabled).toBe(true);
+    const posts = daemon.apiFetch.mock.calls.filter(([path]) => path === "/analytics/devtime/prices/refresh");
+    expect(posts).toHaveLength(1);
+    expect(posts[0][1]).toMatchObject({ method: "POST" });
+    const reads = () => daemon.apiFetch.mock.calls.filter(([path]) => String(path).startsWith("/analytics/devtime?")).length;
+    const before = reads();
+    release({ at: "2026-10-19T10:00:00Z", ok: true, prices_as_of: "2026-10-19", problems: [] });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh prices" })).toBeTruthy());
+    await waitFor(() => expect(reads()).toBeGreaterThan(before));
+  });
+
+  it("says why the last price refresh failed", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens,
+      price_refresh: { at: "2026-10-19T10:00:00Z", ok: false, prices_as_of: null, problems: ["fetch failed", "no table"] } };
+    await mount(state);
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    expect(screen.getByText("Last price refresh failed: fetch failed; no table")).toBeTruthy();
+  });
+
+  it("shows the problems of a price refresh that worked, without calling it failed", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens,
+      price_refresh: { at: "2026-10-19T10:00:00Z", ok: true, prices_as_of: "2026-10-19",
+        problems: ["gpt-night written without price", "no fast table"] } };
+    await mount(state);
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    expect(screen.getByText("Last price refresh: gpt-night written without price; no fast table")).toBeTruthy();
+    expect(screen.queryByText(/Last price refresh failed/)).toBeNull();
+  });
+
+  it("says nothing about a price refresh that worked cleanly", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens,
+      price_refresh: { at: "2026-10-19T10:00:00Z", ok: true, prices_as_of: "2026-10-19", problems: [] } };
+    await mount(state);
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    expect(screen.queryByText(/Last price refresh/)).toBeNull();
+  });
+
+  it("shows an error when the refresh request itself fails", async () => {
+    const state = busy();
+    await mount(state);
+    const answer = daemonFetch(state);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/analytics/devtime/prices/refresh") throw new Error("daemon is down");
+      return answer(path, init);
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Refresh prices" }));
+    expect(await screen.findByText("The price refresh could not be started.")).toBeTruthy();
+  });
+
   it("tabulates tokens per model, marks the unpriced one, and footnotes the price date", async () => {
     await mount(busy());
     fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));

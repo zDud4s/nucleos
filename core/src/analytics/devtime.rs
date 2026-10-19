@@ -178,6 +178,10 @@ pub struct DevtimeTokens {
     /// so a model that reads unpriced because of a bad line says so beside the cost.
     pub dropped_prices: Vec<String>,
     pub previous: PreviousTokens,
+    /// How the daemon's last price refresh went, or `None` when none has run since it started.
+    /// Never set here: the HTTP handler fills it after [`devtime_overview`], because it is daemon
+    /// state and not a reading of the window, and this module stays a function of its inputs.
+    pub price_refresh: Option<crate::price_refresh::PriceRefreshStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -663,6 +667,7 @@ fn tokens_block(window: Window, reads: &Reads, models: &ModelsConfig) -> Devtime
             cache_hit_ratio: hit_ratio(&before),
         },
         by_model: current,
+        price_refresh: None,
     }
 }
 
