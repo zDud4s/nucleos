@@ -846,6 +846,7 @@ mod tests {
             runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            utility_model: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),
