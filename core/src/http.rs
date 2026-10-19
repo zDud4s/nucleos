@@ -1160,7 +1160,11 @@ mod tests {
             .await
             .unwrap();
         // A copy nothing prunes, and an automatic backup to read the date from.
-        std::fs::write(db.path().join("nucleos.db.before-116-revert"), vec![0_u8; 1000]).unwrap();
+        std::fs::write(
+            db.path().join("nucleos.db.before-116-revert"),
+            vec![0_u8; 1000],
+        )
+        .unwrap();
         let backup_dir = db.path().join("backups");
         std::fs::create_dir_all(&backup_dir).unwrap();
         std::fs::write(
@@ -1179,13 +1183,22 @@ mod tests {
 
         let freelist = report["freelist_count"].as_i64().unwrap();
         let page_size = report["page_size"].as_i64().unwrap();
-        assert!(freelist > 0, "the deleted rows' pages are on the freelist: {report}");
-        assert_eq!(report["reclaimable_bytes"].as_i64().unwrap(), freelist * page_size);
+        assert!(
+            freelist > 0,
+            "the deleted rows' pages are on the freelist: {report}"
+        );
+        assert_eq!(
+            report["reclaimable_bytes"].as_i64().unwrap(),
+            freelist * page_size
+        );
         assert!(report["db_bytes"].as_u64().unwrap() > 0);
         assert!(report["wal_bytes"].is_u64());
         assert_eq!(report["loose_bytes"], 1000);
         assert_eq!(report["backups_bytes"], 40);
-        assert!(report["files_bytes"].is_null(), "the test state has no files folder");
+        assert!(
+            report["files_bytes"].is_null(),
+            "the test state has no files folder"
+        );
         assert_eq!(report["auto_backup_last"], "2026-10-19T03:00:00Z");
         db.close().await;
     }

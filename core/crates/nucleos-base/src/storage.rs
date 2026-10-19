@@ -127,8 +127,12 @@ pub struct DatabaseStats {
 }
 
 pub async fn database_stats(pool: &SqlitePool) -> Result<DatabaseStats, sqlx::Error> {
-    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size").fetch_one(pool).await?;
-    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(pool).await?;
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(pool)
+        .await?;
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(pool)
+        .await?;
     let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
         .fetch_one(pool)
         .await?;
@@ -205,8 +209,7 @@ pub fn loose_files_bytes(db_path: &Path) -> u64 {
         .filter(|entry| {
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            file_name.starts_with(&prefix)
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            file_name.starts_with(&prefix) && entry.file_type().is_ok_and(|kind| kind.is_file())
         })
         .map(|entry| entry.metadata().map_or(0, |meta| meta.len()))
         .sum()
@@ -650,7 +653,10 @@ mod tests {
 
         fill_scratch(pool, 200).await;
         let before = database_stats(pool).await.unwrap();
-        assert!(before.wal_bytes > 0, "the writes sit in the WAL until a checkpoint");
+        assert!(
+            before.wal_bytes > 0,
+            "the writes sit in the WAL until a checkpoint"
+        );
 
         assert!(truncate_wal(pool).await.unwrap(), "nothing else is reading");
         let after = database_stats(pool).await.unwrap();
@@ -667,7 +673,10 @@ mod tests {
         let full = database_stats(pool).await.unwrap();
         assert_eq!(full.reclaimable_bytes, 0);
 
-        sqlx::query("DELETE FROM scratch").execute(pool).await.unwrap();
+        sqlx::query("DELETE FROM scratch")
+            .execute(pool)
+            .await
+            .unwrap();
         let emptied = database_stats(pool).await.unwrap();
         assert!(emptied.freelist_count > 0);
         assert_eq!(
