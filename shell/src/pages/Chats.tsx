@@ -2547,7 +2547,11 @@ function ModelMenu({
         disabled={disabled}
       >
         {shownProvider !== null && <ProviderMark provider={shownProvider} size={14} />}
-        {shown}
+        {/* Its own span so a long name ellipsizes instead of pushing Send off the row; the
+            whole name is on the trigger's accessible name and on this title. */}
+        <span className="chats-model-name" title={shown}>
+          {shown}
+        </span>
         <ChevronDown className="chats-tool-caret" aria-hidden="true" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="chats-meta-menu">
