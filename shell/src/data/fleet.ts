@@ -407,7 +407,7 @@ export function useExclusions() {
   return useQuery({
     queryKey: keys.fleet.exclusions,
     queryFn: () => apiFetch<FleetExclusion[]>("/fleet/exclusions"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.queue,
     placeholderData: keepPreviousData,
   });
 }
@@ -423,7 +423,7 @@ export function useExclusionRequests() {
   return useQuery({
     queryKey: keys.fleet.exclusionRequests,
     queryFn: () => apiFetch<Proposal[]>("/fleet/exclusions/requests"),
-    refetchInterval: POLL.fast,
+    refetchInterval: POLL.queue,
     placeholderData: keepPreviousData,
   });
 }
