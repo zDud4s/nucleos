@@ -388,13 +388,15 @@ pub(super) async fn spawn_agent(
                 Ok(Ok(turn)) => record_local_turn(&pool, run_id, &turn, &completed_at).await,
                 Ok(Err(error)) => fail_run(&pool, run_id, &error.to_string()).await,
                 Err(_) => {
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'timed_out', cost_usd = 0, completed_at = ?
+                    crate::storage::settle_write("team local run (timed out)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'timed_out', cost_usd = 0, completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                 }
             }
@@ -543,74 +545,80 @@ pub(super) async fn spawn_agent(
                 // No outcome on this branch, so `compacted` cannot be known -- but the partial
                 // transcript is the whole record of a run that went too far, which is the case the
                 // reading exists to see.
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?,
+                crate::storage::settle_write("team agent run (timed out)", run_id, || {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'timed_out', stdout = ?, context_fill = ?,
                             context_peak = ?, tools_used = ?, completed_at = ?
                      WHERE id = ? AND status = 'running'",
-                )
-                .bind(&partial)
-                .bind(crate::execution::runs::observed_context_fill(
-                    &context_fill,
-                    &partial,
-                ))
-                .bind(crate::execution::runs::peak_of(&partial))
-                .bind(crate::execution::runs::tools_of(&partial))
-                .bind(&completed_at)
-                .bind(run_id)
-                .execute(&pool)
+                    )
+                    .bind(&partial)
+                    .bind(crate::execution::runs::observed_context_fill(
+                        &context_fill,
+                        &partial,
+                    ))
+                    .bind(crate::execution::runs::peak_of(&partial))
+                    .bind(crate::execution::runs::tools_of(&partial))
+                    .bind(&completed_at)
+                    .bind(run_id)
+                    .execute(&pool)
+                })
                 .await;
             }
             Ok(Ok(outcome)) if outcome.exit_code == 0 => {
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = ?,
+                crate::storage::settle_write("team agent run (completed)", run_id, || {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = ?,
                             input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
                             num_turns = ?, context_fill = ?, context_peak = ?, compacted = ?,
                             tools_used = ?, completed_at = ?
                      WHERE id = ? AND status = 'running'",
-                )
-                .bind(&outcome.stdout)
-                .bind(outcome.cost_usd)
-                .bind(outcome.input_tokens)
-                .bind(outcome.output_tokens)
-                .bind(outcome.cache_read_tokens)
-                .bind(outcome.num_turns)
-                .bind(crate::execution::runs::observed_context_fill(
-                    &context_fill,
-                    &outcome.stdout,
-                ))
-                .bind(crate::execution::runs::peak_of(&outcome.stdout))
-                .bind(outcome.compacted)
-                .bind(crate::execution::runs::tools_of(&outcome.stdout))
-                .bind(&completed_at)
-                .bind(run_id)
-                .execute(&pool)
+                    )
+                    .bind(&outcome.stdout)
+                    .bind(outcome.cost_usd)
+                    .bind(outcome.input_tokens)
+                    .bind(outcome.output_tokens)
+                    .bind(outcome.cache_read_tokens)
+                    .bind(outcome.num_turns)
+                    .bind(crate::execution::runs::observed_context_fill(
+                        &context_fill,
+                        &outcome.stdout,
+                    ))
+                    .bind(crate::execution::runs::peak_of(&outcome.stdout))
+                    .bind(outcome.compacted)
+                    .bind(crate::execution::runs::tools_of(&outcome.stdout))
+                    .bind(&completed_at)
+                    .bind(run_id)
+                    .execute(&pool)
+                })
                 .await;
             }
             Ok(Ok(outcome)) => {
                 // An agent that started, spoke, and exited non-zero has a stream like any other,
                 // and `num_turns` is written here too: the denominator was missing on every
                 // non-`completed` path, which is exactly where the fullest runs are.
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
+                crate::storage::settle_write("team agent run (failed)", run_id, || {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
                             cost_usd = ?, num_turns = ?, context_fill = ?, context_peak = ?,
                             compacted = ?, tools_used = ?, completed_at = ?
                      WHERE id = ? AND status = 'running'",
-                )
-                .bind(outcome.exit_code)
-                .bind(&outcome.stdout)
-                .bind(&outcome.stderr)
-                .bind(outcome.cost_usd)
-                .bind(outcome.num_turns)
-                .bind(crate::execution::runs::observed_context_fill(
-                    &context_fill,
-                    &outcome.stdout,
-                ))
-                .bind(crate::execution::runs::peak_of(&outcome.stdout))
-                .bind(outcome.compacted)
-                .bind(crate::execution::runs::tools_of(&outcome.stdout))
-                .bind(&completed_at)
-                .bind(run_id)
-                .execute(&pool)
+                    )
+                    .bind(outcome.exit_code)
+                    .bind(&outcome.stdout)
+                    .bind(&outcome.stderr)
+                    .bind(outcome.cost_usd)
+                    .bind(outcome.num_turns)
+                    .bind(crate::execution::runs::observed_context_fill(
+                        &context_fill,
+                        &outcome.stdout,
+                    ))
+                    .bind(crate::execution::runs::peak_of(&outcome.stdout))
+                    .bind(outcome.compacted)
+                    .bind(crate::execution::runs::tools_of(&outcome.stdout))
+                    .bind(&completed_at)
+                    .bind(run_id)
+                    .execute(&pool)
+                })
                 .await;
             }
             Ok(Err(error)) => fail_run(&pool, run_id, &error.to_string()).await,
@@ -649,20 +657,24 @@ async fn stop_if_the_run_ended(state: &AppState, team_run_id: &str, run_id: i64)
     crate::execution::runs::finalize_termination(state, run_id, "cancelled").await;
     // The launch stamped these after the cancel cleared them, so a node that never got to work
     // would otherwise read as still in flight on a run that has ended.
-    let _ = sqlx::query(
-        "UPDATE team_items SET state = 'failed'
+    crate::storage::settle_write("team item of a stopped run", run_id, || {
+        sqlx::query(
+            "UPDATE team_items SET state = 'failed'
          WHERE team_run_id = ? AND run_id = ? AND state = 'running'",
-    )
-    .bind(team_run_id)
-    .bind(run_id)
-    .execute(&state.pool)
+        )
+        .bind(team_run_id)
+        .bind(run_id)
+        .execute(&state.pool)
+    })
     .await;
-    let _ = sqlx::query(
-        "UPDATE team_runs SET director_node = 'none' WHERE id = ? AND director_run_id = ?",
-    )
-    .bind(team_run_id)
-    .bind(run_id)
-    .execute(&state.pool)
+    crate::storage::settle_write("team run director of a stopped run", run_id, || {
+        sqlx::query(
+            "UPDATE team_runs SET director_node = 'none' WHERE id = ? AND director_run_id = ?",
+        )
+        .bind(team_run_id)
+        .bind(run_id)
+        .execute(&state.pool)
+    })
     .await;
 }
 
@@ -694,28 +706,32 @@ pub(super) async fn record_local_turn(
     turn: &crate::models::local_agent::Turn,
     completed_at: &str,
 ) {
-    let _ = sqlx::query(
-        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0,
+    crate::storage::settle_write("team local run (completed)", run_id, || {
+        sqlx::query(
+            "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0,
                 num_turns = ?, completed_at = ?
          WHERE id = ? AND status = 'running'",
-    )
-    .bind(&turn.answer)
-    .bind(turn.tool_calls as i64)
-    .bind(completed_at)
-    .bind(run_id)
-    .execute(pool)
+        )
+        .bind(&turn.answer)
+        .bind(turn.tool_calls as i64)
+        .bind(completed_at)
+        .bind(run_id)
+        .execute(pool)
+    })
     .await;
 }
 
 async fn fail_run(pool: &sqlx::SqlitePool, run_id: i64, why: &str) {
-    let _ = sqlx::query(
-        "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0, completed_at = ?
+    crate::storage::settle_write("team local run (failed)", run_id, || {
+        sqlx::query(
+            "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0, completed_at = ?
          WHERE id = ? AND status = 'running'",
-    )
-    .bind(why)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(run_id)
-    .execute(pool)
+        )
+        .bind(why)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(run_id)
+        .execute(pool)
+    })
     .await;
 }
 

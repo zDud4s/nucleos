@@ -291,14 +291,16 @@ impl Driver {
             let seat_outcome = match outcome {
                 Err(_) => {
                     let partial = transcript.lock().unwrap().clone();
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'timed_out', stdout = ?, completed_at = ?
+                    crate::storage::settle_write("council seat run (timed out)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'timed_out', stdout = ?, completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(&partial)
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(&partial)
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                     SeatOutcome {
                         status: SEAT_TIMEOUT,
@@ -307,23 +309,25 @@ impl Driver {
                     }
                 }
                 Ok(Ok(run)) if run.exit_code == 0 => {
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
+                    crate::storage::settle_write("council seat run (completed)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
                                 cost_usd = ?, input_tokens = ?, output_tokens = ?,
                                 cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
                                 completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(&run.stdout)
-                    .bind(run.cost_usd)
-                    .bind(run.input_tokens)
-                    .bind(run.output_tokens)
-                    .bind(run.cache_read_tokens)
-                    .bind(run.cache_creation_tokens)
-                    .bind(run.num_turns)
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(&run.stdout)
+                        .bind(run.cost_usd)
+                        .bind(run.input_tokens)
+                        .bind(run.output_tokens)
+                        .bind(run.cache_read_tokens)
+                        .bind(run.cache_creation_tokens)
+                        .bind(run.num_turns)
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                     SeatOutcome {
                         status: SEAT_OK,
@@ -345,25 +349,27 @@ impl Driver {
                     //
                     // Cache creation among them, in both arms: the window a seat spent building its
                     // cache is spend like any other, and a row without it reads as cheaper than it was.
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
+                    crate::storage::settle_write("council seat run (failed)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'failed', exit_code = ?, stdout = ?, stderr = ?,
                                 cost_usd = ?, input_tokens = ?, output_tokens = ?,
                                 cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?,
                                 completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(run.exit_code)
-                    .bind(&run.stdout)
-                    .bind(&run.stderr)
-                    .bind(run.cost_usd)
-                    .bind(run.input_tokens)
-                    .bind(run.output_tokens)
-                    .bind(run.cache_read_tokens)
-                    .bind(run.cache_creation_tokens)
-                    .bind(run.num_turns)
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(run.exit_code)
+                        .bind(&run.stdout)
+                        .bind(&run.stderr)
+                        .bind(run.cost_usd)
+                        .bind(run.input_tokens)
+                        .bind(run.output_tokens)
+                        .bind(run.cache_read_tokens)
+                        .bind(run.cache_creation_tokens)
+                        .bind(run.num_turns)
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                     SeatOutcome {
                         status: SEAT_ERROR,
@@ -372,14 +378,16 @@ impl Driver {
                     }
                 }
                 Ok(Err(error)) => {
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?
+                    crate::storage::settle_write("council seat run (failed)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(error.to_string())
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(error.to_string())
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                     SeatOutcome {
                         status: SEAT_ERROR,
@@ -436,14 +444,16 @@ impl Driver {
                 let message = refusal.message(crate::chats::Brain::Local);
                 // The row is closed here rather than left `running`, exactly as the transport
                 // error arm below closes it: nothing was spawned, so nothing else ever will.
-                let _ = sqlx::query(
-                    "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0, completed_at = ?
+                crate::storage::settle_write("council seat run (failed)", run_id, || {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0, completed_at = ?
                      WHERE id = ? AND status = 'running'",
-                )
-                .bind(&message)
-                .bind(chrono::Utc::now().to_rfc3339())
-                .bind(run_id)
-                .execute(&self.state.pool)
+                    )
+                    .bind(&message)
+                    .bind(chrono::Utc::now().to_rfc3339())
+                    .bind(run_id)
+                    .execute(&self.state.pool)
+                })
                 .await;
                 return SeatOutcome {
                     status: SEAT_ERROR,
@@ -509,13 +519,15 @@ impl Driver {
 
             let seat_outcome = match turn {
                 Err(_) => {
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'timed_out', completed_at = ?
+                    crate::storage::settle_write("council local seat run (timed out)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'timed_out', completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                     SeatOutcome {
                         status: SEAT_TIMEOUT,
@@ -527,15 +539,17 @@ impl Driver {
                     // `cost_usd = 0` and not NULL. A local seat spends nothing, and NULL is what
                     // `budget.rs` time-approximates a cost for — an unmeasured run — so leaving it
                     // unset would charge the window for electricity.
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
+                    crate::storage::settle_write("council local seat run (completed)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
                                 cost_usd = 0, completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(&turn.answer)
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(&turn.answer)
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                     SeatOutcome {
                         status: SEAT_OK,
@@ -544,15 +558,17 @@ impl Driver {
                     }
                 }
                 Ok(Err(error)) => {
-                    let _ = sqlx::query(
-                        "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0,
+                    crate::storage::settle_write("council local seat run (failed)", run_id, || {
+                        sqlx::query(
+                            "UPDATE runs SET status = 'failed', stderr = ?, cost_usd = 0,
                                 completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                    )
-                    .bind(error.to_string())
-                    .bind(&completed_at)
-                    .bind(run_id)
-                    .execute(&pool)
+                        )
+                        .bind(error.to_string())
+                        .bind(&completed_at)
+                        .bind(run_id)
+                        .execute(&pool)
+                    })
                     .await;
                     SeatOutcome {
                         status: SEAT_ERROR,
