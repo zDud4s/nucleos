@@ -385,9 +385,7 @@ pub async fn resume_for_correction(
                     scoped_final,
                 })
         }
-        Err(error) => {
-            GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
-        }
+        Err(error) => GateConfig::Unreadable(format!("gate configuration is unreadable: {error}")),
     };
     let governed_by_classifier = classifier_governs_tools(
         "worktree",

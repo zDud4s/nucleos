@@ -1460,8 +1460,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
 
     #[test]
     fn a_named_turn_ceiling_is_read_from_the_file() {
-        let rules = rules_from("max_turns: 500
-").expect("a positive ceiling is valid");
+        let rules = rules_from(
+            "max_turns: 500
+",
+        )
+        .expect("a positive ceiling is valid");
         assert_eq!(rules.max_turns, Some(500));
     }
 
@@ -1469,8 +1472,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     /// nothing, and `None` is what the run path turns into the house ceiling.
     #[test]
     fn a_file_that_says_nothing_about_turns_asks_for_no_ceiling_of_its_own() {
-        let rules = rules_from("schedules: []
-").expect("an unrelated file still parses");
+        let rules = rules_from(
+            "schedules: []
+",
+        )
+        .expect("an unrelated file still parses");
         assert_eq!(rules.max_turns, None);
     }
 
@@ -1480,9 +1486,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     #[test]
     fn a_ceiling_already_reached_before_the_first_turn_is_refused() {
         for asked in ["0", "-1"] {
-            let error = rules_from(&format!("max_turns: {asked}
-"))
-                .expect_err("a ceiling no run can start under must not load");
+            let error = rules_from(&format!(
+                "max_turns: {asked}
+"
+            ))
+            .expect_err("a ceiling no run can start under must not load");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
             assert!(
                 error.to_string().contains("max_turns"),
