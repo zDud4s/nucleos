@@ -9118,10 +9118,17 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!((body["name"].as_str(), body["version"].as_str()), (Some("harness"), Some("1.1")));
+        assert_eq!(
+            (body["name"].as_str(), body["version"].as_str()),
+            (Some("harness"), Some("1.1"))
+        );
         assert!(library.join("harness/1.1/graph.yaml").is_file());
 
-        std::fs::write(library.join("harness/1.1/graph.yaml"), "# edited in place\n").unwrap();
+        std::fs::write(
+            library.join("harness/1.1/graph.yaml"),
+            "# edited in place\n",
+        )
+        .unwrap();
         for from in [serde_json::json!("1.0"), serde_json::Value::Null] {
             let (status, body) = workflow_call(
                 state.clone(),
@@ -9145,7 +9152,10 @@ mod tests {
             Some(serde_json::json!({ "from_version": "9.9", "version": "2.0" })),
         )
         .await;
-        assert_eq!((status, body["refusal"].as_str()), (StatusCode::NOT_FOUND, Some("no_such_bundle")));
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::NOT_FOUND, Some("no_such_bundle"))
+        );
         let (status, body) = workflow_call(
             state,
             "POST",
@@ -9153,7 +9163,10 @@ mod tests {
             Some(serde_json::json!({ "version": "../escape" })),
         )
         .await;
-        assert_eq!((status, body["refusal"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("bad_name")));
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("bad_name"))
+        );
         assert!(!library.join("escape").exists());
     }
 
@@ -9185,7 +9198,10 @@ mod tests {
         )
         .await;
         let (status, body) = publish("1.0.1").await;
-        assert_eq!((status, body["refusal"].as_str()), (StatusCode::CONFLICT, Some("not_ejected")));
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("not_ejected"))
+        );
 
         workflow_call(
             state.clone(),
@@ -9208,9 +9224,15 @@ mod tests {
             "# mine now\n"
         );
         let (status, body) = publish("1.0.1").await;
-        assert_eq!((status, body["refusal"].as_str()), (StatusCode::CONFLICT, Some("already_published")));
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("already_published"))
+        );
         let (status, body) = publish("1.0").await;
-        assert_eq!((status, body["refusal"].as_str()), (StatusCode::CONFLICT, Some("already_published")));
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("already_published"))
+        );
     }
 
     /// Publishing writes into the library every project reads from, so the stop refuses it too.

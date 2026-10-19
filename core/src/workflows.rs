@@ -1827,7 +1827,12 @@ mod tests {
             "1.0",
             &[("a.md", "old")],
         );
-        let other = shelf(&temp.path().join("other"), "harness", "9", &[("a.md", "new")]);
+        let other = shelf(
+            &temp.path().join("other"),
+            "harness",
+            "9",
+            &[("a.md", "new")],
+        );
         let before = bundle_at(&lib, "harness", "1.0");
 
         assert_eq!(
@@ -1961,14 +1966,12 @@ mod tests {
         let bundle = bundle_at(&lib, "harness", "1.0");
 
         assert_eq!(
-            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0")
-                .unwrap_err(),
+            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0").unwrap_err(),
             Refused::NotInstalled
         );
         install(&pins_of(&project), &bundle).unwrap();
         assert_eq!(
-            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0")
-                .unwrap_err(),
+            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0").unwrap_err(),
             Refused::NotEjected
         );
         assert!(!lib.join("harness/2.0").exists());
