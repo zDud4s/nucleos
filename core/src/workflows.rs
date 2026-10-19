@@ -715,6 +715,12 @@ pub enum Refused {
     NoGraph,
     /// It has one and it does not parse, in [`crate::workflows::graph`]'s own words.
     InvalidGraph(String),
+    /// `<name>/<version>` is already in the library. Versions are immutable (§7.1), so there is no
+    /// way to publish over one — not even with the same bytes.
+    AlreadyPublished,
+    /// The project pins that workflow but holds no copy of its own, so there is nothing of the
+    /// project's to publish.
+    NotEjected,
     /// The pins file, or the ejected copy, could not be read or written.
     Io(String),
 }
@@ -734,6 +740,14 @@ impl std::fmt::Display for Refused {
             ),
             Refused::NoGraph => write!(f, "this bundle has no graph in it yet"),
             Refused::InvalidGraph(detail) => write!(f, "{detail}"),
+            Refused::AlreadyPublished => write!(
+                f,
+                "the library already has that version; a published version never changes"
+            ),
+            Refused::NotEjected => write!(
+                f,
+                "this project has no copy of its own of that workflow to publish"
+            ),
             Refused::Io(detail) => write!(f, "{detail}"),
         }
     }
@@ -941,6 +955,100 @@ pub fn update(
     pins.workflows[index].origin = bundle.origin.clone();
     pins.workflows[index].hash = bundle.hash.clone();
     save_pins(pins_file, &pins)
+}
+
+/// Add `source` to the library as `<name>/<version>`, which from then on never changes.
+///
+/// **§7.1: refused when the pair exists, with no flag to force it.** `drifted` only means something
+/// if `<name>/<version>/` is an address that does not move, and a force switch would make every
+/// pin's hash a statement about the last time somebody felt like overwriting it. Whoever wants to
+/// change a bundle publishes a new version or ejects.
+///
+/// **Not refused for its shape.** The version only has to be a usable directory name
+/// ([`valid_name`]); [`compare_versions`] already orders whatever comes, pre-releases included
+/// (§7.2), so this adds no rule of its own.
+///
+/// The copy is staged next to its destination and renamed into place, so a crash half way leaves a
+/// dot-directory [`library`] does not list rather than a version that exists but is missing files —
+/// which would have a permanent hash nobody could ever correct.
+pub fn publish(
+    library_root: &Path,
+    source: &Path,
+    name: &str,
+    version: &str,
+) -> Result<Bundle, Refused> {
+    if !valid_name(name) || !valid_name(version) {
+        return Err(Refused::BadName);
+    }
+    // The source is read as a bundle first: no manifest means somebody's scratch folder, and it is
+    // not published. This also applies the same size and depth bounds every other read of a bundle
+    // has, before a byte is copied.
+    if read_bundle(source, name, version)
+        .map_err(|error| Refused::Io(error.to_string()))?
+        .is_none()
+    {
+        return Err(Refused::NoSuchBundle);
+    }
+
+    let parent = library_root.join(name);
+    let target = parent.join(version);
+    if target.exists() {
+        return Err(Refused::AlreadyPublished);
+    }
+    std::fs::create_dir_all(&parent).map_err(|error| Refused::Io(error.to_string()))?;
+
+    // Leading dot: not a `valid_name`, so `library` never lists a half-written stage.
+    let stage = parent.join(format!(".publishing-{version}"));
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage).map_err(|error| Refused::Io(error.to_string()))?;
+    }
+    let staged = copy_tree(source, &stage).and_then(|()| {
+        // Checked again right before the rename: the copy takes time, and two publishes of the
+        // same pair must not both succeed.
+        if target.exists() {
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        } else {
+            std::fs::rename(&stage, &target)
+        }
+    });
+    if let Err(error) = staged {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Refused::AlreadyPublished
+        } else {
+            Refused::Io(error.to_string())
+        });
+    }
+
+    read_bundle(&target, name, version)
+        .map_err(|error| Refused::Io(error.to_string()))?
+        .ok_or(Refused::NoSuchBundle)
+}
+
+/// Publish this project's own copy of `name` — ejected, or adopted — as a new library version.
+///
+/// §7.3's "this turned out good, make it everyone's". The copy is looked up through the pin, by
+/// [`copy_path`], so it is the folder the project actually runs rather than a guess at where one
+/// might be. The pin itself is left alone: the project keeps its copy, and whether it then follows
+/// the library again is a separate, deliberate `install`.
+pub fn publish_from_project(
+    project_root: &Path,
+    pins_file: &Path,
+    library_root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<Bundle, Refused> {
+    let pins = read_pins(pins_file).map_err(Refused::Io)?;
+    let pin = pins
+        .workflows
+        .iter()
+        .find(|pin| pin.name == name)
+        .ok_or(Refused::NotInstalled)?;
+    if pin.ejected_at.is_none() {
+        return Err(Refused::NotEjected);
+    }
+    let source = copy_path(project_root, pin).ok_or(Refused::BadName)?;
+    publish(library_root, &source, name, version)
 }
 
 /// Longest a node id may be in an overlay row.
@@ -1677,5 +1785,212 @@ mod tests {
             Err(Refused::NotInstalled)
         );
         assert!(!project.join(".nucleos/workflows/harness").exists());
+    }
+
+    /* -------------------------------------------------------------- publish -- */
+
+    #[test]
+    fn publishing_from_the_library_adds_a_new_version_and_leaves_the_old_one_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let lib = shelf(
+            &temp.path().join("lib"),
+            "harness",
+            "1.0",
+            &[("skills/plan.md", "plan")],
+        );
+        let before = bundle_at(&lib, "harness", "1.0");
+
+        let published = publish(&lib, Path::new(&before.path), "harness", "1.1").unwrap();
+
+        assert_eq!(
+            (published.name.as_str(), published.version.as_str()),
+            ("harness", "1.1")
+        );
+        assert!(lib.join("harness/1.1/skills/plan.md").is_file());
+        assert_eq!(published.hash, before.hash, "same bytes, same hash");
+        assert_eq!(bundle_at(&lib, "harness", "1.0").hash, before.hash);
+        let versions: Vec<_> = library(&lib)
+            .unwrap()
+            .into_iter()
+            .map(|bundle| bundle.version)
+            .collect();
+        assert_eq!(versions, ["1.1", "1.0"]);
+    }
+
+    /// §7.1: no flag forces it, and identical bytes are not an exception.
+    #[test]
+    fn publishing_over_an_existing_version_is_refused_and_changes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let lib = shelf(
+            &temp.path().join("lib"),
+            "harness",
+            "1.0",
+            &[("a.md", "old")],
+        );
+        let other = shelf(&temp.path().join("other"), "harness", "9", &[("a.md", "new")]);
+        let before = bundle_at(&lib, "harness", "1.0");
+
+        assert_eq!(
+            publish(&lib, &other.join("harness/9"), "harness", "1.0").unwrap_err(),
+            Refused::AlreadyPublished
+        );
+        assert_eq!(
+            publish(&lib, Path::new(&before.path), "harness", "1.0").unwrap_err(),
+            Refused::AlreadyPublished
+        );
+        assert_eq!(bundle_at(&lib, "harness", "1.0").hash, before.hash);
+        assert_eq!(
+            std::fs::read_to_string(lib.join("harness/1.0/a.md")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn publishing_refuses_a_name_or_version_that_cannot_be_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let lib = shelf(&temp.path().join("lib"), "harness", "1.0", &[]);
+        let source = lib.join("harness/1.0");
+        for (name, version) in [
+            ("..", "2.0"),
+            ("harness", ".."),
+            ("harness", "a/b"),
+            ("harness", ""),
+            ("har/ness", "2.0"),
+            ("-harness", "2.0"),
+            ("harness", ".hidden"),
+        ] {
+            assert_eq!(
+                publish(&lib, &source, name, version).unwrap_err(),
+                Refused::BadName,
+                "{name}@{version}"
+            );
+        }
+        assert_eq!(library(&lib).unwrap().len(), 1);
+    }
+
+    /// The version has no required shape: pre-releases and plain labels are fine, and the order
+    /// stays `compare_versions`' business.
+    #[test]
+    fn publishing_imposes_no_shape_on_the_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let lib = shelf(&temp.path().join("lib"), "harness", "1.0", &[]);
+        let source = lib.join("harness/1.0");
+        for version in ["1.0-rc1", "2", "2.0.0.1", "spring_edition"] {
+            publish(&lib, &source, "harness", version).unwrap();
+        }
+        assert_eq!(library(&lib).unwrap().len(), 5);
+        assert!(compare_versions("1.0-rc1", "1.0").is_lt());
+    }
+
+    #[test]
+    fn a_source_without_a_manifest_is_not_published() {
+        let temp = tempfile::tempdir().unwrap();
+        let lib = temp.path().join("lib");
+        let scratch = temp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("notes.md"), "x").unwrap();
+
+        assert_eq!(
+            publish(&lib, &scratch, "harness", "1.0").unwrap_err(),
+            Refused::NoSuchBundle
+        );
+        assert_eq!(
+            publish(&lib, &temp.path().join("missing"), "harness", "1.0").unwrap_err(),
+            Refused::NoSuchBundle
+        );
+        assert!(!lib.join("harness/1.0").exists());
+    }
+
+    /// A stage left behind by a crashed publish is neither listed nor in the way of the next try.
+    #[test]
+    fn a_stale_stage_is_neither_listed_nor_in_the_way() {
+        let temp = tempfile::tempdir().unwrap();
+        let lib = shelf(&temp.path().join("lib"), "harness", "1.0", &[("a.md", "a")]);
+        let stage = lib.join("harness/.publishing-1.1");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join(MANIFEST), "description: half\n").unwrap();
+        assert_eq!(library(&lib).unwrap().len(), 1);
+
+        publish(&lib, &lib.join("harness/1.0"), "harness", "1.1").unwrap();
+
+        assert!(!stage.exists());
+        assert!(lib.join("harness/1.1/a.md").is_file());
+    }
+
+    #[test]
+    fn a_projects_ejected_copy_is_published_with_its_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let lib = shelf(
+            &temp.path().join("lib"),
+            "harness",
+            "1.0",
+            &[("a.md", "orig")],
+        );
+        let bundle = bundle_at(&lib, "harness", "1.0");
+        install(&pins_of(&project), &bundle).unwrap();
+        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
+        std::fs::write(project.join(".nucleos/workflows/harness/a.md"), "edited").unwrap();
+
+        let published =
+            publish_from_project(&project, &pins_of(&project), &lib, "harness", "1.0.1").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(lib.join("harness/1.0.1/a.md")).unwrap(),
+            "edited"
+        );
+        assert_ne!(published.hash, bundle.hash);
+        // The project's pin and copy are untouched: publishing is not installing.
+        let pins = read_pins(&pins_of(&project)).unwrap();
+        assert_eq!(pins.workflows[0].version, "1.0");
+        assert!(pins.workflows[0].ejected_at.is_some());
+        assert_eq!(
+            publish_from_project(&project, &pins_of(&project), &lib, "harness", "1.0.1")
+                .unwrap_err(),
+            Refused::AlreadyPublished
+        );
+    }
+
+    #[test]
+    fn a_project_publishes_only_a_copy_it_has() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let lib = shelf(&temp.path().join("lib"), "harness", "1.0", &[]);
+        let bundle = bundle_at(&lib, "harness", "1.0");
+
+        assert_eq!(
+            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0")
+                .unwrap_err(),
+            Refused::NotInstalled
+        );
+        install(&pins_of(&project), &bundle).unwrap();
+        assert_eq!(
+            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0")
+                .unwrap_err(),
+            Refused::NotEjected
+        );
+        assert!(!lib.join("harness/2.0").exists());
+    }
+
+    /// An adopted folder with a manifest is publishable; one without is somebody's folder, not a
+    /// bundle.
+    #[test]
+    fn an_adopted_folder_publishes_only_when_it_is_a_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let lib = temp.path().join("lib");
+        std::fs::create_dir_all(project.join("flow")).unwrap();
+        std::fs::write(project.join("flow/a.md"), "a").unwrap();
+        adopt(&project, &pins_of(&project), "flow", "flow", now()).unwrap();
+
+        assert_eq!(
+            publish_from_project(&project, &pins_of(&project), &lib, "flow", "1.0").unwrap_err(),
+            Refused::NoSuchBundle
+        );
+        std::fs::write(project.join("flow").join(MANIFEST), "description: mine\n").unwrap();
+        publish_from_project(&project, &pins_of(&project), &lib, "flow", "1.0").unwrap();
+        assert!(lib.join("flow/1.0/a.md").is_file());
     }
 }

@@ -3752,7 +3752,7 @@ mod tests {
 
     /// A project's workflows are the owner's, to read and to change.
     ///
-    /// Six routes, all out of every table, and the reads are the half worth arguing for. A
+    /// Eight routes, all out of every table, and the reads are the half worth arguing for. A
     /// workflow is the *instructions an agent is given*: which nodes run, on which model, behind
     /// which gate. A run able to read the graph it is being executed by is a run reading the shape
     /// of its own supervision, and one able to write it could switch the review node off. The
@@ -3775,6 +3775,9 @@ mod tests {
             (Method::GET, "/projects/{id}/workflows/{name}/graph"),
             (Method::POST, "/projects/{id}/workflows/{name}/nodes/{node}"),
             (Method::POST, "/projects/{id}/workflows/adopt"),
+            // The only routes that write into the library every project reads its workflows from.
+            (Method::POST, "/workflows/{name}/publish"),
+            (Method::POST, "/projects/{id}/workflows/{name}/publish"),
             // Reads a path nobody has vouched for — see `detect.rs`. Default-deny leaves it to the
             // key of the person sitting at the machine, which is the only one that should be able
             // to point this daemon at an arbitrary folder.

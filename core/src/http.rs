@@ -9102,6 +9102,146 @@ mod tests {
         assert_eq!(body["refusal"], "not_installed");
     }
 
+    /// Publishing adds a version to the library from another version, and a version that exists is
+    /// never replaced: the second attempt is a conflict that leaves the first one's bytes alone.
+    #[tokio::test]
+    async fn publishing_from_the_library_creates_a_version_and_never_replaces_one() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library.clone());
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/workflows/harness/publish",
+            Some(serde_json::json!({ "version": "1.1" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!((body["name"].as_str(), body["version"].as_str()), (Some("harness"), Some("1.1")));
+        assert!(library.join("harness/1.1/graph.yaml").is_file());
+
+        std::fs::write(library.join("harness/1.1/graph.yaml"), "# edited in place\n").unwrap();
+        for from in [serde_json::json!("1.0"), serde_json::Value::Null] {
+            let (status, body) = workflow_call(
+                state.clone(),
+                "POST",
+                "/workflows/harness/publish",
+                Some(serde_json::json!({ "from_version": from, "version": "1.1" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["refusal"], "already_published");
+        }
+        assert_eq!(
+            std::fs::read_to_string(library.join("harness/1.1/graph.yaml")).unwrap(),
+            "# edited in place\n"
+        );
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/workflows/harness/publish",
+            Some(serde_json::json!({ "from_version": "9.9", "version": "2.0" })),
+        )
+        .await;
+        assert_eq!((status, body["refusal"].as_str()), (StatusCode::NOT_FOUND, Some("no_such_bundle")));
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/workflows/harness/publish",
+            Some(serde_json::json!({ "version": "../escape" })),
+        )
+        .await;
+        assert_eq!((status, body["refusal"].as_str()), (StatusCode::UNPROCESSABLE_ENTITY, Some("bad_name")));
+        assert!(!library.join("escape").exists());
+    }
+
+    /// A project's ejected copy goes back to the library with its edits; a pinned-only workflow has
+    /// nothing of the project's to publish.
+    #[tokio::test]
+    async fn a_projects_ejected_copy_is_published_to_the_library_over_http() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library.clone());
+        let _home = with_project_home(&mut state);
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let publish = |version: &str| {
+            workflow_call(
+                state.clone(),
+                "POST",
+                "/projects/alpha/workflows/harness/publish",
+                Some(serde_json::json!({ "version": version })),
+            )
+        };
+
+        let (status, _) = publish("1.0.1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "not pinned yet");
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+        let (status, body) = publish("1.0.1").await;
+        assert_eq!((status, body["refusal"].as_str()), (StatusCode::CONFLICT, Some("not_ejected")));
+
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/eject",
+            None,
+        )
+        .await;
+        std::fs::write(
+            dir.path().join(".nucleos/workflows/harness/graph.yaml"),
+            "# mine now\n",
+        )
+        .unwrap();
+
+        let (status, body) = publish("1.0.1").await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["version"], "1.0.1");
+        assert_eq!(
+            std::fs::read_to_string(library.join("harness/1.0.1/graph.yaml")).unwrap(),
+            "# mine now\n"
+        );
+        let (status, body) = publish("1.0.1").await;
+        assert_eq!((status, body["refusal"].as_str()), (StatusCode::CONFLICT, Some("already_published")));
+        let (status, body) = publish("1.0").await;
+        assert_eq!((status, body["refusal"].as_str()), (StatusCode::CONFLICT, Some("already_published")));
+    }
+
+    /// Publishing writes into the library every project reads from, so the stop refuses it too.
+    #[tokio::test]
+    async fn nothing_is_published_while_the_stop_is_engaged() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        state.workflow_library = Some(library.clone());
+        let _home = with_project_home(&mut state);
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        for uri in [
+            "/workflows/harness/publish",
+            "/projects/alpha/workflows/harness/publish",
+        ] {
+            let (status, refused) = workflow_call(
+                state.clone(),
+                "POST",
+                uri,
+                Some(serde_json::json!({ "version": "2.0" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::LOCKED, "{uri}");
+            assert_eq!(refused["refusal"], "kill_switch");
+        }
+        assert!(!library.join("harness/2.0").exists());
+    }
+
     /// The stop stops these too, and that is the line `POST /commands` sits on the other side of.
     ///
     /// These put bytes in the project's own folder — one of them copies a whole tree in — which
