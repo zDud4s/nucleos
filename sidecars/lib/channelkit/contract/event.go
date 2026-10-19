@@ -98,13 +98,21 @@ type Message struct {
 // Event is an inbound event (an input shape: decode it strictly). At is kept as
 // the string that arrived (T5). The origin never travels in the body.
 type Event struct {
-	EventID      *string       `json:"event_id" kit:"required"`
-	At           *string       `json:"at,omitempty"`
-	Conversation *Conversation `json:"conversation" kit:"required"`
-	Sender       *Sender       `json:"sender" kit:"required"`
-	Type         *string       `json:"type" kit:"required"`
-	Message      *Message      `json:"message,omitempty"`
-	// B11b adds `Action *ActionPayload` here.
+	EventID      *string        `json:"event_id" kit:"required"`
+	At           *string        `json:"at,omitempty"`
+	Conversation *Conversation  `json:"conversation" kit:"required"`
+	Sender       *Sender        `json:"sender" kit:"required"`
+	Type         *string        `json:"type" kit:"required"`
+	Message      *Message       `json:"message,omitempty"`
+	Action       *ActionPayload `json:"action,omitempty"`
+}
+
+// ActionPayload is the payload of a type:action event: a button press. Token is
+// the opaque button token the adapter received from the core.
+type ActionPayload struct {
+	Ref        *string `json:"ref" kit:"required"`
+	MessageRef *string `json:"message_ref" kit:"required"`
+	Token      *string `json:"token" kit:"required"`
 }
 
 // Validate runs the second stage: grammars, per-type rules and the type-specific
@@ -130,7 +138,8 @@ func (e *Event) Validate() *Error {
 	switch *e.Type {
 	case eventTypeMessage:
 		return e.validateMessage()
-	// B11b: `case eventTypeAction: return e.validateAction()`.
+	case eventTypeAction:
+		return e.validateAction()
 	default:
 		return errOneOf("/type")
 	}
@@ -163,8 +172,10 @@ func (s *Sender) validate(at string) *Error {
 }
 
 func (e *Event) validateMessage() *Error {
-	// A message event carries no payload of another type (B11b adds the action
-	// payload to this check).
+	// A message event carries no payload of another type.
+	if e.Action != nil {
+		return errForbidden("/action")
+	}
 	m := e.Message
 	if m == nil {
 		return errRequiredIf("/message")
@@ -186,6 +197,24 @@ func (e *Event) validateMessage() *Error {
 		}
 	}
 	return nil
+}
+
+func (e *Event) validateAction() *Error {
+	// An action event carries no message.
+	if e.Message != nil {
+		return errForbidden("/message")
+	}
+	a := e.Action
+	if a == nil {
+		return errRequiredIf("/action")
+	}
+	if err := checkRef(*a.Ref, "/action/ref"); err != nil {
+		return err
+	}
+	if err := checkRef(*a.MessageRef, "/action/message_ref"); err != nil {
+		return err
+	}
+	return checkAdapterToken(*a.Token, "/action/token")
 }
 
 // validate applies the per-type rules of an inbound part.
