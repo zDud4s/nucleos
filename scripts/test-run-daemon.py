@@ -9,7 +9,8 @@ staged copy must be complete and leave the source alone, a running copy must nev
 and a bad argument must be refused before anything is made.
 
 Temp directories and fake executables only -- cargo is never invoked (every case passes
--TargetDir with -NoBuild) and nucleos-core.exe is never run. Windows PowerShell only.
+-TargetDir with -NoBuild) and nucleos-core.exe is never run; a live holder is a copy of cmd.exe
+under that name. Windows PowerShell only.
 
 Run:  python scripts/test-run-daemon.py
 """
@@ -82,6 +83,56 @@ def test_a_run_dir_exe_in_use_is_refused_and_left_alone():
         assert held.read_bytes() == b"fake nucleos-core", "the run dir file changed"
 
 
+def hold_with_process(run_dir: Path, *args: str) -> subprocess.Popen:
+    """Run a copy of cmd.exe as run_dir/nucleos-core.exe, idle on its stdin, so the image is held
+    the way a live process holds it -- with a command line that carries `args`."""
+    exe = run_dir / "nucleos-core.exe"
+    shutil.copyfile(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "cmd.exe", exe)
+    return subprocess.Popen(
+        [str(exe), "/d", "/k", "rem", *args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def test_mcp_tool_servers_holding_the_copy_are_not_called_the_daemon():
+    with tempfile.TemporaryDirectory() as tmp:
+        # Long form: the 8.3 temp path a process reports would not match the run dir listing.
+        base = Path(tmp).resolve()
+        target = fake_target(base)
+        run_dir = base / "run"
+        run_dir.mkdir()
+        tools = hold_with_process(run_dir, "--mcp-tools")
+        try:
+            done = run("-TargetDir", str(target), "-RunDir", str(run_dir), "-NoBuild", "-NoStart")
+        finally:
+            tools.kill()
+            tools.wait()
+        assert done.returncode == 3, (done.returncode, done.stdout, done.stderr)
+        assert "the daemon is not running" in done.stderr, done.stderr
+        assert "--mcp-tools" in done.stderr, done.stderr
+        assert f"Stop-Process -Id {tools.pid}" in done.stderr, done.stderr
+
+
+def test_a_daemon_holding_the_copy_is_named_by_pid():
+    with tempfile.TemporaryDirectory() as tmp:
+        # Long form: the 8.3 temp path a process reports would not match the run dir listing.
+        base = Path(tmp).resolve()
+        target = fake_target(base)
+        run_dir = base / "run"
+        run_dir.mkdir()
+        daemon = hold_with_process(run_dir)
+        try:
+            done = run("-TargetDir", str(target), "-RunDir", str(run_dir), "-NoBuild", "-NoStart")
+        finally:
+            daemon.kill()
+            daemon.wait()
+        assert done.returncode == 3, (done.returncode, done.stdout, done.stderr)
+        assert "the daemon is running" in done.stderr, done.stderr
+        assert f"pid {daemon.pid}" in done.stderr, done.stderr
+
+
 def test_a_relative_or_nested_run_dir_is_refused_before_anything_is_made():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
@@ -128,6 +179,8 @@ def test_a_busy_port_is_refused_before_staging():
 
 test_staging_copies_the_daemon_and_every_sidecar_and_touches_no_source()
 test_a_run_dir_exe_in_use_is_refused_and_left_alone()
+test_mcp_tool_servers_holding_the_copy_are_not_called_the_daemon()
+test_a_daemon_holding_the_copy_is_named_by_pid()
 test_a_relative_or_nested_run_dir_is_refused_before_anything_is_made()
 test_a_missing_build_output_is_named()
 test_a_busy_port_is_refused_before_staging()
