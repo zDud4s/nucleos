@@ -14347,6 +14347,12 @@ mod tests {
             crate::config::EFFORT_LEVELS.len()
         );
         assert!(body["configured"].is_string());
+        // Always present, so the window can tell "no problem" from "an older daemon". Null here:
+        // tests never read a real models file, and an absent one is the defaults, not a fault.
+        assert!(
+            body.get("config_problem").is_some_and(|v| v.is_null()),
+            "config_problem must be an explicit null when nothing is wrong: {body}"
+        );
     }
 
     /// The agents' `latest_models` read: both vendors by default, one on request, a 400 naming the

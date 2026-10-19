@@ -583,6 +583,19 @@ export interface AssistantModels {
    * own `efforts` is what the picker draws.
    */
   efforts: string[];
+  /**
+   * Why `nucleos-models.yaml` is not the file in force: it would not parse, so the daemon is
+   * serving the last good copy (`last_good`) or the built-in catalogue (`defaults`). `null` when
+   * the file is fine or absent; absent from an older daemon.
+   */
+  config_problem?: ModelsConfigProblem | null;
+}
+
+/** `config_problem` of `GET /assistant/models`. */
+export interface ModelsConfigProblem {
+  path: string;
+  error: string;
+  using: "last_good" | "defaults";
 }
 
 /* ------------------------------------------------------------------ reads -- */

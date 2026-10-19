@@ -604,6 +604,10 @@ pub(super) async fn get_assistant_models(
         // installed model carries no effort levels of its own, `effort_levels()` keeps calling the
         // sync `catalogue()`, and there is nothing for the network read to add here.
         "efforts": config.effort_levels(),
+        // Why `nucleos-models.yaml` is not the file in force, or null. A typo on the first load
+        // serves the built-in catalogue, and the log line alone leaves the owner wondering where
+        // their local model went. Read after `menu()` above, which is what refreshes it.
+        "config_problem": crate::config::models_config_problem(),
     }))
 }
 

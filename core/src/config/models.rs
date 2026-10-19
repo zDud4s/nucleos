@@ -260,10 +260,59 @@ pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
 /// when its length or modification time moved.
 pub fn models_config_now() -> ModelsConfig {
     static CACHE: std::sync::Mutex<Option<ModelsConfigCache>> = std::sync::Mutex::new(None);
-    match models_config_path() {
+    let (config, problem) = match models_config_path() {
         Some(path) => cached_models_config(&path, &CACHE),
-        None => ModelsConfig::default(),
+        None => (ModelsConfig::default(), None),
+    };
+    if let Ok(mut slot) = MODELS_CONFIG_PROBLEM.lock() {
+        *slot = problem;
     }
+    config
+}
+
+/// Why the models file in force is not the one on disk, or `None` when it is.
+///
+/// The log line a failed load writes is the only trace of it otherwise, and nobody reads the
+/// daemon's log while wondering why the picker offers Opus, Sonnet and Fable and not the local
+/// model they configured. This is what `GET /assistant/models` hands the window so it can say so.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelsConfigProblem {
+    /// The file that would not load.
+    pub path: String,
+    /// The parse or read error, as the loader worded it.
+    pub error: String,
+    /// What applies instead: `last_good` when an earlier parse of this daemon is still in force,
+    /// `defaults` when the daemon never saw a good one and the built-in catalogue is serving.
+    pub using: &'static str,
+}
+
+impl ModelsConfigProblem {
+    fn new(error: &std::io::Error, path: &Path, kept_last_good: bool) -> Self {
+        Self {
+            path: path.display().to_string(),
+            error: error.to_string(),
+            using: if kept_last_good {
+                "last_good"
+            } else {
+                "defaults"
+            },
+        }
+    }
+}
+
+/// The problem the most recent [`models_config_now`] ran into, if it ran into one.
+///
+/// Updated by every call to [`models_config_now`] and so only as current as the last one; the
+/// route that reports it calls that first, through the menu it builds.
+static MODELS_CONFIG_PROBLEM: std::sync::Mutex<Option<ModelsConfigProblem>> =
+    std::sync::Mutex::new(None);
+
+/// See [`ModelsConfigProblem`].
+pub fn models_config_problem() -> Option<ModelsConfigProblem> {
+    MODELS_CONFIG_PROBLEM
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
 }
 
 /// A parsed file and the (path, length, mtime) it was parsed at.
@@ -276,13 +325,14 @@ struct ModelsConfigCache {
 
 /// The stat-checked read behind [`models_config_now`]. A missing (or unstat-able) file answers the
 /// default. A failed read or parse answers the last good configuration (the default if there is
-/// none) and is never cached as a hit, so the next call tries again.
+/// none) together with the [`ModelsConfigProblem`] that explains it, and is never cached as a hit,
+/// so the next call tries again.
 fn cached_models_config(
     path: &Path,
     cache: &std::sync::Mutex<Option<ModelsConfigCache>>,
-) -> ModelsConfig {
+) -> (ModelsConfig, Option<ModelsConfigProblem>) {
     let Ok(meta) = std::fs::metadata(path) else {
-        return ModelsConfig::default();
+        return (ModelsConfig::default(), None);
     };
     let (len, modified) = (meta.len(), meta.modified().ok());
     if let Ok(guard) = cache.lock()
@@ -290,7 +340,7 @@ fn cached_models_config(
             hit.path == path && hit.len == len && modified.is_some() && hit.modified == modified
         })
     {
-        return hit.config.clone();
+        return (hit.config.clone(), None);
     }
     let loaded = load_models_config(path);
     let ok = loaded.is_ok();
@@ -298,6 +348,10 @@ fn cached_models_config(
         .lock()
         .ok()
         .and_then(|guard| guard.as_ref().map(|hit| hit.config.clone()));
+    let problem = loaded
+        .as_ref()
+        .err()
+        .map(|error| ModelsConfigProblem::new(error, path, last_good.is_some()));
     let config = resolve_models_config(loaded, &mut last_good, path);
     if ok && let Ok(mut guard) = cache.lock() {
         *guard = Some(ModelsConfigCache {
@@ -307,7 +361,7 @@ fn cached_models_config(
             config: config.clone(),
         });
     }
-    config
+    (config, problem)
 }
 
 /// The decision inside [`models_config_now`], apart from the file and the static so a test can drive it.
@@ -1187,9 +1241,9 @@ codex_model: gpt-a
 ",
         )
         .unwrap();
-        let first = cached_models_config(&path, &cache);
+        let first = cached_models_config(&path, &cache).0;
         assert_eq!(first.claude_model, "opus");
-        assert_eq!(cached_models_config(&path, &cache), first);
+        assert_eq!(cached_models_config(&path, &cache).0, first);
 
         // A different length, so the check holds even on a coarse-mtime filesystem.
         std::fs::write(
@@ -1200,7 +1254,7 @@ codex_model: gpt-a
         )
         .unwrap();
         assert_eq!(
-            cached_models_config(&path, &cache).claude_model,
+            cached_models_config(&path, &cache).0.claude_model,
             "sonnet-long"
         );
     }
@@ -1211,7 +1265,10 @@ codex_model: gpt-a
         let path = dir.path().join(MODELS_CONFIG_FILE);
         let cache = std::sync::Mutex::new(None);
 
-        assert_eq!(cached_models_config(&path, &cache), ModelsConfig::default());
+        assert_eq!(
+            cached_models_config(&path, &cache).0,
+            ModelsConfig::default()
+        );
 
         std::fs::write(
             &path,
@@ -1219,7 +1276,58 @@ codex_model: gpt-a
 ",
         )
         .unwrap();
-        assert_eq!(cached_models_config(&path, &cache), ModelsConfig::default());
+        assert_eq!(
+            cached_models_config(&path, &cache).0,
+            ModelsConfig::default()
+        );
         assert!(cache.lock().unwrap().is_none());
+    }
+
+    /// The log line is not enough: a typo on the first load serves the built-in catalogue, and
+    /// that has to be visible where the picker is, not only in a file nobody has open.
+    #[test]
+    fn a_bad_first_load_reports_a_problem_that_says_defaults_are_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_CONFIG_FILE);
+        let cache = std::sync::Mutex::new(None);
+
+        let (_, absent) = cached_models_config(&path, &cache);
+        assert_eq!(absent, None, "an absent file is the defaults, not a fault");
+
+        std::fs::write(&path, "claude_model: [not, a, string
+").unwrap();
+        let (config, problem) = cached_models_config(&path, &cache);
+        assert_eq!(config, ModelsConfig::default());
+        let problem = problem.expect("a file that will not parse must be reported");
+        assert_eq!(problem.using, "defaults");
+        assert_eq!(problem.path, path.display().to_string());
+        assert!(!problem.error.is_empty());
+    }
+
+    #[test]
+    fn a_bad_reload_reports_last_good_and_a_fixed_file_clears_the_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_CONFIG_FILE);
+        let cache = std::sync::Mutex::new(None);
+
+        std::fs::write(&path, "claude_model: opus
+codex_model: gpt-a
+").unwrap();
+        let (good, problem) = cached_models_config(&path, &cache);
+        assert_eq!(problem, None);
+
+        // A different length, so the stat check sees the change on a coarse-mtime filesystem.
+        std::fs::write(&path, "claude_model: [broken, and, longer
+").unwrap();
+        let (kept, problem) = cached_models_config(&path, &cache);
+        assert_eq!(kept, good);
+        assert_eq!(problem.expect("reported").using, "last_good");
+
+        std::fs::write(&path, "claude_model: sonnet-fixed
+codex_model: gpt-a
+").unwrap();
+        let (fixed, problem) = cached_models_config(&path, &cache);
+        assert_eq!(fixed.claude_model, "sonnet-fixed");
+        assert_eq!(problem, None);
     }
 }
