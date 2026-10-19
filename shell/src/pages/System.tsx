@@ -27,6 +27,7 @@ import {
   useSetBudget,
   useSetQuotaBrake,
   useSidecars,
+  useStageCompaction,
   useStageRestore,
   useStorage,
   useSystemHealth,
@@ -1083,11 +1084,13 @@ function BackupsView() {
  * What the database and the folders beside it occupy.
  *
  * A folder the daemon could not measure in time arrives as `null` and reads as an em dash with its
- * reason, never as zero. The reclaimable bar is the pages the file keeps after deletes: informative
- * only, since nothing here compacts it.
+ * reason, never as zero. The reclaimable bar is the pages the file keeps after deletes. Giving them
+ * back is a button, and only ever a button: nothing here suggests it. It schedules the compaction
+ * for the next start, which is why the note beside it says that start takes longer.
  */
 function SpacePanel() {
   const storage = useStorage();
+  const stageCompaction = useStageCompaction();
   const space = storage.data;
   const unmeasured = "not measured in time";
 
@@ -1145,9 +1148,49 @@ function SpacePanel() {
               </>
             )}
           </p>
+          {space.compaction_pending ? (
+            <p className="sy-space-notes" role="status">
+              Compaction is scheduled: the {DAEMON_NAME} rewrites the database when it next starts,
+              and that start takes longer.
+            </p>
+          ) : (
+            <div className="sy-space-compact">
+              <ConfirmButton
+                label="Compact on next start"
+                confirmLabel="Compact when it next starts"
+                sayAs={`Rewrite the database on the next start to give back ${formatBytes(space.reclaimable_bytes)}`}
+                variant="ghost"
+                disabled={stageCompaction.isPending}
+                onConfirm={() => stageCompaction.mutate()}
+              />
+              <p className="sy-space-notes">
+                Gives back about {formatBytes(space.reclaimable_bytes)}. The next start takes longer
+                while the file is rewritten, and a copy is kept first.
+              </p>
+              {stageCompaction.isError && <CompactionError error={stageCompaction.error} />}
+            </div>
+          )}
         </>
       )}
     </Panel>
+  );
+}
+
+function CompactionError({ error }: { error: unknown }) {
+  if (isApiRefusal(error)) {
+    return (
+      <RefusalNote
+        refusal={error}
+        sentences={{
+          conflict: "a restore is pending — compact after it has been applied",
+        }}
+      />
+    );
+  }
+  return (
+    <ErrorNote>
+      the compaction could not be scheduled — the {DAEMON_NAME} is not responding
+    </ErrorNote>
   );
 }
 

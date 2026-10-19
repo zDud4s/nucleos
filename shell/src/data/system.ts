@@ -583,6 +583,13 @@ export interface StorageReport {
   loose_bytes: number;
   /** When the newest automatic backup was taken (ISO instant); `null` when none exists. */
   auto_backup_last: string | null;
+  /** A compaction is scheduled for the next start (`POST /system/storage/compact`). */
+  compaction_pending: boolean;
+}
+
+/** What scheduling a compaction answers — the daemon's own sentence about when it happens. */
+export interface StagedCompaction {
+  applies: string;
 }
 
 /** The "Space" panel's reading — `GET /system/storage`. */
@@ -591,6 +598,26 @@ export function useStorage() {
     queryKey: keys.system.storage,
     queryFn: () => apiFetch<StorageReport>("/system/storage"),
     refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * Schedule a compaction (`VACUUM`) of the database for the next start.
+ *
+ * `POST /system/storage/compact`, no body. Nothing shrinks now: the daemon leaves a marker and
+ * does the work before it opens the database, so the next start takes longer. The daemon
+ * answers 409 while a restore is pending. The storage reading is refetched so the panel says
+ * "scheduled" from the daemon's own state rather than from this call having returned.
+ */
+export function useStageCompaction() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<StagedCompaction>("/system/storage/compact", { method: "POST" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.storage });
+    },
   });
 }
 

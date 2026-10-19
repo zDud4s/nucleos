@@ -2937,6 +2937,7 @@ const STORAGE: StorageReport = {
   logs_bytes: 8_388_608,
   loose_bytes: 0,
   auto_backup_last: ago(DAY + 7 * HOUR),
+  compaction_pending: false,
 };
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
@@ -3408,6 +3409,11 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/sidecars" && init?.method === undefined) return SIDECARS;
   if (path === "/backups" && init?.method === undefined) return BACKUPS;
   if (path === "/system/storage") return STORAGE;
+  // Stateless like every other write here: the panel photographed after a press would otherwise
+  // depend on which shots ran before it.
+  if (path === "/system/storage/compact" && init?.method === "POST") {
+    return { applies: "on next daemon start" };
+  }
   if (path === "/pii/observations") return PII;
   if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;

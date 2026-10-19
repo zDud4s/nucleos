@@ -652,6 +652,21 @@
   color: var(--text-muted);
 }
 
+/* The compact button and its note: the note wraps beside the button, then under it when narrow. */
+.sy-space-compact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.sy-space-compact .sy-space-notes {
+  margin: 0;
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
 /* The marker is part of the clipped name cell, but not faint: it is the one fact the prefix of the
    file name carried, said in words. */
 .sy-backup-kind {

@@ -210,6 +210,7 @@ function systemFetch(
   opts: {
     onRestore?: (name: string) => unknown;
     onRestart?: (name: string) => unknown;
+    onCompact?: () => unknown;
     onMint?: (mint: { name: string; level: ApiTokenLevel }) => unknown;
   } = {},
 ): (path: string, init?: RequestInit) => Promise<unknown> {
@@ -266,6 +267,11 @@ function systemFetch(
         };
         world.backups = [...world.backups, created];
         return created;
+      }
+      if (path === "/system/storage/compact") {
+        if (opts.onCompact !== undefined) return opts.onCompact();
+        if (world.storage !== undefined) world.storage = { ...world.storage, compaction_pending: true };
+        return { applies: "on next daemon start" };
       }
       const restoreMatch = /^\/backups\/([^/]+)\/restore$/.exec(path);
       if (restoreMatch !== null) {
@@ -1077,6 +1083,7 @@ describe("System - backups", () => {
         logs_bytes: 8 * 1024 * 1024,
         loose_bytes: 2 * 1024 * 1024,
         auto_backup_last: "2026-10-19T03:00:00Z",
+        compaction_pending: false,
       },
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
@@ -1096,6 +1103,75 @@ describe("System - backups", () => {
     expect(files?.textContent).toMatch(/not measured in time/);
     expect(files?.textContent).not.toMatch(/0 B/);
     expect(screen.getByText(/2\.0 MB of old database copies/)).toBeTruthy();
+  });
+
+  const storageReading: StorageReport = {
+    db_bytes: 440 * 1024 * 1024,
+    wal_bytes: 4 * 1024 * 1024,
+    page_size: 4096,
+    page_count: 112_640,
+    freelist_count: 4_864,
+    reclaimable_bytes: 19 * 1024 * 1024,
+    backups_bytes: 90 * 1024 * 1024,
+    files_bytes: 10 * 1024 * 1024,
+    logs_bytes: 8 * 1024 * 1024,
+    loose_bytes: 0,
+    auto_backup_last: null,
+    compaction_pending: false,
+  };
+
+  it("schedules a compaction for the next start and then says it is scheduled", async () => {
+    const world = systemWorld({ storage: storageReading });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/backups");
+
+    const button = await screen.findByRole("button", { name: "Compact on next start" });
+    // The cost is said before the press, not after it.
+    expect(screen.getByText(/Gives back about 19\.0 MB/)).toBeTruthy();
+    expect(screen.getByText(/next start takes longer/)).toBeTruthy();
+
+    fireEvent.click(button);
+    await afterDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Compact when it next starts" }));
+
+    expect(await screen.findByText(/Compaction is scheduled/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Compact on next start" })).toBeNull();
+    const posts = daemon.apiFetch.mock.calls.filter(([path]) => path === "/system/storage/compact");
+    expect(posts).toHaveLength(1);
+    expect((posts[0][1] as RequestInit).method).toBe("POST");
+  });
+
+  it("shows a compaction already scheduled without offering the button again", async () => {
+    const world = systemWorld({ storage: { ...storageReading, compaction_pending: true } });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/backups");
+
+    expect(await screen.findByText(/Compaction is scheduled/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Compact on next start" })).toBeNull();
+  });
+
+  it("says a restore is pending when the daemon refuses to compact with 409", async () => {
+    const world = systemWorld({ storage: storageReading });
+    daemon.apiFetch.mockImplementation(
+      systemFetch(world, {
+        onCompact: () => {
+          throw new ApiRefusal(409, "conflict", "conflict");
+        },
+      }),
+    );
+
+    await renderSystemAt("/system/backups");
+
+    fireEvent.click(await screen.findByRole("button", { name: "Compact on next start" }));
+    await afterDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Compact when it next starts" }));
+
+    expect(
+      await screen.findByText("a restore is pending — compact after it has been applied"),
+    ).toBeDefined();
+    expect(screen.getByRole("button", { name: "Compact on next start" })).toBeDefined();
   });
 
   it("marks an automatic backup in the list", async () => {
