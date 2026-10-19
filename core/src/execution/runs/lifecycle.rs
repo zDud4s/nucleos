@@ -552,6 +552,47 @@ pub async fn prune_transcripts(
 /// otherwise never reach a sweep at all — the lesson `triage::run_triage_loop` already learned.
 pub(super) const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// The retention loop's weekly database copy: takes one when the newest `auto-` copy is older than
+/// [`crate::backup::AUTO_INTERVAL`] (or there is none) and says so in the feed.
+///
+/// A failure is a `warn!` every time but a `backup_failed` feed line only when it starts: the loop
+/// runs hourly and a full disk would otherwise write 24 identical lines a day. `failing` carries
+/// "the last attempt failed" between ticks, and the next success clears it.
+pub(super) async fn run_auto_backup_step(
+    pool: &sqlx::SqlitePool,
+    now: chrono::DateTime<chrono::Utc>,
+    failing: &mut bool,
+) {
+    match crate::backup::take_auto_backup_if_due(pool, crate::backup::AUTO_RETENTION, now).await {
+        Ok(None) => {}
+        Ok(Some(info)) => {
+            *failing = false;
+            tracing::info!(name = %info.name, size_bytes = info.size_bytes, "backup: automatic copy taken");
+            let summary = format!(
+                "automatic backup taken: {} ({} bytes)",
+                info.name, info.size_bytes
+            );
+            if let Err(error) =
+                crate::feed::append(pool, None, "backup_taken", &summary, None, None).await
+            {
+                tracing::warn!(%error, "backup: could not record the automatic copy in the feed");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "backup: automatic copy failed");
+            if !*failing {
+                *failing = true;
+                let summary = format!("automatic backup failed: {error}");
+                if let Err(error) =
+                    crate::feed::append(pool, None, "backup_failed", &summary, None, None).await
+                {
+                    tracing::warn!(%error, "backup: could not record the failed automatic copy in the feed");
+                }
+            }
+        }
+    }
+}
+
 /// Retention for everything finished work leaves behind: a run's transcript and events, its
 /// entries in the activity feed, councils that are over, queued VCS output tails, and briefing
 /// traces. The sixth sweep consolidates durable gate and refused-action histories on its own
@@ -561,12 +602,20 @@ pub(super) const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::
 /// them would mean six tasks waking on the same hour to take the same write lock. Every failure
 /// is best-effort and logged: a sweep that could not run is a fuller disk later, not a reason to
 /// take a daemon down now.
-pub async fn run_retention_loop(state: AppState) {
+///
+/// `auto_backup` switches on the weekly database copy, the one step here that writes outside the
+/// database. Only the primary daemon asks for it: a secondary instance (a test daemon on its own
+/// data directory) has no business filling the disk with snapshots of a throwaway database.
+pub async fn run_retention_loop(state: AppState, auto_backup: bool) {
     let mut ticker = tokio::time::interval(RETENTION_INTERVAL);
     let mut last_consolidated: Option<std::time::Instant> = None;
+    let mut backup_failing = false;
     loop {
         ticker.tick().await;
         let now = chrono::Utc::now();
+        if auto_backup {
+            run_auto_backup_step(&state.pool, now, &mut backup_failing).await;
+        }
         match prune_transcripts(&state.pool, transcript_retention_days(), now).await {
             Ok(pruned) if pruned == PrunedTranscripts::default() => {}
             Ok(pruned) => tracing::info!(
@@ -635,6 +684,13 @@ pub async fn run_retention_loop(state: AppState) {
                 ),
                 Err(error) => tracing::warn!(%error, "consolidate: pass failed"),
             }
+        }
+        // Last, so the pass's deletes are in the file before the log is folded back into it.
+        // Best-effort: a reader holding the log open just means the next hour tries again.
+        match crate::storage::truncate_wal(&state.pool).await {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!("storage: WAL checkpoint skipped, a reader is active"),
+            Err(error) => tracing::warn!(%error, "storage: WAL checkpoint failed"),
         }
     }
 }

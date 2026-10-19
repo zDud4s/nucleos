@@ -32,6 +32,7 @@ import type {
   Proposal,
   QuotaBrakeView,
   SidecarState,
+  StorageReport,
 } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { NoteDetail, NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
@@ -2910,18 +2911,34 @@ const EMAIL_CONFIG = {
  * with one that predates version stamping so the "unknown" migration has a row to show on.
  */
 /** `backup.rs`'s file name for a snapshot taken `ms` ago — the stamp is what the page dates it by. */
-function snapshotName(ms: number, sequence = 0): string {
+function snapshotName(ms: number, sequence = 0, auto = false): string {
   const stamp = ago(ms).replace(/[-:]/g, "").replace(/\.\d+Z$/, "");
-  return `nucleos-${stamp}.000000000Z-${String(sequence).padStart(4, "0")}.db`;
+  return `${auto ? "auto-" : ""}nucleos-${stamp}.000000000Z-${String(sequence).padStart(4, "0")}.db`;
 }
 
 const BACKUPS: BackupInfo[] = [
-  { name: snapshotName(7 * HOUR), migration_version: 64, size_bytes: 18_874_368 },
-  { name: snapshotName(DAY + 7 * HOUR), migration_version: 64, size_bytes: 18_612_224 },
-  { name: snapshotName(2 * DAY + 2 * HOUR, 1), migration_version: 63, size_bytes: 18_350_080 },
-  { name: snapshotName(2 * DAY + 7 * HOUR), migration_version: 63, size_bytes: 18_087_936 },
-  { name: snapshotName(15 * DAY), migration_version: null, size_bytes: 15_204_352 },
+  { name: snapshotName(7 * HOUR), kind: "manual", migration_version: 64, size_bytes: 18_874_368 },
+  { name: snapshotName(DAY + 7 * HOUR, 0, true), kind: "auto", migration_version: 64, size_bytes: 18_612_224 },
+  { name: snapshotName(2 * DAY + 2 * HOUR, 1), kind: "manual", migration_version: 63, size_bytes: 18_350_080 },
+  { name: snapshotName(2 * DAY + 7 * HOUR), kind: "manual", migration_version: 63, size_bytes: 18_087_936 },
+  { name: snapshotName(15 * DAY), kind: "manual", migration_version: null, size_bytes: 15_204_352 },
 ];
+
+/** What the database and its folders occupy: a mostly-full file with some pages to give back. */
+const STORAGE: StorageReport = {
+  db_bytes: 440_401_920,
+  wal_bytes: 4_194_304,
+  page_size: 4096,
+  page_count: 107_520,
+  freelist_count: 4_650,
+  reclaimable_bytes: 19_046_400,
+  backups_bytes: 92_274_688,
+  files_bytes: 318_767_104,
+  logs_bytes: 8_388_608,
+  loose_bytes: 0,
+  auto_backup_last: ago(DAY + 7 * HOUR),
+  compaction_pending: false,
+};
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
 const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
@@ -3394,6 +3411,12 @@ export function answer(path: string, init?: RequestInit): unknown {
 
   if (path === "/sidecars" && init?.method === undefined) return SIDECARS;
   if (path === "/backups" && init?.method === undefined) return BACKUPS;
+  if (path === "/system/storage") return STORAGE;
+  // Stateless like every other write here: the panel photographed after a press would otherwise
+  // depend on which shots ran before it.
+  if (path === "/system/storage/compact" && init?.method === "POST") {
+    return { applies: "on next daemon start" };
+  }
   if (path === "/pii/observations") return PII;
   if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;

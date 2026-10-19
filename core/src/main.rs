@@ -95,6 +95,34 @@ async fn main() {
             "failed to apply pending database restore; continuing startup and retrying next start: {e}"
         ),
     }
+    // After the restore (which may replace the file) and before the pool opens (nothing else holds
+    // the file). Only an instance that owns its database applies it: the machine's daemon, or a
+    // secondary started with a data directory of its own. A secondary on the default data directory
+    // (port override only) shares the primary's file and leaves the marker for the primary's next
+    // start. A second unconfigured process on the same directory could still race, and SQLite's
+    // locks keep the file safe; no exclusive lock is taken here.
+    let owns_database = is_primary
+        || data_dir_override
+            .as_deref()
+            .is_some_and(|dir| !dir.is_empty());
+    if owns_database {
+        match backup::apply_pending_compaction(&db_path, health::available_space).await {
+            Ok(Some(compacted)) => tracing::warn!(
+                "compacted the database from {} to {} bytes; safety copy at {}",
+                compacted.before_bytes,
+                compacted.after_bytes,
+                compacted.safety_backup.display()
+            ),
+            Ok(None) => tracing::info!("no database compaction to apply"),
+            // `VACUUM` ran and the request is gone: nothing is retried, the owner has to act.
+            Err(e @ backup::BackupError::CompactionUnverified { .. }) => tracing::error!(
+                "database compaction finished but the result failed verification; continuing startup, not retrying: {e}"
+            ),
+            Err(e) => tracing::error!(
+                "failed to compact the database; continuing startup and retrying next start: {e}"
+            ),
+        }
+    }
     let pool = storage::open(&db_path)
         .await
         .expect("failed to open local database");
@@ -964,7 +992,11 @@ async fn main() {
     // `run_events`, and eventually its line in the feed. Nothing removed any of those, so all three
     // grew for as long as the daemon was ever used — and a transcript is stored twice and indexed a
     // third time, so they grew at three times the obvious rate.
-    tokio::spawn(execution::runs::run_retention_loop(state.clone()));
+    // The same loop takes the weekly database copy, on the primary instance only.
+    tokio::spawn(execution::runs::run_retention_loop(
+        state.clone(),
+        is_primary,
+    ));
     // Slot occupancy every minute, rolled into daily rows, for the analytics page's pressure
     // metric (spec analytics-pipeline §5.3). Its own loop: the retention loop is hourly and this
     // is per minute, and neither belongs on the slot acquire/release path.

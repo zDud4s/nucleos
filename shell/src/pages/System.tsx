@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
+import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
 import { NotchProviders } from "./NotchProviders";
 import {
@@ -26,7 +27,9 @@ import {
   useSetBudget,
   useSetQuotaBrake,
   useSidecars,
+  useStageCompaction,
   useStageRestore,
+  useStorage,
   useSystemHealth,
   useTakeBackup,
   useVoiceConfig,
@@ -60,7 +63,9 @@ import {
   Row,
   Rows,
   Section,
+  StatCard,
   StateBadge,
+  Meter,
 } from "../ui";
 import { MachineSettings } from "./MachineSettings";
 import { NotificationsView } from "./NotificationsView";
@@ -1066,21 +1071,148 @@ function BudgetPanel() {
 function BackupsView() {
   return (
     <div className="sy-backups-layout">
-      <BackupsPanel />
+      <div className="sy-backups-main">
+        <SpacePanel />
+        <BackupsPanel />
+      </div>
       <PiiObservations />
     </div>
   );
 }
 
 /**
+ * What the database and the folders beside it occupy.
+ *
+ * A folder the daemon could not measure in time arrives as `null` and reads as an em dash with its
+ * reason, never as zero. The reclaimable bar is the pages the file keeps after deletes. Giving them
+ * back is a button, and only ever a button: nothing here suggests it. It schedules the compaction
+ * for the next start, which is why the note beside it says that start takes longer.
+ */
+function SpacePanel() {
+  const storage = useStorage();
+  const stageCompaction = useStageCompaction();
+  const space = storage.data;
+  const unmeasured = "not measured in time";
+
+  return (
+    <Panel title="Space">
+      {storage.isError && space === undefined && (
+        <SystemListError error={storage.error} what="the space readout" />
+      )}
+      {!storage.isError && space === undefined && <Loading>reading the space used…</Loading>}
+      {space !== undefined && (
+        <>
+          <div className="sy-space-cards">
+            <StatCard
+              label="Database"
+              value={formatBytes(space.db_bytes)}
+              detail={`${formatBytes(space.wal_bytes)} write-ahead log`}
+              bar={
+                <Meter
+                  label="Reclaimable"
+                  value={space.reclaimable_bytes}
+                  ceiling={space.db_bytes}
+                  tone="quantity"
+                  format={formatBytes}
+                />
+              }
+            />
+            <StatCard
+              label="Backups"
+              value={space.backups_bytes === null ? undefined : formatBytes(space.backups_bytes)}
+              unread={unmeasured}
+            />
+            <StatCard
+              label="Files"
+              value={space.files_bytes === null ? undefined : formatBytes(space.files_bytes)}
+              unread={unmeasured}
+            />
+            <StatCard
+              label="Logs"
+              value={space.logs_bytes === null ? undefined : formatBytes(space.logs_bytes)}
+              unread={unmeasured}
+            />
+          </div>
+          <p className="sy-space-notes">
+            {space.auto_backup_last === null ? (
+              "No automatic backup has been taken yet."
+            ) : (
+              <>
+                Last automatic backup <RelativeTime at={space.auto_backup_last} />.
+              </>
+            )}
+            {space.loose_bytes > 0 && (
+              <>
+                {" "}
+                {formatBytes(space.loose_bytes)} of old database copies lie beside the database.
+              </>
+            )}
+          </p>
+          {space.compaction_pending ? (
+            <p className="sy-space-notes" role="status">
+              Compaction is scheduled: the {DAEMON_NAME} rewrites the database when it next starts,
+              and that start takes longer.
+            </p>
+          ) : (
+            <div className="sy-space-compact">
+              <ConfirmButton
+                label="Compact on next start"
+                confirmLabel="Compact when it next starts"
+                sayAs={`Rewrite the database on the next start to give back ${formatBytes(space.reclaimable_bytes)}`}
+                variant="ghost"
+                disabled={stageCompaction.isPending}
+                unavailable={space.reclaimable_bytes === 0}
+                describedBy="space-compact-note"
+                onConfirm={() => stageCompaction.mutate()}
+              />
+              <p className="sy-space-notes" id="space-compact-note">
+                {space.reclaimable_bytes === 0 ? (
+                  "Nothing to give back: the database has no free pages."
+                ) : (
+                  <>
+                    Gives back about {formatBytes(space.reclaimable_bytes)}. The next start takes
+                    longer while the file is rewritten. A safety copy of about{" "}
+                    {formatBytes(Math.max(space.db_bytes - space.reclaimable_bytes, 0))} stays in
+                    backups/ until the next compaction.
+                  </>
+                )}
+              </p>
+              {stageCompaction.isError && <CompactionError error={stageCompaction.error} />}
+            </div>
+          )}
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function CompactionError({ error }: { error: unknown }) {
+  if (isApiRefusal(error)) {
+    return (
+      <RefusalNote
+        refusal={error}
+        sentences={{
+          conflict: "a restore is pending — compact after it has been applied",
+        }}
+      />
+    );
+  }
+  return (
+    <ErrorNote>
+      the compaction could not be scheduled — the {DAEMON_NAME} is not responding
+    </ErrorNote>
+  );
+}
+
+/**
  * When a snapshot was taken, read back out of its name.
  *
- * `backup.rs` names every snapshot `nucleos-<UTC stamp>-<seq>.db`, and that stamp is the only
+ * `backup.rs` names every snapshot `[auto-]nucleos-<UTC stamp>-<seq>.db`, and that stamp is the only
  * time the listing carries. A name that does not fit the pattern answers `null` and the row
  * shows the name alone, rather than a date this page made up.
  */
 export function takenAt(name: string): string | null {
-  const match = /^nucleos-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(name);
+  const match = /^(?:auto-)?nucleos-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(name);
   if (match === null) return null;
   const [, year, month, day, hour, minute, second] = match;
   return `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
@@ -1158,6 +1290,7 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
       {/* The file name, faint: it is what the daemon calls it, and the date in front of it
           is the same fact made readable. Clipped, with the whole of it as the tooltip. */}
       <span className="sy-backup-name" title={backup.name}>
+        {backup.kind === "auto" && <span className="sy-backup-kind">automatic · </span>}
         {backup.name}
       </span>
       <span className="sy-backup-meta">{formatBytes(backup.size_bytes)}</span>
@@ -1207,13 +1340,6 @@ function RestoreError({ error }: { error: unknown }) {
       the restore could not be staged — the {DAEMON_NAME} is not responding
     </ErrorNote>
   );
-}
-
-/** Bytes, for a person — the same three-step scale `MailDetail.tsx` and `data/files.ts` use. */
-function formatBytes(size: number): string {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /* -------------------------------------------------------------------- pii -- */
