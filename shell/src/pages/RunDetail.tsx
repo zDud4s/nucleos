@@ -31,6 +31,7 @@ import {
   Quiet,
   RefusalNote,
   RunPipeline,
+  Section,
 } from "../ui";
 import { JudgeOpinionsBlock } from "./AutopilotJudge";
 import { readRunStream, type RunEvent } from "../lib/run-stream";
@@ -115,20 +116,18 @@ function KnownRun({ id }: { id: number }) {
   */
   const blocks = [
     <FactsPanel key="facts" run={detail} />,
-    <GateBlock key="gate" run={detail} />,
-    /* After the deterministic gate and before the output, which is the order a person
-       reads them in: what the suite said, then why the run ended, then what it printed
-       on the way. */
-    <StopBlock key="stop" id={id} alive={alive} />,
+    /* One panel for both answers to "how did this end": what the suite said, then why the
+       run stopped. Before the output, which is the order a person reads them in. */
+    <EndBlock key="end" run={detail} id={id} alive={alive} />,
     <RunTail key="tail" id={id} alive={alive} recorded={detail.stdout} />,
     <BriefingBlock key="briefing" id={id} />,
     <StdStreams key="streams" run={detail} />,
-    /* Last, not beside StopBlock: the live-run reorder below lifts block 3 by position. */
+    /* Last, not beside EndBlock: the live-run reorder below lifts block 2 by position. */
     <JudgeOpinionsBlock key="judge" runId={id} />,
   ];
   /* While the run is going, what it is writing right now is the only block on this page
      that is changing, and it was fourth. A live run is watched, not read. */
-  if (alive) blocks.unshift(...blocks.splice(3, 1));
+  if (alive) blocks.unshift(...blocks.splice(2, 1));
 
   return (
     <>
@@ -408,6 +407,28 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
+/* ------------------------------------------------------- how it ended -- */
+
+/**
+ * The two answers to "how did this end" in one panel, the suite's and the tool gate's.
+ *
+ * They were two panels in a row, and a failed run was read across both (and the exit code a
+ * third time in the strip above). The sub-headings keep the distinction the two names exist
+ * for: "Test gate" is a deterministic suite, "Why it stopped" is the daemon's own account.
+ * The second is silent while it loads or when it cannot be read, so the panel then holds the
+ * first alone.
+ */
+function EndBlock({ run, id, alive }: { run: Run; id: number; alive: boolean }) {
+  return (
+    <Panel title="How it ended">
+      <div className="runs-end">
+        <GateSection run={run} />
+        <StopSection id={id} alive={alive} />
+      </div>
+    </Panel>
+  );
+}
+
 /* ----------------------------------------------------------------- gate -- */
 
 /**
@@ -420,10 +441,10 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
  * never wrote a gate: a UI that shows their absent test suite as a failure is
  * telling them their code is broken on the evidence of nothing at all.
  */
-function GateBlock({ run }: { run: Run }) {
+function GateSection({ run }: { run: Run }) {
   const measured = run.gate_status !== null && run.gate_status.trim() !== "";
   return (
-    <Panel title="Test gate">
+    <Section label="Test gate" level={3}>
       {/* The VERDICT is the second instrument in the strip above — it is a reading, and a
           reading belongs where the other three are. What stays here is the evidence
           behind it, which is not a badge: the exit code, the sentence for a run nothing
@@ -444,7 +465,7 @@ function GateBlock({ run }: { run: Run }) {
       {run.gate_output !== null && run.gate_output !== "" && (
         <pre className="runs-pre">{run.gate_output}</pre>
       )}
-    </Panel>
+    </Section>
   );
 }
 
@@ -466,7 +487,7 @@ function GateBlock({ run }: { run: Run }) {
  * daemon sends `null` there rather than omitting the key, so an empty list and
  * "not applicable" stay distinguishable.
  */
-function StopBlock({ id, alive }: { id: number; alive: boolean }) {
+function StopSection({ id, alive }: { id: number; alive: boolean }) {
   const { data, isError } = useRunStop(id, alive);
 
   // Silent while it has not arrived and silent if it fails. This block is an
@@ -475,7 +496,7 @@ function StopBlock({ id, alive }: { id: number; alive: boolean }) {
   if (isError || !data) return null;
 
   return (
-    <Panel title="Why it stopped">
+    <Section label="Why it stopped" level={3}>
       <p className="runs-gate-line">{data.summary}</p>
 
       {/* §5.3. An empty list is the same shape whether the mode records nothing
@@ -513,7 +534,7 @@ function StopBlock({ id, alive }: { id: number; alive: boolean }) {
           ))}
         </>
       )}
-    </Panel>
+    </Section>
   );
 }
 

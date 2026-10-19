@@ -11,9 +11,11 @@ import { describe, expect, it } from "vitest";
  * queue. This test is the fence: a new page that borrows the phrase fails here
  * rather than in a screenshot nobody reads.
  *
- * Waiting.tsx keeps one match on purpose, scoped by the word "git" (an
- * `aria-label` that `getByRole("list", { name })` depends on), so the rule for
- * that file is "every match also says git".
+ * The Waiting page is Waiting.tsx plus its module directory waiting/. It keeps
+ * one match on purpose, scoped by the word "git" (an `aria-label` that
+ * `getByRole("list", { name })` depends on), so the rule for those files is
+ * "every match also says git". Other page sub-directories (files/, ...) are
+ * scanned too, so a split page cannot hide the phrase from the fence.
  */
 
 const moduleUrl = import.meta.url.startsWith("file:")
@@ -25,9 +27,9 @@ const pagesDir = `${repoRoot}shell/src/pages`;
 const PHRASE = /waiting on you/i;
 
 function pageSources(): Map<string, string> {
-  const names = readdirSync(pagesDir).filter(
-    (name) => name.endsWith(".tsx") && !name.endsWith(".test.tsx"),
-  );
+  const names = (readdirSync(pagesDir, { recursive: true }) as string[])
+    .map((name) => name.split("\\").join("/"))
+    .filter((name) => name.endsWith(".tsx") && !name.endsWith(".test.tsx"));
   expect(names.length, `no pages found under ${pagesDir}`).toBeGreaterThan(0);
   return new Map(
     names.map((name) => [name, readFileSync(`${pagesDir}/${name}`, "utf8")]),
@@ -37,27 +39,30 @@ function pageSources(): Map<string, string> {
 describe("the bare phrase 'waiting on you'", () => {
   it("one page owns the bare phrase", () => {
     const sources = pageSources();
+    const isWaitingPage = (name: string) =>
+      name === "Waiting.tsx" || name.startsWith("waiting/");
     const matching = [...sources]
       .filter(([, source]) =>
         source.split(/\r?\n/).some((line) => PHRASE.test(line)),
       )
-      .map(([name]) => name)
+      .map(([name]) => (isWaitingPage(name) ? "Waiting page" : name))
+      .filter((name, i, all) => all.indexOf(name) === i)
       .sort();
 
-    expect(matching).toEqual(["Home.tsx", "Waiting.tsx"]);
+    expect(matching).toEqual(["Home.tsx", "Waiting page"]);
 
     const home = sources.get("Home.tsx")!;
     expect(
       home.split(/\r?\n/).filter((line) => PHRASE.test(line)).length,
     ).toBeGreaterThan(0);
 
-    const waitingLines = sources
-      .get("Waiting.tsx")!
-      .split(/\r?\n/)
+    const waitingLines = [...sources]
+      .filter(([name]) => isWaitingPage(name))
+      .flatMap(([, source]) => source.split(/\r?\n/))
       .filter((line) => PHRASE.test(line));
     expect(waitingLines.length).toBeGreaterThan(0);
     for (const line of waitingLines) {
-      expect(line, `unscoped phrase in Waiting.tsx: ${line.trim()}`).toMatch(
+      expect(line, `unscoped phrase on the Waiting page: ${line.trim()}`).toMatch(
         /git/i,
       );
     }

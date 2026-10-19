@@ -680,15 +680,17 @@ function ProjectColumn({
 /* ---------------------------------------------------------------- new job -- */
 
 /**
- * The New job panel, opened from the header.
+ * The New job drawer, opened from the header.
  *
  * One form for the page, where there used to be one in every column. Four copies of the same
  * five fields were the heaviest thing on a screen whose job is to say what is in flight, and the
  * refusal they could earn landed a thousand pixels from the column it was about. One panel, a
  * project select, and the refusal beside the button that caused it.
  *
- * Not a modal: asking for a job needs neither an interruption nor a trap for focus, and the
- * columns under it stay readable while somebody writes. It stays mounted while closed so a
+ * A drawer on the right edge (see `.fleet-compose`) rather than a block above the rack, so
+ * opening it does not push the rack and the columns down. Not a modal: asking for a job needs
+ * neither an interruption nor a trap for focus, and the columns under it stay readable while
+ * somebody writes. It stays mounted while closed so a
  * half-written prompt survives closing it, which is also what keeps the header button's
  * `aria-controls` pointing at something.
  */

@@ -9,7 +9,8 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { Waiting, conflictedFiles, gitNextStep } from "./Waiting";
+import { Waiting } from "./Waiting";
+import { conflictedFiles, gitNextStep } from "./waiting/GitQueue";
 import { ApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import { seatNonce } from "../data/seat";
