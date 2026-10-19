@@ -2151,6 +2151,10 @@
   .chats-composer,
   .chats-detail-inner > .chats-composer-box {
     padding-inline-end: var(--space-8);
+    /* The gutter is padding inside a border-box, so it came out of `--composer`'s own inset a second
+       time and the box shrank to ~2/3 of the column at 800. Adding it back to the ceiling lets the
+       box span the column like the empty state; the gutter stays, so Send is still clear of the dock. */
+    max-width: calc(var(--composer) + var(--space-8));
   }
 }
 
@@ -2192,6 +2196,14 @@
   max-width: var(--composer);
   width: 100%;
   margin-inline: auto;
+}
+
+/* Same compensation as the gutter media block above, repeated here because this rule comes later
+   and would otherwise win the cascade on `max-width`. */
+@media (max-width: 60rem) {
+  .chats-detail-inner > .chats-composer-box {
+    max-width: calc(var(--composer) + var(--space-8));
+  }
 }
 
 /**
@@ -2277,6 +2289,37 @@
    pushes the button clean out of the box. This rule went missing for one revision and that is
    exactly what happened: an unstyled block wrapper, a full-width textarea, and no microphone
    anywhere. No test here can catch it -- the suite renders without stylesheets. */
+/* On a narrow column the controls share the line with Send instead of wrapping: wrapping is decided
+   on each item's natural width, so an open conversation (model, effort, chips, permission) pushed
+   Send alone onto a second row while the empty state, with fewer controls, kept it in the corner.
+   No control is clipped: a button with a popover loses its chevron or icon when cut mid-way, so the
+   room comes from dropping whole low-value parts instead (the "Effort" word, keeping the value) and
+   from the one item that already ellipsizes by design, the dictation notice. Every other item keeps
+   its natural size. The usage-widget gutter on the composer is untouched. */
+@media (max-width: 60rem) {
+  .chats-composer-actions {
+    flex-wrap: nowrap;
+  }
+
+  .chats-composer-actions > :not(.chats-composer-gap):not(.chats-dictation-trouble) {
+    flex: none;
+  }
+
+  .chats-composer-actions > .chats-dictation-trouble {
+    flex: 0 1 auto;
+  }
+
+  .chats-composer-actions .chats-effort-name {
+    display: none;
+  }
+
+  /* The menus open from a trigger near the right edge: keep a margin so they never sit flush with
+     the viewport border (the width cap is already on `.chats-meta-menu`). */
+  .chats-meta-menu {
+    margin-inline-end: 1rem;
+  }
+}
+
 .chats-composer-line {
   display: flex;
   align-items: flex-start;
