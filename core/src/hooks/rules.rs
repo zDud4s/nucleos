@@ -31,6 +31,9 @@ pub struct PostToolUsePayload {
     // that only judges INTENT into a ledger that also knows the RESULT.
     #[serde(default)]
     pub tool_response: Value,
+    // Echoed by the hook so admission can return the grant it handed this call.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
     // The CLI's `hook_event_name`, echoed back so a success (`PostToolUse`) and a failure
     // (`PostToolUseFailure`) are told apart once they reach `shadow::record_outcome`, which stores
     // it verbatim in `outcome_event`. No `#[serde(default)]`: every real invocation of this hook
@@ -46,6 +49,17 @@ pub struct Decision {
     // differently — see below.
     pub decision: String,
     pub reason: String,
+}
+
+/// What `/hooks/pretooluse-decision` answers: a [`Decision`] and, optionally, a replacement tool
+/// input. The CLI reads `updatedInput` only on an allow. New answer fields go here, never on
+/// `Decision`, which is also what the rule walk and its tests read back.
+#[derive(Serialize)]
+pub struct PreToolUseAnswer {
+    #[serde(flatten)]
+    pub decision: Decision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_input: Option<Value>,
 }
 
 /// Spec B: what the hook already read about the run, as the resolver's request needs it. A struct

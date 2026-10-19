@@ -90,6 +90,10 @@ pub struct TimeoutPayload {
     pub silence_ceiling_seconds: i64,
     pub measured_from: &'static str,
     pub verdict: Verdict,
+    /// Seconds the run spent queued for heavy-command admission. They do not count toward the wall
+    /// clock, so the verdict's ceiling grows by this much; `wall_ceiling_seconds` stays the
+    /// configured one.
+    pub admission_wait_seconds: i64,
 }
 
 /// PURE: derives the timeout verdict from elapsed time and `mode` (spec §6).
@@ -105,6 +109,10 @@ pub struct TimeoutPayload {
 /// reached it either, and the wall clock is ruled out — `"silence"`. Once the majorant reaches or
 /// passes the wall ceiling, either clock could have fired, and nothing here can tell them apart —
 /// `"undetermined"`. There is no third case.
+///
+/// The wall ceiling is the configured one plus the time the run spent queued for admission (the
+/// wall clock does not charge that time); this function reports no wait (0), and
+/// [`RunStopResponse::with_admission_wait`] re-derives the verdict with the real one.
 pub fn derive_timeout_verdict(elapsed_seconds: i64, mode: &str) -> TimeoutPayload {
     let wall_ceiling_seconds =
         crate::execution::runs::run_timeout_for_mode(crate::state::DEFAULT_RUN_TIMEOUT, mode)
@@ -125,6 +133,7 @@ pub fn derive_timeout_verdict(elapsed_seconds: i64, mode: &str) -> TimeoutPayloa
         silence_ceiling_seconds,
         measured_from: MEASURED_FROM,
         verdict,
+        admission_wait_seconds: 0,
     }
 }
 
@@ -199,6 +208,23 @@ pub struct RunStopResponse {
     pub stderr_tail: Option<String>,
     /// `kind: superseded` only.
     pub successor_run_id: Option<i64>,
+}
+
+impl RunStopResponse {
+    /// Record the seconds this run waited in the heavy-command admission queue. Only a response
+    /// carrying a `timeout` changes: the wall ceiling the verdict compares against grows by the
+    /// wait, so `Silence` holds iff `elapsed_seconds < wall_ceiling_seconds + seconds`.
+    pub fn with_admission_wait(mut self, seconds: i64) -> Self {
+        if let Some(timeout) = self.timeout.as_mut() {
+            timeout.admission_wait_seconds = seconds;
+            timeout.verdict = if timeout.elapsed_seconds < timeout.wall_ceiling_seconds + seconds {
+                Verdict::Silence
+            } else {
+                Verdict::Undetermined
+            };
+        }
+        self
+    }
 }
 
 /// How much of a raw `tool_input` a [`GateDecisionView`] carries verbatim before it is cut (spec
@@ -448,6 +474,75 @@ mod tests {
                 "elapsed={elapsed_seconds} mode={mode}"
             );
         }
+    }
+
+    /// Queue time does not count toward the wall clock: an elapsed past the bare ceiling is still
+    /// `silence` when the run spent that surplus waiting for admission, and `undetermined` once the
+    /// elapsed passes the ceiling PLUS the wait.
+    #[test]
+    fn an_admission_wait_extends_the_wall_ceiling_for_the_verdict() {
+        let stopped = |elapsed_seconds: i64, wait: i64| {
+            build_response(
+                1,
+                "timed_out".to_owned(),
+                Kind::Timeout,
+                "real",
+                elapsed_seconds,
+                None,
+                None,
+                None,
+                Vec::new(),
+            )
+            .with_admission_wait(wait)
+            .timeout
+            .expect("a timeout stop carries the payload")
+        };
+
+        // Wall ceiling for "real" is 600s: 700s elapsed would be undetermined with no wait.
+        assert_eq!(stopped(700, 0).verdict, Verdict::Undetermined);
+        // 300s of that was queueing: the ceiling is 900s, 700s is under it.
+        assert_eq!(stopped(700, 300).verdict, Verdict::Silence);
+        // Exactly on the extended ceiling is "reached it", as for the bare ceiling.
+        assert_eq!(stopped(900, 300).verdict, Verdict::Undetermined);
+        assert_eq!(stopped(1000, 300).verdict, Verdict::Undetermined);
+    }
+
+    #[test]
+    fn the_admission_wait_is_reported_on_the_timeout_payload() {
+        let bare = derive_timeout_verdict(700, "real");
+        assert_eq!(bare.admission_wait_seconds, 0);
+
+        let response = build_response(
+            1,
+            "timed_out".to_owned(),
+            Kind::Timeout,
+            "real",
+            700,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .with_admission_wait(42);
+        let payload = response.timeout.expect("timeout payload");
+        assert_eq!(payload.admission_wait_seconds, 42);
+        // The wall ceiling field still reports the configured ceiling, not the extended one.
+        assert_eq!(payload.wall_ceiling_seconds, 600);
+
+        // A kind with no timeout payload is left untouched.
+        let failed = build_response(
+            2,
+            "failed".to_owned(),
+            Kind::Failed,
+            "real",
+            700,
+            Some(1),
+            None,
+            None,
+            Vec::new(),
+        )
+        .with_admission_wait(42);
+        assert!(failed.timeout.is_none());
     }
 
     #[test]

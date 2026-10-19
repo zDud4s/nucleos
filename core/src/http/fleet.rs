@@ -45,6 +45,10 @@ pub(super) fn routes() -> Router<AppState> {
         // because it answers about the same set — the roster — seen through capacity rather than
         // through mode.
         .route("/concurrency", get(get_concurrency))
+        // The heavy-command budget the runs and verify share: who holds it, who waits. Beside
+        // `/concurrency` because it is the same picture seen per command. Control/Admin by being in
+        // no table in `auth.rs`.
+        .route("/admission", get(get_admission))
         // A controller's wave asks here for the slots its workers will hold, keeps them by renewing,
         // and gives them back (perfil-de-velocidade spec §4.6). Beside `/concurrency` because they
         // spend what that route reads. Admin by default, by being in no table in `auth.rs`: taking
@@ -669,6 +673,29 @@ pub(super) async fn get_concurrency(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+/// The readout of the heavy-command admission book: `None` (none installed) answers a disabled
+/// readout with no capacity, so a caller never has to tell "off" from "absent".
+pub(super) fn admission_readout(
+    book: Option<&crate::execution::admission::AdmissionBook>,
+) -> crate::execution::admission::Snapshot {
+    match book {
+        Some(book) => book.snapshot(),
+        None => crate::execution::admission::Snapshot {
+            enabled: false,
+            capacity: 0,
+            used: 0,
+            verify_demand: false,
+            holders: Vec::new(),
+            waiters: Vec::new(),
+        },
+    }
+}
+
+pub(super) async fn get_admission() -> Json<crate::execution::admission::Snapshot> {
+    let book = crate::execution::admission::installed();
+    Json(admission_readout(book.as_deref()))
+}
+
 #[derive(Deserialize)]
 pub(super) struct WaveRequest {
     /// Where the controller stands. The project is resolved from it the way the session hook
@@ -746,5 +773,38 @@ pub(super) async fn delete_wave(
             tracing::warn!(wave_id = id, %error, "releasing a wave's slots failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::admission_readout;
+    use crate::execution::admission::{AdmissionBook, Poll};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn admission_readout_lists_holders_and_waiters() {
+        // A private book: the process-wide one is never installed by a test.
+        let book = AdmissionBook::new(1, Duration::from_secs(900), Duration::from_secs(7200));
+        assert!(matches!(
+            book.request(1, "holder", 1),
+            Poll::Granted { weight: 1 }
+        ));
+        assert!(matches!(book.request(2, "waiter", 1), Poll::Waiting { .. }));
+
+        let readout = admission_readout(Some(&book));
+        assert!(readout.enabled);
+        assert_eq!(readout.capacity, 1);
+        assert_eq!(readout.used, 1);
+        assert_eq!(readout.holders.len(), 1);
+        assert_eq!(readout.holders[0].run_id, Some(1));
+        assert_eq!(readout.waiters.len(), 1);
+        assert_eq!(readout.waiters[0].run_id, 2);
+
+        // No book installed: a disabled, empty readout with no capacity.
+        let off = admission_readout(None);
+        assert!(!off.enabled);
+        assert_eq!(off.capacity, 0);
+        assert!(off.holders.is_empty() && off.waiters.is_empty());
     }
 }

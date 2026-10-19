@@ -10,13 +10,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
 
 use crate::config::VerifyConfig;
+use crate::execution::admission::{AdmissionBook, VerifyGrant};
 use crate::gate::{self, ArgvOutcome};
 use crate::tests_map::{self, MapState};
 use crate::verify::resolve;
@@ -112,6 +113,8 @@ pub struct Executor {
     in_flight: Mutex<InFlight>,
     /// A warm sweep is running; the next tick skips rather than overlap it.
     sweeping: AtomicBool,
+    /// The runs' heavy-command budget, shared once at startup ([`Self::share_budget`]).
+    admission: OnceLock<Arc<AdmissionBook>>,
 }
 
 /// Holds a unit's weight and warm dirs; gives them back on drop, whatever path ended the unit.
@@ -119,6 +122,8 @@ struct Reservation {
     executor: Arc<Executor>,
     weight: i64,
     dirs: Vec<PathBuf>,
+    /// The unit's share of the runs' budget; returned when the reservation drops.
+    _admission: Option<VerifyGrant>,
 }
 
 impl Reservation {
@@ -165,7 +170,14 @@ impl Executor {
             wake: Arc::new(Notify::new()),
             in_flight: Mutex::new(InFlight::default()),
             sweeping: AtomicBool::new(false),
+            admission: OnceLock::new(),
         })
+    }
+
+    /// Draw units from the runs' heavy-command budget too, and get woken when it frees up.
+    pub fn share_budget(&self, book: Arc<AdmissionBook>) {
+        book.set_verify_wake(self.wake.clone());
+        let _ = self.admission.set(book);
     }
 
     /// Short critical sections only; never held across an `.await`.
@@ -230,9 +242,16 @@ impl Executor {
             let picked = {
                 let mut state = self.lock();
                 let capacity = self.capacity();
+                let book = self.admission.get();
+                // The most a unit can ever be granted: with a shared book, the smaller of the
+                // two capacities, or a unit heavier than the book would never be picked.
+                let ceiling = match book {
+                    Some(book) => capacity.min(i64::from(book.capacity())).max(1),
+                    None => capacity,
+                };
                 // A row queued under a larger capacity would never fit: charge it the whole
-                // capacity instead. Picked, reserved and released with this same value.
-                let charge = |weight: i64| weight.clamp(1, capacity);
+                // ceiling instead. Picked, reserved and released with this same value.
+                let charge = |weight: i64| weight.clamp(1, ceiling);
                 let candidates: Vec<Candidate> = queued
                     .iter()
                     .map(|q| Candidate {
@@ -243,23 +262,57 @@ impl Executor {
                         enqueued_ms: q.enqueued_ms,
                     })
                     .collect();
-                let free = capacity - state.used;
-                let chosen =
-                    verify_sched::pick(&candidates, free, &state.last_start, now_ms(), aging_ms)
-                        .and_then(|id| queued.iter().find(|q| q.id == id));
-                chosen.map(|chosen| {
-                    let weight = charge(chosen.weight);
-                    state.used += weight;
-                    (chosen.id, weight, chosen.project_id.clone())
-                })
+                let own_free = capacity - state.used;
+                // With a shared book a unit also needs the runs' budget to have room.
+                let free = match book {
+                    Some(book) => own_free.min(i64::from(book.free())),
+                    None => own_free,
+                };
+                let pick = |free: i64, last_start: &HashMap<Option<String>, u64>| {
+                    verify_sched::pick(&candidates, free, last_start, now_ms(), aging_ms)
+                        .and_then(|id| queued.iter().find(|q| q.id == id))
+                };
+                let chosen = pick(free, &state.last_start);
+                match (chosen, book) {
+                    (Some(chosen), book) => {
+                        let weight = charge(chosen.weight);
+                        let grant = match book {
+                            Some(book) => {
+                                let grant =
+                                    book.try_take_verify(u32::try_from(weight).unwrap_or(1));
+                                if grant.is_none() {
+                                    // Lost the room to a run between the read and the take.
+                                    book.set_verify_demand(true);
+                                    break;
+                                }
+                                grant
+                            }
+                            None => None,
+                        };
+                        state.used += weight;
+                        Some((chosen.id, weight, chosen.project_id.clone(), grant))
+                    }
+                    (None, Some(book)) => {
+                        // Held back by the shared budget alone: hold the runs back in turn.
+                        let blocked =
+                            free < own_free && pick(own_free, &state.last_start).is_some();
+                        book.set_verify_demand(blocked);
+                        if blocked {
+                            break;
+                        }
+                        None
+                    }
+                    (None, None) => None,
+                }
             };
-            let Some((id, weight, project)) = picked else {
+            let Some((id, weight, project, grant)) = picked else {
                 break;
             };
             let reservation = Reservation {
                 executor: Arc::clone(self),
                 weight,
                 dirs: Vec::new(),
+                _admission: grant,
             };
             let claimed = match verify_runs::claim(&self.pool, id).await {
                 Ok(Some(claimed)) => claimed,
@@ -515,6 +568,7 @@ pub async fn run_executor(executor: Arc<Executor>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::admission::{AdmissionBook, Poll};
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
@@ -744,6 +798,93 @@ mod tests {
         let state = wait_terminal(&ex, submitted.id).await;
         assert_eq!(state.status, verify_runs::STATUS_PASSED);
         worker.abort();
+    }
+
+    /// An executor of `capacity` that shares `book` with the runs' admission.
+    async fn sharing(capacity: u32, root: &Path, book: &Arc<AdmissionBook>) -> Arc<Executor> {
+        let ex = executor(capacity, root).await;
+        ex.share_budget(Arc::clone(book));
+        ex
+    }
+
+    fn private_book(capacity: u32) -> Arc<AdmissionBook> {
+        Arc::new(AdmissionBook::new(
+            capacity,
+            Duration::from_secs(900),
+            Duration::from_secs(7200),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_unit_waits_while_runs_hold_the_shared_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(1);
+        // A heavy command of a run holds the whole shared budget; the executor alone has room.
+        assert!(matches!(book.request(1, "a", 1), Poll::Granted { .. }));
+        let ex = sharing(4, root.path(), &book).await;
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 1))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 0);
+        assert_eq!(ex.lock().used, 0, "a refused take leaves no weight behind");
+        let waiting = ex.get(submitted.id).await.unwrap().unwrap();
+        assert_eq!(waiting.status, verify_runs::STATUS_QUEUED);
+
+        assert!(book.release(1, "a"));
+        assert_eq!(ex.start_ready().await, 1);
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        assert_eq!(book.free(), 1, "the unit gives its grant back when it ends");
+    }
+
+    #[tokio::test]
+    async fn a_unit_the_shared_budget_cannot_fit_raises_demand() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(2);
+        assert!(matches!(book.request(1, "a", 1), Poll::Granted { .. }));
+        let ex = sharing(4, root.path(), &book).await;
+        // Two units wide: the executor fits it, the shared budget (one free) does not.
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 2))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 0);
+        assert!(
+            book.snapshot().verify_demand,
+            "a unit that only the shared budget holds back must hold the runs back in turn"
+        );
+
+        assert!(book.release(1, "a"));
+        assert_eq!(ex.start_ready().await, 1);
+        assert!(
+            !book.snapshot().verify_demand,
+            "demand drops once the queue is empty"
+        );
+        wait_terminal(&ex, submitted.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_unit_heavier_than_the_shared_book_still_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(1);
+        let ex = sharing(4, root.path(), &book).await;
+        // Two units wide, but the shared book holds one: it is charged the book's whole capacity.
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 2))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        assert!(
+            !book.snapshot().verify_demand,
+            "a unit that fits once clamped must not hold the runs back"
+        );
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        assert_eq!(book.free(), 1, "the unit gives its grant back when it ends");
     }
 
     #[tokio::test]

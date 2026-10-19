@@ -88,6 +88,17 @@ class ClassifyTests(Base):
         self.assertCargo(self.classify(["pwsh", "-c", "foreach ($p in 1) { cargo build }"]))
         self.assertCargo(self.classify(["Invoke-Expression", "cargo build"]))
 
+    def test_a_subcommand_hidden_in_an_expansion_is_heavy(self):
+        # The subcommand only exists at run time, so it may be a build: judge it as one.
+        for argv in (["cargo", "$@"], ["cargo", "+nightly", "${SUB}", "-p", "x"],
+                     ["cargo", "$sub"], ["cargo", "@args"], ["cargo", "@rest"]):
+            with self.subTest(argv=argv):
+                v = self.classify(argv)
+                self.assertCargo(v)
+                self.assertFalse(v.filtered, v)
+        self.assertFalse(self.classify(["cargo", "fmt", "$@"]).heavy)
+        self.assertFalse(self.classify(["cargo", "--version"]).heavy)
+
     def test_xargs_and_find_exec(self):
         self.assertCargo(self.classify(["xargs", "-n", "1", "-P4", "cargo", "test", "-p"]))
         self.assertCargo(self.classify(["find", ".", "-name", "Cargo.toml", "-execdir",
@@ -214,6 +225,13 @@ class GuardTests(Base):
                          f'{self.broker} bash -c "cargo build"')
         self.assertEqual(self.rewritten("PowerShell", "iex 'cargo build'"),
                          f"{self.broker} powershell -NoProfile -Command 'cargo build'")
+
+    def test_an_eval_with_a_cargo_helper_reaches_the_broker(self):
+        # 2026-10-19: a batch of `cargo test`/`clippy` runs went through a helper whose
+        # cargo only names its subcommand through `"$@"`, so the guard judged it light.
+        cmd = ("eval 'r(){ n=$1; shift; cargo \"$@\" > /tmp/$n.log 2>&1; }\n"
+               "r k1 test -p nucleos-core -- storage_'")
+        self.assertTrue(self.rewritten("Bash", cmd).startswith(f"{self.broker} bash -c "))
 
     def test_cd_before_a_script_is_followed(self):
         self.write("sub/build.sh", "cargo build\n")
