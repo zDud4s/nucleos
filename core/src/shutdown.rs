@@ -49,10 +49,17 @@ pub const DRAIN_POLL: Duration = Duration::from_secs(2);
 #[cfg(not(test))]
 static DRAINING: AtomicBool = AtomicBool::new(false);
 
+// The initializer IS `const`; clippy 1.97 still reports it inside the macro.
 #[cfg(test)]
-thread_local! {
-    static DRAINING_IN_THIS_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+#[allow(clippy::missing_const_for_thread_local)]
+mod draining_in_this_test {
+    thread_local! {
+        pub(super) static DRAINING_IN_THIS_TEST: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
 }
+#[cfg(test)]
+use draining_in_this_test::DRAINING_IN_THIS_TEST;
 
 /// Whether the daemon is draining for an update.
 #[cfg(not(test))]
