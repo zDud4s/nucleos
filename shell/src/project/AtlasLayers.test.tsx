@@ -51,10 +51,10 @@ function map(): ProjectMap {
   } as unknown as ProjectMap;
 }
 
-function renderLayers() {
+function renderLayers(data: ProjectMap = map()) {
   return render(
     <QueryClientProvider client={createAppQueryClient()}>
-      <AtlasLayers projectId="p1" data={map()} />
+      <AtlasLayers projectId="p1" data={data} />
     </QueryClientProvider>,
   );
 }
@@ -120,5 +120,33 @@ describe("AtlasLayers", () => {
     const after = screen.getAllByRole("button", { name: /same/ });
     expect(after[0].getAttribute("aria-pressed")).toBe("false");
     expect(after[1].getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("accepting today's graph posts the re-freeze, and only offers it while something is new", async () => {
+    renderLayers();
+    expect(screen.queryByRole("button", { name: /Accept today/ })).toBeNull();
+
+    const data = map();
+    data.layers = {
+      modules: data.layers!.modules,
+      overridden: [],
+      violations: [
+        {
+          from: "core/src/low/a.rs",
+          to: "core/src/top/d.rs",
+          from_layer: 0,
+          to_layer: 2,
+          new: true,
+        },
+      ],
+    };
+    renderLayers(data);
+    fireEvent.click(screen.getByRole("button", { name: /Accept today/ }));
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith(
+        "/projects/p1/map/layers/baseline",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
   });
 });

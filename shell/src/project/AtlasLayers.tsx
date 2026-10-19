@@ -1,6 +1,6 @@
 // §spec mapa-do-projeto
 import { useEffect, useMemo, useState } from "react";
-import { useSetLayer, type Layering, type ProjectMap } from "../data/project-map";
+import { useAcceptLayers, useSetLayer, type Layering, type ProjectMap } from "../data/project-map";
 import { buildBands, isolate, maxLayer, type Band, type LayerBlock } from "./layers-model";
 import { DAEMON_NAME } from "../copy";
 
@@ -28,6 +28,7 @@ function Stack({
   data: ProjectMap;
   layering: Layering;
 }) {
+  const accept = useAcceptLayers(projectId);
   const [isolated, setIsolated] = useState<number | null>(null);
   const [chosen, setChosen] = useState<{ layer: number; key: string } | null>(null);
   const bands = useMemo(() => buildBands(data.modules, layering), [data.modules, layering]);
@@ -57,6 +58,16 @@ function Stack({
         <span className={upward > 0 ? "ws-layer-up" : undefined}>
           {upward} upward imports ({upwardNew} new)
         </span>
+        {upwardNew > 0 ? (
+          <button
+            type="button"
+            className="ml-2"
+            disabled={accept.isPending}
+            onClick={() => accept.mutate()}
+          >
+            Accept today&apos;s graph
+          </button>
+        ) : null}
       </p>
 
       {shown.map((band) => (

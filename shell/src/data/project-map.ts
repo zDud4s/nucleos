@@ -1249,6 +1249,27 @@ export function useSetLayer(projectId: string) {
   });
 }
 
+/**
+ * Accept today's import graph as the new layer baseline: the daemon derives the layers again from
+ * the tree as it is and replaces the frozen one, so imports that were `new` stop being flagged.
+ * The owner's own moves stay. Invalidates the map. Not retried, for {@link useTriage}'s reason.
+ */
+export function useAcceptLayers(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/map/layers/baseline`, {
+        method: "POST",
+      }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: keys.projects.map(projectId),
+      });
+    },
+  });
+}
+
 /** What {@link useTriage} sends: which brain answers the one question (§6). */
 export interface TriageInput {
   brain: Brain;

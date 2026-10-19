@@ -4887,6 +4887,70 @@ mod tests {
         assert!(back["layers"]["overridden"].as_array().unwrap().is_empty());
     }
 
+    /// A POST with no body to the re-freeze route, as the window makes it.
+    async fn post_refreeze(state: &AppState, project: &str) -> StatusCode {
+        build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{project}/map/layers/baseline"))
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The owner accepts today's graph: the baseline is frozen again, so a climb that was `new`
+    /// stops being a violation, and the owner's own moves stay.
+    #[tokio::test]
+    async fn the_owner_can_accept_todays_graph_as_the_new_layer_baseline() {
+        let state = test_state().await;
+        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        std::fs::create_dir_all(dir.path().join("core/src")).unwrap();
+        std::fs::write(dir.path().join("core/src/a.rs"), "use crate::b;\n").unwrap();
+        std::fs::write(dir.path().join("core/src/b.rs"), "pub fn b() {}\n").unwrap();
+        std::fs::write(dir.path().join("core/src/c.rs"), "pub fn c() {}\n").unwrap();
+        get_json(&state, "/projects/alpha/map").await;
+
+        // c now imports a: it froze at 0 and a at 1, so this is a new upward import.
+        std::fs::write(dir.path().join("core/src/c.rs"), "use crate::a;\n").unwrap();
+        let before = get_json(&state, "/projects/alpha/map").await;
+        let violations = before["layers"]["violations"].as_array().unwrap();
+        assert_eq!(violations.len(), 1, "{before}");
+        assert_eq!(violations[0]["new"], true);
+
+        let moved = post_layer(
+            &state,
+            "alpha",
+            serde_json::json!({"path": "core/src/b.rs", "layer": 7}),
+        )
+        .await;
+        assert_eq!(moved, StatusCode::NO_CONTENT);
+
+        assert_eq!(post_refreeze(&state, "alpha").await, StatusCode::NO_CONTENT);
+
+        let after = get_json(&state, "/projects/alpha/map").await;
+        assert_eq!(after["layers"]["modules"]["core/src/c.rs"], 2, "{after}");
+        assert!(
+            after["layers"]["violations"].as_array().unwrap().is_empty(),
+            "{after}"
+        );
+        assert_eq!(after["layers"]["modules"]["core/src/b.rs"], 7, "{after}");
+    }
+
+    /// Accepting the graph of a project that does not exist is a 404.
+    #[tokio::test]
+    async fn accepting_the_layer_baseline_of_an_unknown_project_is_not_found() {
+        let state = test_state().await;
+        assert_eq!(
+            post_refreeze(&state, "nowhere").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
     /// A path outside the project, or not a file, is refused; an unknown project is not found.
     #[tokio::test]
     async fn a_layer_override_outside_the_project_is_refused() {
