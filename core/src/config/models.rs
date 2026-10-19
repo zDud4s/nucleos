@@ -121,9 +121,9 @@ pub struct ModelsConfig {
     #[serde(default = "default_assistant_choices")]
     pub assistant_choices: Vec<AssistantChoice>,
     /// When the vendors' price pages were last read (`YYYY-MM-DD`), or `None` when they never have
-    /// been. Written by the daemon's own price refresh ([`crate::price_refresh`]), or by
-    /// `scripts/refresh-models.py` run by hand. Shown beside every estimated cost so its age is
-    /// visible (spec devtime §4.4).
+    /// been. Written by the daemon's own price refresh ([`crate::price_refresh`]), the only writer
+    /// of the price block since `scripts/refresh-models.py` stopped writing it. Shown beside every
+    /// estimated cost so its age is visible (spec devtime §4.4).
     #[serde(default)]
     pub prices_as_of: Option<String>,
     /// Whether the daemon refreshes `prices_as_of` and `model_prices` by itself: when they go stale,
@@ -849,6 +849,21 @@ pub const MODELS_CONFIG_FILE: &str = "nucleos-models.yaml";
 /// The same file as a person is shown it, and the only spelling a message uses. See
 /// [`crate::machine_config::ROOT_DISPLAY`].
 pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
+
+/// Held by every in-process writer of [`MODELS_CONFIG_FILE`]: the price refresh
+/// ([`crate::price_refresh::refresh_file`], around its re-read, splice and write) and the System
+/// page's write door (`http/admin.rs::post_machine_config`, around its write).
+///
+/// Two reasons. The refresh rewrites the file from a fresh read, and the lock makes "fresh" hold
+/// until its write lands, so a settings write cannot slip in between and be overwritten by a splice
+/// of the text it replaced. And both go through [`crate::project::state::write_atomically`], which
+/// stages the text in the same `nucleos-models.yaml.nucleos-tmp` beside the target; two writes at
+/// once would collide on that temporary. It cannot order the daemon against an edit by hand or
+/// another process, which is why the refresh re-reads only after its fetch, keeping that window as
+/// short as a read and a write.
+///
+/// A tokio mutex because the write door holds it across the `await` of its blocking write.
+pub static MODELS_FILE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// One model's published prices. A `None` field is a price the script could not read: tokens of that
 /// kind make the model "unpriced", never priced at zero.

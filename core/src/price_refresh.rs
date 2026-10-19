@@ -3,12 +3,12 @@
 //! refreshed in months is a wrong number shown with a straight face.
 //!
 //! [`parse`] holds the pure part: two fetched bodies in, the two rendered YAML blocks out, with no
-//! network, no file and no clock, so it can be held byte for byte against what the script writes.
-//! This module is the rest: fetching, writing the file, and deciding when.
+//! network, no file and no clock, so the exact text it renders can be pinned by a test. This module
+//! is the rest: fetching, writing the file, and deciding when.
 //!
 //! Three things start a refresh:
-//! - the loop ([`run_refresh_loop`]), shortly after startup and then daily, when `prices_as_of` is
-//!   missing or older than [`STALE_AFTER_DAYS`];
+//! - the loop ([`run_refresh_loop`]), shortly after startup and then daily (hourly after a failed
+//!   attempt), when `prices_as_of` is missing or older than [`STALE_AFTER_DAYS`];
 //! - the devtime page meeting a model it has no price for ([`note_unpriced`]), at most once per
 //!   [`AUTO_RETRY_HOURS`];
 //! - the "refresh prices" button (`POST /analytics/devtime/prices/refresh`, [`refresh_now`]), which
@@ -45,8 +45,18 @@ const STARTUP_DELAY: Duration = Duration::from_secs(30);
 /// How often the loop looks after that. Staleness is measured in days, so a daily look is enough.
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
 
+/// How soon the loop looks again after a refresh it started failed. Sooner than [`CHECK_EVERY`],
+/// so a vendor page down at startup (or a laptop that woke without network) does not leave stale
+/// prices for another day; not so soon that a page that changed shape is fetched every minute.
+const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
+
 /// Both pages are small; a vendor that takes longer than this is down, and the refresh says so.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most of one body the refresh reads. Both pages are well under a megabyte; the cap is there
+/// so a misbehaving server (or something answering in its place) cannot make the daemon buffer an
+/// unbounded body, and is generous enough that the catalogue growing never trips it.
+const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Sent with both GETs so the vendors can tell this traffic apart. Nothing else identifies anyone.
 const USER_AGENT: &str = "nucleos-price-refresh";
@@ -100,10 +110,20 @@ impl Default for PriceSources {
     }
 }
 
-/// One GET; any failure (transport, non-2xx, unreadable body) is `None`, which
-/// [`parse::refresh_from_bodies`] turns into "could not read …" and a file left untouched.
+/// One GET; any failure (transport, non-2xx, unreadable body, a body over [`MAX_BODY_BYTES`]) is
+/// `None`, which [`parse::refresh_from_bodies`] turns into "could not read …" and a file left
+/// untouched.
 async fn fetch(client: &reqwest::Client, url: &str) -> Option<String> {
-    let response = match client
+    fetch_at_most(client, url, MAX_BODY_BYTES).await
+}
+
+/// [`fetch`] with the body cap as a parameter, so a test can trip it without serving megabytes.
+///
+/// A declared length over the cap is refused before any of the body is read; a body without one
+/// (chunked) is read chunk by chunk and dropped as soon as it passes the cap. Decoded as `text()`
+/// decodes without the `charset` feature: UTF-8, malformed sequences replaced.
+async fn fetch_at_most(client: &reqwest::Client, url: &str, max_bytes: usize) -> Option<String> {
+    let mut response = match client
         .get(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
@@ -120,13 +140,56 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Option<String> {
         tracing::warn!(%status, url, "price refresh: fetch answered with an error status");
         return None;
     }
-    match response.text().await {
-        Ok(body) => Some(body),
-        Err(error) => {
-            tracing::warn!(%error, url, "price refresh: could not read the body");
-            None
+    let max_length = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if let Some(length) = response.content_length()
+        && length > max_length
+    {
+        tracing::warn!(
+            length,
+            max_bytes,
+            url,
+            "price refresh: the body is too large"
+        );
+        return None;
+    }
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > max_bytes {
+                    tracing::warn!(max_bytes, url, "price refresh: the body is too large");
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, url, "price refresh: could not read the body");
+                return None;
+            }
         }
     }
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The models file's text, or the problem line that says why there is none.
+fn read_models_file(path: &Path) -> Result<String, String> {
+    let shown = crate::config::MODELS_CONFIG_DISPLAY_PATH;
+    std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("{shown} does not exist — prices unchanged")
+        } else {
+            format!("could not read {shown} ({error}) — prices unchanged")
+        }
+    })
+}
+
+/// The `prices_as_of` a models file's text declares, best effort: `None` when it has none or the
+/// text does not parse.
+fn prices_as_of_in(text: &str) -> Option<String> {
+    crate::config::parse_models_config(text)
+        .ok()
+        .and_then(|config| config.prices_as_of)
 }
 
 /// Refreshes the price blocks of the models file at `path` from `sources`, dated `now`'s UTC day.
@@ -138,6 +201,11 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Option<String> {
 /// The rest of the file is kept byte for byte ([`parse::splice_price_blocks`]); it is written only
 /// when the text changed, and never when the result would no longer parse — a refresh must never be
 /// the reason the models file stops loading.
+///
+/// The text spliced is read AFTER the fetch, not before: a fetch can take up to [`FETCH_TIMEOUT`],
+/// and a splice of the text read before it would put back whatever a System-page write, a hand
+/// edit or anything else changed meanwhile. The re-read, the splice and the write happen under
+/// [`crate::config::MODELS_FILE_WRITE`], so the System page's write door cannot land in between.
 pub async fn refresh_file(
     client: &reqwest::Client,
     sources: &PriceSources,
@@ -145,20 +213,10 @@ pub async fn refresh_file(
     now: DateTime<Utc>,
 ) -> PriceRefreshStatus {
     let shown = crate::config::MODELS_CONFIG_DISPLAY_PATH;
-    let original = match std::fs::read_to_string(path) {
+    let before = match read_models_file(path) {
         Ok(text) => text,
-        Err(error) => {
-            let problem = if error.kind() == std::io::ErrorKind::NotFound {
-                format!("{shown} does not exist — prices unchanged")
-            } else {
-                format!("could not read {shown} ({error}) — prices unchanged")
-            };
-            return PriceRefreshStatus::new(now, false, None, vec![problem]);
-        }
+        Err(problem) => return PriceRefreshStatus::new(now, false, None, vec![problem]),
     };
-    let current_as_of = crate::config::parse_models_config(&original)
-        .ok()
-        .and_then(|config| config.prices_as_of);
     let (pricing, catalogue) = tokio::join!(
         fetch(client, &sources.pricing_url),
         fetch(client, &sources.openrouter_url)
@@ -167,13 +225,30 @@ pub async fn refresh_file(
     let (blocks, mut problems) =
         parse::refresh_from_bodies(pricing.as_deref(), catalogue.as_deref(), &today);
     let Some(blocks) = blocks else {
-        return PriceRefreshStatus::new(now, false, current_as_of, problems);
+        return PriceRefreshStatus::new(now, false, prices_as_of_in(&before), problems);
     };
+
+    // Held until the write has landed (or been given up); no `await` below it.
+    let _models_file_write = crate::config::MODELS_FILE_WRITE.lock().await;
+    let original = match read_models_file(path) {
+        Ok(text) => text,
+        Err(problem) => {
+            problems.push(problem);
+            return PriceRefreshStatus::new(now, false, None, problems);
+        }
+    };
+    let current_as_of = prices_as_of_in(&original);
     let spliced = parse::splice_price_blocks(&original, &blocks);
     if spliced != original {
         if let Err(error) = crate::config::parse_models_config(&spliced) {
+            // The likeliest cause, named because it is invisible in the file: the splice ends the
+            // block at the first column-zero line (the rule `scripts/refresh-models.py` splices
+            // `assistant_choices` by), so a commented-out row there leaves every row below it in
+            // place, and the first of them that the new block also lists is a duplicate key.
             problems.push(format!(
-                "{shown} would not parse with the new prices ({error}) — prices unchanged"
+                "the refreshed {shown} would not parse ({error}) — prices unchanged; a comment in \
+                 column zero inside `model_prices` ends the block early and leaves the rows below \
+                 it in place, so indent or remove it"
             ));
             return PriceRefreshStatus::new(now, false, current_as_of, problems);
         }
@@ -206,10 +281,20 @@ fn tick_wants_refresh(config: &ModelsConfig, today: NaiveDate) -> bool {
 
 /// Whether the devtime page's unpriced models should start a background refresh.
 ///
-/// Only for an id that was not already unpriced at the last trigger (`known`): an alias such as
-/// `sonnet` never gets a price, and without this it would restart a refresh every
-/// [`AUTO_RETRY_HOURS`] forever. And only when no automatic refresh started in the last
-/// [`AUTO_RETRY_HOURS`], so a vendor page that is down is not hit by every page view.
+/// Only for an id not in `known`, the ids that were unpriced when a triggered refresh then ran
+/// clean. And only when no automatic refresh started in the last [`AUTO_RETRY_HOURS`], so a vendor
+/// page that is down is not hit by every page view.
+///
+/// So an id whose refresh FAILED is not known and is retried once [`AUTO_RETRY_HOURS`] have passed,
+/// while an id still unpriced after a SUCCESSFUL refresh is never retried by this trigger. That is
+/// a deliberate trade-off: an alias such as `sonnet`, or an id no vendor lists, never gets a price,
+/// and retrying it would restart a refresh every [`AUTO_RETRY_HOURS`] forever; a price a vendor
+/// publishes for it later still arrives with the loop's refresh once the prices are
+/// [`STALE_AFTER_DAYS`] old.
+///
+/// `known` only grows (see [`RefreshState::known_unpriced`]): the page's views (global or one
+/// project, 7, 30 or 90 days) each have their own unpriced list, and a set replaced by each trigger
+/// would let two views take turns retriggering one another every day.
 fn should_trigger(
     unpriced: &BTreeSet<String>,
     auto_enabled: bool,
@@ -228,11 +313,13 @@ fn should_trigger(
 struct RefreshState {
     last: Option<PriceRefreshStatus>,
     last_auto_attempt: Option<DateTime<Utc>>,
-    /// The unpriced ids passed to the last trigger. Stored when the trigger fires rather than
-    /// recomputed after the refresh: an id the refresh priced drops out of the page's list by
-    /// itself, and an id it could not price (an alias) stays here and does not trigger again. A
-    /// refresh started by the loop or the button leaves it alone, since it knows no unpriced list.
-    unpriced_after_last: BTreeSet<String>,
+    /// Every id passed to a trigger whose refresh then ran clean, accumulated (never replaced; see
+    /// [`should_trigger`]). Added after the refresh rather than when the trigger fires, so a failed
+    /// refresh leaves its ids to be retried. Not recomputed from the refreshed file: an id the
+    /// refresh priced drops out of the page's list by itself, and an id it could not price (an
+    /// alias) stays here and does not trigger again. A refresh started by the loop or the button
+    /// leaves it alone, since it knows no unpriced list.
+    known_unpriced: BTreeSet<String>,
 }
 
 /// The price refresh of one models file: its sources, its client, and its state.
@@ -323,35 +410,40 @@ impl Refresher {
     }
 
     /// The devtime page's unpriced models: starts a background refresh when [`should_trigger`]
-    /// says so, and returns whether it did. Never waits for it: the page shows this view now, and
-    /// the next one reads the new prices, the models file being re-read per request.
+    /// says so, and returns its handle (`None` when it did not start one). The page never waits
+    /// for it: it shows this view now, and the next one reads the new prices, the models file
+    /// being re-read per request. Tests await the handle.
     pub fn note_unpriced(
         self: &Arc<Self>,
         unpriced: &[String],
         auto_enabled: bool,
         now: DateTime<Utc>,
-    ) -> bool {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let seen: BTreeSet<String> = unpriced.iter().cloned().collect();
         {
             let mut state = self.lock_state();
             if !should_trigger(
                 &seen,
                 auto_enabled,
-                &state.unpriced_after_last,
+                &state.known_unpriced,
                 state.last_auto_attempt,
                 now,
             ) {
-                return false;
+                return None;
             }
             // Recorded before the spawn, so a request arriving meanwhile does not start a second.
             state.last_auto_attempt = Some(now);
-            state.unpriced_after_last = seen;
         }
         let refresher = Arc::clone(self);
-        tokio::spawn(async move {
-            refresher.refresh_auto(now).await;
-        });
-        true
+        Some(tokio::spawn(async move {
+            // Known only after a clean run: a failed one (or one skipped because another refresh
+            // held the lock) leaves the ids to trigger again after the hold.
+            if let Some(status) = refresher.refresh_auto(now).await
+                && status.ok
+            {
+                refresher.lock_state().known_unpriced.extend(seen);
+            }
+        }))
     }
 }
 
@@ -396,21 +488,30 @@ pub async fn refresh_now(now: DateTime<Utc>) -> PriceRefreshStatus {
 /// See [`Refresher::note_unpriced`]; a no-op without a refresher.
 pub fn note_unpriced(unpriced: &[String], auto_enabled: bool, now: DateTime<Utc>) {
     if let Some(refresher) = installed() {
-        refresher.note_unpriced(unpriced, auto_enabled, now);
+        // Detached: the page does not wait for the refresh, and the handle is only for tests.
+        let _ = refresher.note_unpriced(unpriced, auto_enabled, now);
     }
 }
 
-/// The background refresh: a first look after [`STARTUP_DELAY`], then one every [`CHECK_EVERY`],
-/// each reading the models file as it is then, so `auto_refresh_prices: false` takes effect without
-/// a restart.
+/// How long the loop sleeps after a tick: [`RETRY_AFTER_FAILURE`] when the tick ran a refresh and
+/// it failed, [`CHECK_EVERY`] otherwise (a refresh that worked, prices still fresh, auto refresh
+/// off, or a refresh skipped because another one was running and will report for itself).
+fn sleep_after_tick(tick: Option<&PriceRefreshStatus>) -> Duration {
+    match tick {
+        Some(status) if !status.ok => RETRY_AFTER_FAILURE,
+        _ => CHECK_EVERY,
+    }
+}
+
+/// The background refresh: a first look after [`STARTUP_DELAY`], then one every [`CHECK_EVERY`]
+/// (or [`RETRY_AFTER_FAILURE`] after a failed one, [`sleep_after_tick`]), each reading the models
+/// file as it is then, so `auto_refresh_prices: false` takes effect without a restart.
 pub async fn run_refresh_loop(refresher: Arc<Refresher>) {
     tokio::time::sleep(STARTUP_DELAY).await;
-    let mut ticker = tokio::time::interval(CHECK_EVERY);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticker.tick().await;
         let config = crate::config::models_config_now();
-        refresher.auto_tick(&config, Utc::now()).await;
+        let tick = refresher.auto_tick(&config, Utc::now()).await;
+        tokio::time::sleep(sleep_after_tick(tick.as_ref())).await;
     }
 }
 
@@ -457,14 +558,29 @@ mod tests {
         let app = axum::Router::new()
             .route("/pricing.md", axum::routing::get(reply(pricing)))
             .route("/models", axum::routing::get(reply(catalogue)));
+        let base = serve(app).await;
+        PriceSources {
+            pricing_url: format!("{base}/pricing.md"),
+            openrouter_url: format!("{base}/models"),
+        }
+    }
+
+    /// Serves `app` on a loopback port for the rest of the test; returns its `http://` base.
+    async fn serve(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
+        format!("http://{address}")
+    }
+
+    /// Sources nothing listens at, so a test that should not reach the network cannot reach a real
+    /// vendor either: a fetch there fails at once with "could not read".
+    fn dead_sources() -> PriceSources {
         PriceSources {
-            pricing_url: format!("http://{address}/pricing.md"),
-            openrouter_url: format!("http://{address}/models"),
+            pricing_url: "http://127.0.0.1:9/pricing.md".to_string(),
+            openrouter_url: "http://127.0.0.1:9/models".to_string(),
         }
     }
 
@@ -589,20 +705,99 @@ mod tests {
         ));
     }
 
+    fn unpriced(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| id.to_string()).collect()
+    }
+
     #[tokio::test]
-    async fn a_noted_unpriced_model_triggers_once_and_the_same_list_never_again() {
+    async fn a_failed_triggered_refresh_leaves_its_ids_to_retry_after_the_hold() {
         let dir = tempfile::tempdir().unwrap();
-        // No file: the spawned refresh returns before any fetch.
+        // No file: the spawned refresh fails before any fetch (and the sources are dead anyway).
         let refresher = Arc::new(Refresher::new(
             dir.path().join(crate::config::MODELS_CONFIG_FILE),
-            PriceSources::default(),
+            dead_sources(),
             reqwest::Client::new(),
         ));
         let now = Utc.with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap();
-        let unpriced = vec!["sonnet".to_string()];
-        assert!(refresher.note_unpriced(&unpriced, true, now));
+        let sonnet = unpriced(&["sonnet"]);
+
+        refresher
+            .note_unpriced(&sonnet, true, now)
+            .expect("a new unpriced id triggers")
+            .await
+            .unwrap();
+
+        assert_eq!(refresher.last().map(|status| status.ok), Some(false));
+        let two_hours_later = now + chrono::Duration::hours(2);
+        assert!(
+            refresher
+                .note_unpriced(&sonnet, true, two_hours_later)
+                .is_none(),
+            "held for AUTO_RETRY_HOURS after the attempt"
+        );
         let a_day_later = now + chrono::Duration::hours(AUTO_RETRY_HOURS + 1);
-        assert!(!refresher.note_unpriced(&unpriced, true, a_day_later));
+        refresher
+            .note_unpriced(&sonnet, true, a_day_later)
+            .expect("a failed refresh did not make the id known")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_id_still_unpriced_after_a_clean_refresh_does_not_trigger_again() {
+        let (_dir, path) = models_dir();
+        let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
+        let refresher = Arc::new(Refresher::new(path, sources, reqwest::Client::new()));
+        let now = Utc.with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap();
+        let a_day_later = now + chrono::Duration::hours(AUTO_RETRY_HOURS + 1);
+
+        refresher
+            .note_unpriced(&unpriced(&["sonnet"]), true, now)
+            .expect("a new unpriced id triggers")
+            .await
+            .unwrap();
+
+        assert_eq!(refresher.last().map(|status| status.ok), Some(true));
+        assert!(
+            refresher
+                .note_unpriced(&unpriced(&["sonnet"]), true, a_day_later)
+                .is_none()
+        );
+        refresher
+            .note_unpriced(&unpriced(&["sonnet", "claude-new"]), true, a_day_later)
+            .expect("an id never seen before still triggers")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_known_ids_grow_so_two_views_do_not_take_turns_retriggering() {
+        let (_dir, path) = models_dir();
+        let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
+        let refresher = Arc::new(Refresher::new(path, sources, reqwest::Client::new()));
+        let start = Utc.with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap();
+        let nth_day = |n: i64| start + chrono::Duration::hours(n * (AUTO_RETRY_HOURS + 1));
+        // The global view's unpriced list, then one project's 7-day view with a different one.
+        let global = unpriced(&["alias-a"]);
+        let project = unpriced(&["alias-b"]);
+
+        refresher
+            .note_unpriced(&global, true, nth_day(0))
+            .unwrap()
+            .await
+            .unwrap();
+        refresher
+            .note_unpriced(&project, true, nth_day(1))
+            .unwrap()
+            .await
+            .unwrap();
+
+        assert!(refresher.note_unpriced(&global, true, nth_day(2)).is_none());
+        assert!(
+            refresher
+                .note_unpriced(&project, true, nth_day(3))
+                .is_none()
+        );
     }
 
     // --- the file --------------------------------------------------------------------
@@ -681,10 +876,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(crate::config::MODELS_CONFIG_FILE);
         // Nothing listens there: a fetch would add a "could not read" line to the problems.
-        let sources = PriceSources {
-            pricing_url: "http://127.0.0.1:9/pricing.md".to_string(),
-            openrouter_url: "http://127.0.0.1:9/models".to_string(),
-        };
+        let sources = dead_sources();
 
         let status = refresh_file(
             &reqwest::Client::new(),
@@ -698,6 +890,150 @@ mod tests {
         assert_eq!(status.problems.len(), 1, "{:?}", status.problems);
         assert!(status.problems[0].contains("does not exist"));
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn an_edit_made_while_the_refresh_fetches_is_kept() {
+        let (_dir, path) = models_dir();
+        // The catalogue answers only after the file has changed under the refresh, which is where
+        // a System-page write or a hand edit lands during a slow fetch.
+        let edited = models_file().replace("codex_model: gpt-a", "codex_model: gpt-b");
+        let app = axum::Router::new()
+            .route("/pricing.md", axum::routing::get(|| async { PRICING_MD }))
+            .route(
+                "/models",
+                axum::routing::get({
+                    let path = path.clone();
+                    move || async move {
+                        std::fs::write(&path, edited).unwrap();
+                        GOOD
+                    }
+                }),
+            );
+        let base = serve(app).await;
+        let sources = PriceSources {
+            pricing_url: format!("{base}/pricing.md"),
+            openrouter_url: format!("{base}/models"),
+        };
+
+        let status = refresh_file(
+            &reqwest::Client::new(),
+            &sources,
+            &path,
+            at("2026-10-19T08:30:00Z"),
+        )
+        .await;
+
+        assert!(status.ok, "{status:?}");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("codex_model: gpt-b"), "{written}");
+        assert!(written.contains("claude-opus-4-7:"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn a_column_zero_comment_inside_model_prices_refuses_the_refresh_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::config::MODELS_CONFIG_FILE);
+        // The comment ends the block for the splice, so the row under it stays, and it repeats a
+        // key the new block writes: the result would not parse.
+        let original = "claude_model: opus\ncodex_model: gpt-a\nprices_as_of: \"2026-01-01\"\n\
+                        model_prices:\n  old: { input: 1.0 }\n# old row\n  claude-opus-4-7: { input: 1.0 }\n";
+        crate::config::parse_models_config(original).expect("the file parses as it is");
+        std::fs::write(&path, original).unwrap();
+        let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
+
+        let status = refresh_file(
+            &reqwest::Client::new(),
+            &sources,
+            &path,
+            at("2026-10-19T08:30:00Z"),
+        )
+        .await;
+
+        assert!(!status.ok, "{status:?}");
+        assert_eq!(status.prices_as_of.as_deref(), Some("2026-01-01"));
+        assert!(
+            status
+                .problems
+                .iter()
+                .any(|problem| problem.contains("would not parse")
+                    && problem.contains("comment in column zero inside `model_prices`")),
+            "{:?}",
+            status.problems
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_not_read_and_the_refresh_leaves_the_file() {
+        let (_dir, path) = models_dir();
+        // A declared length over the cap is refused on the headers alone.
+        let oversized = vec![b' '; MAX_BODY_BYTES + 1];
+        let app = axum::Router::new()
+            .route("/pricing.md", axum::routing::get(|| async { PRICING_MD }))
+            .route(
+                "/models",
+                axum::routing::get(move || {
+                    let body = oversized.clone();
+                    async move { body }
+                }),
+            );
+        let base = serve(app).await;
+        let sources = PriceSources {
+            pricing_url: format!("{base}/pricing.md"),
+            openrouter_url: format!("{base}/models"),
+        };
+
+        let status = refresh_file(
+            &reqwest::Client::new(),
+            &sources,
+            &path,
+            at("2026-10-19T08:30:00Z"),
+        )
+        .await;
+
+        assert!(!status.ok, "{status:?}");
+        assert!(
+            status
+                .problems
+                .iter()
+                .any(|problem| problem.contains("could not read")),
+            "{:?}",
+            status.problems
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), models_file());
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_is_dropped_once_it_passes_the_cap() {
+        // No declared length: the body has to be counted as it arrives.
+        let chunked = || async {
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+                vec![b'x'; 4096],
+            )))
+        };
+        let base = serve(axum::Router::new().route("/big", axum::routing::get(chunked))).await;
+        let url = format!("{base}/big");
+        let client = reqwest::Client::new();
+
+        assert_eq!(fetch_at_most(&client, &url, 1024).await, None);
+        assert_eq!(
+            fetch_at_most(&client, &url, 8192)
+                .await
+                .map(|body| body.len()),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn the_loop_comes_back_in_an_hour_after_a_failed_refresh_and_in_a_day_otherwise() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 19, 8, 30, 0).unwrap();
+        let failed = PriceRefreshStatus::new(now, false, None, vec!["down".to_string()]);
+        let worked = PriceRefreshStatus::new(now, true, Some("2026-10-19".to_string()), vec![]);
+        assert_eq!(sleep_after_tick(Some(&failed)), RETRY_AFTER_FAILURE);
+        assert_eq!(sleep_after_tick(Some(&worked)), CHECK_EVERY);
+        assert_eq!(sleep_after_tick(None), CHECK_EVERY);
+        assert!(RETRY_AFTER_FAILURE < CHECK_EVERY);
     }
 
     #[tokio::test]
@@ -716,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn the_loop_tick_does_nothing_while_auto_refresh_is_off() {
         let (_dir, path) = models_dir();
-        let refresher = Refresher::new(path, PriceSources::default(), reqwest::Client::new());
+        let refresher = Refresher::new(path, dead_sources(), reqwest::Client::new());
         let config = ModelsConfig {
             auto_refresh_prices: false,
             ..ModelsConfig::default()

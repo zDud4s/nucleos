@@ -1,10 +1,11 @@
-//! The prices half of `scripts/refresh-models.py`, ported line for line and kept pure.
+//! The prices half of `scripts/refresh-models.py`, ported line for line and kept pure. The script
+//! no longer writes prices; this is the only writer of the price block now.
 //!
 //! Two bodies come in (Anthropic's pricing page as markdown, OpenRouter's `/api/v1/models` as JSON)
-//! and two YAML blocks go out (`prices_as_of` and `model_prices`), rendered to the byte so that a
-//! file the daemon refreshes and a file the script refreshes are the same file: the owner can run
-//! either, in any order, and the diff between them is empty. That is why the odd corners are kept
-//! rather than tidied: Python's float `repr` (`1e-05`, `10.0`), its `round(x, 6)`, its `strip()` and
+//! and two YAML blocks go out (`prices_as_of` and `model_prices`), rendered to the byte as the
+//! script rendered its rows, so the first daemon refresh of a file the script last wrote changes
+//! the banner, the date and any price that moved, and nothing else. That is why the odd corners are kept rather than
+//! tidied: Python's float `repr` (`1e-05`, `10.0`), its `round(x, 6)`, its `strip()` and
 //! `splitlines()`. Each of them shows in the rendered text, and each is a diff if it drifts.
 //!
 //! What is not ported is the script's I/O: fetching is the caller's, and every complaint the script
@@ -54,17 +55,20 @@ const OPENROUTER_PRICE_FIELDS: [(&str, &str); 5] = [
 ];
 
 /// The banner above `prices_as_of`. Portuguese because the file has always carried it in
-/// Portuguese: it is quoted here verbatim, and a re-worded banner would be a diff on every refresh.
-/// It still names the script, because the script still writes the same block.
+/// Portuguese, beside the other keys' prose. It names the daemon and when it refreshes, since the
+/// script that used to write this block no longer does. The splice takes the banner above the key
+/// with the block, so a file still carrying the script's banner gets this one on its next refresh.
 pub const PRICE_BANNER: &str = r#"# ─────────────────────────────────────────────────────────────
-# Escrito por `scripts/refresh-models.py`: preços publicados pelos fornecedores, USD por milhão de
-# tokens, lidos em `prices_as_of`. O daemon usa-os só para o custo ESTIMADO do devtime; nunca é a
-# fatura. Um modelo sem preço legível fica com `null` e o script sai com 1. Um preço por tamanho do
-# prompt (Haiku 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de
-# `min_prompt_tokens` tokens de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode
-# (as da cache escalam com ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo
-# sem eles deixa esses pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é
-# desfeito na próxima passagem.
+# Escrito pelo daemon: preços publicados pelos fornecedores, USD por milhão de tokens, lidos em
+# `prices_as_of`. O daemon atualiza-os ao arrancar e uma vez por dia quando têm mais de 7 dias,
+# quando a página Devtime encontra um modelo sem preço, e no botão "Refresh prices" dessa página;
+# `auto_refresh_prices: false` deixa só o botão. Usa-os só para o custo ESTIMADO do devtime; nunca
+# é a fatura. Um modelo sem preço legível fica com `null`. Um preço por tamanho do prompt (Haiku
+# 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de `min_prompt_tokens` tokens
+# de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode (as da cache escalam com
+# ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo sem eles deixa esses
+# pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é desfeito na próxima
+# passagem.
 # ─────────────────────────────────────────────────────────────"#;
 
 /// The two blocks of `nucleos-models.yaml` a refresh owns, rendered and ready for
@@ -1610,9 +1614,10 @@ For Claude 4.6 and later models, specifying US-only inference through the `infer
         }
     }
 
-    /// The bodies below were fed to `scripts/refresh-models.py` (its `fetch` swapped for them) and
-    /// the expected texts are what it wrote, pasted unchanged: the daemon's refresh and the script
-    /// must write the same file.
+    /// The exact text a refresh renders from the bodies below. The rows were first taken from what
+    /// `scripts/refresh-models.py` wrote for the same bodies (its `fetch` swapped for them), pasted
+    /// unchanged; the banner is the daemon's own since the script stopped writing prices, so the
+    /// contract now is this text, byte for byte, and not agreement with the script.
     const GOLDEN_CATALOGUE: &str = r#"{"data": [{"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001", "input_cache_read": "0.000000125"}}, {"id": "openai/gpt-5.5:batch", "pricing": {"prompt": "0.0000006", "completion": "0.000005"}}, {"id": "openai/gpt-6-tiered", "pricing": {"prompt": "0.000002", "completion": "0.00001", "input_cache_write_1h": "0.000004", "overrides": [{"min_prompt_tokens": 272000, "prompt": "0.000004", "completion": "0.00002", "input_cache_read": "0.0000004"}]}}, {"id": "openai/gpt-night", "pricing": {"prompt": "0.000002", "completion": "0.00001", "overrides": [{"utc_days": [0, 1], "utc_start": "00:00", "utc_end": "06:00", "prompt": "0.000001"}]}}, {"id": "openai/gpt-tiny", "pricing": {"prompt": "0.0000003", "completion": "0.00000000001", "input_cache_read": 0}}, {"id": "anthropic/claude-opus-4.7", "pricing": {"prompt": "0.000005", "completion": "0.000026", "input_cache_read": "0.0000005"}}, {"id": "google/gemini-x", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]}"#;
     const GOLDEN_ORIGINAL: &str = "claude_model: opus\ncodex_model: gpt-a\n\n# banner\nassistant_choices:\n  - { id: \"opus\" }\n\n\
                                    prices_as_of: \"2026-01-01\"\nmodel_prices:\n  old: { input: 1.0 }\n\nembedding_model: x\n";
@@ -1624,14 +1629,16 @@ assistant_choices:
   - { id: "opus" }
 
 # ─────────────────────────────────────────────────────────────
-# Escrito por `scripts/refresh-models.py`: preços publicados pelos fornecedores, USD por milhão de
-# tokens, lidos em `prices_as_of`. O daemon usa-os só para o custo ESTIMADO do devtime; nunca é a
-# fatura. Um modelo sem preço legível fica com `null` e o script sai com 1. Um preço por tamanho do
-# prompt (Haiku 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de
-# `min_prompt_tokens` tokens de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode
-# (as da cache escalam com ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo
-# sem eles deixa esses pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é
-# desfeito na próxima passagem.
+# Escrito pelo daemon: preços publicados pelos fornecedores, USD por milhão de tokens, lidos em
+# `prices_as_of`. O daemon atualiza-os ao arrancar e uma vez por dia quando têm mais de 7 dias,
+# quando a página Devtime encontra um modelo sem preço, e no botão "Refresh prices" dessa página;
+# `auto_refresh_prices: false` deixa só o botão. Usa-os só para o custo ESTIMADO do devtime; nunca
+# é a fatura. Um modelo sem preço legível fica com `null`. Um preço por tamanho do prompt (Haiku
+# 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de `min_prompt_tokens` tokens
+# de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode (as da cache escalam com
+# ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo sem eles deixa esses
+# pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é desfeito na próxima
+# passagem.
 # ─────────────────────────────────────────────────────────────
 prices_as_of: "2026-10-18"
 
@@ -1650,14 +1657,16 @@ embedding_model: x
 codex_model: gpt-a
 
 # ─────────────────────────────────────────────────────────────
-# Escrito por `scripts/refresh-models.py`: preços publicados pelos fornecedores, USD por milhão de
-# tokens, lidos em `prices_as_of`. O daemon usa-os só para o custo ESTIMADO do devtime; nunca é a
-# fatura. Um modelo sem preço legível fica com `null` e o script sai com 1. Um preço por tamanho do
-# prompt (Haiku 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de
-# `min_prompt_tokens` tokens de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode
-# (as da cache escalam com ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo
-# sem eles deixa esses pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é
-# desfeito na próxima passagem.
+# Escrito pelo daemon: preços publicados pelos fornecedores, USD por milhão de tokens, lidos em
+# `prices_as_of`. O daemon atualiza-os ao arrancar e uma vez por dia quando têm mais de 7 dias,
+# quando a página Devtime encontra um modelo sem preço, e no botão "Refresh prices" dessa página;
+# `auto_refresh_prices: false` deixa só o botão. Usa-os só para o custo ESTIMADO do devtime; nunca
+# é a fatura. Um modelo sem preço legível fica com `null`. Um preço por tamanho do prompt (Haiku
+# 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de `min_prompt_tokens` tokens
+# de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode (as da cache escalam com
+# ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo sem eles deixa esses
+# pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é desfeito na próxima
+# passagem.
 # ─────────────────────────────────────────────────────────────
 prices_as_of: "2026-10-18"
 
@@ -1672,7 +1681,7 @@ model_prices:
 "#;
 
     #[test]
-    fn the_refresh_writes_byte_for_byte_what_the_script_writes() {
+    fn the_refresh_renders_exactly_the_banner_date_and_rows_pinned_here() {
         let (blocks, lines) =
             refresh_from_bodies(Some(PRICING_MD), Some(GOLDEN_CATALOGUE), "2026-10-18");
         let blocks = blocks.unwrap();

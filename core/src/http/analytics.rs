@@ -145,8 +145,8 @@ async fn devtime(
     if let crate::analytics::Scope::Project(id) = scope {
         known_project(state, id, "devtime analytics").await?;
     }
-    // Re-read per request, so a price refresh (the daemon's own, or the script's) needs no
-    // restart (spec §4.4).
+    // Re-read per request, so a price refresh (or a hand edit of the file) needs no restart
+    // (spec §4.4).
     let models = crate::config::models_config_now();
     let mut overview =
         crate::analytics::devtime::devtime_overview(&state.pool, &models, scope, window, now)

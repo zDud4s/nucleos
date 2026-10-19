@@ -341,6 +341,13 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // vocabularies only, never prompt text, commands or file paths, nothing changed. Marking a finding
     // (`POST /analytics/devtime/findings/{key}/mark`) writes `devtime_feedback` and is in NO table;
     // nor is `POST /analytics/devtime/prices/refresh`, which rewrites `nucleos-models.yaml`.
+    // One deliberate exception to "nothing changed": a devtime view that meets a model without a
+    // price may start a background price refresh (`price_refresh::note_unpriced`) — two GETs of
+    // fixed public vendor pages and a rewrite of the price block of `nucleos-models.yaml`. A
+    // read-only key can cause that but not steer it: nothing from the request reaches the fetch or
+    // the file, the rest of the file is kept byte for byte, it runs at most once per
+    // `AUTO_RETRY_HOURS`, and `auto_refresh_prices: false` turns it off. Accepted rather than
+    // gated, because an estimated cost on stale prices is the worse outcome.
     (Method::GET, "/analytics/devtime"),
     (Method::GET, "/analytics/devtime/findings"),
     (Method::GET, "/projects/{id}/analytics/devtime"),

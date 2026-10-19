@@ -158,6 +158,26 @@ describe("DevtimeSection", () => {
     expect(screen.getByText("Last price refresh failed: fetch failed; no table")).toBeTruthy();
   });
 
+  it("shows the problems of a price refresh that worked, without calling it failed", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens,
+      price_refresh: { at: "2026-10-19T10:00:00Z", ok: true, prices_as_of: "2026-10-19",
+        problems: ["gpt-night written without price", "no fast table"] } };
+    await mount(state);
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    expect(screen.getByText("Last price refresh: gpt-night written without price; no fast table")).toBeTruthy();
+    expect(screen.queryByText(/Last price refresh failed/)).toBeNull();
+  });
+
+  it("says nothing about a price refresh that worked cleanly", async () => {
+    const state = busy();
+    state.devtime.tokens = { ...state.devtime.tokens,
+      price_refresh: { at: "2026-10-19T10:00:00Z", ok: true, prices_as_of: "2026-10-19", problems: [] } };
+    await mount(state);
+    fireEvent.click(await screen.findByRole("button", { name: /Estimated cost/ }));
+    expect(screen.queryByText(/Last price refresh/)).toBeNull();
+  });
+
   it("shows an error when the refresh request itself fails", async () => {
     const state = busy();
     await mount(state);
