@@ -37,6 +37,7 @@ import {
   Teach,
   Well,
 } from "../ui";
+import { WorkflowConsentPanel } from "./WorkflowConsent";
 import { useFocusOnMount, useInlinePanel, WorkflowChain, WorkflowGraph } from "./WorkflowGraph";
 
 /**
@@ -293,6 +294,13 @@ function InstalledRow({
   const library = useWorkflowLibrary();
   const ejectId = useId();
   const guard = useInlinePanel(ejectId);
+  // The step between asking for a version and taking it: the commands it runs, to be read first.
+  // Which version it is for is part of the state, so the button that finally acts sends exactly
+  // the version whose commands were on screen.
+  const [review, setReview] = useState<{
+    version: string;
+    kind: "update" | "follow" | "replace";
+  } | null>(null);
 
   // Where the origin actually IS on this machine, which is not what `origin` on the pin says: that
   // is a coordinate for a machine that does not have the bundle, and this is a path for the one
@@ -375,9 +383,7 @@ function InstalledRow({
         {row.update_available !== null ? (
           <Button
             disabled={update.isPending}
-            onClick={() =>
-              update.mutate({ projectId, name: row.name, version: row.update_available ?? undefined })
-            }
+            onClick={() => setReview({ version: row.update_available ?? row.version, kind: "update" })}
           >
             update to {row.update_available}
           </Button>
@@ -386,7 +392,7 @@ function InstalledRow({
         {row.standing === "drifted" ? (
           <Button
             disabled={update.isPending}
-            onClick={() => update.mutate({ projectId, name: row.name, version: row.version })}
+            onClick={() => setReview({ version: row.version, kind: "follow" })}
           >
             follow the library again
           </Button>
@@ -400,16 +406,16 @@ function InstalledRow({
             {/*
               Update after the diff and never before it: for an ejected workflow this REPLACES the
               copy, which is what update means and why the thing that shows what would be lost sits
-              to its left. And behind an interlock, because it was the most destructive click on
-              the page and fired on the first press — position is not confirmation.
+              to its left. It opens the commands the library's copy runs, and the interlock lives
+              on the button there — the most destructive click on the page, and the one that also
+              swaps in text this project has not read.
             */}
-            <ConfirmButton
-              variant="danger"
-              label="replace with the library's"
-              confirmLabel="replace — this copy's edits are lost"
+            <Button
               disabled={update.isPending}
-              onConfirm={() => update.mutate({ projectId, name: row.name })}
-            />
+              onClick={() => setReview({ version: row.update_available ?? row.version, kind: "replace" })}
+            >
+              replace with the library's
+            </Button>
           </>
         ) : guard.open ? null : (
           <Button id={ejectId} disabled={eject.isPending} onClick={guard.show}>
@@ -437,6 +443,31 @@ function InstalledRow({
           />
         </span>
       </div>
+
+      {review === null ? null : (
+        <WorkflowConsentPanel
+          projectId={projectId}
+          name={row.name}
+          version={review.version}
+          confirmLabel={
+            review.kind === "update"
+              ? `agree and update to ${review.version}`
+              : review.kind === "follow"
+                ? "agree and follow the library again"
+                : "replace — this copy's edits are lost"
+          }
+          holdLabel={review.kind === "replace" ? "replace — this copy's edits are lost" : undefined}
+          pending={update.isPending}
+          sentences={REFUSALS}
+          onCancel={() => setReview(null)}
+          onConfirm={() =>
+            update.mutate(
+              { projectId, name: row.name, version: review.version },
+              { onSuccess: () => setReview(null) },
+            )
+          }
+        />
+      )}
 
       {guard.open ? (
         <EjectGuard
@@ -495,6 +526,7 @@ const REFUSALS: Record<string, string> = {
   not_installed: "this project does not use that workflow.",
   already_ejected: "this project already has its own copy — the diff is the thing to look at.",
   bad_name: "that is not a usable workflow name.",
+  invalid_graph: "this version's graph does not parse, so its commands cannot be listed.",
   internal: `the ${DAEMON_NAME} hit an error of its own.`,
 };
 
@@ -643,6 +675,8 @@ function Library({
 }) {
   const library = useWorkflowLibrary();
   const install = useInstallWorkflow();
+  // The bundle whose commands are on screen, waiting to be agreed to. One at a time.
+  const [reviewing, setReviewing] = useState<Bundle | null>(null);
 
   if (library.isError) {
     // A refusal here was already said above when the project's own listing failed for the same
@@ -687,16 +721,32 @@ function Library({
               bundle={bundle}
               pinnedVersion={pinned.get(bundle.name) ?? null}
               pending={install.isPending}
-              onInstall={() =>
-                install.mutate({
-                  projectId,
-                  name: bundle.name,
-                  version: bundle.version,
-                })
-              }
+              onInstall={() => setReviewing(bundle)}
             />
           ))}
         </Rows>
+      )}
+      {reviewing === null ? null : (
+        <WorkflowConsentPanel
+          key={`${reviewing.name}@${reviewing.version}`}
+          projectId={projectId}
+          name={reviewing.name}
+          version={reviewing.version}
+          confirmLabel={
+            pinned.has(reviewing.name)
+              ? `agree and use ${reviewing.version} instead`
+              : "agree and use here"
+          }
+          pending={install.isPending}
+          sentences={REFUSALS}
+          onCancel={() => setReviewing(null)}
+          onConfirm={() =>
+            install.mutate(
+              { projectId, name: reviewing.name, version: reviewing.version },
+              { onSuccess: () => setReviewing(null) },
+            )
+          }
+        />
       )}
       {install.isError ? (
         isApiRefusal(install.error) ? (

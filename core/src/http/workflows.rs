@@ -51,6 +51,13 @@ pub(super) fn routes() -> Router<AppState> {
             "/projects/{id}/workflows/{name}/graph",
             get(get_project_workflow_graph),
         )
+        // Every command a bundle version would run in this project, verbatim, and which of them
+        // differ from what the project runs today. What the install and update screens show before
+        // the person agrees — slice 10. A GET that writes nothing, in no scope table.
+        .route(
+            "/projects/{id}/workflows/{name}/consent",
+            get(get_project_workflow_consent),
+        )
         // What this project overrides on one node. Under the workflow's name and then the node's,
         // because that is what it is — and a flat `/overlay` taking both in the body would make the
         // one thing being changed invisible in the log.
@@ -601,6 +608,97 @@ pub(super) async fn get_project_workflow_graph(
             version: pinned.version,
             resolved: crate::workflows::graph::resolve(&graph, &pinned.nodes),
         })
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map(Json)
+    .map_err(workflow_refusal)
+}
+
+#[derive(Deserialize)]
+pub(super) struct ConsentQuery {
+    /// The version about to be installed or updated to. Absent means the newest the library has,
+    /// which is what an update without a version would take.
+    #[serde(default)]
+    pub(super) version: Option<String>,
+}
+
+/// Read a graph out of a bundle folder, or `None` when there is no readable graph in it.
+fn graph_in(dir: &std::path::Path) -> Option<crate::workflows::graph::Graph> {
+    let text = std::fs::read_to_string(dir.join(crate::workflows::graph::GRAPH_FILE)).ok()?;
+    crate::workflows::graph::parse(&text).ok()
+}
+
+/// What installing or updating to this version would let run, so the person can agree to exactly
+/// that.
+///
+/// **The target is the library's bundle, and the baseline is the copy the project runs today** —
+/// its own folder when it has one (an ejected or adopted workflow), the library's pinned version
+/// otherwise. A project with no pin has no baseline, and every command is then new.
+///
+/// A target bundle with no graph lists nothing: it has no command nodes, and that is an answer. A
+/// target graph that does not parse is refused with the parser's words, because installing it
+/// would pin something the canvas cannot draw. A baseline that will not parse is treated as empty,
+/// which errs toward showing more as new rather than refusing the update that would fix it.
+pub(super) async fn get_project_workflow_consent(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Query(query): Query<ConsentQuery>,
+) -> Result<Json<crate::workflows::consent::Consent>, (StatusCode, Json<serde_json::Value>)> {
+    let root = resolve_project_root(&state, &id)
+        .await
+        .map_err(|status| refusal(status, "no_project_root"))?;
+    let library = library_or_refusal(&state)?;
+    let pins = pins_file(&state, &id)?;
+
+    tokio::task::spawn_blocking(move || {
+        let target = bundle_or_refusal(&library, &name, query.version.as_deref())?;
+        let target_graph = match std::fs::read_to_string(
+            std::path::Path::new(&target.path).join(crate::workflows::graph::GRAPH_FILE),
+        ) {
+            Ok(text) => crate::workflows::graph::parse(&text)
+                .map_err(crate::workflows::Refused::InvalidGraph)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::workflows::graph::Graph::default()
+            }
+            Err(error) => return Err(crate::workflows::Refused::Io(error.to_string())),
+        };
+
+        let pinned = crate::workflows::read_pins(&pins)
+            .map_err(crate::workflows::Refused::Io)?
+            .workflows
+            .into_iter()
+            .find(|pin| pin.name == name);
+
+        let baseline = match &pinned {
+            None => None,
+            Some(pin) => {
+                let mine = crate::workflows::copy_path(&root, pin).filter(|path| path.is_dir());
+                let (source, graph) = match mine {
+                    Some(path) => ("project", graph_in(&path)),
+                    None => (
+                        "library",
+                        bundle_or_refusal(&library, &name, Some(&pin.version))
+                            .ok()
+                            .and_then(|bundle| graph_in(std::path::Path::new(&bundle.path))),
+                    ),
+                };
+                Some((pin.version.clone(), source, graph.unwrap_or_default()))
+            }
+        };
+        let overlay = pinned
+            .as_ref()
+            .map(|pin| pin.nodes.clone())
+            .unwrap_or_default();
+
+        Ok::<_, crate::workflows::Refused>(crate::workflows::consent::consent(
+            &target.version,
+            &target_graph,
+            baseline
+                .as_ref()
+                .map(|(version, source, graph)| (version.as_str(), *source, graph)),
+            &overlay,
+        ))
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?

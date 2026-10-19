@@ -273,6 +273,9 @@ export const keys = {
     /** One workflow's divergence from its origin, asked for only when somebody opens it. */
     workflowDiff: (projectId: string, name: string) =>
       ["projects", projectId, "workflows", name, "diff"] as const,
+    /** Every command one bundle version would run here, and what changed against what runs now. */
+    workflowConsent: (projectId: string, name: string, version: string) =>
+      ["projects", projectId, "workflows", name, "consent", version] as const,
     /** One workflow's graph, overlay already painted on by the núcleo. */
     workflowGraph: (projectId: string, name: string) =>
       ["projects", projectId, "workflows", name, "graph"] as const,
