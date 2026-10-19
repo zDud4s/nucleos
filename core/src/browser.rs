@@ -1227,6 +1227,7 @@ mod tests {
             runner: std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            utility_model: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),

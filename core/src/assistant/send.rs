@@ -1438,6 +1438,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            utility_model: None,
             assistants: Arc::new(NoAssistants),
             run_handles: Arc::new(Mutex::new(HashMap::new())),
             run_messages: Arc::new(Mutex::new(HashMap::new())),

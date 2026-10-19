@@ -313,6 +313,9 @@ pub struct AppState {
     /// to the remote CLI there would violate that at exactly the moment nobody is watching, so triage
     /// stops instead and mail queues, the same way it already does for the kill switch and the budget.
     pub local_triage_disabled: Option<String>,
+    /// The cheap model a background one-shot (today the rotation compactor) asks the runner for,
+    /// resolved once at startup by `ModelsConfig::utility_model`. `None` keeps the runner's own.
+    pub utility_model: Option<String>,
     /// The factory that builds the model answering a chat turn — the local one, the hosted one on
     /// OpenRouter, or a refusal — resolved per turn instead of two singletons baked at startup.
     ///

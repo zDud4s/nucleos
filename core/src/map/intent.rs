@@ -443,6 +443,18 @@ pub async fn ask_once(
     what: &str,
     standing: Option<&str>,
 ) -> std::io::Result<String> {
+    ask_once_with_model(runner, prompt, what, standing, None).await
+}
+
+/// [`ask_once`] with the model named by the caller (`--model <alias or id>`); `None` keeps the
+/// runner's own, which is what `ask_once` has always done.
+pub async fn ask_once_with_model(
+    runner: &dyn crate::execution::runner::CommandRunner,
+    prompt: String,
+    what: &str,
+    standing: Option<&str>,
+    model: Option<&str>,
+) -> std::io::Result<String> {
     // Every field is spelled out because `RunRequest` deliberately has no `Default` — its own doc
     // comment says why: a flag added later must not silently inherit a value nobody chose. Copied
     // from `council.rs`'s cloud seat, which is the closest neighbour (one question, no tools, no
@@ -492,7 +504,7 @@ pub async fn ask_once(
         // `None` keeps whatever the runner was built with, and that is the point of this signature:
         // the owner chose a brain by choosing which runner arrives here, not by naming a model
         // string that only one of the two would honour.
-        model: None,
+        model: model.map(str::to_owned),
         effort: None,
         fallback_model: Vec::new(),
         add_dirs: Vec::new(),
