@@ -53,7 +53,9 @@ function Fail([int]$Code, [string]$Message) {
 
 # --- 2a. the runtime dir ---------------------------------------------------------------------
 if ([string]::IsNullOrEmpty($RunDir)) {
-    $RunDir = Join-Path (Split-Path -Parent $RepoRoot) '.nucleos-run'
+    # The dev home, never the parent of the checkout: that holds one folder per project.
+    $DevHome = if ($env:NUCLEOS_DEV_HOME) { $env:NUCLEOS_DEV_HOME } else { Join-Path "$env:SystemDrive\" 'nucleos-dev' }
+    $RunDir = Join-Path $DevHome 'run'
 }
 elseif (-not [IO.Path]::IsPathRooted($RunDir)) {
     Fail 2 "-RunDir must be an absolute path (got '$RunDir')"

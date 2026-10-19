@@ -415,12 +415,12 @@ def binary_candidate_cases():
     ]
 
 
-def _token_found_at(wanted):
+def _token_found_at(wanted, env=None):
     """`control_token` with exactly one daemon binary on disk, at `wanted`: `""` if it read `tok`.
 
     Nothing real runs. `cargo_target_dirs`, `os.path.exists` and `subprocess.run` are answered
     here, the ambient `NUCLEOS_DAEMON_TOKEN` is removed, and `deny()` exits, so its `SystemExit`
-    is caught and reported with what it printed.
+    is caught and reported with what it printed. `env` is laid over the environment.
     """
     target = [os.path.join("T", "target")]
 
@@ -432,7 +432,7 @@ def _token_found_at(wanted):
         return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected call")
 
     captured = io.StringIO()
-    with mock.patch.dict(os.environ, {}, clear=False):
+    with mock.patch.dict(os.environ, env or {}, clear=False):
         os.environ.pop("NUCLEOS_DAEMON_TOKEN", None)
         with mock.patch.object(hook, "cargo_target_dirs", lambda _root: target):
             with mock.patch.object(hook.os.path, "exists", lambda path: path == wanted):
@@ -463,6 +463,14 @@ def control_token_cases():
             # only starts it that way has nothing under any target dir: the guard refused --land.
             f"control_token reads the token from the staged run copy, .nucleos-run/{name}",
             _token_found_at(os.path.join(os.path.dirname("/repo"), ".nucleos-run", name)),
+        )
+        for name in ("nucleos-core", "nucleos-core.exe")
+    ] + [
+        (
+            # Since 2026-10-19 the script stages it in the dev home, out of the projects dir.
+            f"control_token reads the token from the dev home's run copy, run/{name}",
+            _token_found_at(os.path.join("/dev-home", "run", name),
+                            env={"NUCLEOS_DEV_HOME": "/dev-home"}),
         )
         for name in ("nucleos-core", "nucleos-core.exe")
     ]
