@@ -5972,7 +5972,9 @@ describe("Chats - a conversation opens at its end", () => {
       });
       await screen.findByText("primeiro e depois muito mais");
 
-      expect(box.scrollTop).toBe(3000);
+      // The status line prints the stream at once, but the answer (and the scroll that follows
+      // it) is drawn on the next animation frame, so on a loaded machine the text is found first.
+      await waitFor(() => expect(box.scrollTop).toBe(3000));
     } finally {
       layout();
     }
