@@ -65,6 +65,8 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 # The native folder picker behind "Add a project"'s Browse button (`dialog:allow-open`).
 tauri-plugin-dialog = "2"
+# Desktop toasts for what is waiting while the window is behind another (`notification:default`).
+tauri-plugin-notification = "2"
 
 [features]
 # CI builds the release bundle with this on. Dev and update-shell builds leave it off, so

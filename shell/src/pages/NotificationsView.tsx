@@ -10,6 +10,7 @@ import {
   type NotifyPolicy,
   type NotifyRule,
 } from "../data/feed";
+import { useDesktopNotify } from "../data/desktop-notify-pref";
 import { useNotifyPolicy, useObservedKinds, useSetNotifyPolicy } from "../data/system";
 import { Button, ErrorNote, Panel, RefusalNote } from "../ui";
 import { DAEMON_NAME } from "../copy";
@@ -95,62 +96,95 @@ export function NotificationsView() {
   }
 
   return (
-    <Panel
-      title="Telegram notifications"
-      /* Save sits in the head, where it is on screen whatever is expanded below it. */
-      aside={
-        <div className="sy-notify-actions">
-          {dirty && <span className="sy-meta">unsaved changes</span>}
-          <span className="sy-meta" role="status">
-            {saved && !dirty ? "saved" : null}
-          </span>
-          <Button
-            onClick={() => {
-              save.mutate(draft, { onSuccess: () => setSaved(true) });
-            }}
-            disabled={!dirty || save.isPending}>
-            {save.isPending ? "saving…" : "Save"}
-          </Button>
-        </div>
-      }
-    >
-      <p className="sy-note sy-notify-never">
-        Proposals, the kill switch and budget alerts are never silenced by these switches, whatever
-        you set here.
-      </p>
+    <>
+      <DesktopSwitch />
+      <Panel
+        title="Telegram notifications"
+        /* Save sits in the head, where it is on screen whatever is expanded below it. */
+        aside={
+          <div className="sy-notify-actions">
+            {dirty && <span className="sy-meta">unsaved changes</span>}
+            <span className="sy-meta" role="status">
+              {saved && !dirty ? "saved" : null}
+            </span>
+            <Button
+              onClick={() => {
+                save.mutate(draft, { onSuccess: () => setSaved(true) });
+              }}
+              disabled={!dirty || save.isPending}>
+              {save.isPending ? "saving…" : "Save"}
+            </Button>
+          </div>
+        }
+      >
+        <p className="sy-note sy-notify-never">
+          Proposals, the kill switch and budget alerts are never silenced by these switches, whatever
+          you set here.
+        </p>
+        <p className="sy-note">
+          A family is a prefix, and a kind can override its family. Anything no rule claims is sent —
+          so a machine nobody has configured behaves exactly as it did before this screen existed.
+          The sidecar re-reads this on its next round: nothing needs restarting.
+        </p>
+
+        {save.isError &&
+          (isApiRefusal(save.error) ? (
+            <RefusalNote refusal={save.error} />
+          ) : (
+            <ErrorNote>the {DAEMON_NAME} is not responding — nothing was saved</ErrorNote>
+          ))}
+
+        <ul className="sy-notify-families">
+          {families.map((family) => (
+            <FamilyItem key={family.selector} family={family} onFamily={setFamily} onKind={setKind} />
+          ))}
+        </ul>
+
+        {loose.length > 0 && (
+          <>
+            <h3 className="sy-notify-heading">On their own</h3>
+            <p className="sy-note">
+              Kinds no family prefix claims. Each is silenced on its own; there is no group switch
+              because there is no group — the grouping here is presentation, not a rule.
+            </p>
+            <ul className="sy-notify-kinds sy-notify-loose">
+              {loose.map((row) => (
+                <KindItem key={row.kind} row={row} onKind={setKind} inFamily={false} />
+              ))}
+            </ul>
+          </>
+        )}
+      </Panel>
+    </>
+  );
+}
+
+/**
+ * The desktop channel's switch: this computer's own toasts, next to Telegram's.
+ *
+ * Not part of the draft below it. It is a preference of this window, saved the moment it is
+ * flipped, and the policy the Telegram switches write is the one the toasts obey too — so there is
+ * nothing here to send to the núcleo.
+ */
+function DesktopSwitch() {
+  const [on, setOn] = useDesktopNotify();
+  return (
+    <Panel title="Desktop notifications">
+      <label className="sy-notify-switch">
+        <input
+          type="checkbox"
+          className="sy-switch"
+          checked={on}
+          onChange={(event) => setOn(event.target.checked)}
+        />
+        <span className="sy-notify-label">
+          Also show these on this computer&apos;s desktop when the window is not in front
+        </span>
+      </label>
       <p className="sy-note">
-        A family is a prefix, and a kind can override its family. Anything no rule claims is sent —
-        so a machine nobody has configured behaves exactly as it did before this screen existed.
-        The sidecar re-reads this on its next round: nothing needs restarting.
+        Waiting approvals, conversations that answered, and the feed lines the choices below allow
+        — the same ones Telegram gets.
       </p>
-
-      {save.isError &&
-        (isApiRefusal(save.error) ? (
-          <RefusalNote refusal={save.error} />
-        ) : (
-          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was saved</ErrorNote>
-        ))}
-
-      <ul className="sy-notify-families">
-        {families.map((family) => (
-          <FamilyItem key={family.selector} family={family} onFamily={setFamily} onKind={setKind} />
-        ))}
-      </ul>
-
-      {loose.length > 0 && (
-        <>
-          <h3 className="sy-notify-heading">On their own</h3>
-          <p className="sy-note">
-            Kinds no family prefix claims. Each is silenced on its own; there is no group switch
-            because there is no group — the grouping here is presentation, not a rule.
-          </p>
-          <ul className="sy-notify-kinds sy-notify-loose">
-            {loose.map((row) => (
-              <KindItem key={row.kind} row={row} onKind={setKind} inFamily={false} />
-            ))}
-          </ul>
-        </>
-      )}
     </Panel>
   );
 }
