@@ -34,6 +34,15 @@ tests:
         - scripts/refresh-models.py
         - scripts/test-refresh-models.py
         - core/assets/nucleos-dev/scripts/
+        # One version across manifests (gates.sh hooks: "release: *").
+        - VERSION
+        - scripts/bump-version.py
+        - scripts/test-bump-version.py
+        - scripts/release-manifest.py
+        - scripts/test-release-manifest.py
+        - scripts/install.ps1
+        - scripts/install.sh
+        - scripts/test-install-scripts.py
       command: bash scripts/gates.sh hooks
     broker:
       # The machine-wide build broker, its classifier and hook, and their tests.
@@ -82,6 +91,7 @@ tests:
     - design/
     - .githooks/
     - AGENTS.md
+    - RELEASING.md
     - CLAUDE.md
     - DESIGN.md
     - PRODUCT.md
