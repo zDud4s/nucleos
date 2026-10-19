@@ -709,7 +709,8 @@
   stroke-linejoin: round;
 }
 
-/* SVG text is sized in viewBox units, so `px` here scales with the room. */
+/* SVG text is sized in viewBox units, so `px` here scales with the room: 12 units
+   at the narrowest two-column room (~520px of 560 units) is still about 11px. */
 .council-court-svg text {
   font-family: var(--font-body);
   fill: var(--text);
@@ -726,19 +727,19 @@
 }
 
 .council-court-svg .council-court-small {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--text-faint);
   letter-spacing: var(--tracking-wide);
 }
 
 .council-court-svg .council-court-wing-title {
-  font-size: 11px;
+  font-size: 12px;
   fill: var(--text);
   letter-spacing: var(--tracking-wide);
 }
 
 .council-court-svg .council-court-balance-label {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--text-muted);
 }
 
@@ -905,7 +906,7 @@
 
 .council-court-svg .council-court-lectern-text {
   font-family: var(--font-display);
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .council-court-svg .council-court-link {
@@ -960,7 +961,7 @@
 }
 
 .council-court-svg .council-court-seat-name {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--text);
 }
 
@@ -973,7 +974,7 @@
 
 /* A masked chair shows its letter, and its name only while it is pointed at. */
 .council-court-svg .council-court-reveal {
-  font-size: 10px;
+  font-size: 12px;
   display: none;
 }
 
@@ -986,12 +987,12 @@
 }
 
 .council-court-svg .council-court-role {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--tone-shadow-fg);
 }
 
 .council-court-svg .council-court-rank {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--text-muted);
 }
 
@@ -1000,7 +1001,7 @@
 }
 
 .council-court-svg .council-court-tick {
-  font-size: 10px;
+  font-size: 12px;
   fill: var(--text-muted);
 }
 
@@ -1317,7 +1318,8 @@
 
 /* ------------------------------------------------------------- responsive -- */
 
-@media (min-width: 901px) {
+/* Two columns only where the room is wide enough for its labels (see the SVG text sizes above). */
+@media (min-width: 1101px) {
   .council-dossier-summary {
     display: none;
   }
@@ -1330,11 +1332,18 @@
   }
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1100px) {
   .council-court-page {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .council-dossier-summary {
+    display: grid;
+  }
+}
+
+/* The small mono labels need a room at least ~560px wide; below that the dossier summary repeats them. */
+@media (max-width: 900px) {
   .council-court-svg .council-court-small {
     display: none;
   }
@@ -1342,10 +1351,6 @@
   .council-court-roll {
     display: grid;
     gap: var(--space-1);
-  }
-
-  .council-dossier-summary {
-    display: grid;
   }
 }
 
