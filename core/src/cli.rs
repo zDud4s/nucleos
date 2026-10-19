@@ -734,7 +734,26 @@ async fn workflow_package() {
     }
 }
 
+/// What `--version` prints: the crate's version and nothing else, so a script can compare it with
+/// `VERSION` byte for byte (`nucleos-core --version` in the release workflow does).
+///
+/// Pure, and taking the arguments, so the test can drive it without a process. `args[0]` is the
+/// program and never a flag.
+pub(super) fn version_output(args: &[String]) -> Option<&'static str> {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "--version")
+        .then_some(env!("CARGO_PKG_VERSION"))
+}
+
 pub(super) async fn run_subcommand() -> bool {
+    // First of all, before anything that could open a database, bind a port or touch the
+    // autostart entry: asking for the version must start nothing.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(version) = version_output(&args) {
+        println!("{version}");
+        return true;
+    }
     if std::env::args().any(|a| a == "--print-token") {
         print_token();
         return true;
