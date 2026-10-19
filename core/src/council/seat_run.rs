@@ -519,15 +519,19 @@ impl Driver {
 
             let seat_outcome = match turn {
                 Err(_) => {
-                    crate::storage::settle_write("council local seat run (timed out)", run_id, || {
-                        sqlx::query(
-                            "UPDATE runs SET status = 'timed_out', completed_at = ?
+                    crate::storage::settle_write(
+                        "council local seat run (timed out)",
+                        run_id,
+                        || {
+                            sqlx::query(
+                                "UPDATE runs SET status = 'timed_out', completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                        )
-                        .bind(&completed_at)
-                        .bind(run_id)
-                        .execute(&pool)
-                    })
+                            )
+                            .bind(&completed_at)
+                            .bind(run_id)
+                            .execute(&pool)
+                        },
+                    )
                     .await;
                     SeatOutcome {
                         status: SEAT_TIMEOUT,
@@ -539,17 +543,21 @@ impl Driver {
                     // `cost_usd = 0` and not NULL. A local seat spends nothing, and NULL is what
                     // `budget.rs` time-approximates a cost for — an unmeasured run — so leaving it
                     // unset would charge the window for electricity.
-                    crate::storage::settle_write("council local seat run (completed)", run_id, || {
-                        sqlx::query(
-                            "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
+                    crate::storage::settle_write(
+                        "council local seat run (completed)",
+                        run_id,
+                        || {
+                            sqlx::query(
+                                "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?,
                                 cost_usd = 0, completed_at = ?
                          WHERE id = ? AND status = 'running'",
-                        )
-                        .bind(&turn.answer)
-                        .bind(&completed_at)
-                        .bind(run_id)
-                        .execute(&pool)
-                    })
+                            )
+                            .bind(&turn.answer)
+                            .bind(&completed_at)
+                            .bind(run_id)
+                            .execute(&pool)
+                        },
+                    )
                     .await;
                     SeatOutcome {
                         status: SEAT_OK,

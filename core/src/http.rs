@@ -1155,6 +1155,150 @@ mod tests {
         db.close().await;
     }
 
+    #[tokio::test]
+    async fn storage_route_requires_the_bearer_token() {
+        let response = backup_request(test_state().await, "GET", "/system/storage", None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn storage_route_reports_the_free_pages_after_a_delete() {
+        let (state, db) = file_test_state().await;
+        sqlx::query("CREATE TABLE scratch (payload TEXT NOT NULL)")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 200)              INSERT INTO scratch SELECT hex(randomblob(2048)) FROM c",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM scratch")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        // A copy nothing prunes, and an automatic backup to read the date from.
+        std::fs::write(
+            db.path().join("nucleos.db.before-116-revert"),
+            vec![0_u8; 1000],
+        )
+        .unwrap();
+        let backup_dir = db.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(
+            backup_dir.join("auto-nucleos-20261019T030000.000000000Z-0000.db"),
+            vec![0_u8; 40],
+        )
+        .unwrap();
+
+        let response =
+            backup_request(state.clone(), "GET", "/system/storage", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let freelist = report["freelist_count"].as_i64().unwrap();
+        let page_size = report["page_size"].as_i64().unwrap();
+        assert!(
+            freelist > 0,
+            "the deleted rows' pages are on the freelist: {report}"
+        );
+        assert_eq!(
+            report["reclaimable_bytes"].as_i64().unwrap(),
+            freelist * page_size
+        );
+        assert!(report["db_bytes"].as_u64().unwrap() > 0);
+        assert!(report["wal_bytes"].is_u64());
+        assert_eq!(report["loose_bytes"], 1000);
+        assert_eq!(report["backups_bytes"], 40);
+        assert!(
+            report["files_bytes"].is_null(),
+            "the test state has no files folder"
+        );
+        assert_eq!(report["auto_backup_last"], "2026-10-19T03:00:00Z");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn storage_compact_route_requires_the_bearer_token() {
+        let response =
+            backup_request(test_state().await, "POST", "/system/storage/compact", None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn storage_report(state: AppState) -> serde_json::Value {
+        let response = backup_request(state, "GET", "/system/storage", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn storage_compact_route_schedules_a_compaction_for_the_next_start() {
+        let (state, db) = file_test_state().await;
+        let marker = db.path().join("nucleos.db.compact-pending");
+        assert_eq!(
+            storage_report(state.clone()).await["compaction_pending"],
+            false
+        );
+
+        let response = backup_request(
+            state.clone(),
+            "POST",
+            "/system/storage/compact",
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let staged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(staged["applies"], "on next daemon start");
+        assert!(marker.exists(), "the request is a marker beside the file");
+        assert_eq!(
+            storage_report(state.clone()).await["compaction_pending"],
+            true
+        );
+
+        // Asking twice is the same request, not an error.
+        let again = backup_request(
+            state.clone(),
+            "POST",
+            "/system/storage/compact",
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn storage_compact_route_is_refused_while_a_restore_is_pending() {
+        let (state, db) = file_test_state().await;
+        let taken = backup::take_backup(&state.pool, 5).await.unwrap();
+        backup::stage_restore(&state.pool, &taken.name)
+            .await
+            .unwrap();
+
+        let response = backup_request(
+            state.clone(),
+            "POST",
+            "/system/storage/compact",
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!db.path().join("nucleos.db.compact-pending").exists());
+        assert_eq!(storage_report(state).await["compaction_pending"], false);
+        db.close().await;
+    }
+
     /// Seeds a team, and optionally a job of two items whose runs carry a peak each.
     ///
     /// Plain SQL rather than reaching into `pressure`'s own test helpers: those are private to that
@@ -9073,8 +9217,12 @@ mod tests {
     #[tokio::test]
     async fn machine_config_route_reports_a_file_that_does_not_parse() {
         let (state, temp) = state_with_machine_root().await;
-        std::fs::write(temp.path().join("email.yaml"), "enabled: [this is not a bool}
-").unwrap();
+        std::fs::write(
+            temp.path().join("email.yaml"),
+            "enabled: [this is not a bool}
+",
+        )
+        .unwrap();
         std::fs::write(temp.path().join("calendar.yaml"), "").unwrap();
 
         let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
@@ -9094,7 +9242,10 @@ mod tests {
 
         let absent = machine_row(&body, "voice.yaml");
         assert_eq!(absent["exists"], false);
-        assert_eq!(absent["valid"], true, "an absent file means defaults, which is valid");
+        assert_eq!(
+            absent["valid"], true,
+            "an absent file means defaults, which is valid"
+        );
     }
 
     /// What the daemon started on is served beside what is on disk now, so a file fixed after the
@@ -9103,18 +9254,29 @@ mod tests {
     async fn machine_config_route_reports_what_the_daemon_started_on() {
         let (mut state, temp) = state_with_machine_root().await;
         // The file was broken when the daemon read it ...
-        std::fs::write(temp.path().join("email.yaml"), "enabled: [this is not a bool}
-").unwrap();
+        std::fs::write(
+            temp.path().join("email.yaml"),
+            "enabled: [this is not a bool}
+",
+        )
+        .unwrap();
         state.startup_config = std::sync::Arc::new(crate::machine_config::check_all(temp.path()));
         // ... and has been fixed since.
-        std::fs::write(temp.path().join("email.yaml"), "enabled: false
-").unwrap();
+        std::fs::write(
+            temp.path().join("email.yaml"),
+            "enabled: false
+",
+        )
+        .unwrap();
 
         let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
 
         let email = machine_row(&body, "email.yaml");
         assert_eq!(email["valid"], true, "the file on disk now parses");
-        assert_eq!(email["at_startup"]["valid"], false, "but the daemon started without it");
+        assert_eq!(
+            email["at_startup"]["valid"], false,
+            "but the daemon started without it"
+        );
         assert!(!email["at_startup"]["problem"].as_str().unwrap().is_empty());
 
         let web = machine_row(&body, "web.yaml");

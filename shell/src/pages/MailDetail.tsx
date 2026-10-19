@@ -15,6 +15,7 @@ import {
   type SavedAttachments,
   type SavedFile,
 } from "../data/mail";
+import { formatBytes } from "../data/files";
 import {
   Button,
   ConfirmButton,
@@ -358,12 +359,6 @@ function AttachmentError({ error, what }: { error: unknown; what: string }) {
     );
   }
   return <ErrorNote>{`Could not reach the ${DAEMON_NAME}: ${what}.`}</ErrorNote>;
-}
-
-function formatBytes(size: number): string {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /* -------------------------------------------------------- sender verdict -- */

@@ -37,6 +37,11 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
+        // In no `auth.rs` table on purpose, like `/config/machine`: it names the data directory's
+        // layout and sizes, which a read-only key has no use for.
+        .route("/system/storage", get(get_system_storage))
+        // Same reasoning, and the same default: it rewrites the database file on the next start.
+        .route("/system/storage/compact", post(post_system_storage_compact))
         .route("/backups/{name}/restore", post(post_backup_restore))
         .route("/api-tokens", get(list_api_tokens).post(create_api_token))
         .route(
@@ -181,6 +186,103 @@ pub(super) async fn get_backups(
         .map_err(|error| backup_status(&error))
 }
 
+/// How long one folder may take to measure before the panel shows "unknown" instead of waiting.
+/// A files folder holding years of attachments is a tree of tens of thousands of entries, and a
+/// slow disk must not hold a poll that the shell repeats every few seconds.
+const FOLDER_SIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Serialize)]
+pub(super) struct StorageReport {
+    #[serde(flatten)]
+    database: crate::storage::DatabaseStats,
+    /// `null` for the three folders when measuring ran past [`FOLDER_SIZE_BUDGET`] (or the folder
+    /// is not configured), so "unknown" never reads as "empty".
+    backups_bytes: Option<u64>,
+    files_bytes: Option<u64>,
+    logs_bytes: Option<u64>,
+    /// `nucleos.db.*` copies lying beside the database, that nothing prunes.
+    loose_bytes: u64,
+    /// When the newest automatic backup was taken, from its file name.
+    auto_backup_last: Option<String>,
+    /// A compaction is scheduled for the next start (`POST /system/storage/compact`).
+    compaction_pending: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct StagedCompaction {
+    applies: &'static str,
+}
+
+/// Schedules a `VACUUM` for the next daemon start, before the pool opens. Never runs one here: a
+/// compaction holds the file for as long as it takes, which no request should wait on. 409 while a
+/// restore is pending.
+pub(super) async fn post_system_storage_compact(
+    State(state): State<AppState>,
+) -> Result<Json<StagedCompaction>, StatusCode> {
+    backup::stage_compaction(&state.pool)
+        .await
+        .map(|()| {
+            Json(StagedCompaction {
+                applies: "on next daemon start",
+            })
+        })
+        .map_err(|error| backup_status(&error))
+}
+
+pub(super) async fn get_system_storage(
+    State(state): State<AppState>,
+) -> Result<Json<StorageReport>, StatusCode> {
+    let database = crate::storage::database_stats(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "storage: could not read the database page counts");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let db_path = crate::storage::database_file(&state.pool)
+        .await
+        .ok()
+        .flatten();
+    let compaction_pending = db_path.as_deref().is_some_and(backup::compaction_pending);
+    let data_dir = db_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf);
+    let (backups_bytes, files_bytes, logs_bytes) = tokio::join!(
+        folder_size(data_dir.as_ref().map(|dir| dir.join("backups"))),
+        folder_size(state.files_root.clone()),
+        folder_size(data_dir.as_ref().map(|dir| dir.join("logs"))),
+    );
+    let loose_bytes = match db_path {
+        Some(path) => tokio::task::spawn_blocking(move || crate::storage::loose_files_bytes(&path))
+            .await
+            .unwrap_or(0),
+        None => 0,
+    };
+    let auto_backup_last = backup::newest_auto_backup(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|taken| taken.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    Ok(Json(StorageReport {
+        database,
+        backups_bytes,
+        files_bytes,
+        logs_bytes,
+        loose_bytes,
+        auto_backup_last,
+        compaction_pending,
+    }))
+}
+
+async fn folder_size(path: Option<std::path::PathBuf>) -> Option<u64> {
+    let path = path?;
+    let measuring = tokio::task::spawn_blocking(move || crate::storage::directory_size(&path));
+    tokio::time::timeout(FOLDER_SIZE_BUDGET, measuring)
+        .await
+        .ok()?
+        .ok()
+}
+
 pub(super) async fn post_backup_restore(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -217,9 +319,9 @@ pub(super) fn backup_status(error: &backup::BackupError) -> StatusCode {
             StatusCode::CONFLICT
         }
         backup::BackupError::Verification(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        backup::BackupError::Database(_) | backup::BackupError::Io(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        backup::BackupError::Database(_)
+        | backup::BackupError::Io(_)
+        | backup::BackupError::CompactionUnverified { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
