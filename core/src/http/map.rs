@@ -66,6 +66,11 @@ pub(super) fn routes() -> Router<AppState> {
         // The owner moving a module to another layer. In NO table in `auth.rs`, like `anchors`:
         // a read-only key must not rearrange the owner's architecture.
         .route("/projects/{id}/map/layers", post(post_project_map_layer))
+        // Accepting today's graph as the new baseline. In NO table in `auth.rs` for the same reason.
+        .route(
+            "/projects/{id}/map/layers/baseline",
+            post(post_project_map_layer_baseline),
+        )
         // The model's second entrance (§6), and in no table in `auth.rs` for `extract`'s reason
         // doubled: it spends a model per decision. No id anywhere on it, and that is §10 rather
         // than an omission — the triager's scope is everything nobody has stamped, and a caller
@@ -1829,6 +1834,41 @@ pub(super) async fn post_project_map_layer(
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "writing a layer override failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /projects/{id}/map/layers/baseline`: the owner accepts today's graph. The layers are
+/// derived again from the tree as it is now and replace the frozen baseline, so every import that
+/// was `new` becomes part of it. The owner's own moves stay: they are decisions, not a portrait.
+/// `204` when written, `404` for an unknown project.
+pub(super) async fn post_project_map_layer_baseline(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let root = resolve_read_root(&state, &id, None).await?;
+    let structure = tokio::task::spawn_blocking(move || crate::map::structure(&root))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return StatusCode::NOT_FOUND;
+            }
+            tracing::warn!(%error, project_id = %id, "reading the tree to re-freeze layers failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let paths: Vec<String> = structure.modules.iter().map(|m| m.path.clone()).collect();
+    let derived = crate::map::layers::assign(
+        &paths,
+        &structure.imports,
+        &std::collections::BTreeMap::new(),
+    );
+    crate::map::store::refreeze_layers(&state.pool, &id, &derived, &structure.imports)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, project_id = %id, "re-freezing the project's layers failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(StatusCode::NO_CONTENT)

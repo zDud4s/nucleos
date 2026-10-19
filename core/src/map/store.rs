@@ -1148,6 +1148,54 @@ pub async fn freeze_layers(
     Ok(true)
 }
 
+/// Replaces a project's frozen baseline with a new one, in one transaction: the owner accepting
+/// today's graph. [`freeze_layers`] refuses when a baseline exists, and that is right for the
+/// automatic first read; this is the deliberate counterpart. The owner's moves in
+/// `map_layer_overrides` are not touched, they are decisions and not part of the portrait.
+pub async fn refreeze_layers(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    layers: &std::collections::BTreeMap<String, u32>,
+    imports: &[crate::map::Import],
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM map_layer_modules WHERE project_id = ?")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM map_layer_imports WHERE project_id = ?")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    for (path, layer) in layers {
+        sqlx::query(
+            "INSERT OR IGNORE INTO map_layer_modules (project_id, path, layer, frozen_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(path)
+        .bind(i64::from(*layer))
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for import in imports {
+        sqlx::query(
+            "INSERT OR IGNORE INTO map_layer_imports (project_id, from_path, to_path)
+             VALUES (?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(&import.from)
+        .bind(&import.to)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// The owner's layer moves for one project, by path.
 pub async fn layer_overrides(
     pool: &sqlx::SqlitePool,
@@ -2818,6 +2866,43 @@ mod tests {
         assert_eq!(layer_baseline(&pool, "alpha").await.unwrap(), frozen);
 
         // Another project is untouched by the first one's freeze.
+        assert!(
+            layer_baseline(&pool, "beta")
+                .await
+                .unwrap()
+                .layers
+                .is_empty()
+        );
+    }
+
+    /// A re-freeze replaces the baseline and leaves the owner's moves alone.
+    #[tokio::test]
+    async fn a_refreeze_replaces_the_baseline_and_keeps_the_overrides() {
+        let pool = test_pool().await;
+        let first = std::collections::BTreeMap::from([("a.rs".to_string(), 1u32)]);
+        let imports = vec![crate::map::Import {
+            from: "a.rs".to_string(),
+            to: "b.rs".to_string(),
+        }];
+        freeze_layers(&pool, "alpha", &first, &imports)
+            .await
+            .unwrap();
+        set_layer_override(&pool, "alpha", "a.rs", Some(4))
+            .await
+            .unwrap();
+
+        let second = std::collections::BTreeMap::from([
+            ("a.rs".to_string(), 2u32),
+            ("c.rs".to_string(), 0u32),
+        ]);
+        refreeze_layers(&pool, "alpha", &second, &[]).await.unwrap();
+
+        let baseline = layer_baseline(&pool, "alpha").await.unwrap();
+        assert_eq!(baseline.layers, second);
+        assert!(baseline.imports.is_empty(), "{baseline:?}");
+        assert_eq!(layer_overrides(&pool, "alpha").await.unwrap()["a.rs"], 4);
+
+        // Another project is untouched.
         assert!(
             layer_baseline(&pool, "beta")
                 .await

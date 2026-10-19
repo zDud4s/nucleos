@@ -1060,6 +1060,21 @@ button.ws-lead-door:hover {
   border-radius: var(--radius-sm);
 }
 
+.ws-layer-lines {
+  fill: var(--text-muted);
+  max-width: 100%;
+}
+
+.ws-layer-line {
+  stroke: var(--text-muted);
+  opacity: 0.7;
+}
+
+.ws-layer-line[data-new="true"] {
+  stroke: var(--tone-danger-fg);
+  opacity: 1;
+}
+
 .ws-layer-up {
   color: var(--tone-danger-fg);
   font-weight: var(--weight-medium);

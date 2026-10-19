@@ -1,5 +1,5 @@
 // §spec mapa-do-projeto
-import type { Layering, MapImport, MapModule } from "../data/project-map";
+import type { LayerViolation, Layering, MapImport, MapModule } from "../data/project-map";
 import { blockKey } from "./atlas-model";
 
 /** The files of one folder that sit in one layer. */
@@ -119,4 +119,73 @@ export function isolate(
     if (from === layer) bump(outOf, to);
   }
   return { band, into, outOf };
+}
+
+/** One row of the ladder: a band, or a run of quiet bands folded into one. */
+export interface LadderRow {
+  /** Highest layer in the row. */
+  top: number;
+  /** Lowest layer in the row (equal to `top` for a single band). */
+  bottom: number;
+  files: number;
+}
+
+/** Upward imports joining two rows, counted together. `fromRow` is the importer's row. */
+export interface LadderLine {
+  fromRow: number;
+  toRow: number;
+  count: number;
+  newCount: number;
+}
+
+export interface Ladder {
+  rows: LadderRow[];
+  lines: LadderLine[];
+}
+
+/**
+ * The stack boiled down to what an upward import needs: one row per band, and a line for every
+ * pair of rows an upward import joins. When there are more bands than `limit` the bands no
+ * violation starts or ends at are folded into runs, so a deep graph keeps its lines readable;
+ * with `limit` or fewer, nothing is folded.
+ */
+export function ladder(bands: Band[], violations: LayerViolation[], limit = 12): Ladder {
+  const ends = new Set<number>();
+  for (const violation of violations) {
+    ends.add(violation.from_layer);
+    ends.add(violation.to_layer);
+  }
+  const fold = bands.length > limit;
+
+  const rows: LadderRow[] = [];
+  const rowOf = new Map<number, number>();
+  let open = false;
+  for (const band of bands) {
+    if (fold && !ends.has(band.layer) && open) {
+      const row = rows[rows.length - 1];
+      row.bottom = band.layer;
+      row.files += band.files;
+    } else {
+      rows.push({ top: band.layer, bottom: band.layer, files: band.files });
+      open = fold && !ends.has(band.layer);
+    }
+    rowOf.set(band.layer, rows.length - 1);
+  }
+
+  const joined = new Map<string, LadderLine>();
+  for (const violation of violations) {
+    const fromRow = rowOf.get(violation.from_layer);
+    const toRow = rowOf.get(violation.to_layer);
+    if (fromRow === undefined || toRow === undefined || fromRow === toRow) continue;
+    const key = `${fromRow}:${toRow}`;
+    let line = joined.get(key);
+    if (line === undefined) {
+      line = { fromRow, toRow, count: 0, newCount: 0 };
+      joined.set(key, line);
+    }
+    line.count += 1;
+    if (violation.new) line.newCount += 1;
+  }
+  const lines = [...joined.values()].sort((a, b) => a.fromRow - b.fromRow || a.toRow - b.toRow);
+  return { rows, lines };
 }
