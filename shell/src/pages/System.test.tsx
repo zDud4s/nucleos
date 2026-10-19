@@ -18,7 +18,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { System } from "./System";
+import { System, takenAt } from "./System";
 import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
@@ -257,6 +257,7 @@ function systemFetch(
       if (path === "/backup") {
         const created: BackupInfo = {
           name: `snap-${String(world.backups.length + 1)}`,
+          kind: "manual",
           migration_version: 60,
           size_bytes: 1024,
         };
@@ -1050,11 +1051,17 @@ describe("System - quota brake", () => {
 /* ----------------------------------------------------------------- backups -- */
 
 describe("System - backups", () => {
+  it("dates an automatic copy from its name like a manual one", () => {
+    expect(takenAt("nucleos-20261019T094420.000000000Z-0000.db")).toBe("2026-10-19T09:44:20Z");
+    expect(takenAt("auto-nucleos-20261019T094420.000000000Z-0000.db")).toBe("2026-10-19T09:44:20Z");
+    expect(takenAt("snap-1")).toBeNull();
+  });
+
   it("lists backups and says a restore is staged for the next start", async () => {
     const world = systemWorld({
       backups: [
-        { name: "snap-1", migration_version: 60, size_bytes: 2048 },
-        { name: "snap-0", migration_version: null, size_bytes: 512 },
+        { name: "snap-1", kind: "manual", migration_version: 60, size_bytes: 2048 },
+        { name: "snap-0", kind: "manual", migration_version: null, size_bytes: 512 },
       ],
     });
     daemon.apiFetch.mockImplementation(systemFetch(world));
@@ -1082,7 +1089,7 @@ describe("System - backups", () => {
 
   it("says a restore is already staged when the daemon answers 409", async () => {
     const world = systemWorld({
-      backups: [{ name: "snap-1", migration_version: 60, size_bytes: 2048 }],
+      backups: [{ name: "snap-1", kind: "manual", migration_version: 60, size_bytes: 2048 }],
     });
     daemon.apiFetch.mockImplementation(
       systemFetch(world, {

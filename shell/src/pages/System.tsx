@@ -1075,12 +1075,12 @@ function BackupsView() {
 /**
  * When a snapshot was taken, read back out of its name.
  *
- * `backup.rs` names every snapshot `nucleos-<UTC stamp>-<seq>.db`, and that stamp is the only
+ * `backup.rs` names every snapshot `[auto-]nucleos-<UTC stamp>-<seq>.db`, and that stamp is the only
  * time the listing carries. A name that does not fit the pattern answers `null` and the row
  * shows the name alone, rather than a date this page made up.
  */
 export function takenAt(name: string): string | null {
-  const match = /^nucleos-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(name);
+  const match = /^(?:auto-)?nucleos-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/.exec(name);
   if (match === null) return null;
   const [, year, month, day, hour, minute, second] = match;
   return `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;

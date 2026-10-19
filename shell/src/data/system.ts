@@ -538,6 +538,8 @@ export function wantsAttention(readout: HealthReadout | undefined): boolean {
 /** One stored snapshot — `backup::BackupInfo`. */
 export interface BackupInfo {
   name: string;
+  /** Who took it: a person pressing the button, or the daemon's weekly `auto-` copy. */
+  kind: "manual" | "auto";
   /** Absent when the snapshot predates version stamping — absent is not zero. */
   migration_version: number | null;
   size_bytes: number;

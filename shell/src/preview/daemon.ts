@@ -2910,17 +2910,17 @@ const EMAIL_CONFIG = {
  * with one that predates version stamping so the "unknown" migration has a row to show on.
  */
 /** `backup.rs`'s file name for a snapshot taken `ms` ago — the stamp is what the page dates it by. */
-function snapshotName(ms: number, sequence = 0): string {
+function snapshotName(ms: number, sequence = 0, auto = false): string {
   const stamp = ago(ms).replace(/[-:]/g, "").replace(/\.\d+Z$/, "");
-  return `nucleos-${stamp}.000000000Z-${String(sequence).padStart(4, "0")}.db`;
+  return `${auto ? "auto-" : ""}nucleos-${stamp}.000000000Z-${String(sequence).padStart(4, "0")}.db`;
 }
 
 const BACKUPS: BackupInfo[] = [
-  { name: snapshotName(7 * HOUR), migration_version: 64, size_bytes: 18_874_368 },
-  { name: snapshotName(DAY + 7 * HOUR), migration_version: 64, size_bytes: 18_612_224 },
-  { name: snapshotName(2 * DAY + 2 * HOUR, 1), migration_version: 63, size_bytes: 18_350_080 },
-  { name: snapshotName(2 * DAY + 7 * HOUR), migration_version: 63, size_bytes: 18_087_936 },
-  { name: snapshotName(15 * DAY), migration_version: null, size_bytes: 15_204_352 },
+  { name: snapshotName(7 * HOUR), kind: "manual", migration_version: 64, size_bytes: 18_874_368 },
+  { name: snapshotName(DAY + 7 * HOUR, 0, true), kind: "auto", migration_version: 64, size_bytes: 18_612_224 },
+  { name: snapshotName(2 * DAY + 2 * HOUR, 1), kind: "manual", migration_version: 63, size_bytes: 18_350_080 },
+  { name: snapshotName(2 * DAY + 7 * HOUR), kind: "manual", migration_version: 63, size_bytes: 18_087_936 },
+  { name: snapshotName(15 * DAY), kind: "manual", migration_version: null, size_bytes: 15_204_352 },
 ];
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
