@@ -1,0 +1,10 @@
+.identities-sender { margin-bottom: var(--space-3, 0.75rem); }
+.identities-sender-head { display: flex; gap: 0.5rem; align-items: baseline; }
+.identities-sender-name { font-weight: 600; }
+.identities-sender-ref { color: var(--text-muted, inherit); font-variant-numeric: tabular-nums; }
+.identities-conversations { list-style: none; margin: 0.25rem 0 0; padding: 0; }
+.identities-conversation { display: flex; gap: 0.5rem; align-items: center; padding: 0.15rem 0; }
+.identities-conversation-ref { font-variant-numeric: tabular-nums; }
+.identities-projects { list-style: none; margin: 0.25rem 0; padding: 0; }
+.identities-project { display: flex; gap: 0.5rem; }
+.identities-empty { color: var(--text-muted, inherit); }
