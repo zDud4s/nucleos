@@ -43,5 +43,6 @@ pub mod tests_map;
 pub mod transcribe;
 pub mod trust;
 pub mod verify_sched;
+pub mod wake;
 pub mod warm;
 pub mod web_client;
