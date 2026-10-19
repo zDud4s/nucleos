@@ -297,7 +297,7 @@ export function PaletteProvider({ children }: PaletteProviderProps) {
       >
         <CommandInput
           className="ui-palette-input"
-          placeholder="Go to a page, or anything this page offers…"
+          placeholder="Go to a page, or search everything…"
           value={query}
           onValueChange={setQuery}
         />

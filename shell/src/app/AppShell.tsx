@@ -12,6 +12,7 @@ import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { ConnectionGate } from "./ConnectionGate";
 import { CaptureChord } from "./CaptureChord";
 import { ConversationChord } from "./ConversationChord";
+import { GlobalSearch } from "./GlobalSearch";
 import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
@@ -107,6 +108,7 @@ function Frame() {
         <ConversationChord />
         <CaptureChord />
         <Destinations />
+        <GlobalSearch />
         <Sidebar
           badges={{
             proposals: waiting,

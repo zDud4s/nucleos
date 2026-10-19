@@ -3014,6 +3014,51 @@ ol.ui-well {
   white-space: nowrap;
 }
 
+/* A global-search hit: the title and where it is from on one line, the excerpt under it, clamped
+   to two lines so a list of hits is scanned rather than scrolled. Text only. */
+.ui-palette-hit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.ui-palette-hit-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.ui-palette-hit-title {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ui-palette-hit-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ui-palette-hit-text {
+  min-width: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 .ui-palette-empty {
   padding: var(--space-4);
   color: var(--text-muted);
