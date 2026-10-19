@@ -26,6 +26,7 @@ import type {
   ApiTokenLevel,
   ApiTokenSummary,
   BackupInfo,
+  StorageReport,
   BudgetView,
   CalendarConfig,
   CreatedApiToken,
@@ -116,6 +117,8 @@ interface SystemWorld {
   budget: BudgetView;
   quotaBrake: QuotaBrakeView;
   backups: BackupInfo[];
+  /** What `/system/storage` answers; `undefined` is a daemon that cannot read it. */
+  storage?: StorageReport;
   pii: PiiTallyRow[];
   tokens: ApiTokenSummary[];
   emailConfig: EmailConfig;
@@ -350,6 +353,9 @@ function systemFetch(
         return world.quotaBrake;
       case "/backups":
         return world.backups;
+      case "/system/storage":
+        if (world.storage === undefined) throw new ApiRefusal(404, "not_found", "no such route");
+        return world.storage;
       case "/pii/observations":
         return world.pii;
       case "/api-tokens":
@@ -1055,6 +1061,57 @@ describe("System - backups", () => {
     expect(takenAt("nucleos-20261019T094420.000000000Z-0000.db")).toBe("2026-10-19T09:44:20Z");
     expect(takenAt("auto-nucleos-20261019T094420.000000000Z-0000.db")).toBe("2026-10-19T09:44:20Z");
     expect(takenAt("snap-1")).toBeNull();
+  });
+
+  it("shows the space the database uses", async () => {
+    const world = systemWorld({
+      storage: {
+        db_bytes: 440 * 1024 * 1024,
+        wal_bytes: 4 * 1024 * 1024,
+        page_size: 4096,
+        page_count: 112_640,
+        freelist_count: 4_864,
+        reclaimable_bytes: 19 * 1024 * 1024,
+        backups_bytes: 90 * 1024 * 1024,
+        files_bytes: null,
+        logs_bytes: 8 * 1024 * 1024,
+        loose_bytes: 2 * 1024 * 1024,
+        auto_backup_last: "2026-10-19T03:00:00Z",
+      },
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/backups");
+
+    const database = (await screen.findByText("Database")).closest("article");
+    expect(database?.textContent).toMatch(/440\.0 MB/);
+    expect(database?.textContent).toMatch(/4\.0 MB write-ahead log/);
+    // The reclaimable pages are drawn against the whole file, in words as well as width.
+    expect(screen.getByRole("img", { name: /Reclaimable/ }).getAttribute("aria-label")).toMatch(/19\.0 MB/);
+    expect(screen.getByText("Backups", { selector: ".ui-stat-label" }).closest("article")?.textContent).toMatch(
+      /90\.0 MB/,
+    );
+    // A folder the daemon could not measure in time is not an empty one.
+    const files = screen.getByText("Files").closest("article");
+    expect(files?.textContent).toMatch(/not measured in time/);
+    expect(files?.textContent).not.toMatch(/0 B/);
+    expect(screen.getByText(/2\.0 MB of old database copies/)).toBeTruthy();
+  });
+
+  it("marks an automatic backup in the list", async () => {
+    const world = systemWorld({
+      backups: [
+        { name: "auto-nucleos-20261019T030000.000000000Z-0000.db", kind: "auto", migration_version: 64, size_bytes: 2048 },
+        { name: "nucleos-20261018T030000.000000000Z-0000.db", kind: "manual", migration_version: 64, size_bytes: 2048 },
+      ],
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/backups");
+
+    const list = await screen.findByRole("list", { name: "Backups" });
+    expect(rowFor(list, "auto-nucleos-20261019T030000.000000000Z-0000.db").textContent).toMatch(/automatic/);
+    expect(rowFor(list, "nucleos-20261018T030000.000000000Z-0000.db").textContent).not.toMatch(/automatic/);
   });
 
   it("lists backups and says a restore is staged for the next start", async () => {

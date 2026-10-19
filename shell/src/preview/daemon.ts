@@ -32,6 +32,7 @@ import type {
   Proposal,
   QuotaBrakeView,
   SidecarState,
+  StorageReport,
 } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
 import type { NoteDetail, NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
@@ -2923,6 +2924,21 @@ const BACKUPS: BackupInfo[] = [
   { name: snapshotName(15 * DAY), kind: "manual", migration_version: null, size_bytes: 15_204_352 },
 ];
 
+/** What the database and its folders occupy: a mostly-full file with some pages to give back. */
+const STORAGE: StorageReport = {
+  db_bytes: 440_401_920,
+  wal_bytes: 4_194_304,
+  page_size: 4096,
+  page_count: 107_520,
+  freelist_count: 4_650,
+  reclaimable_bytes: 19_046_400,
+  backups_bytes: 92_274_688,
+  files_bytes: 318_767_104,
+  logs_bytes: 8_388_608,
+  loose_bytes: 0,
+  auto_backup_last: ago(DAY + 7 * HOUR),
+};
+
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
 const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["email", "Which mailbox the e-mail pillar reads, and how often.", "host: imap.example.com\nusername: me@example.com\nmailbox: INBOX\npoll_interval_secs: 120\n"],
@@ -3391,6 +3407,7 @@ export function answer(path: string, init?: RequestInit): unknown {
 
   if (path === "/sidecars" && init?.method === undefined) return SIDECARS;
   if (path === "/backups" && init?.method === undefined) return BACKUPS;
+  if (path === "/system/storage") return STORAGE;
   if (path === "/pii/observations") return PII;
   if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;

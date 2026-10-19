@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
+import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
 import { NotchProviders } from "./NotchProviders";
 import {
@@ -27,6 +28,7 @@ import {
   useSetQuotaBrake,
   useSidecars,
   useStageRestore,
+  useStorage,
   useSystemHealth,
   useTakeBackup,
   useVoiceConfig,
@@ -60,7 +62,9 @@ import {
   Row,
   Rows,
   Section,
+  StatCard,
   StateBadge,
+  Meter,
 } from "../ui";
 import { MachineSettings } from "./MachineSettings";
 import { NotificationsView } from "./NotificationsView";
@@ -1066,9 +1070,84 @@ function BudgetPanel() {
 function BackupsView() {
   return (
     <div className="sy-backups-layout">
-      <BackupsPanel />
+      <div className="sy-backups-main">
+        <SpacePanel />
+        <BackupsPanel />
+      </div>
       <PiiObservations />
     </div>
+  );
+}
+
+/**
+ * What the database and the folders beside it occupy.
+ *
+ * A folder the daemon could not measure in time arrives as `null` and reads as an em dash with its
+ * reason, never as zero. The reclaimable bar is the pages the file keeps after deletes: informative
+ * only, since nothing here compacts it.
+ */
+function SpacePanel() {
+  const storage = useStorage();
+  const space = storage.data;
+  const unmeasured = "not measured in time";
+
+  return (
+    <Panel title="Space">
+      {storage.isError && space === undefined && (
+        <SystemListError error={storage.error} what="the space readout" />
+      )}
+      {!storage.isError && space === undefined && <Loading>reading the space used…</Loading>}
+      {space !== undefined && (
+        <>
+          <div className="sy-space-cards">
+            <StatCard
+              label="Database"
+              value={formatBytes(space.db_bytes)}
+              detail={`${formatBytes(space.wal_bytes)} write-ahead log`}
+              bar={
+                <Meter
+                  label="Reclaimable"
+                  value={space.reclaimable_bytes}
+                  ceiling={space.db_bytes}
+                  tone="quantity"
+                  format={formatBytes}
+                />
+              }
+            />
+            <StatCard
+              label="Backups"
+              value={space.backups_bytes === null ? undefined : formatBytes(space.backups_bytes)}
+              unread={unmeasured}
+            />
+            <StatCard
+              label="Files"
+              value={space.files_bytes === null ? undefined : formatBytes(space.files_bytes)}
+              unread={unmeasured}
+            />
+            <StatCard
+              label="Logs"
+              value={space.logs_bytes === null ? undefined : formatBytes(space.logs_bytes)}
+              unread={unmeasured}
+            />
+          </div>
+          <p className="sy-space-notes">
+            {space.auto_backup_last === null ? (
+              "No automatic backup has been taken yet."
+            ) : (
+              <>
+                Last automatic backup <RelativeTime at={space.auto_backup_last} />.
+              </>
+            )}
+            {space.loose_bytes > 0 && (
+              <>
+                {" "}
+                {formatBytes(space.loose_bytes)} of old database copies lie beside the database.
+              </>
+            )}
+          </p>
+        </>
+      )}
+    </Panel>
   );
 }
 
@@ -1158,6 +1237,7 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
       {/* The file name, faint: it is what the daemon calls it, and the date in front of it
           is the same fact made readable. Clipped, with the whole of it as the tooltip. */}
       <span className="sy-backup-name" title={backup.name}>
+        {backup.kind === "auto" && <span className="sy-backup-kind">automatic · </span>}
         {backup.name}
       </span>
       <span className="sy-backup-meta">{formatBytes(backup.size_bytes)}</span>
@@ -1207,13 +1287,6 @@ function RestoreError({ error }: { error: unknown }) {
       the restore could not be staged — the {DAEMON_NAME} is not responding
     </ErrorNote>
   );
-}
-
-/** Bytes, for a person — the same three-step scale `MailDetail.tsx` and `data/files.ts` use. */
-function formatBytes(size: number): string {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /* -------------------------------------------------------------------- pii -- */

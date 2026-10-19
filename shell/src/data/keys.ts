@@ -641,6 +641,8 @@ export const keys = {
     home: ["system", "home"] as const,
     sidecars: ["system", "sidecars"] as const,
     backups: ["system", "backups"] as const,
+    /** `GET /system/storage` — what the database file and the folders beside it occupy. */
+    storage: ["system", "storage"] as const,
     tokens: ["system", "tokens"] as const,
     pii: ["system", "pii"] as const,
     /**

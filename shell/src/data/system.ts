@@ -563,6 +563,38 @@ export function useBackups() {
 }
 
 /**
+ * What the database file and the folders beside it occupy — `GET /system/storage`.
+ *
+ * The three folder sizes are `null` when the daemon could not measure them in time, which is not
+ * the same claim as an empty folder.
+ */
+export interface StorageReport {
+  db_bytes: number;
+  wal_bytes: number;
+  page_size: number;
+  page_count: number;
+  /** Pages the file keeps for reuse after deletes; a `VACUUM` would give them back. */
+  freelist_count: number;
+  reclaimable_bytes: number;
+  backups_bytes: number | null;
+  files_bytes: number | null;
+  logs_bytes: number | null;
+  /** `nucleos.db.*` copies lying beside the database that nothing prunes. */
+  loose_bytes: number;
+  /** When the newest automatic backup was taken (ISO instant); `null` when none exists. */
+  auto_backup_last: string | null;
+}
+
+/** The "Space" panel's reading — `GET /system/storage`. */
+export function useStorage() {
+  return useQuery({
+    queryKey: keys.system.storage,
+    queryFn: () => apiFetch<StorageReport>("/system/storage"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/**
  * Take a snapshot now.
  *
  * `POST /backup` — SINGULAR, one letter apart from the listing route above and

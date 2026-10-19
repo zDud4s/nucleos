@@ -633,6 +633,31 @@
   }
 }
 
+/* The Space panel sits above the list, in the same column. */
+.sy-backups-main {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.sy-space-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: var(--space-3);
+}
+
+.sy-space-notes {
+  margin: var(--space-3) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* The marker is part of the clipped name cell, but not faint: it is the one fact the prefix of the
+   file name carried, said in words. */
+.sy-backup-kind {
+  color: var(--text);
+}
+
 /* Count, total size and age of the newest, in one line above the list. */
 .sy-backups-summary {
   margin: 0 0 var(--space-2);
