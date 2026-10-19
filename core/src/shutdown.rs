@@ -213,7 +213,7 @@ mod tests {
     use crate::execution::worktree::Owner;
     use axum::Router;
     use axum::body::Body;
-    use axum::routing::{get, post};
+    use axum::routing::post;
     use std::sync::Arc;
     use tower::ServiceExt;
 
