@@ -474,7 +474,10 @@ mod tests {
     #[tokio::test]
     async fn an_idle_pass_reports_no_work_and_the_loop_waits_longer() {
         let (state, _root) = state_with_root().await;
-        assert!(!team_tick(&state, chrono::Utc::now()).await, "nothing live, nothing due");
+        assert!(
+            !team_tick(&state, chrono::Utc::now()).await,
+            "nothing live, nothing due"
+        );
         assert_eq!(lifecycle::team_wait(false), TEAM_IDLE_TICK);
         assert_eq!(lifecycle::team_wait(true), TEAM_TICK);
         assert!(TEAM_IDLE_TICK > TEAM_TICK);
@@ -483,7 +486,10 @@ mod tests {
         start(&state, "marketing", "write the launch post", None)
             .await
             .unwrap();
-        assert!(team_tick(&state, chrono::Utc::now()).await, "a live run is work");
+        assert!(
+            team_tick(&state, chrono::Utc::now()).await,
+            "a live run is work"
+        );
     }
 
     // -----------------------------------------------------------------------------------------

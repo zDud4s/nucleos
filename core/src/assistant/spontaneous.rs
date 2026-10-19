@@ -76,7 +76,12 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
                             .collect();
                         let grew = live.carried.len() != recorded;
                         recorded = live.carried.len();
-                        (begun, fresh, relock(&SET_ASIDE).contains_key(&chat_id), grew)
+                        (
+                            begun,
+                            fresh,
+                            relock(&SET_ASIDE).contains_key(&chat_id),
+                            grew,
+                        )
                     }
                     _ => return,
                 }
@@ -542,8 +547,15 @@ mod tests {
         }
         assert_eq!(seen[1], Duration::from_millis(400));
         assert_eq!(seen[2], Duration::from_millis(800));
-        assert_eq!(*seen.last().unwrap(), BETWEEN_TURNS_TICK_MAX, "never slower than the cap");
-        assert_eq!(next_between_turns_tick(BETWEEN_TURNS_TICK_MAX, true), BETWEEN_TURNS_TICK);
+        assert_eq!(
+            *seen.last().unwrap(),
+            BETWEEN_TURNS_TICK_MAX,
+            "never slower than the cap"
+        );
+        assert_eq!(
+            next_between_turns_tick(BETWEEN_TURNS_TICK_MAX, true),
+            BETWEEN_TURNS_TICK
+        );
     }
 
     async fn test_state() -> AppState {
