@@ -307,6 +307,7 @@ mod tests {
             token: Token("control-token".into()),
             pool,
             telegram_doctrine: None,
+            channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,

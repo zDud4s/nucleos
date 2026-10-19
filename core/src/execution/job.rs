@@ -142,6 +142,7 @@ mod tests {
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,
+            channels: Default::default(),
             runner: runner.clone(),
             triage_runner: None,
             local_triage_disabled: None,

@@ -20,6 +20,11 @@ pub enum Origin {
     Voice,
     /// Typed in the panel of a NucleOS browser window on this machine; answered like `Shell`.
     BrowserPanel,
+    /// A message that arrived through a channel sidecar, named by its registry id.
+    ///
+    /// The id is the manifest's `&'static str`, so the type stays `Copy`; an id that is not in the
+    /// registry cannot be built from the wire (see `from_wire`).
+    Channel(&'static str),
 }
 
 impl Origin {
@@ -30,8 +35,17 @@ impl Origin {
             Some("telegram") => Self::Telegram,
             Some("voice") => Self::Voice,
             Some("browser-panel") => Self::BrowserPanel,
-            _ => Self::Shell,
+            Some(wire) => wire
+                .strip_prefix("channel:")
+                .and_then(crate::channels::registry::by_id)
+                .map_or(Self::Shell, |manifest| Self::Channel(manifest.id)),
+            None => Self::Shell,
         }
+    }
+
+    /// Whether the sender is somebody on the far side of a network rather than at this machine.
+    pub fn is_remote(self) -> bool {
+        matches!(self, Self::Telegram | Self::Channel(_))
     }
 
     /// How this origin is written down, so a message that waits is sent as the thing it was.
@@ -45,8 +59,31 @@ impl Origin {
             Self::Voice => "voice",
             Self::BrowserPanel => "browser-panel",
             Self::Shell => "shell",
+            Self::Channel(id) => crate::channels::registry::by_id(id)
+                .map_or("shell", |manifest| manifest.origin_wire),
         }
     }
+}
+
+/// The channel-wide doctrine pushed onto a turn, by the door the message came in by.
+///
+/// Written out per origin rather than swept up by a wildcard, so that the next origin — which will
+/// arrive over a network, as every origin after the first has — is a compile error here instead of
+/// silently inheriting the doctrine a Telegram channel was given. Voice sits with the shell: a
+/// spoken turn is somebody at this machine, which is the presence the exemption is about.
+fn doctrine_for(state: &crate::state::AppState, origin: Origin) -> Option<String> {
+    match origin {
+        Origin::Telegram => state.telegram_doctrine.clone(),
+        // A2 reads the per-channel yaml doctrine here (R2a)
+        Origin::Channel(_) => None,
+        Origin::Shell | Origin::Voice | Origin::BrowserPanel => None,
+    }
+}
+
+/// Whether a chat with no declared brain is treated as one that wants the local model: the
+/// default of a remote origin, which has always been answered locally when it can be.
+fn undeclared_brain_wants_local(origin: Origin) -> bool {
+    origin.is_remote()
 }
 
 /// Why a turn was refused before it cost anything: the chat says `local` and this machine has none.
@@ -775,7 +812,7 @@ pub(super) async fn send_message_inner(
         // `OpenRouter` is unreachable in practice: `wants_hosted` above already returned for it.
         // The arm stays only to keep the match exhaustive over `Brain`'s third variant.
         Some(crate::chats::Brain::Cloud) | Some(crate::chats::Brain::OpenRouter) => false,
-        None => origin == Origin::Telegram,
+        None => undeclared_brain_wants_local(origin),
     };
     // Whether local was CHOSEN or merely inferred, which is what decides the refusal below: a
     // `chats` row saying `local` is somebody's word about where this work stays.
@@ -891,10 +928,7 @@ pub(super) async fn send_message_inner(
     // swept up by a wildcard, so that the next origin — which will arrive over a network, as every
     // origin after the first has — is a compile error here instead of silently inheriting the
     // doctrine a Telegram channel was given.
-    let doctrine = match origin {
-        Origin::Telegram => state.telegram_doctrine.clone(),
-        Origin::Shell | Origin::Voice | Origin::BrowserPanel => None,
-    };
+    let doctrine = doctrine_for(state, origin);
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
     let config = build_mcp_config(&exe);
@@ -1429,12 +1463,75 @@ mod tests {
         )
     }
 
+    #[test]
+    fn channel_origin_round_trips_through_its_wire_spelling() {
+        let origin = Origin::Channel("telegram");
+        assert_eq!(origin.as_wire(), "channel:telegram");
+        assert_eq!(Origin::from_wire(Some(origin.as_wire())), origin);
+    }
+
+    #[test]
+    fn an_unknown_channel_spelling_falls_back_to_shell() {
+        assert_eq!(Origin::from_wire(Some("channel:nope")), Origin::Shell);
+        assert_eq!(Origin::from_wire(Some("channel:")), Origin::Shell);
+    }
+
+    #[test]
+    fn telegram_wire_is_unchanged() {
+        assert_eq!(Origin::Telegram.as_wire(), "telegram");
+        assert_eq!(Origin::from_wire(Some("telegram")), Origin::Telegram);
+    }
+
+    #[test]
+    fn is_remote_only_for_telegram_and_channels() {
+        assert!(Origin::Telegram.is_remote());
+        assert!(Origin::Channel("telegram").is_remote());
+        assert!(!Origin::Shell.is_remote());
+        assert!(!Origin::Voice.is_remote());
+        assert!(!Origin::BrowserPanel.is_remote());
+    }
+
+    #[tokio::test]
+    async fn doctrine_for_a_channel_is_none_until_a2_reads_the_yaml() {
+        let mut state = crate::channels::testkit::state().await;
+        state.telegram_doctrine = Some("be brief".to_string());
+        assert_eq!(doctrine_for(&state, Origin::Channel("telegram")), None);
+        assert_eq!(
+            doctrine_for(&state, Origin::Telegram),
+            Some("be brief".to_string())
+        );
+        assert_eq!(doctrine_for(&state, Origin::Shell), None);
+    }
+
+    #[test]
+    fn a_channel_turn_never_gets_the_unrestricted_tool_policy() {
+        use crate::execution::runner::ToolPolicy;
+        use crate::relay::Handover;
+        assert_eq!(
+            super::super::turn::tool_policy_for(
+                Some("."),
+                Origin::Channel("telegram"),
+                true,
+                Handover::Typed
+            ),
+            ToolPolicy::McpOnly
+        );
+    }
+
+    #[test]
+    fn an_undeclared_local_scope_is_remote_for_a_channel_origin() {
+        assert!(undeclared_brain_wants_local(Origin::Channel("telegram")));
+        assert!(undeclared_brain_wants_local(Origin::Telegram));
+        assert!(!undeclared_brain_wants_local(Origin::Shell));
+    }
+
     async fn test_state() -> AppState {
         AppState {
             startup_config: Default::default(),
             token: Token("t".into()),
             pool: crate::testdb::fresh_pool().await,
             telegram_doctrine: None,
+            channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,

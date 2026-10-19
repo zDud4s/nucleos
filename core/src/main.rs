@@ -774,6 +774,9 @@ async fn main() {
             &calendar_config,
         )),
         council: Arc::new(council::CouncilRuntime::new(council_config, council_token)),
+        channels: Arc::new(channels::ChannelsRuntime::load(
+            machine_config_root.as_deref(),
+        )),
         github: Arc::new(integrations::github::GithubRuntime::from_config(
             &github_config,
             github_configured,
