@@ -511,12 +511,14 @@ pub(super) async fn prepare_handoff_successor(
         .await?;
 
     if !record_handoff_if_needed(pool, run_id, successor_id).await? {
-        let _ = sqlx::query(
-            "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE id = ? AND status = 'running'",
-        )
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(successor_id)
-        .execute(pool)
+        crate::storage::settle_write("run (interrupted)", successor_id, || {
+            sqlx::query(
+                "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE id = ? AND status = 'running'",
+            )
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(successor_id)
+            .execute(pool)
+        })
         .await;
         return Ok(false);
     }

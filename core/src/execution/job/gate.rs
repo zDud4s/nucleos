@@ -110,23 +110,45 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
 
     match crate::execution::worktree::merge_branch(&worktree, &branch).await {
         Ok(true) => {
-            let _ = sqlx::query(
-                "UPDATE job_items SET status = 'merging' WHERE job_id = ? AND ordinal = ?",
-            )
-            .bind(job.id)
-            .bind(ordinal as i64)
-            .execute(pool)
+            // The branch already holds the merge, so a status the row never got is a job that
+            // would carry on over a state the database does not have: stop, like the checks above.
+            let marked = crate::storage::settle_write("job item (merging)", job.id, || {
+                sqlx::query(
+                    "UPDATE job_items SET status = 'merging' WHERE job_id = ? AND ordinal = ?",
+                )
+                .bind(job.id)
+                .bind(ordinal as i64)
+                .execute(pool)
+            })
             .await;
+            if !marked {
+                tracing::warn!(
+                    job_id = job.id,
+                    ordinal,
+                    "could not mark a merged item as merging, so the job stops here"
+                );
+                return Step::Stopped;
+            }
             Step::Continued
         }
         Ok(false) => {
-            let _ = sqlx::query(
-                "UPDATE job_items SET status = 'conflicted' WHERE job_id = ? AND ordinal = ?",
-            )
-            .bind(job.id)
-            .bind(ordinal as i64)
-            .execute(pool)
+            let marked = crate::storage::settle_write("job item (conflicted)", job.id, || {
+                sqlx::query(
+                    "UPDATE job_items SET status = 'conflicted' WHERE job_id = ? AND ordinal = ?",
+                )
+                .bind(job.id)
+                .bind(ordinal as i64)
+                .execute(pool)
+            })
             .await;
+            if !marked {
+                tracing::warn!(
+                    job_id = job.id,
+                    ordinal,
+                    "could not mark a conflicting item as conflicted, so the job stops here"
+                );
+                return Step::Stopped;
+            }
             say(
                 pool,
                 job,

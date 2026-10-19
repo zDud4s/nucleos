@@ -610,17 +610,19 @@ pub(super) async fn release_item(pool: &SqlitePool, job: &JobRow, item: Option<I
     let Some(ItemClaim { ordinal, held }) = item else {
         return;
     };
-    let _ = sqlx::query(
-        "UPDATE job_items
+    crate::storage::settle_write("job item release", job.id, || {
+        sqlx::query(
+            "UPDATE job_items
          SET status = ?,
              gate_status = CASE WHEN ? = 'gate_failed' THEN 'failed' ELSE gate_status END
          WHERE job_id = ? AND ordinal = ? AND status = 'running'",
-    )
-    .bind(held)
-    .bind(held)
-    .bind(job.id)
-    .bind(ordinal as i64)
-    .execute(pool)
+        )
+        .bind(held)
+        .bind(held)
+        .bind(job.id)
+        .bind(ordinal as i64)
+        .execute(pool)
+    })
     .await;
 }
 

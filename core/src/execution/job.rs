@@ -3858,6 +3858,98 @@ mod tests {
             .success()
     }
 
+    /// The merge has landed on the job's branch; if the item's `merging` status cannot be written,
+    /// the job must stop instead of carrying on over a row that never learned of it.
+    ///
+    /// The write is refused by a trigger rather than a closed pool, because the merge reads and
+    /// writes the same pool before it reaches the status: a closed pool would stop it earlier, at
+    /// a check that has nothing to do with this one. `UPDATE OF status` leaves the
+    /// `merge_base_sha` write before it alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_merge_whose_status_cannot_be_written_stops_the_job() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-merge-stop-", "git --version");
+        let trees = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(trees.path());
+        let pool = test_pool().await;
+        let job_id = seed_job_in(
+            &pool,
+            "nucleos",
+            "implementing",
+            &repo.to_string_lossy(),
+            None,
+        )
+        .await
+        .unwrap();
+        let job_tree = crate::execution::worktree::create(
+            &repo,
+            crate::execution::worktree::Owner::Job(job_id),
+        )
+        .await
+        .expect("the job's checkout");
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Job(job_id),
+            "nucleos",
+            &repo.to_string_lossy(),
+            &job_tree.path.to_string_lossy(),
+            &job_tree.branch,
+            job_tree.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let base = crate::execution::worktree::head_sha(&job_tree.path)
+            .await
+            .unwrap();
+        let tree = crate::execution::worktree::adopt_or_create_at(
+            &repo,
+            crate::execution::worktree::Owner::Item(item_id),
+            Some(&base),
+        )
+        .await
+        .expect("the item's checkout");
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Item(item_id),
+            "project-a",
+            &repo.to_string_lossy(),
+            &tree.path.to_string_lossy(),
+            &tree.branch,
+            tree.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the item's checkout");
+        std::fs::write(tree.path.join("work.txt"), "work\n").expect("write the item's work");
+
+        sqlx::query(
+            "CREATE TRIGGER refuse_item_status BEFORE UPDATE OF status ON job_items
+             BEGIN SELECT RAISE(ABORT, 'status writes refused'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = test_state(pool.clone()).await;
+        let state = with_home(state, &_container);
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
+            Step::Stopped,
+            "a merge whose status was not recorded must not let the job carry on"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM job_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "implemented");
+    }
+
     /// **The proof of this slice: undoing a red merge takes back that merge and nothing else.**
     ///
     /// Two items with checkouts of their own. A lands and is kept; B lands and is rejected. The

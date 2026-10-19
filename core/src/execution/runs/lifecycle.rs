@@ -638,3 +638,105 @@ pub async fn run_retention_loop(state: AppState) {
         }
     }
 }
+
+#[cfg(test)]
+mod terminal_write_ratchet {
+    use std::path::{Path, PathBuf};
+
+    /// Statements that take a run, a team item, a job item or a distill row to a state something is
+    /// waiting on. Matched against the statement with its whitespace collapsed.
+    const TERMINAL: [&str; 5] = [
+        "UPDATE runs SET status",
+        "UPDATE job_items",
+        "UPDATE team_items",
+        "UPDATE team_runs",
+        "UPDATE distill_queue",
+    ];
+
+    /// `file:line` of terminal writes that may stay discarded, each with the reason. Empty on
+    /// purpose: a dropped terminal write leaves a run `running` and its waiter stuck.
+    const ALLOWED: [&str; 0] = [];
+
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "tests") {
+                    continue;
+                }
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "tests.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Line numbers of every `let _ = sqlx::query(` in `source` whose statement
+    /// is a terminal write, ignoring everything from a `#[cfg(test)] mod` on.
+    fn discarded_terminal_writes(source: &str) -> Vec<usize> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod "))
+            {
+                break;
+            }
+            if !line.contains("let _ = sqlx::query(") {
+                continue;
+            }
+            let statement = lines[index..lines.len().min(index + 4)]
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if TERMINAL.iter().any(|sql| statement.contains(sql)) {
+                found.push(index + 1);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn the_detector_sees_a_discarded_terminal_write() {
+        let bad = "fn f() {\n    let _ = sqlx::query(\n        \"UPDATE runs SET status = 'failed'\",\n    )\n    .execute(&pool)\n    .await;\n}\n";
+        assert_eq!(discarded_terminal_writes(bad), [2]);
+        let decorative = "let _ = sqlx::query(\"UPDATE runs SET session_id = ?\")";
+        assert!(discarded_terminal_writes(decorative).is_empty());
+        let in_tests = "fn f() {}\n#[cfg(test)]\nmod tests {\n let _ = sqlx::query(\"UPDATE runs SET status = 'x'\")\n}\n";
+        assert!(discarded_terminal_writes(in_tests).is_empty());
+    }
+
+    /// A terminal write that fails must say so, and retry while the database is busy: use
+    /// `storage::settle_write`. `let _ =` here once left runs `running` until the next start, team
+    /// items and council seats waiting on a run that had ended, and `cost_usd` NULL.
+    #[test]
+    fn no_terminal_write_is_discarded() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).unwrap();
+            let relative = file
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            for line in discarded_terminal_writes(&source) {
+                let at = format!("{relative}:{line}");
+                if !ALLOWED.contains(&at.as_str()) {
+                    offenders.push(at);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "terminal writes discarded with `let _ =`; use storage::settle_write: {offenders:#?}"
+        );
+    }
+}
