@@ -83,6 +83,13 @@ pub const TERMINAL_STATES: &[&str] = &["done", "stopped", "expired", "failed", "
 /// department's rounds are short, and a whole round of specialists can land between two ticks.
 const TEAM_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How often a pass runs while the previous one found no live run and no due action. Starting a run
+/// rings [`TEAM_WAKE`], so only an approval granted to an already-finished run waits this long.
+const TEAM_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Rung when a run is started, to cut the idle wait short.
+static TEAM_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 /// Ceilings the daemon imposes on what a team may declare, whatever the owner types.
 ///
 /// The roster is static and written by the owner (design §1.1), so what is left to bound is how far
@@ -463,6 +470,21 @@ mod tests {
     use super::*;
     use crate::auth::Scope;
     use crate::speed::Speed;
+
+    #[tokio::test]
+    async fn an_idle_pass_reports_no_work_and_the_loop_waits_longer() {
+        let (state, _root) = state_with_root().await;
+        assert!(!team_tick(&state, chrono::Utc::now()).await, "nothing live, nothing due");
+        assert_eq!(lifecycle::team_wait(false), TEAM_IDLE_TICK);
+        assert_eq!(lifecycle::team_wait(true), TEAM_TICK);
+        assert!(TEAM_IDLE_TICK > TEAM_TICK);
+
+        marketing(&state).await;
+        start(&state, "marketing", "write the launch post", None)
+            .await
+            .unwrap();
+        assert!(team_tick(&state, chrono::Utc::now()).await, "a live run is work");
+    }
 
     // -----------------------------------------------------------------------------------------
     // The vocabulary three readers share

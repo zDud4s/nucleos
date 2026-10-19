@@ -195,6 +195,9 @@ pub async fn start_with(
     .await
     .map_err(|error| StartError::Unavailable(error.to_string()))?;
 
+    // Wakes the loop if it was waiting out an idle stretch, so a department starts at once.
+    TEAM_WAKE.notify_one();
+
     let _ = crate::feed::append(
         &state.pool,
         None,
@@ -376,11 +379,18 @@ pub async fn workspace_gc(state: &AppState, now: chrono::DateTime<chrono::Utc>) 
 }
 
 pub async fn run_team_loop(state: AppState) {
-    let mut interval = tokio::time::interval(TEAM_TICK);
     loop {
-        interval.tick().await;
-        team_tick(&state, chrono::Utc::now()).await;
+        let busy = team_tick(&state, chrono::Utc::now()).await;
+        // A new run wakes the loop at once; everything else (an approval, a trigger) is picked up
+        // within one idle wait.
+        let _ = tokio::time::timeout(team_wait(busy), TEAM_WAKE.notified()).await;
     }
+}
+
+/// How long the loop waits after a pass: the short tick while a run or an action is in play, the
+/// long one when the pass found nothing.
+pub(super) fn team_wait(busy: bool) -> std::time::Duration {
+    if busy { TEAM_TICK } else { TEAM_IDLE_TICK }
 }
 
 pub async fn run_workspace_gc_loop(state: AppState) {

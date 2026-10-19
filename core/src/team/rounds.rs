@@ -10,12 +10,15 @@ use super::*;
 ///
 /// Runs are advanced independently and a failure in one is logged rather than propagated: a
 /// department that cannot be moved must not stop the sweep that moves the others.
-pub async fn team_tick(state: &AppState, now: chrono::DateTime<chrono::Utc>) {
+///
+/// Says whether the pass found any work at all (a live run or a due action), which is what lets
+/// [`run_team_loop`] wait longer while a daemon with no department running is simply idle.
+pub async fn team_tick(state: &AppState, now: chrono::DateTime<chrono::Utc>) -> bool {
     // Before the runs, and independently of them. An action outlives the run that asked for it —
     // people decide overnight, and by morning that department has usually finished — so this loop
     // reads `team_actions` rather than walking the live runs. It is also why a pending action never
     // holds a run open: nothing here is waiting for anything there.
-    execute_due_actions(state).await;
+    let acted = execute_due_actions(state).await;
 
     let live: Vec<TeamRun> = match sqlx::query_as(
         "SELECT id, team_id, request, workspace, state, director_node, director_run_id, round,
@@ -31,16 +34,18 @@ pub async fn team_tick(state: &AppState, now: chrono::DateTime<chrono::Utc>) {
         Ok(rows) => rows,
         Err(error) => {
             tracing::warn!(%error, "could not read the live team runs");
-            return;
+            return true;
         }
     };
 
+    let busy = acted || !live.is_empty();
     for run in live {
         let id = run.id.clone();
         if let Err(error) = advance(state, run, now).await {
             tracing::warn!(team_run = %id, %error, "a team run could not be advanced this pass");
         }
     }
+    busy
 }
 
 /// One run, one pass.
