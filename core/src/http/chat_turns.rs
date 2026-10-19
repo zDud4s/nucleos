@@ -44,7 +44,7 @@ pub(super) fn routes() -> Router<AppState> {
             "/assistant/chats/{chat_id}/turns/{turn_id}/chain",
             get(get_relay_chain),
         )
-        .route("/assistant/{turn_id}", get(get_run))
+        .route("/assistant/{turn_id}", get(get_turn))
         // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
         // the two cannot shadow each other whatever a turn id looks like.
         .route("/assistant/{turn_id}/live", get(get_assistant_live))
@@ -676,6 +676,28 @@ pub(super) async fn post_say_now(
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }
+}
+
+/// One turn as the run row that holds it — `/runs/{id}`'s answer without the conversation id.
+///
+/// Turn ids are sequential integers and a read-only key may call this route, so an answer that
+/// named the chat would give that key the destination `POST /assistant/message` takes from the
+/// client. Nothing reads `chat_id` off this route (the shell follows a turn through
+/// `/assistant/chats/*` and `/live`, the Telegram sidecar reads status and answer), so the field
+/// is dropped here rather than the shared run view changing under `/runs/{id}`.
+pub(super) async fn get_turn(
+    State(state): State<AppState>,
+    Path(turn_id): Path<i64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Json(run) = get_run(State(state), Path(turn_id)).await?;
+    let mut value = serde_json::to_value(run).map_err(|error| {
+        tracing::warn!(%error, turn_id, "serialising a turn failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("chat_id");
+    }
+    Ok(Json(value))
 }
 
 /// What one turn's tools answered.

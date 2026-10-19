@@ -19214,6 +19214,33 @@ mod tests {
         assert_eq!(parsed["id"], serde_json::json!(turn_id));
     }
 
+    /// `GET /assistant/{turn_id}` is granted to a read-only key, and turn ids are sequential
+    /// integers. A conversation id in the answer would hand that key the destination to post to
+    /// (`POST /assistant/message` takes a client-chosen `chat_id`), so the turn view leaves it out.
+    /// `/runs/{id}` keeps it: that route is the run view and the shell links back through it.
+    #[tokio::test]
+    async fn the_turn_view_does_not_name_the_conversation_but_the_run_view_still_does() {
+        let state = test_state().await;
+        let turn_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, created_at, mode, chat_id)
+             VALUES ('hi', 'completed', ?, 'assistant', 'secret-chat') RETURNING id",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let turn = get_json(&state, &format!("/assistant/{turn_id}")).await;
+        assert_eq!(turn["id"], serde_json::json!(turn_id));
+        assert!(
+            turn.get("chat_id").is_none(),
+            "the turn view leaked the conversation id: {turn}"
+        );
+
+        let run = get_json(&state, &format!("/runs/{turn_id}")).await;
+        assert_eq!(run["chat_id"], serde_json::json!("secret-chat"));
+    }
+
     #[tokio::test]
     async fn the_route_report_is_served_with_its_exact_shape_and_needs_the_token() {
         let state = test_state().await;
