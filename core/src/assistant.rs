@@ -7,6 +7,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::execution::runner::extract_reply;
 
 mod chat_key;
+pub(crate) mod rotation;
 
 mod live;
 mod send;
@@ -7285,6 +7286,166 @@ mod tests {
         settled_turn(&state.pool, id).await;
 
         assert_eq!(runner.last_prompt.lock().unwrap().clone().unwrap(), "olá");
+    }
+
+    // ---- invisible root rotation ----------------------------------------------------------------
+
+    /// A runner whose one answer reports a context of `fill` tokens (all of it fresh input).
+    fn runner_reporting_fill(fill: i64) -> Arc<FakeCommandRunner> {
+        let stream = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"usage\":{{\"input_tokens\":{fill},\"cache_read_input_tokens\":0}},\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]}}}}\n{}\n",
+            r#"{"type":"result","subtype":"success","result":"ok"}"#,
+        );
+        Arc::new(FakeCommandRunner {
+            canned: Mutex::new(Some(crate::execution::runner::RunOutcome {
+                exit_code: 0,
+                stdout: stream,
+                stderr: String::new(),
+                session_id: Some("rot-session".to_string()),
+                cost_usd: Some(0.01),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+                model_requested: false,
+            })),
+            ..Default::default()
+        })
+    }
+
+    async fn store_rotation(pool: &SqlitePool, chat_id: &str, prefix: &str, tainted: bool) {
+        sqlx::query(
+            "INSERT INTO root_rotations (chat_id, root_id, prefix, tainted, created_at)
+             VALUES (?, 'root-1', ?, ?, '2026-10-19T10:00:00+00:00')",
+        )
+        .bind(chat_id)
+        .bind(prefix)
+        .bind(tainted)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A pending rotation replaces the replay: the CLI gets the stored prefix, then the new
+    /// message, and the row still shows what the person typed.
+    #[tokio::test]
+    async fn a_turn_after_a_rotation_is_handed_the_stored_prefix() {
+        let mut state = test_state().await;
+        let runner = Arc::new(FakeCommandRunner::default());
+        state.runner = runner.clone();
+        let chat_id = "rotation-delivery-chat";
+        // An old exchange that the ordinary replay WOULD have carried; the prefix replaces it.
+        past_exchange(&state.pool, chat_id, "pergunta antiga", "resposta antiga").await;
+        store_rotation(&state.pool, chat_id, "PREFIX-OF-THE-ROTATION", false).await;
+
+        let id = send_message(&state, chat_id, "e agora?", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let launched = runner.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(launched.starts_with("PREFIX-OF-THE-ROTATION"), "{launched}");
+        assert!(launched.ends_with("e agora?"), "{launched}");
+        assert!(!launched.contains("pergunta antiga"), "{launched}");
+
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "e agora?");
+        let delivered: Option<i64> =
+            sqlx::query_scalar("SELECT delivered_run_id FROM root_rotations WHERE chat_id = ?")
+                .bind(chat_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(delivered, Some(id));
+        let untrusted: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(untrusted, 0);
+    }
+
+    /// A rotation whose summary may carry untrusted text marks the turn it is delivered to.
+    #[tokio::test]
+    async fn a_tainted_rotation_marks_the_turn_it_is_delivered_to() {
+        let mut state = test_state().await;
+        state.runner = Arc::new(FakeCommandRunner::default());
+        let chat_id = "rotation-tainted-chat";
+        store_rotation(&state.pool, chat_id, "DIRTY-PREFIX", true).await;
+
+        let id = send_message(&state, chat_id, "continua", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        let untrusted: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(untrusted, 1);
+    }
+
+    /// Past the soft threshold, a root chat's completed turn leaves a pending rotation and no
+    /// session to resume.
+    #[tokio::test]
+    async fn a_large_completed_root_turn_rotates() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = "rotation-large-chat";
+        rotation::test_nodes::give_root(chat_id, "root-1");
+
+        let id = send_message(&state, chat_id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        let (status, _) = settled_turn(&state.pool, id).await;
+        assert_eq!(status, "completed");
+
+        assert_eq!(get_session(&state.pool, chat_id).await.unwrap(), None);
+        let (prefix, from_run): (String, Option<i64>) = sqlx::query_as(
+            "SELECT prefix, from_run_id FROM root_rotations
+              WHERE chat_id = ? AND delivered_run_id IS NULL",
+        )
+        .bind(chat_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(prefix.contains("TEST-BRIEF"), "{prefix}");
+        assert!(
+            prefix.contains("## Last request (verbatim)\nolá"),
+            "{prefix}"
+        );
+        assert_eq!(from_run, Some(id));
+    }
+
+    /// Below the threshold nothing rotates and the session is kept, as before.
+    #[tokio::test]
+    async fn a_small_root_turn_keeps_its_session() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(10_000);
+        let chat_id = "rotation-small-chat";
+        rotation::test_nodes::give_root(chat_id, "root-1");
+
+        let id = send_message(&state, chat_id, "olá", Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+
+        assert_eq!(
+            get_session(&state.pool, chat_id).await.unwrap().as_deref(),
+            Some("rot-session")
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM root_rotations")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     // ---- chat turn silence deadline -------------------------------------------------------------

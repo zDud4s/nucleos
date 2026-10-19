@@ -1009,29 +1009,35 @@ pub(super) async fn send_message_inner(
     // answering with it, and better than one that refuses.
     let prompt = match &resume {
         Some(_) => prompt,
-        None => match history_window(&state.pool, chat_id).await {
-            Ok((older, tail)) => {
-                // What no longer fits verbatim is summarised rather than dropped (spec P6 (ii)).
-                // Only here, on the rotation of a CLI conversation: the local path replays on
-                // EVERY turn and must not pay a model call for each of them.
-                let summary = rolled_up(state.runner.as_ref(), &older).await;
-                if !tail.is_empty() || summary.is_some() {
-                    replayed_after(summary.as_deref(), &tail, &prompt)
-                } else {
-                    // Nothing of our own to replay. On an ordinary new conversation that is the
-                    // truth and the prompt stands alone — but a chat picked up from the editor has
-                    // a past that simply is not in our runs, and beginning it blank is the
-                    // complaint this feature answers.
-                    match handed_over(&state.pool, chat_id).await {
-                        history if !history.is_empty() => replayed(&history, &prompt),
-                        _ => prompt,
+        None => match rotated_prompt(&state.pool, chat_id, id, &prompt).await {
+            // A rotation is waiting: its prefix already carries the summary, so the exchanges are
+            // not replayed on top of it. Only the text sent to the CLI changes; `runs.prompt` keeps
+            // what the person typed.
+            Some(prefixed) => prefixed,
+            None => match history_window(&state.pool, chat_id).await {
+                Ok((older, tail)) => {
+                    // What no longer fits verbatim is summarised rather than dropped (spec P6 (ii)).
+                    // Only here, on the rotation of a CLI conversation: the local path replays on
+                    // EVERY turn and must not pay a model call for each of them.
+                    let summary = rolled_up(state.runner.as_ref(), &older).await;
+                    if !tail.is_empty() || summary.is_some() {
+                        replayed_after(summary.as_deref(), &tail, &prompt)
+                    } else {
+                        // Nothing of our own to replay. On an ordinary new conversation that is the
+                        // truth and the prompt stands alone — but a chat picked up from the editor has
+                        // a past that simply is not in our runs, and beginning it blank is the
+                        // complaint this feature answers.
+                        match handed_over(&state.pool, chat_id).await {
+                            history if !history.is_empty() => replayed(&history, &prompt),
+                            _ => prompt,
+                        }
                     }
                 }
-            }
-            Err(error) => {
-                tracing::warn!(%error, chat_id, "could not read the conversation to replay it");
-                prompt
-            }
+                Err(error) => {
+                    tracing::warn!(%error, chat_id, "could not read the conversation to replay it");
+                    prompt
+                }
+            },
         },
     };
     let cwd = cwd.map(std::path::PathBuf::from);
@@ -1054,6 +1060,33 @@ pub(super) async fn send_message_inner(
         },
     );
     Ok(id)
+}
+
+/// The prompt for a turn that follows an invisible root rotation: the stored rehydration prefix,
+/// then the new message. `None` when no rotation is waiting (or it could not be read), so the
+/// caller falls back to its ordinary replay.
+///
+/// A tainted rotation marks the new run `read_untrusted` here, before the turn is spawned, so the
+/// hooks see the mark from the first tool call.
+async fn rotated_prompt(
+    pool: &SqlitePool,
+    chat_id: &str,
+    run_id: i64,
+    prompt: &str,
+) -> Option<String> {
+    let pending = match rotation::take_pending(pool, chat_id, run_id).await {
+        Ok(pending) => pending?,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "could not read a pending rotation; replaying instead");
+            return None;
+        }
+    };
+    if pending.tainted
+        && let Err(error) = crate::execution::runs::mark_untrusted_context(pool, run_id).await
+    {
+        tracing::warn!(%error, run_id, "could not mark a turn after a tainted rotation");
+    }
+    Some(rotation::with_prefix(&pending.prefix, prompt))
 }
 
 /// A turn's MCP config written to disk and not yet handed to the turn that will remove it.

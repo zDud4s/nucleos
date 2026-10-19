@@ -114,6 +114,18 @@ For `TDD-able: no` code tasks, stay in normal orchestrate flow with no formal TD
 
 If `auto_select.enabled: true`, after receiving the planner output: locate the `## Selected models` block. Missing or malformed → STOP per the auto-select rows in dispatch.md's error table. Parse each line into `(phase, tool, model, reasoning_effort?, reason)`; header followed by zero lines = "no match", fall back to `models.yaml` for every downstream phase. Verify each parsed tool is locally available; if not, STOP `auto-selected tool unavailable: <tool> for phase <phase>` — do NOT silently fall back. Record `auto_overrides = { phase: (tool, model, effort, reason) }` for Phases 2-4. If `auto_select.enabled` is `false` or absent, set `auto_overrides = {}`.
 
+### Large tasks: become the root node
+
+When Size is `large`, or the plan would not fit one controller within `nodes.orchestrator_budget` (speed.yaml), you are the **root node** of a node tree. Small and medium tasks skip this section and run Phase 2 unchanged.
+
+1. Open the root: `mcp__nucleos__node_open` without `parent_id`, with the task's `task_id`.
+2. Decompose breadth-first into child nodes under the decomposition rules in workflow.md ("Decomposition (node trees)") and the `orchestrate-node` skill (discovery path); `nodes.max_depth`/`max_width` bound the tree. Open each child with `node_open` (`parent_id` = the root).
+3. Dispatch each sub-orchestrator through the `wf-orchestrator` cockpit, phase `orchestrate_node`, routed per dispatch.md ("Node tree"). Sub-orchestrators dispatch only their own children; you read only the summary each returns, never its leaves' output.
+4. Keep the tree written through: `node_update` on every state change, `node_close` as each node settles, `node_tree`/`node_active` to resume after a compaction.
+5. You still own what no node may own: the intent, RED (orchestrate-tdd), the single final verification (Rule 3), review (Rule 6) and maintenance. Nodes run no tests; they return the commands.
+
+Do not restate the node mechanics here; the `orchestrate-node` skill is their single home.
+
 ## Phase 2 - Execute
 
 If `auto_overrides["execute"]` is set, use its `(tool, model, reasoning_effort)`. Otherwise read `execute.tool`, `execute.model`, and `execute.reasoning_effort` from `<state_dir>/models.yaml`. Dispatch the execution packet (or trivial instruction) through the resolved tool. The executor's instructions are the **`executor`** skill (discovery path) — that is the phase skill body you inline into the prompt. Tool-specific invocation details live in the bridge skill named after `<execute.tool>`; read that one **yourself** and never inline it, per dispatch.md's "The phase skill, and the skill that is not one". When dispatch routing resolves to `agent`, the controller delegates via the Claude Code Task tool (in-process subagent) instead of a subprocess; see dispatch.md.
@@ -191,7 +203,7 @@ The phase-to-skill map (`plan`→`planner`, `execute`→`executor`, `review`→`
 
 | Rationalization | Reality |
 |---|---|
-| "the phase will figure out what it needs, extra context is harmless" | Extra context is the cockpit failing. A phase given `dispatch.md` reads instructions addressed to you and acts on them; that is why the controller-only invariant exists. |
+| "the phase will figure out what it needs, extra context is harmless" | Extra context is the cockpit failing. A phase given `dispatch.md` reads instructions addressed to you and acts on them; that is why the one-controller-per-node invariant exists. |
 | "the archive is close enough; I trimmed a little on the way out" | Then the archive is not evidence of anything. Dispatch the file the script wrote. |
 | "the prompt is gone, I will write the manifest from memory" | Then it is a claim, not a measurement. Archive the prompt as you assemble it, not afterwards. |
 

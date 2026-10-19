@@ -8,6 +8,7 @@ use crate::governance::autopilot::{Mode, ProjectSummary};
 
 mod browser;
 mod delivery;
+mod nodes;
 
 pub use delivery::*;
 

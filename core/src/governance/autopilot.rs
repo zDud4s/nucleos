@@ -713,6 +713,49 @@ fn session_hook_entry() -> serde_json::Value {
     })
 }
 
+/// The `SessionStart` entry: the same command, but with a `compact` matcher, because this event
+/// (unlike the other session events) does carry a matcher in Claude Code, over its `source`
+/// (`startup`, `resume`, `clear`, `compact`). Only `compact` is wired: a bundle's rehydration
+/// hook exists to restore what a compaction dropped, and a fresh or resumed session has its
+/// context (or the CLAUDE.md files) already. Widen it here if a bundle ever needs more.
+const SESSION_START_EVENT: &str = "SessionStart";
+const SESSION_START_MATCHER: &str = "compact";
+
+fn session_start_entry() -> serde_json::Value {
+    serde_json::json!({
+        "matcher": SESSION_START_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"")
+        }]
+    })
+}
+
+/// The auto-compact window written into a project's `env` when it names none: the root soft
+/// threshold (120k tokens). The CLI clamps it to 100k-1M.
+pub const AUTO_COMPACT_WINDOW_DEFAULT: &str = "120000";
+const AUTO_COMPACT_WINDOW_KEY: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+
+/// The window to write: `NUCLEOS_AUTO_COMPACT_WINDOW` when it holds a positive integer,
+/// otherwise [`AUTO_COMPACT_WINDOW_DEFAULT`].
+fn auto_compact_window(override_value: Option<&str>) -> String {
+    override_value
+        .map(str::trim)
+        .filter(|text| text.parse::<u64>().is_ok_and(|n| n > 0))
+        .unwrap_or(AUTO_COMPACT_WINDOW_DEFAULT)
+        .to_string()
+}
+
+/// Adds the window to `settings.env` unless the file already sets that key (the user's wins) and
+/// keeps every other env key. A non-object `env` is left alone.
+fn set_auto_compact_window(object: &mut serde_json::Map<String, serde_json::Value>, window: &str) {
+    let env = object.entry("env").or_insert_with(|| serde_json::json!({}));
+    if let Some(env) = env.as_object_mut() {
+        env.entry(AUTO_COMPACT_WINDOW_KEY)
+            .or_insert_with(|| serde_json::Value::String(window.to_string()));
+    }
+}
+
 /// Registers one hook entry under `event_name` in `hooks`, deduped the same way for every event.
 ///
 /// A free function rather than the chain inlined three times, because `.entry("hooks")…
@@ -823,6 +866,12 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
         wire_event(hooks, event_name, session_hook_entry())
             .map_err(|error| format!("{}: {error}", settings_path.display()))?;
     }
+    wire_event(hooks, SESSION_START_EVENT, session_start_entry())
+        .map_err(|error| format!("{}: {error}", settings_path.display()))?;
+    set_auto_compact_window(
+        object,
+        &auto_compact_window(std::env::var("NUCLEOS_AUTO_COMPACT_WINDOW").ok().as_deref()),
+    );
 
     let body = serde_json::to_string_pretty(&settings)
         .map_err(|error| format!("could not write the settings back: {error}"))?;
@@ -3199,6 +3248,65 @@ pub mod tests {
             assert_eq!(ours[0]["hooks"][0]["command"], tool_command, "`{event}`");
             assert!(ours[0].get("matcher").is_none(), "`{event}`: {:?}", ours[0]);
         }
+    }
+
+    fn wired_settings(root: &TempDir) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wiring_registers_session_start_for_compaction_once() {
+        let root = TempDir::new().unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+        let settings = wired_settings(&root);
+        let entries = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["matcher"], "compact");
+        assert_eq!(
+            entries[0]["hooks"][0]["command"],
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        );
+    }
+
+    #[test]
+    fn wiring_writes_the_auto_compact_window_and_keeps_other_env_keys() {
+        let root = TempDir::new().unwrap();
+        write_settings(&root, r#"{"env":{"FOO":"bar"}}"#);
+        wire_classifier_hook(root.path()).unwrap();
+        let settings = wired_settings(&root);
+        assert_eq!(settings["env"]["FOO"], "bar");
+        let expected =
+            auto_compact_window(std::env::var("NUCLEOS_AUTO_COMPACT_WINDOW").ok().as_deref());
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            expected.as_str()
+        );
+    }
+
+    #[test]
+    fn wiring_respects_a_window_the_user_already_set() {
+        let root = TempDir::new().unwrap();
+        write_settings(
+            &root,
+            r#"{"env":{"CLAUDE_CODE_AUTO_COMPACT_WINDOW":"150000"}}"#,
+        );
+        wire_classifier_hook(root.path()).unwrap();
+        assert_eq!(
+            wired_settings(&root)["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+            "150000"
+        );
+    }
+
+    #[test]
+    fn the_auto_compact_window_defaults_and_accepts_a_positive_override() {
+        assert_eq!(auto_compact_window(None), "120000");
+        assert_eq!(auto_compact_window(Some("abc")), "120000");
+        assert_eq!(auto_compact_window(Some("0")), "120000");
+        assert_eq!(auto_compact_window(Some(" 160000 ")), "160000");
     }
 
     /// A project that already had its own `Stop` hook keeps it, with ours beside it.

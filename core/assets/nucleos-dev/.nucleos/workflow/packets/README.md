@@ -1,6 +1,6 @@
 # Packet schemas — the contract
 
-Four of the five schemas here end their header with "See packets/README.md for the contract." This is that file. It states only what the templates assume and nothing new.
+Four of the original five schemas here end their header with "See packets/README.md for the contract." This is that file. It states only what the templates assume and nothing new.
 
 ## What these files are
 
@@ -13,6 +13,8 @@ Read-only forms. A phase READS a schema and EMITS a filled copy; it never edits 
 | `execute.md` | `execute` | the steps, the boundaries, the validation commands, and the Handoff with its evidence |
 | `review.md` | `review` | the hard gates, the checklist, the verdict |
 | `rescue.md` | `rescue` | what was attempted, what failed, which assumption to test next |
+| `node.md` | the parent node (or the root controller) | one work-tree node's identity, goal, owned paths, budget, inherited limits and plan pointers; read by a sub-orchestrator or leaf |
+| `handoff.md` | the node itself, on close | the full node handoff at `<state_dir>/nodes/<root_id>/<node_id>.md`; its Summary is the text `node_close` passes up |
 
 ## Where filled copies go
 

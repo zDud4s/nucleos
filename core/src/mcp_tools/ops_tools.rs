@@ -484,6 +484,131 @@ impl NucleosTools {
     }
 
     #[tool(
+        description = "Open a work node: a unit of work in a tree you can hand off and rehydrate. \
+                       parent_id absent opens a new root. Limits: depth at most 3, at most 6 open \
+                       siblings, and owned_paths may not overlap a running sibling. A violation \
+                       is refused with the reason. Returns {id, root_id, depth}."
+    )]
+    pub(super) async fn node_open(
+        &self,
+        Parameters(NodeOpenParams {
+            parent_id,
+            kind,
+            title,
+            goal,
+            owned_paths,
+            budget_tokens,
+            task_id,
+            session_id,
+            chat_id,
+        }): Parameters<NodeOpenParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .node_open(&serde_json::json!({
+                    "parent_id": parent_id,
+                    "kind": kind,
+                    "title": title,
+                    "goal": goal,
+                    "owned_paths": owned_paths,
+                    "budget_tokens": budget_tokens,
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "chat_id": chat_id,
+                }))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Update a work node: its status, a decision to record, or the peak context \
+                       size it has reached. Only the fields you pass change."
+    )]
+    pub(super) async fn node_update(
+        &self,
+        Parameters(NodeUpdateParams {
+            id,
+            status,
+            decision,
+            context_peak,
+        }): Parameters<NodeUpdateParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .node_update(
+                    &id,
+                    &serde_json::json!({
+                        "status": status,
+                        "decision": decision,
+                        "context_peak": context_peak,
+                    }),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Close a work node with a final status and a summary of at most 1500 \
+                       characters (longer is refused). handoff_path must be a file that exists."
+    )]
+    pub(super) async fn node_close(
+        &self,
+        Parameters(NodeCloseParams {
+            id,
+            status,
+            summary,
+            handoff_path,
+        }): Parameters<NodeCloseParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .node_close(
+                    &id,
+                    &serde_json::json!({
+                        "status": status,
+                        "summary": summary,
+                        "handoff_path": handoff_path,
+                    }),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read a work tree from its root. view \"brief\" (default) returns a markdown \
+                       `text` ready to paste into a fresh context for rehydration; \"full\" \
+                       returns every node in detail."
+    )]
+    pub(super) async fn node_tree(
+        &self,
+        Parameters(NodeTreeParams { root_id, view }): Parameters<NodeTreeParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .node_tree(&root_id, view.as_deref().unwrap_or("brief"))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Find the root of the open work tree for a session_id or a chat_id. Returns \
+                       {root_id}, or a not-found error when none is open."
+    )]
+    pub(super) async fn node_active(
+        &self,
+        Parameters(NodeActiveParams {
+            session_id,
+            chat_id,
+        }): Parameters<NodeActiveParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .node_active(session_id.as_deref(), chat_id.as_deref())
+                .await,
+        )
+    }
+
+    #[tool(
         description = "Read a verification ticket: per-unit status, durations and output tails. \
                        Blocks up to about 45 seconds for it to finish unless wait is false."
     )]

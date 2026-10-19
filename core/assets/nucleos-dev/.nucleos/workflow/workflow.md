@@ -16,7 +16,16 @@ The optional `parallel_execute` wave is disabled by default and does not change 
 
 ## Roles
 
-Role assignments live in `<state_dir>/models.yaml`. The orchestrator is a controller only — it dispatches each phase through the configured tool/model and never substitutes its own model for a configured phase.
+Role assignments live in `<state_dir>/models.yaml`. Every node of a task tree has exactly one controller, which dispatches only its direct children through the configured tool/model and never substitutes its own model for a configured phase (see `dispatch.md`, "One controller per node").
+
+## Decomposition (node trees)
+
+- Split breadth first, along logical boundaries with clear file ownership (`owned_paths`).
+- Go deeper only until each leaf fits `leaf_budget`, counting its reads with exact line ranges. A big file read whole does not justify more splitting: the packet gives line ranges.
+- Limits come from `speed.yaml` `nodes:` (`max_depth`, `max_width`, `leaf_budget`, `orchestrator_budget`, `ceiling`).
+- A node closed `handoff` because of the ceiling generates a rework row (`mcp__nucleos__record`, kind `rework`, `caught_by` `budget`, payload kind `decomposition`): a session past the threshold is a decomposition defect.
+- Rule 3 stands: exactly ONE final verify, by the ROOT. Nodes never run build or test tools; they return the commands in their handoff. The RED proof and the final verify stay with the root.
+- Optional `subtree_verify` (`speed.yaml`, default `false`): when `true`, a sub-orchestrator MAY call `verify` with a scope restricted to its branch as an intermediate gate. The root's final verify remains the only ship/no-ship decision.
 
 ## Dispatch
 
@@ -42,6 +51,7 @@ Filled packets flow via stdin/temp files (see `dispatch.md`); never Edit/Write `
 | `plans/` | Persisted execution plan (packet-level breakdown) for medium/large code tasks. | `specs/` is the design; `plans/` is the executable phase breakdown. |
 | `specs/` | Persisted spec (broader design/intent) for large tasks. | Written before/above the plan; large tasks may have both. |
 | `loops/` | Spec-session checklists (see below), one file per session. | Working state of a session, not a deliverable. |
+| `nodes/` | Handoff files of node trees, one directory per root (`nodes/<root_id>/<node_id>.md`). | Written by nodes at close; the daemon holds the tree itself. |
 | `prompts/` | The archived prompt of each dispatched phase (see `prompt-contract.yaml`). | Evidence of what a phase was sent. |
 
 Metrics, rework, intent and event rows are not files you write: the controller records them with the MCP tool `mcp__nucleos__record` (`{kind: metric|rework|intent|event, task_id, phase?, caught_by?, payload}`), and the daemon owns the ledgers.

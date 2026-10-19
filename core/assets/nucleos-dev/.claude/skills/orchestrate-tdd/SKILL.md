@@ -87,6 +87,15 @@ This is the single home of the batched flow (Rule 3 in workflow.md points here).
 | "I'll run the scoped GREEN tests before the final verification, to be safe" | That is the pass batching removes; the verification runs them, and step 5 checks it did. |
 | "RED is batched, so a compile error proves every test failed for the right reason" | Only when each error names a symbol the plan adds. A typo in one test is that packet's wrong-reason RED. |
 
+## Large TDD tasks: root node
+
+When Size is `large`, or the plan would not fit one controller within `nodes.orchestrator_budget`, follow `orchestrate` §"Large tasks: become the root node": open a root node (`mcp__nucleos__node_open`, no `parent_id`, with `task_id`) and decompose into child nodes per the `orchestrate-node` skill. Medium tasks run the phases below unchanged. For a node tree:
+
+- Each node's leaves still author the tests and the code through `wf-executor` packets (RED and GREEN objectives and boundaries as below); a node dispatches only its direct children and returns a summary.
+- Nodes never run tests. Every packet stays `Test runs: batched`, and a node hands back the exact test commands and refs it would have run.
+- You, the root, collect every packet's refs and prove RED once for all packets together (`## Batched test runs` step 2), run the integrity check against the RED snapshot, and run the single final verification (Rule 3). No node, and no subtree, decides ship.
+- `nodes.subtree_verify` (default `false`) may add an intermediate `mcp__nucleos__verify` on a finished subtree. It is a gate for catching a red early, never the ship decision, and the final verification still runs once at the end.
+
 ## Phase 2 - RED (author failing tests)
 
 Resolve the executor `(tool, model, reasoning_effort)` from `auto_overrides["execute"]` or `execute.*` in `<state_dir>/models.yaml`. Dispatch a filled `execute.md` packet scoped to tests only:

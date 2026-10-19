@@ -446,3 +446,66 @@ pub(super) struct SendToChatParams {
     /// not shown to the person on this end first.
     pub(super) text: String,
 }
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct NodeOpenParams {
+    /// The node to open this one under. Absent opens a new root.
+    pub(super) parent_id: Option<String>,
+    /// "root" for a node without a parent; "orchestrator" or "leaf" for a child.
+    pub(super) kind: String,
+    /// A short title.
+    pub(super) title: String,
+    /// What this node must achieve, in a sentence or two.
+    pub(super) goal: String,
+    /// Paths this node owns. They may not overlap a running sibling. Default none.
+    #[serde(default)]
+    pub(super) owned_paths: Vec<String>,
+    /// The token budget for this node. Absent takes the daemon default.
+    pub(super) budget_tokens: Option<i64>,
+    /// The workflow task this node belongs to.
+    pub(super) task_id: Option<String>,
+    /// The session this tree belongs to, so `node_active` can find it again.
+    pub(super) session_id: Option<String>,
+    /// The chat this tree belongs to, so `node_active` can find it again.
+    pub(super) chat_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct NodeUpdateParams {
+    /// The node to update.
+    pub(super) id: String,
+    /// The new status of the node.
+    pub(super) status: Option<String>,
+    /// A decision to record on the node.
+    pub(super) decision: Option<String>,
+    /// The peak context size, in tokens, this node has reached.
+    pub(super) context_peak: Option<i64>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct NodeCloseParams {
+    /// The node to close.
+    pub(super) id: String,
+    /// The final status, e.g. "done" or "failed".
+    pub(super) status: String,
+    /// What happened, at most 1500 characters.
+    pub(super) summary: String,
+    /// A path to the handoff file. It must exist.
+    pub(super) handoff_path: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct NodeTreeParams {
+    /// The root of the tree.
+    pub(super) root_id: String,
+    /// "brief" (default) or "full".
+    pub(super) view: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct NodeActiveParams {
+    /// Find the open tree of this session.
+    pub(super) session_id: Option<String>,
+    /// Find the open tree of this chat.
+    pub(super) chat_id: Option<String>,
+}

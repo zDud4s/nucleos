@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Production hook for NucleOS sessions — launched by the daemon or opened by hand.
 
-Registered under six events (`autopilot.rs`'s `wire_classifier_hook`), told apart by the
+Registered under seven events (`autopilot.rs`'s `wire_classifier_hook`), told apart by the
 payload's own `hook_event_name` rather than by anything the invocation says, because the same
-command is wired to all six. `Stop`, `SubagentStop` and `UserPromptSubmit` only forward to the
+command is wired to all seven. `Stop`, `SubagentStop`, `UserPromptSubmit` and `SessionStart` (stdout JSON such as
+`hookSpecificOutput.additionalContext` is printed verbatim) only forward to the
 hooks a pinned workflow bundle declares (`bundle_hooks`), and fail open; the three tool events
 are what follows:
 
@@ -780,7 +781,7 @@ def interactive_session(payload: dict) -> None:
 
 # The events that are not about a tool call. Wired so a pinned workflow bundle can hang its own
 # hooks on them (`core/src/workflows/hooks.rs`); this script only forwards them.
-SESSION_EVENTS = ("Stop", "SubagentStop", "UserPromptSubmit")
+SESSION_EVENTS = ("Stop", "SubagentStop", "UserPromptSubmit", "SessionStart")
 
 # Longer than the daemon's own fifty-second budget for running every hook of one event, so the
 # daemon is what stops a slow hook and says so, rather than this giving up first.

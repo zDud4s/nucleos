@@ -117,6 +117,7 @@ PHASE_SKILL = {
     "red": "executor",
     "green": "executor",
     "refactor": "executor",
+    "orchestrate_node": "orchestrate-node",
 }
 
 PHASE_COCKPIT = {
@@ -129,6 +130,7 @@ PHASE_COCKPIT = {
     "red": "wf-executor",
     "green": "wf-executor",
     "refactor": "wf-executor",
+    "orchestrate_node": "wf-orchestrator",
 }
 
 ENTRY = re.compile(r"^- (\d{4}-\d{2}-\d{2}) \[([a-z-]+)\]")

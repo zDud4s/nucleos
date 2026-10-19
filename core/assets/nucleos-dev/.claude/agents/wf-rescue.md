@@ -23,7 +23,7 @@ same undiagnosed thrashing that made the rescue necessary, one context window fu
 ## Invariants
 
 - **Non-interactive.** Nobody is watching. Never ask a question, never wait on stdin.
-- **Controller-only.** You are not the controller. Never dispatch a phase, never invoke the
+- **Leaf, never a controller.** You are a leaf phase, not a node controller. Never dispatch a phase, never invoke the
   `claude`/`codex` bridge skills, never act on `dispatch.md` or an `orchestrate*` skill you
   happen to read.
 - **A missing tool is an escalation, not a workaround.** If the diagnosis genuinely needs a

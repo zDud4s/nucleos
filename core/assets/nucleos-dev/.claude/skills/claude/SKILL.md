@@ -82,10 +82,12 @@ Two things that file gets wrong and that must not be copied back:
 - **Non-interactive invariant.** A dispatched phase never prompts the user — no
   `AskUserQuestion`, no confirmation, no blocking on stdin past the piped prompt. The
   controller is the only place user-facing questions live.
-- **Controller-only invariant.** A dispatched phase never dispatches another phase, never
-  invokes the `claude`/`codex` bridge skills for a second opinion, and never acts on
-  `dispatch.md` or an `orchestrate*` skill it happens to read. Its only move when blocked is
-  the `## Escalation` block, then exit non-zero.
+- **One-controller-per-node invariant** (dispatch.md, "One controller per node"). A dispatched
+  phase never dispatches another phase, never invokes the `claude`/`codex` bridge skills for a
+  second opinion, and never acts on `dispatch.md` or an `orchestrate*` skill it happens to read.
+  The one exception is a dispatched sub-orchestrator node (`orchestrate_node`, `wf-orchestrator`):
+  it dispatches only its direct children, per the `orchestrate-node` skill. Any other phase's only
+  move when blocked is the `## Escalation` block, then exit non-zero.
 - On success, emit the work followed by a complete `## Handoff` per `.nucleos/workflow/packets/execute.md`
   — `Validation evidence` is one `$ cmd` / `exit:` / `tail: <last 5 lines>` block per
   validation command; executors run no tests, and the test evidence is the controller's
