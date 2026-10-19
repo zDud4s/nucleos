@@ -36,6 +36,18 @@
   color: var(--text-muted);
 }
 
+/* An item and the dot that follows it wrap as one unit; the last item has no dot after it. */
+.feed-verdict-item {
+  display: inline-flex;
+  align-items: baseline;
+  column-gap: var(--space-2);
+  white-space: nowrap;
+}
+
+.feed-verdict-item:last-child .feed-verdict-dot {
+  display: none;
+}
+
 /**
  * A count, and the way to its newest line.
  *
@@ -583,11 +595,11 @@
   transform: rotate(90deg);
 }
 
+/* A group name wraps rather than truncating: "RUNS & WORKT..." named nothing. */
 .feed-trace-lane-name {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  line-height: var(--leading-tight, 1.25);
 }
 
 .feed-trace-lane-n {

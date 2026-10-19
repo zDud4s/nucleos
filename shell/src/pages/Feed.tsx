@@ -518,7 +518,12 @@ function Verdict({
   const total = counts.wrong + counts.held + counts.asks + counts.routine;
   return (
     <span className="feed-verdict">
-      <span className="feed-verdict-window">{windowText}</span>
+      <span className="feed-verdict-item">
+        <span className="feed-verdict-window">{windowText}</span>
+        <span className="feed-verdict-dot" aria-hidden="true">
+          ·
+        </span>
+      </span>
       {total === 0 ? (
         <Separated>
           <span>the machine wrote nothing</span>
@@ -545,14 +550,16 @@ function Verdict({
   );
 }
 
+// The dot trails the item before it, so a wrapped line can never start with a stray dot; the
+// last item drops it (see `.feed-verdict-item:last-child`).
 function Separated({ children }: { children: ReactNode }) {
   return (
-    <>
+    <span className="feed-verdict-item">
+      {children}
       <span className="feed-verdict-dot" aria-hidden="true">
         ·
       </span>
-      {children}
-    </>
+    </span>
   );
 }
 
