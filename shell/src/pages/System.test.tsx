@@ -1127,9 +1127,14 @@ describe("System - backups", () => {
     await renderSystemAt("/system/backups");
 
     const button = await screen.findByRole("button", { name: "Compact on next start" });
-    // The cost is said before the press, not after it.
+    // The cost is said before the press, not after it: the time, and the safety copy that stays
+    // (the compacted size, 440 MB less the 19 MB given back) until the next compaction.
     expect(screen.getByText(/Gives back about 19\.0 MB/)).toBeTruthy();
     expect(screen.getByText(/next start takes longer/)).toBeTruthy();
+    expect(
+      screen.getByText(/A safety copy of about 421\.0 MB stays in backups\/ until the next compaction/),
+    ).toBeTruthy();
+    expect(button.getAttribute("aria-disabled")).toBeNull();
 
     fireEvent.click(button);
     await afterDwell();
@@ -1140,6 +1145,26 @@ describe("System - backups", () => {
     const posts = daemon.apiFetch.mock.calls.filter(([path]) => path === "/system/storage/compact");
     expect(posts).toHaveLength(1);
     expect((posts[0][1] as RequestInit).method).toBe("POST");
+  });
+
+  it("disables the compact button, with the reason, when nothing is reclaimable", async () => {
+    const world = systemWorld({ storage: { ...storageReading, reclaimable_bytes: 0 } });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/backups");
+
+    const button = await screen.findByRole("button", { name: "Compact on next start" });
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    const reason = screen.getByText("Nothing to give back: the database has no free pages.");
+    expect(button.getAttribute("aria-describedby")).toBe(reason.id);
+    expect(screen.queryByText(/Gives back about/)).toBeNull();
+
+    fireEvent.click(button);
+    await afterDwell();
+    expect(screen.queryByRole("button", { name: "Compact when it next starts" })).toBeNull();
+    expect(daemon.apiFetch.mock.calls.some(([path]) => path === "/system/storage/compact")).toBe(
+      false,
+    );
   });
 
   it("shows a compaction already scheduled without offering the button again", async () => {

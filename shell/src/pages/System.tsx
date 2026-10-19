@@ -1161,11 +1161,21 @@ function SpacePanel() {
                 sayAs={`Rewrite the database on the next start to give back ${formatBytes(space.reclaimable_bytes)}`}
                 variant="ghost"
                 disabled={stageCompaction.isPending}
+                unavailable={space.reclaimable_bytes === 0}
+                describedBy="space-compact-note"
                 onConfirm={() => stageCompaction.mutate()}
               />
-              <p className="sy-space-notes">
-                Gives back about {formatBytes(space.reclaimable_bytes)}. The next start takes longer
-                while the file is rewritten, and a copy is kept first.
+              <p className="sy-space-notes" id="space-compact-note">
+                {space.reclaimable_bytes === 0 ? (
+                  "Nothing to give back: the database has no free pages."
+                ) : (
+                  <>
+                    Gives back about {formatBytes(space.reclaimable_bytes)}. The next start takes
+                    longer while the file is rewritten. A safety copy of about{" "}
+                    {formatBytes(Math.max(space.db_bytes - space.reclaimable_bytes, 0))} stays in
+                    backups/ until the next compaction.
+                  </>
+                )}
               </p>
               {stageCompaction.isError && <CompactionError error={stageCompaction.error} />}
             </div>
