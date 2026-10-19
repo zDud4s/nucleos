@@ -106,6 +106,10 @@ const PROJECT_SCOPED: &[&str] = &[
     "verify_requests",
     "verify_runs",
     "webhook_deliveries",
+    // The orchestration tree a project's work was decomposed into (migration 0216): its roots,
+    // children, decisions and summaries are that project's work history. Roots opened with no
+    // project (`project_id` NULL) never match a project id, so they stay.
+    "work_nodes",
     // The workflow ledgers a project's tasks wrote are that project's history too.
     "workflow_records",
     "worktree_touched_paths",
