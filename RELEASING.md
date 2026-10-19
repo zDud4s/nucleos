@@ -88,3 +88,37 @@ the escape is `NUCLEOS_ALLOW_DIRECT_GIT=1 git push origin vX.Y.Z`.
 
 macOS minutes bill at ten times while the repository is private, which is why this workflow runs
 only on a tag.
+
+## Installing a release
+
+The scripts are attached to every release, so the `latest` URLs always match the newest one. Both
+download with curl / `Invoke-WebRequest`, which leave no quarantine attribute or Mark-of-the-Web,
+so Gatekeeper and SmartScreen do not block the result, and both verify the download against the
+release's `SHA256SUMS` before installing (a mismatch deletes it and exits non-zero).
+
+```bash
+# macOS (Apple silicon) and Linux (x86_64)
+curl -fsSL https://github.com/zDud4s/nucleos/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/zDud4s/nucleos/releases/latest/download/install.sh | bash -s -- 1.2.3
+```
+
+```powershell
+# Windows (x64)
+irm https://github.com/zDud4s/nucleos/releases/latest/download/install.ps1 | iex
+```
+
+- macOS extracts the `.app.tar.gz` into `/Applications`, or `~/Applications` without permission.
+- Linux puts the AppImage in `~/.local/bin` and adds a menu entry. AppImages need FUSE
+  (`sudo apt install libfuse2` on Ubuntu 22.04). The `.deb` is a manual download.
+- Windows runs the NSIS installer silently for the current user. Close NucleOS first.
+- Intel Macs have no installer yet (the release builds Apple silicon only).
+- While the repository is private, `releases/latest/download` needs authentication, so the
+  one-liners work end to end only once it is public. Set `NUCLEOS_RELEASE_BASE` to a directory that
+  holds `SHA256SUMS` and the assets to install from a mirror, and `NUCLEOS_INSTALL_DRY_RUN=1` to
+  download and verify without installing.
+
+### Fallback: the browser
+
+Downloading the `.dmg` or `.exe` in a browser marks it as quarantined. macOS: open the app once,
+then System Settings, Privacy & Security, "Open Anyway". Windows SmartScreen: "More info", then
+"Run anyway".
