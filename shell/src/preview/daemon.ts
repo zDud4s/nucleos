@@ -3466,7 +3466,15 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/calendar/busy") return { busy: true };
   if (path === "/calendar/config") return CALENDAR_CONFIG;
   if (path === "/notifications/pending") return HELD;
-  if (splitQuery(path)[0] === "/feed") return FEED;
+  if (splitQuery(path)[0] === "/feed") {
+    // Narrowed by `q` and cut by `limit` the way the núcleo does, so the palette's global search
+    // shows feed lines that match rather than the whole list under every query.
+    const params = splitQuery(path)[1];
+    const q = (params.get("q") ?? "").trim().toLowerCase();
+    const limit = Number(params.get("limit"));
+    const lines = q === "" ? FEED : FEED.filter((entry) => entry.summary.toLowerCase().includes(q));
+    return Number.isFinite(limit) && limit > 0 ? lines.slice(0, limit) : lines;
+  }
   /*
     The axis and its marker. The window and the cursor are applied as the núcleo applies them, so
     the page's incremental poll brings nothing new and a preset photographs exactly its window. A
@@ -3731,6 +3739,19 @@ export function answer(path: string, init?: RequestInit): unknown {
   /* An object with a list inside it, so the empty-list default cannot stand in. */
   if (/^\/projects\/[^/]+\/map\/silenced$/.test(route)) return { rows: [], total: 0 };
 
+  if (splitQuery(path)[0] === "/assistant/search") {
+    // What was said, found by the conversations' own titles here: the preview keeps no transcripts.
+    const q = (splitQuery(path)[1].get("q") ?? "").trim().toLowerCase();
+    if (q === "") return [];
+    return CHATS.filter((chat) => (chat.title ?? "").toLowerCase().includes(q)).map((chat, at) => ({
+      chat_id: chat.chat_id,
+      title: chat.title,
+      turn_id: at + 1,
+      side: "answered",
+      excerpt: `…${chat.title ?? ""}…`,
+      created_at: chat.created_at,
+    }));
+  }
   if (path === "/assistant/chats") return CHATS;
   if (splitQuery(path)[0] === "/assistant/models") return CHAT_MODELS;
   if (path === "/assistant/ide-sessions") return [];

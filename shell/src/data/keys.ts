@@ -592,6 +592,20 @@ export const keys = {
     dictations: ["voice", "dictations"] as const,
   },
 
+  /**
+   * What the palette's global search asked each source, by the query. Their own roots and not
+   * the pages' keys: the same endpoint with a `limit` of five is a different answer from the
+   * page's list, and sharing an entry would hand a page five rows.
+   */
+  search: {
+    said: (q: string) => ["search", "said", q] as const,
+    runs: (q: string) => ["search", "runs", q] as const,
+    feed: (q: string) => ["search", "feed", q] as const,
+    mail: (q: string) => ["search", "mail", q] as const,
+    web: (q: string) => ["search", "web", q] as const,
+    notes: (q: string) => ["search", "notes", q] as const,
+  },
+
   web: {
     all: ["web"] as const,
     pages: (q?: string) => ["web", "pages", q ?? null] as const,
