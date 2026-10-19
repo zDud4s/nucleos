@@ -206,4 +206,25 @@ describe("the notifications view", () => {
 
     expect(await screen.findByText(/nothing is known about the notification policy/i)).toBeDefined();
   });
+
+  it("the desktop switch remembers its state", async () => {
+    localStorage.clear();
+    serve({ families: [], kinds: [] }, OBSERVED);
+    const first = renderWithQuery(<NotificationsView />);
+
+    // On by default: a machine nobody has configured shows toasts, as the owner decided.
+    const label = /also show these on this computer's desktop/i;
+    const box = (await screen.findByLabelText(label)) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+
+    fireEvent.click(box);
+    expect(box.checked).toBe(false);
+    expect(localStorage.getItem("nucleos.desktopNotify")).toBe("false");
+
+    // A fresh mount reads it back; it is not a draft that waits for Save.
+    first.unmount();
+    renderWithQuery(<NotificationsView />);
+    expect(((await screen.findByLabelText(label)) as HTMLInputElement).checked).toBe(false);
+    localStorage.clear();
+  });
 });
