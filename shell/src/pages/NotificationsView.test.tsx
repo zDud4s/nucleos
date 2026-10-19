@@ -207,6 +207,117 @@ describe("the notifications view", () => {
     expect(await screen.findByText(/nothing is known about the notification policy/i)).toBeDefined();
   });
 
+  describe("the channel scope selector", () => {
+    const channel = (id: string, label: string, configured: boolean) => ({
+      id,
+      kind: id,
+      label,
+      health_row: id,
+      configured,
+      missing_secrets: [],
+      settings_area: id,
+      state: configured ? "online" : "not_configured",
+      since: null,
+      adapter: null,
+      capabilities: null,
+      home: null,
+      identities: { senders: 0, conversations: 0 },
+      pairing: null,
+      outbox: { pending: 0, leased: 0, failed: 0, oldest_due_at: null },
+      drops: { unknown_sender: 0, pairing_failures: 0, counted_since: "2026-10-19T00:00:00Z" },
+    });
+    const READOUT = {
+      contract_version: "1",
+      primary: "telegram",
+      routing: { state: "ok" },
+      channels: [
+        channel("telegram", "Telegram", true),
+        channel("email", "Email", true),
+        channel("matrix", "Matrix", false),
+      ],
+    };
+
+    /** `serve`, plus `GET /channels` answered by `channels` (a function, so a test can fail or stall it). */
+    function serveWithChannels(channels: () => unknown) {
+      serve({ families: [], kinds: [] }, OBSERVED);
+      const base = daemon.apiFetch.getMockImplementation()!;
+      daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+        if (path === "/channels") return channels();
+        return base(path, init);
+      });
+    }
+
+    it("titles the panel neutrally", async () => {
+      serve({ families: [], kinds: [] }, OBSERVED);
+      renderWithQuery(<NotificationsView />);
+      expect(await screen.findByText("Notifications")).toBeDefined();
+      expect(screen.queryByText("Telegram notifications")).toBeNull();
+    });
+
+    it("draws no selector without onChannelChange", async () => {
+      serve({ families: [], kinds: [] }, OBSERVED);
+      renderWithQuery(<NotificationsView />);
+      await screen.findByText("jobs");
+      expect(screen.queryByLabelText(/channel/i)).toBeNull();
+    });
+
+    it("offers Default and the configured channels, marking the primary", async () => {
+      serveWithChannels(() => READOUT);
+      renderWithQuery(<NotificationsView onChannelChange={vi.fn()} />);
+
+      await screen.findByText("jobs");
+      await waitFor(() =>
+        expect((screen.getByLabelText(/channel/i) as HTMLSelectElement).disabled).toBe(false),
+      );
+      const select = screen.getByLabelText(/channel/i) as HTMLSelectElement;
+      const names = Array.from(select.options).map((o) => o.textContent ?? "");
+      expect(names).toHaveLength(3);
+      expect(names[0]).toBe("Default (all channels)");
+      expect(names[1]).toMatch(/Telegram/);
+      expect(names[1]).toMatch(/primary/);
+      expect(names[2]).toBe("Email");
+      expect(names.join(" ")).not.toMatch(/Matrix/);
+    });
+
+    it("reports the choice, and Default as undefined", async () => {
+      serveWithChannels(() => READOUT);
+      const onChannelChange = vi.fn();
+      renderWithQuery(<NotificationsView channel="telegram" onChannelChange={onChannelChange} />);
+
+      await screen.findByText("jobs");
+      await waitFor(() =>
+        expect((screen.getByLabelText(/channel/i) as HTMLSelectElement).disabled).toBe(false),
+      );
+      const select = screen.getByLabelText(/channel/i) as HTMLSelectElement;
+      expect(select.value).toBe("telegram");
+
+      fireEvent.change(select, { target: { value: "email" } });
+      expect(onChannelChange).toHaveBeenLastCalledWith("email");
+      fireEvent.change(select, { target: { value: "" } });
+      expect(onChannelChange).toHaveBeenLastCalledWith(undefined);
+    });
+
+    it("keeps Default working, with a quiet note, when the channel list fails", async () => {
+      serveWithChannels(() => {
+        throw new Error("the daemon did not answer");
+      });
+      renderWithQuery(<NotificationsView onChannelChange={vi.fn()} />);
+
+      expect(await screen.findByText("jobs")).toBeDefined();
+      expect(await screen.findByText(/channel list did not load/i)).toBeDefined();
+      const select = screen.getByLabelText(/channel/i) as HTMLSelectElement;
+      expect(Array.from(select.options).map((o) => o.textContent)).toEqual(["Default (all channels)"]);
+    });
+
+    it("disables the selector while the channels load", async () => {
+      serveWithChannels(() => new Promise(() => {}));
+      renderWithQuery(<NotificationsView onChannelChange={vi.fn()} />);
+
+      await screen.findByText("jobs");
+      expect((screen.getByLabelText(/channel/i) as HTMLSelectElement).disabled).toBe(true);
+    });
+  });
+
   it("the desktop switch remembers its state", async () => {
     localStorage.clear();
     serve({ families: [], kinds: [] }, OBSERVED);

@@ -10,13 +10,14 @@ import {
   type NotifyPolicy,
   type NotifyRule,
 } from "../data/feed";
+import { useChannels } from "../data/channels";
 import { useDesktopNotify } from "../data/desktop-notify-pref";
 import { useNotifyPolicy, useObservedKinds, useSetNotifyPolicy } from "../data/system";
 import { Button, ErrorNote, Panel, RefusalNote } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
- * Which notifications reach Telegram.
+ * Which notifications reach the messaging channels.
  *
  * The screen is the resolution of the policy, drawn — not a second idea laid
  * over it. `groupKinds` resolves once, in `data/feed.ts`, and everything here
@@ -29,7 +30,13 @@ import { DAEMON_NAME } from "../copy";
  * two halves drift) and because a switch that fired a request per flip would
  * make a settings screen into a stream of writes.
  */
-export function NotificationsView() {
+export function NotificationsView({
+  channel,
+  onChannelChange,
+}: {
+  channel?: string;
+  onChannelChange?: (channel: string | undefined) => void;
+} = {}) {
   const stored = useNotifyPolicy();
   const observed = useObservedKinds();
   const save = useSetNotifyPolicy();
@@ -99,10 +106,14 @@ export function NotificationsView() {
     <>
       <DesktopSwitch />
       <Panel
-        title="Telegram notifications"
+        title="Notifications"
         /* Save sits in the head, where it is on screen whatever is expanded below it. */
         aside={
           <div className="sy-notify-actions">
+            {/* Drawn only when the parent can act on a choice; `System` passes it. */}
+            {onChannelChange && (
+              <ChannelScopeSelector channel={channel} onChannelChange={onChannelChange} />
+            )}
             {dirty && <span className="sy-meta">unsaved changes</span>}
             <span className="sy-meta" role="status">
               {saved && !dirty ? "saved" : null}
@@ -124,7 +135,7 @@ export function NotificationsView() {
         <p className="sy-note">
           A family is a prefix, and a kind can override its family. Anything no rule claims is sent —
           so a machine nobody has configured behaves exactly as it did before this screen existed.
-          The sidecar re-reads this on its next round: nothing needs restarting.
+          The adapter picks this up on its next round: nothing needs restarting.
         </p>
 
         {save.isError &&
@@ -155,6 +166,49 @@ export function NotificationsView() {
           </>
         )}
       </Panel>
+    </>
+  );
+}
+
+/**
+ * Picks which scope the policy below applies to: the default for every channel, or one channel.
+ *
+ * Only configured channels are offered; an unconfigured one has no adapter to read an override. A
+ * failed channel list must not take the Default mode down with it, so the error is a quiet note and
+ * the selector keeps its one safe option.
+ */
+function ChannelScopeSelector({
+  channel,
+  onChannelChange,
+}: {
+  channel?: string;
+  onChannelChange: (channel: string | undefined) => void;
+}) {
+  const channels = useChannels();
+  const selectId = useId();
+  const options = channels.data?.channels.filter((c) => c.configured) ?? [];
+  const primary = channels.data?.primary ?? null;
+
+  return (
+    <>
+      <label className="sy-meta" htmlFor={selectId}>
+        Channel
+      </label>
+      <select
+        id={selectId}
+        className="sy-notify-select"
+        value={channel ?? ""}
+        disabled={channels.isPending}
+        onChange={(event) => onChannelChange(event.target.value === "" ? undefined : event.target.value)}
+      >
+        <option value="">Default (all channels)</option>
+        {options.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.id === primary ? `${c.label} (primary)` : c.label}
+          </option>
+        ))}
+      </select>
+      {channels.isError && <span className="sy-note">the channel list did not load</span>}
     </>
   );
 }
