@@ -201,38 +201,41 @@ function RunCrumb() {
  */
 function Instruments({ run, alive }: { run: TeamRunView; alive: boolean }) {
   return (
-    <div className="teams-strip">
-      <StatCard label="State" value={<StateBadge domain="team_run" state={run.state} />} />
-      <StatCard
-        label="Round"
-        value={run.round}
-        detail={
-          alive
-            ? `${itemCount(run.items.length)} so far, across all rounds`
-            : `${itemCount(run.items.length)} across ${run.round === 1 ? "1 round" : `${run.round} rounds`}`
-        }
-      />
-      {/* `money` and never a raw `toFixed`: every figure in this app that is a spend is
-          written by the one formatter, so `$1.25` and `$0.004` are the same reading at
-          two magnitudes rather than two conventions. */}
-      <StatCard
-        label="Cost"
-        value={money(run.cost_usd)}
-        detail={run.root_id === run.id ? "this run's own spend" : "this run's own spend — it is part of a chain"}
-      />
-      {/* A word and not a figure, so it is set at the rank a word can be read at: the
-          display face at `--text-3xl` turned "between rounds" into two lines of headline
-          that outshouted the three readings beside it. The card's job is the same; only
-          the type is honest about what is in it. */}
-      <StatCard
-        label="Director"
-        value={
-          <span className="text-lg leading-snug" title={run.director_node}>
-            {directorNodeText(run.director_node)}
-          </span>
-        }
-        detail={alive ? "what it is doing now" : "what it was doing when it stopped"}
-      />
+    // The frame is the strip's query container: a grid cannot query its own width.
+    <div className="teams-strip-frame">
+      <div className="teams-strip">
+        <StatCard label="State" value={<StateBadge domain="team_run" state={run.state} />} />
+        <StatCard
+          label="Round"
+          value={run.round}
+          detail={
+            alive
+              ? `${itemCount(run.items.length)} so far, across all rounds`
+              : `${itemCount(run.items.length)} across ${run.round === 1 ? "1 round" : `${run.round} rounds`}`
+          }
+        />
+        {/* `money` and never a raw `toFixed`: every figure in this app that is a spend is
+            written by the one formatter, so `$1.25` and `$0.004` are the same reading at
+            two magnitudes rather than two conventions. */}
+        <StatCard
+          label="Cost"
+          value={money(run.cost_usd)}
+          detail={run.root_id === run.id ? "this run's own spend" : "this run's own spend — it is part of a chain"}
+        />
+        {/* A word and not a figure, so it is set at the rank a word can be read at: the
+            display face at `--text-3xl` turned "between rounds" into two lines of headline
+            that outshouted the three readings beside it. The card's job is the same; only
+            the type is honest about what is in it. */}
+        <StatCard
+          label="Director"
+          value={
+            <span className="text-lg leading-snug" title={run.director_node}>
+              {directorNodeText(run.director_node)}
+            </span>
+          }
+          detail={alive ? "what it is doing now" : "what it was doing when it stopped"}
+        />
+      </div>
     </div>
   );
 }

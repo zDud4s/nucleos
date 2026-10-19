@@ -510,7 +510,8 @@
 /* Project brakes and the budget share a row when the page is wide enough. */
 .sy-health-pair {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(28rem, 1fr));
+  /* min() lets the pair fall to one column narrower than 28rem instead of overflowing it. */
+  grid-template-columns: repeat(auto-fit, minmax(min(28rem, 100%), 1fr));
   align-items: start;
   gap: var(--space-4);
 }

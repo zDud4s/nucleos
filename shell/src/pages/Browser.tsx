@@ -749,11 +749,23 @@ function SiteRow({
       </div>
       {site.granted_for !== null && <p className="browser-meta">brought in by {site.granted_for}</p>}
       <div className="browser-actions">
-        <ConfirmButton label="Revoke" confirmLabel={`Revoke ${site.origin}`} variant="danger" disabled={pending} onConfirm={onRevoke} />
+        {/* The drawn confirm labels stay short and the origin goes to `sayAs`: the button
+            reserves the width of its confirm label, and with the origin in it "Stop
+            submitting" was a 360px button that broke onto two lines at 800px. The row's head
+            already names the site for the eye. */}
+        <ConfirmButton
+          label="Revoke"
+          confirmLabel="Revoke this site"
+          sayAs={`Revoke ${site.origin}`}
+          variant="danger"
+          disabled={pending}
+          onConfirm={onRevoke}
+        />
         {site.writable && (
           <ConfirmButton
             label="Stop submitting"
-            confirmLabel={`Stop agents submitting forms on ${site.origin}`}
+            confirmLabel="Stop form submits"
+            sayAs={`Stop agents submitting forms on ${site.origin}`}
             variant="ghost"
             disabled={pending}
             onConfirm={onReadonly}

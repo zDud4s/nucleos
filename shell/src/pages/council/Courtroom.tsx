@@ -28,6 +28,7 @@ const CX = VIEW_W / 2;
 /** The scales' pivot, and the half-length of the beam, in viewBox units. */
 const PIVOT = { x: 78, y: 52 };
 const HALF_BEAM = 36;
+const CAPTION_SHIFT = 10;
 const CHAIN = 14;
 const PLATE = 6.5;
 
@@ -42,6 +43,14 @@ const WING_X = 482;
 const JUDGE_LABEL_CHARS = 16;
 
 const clip = (text: string, room: number) => (text.length > room ? `${text.slice(0, room - 1)}…` : text);
+
+/**
+ * Characters a role keeps under its seat. The two seats either side of the arc's
+ * foot sit ~90 viewBox units apart on the same line, and two 16-character roles at
+ * 12px overlapped there; 11 leaves both clear. The full role stays on the seat's
+ * accessible name and title.
+ */
+const ROLE_ROOM = 11;
 
 /** "1st", "2nd", "3rd", "4th", "11th", "21st". */
 export function ordinal(n: number): string {
@@ -128,70 +137,94 @@ export function Courtroom({
 
   return (
     <div className={`council-court${court.dimmed ? " council-court-dimmed" : ""}`}>
-      <svg
-        className={`council-court-svg${settle ? " council-court-settle" : ""}`}
-        viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
-        aria-hidden="true"
-      >
-        <Pediment />
-        <Judge judge={court.judge} selected={selected?.kind === "judge"} />
-        <Scales balance={court.balance} />
-        <Wing wing={court.wing} />
-        {court.links.map((link, i) => (
-          <Link key={`${link.kind}-${link.from}-${link.to}-${i}`} link={link} where={where} />
-        ))}
-        <Lectern court={court} interactive={mode === "session"} selected={lecternSelected} />
-        {court.seats.map((seat) => (
-          <Seat
+      {/* The stage is exactly the drawing's box: every overlay below is placed in percent of it,
+          and the roll under it (shown below 900px) must not stretch what those percents mean. */}
+      <div className="council-court-stage">
+        <svg
+          className={`council-court-svg${settle ? " council-court-settle" : ""}`}
+          viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
+          aria-hidden="true"
+        >
+          <Pediment />
+          <Judge judge={court.judge} selected={selected?.kind === "judge"} />
+          <Scales balance={court.balance} />
+          <Wing wing={court.wing} />
+          {court.links.map((link, i) => (
+            <Link key={`${link.kind}-${link.from}-${link.to}-${i}`} link={link} where={where} />
+          ))}
+          <Lectern court={court} interactive={mode === "session"} selected={lecternSelected} />
+          {court.seats.map((seat) => (
+            <Seat
+              key={seat.key}
+              seat={seat}
+              selected={selected?.kind === "seat" && selected.index === seat.index}
+              revealed={hot === seat.index}
+              settle={settle === true}
+            />
+          ))}
+        </svg>
+        {/* The SVG is the picture; these real buttons are what the keyboard, the pointer and a screen reader meet. */}
+        <HitButton
+          className="council-court-hit council-court-hit-judge"
+          box={{ x: CX, y: 55, w: 120, h: 30 }}
+          selected={selected?.kind === "judge"}
+          label={`Chairman, ${court.judge.state === "empty" ? "empty" : court.judge.name}`}
+          title={
+            court.judge.state === "empty"
+              ? "Chairman: empty"
+              : court.judge.sub === null
+                ? `Chairman: ${court.judge.name}`
+                : `Chairman: ${court.judge.name} · ${court.judge.sub}`
+          }
+          onSelect={() => onSelect({ kind: "judge" })}
+        />
+        {mode === "session" && (
+          <HitButton
+            className="council-court-hit council-court-hit-lectern"
+            box={{ x: CX, y: LECTERN.y + LECTERN.h / 2, w: LECTERN.w, h: LECTERN.h }}
+            selected={lecternSelected}
+            label="The case"
+            title={court.lectern.full}
+            onSelect={() => onSelect({ kind: "lectern" })}
+          />
+        )}
+        {court.seats.map((seat, i) => (
+          <HitButton
             key={seat.key}
-            seat={seat}
+            className="council-court-hit council-court-hit-seat"
+            box={{ x: seat.x, y: seat.y, w: seat.r * 2, h: seat.r * 2 }}
             selected={selected?.kind === "seat" && selected.index === seat.index}
-            revealed={hot === seat.index}
-            settle={settle === true}
+            label={seatLabel(seat, mode)}
+            title={seatTitle(seat)}
+            setRef={(node) => {
+              seatRefs.current[i] = node;
+            }}
+            onSelect={() => onSelect({ kind: "seat", index: seat.index })}
+            onKeyDown={(event) => onSeatKey(event, i, seat)}
+            onHot={(on) => setHot((now) => (on ? seat.index : now === seat.index ? null : now))}
           />
         ))}
-      </svg>
-      {/* The SVG is the picture; these real buttons are what the keyboard, the pointer and a screen reader meet. */}
-      <HitButton
-        className="council-court-hit council-court-hit-judge"
-        box={{ x: CX, y: 55, w: 120, h: 30 }}
-        selected={selected?.kind === "judge"}
-        label={`Chairman, ${court.judge.state === "empty" ? "empty" : court.judge.name}`}
-        title={
-          court.judge.state === "empty"
-            ? "Chairman: empty"
-            : court.judge.sub === null
-              ? `Chairman: ${court.judge.name}`
-              : `Chairman: ${court.judge.name} · ${court.judge.sub}`
-        }
-        onSelect={() => onSelect({ kind: "judge" })}
-      />
-      {mode === "session" && (
-        <HitButton
-          className="council-court-hit council-court-hit-lectern"
-          box={{ x: CX, y: LECTERN.y + LECTERN.h / 2, w: LECTERN.w, h: LECTERN.h }}
-          selected={lecternSelected}
-          label="The case"
-          title={court.lectern.full}
-          onSelect={() => onSelect({ kind: "lectern" })}
-        />
-      )}
-      {court.seats.map((seat, i) => (
-        <HitButton
-          key={seat.key}
-          className="council-court-hit council-court-hit-seat"
-          box={{ x: seat.x, y: seat.y, w: seat.r * 2, h: seat.r * 2 }}
-          selected={selected?.kind === "seat" && selected.index === seat.index}
-          label={seatLabel(seat, mode)}
-          title={seatTitle(seat)}
-          setRef={(node) => {
-            seatRefs.current[i] = node;
-          }}
-          onSelect={() => onSelect({ kind: "seat", index: seat.index })}
-          onKeyDown={(event) => onSeatKey(event, i, seat)}
-          onHot={(on) => setHot((now) => (on ? seat.index : now === seat.index ? null : now))}
-        />
-      ))}
+        {question !== undefined && (
+          <textarea
+            className="council-court-question"
+            aria-label="Question"
+            placeholder="Ask the council…"
+            rows={1}
+            value={question.value}
+            onChange={(event) => question.onChange(event.target.value)}
+            onFocus={() => onSelect({ kind: "lectern" })}
+            onKeyDown={(event) => {
+              // An IME still composing owns the Enter; it is not a send.
+              if (event.nativeEvent.isComposing) return;
+              if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                event.preventDefault();
+                question.onSubmit();
+              }
+            }}
+          />
+        )}
+        {wingAction !== undefined && <div className="council-court-wing-action">{wingAction}</div>}
+      </div>
       {/* Under 900px the SVG's small print is hidden; this is the same roster as plain text. The buttons above carry the accessible names. */}
       <ol className="council-court-roll" aria-hidden="true">
         {court.seats.map((seat) => (
@@ -206,26 +239,6 @@ export function Courtroom({
           </li>
         ))}
       </ol>
-      {question !== undefined && (
-        <textarea
-          className="council-court-question"
-          aria-label="Question"
-          placeholder="Ask the council…"
-          rows={1}
-          value={question.value}
-          onChange={(event) => question.onChange(event.target.value)}
-          onFocus={() => onSelect({ kind: "lectern" })}
-          onKeyDown={(event) => {
-            // An IME still composing owns the Enter; it is not a send.
-            if (event.nativeEvent.isComposing) return;
-            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-              event.preventDefault();
-              question.onSubmit();
-            }
-          }}
-        />
-      )}
-      {wingAction !== undefined && <div className="council-court-wing-action">{wingAction}</div>}
     </div>
   );
 }
@@ -250,11 +263,12 @@ function Judge({ judge, selected }: { judge: CourtJudge; selected: boolean }) {
   return (
     <g className="council-court-judge" data-state={judge.state} data-selected={selected || undefined}>
       <rect className="council-court-bench" x={CX - 60} y={40} width={120} height={30} rx={5} />
-      <text className="council-court-judge-label" x={CX} y={judge.sub === null ? 59 : 54} textAnchor="middle">
+      {/* Two 12px-ish lines in a 30-unit bench: the baselines sit 15 apart so they do not touch. */}
+      <text className="council-court-judge-label" x={CX} y={judge.sub === null ? 59 : 52} textAnchor="middle">
         {clip(judge.label, JUDGE_LABEL_CHARS)}
       </text>
       {judge.sub !== null && (
-        <text className="council-court-small" x={CX} y={65} textAnchor="middle">
+        <text className="council-court-small" x={CX} y={67} textAnchor="middle">
           {clip(judge.sub, 22)}
         </text>
       )}
@@ -296,11 +310,13 @@ function Scales({ balance }: { balance: Balance }) {
         {plate(right)}
       </g>
       <circle className="council-court-pivot" cx={PIVOT.x} cy={PIVOT.y} r={3} />
-      <text className="council-court-balance-label" x={PIVOT.x} y={108} textAnchor="middle">
+      {/* The captions centre a little right of the pivot: "fewer than 3 ballots" in tracked mono is
+          wider than twice the pivot's distance from the edge, and centred on it lost its first letter. */}
+      <text className="council-court-balance-label" x={PIVOT.x + CAPTION_SHIFT} y={108} textAnchor="middle">
         {balance.label}
       </text>
       {balance.sub !== null && (
-        <text className="council-court-small" x={PIVOT.x} y={120} textAnchor="middle">
+        <text className="council-court-small" x={PIVOT.x + CAPTION_SHIFT} y={124} textAnchor="middle">
           {balance.sub}
         </text>
       )}
@@ -314,7 +330,7 @@ function Wing({ wing }: { wing: Court["wing"] }) {
   return (
     <g className="council-court-wing">
       {title.map((line, i) => (
-        <text key={`t${i}`} className="council-court-wing-title" x={WING_X} y={34 + i * 14} textAnchor="middle">
+        <text key={`t${i}`} className="council-court-wing-title" x={WING_X} y={34 + i * 15} textAnchor="middle">
           {line}
         </text>
       ))}
@@ -323,7 +339,7 @@ function Wing({ wing }: { wing: Court["wing"] }) {
           key={`s${i}`}
           className="council-court-small"
           x={WING_X}
-          y={34 + title.length * 14 + 4 + i * 12}
+          y={34 + title.length * 15 + 4 + i * 14}
           textAnchor="middle"
         >
           {line}
@@ -435,7 +451,8 @@ function Seat({
   // Inside the circle: the short name, sized to the disc. The full one stays on the accessible name and title.
   const fit = fitSeatLabel(seat.label, r);
   const reveal = fitSeatLabel(seat.name, r);
-  const tagY = y + r + (seat.sublabel === null ? 10 : 20);
+  // 12px text: its first line starts 12 below the disc so the glyphs clear the ring, and a second 12 below that.
+  const tagY = y + r + (seat.sublabel === null ? 12 : 24);
   return (
     <g
       className="council-court-seat"
@@ -466,8 +483,8 @@ function Seat({
         </text>
       )}
       {seat.sublabel !== null && (
-        <text className="council-court-role" x={x} y={y + r + 10} textAnchor="middle">
-          {clip(seat.sublabel, 16)}
+        <text className="council-court-role" x={x} y={y + r + 12} textAnchor="middle">
+          {clip(seat.sublabel, ROLE_ROOM)}
         </text>
       )}
       {(seat.rank !== null || seat.dissent) && (
@@ -479,7 +496,7 @@ function Seat({
         </text>
       )}
       {(seat.state === "thinking" || seat.state === "speaking") && (
-        <text className="council-court-small council-court-seat-state" x={x} y={y + r + (seat.sublabel === null ? 10 : 20)} textAnchor="middle">
+        <text className="council-court-small council-court-seat-state" x={x} y={tagY} textAnchor="middle">
           {seat.state === "thinking" ? "thinking…" : "speaking"}
         </text>
       )}

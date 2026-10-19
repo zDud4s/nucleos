@@ -2313,6 +2313,22 @@
     display: none;
   }
 
+  /* The model trigger is the one control allowed to give way: its name ellipsizes down to
+     whatever the row leaves, while its mark and caret keep their size. */
+  .chats-composer-actions > .chats-tool:has(> .chats-model-name) {
+    flex: 0 1 auto;
+    min-width: 4rem;
+  }
+
+  .chats-composer-actions .chats-model-name {
+    flex: 0 1 auto;
+    max-width: 8rem;
+  }
+
+  .chats-composer-actions > .chats-tool:has(> .chats-model-name) > :not(.chats-model-name) {
+    flex: none;
+  }
+
   /* The menus open from a trigger near the right edge: keep a margin so they never sit flush with
      the viewport border (the width cap is already on `.chats-meta-menu`). */
   .chats-meta-menu {
@@ -3830,6 +3846,15 @@
 .chats-effort {
   padding: var(--space-2) var(--space-3) var(--space-3);
   min-width: 16rem;
+}
+
+/* The model's name on the composer's trigger: a long one ellipsizes, capped tighter under 60rem. */
+.chats-model-name {
+  min-width: 0;
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chats-effort-name {

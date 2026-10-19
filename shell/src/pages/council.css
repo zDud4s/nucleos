@@ -682,8 +682,13 @@
 }
 
 .council-court {
-  position: relative;
   min-width: 0;
+}
+
+/* The drawing's own box: the hit buttons, the question and the wing action are placed in
+   percent of it. */
+.council-court-stage {
+  position: relative;
 }
 
 .council-court-dimmed {
@@ -1092,10 +1097,14 @@
   outline-offset: 1px;
 }
 
+/* Anchored by its bottom edge, just above the eighth chair (its top is at ~41% of the
+   viewBox): the button keeps its pixel height while the drawing scales, so a top anchor
+   let it grow down over that chair as the court got narrower. */
 .council-court-wing-action {
   position: absolute;
   left: 71.5%;
-  top: 31%;
+  top: 39.5%;
+  transform: translateY(-100%);
   width: 25%;
   display: flex;
   justify-content: center;

@@ -1688,11 +1688,30 @@
  * mechanism `.app-home-stats` uses, at the smaller minimum a four-card strip under a
  * header needs.
  */
+/* Four cards, then two by two, then one: an auto-fit track left a single card
+   alone on a second row at three-across widths. The breakpoints are the widths at
+   which four (and then two) 11rem cards with their gaps stop fitting. */
+.teams-strip-frame {
+  container: teams-strip / inline-size;
+}
+
 .teams-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-3);
   margin-bottom: var(--space-4);
+}
+
+@container teams-strip (max-width: 46.25rem) {
+  .teams-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container teams-strip (max-width: 22.75rem) {
+  .teams-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* What the strip cannot put in a card: the daemon's own sentence about why a run
