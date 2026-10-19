@@ -138,6 +138,7 @@ mod tests {
     ) {
         let runner = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         let state = AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,

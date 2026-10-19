@@ -2916,6 +2916,7 @@ mod tests {
     async fn test_state() -> crate::state::AppState {
         let pool = crate::testdb::fresh_shared_pool().await;
         crate::state::AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("verification-token".into()),
             pool,
             telegram_doctrine: None,

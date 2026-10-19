@@ -900,6 +900,7 @@ mod tests {
         config: Option<CouncilConfig>,
     ) -> crate::state::AppState {
         crate::state::AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("control-token".into()),
             pool: test_pool().await,
             telegram_doctrine: None,

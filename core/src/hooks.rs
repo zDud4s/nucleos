@@ -55,6 +55,7 @@ mod tests {
     async fn test_state() -> AppState {
         let pool = crate::testdb::fresh_pool().await;
         AppState {
+            startup_config: Default::default(),
             token: Token("test-token".into()),
             pool,
             telegram_doctrine: None,

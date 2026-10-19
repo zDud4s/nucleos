@@ -497,6 +497,7 @@ mod tests {
             Arc::new(crate::browser::BrowserRuntime::disabled())
         };
         let state = AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool: db.pool.clone(),
             telegram_doctrine: None,

@@ -337,6 +337,7 @@ mod tests {
         let pool = db.pool.clone();
         (
             AppState {
+                startup_config: Default::default(),
                 token: Token("test-token".into()),
                 pool,
                 telegram_doctrine: None,
@@ -1298,6 +1299,7 @@ mod tests {
     async fn test_state() -> AppState {
         let pool = crate::testdb::fresh_pool().await;
         AppState {
+            startup_config: Default::default(),
             token: Token("test-token".into()),
             pool,
             telegram_doctrine: None,
@@ -9052,6 +9054,72 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["refusal"], "no_machine_root");
+    }
+
+    /// The row of `path` in a `GET /config/machine` body.
+    fn machine_row(body: &serde_json::Value, path: &str) -> serde_json::Value {
+        body["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == path)
+            .unwrap_or_else(|| panic!("no row for {path}"))
+            .clone()
+    }
+
+    /// A file that is on disk and does not parse says so, with why; one that parses and one that is
+    /// absent say nothing is wrong. The loaders start the daemon on defaults for the first kind and
+    /// log a warning the owner does not read, so the page is where this has to be visible.
+    #[tokio::test]
+    async fn machine_config_route_reports_a_file_that_does_not_parse() {
+        let (state, temp) = state_with_machine_root().await;
+        std::fs::write(temp.path().join("email.yaml"), "enabled: [this is not a bool}
+").unwrap();
+        std::fs::write(temp.path().join("calendar.yaml"), "").unwrap();
+
+        let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let bad = machine_row(&body, "email.yaml");
+        assert_eq!(bad["exists"], true);
+        assert_eq!(bad["valid"], false);
+        assert!(!bad["problem"].as_str().unwrap().is_empty());
+        // Served as it is, so the page can show the text the person has to fix.
+        assert!(bad["contents"].as_str().unwrap().contains("not a bool"));
+
+        let good = machine_row(&body, "calendar.yaml");
+        assert_eq!(good["exists"], true);
+        assert_eq!(good["valid"], true);
+        assert!(good["problem"].is_null());
+
+        let absent = machine_row(&body, "voice.yaml");
+        assert_eq!(absent["exists"], false);
+        assert_eq!(absent["valid"], true, "an absent file means defaults, which is valid");
+    }
+
+    /// What the daemon started on is served beside what is on disk now, so a file fixed after the
+    /// start reads as valid today and as started-on-defaults, until the daemon restarts.
+    #[tokio::test]
+    async fn machine_config_route_reports_what_the_daemon_started_on() {
+        let (mut state, temp) = state_with_machine_root().await;
+        // The file was broken when the daemon read it ...
+        std::fs::write(temp.path().join("email.yaml"), "enabled: [this is not a bool}
+").unwrap();
+        state.startup_config = std::sync::Arc::new(crate::machine_config::check_all(temp.path()));
+        // ... and has been fixed since.
+        std::fs::write(temp.path().join("email.yaml"), "enabled: false
+").unwrap();
+
+        let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
+
+        let email = machine_row(&body, "email.yaml");
+        assert_eq!(email["valid"], true, "the file on disk now parses");
+        assert_eq!(email["at_startup"]["valid"], false, "but the daemon started without it");
+        assert!(!email["at_startup"]["problem"].as_str().unwrap().is_empty());
+
+        let web = machine_row(&body, "web.yaml");
+        assert_eq!(web["at_startup"]["valid"], true);
+        assert!(web["at_startup"]["problem"].is_null());
     }
 
     /// An installed workflow's declared file is in the fence and cannot be written from here.
@@ -18238,6 +18306,7 @@ mod tests {
         // progress while the handler itself is parked on the pool.
         let pool = crate::testdb::fresh_shared_pool().await;
         let state = AppState {
+            startup_config: Default::default(),
             token: Token("test-token".into()),
             pool: pool.clone(),
             telegram_doctrine: None,
@@ -25387,6 +25456,7 @@ mod triage_barrier_tests {
     async fn test_state() -> crate::state::AppState {
         let pool = crate::testdb::fresh_shared_pool().await;
         crate::state::AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("verification-token".into()),
             pool,
             telegram_doctrine: None,

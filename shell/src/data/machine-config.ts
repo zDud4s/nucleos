@@ -38,6 +38,18 @@ export interface MachineSetting {
   takes_effect: string;
   /** Whether the file is on disk. `false` is "never configured", not "empty". */
   exists: boolean;
+  /**
+   * Whether the file as it is on disk NOW reads: the núcleo runs the same validator the write door
+   * runs over it. An absent file is valid, because defaults are its contract.
+   */
+  valid: boolean;
+  /** Why it does not read, in the parser's words (cut to 300 characters); `null` when `valid`. */
+  problem: string | null;
+  /**
+   * What the daemon found when it read this file at startup. `valid: false` means it started on
+   * its defaults for it, whatever the file says today — so a file fixed since still wants a restart.
+   */
+  at_startup: { valid: boolean; problem: string | null };
   /** The file, verbatim, or `null` when it does not exist. No secret is in any of them. */
   contents: string | null;
   /**

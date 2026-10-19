@@ -1484,6 +1484,7 @@ mod tests {
 
     fn declaration_test_state(pool: SqlitePool) -> crate::state::AppState {
         crate::state::AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,

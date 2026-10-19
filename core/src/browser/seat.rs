@@ -507,6 +507,7 @@ mod tests {
         let db = TempDb::new().await;
         let (browser, seen) = stub_sidecar(fail_begin).await;
         let state = AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool: db.pool.clone(),
             telegram_doctrine: None,
