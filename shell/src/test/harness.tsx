@@ -31,7 +31,7 @@ import type { ListingRead, ProjectRepo, ReadOutcome } from "../data/project-gith
 import type { CaptureRequest } from "../data/captures";
 import type { FeedEntry, FeedSeen, FeedTimeline } from "../data/feed";
 import type { Branches, Commit } from "../data/project-git";
-import type { Bundle, Installed, WorkflowDiff } from "../data/workflows";
+import type { Bundle, Installed, WorkflowConsent, WorkflowDiff } from "../data/workflows";
 import type { GraphNode, WorkflowGraph } from "../data/workflow-graph";
 import type { Detected } from "../data/detect";
 import type { Onboarding } from "../data/onboarding";
@@ -195,6 +195,13 @@ export interface DaemonState {
   workflows: Installed[];
   /** What the diff route answers, or `null` for a project with no copy to compare. */
   workflowDiff: WorkflowDiff | null;
+  /**
+   * What the consent route answers, or `null` for "nothing runs": the daemon's answer for a bundle
+   * with no command nodes, built per request so it names the version that was asked about.
+   */
+  workflowConsent: WorkflowConsent | null;
+  /** Every version the shell asked the consent route about, in order. */
+  consentAsked: { name: string; version: string }[];
   /** Every pin change the shell asked for, as it asked for it. */
   workflowChanges: { verb: string; name: string; version?: string }[];
   /** What every workflow-changing route refuses with, or `null` to accept. */
@@ -410,6 +417,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     library: [],
     workflows: [],
     workflowDiff: null,
+    workflowConsent: null,
+    consentAsked: [],
     workflowChanges: [],
     workflowRefusal: null,
     pinsError: null,
@@ -1488,6 +1497,13 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
         throw new ApiRefusal(404, "no_graph", "this bundle has no graph in it yet");
       }
       return state.graph;
+    }
+    if (path.startsWith("/projects/") && path.includes("/consent") && path.includes("/workflows/")) {
+      const [route, query = ""] = path.split("?");
+      const name = decodeURIComponent(route.split("/")[4] ?? "");
+      const version = new URLSearchParams(query).get("version") ?? "";
+      state.consentAsked.push({ name, version });
+      return state.workflowConsent ?? { version, baseline: null, commands: [], removed: [] };
     }
     if (path.startsWith("/projects/") && path.endsWith("/diff") && path.includes("/workflows/")) {
       if (state.workflowDiff === null) {
