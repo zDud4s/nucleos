@@ -5,6 +5,24 @@ use super::*;
 /// How often a kept process is looked at between turns.
 pub(super) const BETWEEN_TURNS_TICK: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// The slowest a quiet kept process is looked at. A process that has said nothing for a while is
+/// almost always waiting on a long background task, so an unprompted answer starting up to this much
+/// late is invisible, while 200 ms forever per kept conversation is a permanent wake-up.
+pub(super) const BETWEEN_TURNS_TICK_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The wait before the next look: back to the fast tick as soon as the process showed any activity,
+/// otherwise doubling up to [`BETWEEN_TURNS_TICK_MAX`].
+pub(super) fn next_between_turns_tick(
+    current: std::time::Duration,
+    active: bool,
+) -> std::time::Duration {
+    if active {
+        BETWEEN_TURNS_TICK
+    } else {
+        (current * 2).min(BETWEEN_TURNS_TICK_MAX)
+    }
+}
+
 /// Hands out the tokens that say which reader owns a process.
 pub(super) static NEXT_WATCHER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -30,11 +48,12 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
         // this reader's life: `carried` only grows while no turn holds the process, and a turn
         // taking the process ends this reader.
         let mut recorded = 0_usize;
+        let mut tick = BETWEEN_TURNS_TICK;
         loop {
-            tokio::time::sleep(BETWEEN_TURNS_TICK).await;
+            tokio::time::sleep(tick).await;
             // No lock is held across an await: the guard lives only in this block. An entry that is
             // gone (a turn took it) or owned by a newer reader ends this one.
-            let (begun, task_lines, has_set_aside) = {
+            let (begun, task_lines, has_set_aside, grew) = {
                 let mut kept = relock(&LIVE_CHATS);
                 match kept.get_mut(&chat_id) {
                     Some(live) if live.watcher == token => {
@@ -55,12 +74,14 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
                                 _ => None,
                             })
                             .collect();
+                        let grew = live.carried.len() != recorded;
                         recorded = live.carried.len();
-                        (begun, fresh, relock(&SET_ASIDE).contains_key(&chat_id))
+                        (begun, fresh, relock(&SET_ASIDE).contains_key(&chat_id), grew)
                     }
                     _ => return,
                 }
             };
+            tick = next_between_turns_tick(tick, begun || grew || has_set_aside);
             // A task that ends between turns is recorded now, not when a later turn reads the line.
             for line in &task_lines {
                 crate::chats::tasks::apply_line(&state.pool, &chat_id, line).await;
@@ -510,6 +531,20 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn a_quiet_watcher_backs_off_to_the_cap_and_activity_resets_it() {
+        let mut tick = BETWEEN_TURNS_TICK;
+        let mut seen = vec![tick];
+        for _ in 0..6 {
+            tick = next_between_turns_tick(tick, false);
+            seen.push(tick);
+        }
+        assert_eq!(seen[1], Duration::from_millis(400));
+        assert_eq!(seen[2], Duration::from_millis(800));
+        assert_eq!(*seen.last().unwrap(), BETWEEN_TURNS_TICK_MAX, "never slower than the cap");
+        assert_eq!(next_between_turns_tick(BETWEEN_TURNS_TICK_MAX, true), BETWEEN_TURNS_TICK);
+    }
 
     async fn test_state() -> AppState {
         AppState {
