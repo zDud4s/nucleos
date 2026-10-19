@@ -110,6 +110,7 @@ pub use nucleos_base::verify_sched;
 pub use nucleos_base::warm;
 pub use nucleos_base::web_client;
 pub mod wip;
+pub mod work_nodes;
 pub mod workflow_records;
 pub mod workflows;
 

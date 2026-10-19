@@ -1329,6 +1329,30 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                             }
                         }
                     }
+                    // Invisible root rotation. After the session block on purpose: the upsert above
+                    // would otherwise recreate the session `rotate` just forgot. A completed turn
+                    // only; a cancelled one has not settled anything worth carrying forward.
+                    if status == "completed" {
+                        match rotation::rotate(
+                            &pool,
+                            &*rotation::root_nodes(&pool),
+                            &rotation::DeterministicSummarizer,
+                            &turn.slot.chat_id,
+                            id,
+                            context_fill,
+                        )
+                        .await
+                        {
+                            // The kept process still holds the old session; stop it now rather than
+                            // rely on the next turn noticing (it would, through `resume.is_none()`,
+                            // but a spontaneous answer between turns would be spoken down it).
+                            Ok(true) => evict_live(&turn.slot.chat_id),
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, id, "root rotation failed; the session stays");
+                            }
+                        }
+                    }
                 }
                 // `stdout` is left NULL rather than filled with the stream: there is no reply, and a
                 // column that says so is honest.

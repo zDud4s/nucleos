@@ -35,7 +35,7 @@ order:
   - prior_artifacts  # the previous phase's output: a filled packet, a Handoff, findings
 
 # Never, in any phase, for any reason. Each of these is addressed to the controller, and a
-# dispatched phase that acts on one is doing the thing the controller-only invariant forbids.
+# dispatched phase that acts on one is doing the thing the one-controller-per-node rule forbids.
 never:
   - dispatch_md          # the controller's contract
   - controller_skill     # orchestrate / orchestrate-tdd
@@ -69,6 +69,12 @@ phases:
     allowed: [phase_skill, project_yaml, objective]
     required: [phase_skill, objective]
 
+  # A node of the work tree (hierarchical orchestration). A sub-orchestrator runs in the
+  # `wf-orchestrator` cockpit and gets the node packet; it dispatches only its own children.
+  orchestrate_node:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective]
+
   # The three orchestrate-tdd dispatches are `execute` under different objectives and
   # boundaries, and get the executor's cockpit and the executor's sections.
   red:
@@ -101,7 +107,7 @@ prompt_archive:
 never_fingerprints:
   dispatch_md:
     - "#### The phase cockpit"
-    - "## Controller-only invariant"
+    - "## One controller per node"
     - "## Dispatch routing"
   controller_skill:
     - "You are the orchestrator."

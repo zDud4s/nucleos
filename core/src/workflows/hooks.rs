@@ -34,14 +34,16 @@ use serde::{Deserialize, Serialize};
 use crate::workflows;
 
 /// The events a bundle may declare a hook on. The first three are tool events, which take a
-/// matcher; the rest are the session events `autopilot::SESSION_EVENTS` wires.
-pub const EVENTS: [&str; 6] = [
+/// matcher; the rest are the session events `autopilot::SESSION_EVENTS` wires, plus `SessionStart`
+/// (wired with its own `compact` matcher by `autopilot::session_start_entry`).
+pub const EVENTS: [&str; 7] = [
     "PreToolUse",
     "PostToolUse",
     "PostToolUseFailure",
     "Stop",
     "SubagentStop",
     "UserPromptSubmit",
+    "SessionStart",
 ];
 
 /// Whether `event` is about one tool call, and so has a tool name a matcher can be read against.
@@ -482,6 +484,27 @@ mod tests {
         let mut hook = decl("Stop", "scripts/guard.py");
         hook.timeout_secs = Some(10);
         assert_eq!(validate(&[hook], |rel| rel == "scripts/guard.py"), Ok(()));
+    }
+
+    #[test]
+    fn a_session_start_hook_is_accepted_and_selected_without_a_tool_name() {
+        assert_eq!(
+            validate(&[decl("SessionStart", "scripts/rehydrate.py")], |_| true),
+            Ok(())
+        );
+        let temp = tempfile::tempdir().unwrap();
+        shelf(
+            temp.path(),
+            "dev",
+            "1.0",
+            "hooks:\n  - event: SessionStart\n    script: rehydrate.py\n    timeout_secs: 10\n",
+            &[("rehydrate.py", "")],
+        );
+        let pinned = pins(&[("dev", "1.0")]);
+        let chosen = select(temp.path(), &pinned, "SessionStart", None);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].hook.script, "rehydrate.py");
+        assert!(select(temp.path(), &pinned, "Stop", None).is_empty());
     }
 
     #[test]

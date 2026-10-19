@@ -50,6 +50,7 @@ mod knowledge;
 mod map;
 mod map_flows;
 mod map_states;
+mod nodes;
 mod projects;
 mod proposals;
 mod relay;
@@ -134,6 +135,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(map::routes())
         .merge(map_flows::routes())
         .merge(map_states::routes())
+        .merge(nodes::routes())
         .merge(projects::routes())
         .merge(proposals::routes())
         .merge(relay::routes())
@@ -9073,8 +9075,12 @@ mod tests {
     #[tokio::test]
     async fn machine_config_route_reports_a_file_that_does_not_parse() {
         let (state, temp) = state_with_machine_root().await;
-        std::fs::write(temp.path().join("email.yaml"), "enabled: [this is not a bool}
-").unwrap();
+        std::fs::write(
+            temp.path().join("email.yaml"),
+            "enabled: [this is not a bool}
+",
+        )
+        .unwrap();
         std::fs::write(temp.path().join("calendar.yaml"), "").unwrap();
 
         let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
@@ -9094,7 +9100,10 @@ mod tests {
 
         let absent = machine_row(&body, "voice.yaml");
         assert_eq!(absent["exists"], false);
-        assert_eq!(absent["valid"], true, "an absent file means defaults, which is valid");
+        assert_eq!(
+            absent["valid"], true,
+            "an absent file means defaults, which is valid"
+        );
     }
 
     /// What the daemon started on is served beside what is on disk now, so a file fixed after the
@@ -9103,18 +9112,29 @@ mod tests {
     async fn machine_config_route_reports_what_the_daemon_started_on() {
         let (mut state, temp) = state_with_machine_root().await;
         // The file was broken when the daemon read it ...
-        std::fs::write(temp.path().join("email.yaml"), "enabled: [this is not a bool}
-").unwrap();
+        std::fs::write(
+            temp.path().join("email.yaml"),
+            "enabled: [this is not a bool}
+",
+        )
+        .unwrap();
         state.startup_config = std::sync::Arc::new(crate::machine_config::check_all(temp.path()));
         // ... and has been fixed since.
-        std::fs::write(temp.path().join("email.yaml"), "enabled: false
-").unwrap();
+        std::fs::write(
+            temp.path().join("email.yaml"),
+            "enabled: false
+",
+        )
+        .unwrap();
 
         let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
 
         let email = machine_row(&body, "email.yaml");
         assert_eq!(email["valid"], true, "the file on disk now parses");
-        assert_eq!(email["at_startup"]["valid"], false, "but the daemon started without it");
+        assert_eq!(
+            email["at_startup"]["valid"], false,
+            "but the daemon started without it"
+        );
         assert!(!email["at_startup"]["problem"].as_str().unwrap().is_empty());
 
         let web = machine_row(&body, "web.yaml");

@@ -14,6 +14,15 @@
 # Invariant (II): speed never creates capacity. How much parallel work may run is
 # the harness's number (WORKFLOW_PARALLEL_CEILING); this table can only narrow to it.
 default: normal
+# Node trees (hierarchical orchestration). The daemon enforces depth, width and summary size;
+# the budgets are planning targets for the decomposition. subtree_verify: see workflow.md.
+nodes:
+  max_depth: 3
+  max_width: 6
+  leaf_budget: 120000
+  orchestrator_budget: 150000
+  ceiling: 200000
+  subtree_verify: false
 profiles:
   normal:
     reasoning_effort: medium   # codex-safe subset only: low | medium | high | xhigh

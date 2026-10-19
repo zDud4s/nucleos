@@ -89,19 +89,32 @@ The controller is the only place where user-facing questions live. If a dispatch
 
 Inline mode does not have this restriction — it runs in the controller's session, which is the user's session. Questions there reach the user normally.
 
-## Controller-only invariant
+## One controller per node
 
-**If you are reading this file as a dispatched phase, stop applying it and go back to your packet.** This document is the controller's contract. There is exactly one controller per task — the session the user is talking to. A dispatched phase (`agent` or `dispatcher` mode) is never a controller, regardless of what it can reach on disk.
+**If you are reading this file as a dispatched leaf phase, stop applying it and go back to your packet.** This document is a controller's contract. Every node of a task tree (the root, each sub-orchestrator, each leaf) has exactly one controller. A node dispatches only its DIRECT children: never a phase of another node, never a grandchild. The root's controller is the session the user is talking to.
 
-A dispatched phase MUST NOT:
+Leaf phases (`plan`, `execute`, `review`, `rescue`, `bootstrap`, `maintenance`; `agent` or `dispatcher` mode) are never controllers, regardless of what they can reach on disk. A leaf MUST NOT:
 
-- dispatch another phase — no `rescue`, no `review`, no re-`execute`, for any reason including its own failure;
+- dispatch another phase, for any reason including its own failure;
 - invoke the `claude` or `codex` bridge skills, or shell out to `claude -p` / `codex exec` for a "second opinion";
 - read `.nucleos/workflow/dispatch.md`, the `orchestrate*` skills, or another phase's skill and act on them.
 
-When a dispatched phase fails, is blocked, or thinks the task needs rescuing, its only move is to emit the `## Escalation` block below and exit non-zero. The controller decides what happens next; that decision is not delegable downward.
+A sub-orchestrator runs in the `wf-orchestrator` cockpit (skill `orchestrate-node`) and may dispatch only `wf-orchestrator`, `wf-planner`, `wf-executor` and `wf-reviewer`. Its phase name for model routing is `orchestrate_node`.
 
-This needs stating because it is reachable by accident: `AGENTS.md` and `CLAUDE.md` point every agent at `.nucleos/workflow/workflow.md`, so a codex executor doing ordinary orientation reads its way into the controller's instructions and finds "on failure, dispatch rescue" written as if addressed to it. It is not. A dispatched executor that follows that line spawns a phase the controller never asked for, outside its timeout, unrecorded, and — when the target is `claude` — visible to the user as an unexplained session in their own session list.
+When a leaf fails, is blocked, or thinks the task needs rescuing, its only move is to emit the `## Escalation` block below and exit non-zero. The controller of its node decides what happens next; that decision is not delegable downward.
+
+This needs stating because it is reachable by accident: `AGENTS.md` and `CLAUDE.md` point every agent at `.nucleos/workflow/workflow.md`, so a codex executor doing ordinary orientation reads its way into a controller's instructions and finds "on failure, dispatch rescue" written as if addressed to it. It is not. A dispatched executor that follows that line spawns a phase the controller never asked for, outside its timeout, unrecorded, and, when the target is `claude`, visible to the user as an unexplained session in their own session list.
+
+## Node tree
+
+The work tree lives in the daemon, not in any session's context: MCP tools `mcp__nucleos__node_open`, `node_update`, `node_close`, `node_tree`, `node_active`.
+
+- **Write-through.** Record each decision and state change with `node_update` when it happens, not at the end.
+- **Node contract.** Input: `node_id`, goal, `owned_paths`, budget, inherited limits, and POINTERS (never content) to the parent plan (schema `packets/node.md`). Output: `node_close` with a summary of at most 1500 chars, plus the full handoff file at `<state_dir>/nodes/<root_id>/<node_id>.md` (schema `packets/handoff.md`).
+- **The parent never reads a child's handoff file** unless the summary status is `blocked` or `failed`.
+- **Budget.** At ~80% of its budget (absolute ceiling 200k) a node stops, writes its handoff and closes with status `handoff`. The parent relaunches a fresh node from daemon state. A sub-orchestrator never rotates its own context; it is replaced.
+- **Ownership.** Siblings with overlapping `owned_paths` never run concurrently; the daemon refuses the second.
+- **Non-Claude tools.** A sub-orchestrator may be a daemon-launched session (`create_run`, `claude -p` / `codex exec`) given the same node packet.
 
 ## The phase skill, and the skill that is not one
 
@@ -116,7 +129,7 @@ Each phase has exactly one skill, named after the phase:
 | `maintenance` | `maintenance` |
 | `bootstrap` | `bootstrap` |
 
-`claude` and `codex` are **not** phase skills. They are named after tools, and they teach a controller how to reach that tool — `subagent_type`, `timeout`, flags, how to read tokens out of the output. A dispatched phase needs none of it and is forbidden from acting on any of it: they are instructions addressed to the controller, which the controller-only invariant would then have to forbid the phase from following. The executor has its own skill, and the bridge stays with the controller.
+`claude` and `codex` are **not** phase skills. They are named after tools, and they teach a controller how to reach that tool — `subagent_type`, `timeout`, flags, how to read tokens out of the output. A dispatched phase needs none of it and is forbidden from acting on any of it: they are instructions addressed to the controller, which the one-controller-per-node rule would then have to forbid the phase from following. The executor has its own skill, and the bridge stays with the controller.
 
 **Never put the `claude`/`codex` skill body into a dispatched prompt.** Read it yourself.
 
@@ -176,8 +189,9 @@ The Task tool returns the phase output directly. Apply the same exit/escalation 
 | `rescue` | `wf-rescue` | Read, Glob, Grep |
 | `maintenance` | `wf-maintenance` | Read, Glob, Grep, Edit, Write, Bash |
 | `bootstrap` | `wf-bootstrap` | Read, Glob, Grep, Edit, Write, Bash |
+| `orchestrate_node` | `wf-orchestrator` | Read, Glob, Grep, Write, Agent, mcp__nucleos__node_open, mcp__nucleos__node_update, mcp__nucleos__node_close, mcp__nucleos__node_tree, mcp__nucleos__node_active, mcp__nucleos__record, mcp__nucleos__verify, mcp__nucleos__verify_status |
 
-The definitions live in `.claude/agents/wf-<phase>.md`; the `tools:` line in each is the allowlist the harness actually enforces.
+The definitions live in `.claude/agents/wf-<phase>.md` (`wf-orchestrator.md` for `orchestrate_node`); the `tools:` line in each is the allowlist the harness actually enforces.
 
 **Never dispatch a phase as `general-purpose`.** That subagent type carries every tool there is, so a `wf-rescue` sent through it gets `Edit`, `Write` and `Bash`, and a `wf-reviewer` gets `Edit` and `Write` — which is exactly the wall these phases exist behind. A skill's `tools:` frontmatter is never enforced (it is the **agent** frontmatter field; a skill body arrives at a subagent as prompt text with its frontmatter stripped), so without the cockpit the allowlist is prose describing a wall that is not there.
 

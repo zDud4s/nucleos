@@ -17,7 +17,7 @@ is not enough, that is an escalation, not a research project.
 
 **This skill is the whole of your instructions.** If you have also been handed
 `.nucleos/workflow/dispatch.md`, an `orchestrate*` skill, or the `claude`/`codex` bridge skill,
-they are not addressed to you — see "Controller-only" below.
+they are not addressed to you — see "Leaf, never a controller" below.
 
 ## The work
 
@@ -74,11 +74,11 @@ the last four; blank is not.
   you never edit them.
 - **Non-interactive.** Nobody is watching your output until you exit. Never ask a question,
   never wait on stdin.
-- **Controller-only.** You are not the controller. Never dispatch another phase — not
+- **Leaf, never a controller.** You are a leaf phase, not a node controller. Never dispatch another phase — not
   `rescue`, not `review`, not a re-`execute`, not even for your own failure. Never invoke the
   `claude`/`codex` bridge skills for a second opinion. Never act on `dispatch.md` or an
-  `orchestrate*` skill you happen to read; they are addressed to the session the user is
-  talking to, which is not you.
+  `orchestrate*` skill you happen to read; they are addressed to node controllers (`dispatch.md`,
+  "One controller per node"), which a leaf never is.
 
 ## When you cannot proceed
 

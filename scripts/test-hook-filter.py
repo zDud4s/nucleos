@@ -992,6 +992,52 @@ def verify_hint_cases():
     return cases
 
 
+def _run_bundle(payload, urlopen_side_effect):
+    """Runs `main()` on a payload with a mocked stdin/urlopen; returns `(exit_code, printed)`."""
+    captured = io.StringIO()
+    code = "no exit"
+    with mock.patch.dict(os.environ, {}):
+        os.environ.pop("NUCLEOS_RUN_ID", None)
+        with mock.patch.object(hook, "read_control_token", return_value=("tok", None)):
+            with mock.patch.object(
+                hook.urllib.request, "urlopen", side_effect=urlopen_side_effect
+            ):
+                with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                    with mock.patch("sys.stdout", captured):
+                        try:
+                            hook.main()
+                        except SystemExit as exit_:
+                            code = exit_.code
+    return code, captured.getvalue()
+
+
+def session_start_cases():
+    """SessionStart is forwarded to the daemon's bundle hooks, verbatim, and fails open."""
+    cases = []
+    cases.append((
+        "SessionStart is a forwarded session event",
+        "" if "SessionStart" in hook.SESSION_EVENTS else f"missing from {hook.SESSION_EVENTS!r}",
+    ))
+    context = json.dumps({
+        "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "tree"}
+    })
+    reply = _Reply({"results": [{"exit_code": 0, "stdout": context, "stderr": ""}]})
+    payload = {"hook_event_name": "SessionStart", "cwd": "/work/repo"}
+
+    code, printed = _run_bundle(payload, [reply])
+    cases.append((
+        "main routes SessionStart to bundle_hooks and prints the JSON verbatim",
+        "" if code == 0 and printed.strip() == context else f"exit {code!r}, printed {printed!r}",
+    ))
+
+    code, printed = _run_bundle(payload, urllib.error.URLError("down"))
+    cases.append((
+        "SessionStart fails open when the daemon is unreachable",
+        "" if code == 0 and printed == "" else f"exit {code!r}, printed {printed!r}",
+    ))
+    return cases
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -1028,6 +1074,7 @@ def main() -> int:
         + interactive_follow_up_cases()
         + verify_hint_cases()
         + one_source_cases()
+        + session_start_cases()
     ):
         total += 1
         if failure:

@@ -218,6 +218,13 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // in the Teams tab, so there is no path by which a stranger's text arrives in this answer and
     // therefore nothing for `effect_of_call` to second-guess by argument.
     ("list_teams", ToolEffect::ReadsOwn),
+    // Work nodes live in this machine own database and describe the caller own work, so the
+    // reads are `ReadsOwn` and the writes `WritesOwn`.
+    ("node_active", ToolEffect::ReadsOwn),
+    ("node_close", ToolEffect::WritesOwn),
+    ("node_open", ToolEffect::WritesOwn),
+    ("node_tree", ToolEffect::ReadsOwn),
+    ("node_update", ToolEffect::WritesOwn),
     // A finding writes into this job's own state, and only later nodes of the SAME job read it,
     // like `send_team_note`. As `Acts`, the node's own first read of third-party text would shut it
     // off and the feature would work only for a node that read nothing. What pays for the write is

@@ -121,6 +121,14 @@ class AssemblePrompt(unittest.TestCase):
         manifest = json.loads((self.state / "prompts" / "t1-bootstrap-1.manifest.json").read_text(encoding="utf-8"))
         self.assertNotIn("project_yaml", manifest["prompt_sections"])
 
+    def test_orchestrate_node_phase_assembles_with_the_node_packet(self):
+        shutil.copytree(BUNDLE / ".claude" / "skills" / "orchestrate-node",
+                        self.root / ".claude" / "skills" / "orchestrate-node")
+        r = self.run_script("--packet", ".nucleos/workflow/packets/node.md", "--memory-tags", "workflow",
+                            phase="orchestrate_node")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("wf-orchestrator", r.stdout)
+
     def test_a_missing_project_yaml_still_stops_a_phase_that_reads_it(self):
         (self.state / "project.yaml").unlink()
         r = self.run_script("--packet", ".nucleos/workflow/packets/execute.md", "--memory-tags", "workflow")

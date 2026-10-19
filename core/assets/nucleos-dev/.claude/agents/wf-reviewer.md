@@ -24,7 +24,7 @@ Findings go in the verdict. Always.
 ## Invariants
 
 - **Non-interactive.** Nobody is watching. Never ask a question, never wait on stdin.
-- **Controller-only.** You are not the controller. Never dispatch a phase, never invoke the
+- **Leaf, never a controller.** You are a leaf phase, not a node controller. Never dispatch a phase, never invoke the
   `claude`/`codex` bridge skills, never act on `dispatch.md` or an `orchestrate*` skill you
   happen to read. A send-back is the controller's decision, not yours.
 - **A missing tool is an escalation, not a workaround.** "I could not verify this" is a

@@ -24,7 +24,8 @@
 # `hooks:` is what the daemon wires into the project's Claude Code settings, each entry running
 # `python <bundle_dir>/<script> <args>`. A script that is not listed here is called by a
 # controller, never by a hook.
-#   event: Stop | SubagentStop | UserPromptSubmit | PreToolUse | PostToolUse | PostToolUseFailure
+#   event: Stop | SubagentStop | UserPromptSubmit | SessionStart | PreToolUse | PostToolUse |
+#          PostToolUseFailure (SessionStart is wired with the `compact` matcher only)
 #   matcher: a tool-name regex, tool events only
 #   script: path relative to this version directory
 #   args: argv after the script
@@ -52,6 +53,7 @@ owns:
   - .claude/skills/executor/
   - .claude/skills/maintenance/
   - .claude/skills/orchestrate/
+  - .claude/skills/orchestrate-node/
   - .claude/skills/orchestrate-tdd/
   - .claude/skills/planner/
   - .claude/skills/rescue/
@@ -63,6 +65,7 @@ owns:
   - .claude/agents/wf-bootstrap.md
   - .claude/agents/wf-executor.md
   - .claude/agents/wf-maintenance.md
+  - .claude/agents/wf-orchestrator.md
   - .claude/agents/wf-planner.md
   - .claude/agents/wf-rescue.md
   - .claude/agents/wf-reviewer.md
@@ -74,6 +77,7 @@ owns:
   - .agents/skills/executor/
   - .agents/skills/maintenance/
   - .agents/skills/orchestrate/
+  - .agents/skills/orchestrate-node/
   - .agents/skills/orchestrate-tdd/
   - .agents/skills/planner/
   - .agents/skills/rescue/
@@ -90,4 +94,8 @@ hooks:
   - event: UserPromptSubmit
     script: scripts/spec_loop.py
     args: [--prompt-hook]
+    timeout_secs: 10
+  # Re-injects the daemon's work tree after a native compact; fails open.
+  - event: SessionStart
+    script: scripts/rehydrate.py
     timeout_secs: 10
