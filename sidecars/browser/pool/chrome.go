@@ -5,6 +5,7 @@ package pool
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"nucleosbrowser/browser"
@@ -168,6 +169,10 @@ type chromeInstance struct {
 	process *launch.Process
 	proxy   *fence.Proxy
 	cancel  context.CancelFunc
+
+	// stopOnce keeps a second stop (a retire racing a shutdown) from repeating Browser.close,
+	// proxy.Close and the process kill.
+	stopOnce sync.Once
 }
 
 // Shutdown closes the browser gracefully and then makes sure it is gone.
@@ -187,6 +192,10 @@ func (i *chromeInstance) Shutdown(ctx context.Context) { i.stop(ctx) }
 // hangs, or a renderer that ignores it, leaves a Chrome running with our argv holding the profile —
 // and the next launch over that directory inherits it instead of starting clean.
 func (i *chromeInstance) stop(ctx context.Context) {
+	i.stopOnce.Do(func() { i.stopNow(ctx) })
+}
+
+func (i *chromeInstance) stopNow(ctx context.Context) {
 	if i.conn != nil {
 		closing, cancel := context.WithTimeout(withoutCancel(ctx), 5*time.Second)
 		_, _ = i.conn.Call(closing, cdp.BrowserSession, "Browser.close", nil)
@@ -220,11 +229,18 @@ type humanInstance struct {
 	conn    *cdp.Conn
 	process *launch.Process
 	cancel  context.CancelFunc
+
+	// stopOnce: see chromeInstance.
+	stopOnce sync.Once
 }
 
 func (i *humanInstance) Shutdown(ctx context.Context) { i.stop(ctx) }
 
 func (i *humanInstance) stop(ctx context.Context) {
+	i.stopOnce.Do(func() { i.stopNow(ctx) })
+}
+
+func (i *humanInstance) stopNow(ctx context.Context) {
 	if i.Human != nil {
 		// Before the connection goes, so nothing Chrome does on the way out is recorded as somewhere
 		// the person chose to go.
