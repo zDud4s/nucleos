@@ -93,10 +93,14 @@ pub fn build_router(state: AppState) -> Router {
     #[cfg(debug_assertions)]
     origins.push("http://localhost:1420".parse().unwrap());
 
+    // The shell reads the daemon's version from `/health` across origins. A custom response header
+    // is hidden from a cross-origin page unless it is listed here, and the version handshake after
+    // an update would then see nothing and call every daemon "unknown".
     let cors = CorsLayer::new()
         .allow_origin(origins)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .expose_headers(vec![axum::http::HeaderName::from_static(VERSION_HEADER)]);
 
     let protected = Router::new()
         .route("/status", get(status))
@@ -149,8 +153,18 @@ pub fn build_router(state: AppState) -> Router {
         .layer(cors)
 }
 
+/// The response header that names the daemon's version. Lowercase because `HeaderName::from_static`
+/// refuses anything else; HTTP header names are case-insensitive on the wire (`X-Nucleos-Version`).
+const VERSION_HEADER: &str = "x-nucleos-version";
+
+/// `GET /health`: the body stays `"ok"` (the shell's connection gate and the preview read it), and
+/// the version rides in a header so nothing that parses the body can break.
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+    (
+        StatusCode::OK,
+        [(VERSION_HEADER, env!("CARGO_PKG_VERSION"))],
+        "ok",
+    )
 }
 
 async fn health_readout(State(state): State<AppState>) -> Json<health::HealthReadout> {
@@ -23542,6 +23556,39 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{header:?}");
         }
+    }
+
+    /// The body is read by `shell/src/data/client.ts` and the preview as plain `ok`; the version
+    /// must arrive beside it, in a header, and a cross-origin page must be allowed to read it.
+    #[tokio::test]
+    async fn health_keeps_its_body_and_names_the_version() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "https://tauri.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-nucleos-version").unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+        let exposed = response
+            .headers()
+            .get("access-control-expose-headers")
+            .expect("a cross-origin page needs the header exposed")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(exposed.contains("x-nucleos-version"), "{exposed}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
     }
 
     /// Only this test may await `shutdown_requested()`: the notifiers are process-wide.
