@@ -599,6 +599,32 @@ export const NOTIFY_FAMILIES: { selector: string; label: string }[] = [
 ];
 
 /**
+ * Whether a feed kind may be forwarded under a policy — the sidecar's `Policy.Allows`
+ * (`sidecars/telegram/notifier/policy.go`), written a second time for the one consumer that
+ * decides in the window: the desktop notifier.
+ *
+ * An exact kind rule wins; otherwise the LONGEST matching family prefix decides; otherwise the
+ * kind passes. A rule with an empty selector is ignored (the empty prefix would match every kind
+ * and mute the channel), and an empty kind matches no prefix, so it passes. The two
+ * implementations are held to the same table by `desktop-notify.test.ts`.
+ */
+export function policyAllows(policy: NotifyPolicy, kind: string): boolean {
+  for (const rule of policy.kinds) {
+    if (rule.selector !== "" && rule.selector === kind) return rule.enabled;
+  }
+  let best = -1;
+  let allowed = true;
+  for (const rule of policy.families) {
+    if (rule.selector === "" || !kind.startsWith(rule.selector)) continue;
+    if (rule.selector.length > best) {
+      best = rule.selector.length;
+      allowed = rule.enabled;
+    }
+  }
+  return best >= 0 ? allowed : true;
+}
+
+/**
  * Everything the notifications tab draws, resolved once.
  *
  * Takes the policy as well as the observed kinds because three of the four

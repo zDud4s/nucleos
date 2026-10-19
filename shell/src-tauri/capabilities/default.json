@@ -9,6 +9,7 @@
     "updater:default",
     "process:allow-restart",
     "dialog:allow-open",
+    "notification:default",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "vscode://file/*" }]
