@@ -10148,7 +10148,11 @@ tests:
         run_auto_backup_step(&db.pool, now, &mut failing).await;
 
         let listed = crate::backup::list_backups(&db.pool).await.unwrap();
-        assert_eq!(listed.len(), 1, "the second tick finds the copy still fresh");
+        assert_eq!(
+            listed.len(),
+            1,
+            "the second tick finds the copy still fresh"
+        );
         assert_eq!(listed[0].kind, crate::backup::BackupKind::Auto);
         assert_eq!(backup_feed_kinds(&db.pool).await, vec!["backup_taken"]);
         assert!(!failing);

@@ -902,13 +902,10 @@ mod tests {
             .await
             .unwrap();
         assert!(again.is_none(), "a fresh automatic copy is not repeated");
-        let next = take_auto_backup_if_due(
-            &db.pool,
-            AUTO_RETENTION,
-            now + chrono::Duration::days(8),
-        )
-        .await
-        .unwrap();
+        let next =
+            take_auto_backup_if_due(&db.pool, AUTO_RETENTION, now + chrono::Duration::days(8))
+                .await
+                .unwrap();
         assert!(next.is_some(), "a week later the next one is due");
         db.close().await;
     }
