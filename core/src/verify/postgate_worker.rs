@@ -711,8 +711,7 @@ async fn launch_probe(
         RedPhase::FlakeCheck => Caller::FlakeCheck,
         RedPhase::Bisect => Caller::Bisect,
     };
-    let request = match submit_full(executor, project_id, caller, project_root, sha, deadline)
-        .await
+    let request = match submit_full(executor, project_id, caller, project_root, sha, deadline).await
     {
         Ok(id) => id,
         Err(reason) => {
@@ -1349,7 +1348,8 @@ mod tests {
     /// The window `a_gate_started_but_never_submitted...` leaves out: the request WAS submitted and
     /// the daemon died before `set_request`. Submitting again would queue the whole gate twice.
     #[tokio::test]
-    async fn a_gate_submitted_but_never_recorded_adopts_its_request_instead_of_submitting_another() {
+    async fn a_gate_submitted_but_never_recorded_adopts_its_request_instead_of_submitting_another()
+    {
         let f = fixture(Some(GATE_ON)).await;
         let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
         let Step::Started { request, .. } = step else {
@@ -1358,10 +1358,12 @@ mod tests {
         assert_eq!(count(&f.pool, "verify_requests").await, 1);
 
         // The crash: the ticket id never reached `postgate_state`.
-        sqlx::query("UPDATE postgate_state SET running_request_id = NULL WHERE project_id = 'alpha'")
-            .execute(&f.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE postgate_state SET running_request_id = NULL WHERE project_id = 'alpha'",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
 
         let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
         assert_eq!(
@@ -1627,10 +1629,14 @@ mod tests {
     {
         let f = fixture(Some(GATE_ON)).await;
         let base = f.tip.clone();
-        let c2 = commit_file(&f.root, "b.txt", "b
-", "c2");
-        let c3 = commit_file(&f.root, "c.txt", "c
-", "c3");
+        let c2 = commit_file(
+            &f.root, "b.txt", "b
+", "c2",
+        );
+        let c3 = commit_file(
+            &f.root, "c.txt", "c
+", "c3",
+        );
         verify_postgate::mark_covered(&f.pool, "alpha", "main", &base)
             .await
             .unwrap();

@@ -1294,8 +1294,12 @@ codex_model: gpt-a
         let (_, absent) = cached_models_config(&path, &cache);
         assert_eq!(absent, None, "an absent file is the defaults, not a fault");
 
-        std::fs::write(&path, "claude_model: [not, a, string
-").unwrap();
+        std::fs::write(
+            &path,
+            "claude_model: [not, a, string
+",
+        )
+        .unwrap();
         let (config, problem) = cached_models_config(&path, &cache);
         assert_eq!(config, ModelsConfig::default());
         let problem = problem.expect("a file that will not parse must be reported");
@@ -1310,22 +1314,34 @@ codex_model: gpt-a
         let path = dir.path().join(MODELS_CONFIG_FILE);
         let cache = std::sync::Mutex::new(None);
 
-        std::fs::write(&path, "claude_model: opus
+        std::fs::write(
+            &path,
+            "claude_model: opus
 codex_model: gpt-a
-").unwrap();
+",
+        )
+        .unwrap();
         let (good, problem) = cached_models_config(&path, &cache);
         assert_eq!(problem, None);
 
         // A different length, so the stat check sees the change on a coarse-mtime filesystem.
-        std::fs::write(&path, "claude_model: [broken, and, longer
-").unwrap();
+        std::fs::write(
+            &path,
+            "claude_model: [broken, and, longer
+",
+        )
+        .unwrap();
         let (kept, problem) = cached_models_config(&path, &cache);
         assert_eq!(kept, good);
         assert_eq!(problem.expect("reported").using, "last_good");
 
-        std::fs::write(&path, "claude_model: sonnet-fixed
+        std::fs::write(
+            &path,
+            "claude_model: sonnet-fixed
 codex_model: gpt-a
-").unwrap();
+",
+        )
+        .unwrap();
         let (fixed, problem) = cached_models_config(&path, &cache);
         assert_eq!(fixed.claude_model, "sonnet-fixed");
         assert_eq!(problem, None);

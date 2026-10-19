@@ -1978,8 +1978,8 @@ mod tests {
     /// credits nothing while that run is live. A unit it cannot yet credit is never stamped, so
     /// one that took a slot would take it again on every pass until its chain ended.
     #[tokio::test]
-    async fn a_terminal_run_whose_chain_tail_is_live_takes_no_slot_in_a_sweep_pass() -> sqlx::Result<()>
-    {
+    async fn a_terminal_run_whose_chain_tail_is_live_takes_no_slot_in_a_sweep_pass()
+    -> sqlx::Result<()> {
         let pool = test_pool().await;
         let stuck = seed(&pool, "machine", None, "stuck").await?;
 
