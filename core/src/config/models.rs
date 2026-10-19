@@ -870,8 +870,9 @@ pub struct ModelPrice {
     pub source: Option<String>,
 }
 
-/// The rates for requests whose prompt is at least `min_prompt_tokens`, OpenRouter's own key and
-/// meaning; Anthropic's "for prompts over 100,000 tokens" is written as 100,001. A tier carries only
+/// The rates for requests whose prompt is at least `min_prompt_tokens`. Both vendors publish the
+/// threshold as "over N" (Anthropic's "for prompts over 100,000 tokens", OpenRouter's
+/// `min_prompt_tokens: 100000` for the same model), so it is written as N + 1. A tier carries only
 /// the rates it overrides; a `None` rate is the base one.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
 pub struct PriceTier {
