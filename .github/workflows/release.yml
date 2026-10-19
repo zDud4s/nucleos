@@ -1,13 +1,16 @@
 # Release: build, sign and publish the three-platform installers plus latest.json from a v* tag.
 #
-# Owner's steps, once:
+# Owner's steps, once (the full text is RELEASING.md):
 #   1. npm run tauri signer generate -- -w ~/.tauri/nucleos.key
 #   2. Paste the printed .pub into `plugins.updater.pubkey` in shell/src-tauri/tauri.conf.json.
 #   3. Create the repository secrets TAURI_SIGNING_PRIVATE_KEY (the key file's content) and
 #      TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+#   4. For macOS, create the stable self-signed certificate and the secrets APPLE_CERTIFICATE,
+#      APPLE_CERTIFICATE_PASSWORD and APPLE_SIGNING_IDENTITY (RELEASING.md). Without them the macOS
+#      leg fails: an ad-hoc signature would change identity every release and re-prompt the TCC
+#      grants (microphone, accessibility) after each update.
 # Per release:
-#   4. Bump `version` in shell/src-tauri/tauri.conf.json.
-#   5. Push the tag `v<version>` (it must equal that version).
+#   5. python scripts/bump-version.py X.Y.Z, commit, then push the tag vX.Y.Z (it must equal VERSION).
 # The repository's releases must be public: the updater feed (latest.json) is fetched anonymously.
 name: release
 
@@ -33,6 +36,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # `python3` is not trusted on the Windows runner (see ci.yml), so pin one and call `python`.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - uses: actions/setup-node@v4
         with:
@@ -66,14 +74,21 @@ jobs:
       - name: Guard the release config
         shell: bash
         run: |
-          conf=shell/src-tauri/tauri.conf.json
-          if grep -q 'REPLACE_WITH_' "$conf"; then
-            echo "::error::$conf still contains REPLACE_WITH_ (the updater pubkey is not set)"; exit 1
+          if grep -q 'REPLACE_WITH_' shell/src-tauri/tauri.conf.json; then
+            echo "::error::shell/src-tauri/tauri.conf.json still contains REPLACE_WITH_ (the updater pubkey is not set)"; exit 1
           fi
-          version="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$conf" | head -n 1)"
-          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
-            echo "::error::tauri.conf.json version '$version' does not match tag '$GITHUB_REF_NAME'"; exit 1
+          # VERSION, every manifest and the tag are one number.
+          python scripts/bump-version.py --check --expect "${GITHUB_REF_NAME#v}"
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::secret TAURI_SIGNING_PRIVATE_KEY is empty: the updater artifacts would not be signed"; exit 1
           fi
+          if [ "$RUNNER_OS" = macOS ] && { [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; }; then
+            echo "::error::secrets APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY are empty: refusing an ad-hoc macOS signature"; exit 1
+          fi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
 
       - name: Stage the núcleo and the sidecars
         shell: bash
@@ -84,6 +99,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         with:
           projectPath: shell
           tagName: ${{ github.ref_name }}
@@ -93,12 +111,37 @@ jobs:
           updaterJsonPreferNsis: true
           args: --config src-tauri/tauri.release.conf.json --features release-bundle ${{ matrix.bundles }}
 
-  # Publishes the draft only once every leg has uploaded, so latest.json never goes live half-filled.
+      - name: Verify the macOS signature carries the stable certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          app="$(find shell/src-tauri/target -maxdepth 6 -name 'NucleOS.app' -type d | head -n 1)"
+          [ -n "$app" ] || { echo "::error::no NucleOS.app under shell/src-tauri/target"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvv "$app" 2>&1 | tee /tmp/codesign.txt
+          grep -q "Authority=$APPLE_SIGNING_IDENTITY" /tmp/codesign.txt             || { echo "::error::the app is not signed by $APPLE_SIGNING_IDENTITY"; exit 1; }
+          # A certificate-anchored requirement is what keeps the TCC grants across updates.
+          codesign -d -r- "$app" 2>&1 | grep -q 'certificate leaf = H"'             || { echo "::error::the designated requirement is not anchored to the certificate"; exit 1; }
+
+  # Checks the draft is complete, adds SHA256SUMS, and only then makes it public, so latest.json
+  # never goes live half-filled and the install scripts always have the checksums to verify against.
   publish:
     needs: build
     runs-on: ubuntu-22.04
     steps:
-      - name: Publish the draft release
+      - uses: actions/checkout@v4
+
+      - name: Prove the draft is complete and publish it
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          mkdir release-assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          python3 scripts/release-manifest.py verify --dir release-assets --version "$version"
+          python3 scripts/release-manifest.py sums --dir release-assets --version "$version"
+          # The install scripts ride along as assets, so `releases/latest/download/install.sh` always
+          # matches the release they install. They are not in SHA256SUMS: they are what verifies it.
+          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS scripts/install.sh scripts/install.ps1             --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

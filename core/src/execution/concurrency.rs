@@ -36,6 +36,9 @@ pub enum NoRoom {
     Project { limit: i64 },
     /// The house is at its ceiling across all projects, even though this project has room of its own.
     House { limit: i64 },
+    /// The daemon is draining for an update (`shutdown.rs`): nothing new may start, whatever the
+    /// ceilings say. Not a wall to wait out by retrying in a loop; the daemon is about to exit.
+    Draining,
 }
 
 impl NoRoom {
@@ -48,6 +51,7 @@ impl NoRoom {
             Self::House { limit } => {
                 format!("the machine already has {limit} piece(s) of work in flight")
             }
+            Self::Draining => "the daemon is draining to install an update".to_owned(),
         }
     }
 }
@@ -209,6 +213,11 @@ async fn room_for_on(
     conn: &mut SqliteConnection,
     project_id: &str,
 ) -> sqlx::Result<Option<NoRoom>> {
+    // Before any count: a draining daemon has no room at all. `claim_on` reaches this only after
+    // an owner that already holds a slot got its own back, so work in flight is never refused.
+    if crate::shutdown::is_draining() {
+        return Ok(Some(NoRoom::Draining));
+    }
     let house = house_limit_on(conn).await?;
     if slots_in_flight_on(conn).await? >= house {
         return Ok(Some(NoRoom::House { limit: house }));

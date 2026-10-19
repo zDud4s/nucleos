@@ -1501,4 +1501,25 @@ mod tests {
         assert!(ambiguous_sync_message(r#"{"refusal":"no_project"}"#).is_none());
         assert!(ambiguous_sync_message("not json").is_none());
     }
+
+    /// The daemon names its version without starting anything, and that version is the repository's
+    /// `VERSION`: the shell compares the two after an update, so a daemon built from a stale crate
+    /// version would be reported as a mismatch forever.
+    #[test]
+    fn the_version_flag_prints_the_crate_version_and_starts_nothing() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            version_output(&args(&["nucleos-core", "--version"])),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(version_output(&args(&["nucleos-core"])), None);
+        // The program name is not a flag, whatever it is called.
+        assert_eq!(version_output(&args(&["--version"])), None);
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            include_str!("../../VERSION").trim(),
+            "core/Cargo.toml disagrees with VERSION: run scripts/bump-version.py"
+        );
+    }
 }

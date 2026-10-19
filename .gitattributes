@@ -33,6 +33,9 @@ core/assets/** text eol=lf
 *.mjs text eol=lf
 *.yml text eol=lf
 
+# install.ps1 is run by Windows PowerShell 5.1 and edited on Windows; keep CRLF there, and LF in the blob.
+*.ps1 text eol=crlf
+
 # Devtime transcript fixtures are read by byte offset (a torn last line, a resume from a stored
 # offset) and compared against a byte-exact golden. A CRLF checkout would move every offset and
 # change the golden, so they are stored and checked out exactly as written.

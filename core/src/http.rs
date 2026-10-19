@@ -93,10 +93,14 @@ pub fn build_router(state: AppState) -> Router {
     #[cfg(debug_assertions)]
     origins.push("http://localhost:1420".parse().unwrap());
 
+    // The shell reads the daemon's version from `/health` across origins. A custom response header
+    // is hidden from a cross-origin page unless it is listed here, and the version handshake after
+    // an update would then see nothing and call every daemon "unknown".
     let cors = CorsLayer::new()
         .allow_origin(origins)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .expose_headers(vec![axum::http::HeaderName::from_static(VERSION_HEADER)]);
 
     let protected = Router::new()
         .route("/status", get(status))
@@ -137,6 +141,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(run_queue::routes())
         .merge(team::routes())
         .merge(workflows::routes())
+        // While the daemon drains for an update, the routes that start work answer 503
+        // (`shutdown.rs`). Added before the token check, so it runs inside it: only a caller that
+        // authenticated learns the daemon is draining.
+        .layer(axum::middleware::from_fn(crate::shutdown::refuse_new_work))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -149,8 +157,18 @@ pub fn build_router(state: AppState) -> Router {
         .layer(cors)
 }
 
+/// The response header that names the daemon's version. Lowercase because `HeaderName::from_static`
+/// refuses anything else; HTTP header names are case-insensitive on the wire (`X-Nucleos-Version`).
+const VERSION_HEADER: &str = "x-nucleos-version";
+
+/// `GET /health`: the body stays `"ok"` (the shell's connection gate and the preview read it), and
+/// the version rides in a header so nothing that parses the body can break.
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+    (
+        StatusCode::OK,
+        [(VERSION_HEADER, env!("CARGO_PKG_VERSION"))],
+        "ok",
+    )
 }
 
 async fn health_readout(State(state): State<AppState>) -> Json<health::HealthReadout> {
@@ -23809,6 +23827,111 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{header:?}");
         }
+    }
+
+    /// The body is read by `shell/src/data/client.ts` and the preview as plain `ok`; the version
+    /// must arrive beside it, in a header, and a cross-origin page must be allowed to read it.
+    #[tokio::test]
+    async fn health_keeps_its_body_and_names_the_version() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("Origin", "https://tauri.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-nucleos-version").unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+        let exposed = response
+            .headers()
+            .get("access-control-expose-headers")
+            .expect("a cross-origin page needs the header exposed")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(exposed.contains("x-nucleos-version"), "{exposed}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    /// The two update routes are in no `auth.rs` table on purpose: a run's key, a read-only key and
+    /// a run-creating key must not read the readiness or begin a drain. Only the control token (and
+    /// an Admin key) may. The draining itself is covered in `shutdown.rs`; a request that is let
+    /// through here would flip a process-wide flag the other tests in this binary share.
+    #[tokio::test]
+    async fn shutdown_needs_the_control_scope() {
+        let state = test_state().await;
+        let reader = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let creator = store_api_token_at_level(&state, "creator", ApiTokenLevel::RunCreating).await;
+
+        for (method, path) in [
+            ("POST", "/system/shutdown"),
+            ("GET", "/system/update-readiness"),
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+
+            for key in [&reader, &creator] {
+                let response = api_token_request(state.clone(), method, path, key, None).await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            }
+        }
+    }
+
+    /// The updater asks before it acts: the version, how many runs are live, and whether the
+    /// daemon is already draining.
+    #[tokio::test]
+    async fn update_readiness_reports_version_runs_and_draining() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'worktree', '2026-10-19T00:00:00Z'),
+                    ('y', 'completed', 'worktree', '2026-10-19T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/system/update-readiness")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["live_runs"], 1);
+        assert_eq!(body["draining"], false);
     }
 
     /// Only this test may await `shutdown_requested()`: the notifiers are process-wide.
