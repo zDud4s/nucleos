@@ -41,7 +41,7 @@ import {
   Section,
 } from "../ui";
 import { VoiceOrb } from "./VoiceOrb";
-import { VoiceRoom } from "./VoiceRoom";
+import { ROOM_BOTTOM, VoiceRoom } from "./VoiceRoom";
 import "./voice.css";
 import { DAEMON_NAME } from "../copy";
 
@@ -170,15 +170,19 @@ export function Voice() {
 
   /* The dock grows (stacked columns, notes, outcomes) and the captions and the orb are placed
      against its top edge. Its measured height goes to the room as a CSS variable, so they step
-     clear instead of sitting under it; 96px is what the room's geometry assumes. */
+     clear instead of sitting under it; 96px is what the room's geometry assumes. The sand's plate is
+     drawn in script, so the same number goes to it as a prop. */
   const roomRef = useRef<HTMLDivElement>(null);
   const dockRef = useRef<HTMLDivElement>(null);
+  const [dockHeight, setDockHeight] = useState(ROOM_BOTTOM);
   useEffect(() => {
     const room = roomRef.current;
     const dock = dockRef.current;
     if (room === null || dock === null || typeof ResizeObserver !== "function") return;
     const measure = () => {
-      room.style.setProperty("--voice-dock-h", `${Math.max(96, Math.ceil(dock.offsetHeight))}px`);
+      const height = Math.max(ROOM_BOTTOM, Math.ceil(dock.offsetHeight));
+      room.style.setProperty("--voice-dock-h", `${height}px`);
+      setDockHeight(height);
     };
     const observer = new ResizeObserver(measure);
     observer.observe(dock);
@@ -201,7 +205,13 @@ export function Voice() {
       data-archive={archiveOpen ? "open" : undefined}
       data-live={on || phase !== "idle" ? "" : undefined}
     >
-      <VoiceRoom phase={voice.phase} level={voice.level} threshold={voice.threshold} tap={voice.answerTap} />
+      <VoiceRoom
+        phase={voice.phase}
+        level={voice.level}
+        threshold={voice.threshold}
+        tap={voice.answerTap}
+        dock={dockHeight}
+      />
       <VoiceOrb phase={voice.phase} tap={voice.answerTap} />
 
       <div className="voice-room-top">

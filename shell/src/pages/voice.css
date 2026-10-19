@@ -246,14 +246,15 @@
 
 /* ------------------------------------------------------------ conversation -- */
 
-/* The dock's diagnostics: one fact to a line, in the mono face and the faint rung, because they are
-   readings off the machine and not prose. */
+/* The dock's diagnostics: one fact to a line, in the mono face, because they are readings off the
+   machine and not prose. The muted rung and not the faint one: they are read over the sand, and at the
+   faint rung a 12px mono line there did not hold its contrast. */
 .voice-conversation-status {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: var(--space-1);
-  color: var(--text-faint);
+  color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
@@ -267,8 +268,8 @@
    what it is: it is listening, and that is not speech yet. */
 .voice-meter {
   position: relative;
-  width: 6rem;
-  height: 6px;
+  width: 8rem;
+  height: 8px;
   flex: none;
   border-radius: var(--radius-md);
   background: var(--surface-sunken);
@@ -399,7 +400,8 @@
 
 /* `--voice-orb-size` mirrors `orbGeometry` in VoiceRoom.tsx: the sand's plate is sized from the same
    numbers in script, and the two have to agree or the orb floats off its plate. The free band is the
-   room less `ROOM_TOP` (112px) and `ROOM_BOTTOM` (96px), 208px in all. The `cqh`/`cqw` units resolve
+   room less `ROOM_TOP` (112px) and the dock (`--voice-dock-h`, 96px at the least), and the floor is
+   `ORB_FLOOR`. The `cqh`/`cqw` units resolve
    where the property is used, against this element, which is the size container. */
 .voice-room {
   position: relative;
@@ -410,7 +412,7 @@
   container-type: size;
   background: var(--surface-sunken);
   --voice-dock-h: 96px;
-  --voice-orb-size: max(140px, min(0.44 * (100cqh - 112px - var(--voice-dock-h)), 50cqw));
+  --voice-orb-size: max(96px, min(0.44 * (100cqh - 112px - var(--voice-dock-h)), 50cqw));
 }
 
 /* Without a size the canvas measures zero and draws nothing. */
@@ -488,6 +490,11 @@
   gap: 6px;
   text-align: center;
   pointer-events: none;
+  /* A short window puts the captions on the plate's rim, where the sand is densest: a halo of the
+     ground keeps each letter off the grains under it. */
+  text-shadow:
+    0 0 2px var(--bg),
+    0 0 6px var(--bg);
 }
 
 .voice-caption-label {
@@ -647,6 +654,9 @@
      visible and reachable, so it rises above the drawer on a ground of its own instead. */
   .voice-room[data-archive="open"]:not([data-live]) .voice-dock {
     visibility: hidden;
+    /* Hidden, it is still measured: at the drawer's narrow width it would wrap twice as tall and push
+       the orb up for nothing. */
+    right: 0;
   }
 
   .voice-room[data-archive="open"][data-live] .voice-dock {
@@ -663,6 +673,12 @@
   .voice-dock-diag {
     display: flex;
     justify-content: center;
+  }
+
+  /* Stacked, the dock is three times as tall, and the wide gradient left its top lines on bare sand.
+     The veil reaches its full strength within the first lines instead. */
+  .voice-dock {
+    background: linear-gradient(transparent, color-mix(in srgb, var(--bg) 78%, transparent) 4rem);
   }
 
   .voice-dock-capture {
