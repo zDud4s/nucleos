@@ -847,16 +847,24 @@
 
 /* The files on the left, the chosen one on the right. */
 .sy-settings {
-  display: grid;
-  grid-template-columns: 14rem minmax(0, 1fr);
+  display: flex;
+  flex-wrap: wrap;
   align-items: start;
   gap: var(--space-4);
 }
 
-@media (max-width: 48rem) {
-  .sy-settings {
-    grid-template-columns: minmax(0, 1fr);
-  }
+/* The detail takes the row's room and the list only its 14rem; when the column cannot give the
+   detail 24rem beside the list, the detail drops under it at full width. The column, not the window,
+   decides: at an 800px window the sidebar left ~430px and a viewport query kept the two side by side,
+   the detail 162px wide and the file path broken every few characters. */
+.sy-settings-list {
+  flex: 1 1 14rem;
+  max-width: 100%;
+}
+
+.sy-settings-detail {
+  flex: 999 1 24rem;
+  min-width: 0;
 }
 
 .sy-settings-list {
@@ -925,10 +933,6 @@
 .sy-mark-on {
   border-color: var(--text-muted);
   background: var(--text-muted);
-}
-
-.sy-settings-detail {
-  min-width: 0;
 }
 
 .sy-setting-label {

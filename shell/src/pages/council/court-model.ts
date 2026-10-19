@@ -527,7 +527,7 @@ export function buildSetupCourt(
     ? { title: "ROUNDS", sub: null }
     : { title: `ROUNDS ${rounds}`, sub: ceilingLine(d, rounds) };
   const judge: CourtJudge = d.chairman === null
-    ? { name: "", label: "+", sub: "choose a chairman", state: "empty" }
+    ? { name: "", label: "+", sub: "choose one", state: "empty" }
     : { name: d.chairman.name, label: d.chairman.name, sub: null, state: "seated" };
   return {
     seats, judge, balance, wing,

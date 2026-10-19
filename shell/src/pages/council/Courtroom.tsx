@@ -42,6 +42,12 @@ const WING_X = 482;
 
 const JUDGE_LABEL_CHARS = 16;
 
+/**
+ * Characters the bench's second line keeps. It is 12px with wide tracking, about 8 viewBox units a
+ * character, in a 120-unit bench: 17 characters ran ~16 units past the dashed outline, 13 stay inside.
+ */
+const JUDGE_SUB_CHARS = 13;
+
 const clip = (text: string, room: number) => (text.length > room ? `${text.slice(0, room - 1)}…` : text);
 
 /**
@@ -269,7 +275,7 @@ function Judge({ judge, selected }: { judge: CourtJudge; selected: boolean }) {
       </text>
       {judge.sub !== null && (
         <text className="council-court-small" x={CX} y={67} textAnchor="middle">
-          {clip(judge.sub, 22)}
+          {clip(judge.sub, JUDGE_SUB_CHARS)}
         </text>
       )}
     </g>

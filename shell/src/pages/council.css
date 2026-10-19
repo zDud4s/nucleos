@@ -1102,12 +1102,19 @@
    let it grow down over that chair as the court got narrower. */
 .council-court-wing-action {
   position: absolute;
-  left: 71.5%;
+  right: 3.5%;
   top: 39.5%;
   transform: translateY(-100%);
-  width: 25%;
+  min-width: 25%;
   display: flex;
   justify-content: center;
+}
+
+/* One line: in a 25% box an 800px window's court gave "Stop council" ~104px and the label broke in two.
+   The box is anchored by its right edge and only has a minimum width, so a button wider than it grows
+   the box leftwards, towards the room, instead of past the court's edge. */
+.council-court-wing-action > * {
+  white-space: nowrap;
 }
 
 /* --------------------------------------------------------------- dossier -- */
