@@ -141,6 +141,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(run_queue::routes())
         .merge(team::routes())
         .merge(workflows::routes())
+        // While the daemon drains for an update, the routes that start work answer 503
+        // (`shutdown.rs`). Added before the token check, so it runs inside it: only a caller that
+        // authenticated learns the daemon is draining.
+        .layer(axum::middleware::from_fn(crate::shutdown::refuse_new_work))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_token,
@@ -23589,6 +23593,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    /// The two update routes are in no `auth.rs` table on purpose: a run's key, a read-only key and
+    /// a run-creating key must not read the readiness or begin a drain. Only the control token (and
+    /// an Admin key) may. The draining itself is covered in `shutdown.rs`; a request that is let
+    /// through here would flip a process-wide flag the other tests in this binary share.
+    #[tokio::test]
+    async fn shutdown_needs_the_control_scope() {
+        let state = test_state().await;
+        let reader = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let creator =
+            store_api_token_at_level(&state, "creator", ApiTokenLevel::RunCreating).await;
+
+        for (method, path) in [
+            ("POST", "/system/shutdown"),
+            ("GET", "/system/update-readiness"),
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+
+            for key in [&reader, &creator] {
+                let response = api_token_request(state.clone(), method, path, key, None).await;
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            }
+        }
+    }
+
+    /// The updater asks before it acts: the version, how many runs are live, and whether the
+    /// daemon is already draining.
+    #[tokio::test]
+    async fn update_readiness_reports_version_runs_and_draining() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'worktree', '2026-10-19T00:00:00Z'),
+                    ('y', 'completed', 'worktree', '2026-10-19T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/system/update-readiness")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["live_runs"], 1);
+        assert_eq!(body["draining"], false);
     }
 
     /// Only this test may await `shutdown_requested()`: the notifiers are process-wide.

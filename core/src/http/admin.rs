@@ -5,6 +5,10 @@ use super::*;
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/sidecars", get(get_sidecars))
+        // The update handshake. In no `auth.rs` table on purpose: Control and Admin only, like
+        // `/daemon/shutdown`. A run's key must not read the readiness or begin a drain.
+        .route("/system/update-readiness", get(get_update_readiness))
+        .route("/system/shutdown", post(post_system_shutdown))
         .route("/sidecars/{name}/restart", post(post_sidecar_restart))
         .route("/config/email", get(get_email_config))
         .route(
@@ -641,4 +645,81 @@ pub(super) async fn post_capture_wait(
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }
+}
+
+/// `GET /system/update-readiness`: the version, how many runs are live, and whether the daemon is
+/// already draining. What the updater asks before it stops anything.
+async fn get_update_readiness(
+    State(state): State<AppState>,
+) -> Result<Json<crate::shutdown::Readiness>, StatusCode> {
+    crate::shutdown::readiness(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "could not count the live runs for the update readiness");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct SystemShutdownQuery {
+    /// How long to wait for the live runs, in seconds. Absent means the default; capped.
+    timeout_secs: Option<u64>,
+}
+
+/// `POST /system/shutdown`: stop the daemon once no run is live, without ever interrupting one.
+///
+/// Answers 202 at once with the readiness it saw; the wait happens in a task. New work is refused
+/// from this moment on (`shutdown.rs`). When the wait ends with no run live the daemon leaves by
+/// the same graceful path as `/daemon/shutdown`, exit code 0. When it times out the daemon
+/// carries on and `GET /system/update-readiness` shows `draining: false` and the runs still live.
+/// A second request while one is draining changes nothing.
+async fn post_system_shutdown(
+    State(state): State<AppState>,
+    Query(query): Query<SystemShutdownQuery>,
+) -> Result<(StatusCode, Json<crate::shutdown::Readiness>), StatusCode> {
+    let timeout = query
+        .timeout_secs
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(crate::shutdown::DEFAULT_DRAIN_TIMEOUT)
+        .min(crate::shutdown::MAX_DRAIN_TIMEOUT);
+
+    if crate::shutdown::begin_draining() {
+        tracing::warn!(
+            timeout_secs = timeout.as_secs(),
+            "draining the daemon for an update"
+        );
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            match crate::shutdown::drain_until_idle(
+                &pool,
+                timeout,
+                crate::shutdown::DRAIN_POLL,
+                request_shutdown,
+            )
+            .await
+            {
+                Ok(crate::shutdown::DrainOutcome::Stopped) => {
+                    tracing::warn!("no run is live: stopping the daemon for the update");
+                }
+                Ok(crate::shutdown::DrainOutcome::TimedOut { live_runs }) => {
+                    tracing::warn!(live_runs, "the update drain timed out; the daemon carries on");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "the update drain could not count the live runs; the daemon carries on"
+                    );
+                }
+            }
+        });
+    }
+
+    crate::shutdown::readiness(&state.pool)
+        .await
+        .map(|readiness| (StatusCode::ACCEPTED, Json(readiness)))
+        .map_err(|error| {
+            tracing::warn!(%error, "could not read the readiness after starting the drain");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
