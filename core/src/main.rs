@@ -96,9 +96,14 @@ async fn main() {
         ),
     }
     // After the restore (which may replace the file) and before the pool opens (nothing else holds
-    // the file). Primary only: a secondary instance has a data directory of its own, but this is
-    // the step that rewrites a database, and only the machine's daemon should ever do that.
-    if is_primary {
+    // the file). Only an instance that owns its database applies it: the machine's daemon, or a
+    // secondary started with a data directory of its own. A secondary on the default data directory
+    // (port override only) shares the primary's file and leaves the marker for the primary's next
+    // start. A second unconfigured process on the same directory could still race, and SQLite's
+    // locks keep the file safe; no exclusive lock is taken here.
+    let owns_database =
+        is_primary || data_dir_override.as_deref().is_some_and(|dir| !dir.is_empty());
+    if owns_database {
         match backup::apply_pending_compaction(&db_path, health::available_space).await {
             Ok(Some(compacted)) => tracing::warn!(
                 "compacted the database from {} to {} bytes; safety copy at {}",
@@ -107,6 +112,10 @@ async fn main() {
                 compacted.safety_backup.display()
             ),
             Ok(None) => tracing::info!("no database compaction to apply"),
+            // `VACUUM` ran and the request is gone: nothing is retried, the owner has to act.
+            Err(e @ backup::BackupError::CompactionUnverified { .. }) => tracing::error!(
+                "database compaction finished but the result failed verification; continuing startup, not retrying: {e}"
+            ),
             Err(e) => tracing::error!(
                 "failed to compact the database; continuing startup and retrying next start: {e}"
             ),

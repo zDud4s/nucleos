@@ -1242,7 +1242,10 @@ mod tests {
         let staged: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(staged["applies"], "on next daemon start");
         assert!(marker.exists(), "the request is a marker beside the file");
-        assert_eq!(storage_report(state.clone()).await["compaction_pending"], true);
+        assert_eq!(
+            storage_report(state.clone()).await["compaction_pending"],
+            true
+        );
 
         // Asking twice is the same request, not an error.
         let again = backup_request(

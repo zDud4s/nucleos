@@ -315,7 +315,9 @@ pub(super) fn backup_status(error: &backup::BackupError) -> StatusCode {
             StatusCode::CONFLICT
         }
         backup::BackupError::Verification(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        backup::BackupError::Database(_) | backup::BackupError::Io(_) => {
+        backup::BackupError::Database(_)
+        | backup::BackupError::Io(_)
+        | backup::BackupError::CompactionUnverified { .. } => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

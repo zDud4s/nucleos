@@ -60,6 +60,12 @@ pub enum BackupError {
     NotFound,
     PendingRestoreExists,
     Verification(String),
+    /// `VACUUM` succeeded but the compacted file did not pass the checks afterwards. The safety
+    /// copy taken before it is the way back, so it is kept and named.
+    CompactionUnverified {
+        reason: String,
+        safety_backup: PathBuf,
+    },
 }
 
 impl fmt::Display for BackupError {
@@ -79,6 +85,14 @@ impl fmt::Display for BackupError {
             Self::NotFound => formatter.write_str("backup not found"),
             Self::PendingRestoreExists => formatter.write_str("a restore is already pending"),
             Self::Verification(reason) => write!(formatter, "backup verification failed: {reason}"),
+            Self::CompactionUnverified {
+                reason,
+                safety_backup,
+            } => write!(
+                formatter,
+                "compacted file failed verification ({reason}); safety copy kept at {}",
+                safety_backup.display()
+            ),
         }
     }
 }
@@ -278,8 +292,10 @@ pub struct Compacted {
 }
 
 /// How many times the database (plus its WAL) must fit in the free space before a compaction is
-/// tried: the `pre-compact` copy is one, the rebuilt file `VACUUM` writes is another, and its
-/// rollback journal is up to a third. The owner's 440 MB database wants ~1.3 GB free, which is what
+/// tried. The database is in WAL mode, so `VACUUM` writes the rebuilt database through the `-wal`
+/// file (up to about one more database) and builds it in a temp database in SQLite's temp
+/// directory. The factor covers, on the database's own volume, the database itself, the
+/// `pre-compact` copy and that WAL. The owner's 440 MB database wants ~1.3 GB free, which is what
 /// keeps a full disk from being the thing a "reclaim space" button causes.
 const COMPACTION_ROOM_FACTOR: u64 = 3;
 
@@ -310,13 +326,26 @@ pub fn compaction_pending(db_path: &Path) -> bool {
 /// `available_space` answers how many bytes the volume holding the database directory has free;
 /// it is a parameter so the test can say "no room" without filling a disk.
 ///
-/// Every failure leaves the marker in place (so the next start retries) and the database untouched
-/// or intact: `VACUUM` is atomic, and the `pre-compact` copy is verified before it runs. Not having
-/// room is not a failure: it forgets the request, because retrying a disk that is still full on
-/// every start would only make every start slow.
+/// A failure before `VACUUM` has finished leaves the marker in place (so the next start retries),
+/// the database untouched (`VACUUM` is atomic) and no safety copy of this run behind, so failed
+/// retries never pile up full-size copies. Once `VACUUM` has succeeded the marker is always
+/// removed; if the compacted file then fails its checks the error is
+/// [`BackupError::CompactionUnverified`], this run's safety copy is kept and the older ones are not
+/// pruned. Not having room is not a failure: it forgets the request, because retrying a disk that
+/// is still full on every start would only make every start slow.
 pub async fn apply_pending_compaction(
     db_path: &Path,
     available_space: impl FnOnce(&Path) -> std::io::Result<u64>,
+) -> Result<Option<Compacted>, BackupError> {
+    apply_compaction(db_path, available_space, "VACUUM").await
+}
+
+/// [`apply_pending_compaction`] with the statement that compacts the file as a parameter, so a test
+/// can make the compaction fail, or leave a file that fails its checks, without a second process.
+async fn apply_compaction(
+    db_path: &Path,
+    available_space: impl FnOnce(&Path) -> std::io::Result<u64>,
+    vacuum: &str,
 ) -> Result<Option<Compacted>, BackupError> {
     let marker = compact_marker_path(db_path);
     if !marker.exists() {
@@ -356,27 +385,33 @@ pub async fn apply_pending_compaction(
                 .busy_timeout(Duration::from_secs(10)),
         )
         .await?;
-    let result = compact_database(&pool, db_path).await;
+    let result = compact_database(&pool, db_path, vacuum).await;
     // Closing the last connection folds the WAL away, so the sizes below are the whole story.
     pool.close().await;
     let (before_bytes, safety_backup) = result?;
 
-    let version = verified_version(db_path).await?;
-    let safety_version = verified_version(&safety_backup).await?;
-    if version != safety_version {
-        return Err(BackupError::Verification(format!(
-            "compacted database has migration version {version}, its safety copy {safety_version}"
-        )));
+    // `VACUUM` has run: the request is answered whatever the checks below say, because retrying a
+    // compaction of a file that is already compact (or that failed its checks) helps nobody.
+    let marker_removed = remove_if_exists(&marker);
+    if let Err(reason) = verify_compacted(db_path, &safety_backup).await {
+        if let Err(error) = &marker_removed {
+            tracing::warn!(%error, "could not remove the compaction request");
+        }
+        return Err(BackupError::CompactionUnverified {
+            reason: reason.to_string(),
+            safety_backup,
+        });
     }
     let after_bytes = file_len(db_path);
 
-    // Best effort from here: the compaction is done and verified, only housekeeping is left. The
-    // marker goes last among the fallible steps that matter; if it cannot be removed the next
-    // start compacts an already compact file, which is slow but harmless.
+    // Best effort from here: the compaction is done and verified, only housekeeping is left. Older
+    // safety copies go only now, once this run's copy has proved to be the one to keep.
     if let Err(error) = prune_pre_compact_copies(directory, &safety_backup) {
         tracing::warn!(%error, "could not remove older pre-compact copies");
     }
-    fs::remove_file(&marker)?;
+    // If the marker cannot be removed the next start compacts an already compact file, which is
+    // slow but harmless.
+    marker_removed?;
     Ok(Some(Compacted {
         before_bytes,
         after_bytes,
@@ -389,6 +424,7 @@ pub async fn apply_pending_compaction(
 async fn compact_database(
     pool: &SqlitePool,
     db_path: &Path,
+    vacuum: &str,
 ) -> Result<(u64, PathBuf), BackupError> {
     let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
         .fetch_one(pool)
@@ -422,8 +458,26 @@ async fn compact_database(
         return Err(error);
     }
 
-    sqlx::query("VACUUM").execute(pool).await?;
+    // `VACUUM` is atomic, so a failure leaves the database as it was and this run's copy is only
+    // dead weight: remove it, or every failed retry would leave another full-size file behind.
+    if let Err(error) = sqlx::query(vacuum).execute(pool).await {
+        let _ = remove_if_exists(&safety_path);
+        return Err(BackupError::Database(error));
+    }
     Ok((before_bytes, safety_path))
+}
+
+/// The compacted file passes `quick_check` and carries the migration version of the safety copy
+/// taken just before it.
+async fn verify_compacted(db_path: &Path, safety_backup: &Path) -> Result<(), BackupError> {
+    let version = verified_version(db_path).await?;
+    let safety_version = verified_version(safety_backup).await?;
+    if version != safety_version {
+        return Err(BackupError::Verification(format!(
+            "compacted database has migration version {version}, its safety copy {safety_version}"
+        )));
+    }
+    Ok(())
 }
 
 /// Removes every `pre-compact-*.db` in `backups/` except `keep`.
@@ -1259,7 +1313,10 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none(), "no room, nothing done");
-        assert!(!compaction_pending(&db_path), "and the request is forgotten");
+        assert!(
+            !compaction_pending(&db_path),
+            "and the request is forgotten"
+        );
         assert_eq!(file_len(&db_path), size_before, "the file is untouched");
         assert!(pre_compact_files(&db_path).is_empty());
         assert_eq!(scratch_rows(&db_path).await, rows);
@@ -1279,6 +1336,77 @@ mod tests {
 
         assert!(result.is_err());
         assert!(compaction_pending(&db_path), "the next start retries");
+    }
+
+    /// An older safety copy, as a previous compaction would have left it.
+    fn plant_old_pre_compact_copy(db_path: &Path) -> PathBuf {
+        let directory = db_path.parent().unwrap().join("backups");
+        fs::create_dir_all(&directory).unwrap();
+        let old = directory.join(format!("{PRE_COMPACT_PREFIX}19700101T000000.000000000Z.db"));
+        fs::write(&old, b"old").unwrap();
+        old
+    }
+
+    #[tokio::test]
+    async fn a_failed_vacuum_removes_its_own_safety_copy_and_keeps_the_request() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        let rows = seed_free_pages(&db.pool, 40).await;
+        let old = plant_old_pre_compact_copy(&db_path);
+        stage_compaction(&db.pool).await.unwrap();
+        db.pool.close().await;
+
+        // `VACUUM` of a schema that does not exist is an error, after the safety copy was taken.
+        let result = apply_compaction(&db_path, |_| Ok(u64::MAX), "VACUUM nosuchschema").await;
+
+        assert!(
+            matches!(result, Err(BackupError::Database(_))),
+            "{result:?}"
+        );
+        assert!(compaction_pending(&db_path), "the next start retries");
+        assert_eq!(
+            pre_compact_files(&db_path),
+            vec![old],
+            "this run's copy is gone, the older one is not touched"
+        );
+        assert_eq!(scratch_rows(&db_path).await, rows);
+    }
+
+    #[tokio::test]
+    async fn a_compacted_file_that_fails_verification_keeps_its_copies_and_loses_the_request() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        seed_free_pages(&db.pool, 40).await;
+        let old = plant_old_pre_compact_copy(&db_path);
+        stage_compaction(&db.pool).await.unwrap();
+        db.pool.close().await;
+
+        // Compacts, then drops the newest migration row: the file no longer matches its copy.
+        let result = apply_compaction(
+            &db_path,
+            |_| Ok(u64::MAX),
+            "VACUUM; DELETE FROM _sqlx_migrations \
+             WHERE version = (SELECT MAX(version) FROM _sqlx_migrations)",
+        )
+        .await;
+
+        let Err(BackupError::CompactionUnverified { safety_backup, .. }) = &result else {
+            panic!("expected CompactionUnverified, got {result:?}");
+        };
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains(&safety_backup.display().to_string()),
+            "the message names the copy"
+        );
+        assert!(safety_backup.exists());
+        assert!(old.exists(), "older copies are not pruned after a bad run");
+        assert!(
+            !compaction_pending(&db_path),
+            "VACUUM ran, the request is answered"
+        );
     }
 
     #[tokio::test]
