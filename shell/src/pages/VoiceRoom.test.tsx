@@ -9,6 +9,7 @@ import {
   G7,
   MODES_DISC,
   MODES_SQ,
+  ORB_FLOOR,
   ROOM_BOTTOM,
   ROOM_TOP,
   VoiceRoom,
@@ -95,17 +96,25 @@ describe("the room's drive", () => {
     expect(narrow.R).toBeCloseTo((150 / 2) * 0.78, 6);
     expect(narrow.plate).toBeCloseTo(300 * 0.47, 6);
 
-    // The orb never shrinks below 140 whatever the room, and the plate never below 1.15 radii.
+    // The orb never shrinks below its floor whatever the room, and the plate never below 1.15 radii.
+    expect(ORB_FLOOR).toBe(96);
     const tiny = orbGeometry(100, 100);
     expect(tiny.cx).toBe(50);
     expect(tiny.cy).toBeCloseTo(112, 6);
-    expect(tiny.R).toBeCloseTo((140 / 2) * 0.78, 6);
+    expect(tiny.R).toBeCloseTo((96 / 2) * 0.78, 6);
     expect(tiny.plate).toBeCloseTo(tiny.R * 1.15, 6);
 
     // On a 1920x1080 window's room the plate clears both bars.
     const full = orbGeometry(1920, 990);
     expect(full.cy - full.plate).toBeGreaterThanOrEqual(ROOM_TOP);
     expect(full.cy + full.plate).toBeLessThanOrEqual(990 - ROOM_BOTTOM);
+
+    // A narrow window stacks the dock, and its measured height moves the band up: the plate stays clear
+    // of the dock and the orb stays inside the band.
+    const stacked = orbGeometry(560, 600, 250);
+    expect(stacked.cy).toBeCloseTo(112 + (600 - 112 - 250) / 2, 6);
+    expect(stacked.cy + stacked.plate).toBeLessThanOrEqual(600 - 250);
+    expect(stacked.cy - stacked.R / 0.78).toBeGreaterThanOrEqual(ROOM_TOP);
   });
 
   it("the room breathes when nobody speaks", () => {

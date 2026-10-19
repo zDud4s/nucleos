@@ -42,17 +42,28 @@ export const DIM: Record<ConversationPhase, number> = {
 
 /** CSS pixels the top bar takes at the top of the room. Mirrored by `.voice-orb` in voice.css. */
 export const ROOM_TOP = 112;
-/** CSS pixels the dock takes at the bottom of the room. */
+/** CSS pixels the dock takes at the bottom of the room, at the least: a taller dock is measured and passed in. */
 export const ROOM_BOTTOM = 96;
+
+/** The smallest the orb gets, in CSS pixels. Mirrored by `--voice-orb-size` in voice.css. It was 140, and
+ *  a short window with a stacked dock then had the orb's lower edge under the captions. */
+export const ORB_FLOOR = 96;
 
 /**
  * Where the orb stands in the room, how big its shell is, and how wide the plate is. All in CSS pixels.
  * The orb and its plate are centred in the free band between the top bar and the dock, and sized to fit
  * it: the plate never runs under either bar (the floors only bite in a room too small to fit anything).
+ * `bottom` is the dock's measured height, the same number voice.css reads as `--voice-dock-h`: with the
+ * constant here instead, a narrow window's stacked dock had the plate drawn under it and the orb (placed
+ * by the stylesheet from the measured height) standing off the plate's hole.
  */
-export function orbGeometry(w: number, h: number): { cx: number; cy: number; R: number; plate: number } {
-  const free = Math.max(h - ROOM_TOP - ROOM_BOTTOM, 0);
-  const orbSize = Math.max(140, Math.min(free * 0.44, w * 0.5));
+export function orbGeometry(
+  w: number,
+  h: number,
+  bottom: number = ROOM_BOTTOM,
+): { cx: number; cy: number; R: number; plate: number } {
+  const free = Math.max(h - ROOM_TOP - bottom, 0);
+  const orbSize = Math.max(ORB_FLOOR, Math.min(free * 0.44, w * 0.5));
   const R = (orbSize / 2) * 0.78;
   return {
     cx: w / 2,
@@ -405,12 +416,14 @@ interface Box {
   w: number;
   h: number;
   dpr: number;
+  /** The dock's height, as `orbGeometry` takes it. */
+  bottom: number;
 }
 
 /** A darkening toward the room's corners, so the sheet's edge does not read as the end of the world. */
 function vignette(ctx: CanvasRenderingContext2D, box: Box, palette: Palette, inner: number, strength: number): void {
   const { w, h } = box;
-  const { cx, cy } = orbGeometry(w, h);
+  const { cx, cy } = orbGeometry(w, h, box.bottom);
   const vig = ctx.createRadialGradient(cx, cy, inner, cx, cy, Math.max(w, h) * 0.72);
   vig.addColorStop(0, withAlpha(palette.bg, 0));
   vig.addColorStop(1, withAlpha(palette.bg, palette.light ? strength * 0.25 : strength));
@@ -423,7 +436,7 @@ function drawRoom(ctx: CanvasRenderingContext2D, box: Box, palette: Palette, s: 
   const { w, h, dpr } = box;
   if (w === 0 || h === 0) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const { cx, cy, R, plate: Sd } = orbGeometry(w, h);
+  const { cx, cy, R, plate: Sd } = orbGeometry(w, h, box.bottom);
 
   ctx.fillStyle = palette.back;
   ctx.fillRect(0, 0, w, h);
@@ -496,17 +509,20 @@ export function VoiceRoom({
   level,
   threshold,
   tap,
+  dock = ROOM_BOTTOM,
 }: {
   phase: ConversationPhase;
   level: number;
   threshold: number;
   tap?: AnswerTap | null;
+  /** The dock's measured height in CSS pixels; the plate is centred in the band above it. */
+  dock?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   /* Read by the frame loop, which outlives every render; a prop captured by its closure would freeze
      the room at whatever it heard first. */
-  const inputRef = useRef({ phase, level, threshold, tap });
-  inputRef.current = { phase, level, threshold, tap };
+  const inputRef = useRef({ phase, level, threshold, tap, dock });
+  inputRef.current = { phase, level, threshold, tap, dock };
   /* The effect below owns the canvas and the sand; the phase effect after it reaches `settle` through here. */
   const settleRef = useRef<((force: boolean) => void) | null>(null);
 
@@ -525,7 +541,12 @@ export function VoiceRoom({
       return forced === "light" ? true : forced === "dark" ? false : scheme.matches;
     };
     let palette = readPalette(isLight());
-    const box: Box = { w: 0, h: 0, dpr: 1 };
+    const box: Box = { w: 0, h: 0, dpr: 1, bottom: inputRef.current.dock };
+    // Every frame takes the dock's height as it is now: it grows and shrinks without the canvas resizing.
+    const paint = () => {
+      box.bottom = inputRef.current.dock;
+      drawRoom(ctx, box, palette, sand);
+    };
     const sand = createSand();
     const plate = newTrack(MODES_DISC);
     const outer = newTrack(MODES_SQ);
@@ -561,7 +582,7 @@ export function VoiceRoom({
       trackMode(outer, MODES_SQ, phase);
       outer.mix = Math.min(1, outer.mix + dt * 0.8);
       step(true, energy, dt, blended(plate, discField), blended(outer, sqField));
-      drawRoom(ctx, box, palette, sand);
+      paint();
       frame = requestAnimationFrame(loop);
     };
 
@@ -590,7 +611,7 @@ export function VoiceRoom({
       if (!force && settledFor === phase) return;
       settledFor = phase;
       rest(phase);
-      drawRoom(ctx, box, palette, sand);
+      paint();
     };
     settleRef.current = settle;
 
@@ -620,7 +641,7 @@ export function VoiceRoom({
     // The theme changed: take its colours again, and repaint at once if nothing is going to.
     const onScheme = () => {
       palette = readPalette(isLight());
-      if (reduced.matches) drawRoom(ctx, box, palette, sand);
+      if (reduced.matches) paint();
     };
     // A theme picked inside the app is an attribute on the root, which `prefers-color-scheme` never reports.
     const themeObserver =
@@ -648,6 +669,11 @@ export function VoiceRoom({
   useEffect(() => {
     settleRef.current?.(false);
   }, [phase]);
+
+  // Nor is there a frame to pick up a dock that changed height: repaint the still room around it.
+  useEffect(() => {
+    settleRef.current?.(true);
+  }, [dock]);
 
   return <canvas ref={canvasRef} aria-hidden="true" className="voice-room-canvas" />;
 }
