@@ -228,25 +228,6 @@ pub(super) async fn post_email_triage(
     .map(Json)
 }
 
-#[derive(serde::Serialize, sqlx::FromRow)]
-pub(super) struct QueuedEmail {
-    pub(super) id: i64,
-    pub(super) from_addr: String,
-    pub(super) from_name: Option<String>,
-    pub(super) subject: Option<String>,
-    pub(super) received_at: String,
-    pub(super) triage_class: Option<String>,
-    pub(super) triage_summary: Option<String>,
-    pub(super) triaged_at: Option<String>,
-    pub(super) has_attachments: i64,
-    /// The standing human decision about this sender — `pin`, `mute`, or none.
-    ///
-    /// Carried on the row rather than fetched per sender, because it is what the button in the list
-    /// has to be drawn from: without it every row would have to ask separately, and a list of forty
-    /// messages would open forty requests to render forty small pieces of state.
-    pub(super) sender_verdict: Option<String>,
-}
-
 /// How many correspondents the roster returns. Enough to find anyone; short enough to draw.
 pub(super) const CONTACTS_LIMIT: i64 = 200;
 
@@ -757,7 +738,7 @@ pub(super) struct EmailQueueQuery {
 pub(super) async fn get_email_queue(
     State(state): State<AppState>,
     Query(query): Query<EmailQueueQuery>,
-) -> Result<Json<Vec<QueuedEmail>>, StatusCode> {
+) -> Result<Json<Vec<crate::integrations::email::QueuedEmail>>, StatusCode> {
     // Newest arrival first — the order a mailbox is read in. Deliberately NOT by triage time: a
     // verdict landing now would otherwise drag a week-old message to the top, and a list that
     // reorders itself while you read it is one you lose your place in. Waiting mail is marked
@@ -778,71 +759,12 @@ pub(super) async fn get_email_queue(
     // survives triage — sender, subject, and the locally-written summary — so a search for a word
     // that was only ever in a body finds nothing, which is the correct answer once the body is gone
     // rather than a gap in the index.
-    let search = query
-        .q
-        .as_deref()
-        .map(str::trim)
-        .filter(|q| !q.is_empty())
-        .map(|q| (q.to_string(), crate::search::fts_query(q)));
+    let search = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
 
-    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
-                triaged_at, has_attachments, NULL AS sender_verdict
-           FROM emails
-          WHERE direction = 'inbound'",
-    );
-    if let Some((raw, fts)) = &search {
-        builder
-            .push(" AND (subject LIKE ")
-            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
-            .push(" ESCAPE '\\' OR from_addr LIKE ")
-            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
-            .push(" ESCAPE '\\'");
-        if fts.is_empty() {
-            builder.push(" OR 0");
-        } else {
-            builder
-                .push(" OR id IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ")
-                .push_bind(fts)
-                .push(")");
-        }
-        builder.push(")");
-    }
-    builder
-        .push(" ORDER BY received_at DESC, id DESC LIMIT ")
-        .push_bind(EMAIL_QUEUE_LIMIT);
-
-    let mut queue = builder
-        .build_query_as::<QueuedEmail>()
-        .fetch_all(&state.pool)
+    // The FTS expression is derived from the trimmed text inside `queue_search`.
+    let queue = crate::integrations::email::queue_search(&state.pool, EMAIL_QUEUE_LIMIT, search)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Filled in afterwards rather than joined in SQL, because matching `emails.from_addr` to a
-    // contact means applying `contacts::normalize_address` — which strips a display name's angle
-    // brackets as well as lowercasing. Writing that as `LOWER(TRIM(...))` in the query would be a
-    // second, subtly different definition of the same rule, and it would disagree exactly for the
-    // senders whose header carries a name. One definition, applied here.
-    //
-    // The set is every address whose contact carries a standing verdict — only what a human pinned
-    // or muted, so it is small regardless of how much mail there is.
-    let overrides: Vec<(String, String)> = sqlx::query_as(
-        "SELECT addresses.address, overrides.verdict
-           FROM contact_overrides AS overrides
-           JOIN contact_addresses AS addresses
-             ON addresses.contact_id = overrides.contact_id",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let by_address: std::collections::HashMap<String, String> = overrides.into_iter().collect();
-    for message in &mut queue {
-        message.sender_verdict = by_address
-            .get(&crate::integrations::contacts::normalize_address(
-                &message.from_addr,
-            ))
-            .cloned();
-    }
 
     Ok(Json(queue))
 }
