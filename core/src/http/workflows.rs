@@ -65,6 +65,15 @@ pub(super) fn routes() -> Router<AppState> {
             "/projects/{id}/workflows/adopt",
             post(post_project_workflow_adopt),
         )
+        // Publishing is the only door that writes INTO the library, which the comment at the top
+        // says nothing else here does. Two routes for the two sources (§7.3) — a version of the
+        // library, or a project's own copy — because the second needs a project and the first has
+        // none. Both create a version that never changes; neither can overwrite one.
+        .route("/workflows/{name}/publish", post(post_workflow_publish))
+        .route(
+            "/projects/{id}/workflows/{name}/publish",
+            post(post_project_workflow_publish),
+        )
 }
 
 /* ------------------------------------------------------------- workflows -- */
@@ -159,6 +168,10 @@ pub(super) fn workflow_status(refused: &crate::workflows::Refused) -> (StatusCod
         crate::workflows::Refused::InvalidGraph(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, "invalid_graph")
         }
+        // 409: the version exists and is immutable, which is the answer to "publish it again" and
+        // nothing about the request being malformed.
+        crate::workflows::Refused::AlreadyPublished => (StatusCode::CONFLICT, "already_published"),
+        crate::workflows::Refused::NotEjected => (StatusCode::CONFLICT, "not_ejected"),
         crate::workflows::Refused::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
 }
@@ -681,6 +694,75 @@ pub(super) async fn post_project_workflow_adopt(
 
     workflow_feed(&state, &id, &said).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub(super) struct PublishLibraryRequest {
+    /// The library version to copy from. Absent means the newest the library has.
+    #[serde(default)]
+    pub(super) from_version: Option<String>,
+    /// The new version. Required and never defaulted: a version number invented on the caller's
+    /// behalf would be a coordinate nobody chose.
+    pub(super) version: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct PublishProjectRequest {
+    pub(super) version: String,
+}
+
+/// Publish a new version of a library workflow, from another version of it.
+///
+/// This is how a workflow is edited without ejecting it (§7.3): copy a version, change it in the
+/// editor, publish the result. Nothing is pinned or changed in any project.
+pub(super) async fn post_workflow_publish(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<PublishLibraryRequest>,
+) -> Result<(StatusCode, Json<crate::workflows::Bundle>), (StatusCode, Json<serde_json::Value>)> {
+    // The kill switch, though no project is involved: this writes bytes agents will later be
+    // given, and a halted house is halted for that too.
+    let halted = crate::governance::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true);
+    if halted {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+    let library = library_or_refusal(&state)?;
+
+    let published = tokio::task::spawn_blocking(move || {
+        let from = bundle_or_refusal(&library, &name, body.from_version.as_deref())?;
+        let source = std::path::Path::new(&from.path);
+        crate::workflows::publish(&library, source, &name, &body.version)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    Ok((StatusCode::CREATED, Json(published)))
+}
+
+/// Publish this project's own copy of a workflow as a new library version.
+///
+/// The way a copy that turned out good becomes everyone's (§7.3). The project's pin is not touched;
+/// following the new version is a separate `install`.
+pub(super) async fn post_project_workflow_publish(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+    Json(body): Json<PublishProjectRequest>,
+) -> Result<(StatusCode, Json<crate::workflows::Bundle>), (StatusCode, Json<serde_json::Value>)> {
+    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let said = format!("{name} published to the library as {}", body.version);
+
+    let published = tokio::task::spawn_blocking(move || {
+        crate::workflows::publish_from_project(&root, &pins, &library, &name, &body.version)
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+
+    workflow_feed(&state, &id, &said).await;
+    Ok((StatusCode::CREATED, Json(published)))
 }
 
 /// Materialize one pinned workflow in `root`, or say only what it would do.
