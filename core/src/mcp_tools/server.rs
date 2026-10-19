@@ -29,6 +29,13 @@ pub struct NucleosTools {
     /// serves are the same fact — a narrowed server with no scope behind it would advertise tools
     /// that cannot answer.
     pub(super) served: McpBox,
+    /// The value that closes this turn's untrusted-content boundary (`<<<untrusted:NONCE>>>`).
+    ///
+    /// Owned by the server, so it lives exactly as long as the turn this server was built for: the
+    /// MCP subprocess is one per `claude` process, a `LocalToolBox` holds one per local turn. Every
+    /// place that wraps content (`filter_outgoing`, `LocalToolBox::call`) and the one place that
+    /// tells the model the value (`get_info`'s legend) reads THIS field, so they cannot disagree.
+    nonce: String,
 }
 
 impl NucleosTools {
@@ -44,7 +51,20 @@ impl NucleosTools {
             client,
             tool_router: Self::tool_router(),
             served,
+            nonce: fresh_nonce(),
         }
+    }
+
+    /// This turn's boundary value. See the field.
+    pub(super) fn boundary_nonce(&self) -> &str {
+        &self.nonce
+    }
+
+    /// Adopts another server's boundary value, for a box derived inside the same turn: one turn
+    /// has one boundary, and a second value would make the model's legend wrong for half of it.
+    pub(super) fn sharing_boundary_with(mut self, other: &Self) -> Self {
+        self.nonce.clone_from(&other.nonce);
+        self
     }
 
     /// The whole router: the two `#[tool_router]` impls, `tools.rs` and `ops_tools.rs`, added
@@ -98,8 +118,8 @@ impl ServerHandler for NucleosTools {
     ///
     /// Hand-written for the same reason `call_tool` below is — `#[tool_handler]` skips generating a
     /// method the impl already defines — but the reason it has to be is different and specific: the
-    /// macro's `instructions` is a string literal, and this text has to carry a value drawn at
-    /// startup. That is not a detail. `filter_outgoing` wraps a stranger's words in markers a page
+    /// macro's `instructions` is a string literal, and this text has to carry a value drawn
+    /// per turn. That is not a detail. `filter_outgoing` wraps a stranger's words in markers a page
     /// cannot forge, and until this existed nothing told the model what those markers MEANT. A
     /// delimiter the reader has no legend for is a decoration: the mechanism was sound and the
     /// convention was private to the code that emitted it.
@@ -125,7 +145,7 @@ impl ServerHandler for NucleosTools {
             "nucleos",
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(boundary_legend())
+        .with_instructions(boundary_legend(&self.nonce))
     }
 
     /// Every tool result leaves through here, and that is the entire point of writing it by hand.
@@ -157,7 +177,7 @@ impl ServerHandler for NucleosTools {
         let called = request.name.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = Self::tool_router().call(tcc).await?;
-        Ok(filter_outgoing(&called, result))
+        Ok(filter_outgoing(&called, result, &self.nonce))
     }
 
     /// What this instance announces, which is the whole router unless it is serving a box.
