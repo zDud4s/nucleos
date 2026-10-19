@@ -649,6 +649,11 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
 /// slashes because it is compared against a JSON command string, where that is the spelling.
 pub const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
+/// The timeout, in seconds, written onto the tool-event hook entries. A shell command can wait for
+/// admission inside the hook (`admit_heavy`), far longer than the CLI's default; the script's own
+/// budget (`ADMIT_HOOK_BUDGET_SECONDS`, 3300) stays below this.
+pub const HOOK_TIMEOUT_SECONDS: u64 = 3600;
+
 /// This daemon's classifier hook, carried inside the binary so it can be installed anywhere.
 ///
 /// **Under `core/hooks/` and not under `.claude/`, which is where it used to live.** This is the
@@ -691,7 +696,8 @@ fn hook_entry() -> serde_json::Value {
         "matcher": "*",
         "hooks": [{
             "type": "command",
-            "command": format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\"")
+            "command": format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\""),
+            "timeout": HOOK_TIMEOUT_SECONDS
         }]
     })
 }
@@ -747,6 +753,30 @@ fn wire_event(
     });
     if !already {
         list.push(entry);
+    } else if !SESSION_EVENTS.contains(&event_name) {
+        // An entry written before admission existed has no timeout, or a short one, and the hook
+        // now waits for admission: give OUR inner hook the long timeout and touch nothing else.
+        for existing in list.iter_mut() {
+            let Some(inner_hooks) = existing
+                .get_mut("hooks")
+                .and_then(|value| value.as_array_mut())
+            else {
+                continue;
+            };
+            for inner in inner_hooks {
+                let ours = inner
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(|command| command.contains(HOOK_SCRIPT));
+                let short = inner
+                    .get("timeout")
+                    .and_then(|timeout| timeout.as_u64())
+                    .is_none_or(|seconds| seconds < HOOK_TIMEOUT_SECONDS);
+                if ours && short {
+                    inner["timeout"] = serde_json::json!(HOOK_TIMEOUT_SECONDS);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1960,6 +1990,79 @@ pub mod tests {
 
         assert!(command.starts_with(expected_prefix), "{command}");
         assert!(command.ends_with(&format!("/{HOOK_SCRIPT}\"")), "{command}");
+    }
+
+    #[test]
+    fn the_tool_events_carry_the_admission_timeout() {
+        let root = TempDir::new().unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            let timeout = settings["hooks"][event][0]["hooks"][0]["timeout"].as_u64();
+            assert_eq!(timeout, Some(HOOK_TIMEOUT_SECONDS), "{event}");
+        }
+        for event in SESSION_EVENTS {
+            assert!(
+                settings["hooks"][event][0]["hooks"][0]["timeout"].is_null(),
+                "{event} must not carry the admission timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_entry_without_a_timeout_is_given_one() {
+        for (existing, unrelated) in [(None, "keep"), (Some(30_u64), "keep")] {
+            let root = TempDir::new().unwrap();
+            let mut inner = serde_json::json!({
+                "type": "command",
+                "command": format!("python \"${{CLAUDE_PROJECT_DIR}}/{HOOK_SCRIPT}\""),
+            });
+            if let Some(seconds) = existing {
+                inner["timeout"] = serde_json::json!(seconds);
+            }
+            write_settings(
+                &root,
+                &serde_json::json!({
+                    "hooks": {
+                        "PreToolUse": [{
+                            "matcher": "Bash",
+                            "note": unrelated,
+                            "hooks": [
+                                {"type": "command", "command": "echo other", "timeout": 5},
+                                inner
+                            ]
+                        }]
+                    }
+                })
+                .to_string(),
+            );
+
+            wire_classifier_hook(root.path()).unwrap();
+
+            let settings: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+            )
+            .unwrap();
+            let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            let ours = entries
+                .iter()
+                .filter(|entry| serde_json::to_string(entry).unwrap().contains(HOOK_SCRIPT))
+                .count();
+            assert_eq!(ours, 1, "no second entry: {entries:?}");
+            let hooks = entries[0]["hooks"].as_array().unwrap();
+            assert_eq!(hooks[1]["timeout"].as_u64(), Some(HOOK_TIMEOUT_SECONDS));
+            assert_eq!(
+                hooks[0]["timeout"].as_u64(),
+                Some(5),
+                "the other hook is untouched"
+            );
+            assert_eq!(entries[0]["matcher"], "Bash");
+            assert_eq!(entries[0]["note"], unrelated);
+        }
     }
 
     #[test]

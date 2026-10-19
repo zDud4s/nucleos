@@ -196,6 +196,43 @@ pub struct VerifyConfig {
     pub broker_prefix: Vec<String>,
     /// Days a green unit stays reusable by the cache (spec §5.3).
     pub cache_days: u64,
+    /// The admission book bounding how many heavy commands runs launch at once.
+    pub admission: AdmissionConfig,
+}
+
+/// The longest a run may be made to wait for admission, in seconds. A heavy command's hook has a
+/// ceiling of its own, and a wait that outlives it would be cut off by the caller instead.
+pub const ADMISSION_MAX_WAIT_CEILING_SECONDS: u64 = 3000;
+
+/// `verify.yaml`'s `admission:` block: the bound on heavy commands launched at once.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdmissionConfig {
+    /// Off means every heavy command is admitted at once.
+    pub enabled: bool,
+    /// Weight units that may be held at once. Absent means half the physical cores, at least one.
+    pub capacity: Option<u32>,
+    /// How long a waiting command is held before it is let through without a grant.
+    pub max_wait_seconds: u64,
+    /// The weight of an ordinary heavy command (build, check, a filtered test).
+    pub heavy_weight: u32,
+    /// The weight of an unfiltered full test suite.
+    pub full_suite_weight: u32,
+    /// A grant nobody released is reclaimed after this long.
+    pub grant_ttl_seconds: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity: None,
+            max_wait_seconds: 900,
+            heavy_weight: 1,
+            full_suite_weight: 2,
+            grant_ttl_seconds: 7200,
+        }
+    }
 }
 
 impl Default for VerifyConfig {
@@ -207,6 +244,7 @@ impl Default for VerifyConfig {
             disk_cap_gb: 60,
             broker_prefix: Vec::new(),
             cache_days: 7,
+            admission: AdmissionConfig::default(),
         }
     }
 }
@@ -235,6 +273,23 @@ pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
     }
     if config.cache_days < 1 {
         return Err("cache_days must be at least 1".to_string());
+    }
+    let admission = &config.admission;
+    if admission.capacity == Some(0) {
+        return Err("admission.capacity must be at least 1".to_string());
+    }
+    if admission.heavy_weight < 1 || admission.full_suite_weight < 1 {
+        return Err("admission weights must be at least 1".to_string());
+    }
+    if admission.max_wait_seconds < 1
+        || admission.max_wait_seconds > ADMISSION_MAX_WAIT_CEILING_SECONDS
+    {
+        return Err(format!(
+            "admission.max_wait_seconds must be between 1 and {ADMISSION_MAX_WAIT_CEILING_SECONDS}"
+        ));
+    }
+    if admission.grant_ttl_seconds < 60 {
+        return Err("admission.grant_ttl_seconds must be at least 60".to_string());
     }
     Ok(config)
 }
