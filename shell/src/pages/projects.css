@@ -299,13 +299,19 @@
  */
 .pj-tabs {
   display: flex;
-  flex-wrap: wrap;
+  /* One line that scrolls: wrapping put "Permissions" and "Analytics" on a second line at 800-850px. */
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
   gap: var(--space-1);
   margin-bottom: var(--space-4);
   border-bottom: 1px solid var(--border);
 }
 
 .pj-tab {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  scroll-snap-align: start;
   padding: var(--space-2) var(--space-3);
   font-size: var(--text-sm);
   color: var(--text-muted);
@@ -385,10 +391,6 @@
     position: sticky;
     top: var(--space-4);
   }
-}
-
-.pj-filter {
-  margin-bottom: var(--space-3);
 }
 
 .pj-crumbs {
@@ -1273,10 +1275,6 @@
   font-size: var(--text-xs);
   color: var(--text-muted);
   overflow-wrap: anywhere;
-}
-
-.rs-filter {
-  max-width: 24rem;
 }
 
 /* The reason's tone, as a small square: a dot is the mode's shape, and the two

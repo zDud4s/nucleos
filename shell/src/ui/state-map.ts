@@ -54,7 +54,8 @@ export type StateDomain =
   | "feed"
   | "rule"
   | "folder"
-  | "knowledge";
+  | "knowledge"
+  | "sidecar";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -589,6 +590,19 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     down: { tone: "danger", label: "down" },
     ok: { tone: "active", label: "healthy" },
     degraded: { tone: "paused", label: "degraded" },
+  },
+
+  /**
+   * A supervised sidecar's liveness — `sidecar.rs` `RUNNING` / `DOWN`, `GET /sidecars`.
+   *
+   * Two states, and `down` is not always an outage: the supervisor restarts a sidecar that died, so
+   * the row says what its supervisor last saw. It takes the failure tone because a dead sidecar
+   * silently disables whatever depends on it (the Mail tab, the Telegram bridge) and that is
+   * exactly what the System page exists to surface.
+   */
+  sidecar: {
+    running: { tone: "active", label: "running" },
+    down: { tone: "danger", label: "down" },
   },
 
   /**

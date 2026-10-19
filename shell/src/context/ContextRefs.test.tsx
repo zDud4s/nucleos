@@ -118,12 +118,12 @@ describe("ContextRefs - the owner's context files", () => {
     expect(calls("GET").map(([path]) => path)).toEqual(["/context-refs/team/financas"]);
   });
 
-  it("says the núcleo did not answer rather than showing an empty list", async () => {
+  it("says the background service is not responding rather than showing an empty list", async () => {
     daemon.apiFetch.mockRejectedValue(new Error("down"));
 
     renderWithQuery(<ContextRefs ownerKind="agent" ownerId="copywriter" />);
 
-    expect(await screen.findByText(/the núcleo did not answer/)).toBeDefined();
+    expect(await screen.findByText(/the background service is not responding/)).toBeDefined();
     expect(screen.queryByText("No context files yet.")).toBeNull();
   });
 

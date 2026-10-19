@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { clearWebDraft } from "./Web";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -11,6 +12,7 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 beforeEach(() => {
+  clearWebDraft();
   daemon.apiFetch.mockReset();
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useCaptureWait, useSetCaptureWait } from "../data/capture-wait";
 import { ErrorNote, RefusalNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * How long a capture request waits for the owner, as one number at the top of this machine's
@@ -47,7 +48,7 @@ export function CaptureWait() {
       {refusal ? (
         <RefusalNote refusal={refusal} />
       ) : set.error ? (
-        <ErrorNote>the núcleo did not answer — the capture wait was not changed</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} is not responding — the capture wait was not changed</ErrorNote>
       ) : null}
     </div>
   );

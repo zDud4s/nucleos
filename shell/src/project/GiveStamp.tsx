@@ -3,6 +3,7 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useGiveStamp, type Anchored } from "../data/project-map";
 import { ErrorNote } from "../ui";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * The owner's verdict on one decision, as three buttons and a note (§5.2).
@@ -113,7 +114,7 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
  */
 function Refused({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>The núcleo did not answer, so nothing was recorded.</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} gave no reply, so nothing was recorded.</ErrorNote>;
   }
 
   if (error.status === 503) {

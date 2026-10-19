@@ -391,6 +391,39 @@ function DepartmentTable({
   runsKnown: boolean;
   actionsKnown: boolean;
 }) {
+  // Sorting is the reader's, in memory only: the daemon's order is what a fresh visit shows.
+  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" } | null>(null);
+  const toggle = (key: SortKey) =>
+    setSort((prev) =>
+      prev === null || prev.key !== key
+        ? { key, dir: key === "name" ? "asc" : "desc" }
+        : prev.dir === (key === "name" ? "asc" : "desc")
+          ? { key, dir: key === "name" ? "desc" : "asc" }
+          : null,
+    );
+  const reading = (team: TeamView): number | string => {
+    switch (sort?.key) {
+      case "name":
+        return team.name.toLowerCase();
+      case "staff":
+        return headcountOf(team);
+      case "live":
+        return runsKnown ? runs.filter((r) => r.team_id === team.id && teamRunIsAlive(r.state)).length : -1;
+      default:
+        return actionsKnown ? waitingFor(team.id, actions, runs) : -1;
+    }
+  };
+  const ordered =
+    sort === null
+      ? teams
+      : [...teams].sort((a, b) => {
+          const x = reading(a);
+          const y = reading(b);
+          const by = typeof x === "string" && typeof y === "string" ? x.localeCompare(y) : Number(x) - Number(y);
+          return sort.dir === "asc" ? by : -by;
+        });
+  const ariaSort = (key: SortKey) =>
+    sort?.key !== key ? undefined : sort.dir === "asc" ? ("ascending" as const) : ("descending" as const);
   return (
     <section className="teams-table-block" aria-label="Teams">
       {/* The key to the marks, out of the header cell and above the table, where it reads as a
@@ -416,18 +449,27 @@ function DepartmentTable({
         <caption className="sr-only">Every team, with what it is doing now</caption>
         <thead>
           <tr>
-            <th scope="col">Team</th>
+            <th scope="col" aria-sort={ariaSort("name")}>
+              <SortButton label="Team" active={sort?.key === "name"} dir={sort?.dir} onClick={() => toggle("name")} />
+            </th>
             <th scope="col">State</th>
-            <th scope="col" className="teams-col-num">
-              Staff
+            <th scope="col" className="teams-col-num" aria-sort={ariaSort("staff")}>
+              <SortButton label="Staff" active={sort?.key === "staff"} dir={sort?.dir} onClick={() => toggle("staff")} />
             </th>
-            <th scope="col" className="teams-col-num">
-              At work
+            <th scope="col" className="teams-col-num" aria-sort={ariaSort("live")}>
+              <SortButton label="At work" active={sort?.key === "live"} dir={sort?.dir} onClick={() => toggle("live")} />
             </th>
-            <th scope="col" className="teams-col-num">
+            <th scope="col" className="teams-col-num" aria-sort={ariaSort("waiting")}>
               <Tip tip="Up to this many team actions may be waiting for a decision. Some may already be in progress.">
                 Waiting
               </Tip>
+              <SortButton
+                label="Sort by waiting"
+                glyphOnly
+                active={sort?.key === "waiting"}
+                dir={sort?.dir}
+                onClick={() => toggle("waiting")}
+              />
             </th>
             <th scope="col">On its own</th>
             {/* Right-aligned because the bars are flushed right: a left-aligned title over
@@ -438,7 +480,7 @@ function DepartmentTable({
           </tr>
         </thead>
         <tbody>
-          {teams.map((team) => (
+          {ordered.map((team) => (
             <DepartmentRow
               key={team.id}
               team={team}
@@ -452,6 +494,32 @@ function DepartmentTable({
       </table>
       </div>
     </section>
+  );
+}
+
+type SortKey = "name" | "staff" | "live" | "waiting";
+
+function SortButton({
+  label,
+  active,
+  dir,
+  onClick,
+  glyphOnly = false,
+}: {
+  label: string;
+  active: boolean;
+  dir: "asc" | "desc" | undefined;
+  onClick: () => void;
+  glyphOnly?: boolean;
+}) {
+  const glyph = !active ? "↕" : dir === "asc" ? "↑" : "↓";
+  return (
+    <button type="button" className="teams-sort" data-active={active || undefined} onClick={onClick} aria-label={glyphOnly ? label : undefined}>
+      {glyphOnly ? null : label}
+      <span aria-hidden="true" className="teams-sort-glyph">
+        {glyph}
+      </span>
+    </button>
   );
 }
 

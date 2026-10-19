@@ -121,7 +121,7 @@ export function inAttentionOrder(rows: ProjectSummary[]): ProjectSummary[] {
  * paragraph above exists to defend. What the row says about that folder is the row's to soften.
  */
 export function headline(rows: ProjectSummary[]): string {
-  if (rows.length === 0) return "the núcleo knows of no project";
+  if (rows.length === 0) return "no project is registered";
 
   const parts = [`${rows.length} ${rows.length === 1 ? "project" : "projects"}`];
   const active = rows.filter((row) => row.mode === "active").length;

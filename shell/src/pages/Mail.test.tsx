@@ -140,6 +140,7 @@ describe("Mail — the headline", () => {
     await renderMail();
 
     expect(await screen.findByText("Triage is off. Mail arrives, but nothing sorts it.")).toBeDefined();
+    expect(screen.getByRole("link", { name: "System, Settings" })).toBeDefined();
   });
 
   it("leads with the reader's own share of the queue, not the daemon's backlog", async () => {

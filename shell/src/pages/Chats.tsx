@@ -162,6 +162,9 @@ import { clearDraft, readDraft, readScroll, saveDraft, saveScroll } from "../cha
 import { useChatTabs } from "../chats/tabs";
 import { DAEMON_NAME } from "../copy";
 
+/** The short label over a turn of the background service. `DAEMON_NAME` is too long for a turn label. */
+const SPEAKER_LABEL = "service";
+
 import "./chats.css";
 
 /**
@@ -520,7 +523,7 @@ function SaidRow({ hit }: { hit: SaidHit }) {
     <span className="chats-palette-said">
       <span className="chats-palette-said-head">
         <span className="chats-palette-said-who">
-          {hit.side === "asked" ? "you" : "núcleo"}
+          {hit.side === "asked" ? "you" : SPEAKER_LABEL}
         </span>
         <span className="chats-palette-title">
           {hit.title ?? "New conversation"}
@@ -720,7 +723,7 @@ function NoTools({ session }: { session: IdeSession }) {
   return (
     <div className="chats-new-notools">
       <p className="chats-new-warning" role="status">
-        this session was had in a folder with no núcleo hook — continued here,
+        this session was had in a folder with no {DAEMON_NAME} hook — continued here,
         it can talk about the code but <b>cannot read or change any file</b>,
         and cannot run anything
       </p>
@@ -2027,7 +2030,7 @@ function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
   return (
     <div className="chats-project">
       <p className="chats-new-warning" role="status">
-        this conversation is about {cwd}, which has no núcleo hook — it can talk
+        this conversation is about {cwd}, which has no {DAEMON_NAME} hook — it can talk
         about the code but <b>cannot read or change any file</b>, and cannot run
         anything
       </p>
@@ -3695,7 +3698,7 @@ function PickedUp({
                     : "chats-said-who"
                 }
               >
-                {said.by_owner ? "you" : "núcleo"}
+                {said.by_owner ? "you" : SPEAKER_LABEL}
               </span>
             )}
             {/* Text, never markup — this is somebody else's file. `Rich` never emits either:
@@ -3793,7 +3796,7 @@ function HowItContinued({
             <li key={`handed-${index}`} className="chats-handed-pair">
               <span className="chats-said-who">you</span>
               <p className="chats-said-text">{asked}</p>
-              <span className="chats-said-who">núcleo</span>
+              <span className="chats-said-who">{SPEAKER_LABEL}</span>
               <p className="chats-said-text">{answered}</p>
             </li>
           ))}
@@ -4518,7 +4521,7 @@ const TurnBlock = memo(function TurnBlock({
           note="said while it was working"
         />
       ))}
-      <p className="chats-turn-who">núcleo</p>
+      <p className="chats-turn-who">{SPEAKER_LABEL}</p>
       {live && <LiveAnswer turnId={turn.id} chatId={chatId} since={turn.createdAt} />}
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}

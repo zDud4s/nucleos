@@ -10,6 +10,7 @@ import { useProjects, type ProjectSummary } from "../data/system";
 import { UI_LOCALE } from "../lib/locale";
 import { Count } from "../ui/Count";
 import { ErrorNote } from "../ui/ErrorNote";
+import { ListFilter } from "../ui/ListFilter";
 import { PageHeader } from "../ui/PageHeader";
 import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
@@ -132,7 +133,7 @@ export function Roster() {
  */
 function asOf(dataUpdatedAt: number): string {
   if (dataUpdatedAt <= 0) return "last known — ";
-  return `as of ${new Date(dataUpdatedAt).toTimeString().slice(0, 8)} — `;
+  return `as of ${new Date(dataUpdatedAt).toLocaleTimeString(UI_LOCALE, { hour12: false })} — `;
 }
 
 function RosterError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
@@ -157,48 +158,23 @@ function RosterError({ error, onRetry }: { error: unknown; onRetry: () => void }
 function Filtered({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
   const navigate = useNavigate();
   const [q, setQ] = useState("");
-  const input = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
-      const target = event.target;
-      if (
-        target instanceof HTMLElement &&
-        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
-      ) {
-        return;
-      }
-      event.preventDefault();
-      input.current?.focus();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
 
   const needle = q.trim().toLowerCase();
   const shown = needle === "" ? rows : rows.filter((row) => row.project_id.toLowerCase().includes(needle));
 
   return (
     <>
-      <input
-        ref={input}
-        className="pj-field-input rs-filter"
-        type="search"
-        value={q}
-        placeholder="Filter by name (press / to focus)"
-        aria-label="Filter projects by name"
-        spellCheck={false}
-        onChange={(event) => setQ(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Escape" && q !== "") {
-            setQ("");
-          } else if (event.key === "Enter" && shown.length === 1) {
-            void navigate({
-              to: "/projects/$projectId/$view",
-              params: { projectId: shown[0].project_id, view: "state" },
-            });
-          }
+      <ListFilter
+        noun="projects"
+        query={q}
+        onQueryChange={setQ}
+        resultCount={shown.length}
+        onClear={() => setQ("")}
+        onOpenOnly={() => {
+          void navigate({
+            to: "/projects/$projectId/$view",
+            params: { projectId: shown[0].project_id, view: "state" },
+          });
         }}
       />
       {shown.length === 0 ? (
@@ -222,9 +198,12 @@ function Filtered({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
  */
 function LeftTheRoster({ removed }: { removed: Removed }) {
   const line = useRef<HTMLDivElement>(null);
+  const [dismissed, setDismissed] = useState(false);
   useEffect(() => {
+    setDismissed(false);
     line.current?.focus();
   }, [removed]);
+  if (dismissed) return null;
 
   const where =
     removed.projectRoot === null ? "it had no folder named" : `its folder is still at ${removed.projectRoot}`;
@@ -234,7 +213,18 @@ function LeftTheRoster({ removed }: { removed: Removed }) {
 
   return (
     <div ref={line} tabIndex={-1} className="mb-4">
-      <Quiet announce says={says} action={<Link to="/projects/new">add it back</Link>} />
+      <Quiet
+        announce
+        says={says}
+        action={
+          <>
+            <Link to="/projects/new">add it back</Link>
+            <button type="button" className="ui-quiet-ask" onClick={() => setDismissed(true)}>
+              dismiss
+            </button>
+          </>
+        }
+      />
     </div>
   );
 }
@@ -469,8 +459,14 @@ function Card({ project, reasons }: { project: ProjectSummary; reasons: Reason[]
       <ul className="rs-card-reasons">
         {reasons.map((reason) => (
           <li key={reason.says} title={reason.detail}>
-            <span className="rs-mark" data-mark={reason.mark} aria-hidden="true" />
-            {reason.says}
+            {reason.mark === "review" ? (
+              <span className="ui-awaiting">{reason.says}</span>
+            ) : (
+              <>
+                <span className="rs-mark" data-mark={reason.mark} aria-hidden="true" />
+                {reason.says}
+              </>
+            )}
             {reason.detail !== undefined && <span className="rs-reason-detail">{reason.detail}</span>}
           </li>
         ))}

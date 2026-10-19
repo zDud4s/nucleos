@@ -98,6 +98,10 @@
   display: contents;
 }
 
+.feed-active-filters {
+  flex-basis: 100%;
+}
+
 .feed-search-bar {
   display: flex;
   align-items: stretch;
@@ -1311,7 +1315,7 @@
 */
 .feed-routine > .feed-line-time {
   font-size: var(--text-xs);
-  opacity: 0.7;
+  color: var(--text-muted);
 }
 
 .feed-routine-toggle {
@@ -1491,5 +1495,4 @@
   margin-top: var(--space-1);
   color: var(--text-muted);
   font-family: var(--font-mono);
-  opacity: 0.8;
 }

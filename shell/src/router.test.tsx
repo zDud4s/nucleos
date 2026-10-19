@@ -149,6 +149,23 @@ describe("the app router", () => {
     expect(byId["/teams"]?.options?.component).not.toBe(Bench);
   });
 
+  it("keeps a Bench tab in ?tab= and drops one the Bench does not have", () => {
+    const router = createAppRouter();
+    const byId = router.routesById as unknown as Record<
+      string,
+      { options?: { validateSearch?: (search: Record<string, unknown>) => unknown } }
+    >;
+    const validate = byId["/teams/$teamId"]?.options?.validateSearch;
+    if (validate === undefined) throw new Error("/teams/$teamId has no validateSearch");
+
+    for (const tab of ["work", "decisions", "roster", "routines", "charter"]) {
+      expect(validate({ tab }), tab).toEqual({ tab });
+    }
+    expect(validate({ tab: "nope" })).toEqual({});
+    expect(validate({ tab: 3 })).toEqual({});
+    expect(validate({})).toEqual({});
+  });
+
   /**
    * The two project routes, and the fact that they are two.
    *

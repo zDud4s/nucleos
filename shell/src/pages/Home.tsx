@@ -15,7 +15,7 @@ import {
 } from "../data/system";
 import { DAEMON_NAME } from "../copy";
 import { useWaitingCount } from "../data/waiting";
-import { ErrorNote, Meter, PageHeader, StaleNote, StatCard, Term, ceilingShare, usd } from "../ui";
+import { ErrorNote, Meter, PageHeader, Skeleton, StaleNote, StatCard, Term, ceilingShare, usd } from "../ui";
 
 /**
  * The first screen: what needs you, whether the machine is well, and what it has spent.
@@ -94,6 +94,11 @@ export function Home() {
   ).length;
   const notConfigured = subsystems?.filter((row) => row.status === "disabled").length;
   const faulty = wrongClause(health.data) !== null;
+  // Nothing has answered yet: hold the grid's shape with card-shaped blocks instead of four
+  // cards of em dashes. As soon as any one read lands (or fails) the real cards take over, and
+  // each still says "not read" for itself.
+  const firstRead =
+    projects.isPending && budget.isPending && health.isPending && waitingState?.data === undefined && !waitingRead.isError;
 
   return (
     <>
@@ -118,6 +123,9 @@ export function Home() {
         down it, which is the invariant `project/ModeState.tsx:31-34` already defends for a
         project page.
       */}
+      {firstRead ? (
+        <Skeleton label="Loading your readings" variant="cards" count={4} />
+      ) : (
       <div className="app-home-stats">
         <div className="app-home-lead">
           <Cell stale={waitingStale}>
@@ -211,6 +219,7 @@ export function Home() {
           <SpendRow spend={spend} read={budget} />
         </Cell>
       </div>
+      )}
 
       {/* What has actually happened, which is the question the figures above raise
           and none of them answers. Five lines, not the cockpit's ten: this is the last

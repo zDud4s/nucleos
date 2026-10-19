@@ -1,4 +1,5 @@
 import type { GEdgeType, GFilters, GNodeKind } from "./graph-types";
+import { Mark } from "./marks";
 import { Segments } from "./Segments";
 
 /**
@@ -103,7 +104,7 @@ export function GraphFilters({
               aria-pressed={filters.nodeKinds.has(kind)}
               onClick={() => onFilters({ ...filters, nodeKinds: toggled(filters.nodeKinds, kind) })}
             >
-              <span className={`unified-mark unified-mark-${kind === "knowledge" ? "k-semantic" : kind}`} aria-hidden="true" />
+              <Mark hue={kind === "knowledge" ? "k-semantic" : kind} />
               {KIND_LABELS[kind]}
             </button>
           ))}

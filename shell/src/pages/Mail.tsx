@@ -124,6 +124,16 @@ export function Mail() {
     <>
       <PageHeader title="Mail" headline={headline(rows, config.data, stale)} />
 
+      {config.data !== undefined && (!config.data.enabled || !config.data.armed) && (
+        <p className="mail-note">
+          Turn it on under{" "}
+          <Link to="/system/$view" params={{ view: "settings" }}>
+            System, Settings
+          </Link>
+          .
+        </p>
+      )}
+
       {/* Mail opens on what arrived, and the one action beside the count it resolves. */}
       <Panel title="Queue" aside={<QueueAside rows={rows} triage={triage} />}>
         <TriageStatus triage={triage} />

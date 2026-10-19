@@ -9,7 +9,7 @@ import {
   type AnalyticsReport,
   type QuotaHistory,
 } from "../data/analytics";
-import { ErrorNote, Skeleton, StaleNote, StatCard } from "../ui";
+import { ErrorNote, SectionNav, Skeleton, StaleNote, StatCard } from "../ui";
 import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, unreachable, type MetricKey } from "./sections";
 import { PipelineSection } from "./PipelineSection";
 import { DevtimeSection } from "./DevtimeSection";
@@ -45,11 +45,6 @@ const COVERAGE =
 /** Local wall-clock, 24-hour — the same reading `ModeState`'s readings line gives. */
 function clockOf(at: number): string {
   return new Date(at).toTimeString().slice(0, 5);
-}
-
-/** Scrolls a section into view; `scrollIntoView` is absent in jsdom, hence the optional call. */
-function jumpTo(id: string) {
-  document.getElementById(id)?.scrollIntoView?.({ behavior: "smooth", block: "start" });
 }
 
 export function AnalyticsView({ projectId, days: asked, onDaysChange }: AnalyticsViewProps) {
@@ -99,17 +94,14 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
           ) : null}
         </div>
       </div>
-      <nav className="an-sections" aria-label="Sections">
-        {[
+      <SectionNav
+        label="Sections"
+        items={[
           { id: runsId, label: "Summary" },
           { id: pipelineId, label: "Pipeline" },
           { id: devtimeId, label: "Development time" },
-        ].map((section) => (
-          <button key={section.id} type="button" className="an-section-link" onClick={() => jumpTo(section.id)}>
-            {section.label}
-          </button>
-        ))}
-      </nav>
+        ]}
+      />
       <section id={runsId} className="an-runs" aria-labelledby={`${runsId}-title`}>
         <h2 id={`${runsId}-title`} className="an-runs-title">
           Summary

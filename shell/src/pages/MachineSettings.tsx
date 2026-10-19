@@ -13,6 +13,7 @@ import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, StateBadge } from
 import { DistillerModel } from "./DistillerModel";
 import { CaptureWait } from "./CaptureWait";
 import { EmbeddingModel } from "./EmbeddingModel";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * This machine's settings — the files whose author is the daemon rather than
@@ -67,7 +68,7 @@ export function MachineSettings() {
   if (config.isPending) return <p className="sy-loading">reading this machine's settings…</p>;
   if (config.error) {
     if (isApiRefusal(config.error)) return <RefusalNote refusal={config.error} />;
-    return <ErrorNote>the núcleo did not answer — nothing is known about this machine's settings</ErrorNote>;
+    return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about this machine's settings</ErrorNote>;
   }
 
   const area = chosen ?? config.data.settings[0]?.area ?? null;
@@ -275,7 +276,7 @@ function SettingPanel({
           {isApiRefusal(write.error) ? (
             <RefusalNote refusal={write.error} />
           ) : (
-            <ErrorNote>the núcleo did not answer — nothing was written</ErrorNote>
+            <ErrorNote>the {DAEMON_NAME} is not responding — nothing was written</ErrorNote>
           )}
         </div>
       )}
@@ -374,7 +375,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
         (isApiRefusal(store.error) ? (
           <RefusalNote refusal={store.error} />
         ) : (
-          <ErrorNote>the núcleo did not answer — nothing was stored</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was stored</ErrorNote>
         ))}
       {/* The destructive half fails as loudly as the other: a Forget that silently did
           nothing leaves the credential set while the button goes back to normal. */}
@@ -382,7 +383,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
         (isApiRefusal(forget.error) ? (
           <RefusalNote refusal={forget.error} />
         ) : (
-          <ErrorNote>the núcleo did not answer — nothing was forgotten</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was forgotten</ErrorNote>
         ))}
     </div>
   );

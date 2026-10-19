@@ -1,4 +1,5 @@
 // §spec motor-de-workflows
+import { DAEMON_NAME } from "../copy";
 import { useEffect, useId, useRef, useState } from "react";
 import { ShapeIcon, WorkflowCanvas, type SelectedBy } from "../canvas/WorkflowCanvas";
 import { inSequence, nodeMeaning, nodeShape, SHAPES } from "../canvas/workflow-model";
@@ -167,7 +168,7 @@ function GraphMissing({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        The núcleo did not answer about this graph
+        The {DAEMON_NAME} gave no reply about this graph
         {error instanceof Error && error.message !== "" ? `: ${error.message}` : "."}
       </ErrorNote>
     );
@@ -440,7 +441,7 @@ function Inspector({
             />
           ) : (
             <ErrorNote>
-              The núcleo did not answer, so this change may not have been saved
+              The {DAEMON_NAME} gave no reply, so this change may not have been saved
               {overlay.error instanceof Error && overlay.error.message !== ""
                 ? `: ${overlay.error.message}`
                 : "."}

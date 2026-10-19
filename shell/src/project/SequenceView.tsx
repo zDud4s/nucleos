@@ -1,4 +1,5 @@
 // §spec atlas-sequence
+import { DAEMON_NAME } from "../copy";
 import { useId } from "react";
 import { layoutSequence, useMapFlows, type FlowCheck } from "../data/map-flows";
 import { absolutePath } from "../data/project-code";
@@ -9,7 +10,7 @@ const DANGER = "var(--tone-danger-fg)";
 const COLUMN = 170;
 const HOW_TO_DECLARE =
   "No flows are declared for this project. Declare them in .nucleos/flows.yaml as " +
-  "flows: [{ name, steps: [{ participant, path, fn }] }], and the núcleo verifies each step " +
+  `flows: [{ name, steps: [{ participant, path, fn }] }], and the ${DAEMON_NAME} verifies each step ` +
   "against the code.";
 
 /**
@@ -20,7 +21,7 @@ const HOW_TO_DECLARE =
 export function SequenceView({ projectId }: { projectId: string }) {
   const flows = useMapFlows(projectId);
   if (flows.isError) {
-    return <ErrorNote>The núcleo could not read the declared flows of this project.</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} could not read the declared flows of this project.</ErrorNote>;
   }
   if (flows.data === undefined) {
     return <p className="text-sm text-text-faint">Reading the declared flows…</p>;

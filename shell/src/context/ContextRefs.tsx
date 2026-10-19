@@ -9,6 +9,7 @@ import {
   type ContextRef,
 } from "../data/context-refs";
 import { isApiRefusal } from "../data/client";
+import { DAEMON_NAME } from "../copy";
 import type { DroppedFile } from "../data/files";
 import {
   Button,
@@ -106,7 +107,7 @@ export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
   let body: ReactNode;
   if (refs.isError) {
     body = (
-      <ErrorNote onRetry={() => void refs.refetch()}>the núcleo did not answer — these context files are unknown</ErrorNote>
+      <ErrorNote onRetry={() => void refs.refetch()}>the {DAEMON_NAME} is not responding — these context files are unknown</ErrorNote>
     );
   } else if (refs.data === undefined) {
     body = <Skeleton label="Loading context files…" lines={2} />;
@@ -232,7 +233,7 @@ function RefRow({
 
 /** The núcleo's own sentence when it refused; otherwise that it did not answer. */
 function WriteRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — nothing was changed</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was changed</ErrorNote>;
   const said = error.detail.trim();
   return (
     <RefusalNote

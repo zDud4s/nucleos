@@ -134,25 +134,21 @@
   color: var(--text-muted);
 }
 
-/* The identity mark: the same hue the item's node takes on the graph. */
+/* The identity mark: the same shape the item's node takes on the graph, in one neutral tone. */
 .unified-mark {
   flex: none;
   width: 0.5rem;
   height: 0.5rem;
   border-radius: 50%;
-  background: var(--brain-note);
   transform: translateY(-0.05rem);
 }
 
-.unified-mark-note { background: var(--brain-note); }
-.unified-mark-k-semantic { background: var(--brain-k-semantic); }
-.unified-mark-k-episodic { background: var(--brain-k-episodic); }
-.unified-mark-k-procedural { background: var(--brain-k-procedural); }
-.unified-mark-k-working { background: var(--brain-k-working); }
-.unified-mark-project { background: var(--brain-project); }
-.unified-mark-contact { background: var(--brain-contact); }
-.unified-mark-mail { background: var(--brain-mail); }
-.unified-mark-file { background: var(--brain-file); }
+.unified-mark-shape {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 0;
+  fill: var(--text-muted);
+}
 
 /* A capture is a question waiting on you: hollow, in the one tone that asks something. */
 .unified-mark-capture {

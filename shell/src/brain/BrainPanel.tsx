@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../copy";
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { ApiRefusal } from "../data/client";
@@ -50,7 +51,7 @@ export interface BrainPanelProps {
 const TEACH_SENTENCES: Record<string, string> = {
   already_taught: "This note is already taught — its lesson is still pending or active.",
   archived: "An archived note cannot be taught — restore it first.",
-  unknown_kind: "The núcleo does not know that kind of lesson.",
+  unknown_kind: `The ${DAEMON_NAME} does not know that kind of lesson.`,
 };
 
 /** Everything around a note, whatever the global filters hide: the local graph is the neighbourhood as it is. */
@@ -67,7 +68,7 @@ const EMPTY_KNOWLEDGE: Known[] = [];
 /** A refusal as the daemon's own text; anything else means there was no answer. */
 function Failure({ error, sentences }: { error: unknown; sentences?: Record<string, string> }) {
   if (error instanceof ApiRefusal) return <RefusalNote refusal={error} sentences={sentences} />;
-  return <ErrorNote>the núcleo did not answer</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding</ErrorNote>;
 }
 
 export function BrainPanel({ nodeId, graph, model, onSelect }: BrainPanelProps) {
@@ -150,7 +151,7 @@ function NotePanel({
   const update = useUpdateNote();
   const remove = useRemoveLink();
 
-  if (detail.isError) return <ErrorNote>the núcleo did not answer — the note is not known</ErrorNote>;
+  if (detail.isError) return <ErrorNote>the {DAEMON_NAME} is not responding — the note is not known</ErrorNote>;
   if (detail.data === undefined) return <Quiet says="Loading…" />;
   const { note, links_out, links_in, events } = detail.data;
   const archived = note.state === "archived";

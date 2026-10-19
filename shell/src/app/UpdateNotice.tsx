@@ -1,10 +1,11 @@
 import { useState } from "react";
+import { DAEMON_NAME } from "../copy";
 import { applyUpdate, useUpdate, type UpdatePhase } from "../data/updater";
 import { Button, ErrorNote } from "../ui";
 
 const PHASE_TEXT: Record<UpdatePhase | "downloading", string> = {
   downloading: "downloading…",
-  stopping: "stopping the núcleo…",
+  stopping: `stopping the ${DAEMON_NAME}…`,
   installing: "installing…",
 };
 

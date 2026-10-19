@@ -43,6 +43,7 @@ import {
 import { VoiceOrb } from "./VoiceOrb";
 import { VoiceRoom } from "./VoiceRoom";
 import "./voice.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Voice — configuration, the capture pipeline, memos and dictations.
@@ -166,6 +167,24 @@ export function Voice() {
     archiveButton.current?.focus();
   }
 
+  /* The dock grows (stacked columns, notes, outcomes) and the captions and the orb are placed
+     against its top edge. Its measured height goes to the room as a CSS variable, so they step
+     clear instead of sitting under it; 96px is what the room's geometry assumes. */
+  const roomRef = useRef<HTMLDivElement>(null);
+  const dockRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const room = roomRef.current;
+    const dock = dockRef.current;
+    if (room === null || dock === null || typeof ResizeObserver !== "function") return;
+    const measure = () => {
+      room.style.setProperty("--voice-dock-h", `${Math.max(96, Math.ceil(dock.offsetHeight))}px`);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(dock);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+
   const memoCount = memos.data?.length;
   const dictationCount = dictations.data?.length;
   const counts = [
@@ -176,6 +195,7 @@ export function Voice() {
   return (
     <div
       className="voice-room"
+      ref={roomRef}
       data-phase={voice.phase}
       data-archive={archiveOpen ? "open" : undefined}
       data-live={on || phase !== "idle" ? "" : undefined}
@@ -216,7 +236,7 @@ export function Voice() {
 
       {armed ? <Captions voice={voice} hotkey={conversationHotkey} /> : <NotArmed />}
 
-      <div className="voice-dock">
+      <div className="voice-dock" ref={dockRef}>
         <div className="voice-dock-diag">
           <ConversationStatus voice={voice} />
         </div>
@@ -686,7 +706,7 @@ function CaptureOutcomeNote({ outcome }: { outcome: CaptureOutcome | null }) {
 
 function CaptureRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — this capture was not sent</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — this capture was not sent</ErrorNote>;
 }
 
 /** `held` is one of the sentences the host sends verbatim — rendered as-is, never paraphrased. */
@@ -708,7 +728,7 @@ function DeliveryNote({ delivery }: { delivery: Delivery | null }) {
 
 function HotkeyConflictNote({ failed, registerFailed }: { failed: string[] | null; registerFailed: boolean }) {
   if (registerFailed) {
-    return <ErrorNote>the hotkeys could not be registered — the host did not answer</ErrorNote>;
+    return <ErrorNote>the hotkeys could not be registered — the host is not responding</ErrorNote>;
   }
   if (failed === null || failed.length === 0) return null;
   const noun = failed.length === 1 ? "this hotkey" : "these hotkeys";
@@ -783,7 +803,7 @@ function formatBytes(n: number): string {
 
 function ConfigError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the voice configuration</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the voice configuration</ErrorNote>;
 }
 
 /* ------------------------------------------------------------------ lists -- */
@@ -803,7 +823,7 @@ function MemoList({
       {rows !== undefined && rows.length === 0 ? (
         <Section label="Memos">
           <Quiet says="no memos yet">
-            <p>A memo is a capture that stays a note — start one above, or press the memo hotkey from anywhere.</p>
+            <p>A memo is a capture that stays a note — use Start memo, or press the memo hotkey from anywhere.</p>
           </Quiet>
         </Section>
       ) : (
@@ -832,12 +852,12 @@ function MemoList({
 
 function MemosError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the memos</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the memos</ErrorNote>;
 }
 
 function DeleteMemoError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — that memo was not deleted</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — that memo was not deleted</ErrorNote>;
 }
 
 function DictationList({ dictations }: { dictations: ReturnType<typeof useDictations> }) {
@@ -849,7 +869,7 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
       {rows !== undefined && rows.length === 0 ? (
         <Section label="Dictations">
           <Quiet says="no dictations yet">
-            <p className="voice-note">A dictation is a capture that gets pasted where you were typing — start one above, or press the dictation hotkey from anywhere.</p>
+            <p className="voice-note">A dictation is a capture that gets pasted where you were typing — use Start dictation, or press the dictation hotkey from anywhere.</p>
           </Quiet>
         </Section>
       ) : (
@@ -872,7 +892,7 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
 
 function DictationsError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the núcleo did not answer — nothing is known about the dictations</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the dictations</ErrorNote>;
 }
 
 function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () => void; deleting?: boolean }) {

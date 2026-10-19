@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../copy";
 import { useId, useState } from "react";
 import { useProjectStates, type StateMachine } from "../data/project-states";
 import { absolutePath } from "../data/project-code";
@@ -23,7 +24,7 @@ export function StatesView({ projectId }: { projectId: string }) {
   if (states.isError && states.data === undefined) {
     return (
       <ErrorNote>
-        The núcleo could not read this project&rsquo;s state machines.{" "}
+        The {DAEMON_NAME} could not read this project&rsquo;s state machines.{" "}
         <Button variant="quiet" onClick={() => void states.refetch()} disabled={states.isFetching}>
           {states.isFetching ? "reading…" : "read it again"}
         </Button>
@@ -51,7 +52,7 @@ export function StatesView({ projectId }: { projectId: string }) {
     <div className="flex flex-col gap-6">
       {failed ? (
         <ErrorNote>
-          VS Code did not answer. Is it installed, and does it open <code>vscode://</code> links on
+          VS Code gave no reply. Is it installed, and does it open <code>vscode://</code> links on
           this machine?
         </ErrorNote>
       ) : null}

@@ -29,6 +29,7 @@ import {
   Teach,
 } from "../ui";
 import "./web.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * Web — the local archive, one component serving `/web` and
@@ -173,14 +174,23 @@ const FILTER_REST_MS = 200;
  * typed, and Enter takes the same words outward to the search provider — the archive answers
  * first, the web second, so nothing is fetched that is already here.
  */
+// What was typed in the bar survives a trip to the Sessions tab, which unmounts the archive.
+let barDraft = "";
+
+/** Forget the kept draft (tests start every case from an empty bar). */
+export function clearWebDraft() {
+  barDraft = "";
+}
+
 function WebBar({ onFilter }: { onFilter: (q: string | undefined) => void }) {
   const read = useWebRead();
   const search = useWebSearch();
   const navigate = useNavigate();
-  const [text, setText] = useState("");
+  const [text, setText] = useState(barDraft);
   const trimmed = text.trim();
   const isUrl = looksLikeUrl(text);
   const hintId = useId();
+  barDraft = text;
 
   useEffect(() => {
     const next = isUrl || trimmed === "" ? undefined : trimmed;
@@ -220,7 +230,7 @@ function WebBar({ onFilter }: { onFilter: (q: string | undefined) => void }) {
             value={text}
             aria-label="Read an address or filter the archive"
             aria-describedby={hintId}
-            placeholder="Paste an address to read, or type to filter the archive"
+            placeholder="Address to read, or words to filter"
             autoComplete="off"
             spellCheck={false}
             onChange={(event) => setText(event.target.value)}
@@ -275,7 +285,7 @@ function ReadRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ ...READ_SENTENCES, ...daemonProse(error) }} />;
   }
-  return <ErrorNote>the núcleo did not answer — nothing was read</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was read</ErrorNote>;
 }
 
 /* ------------------------------------------------------------------ search -- */
@@ -334,7 +344,7 @@ function SearchOutcome({ query, view }: { query: string; view: SearchView }) {
 
 function SearchRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the núcleo did not answer — nothing was searched</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was searched</ErrorNote>;
 }
 
 /* --------------------------------------------------------------- the list -- */
@@ -426,7 +436,7 @@ function ReaderError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "there is no page with that number" }} />;
   }
-  return <ErrorNote>the núcleo did not answer — nothing is known about this page</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about this page</ErrorNote>;
 }
 
 /**

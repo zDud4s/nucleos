@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../copy";
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useOnboard, useOnboarding } from "../data/onboarding";
@@ -33,7 +34,7 @@ export function OnboardPanel({
     return isApiRefusal(reading.error) ? (
       <RefusalNote refusal={reading.error} sentences={ONBOARD_SENTENCES} />
     ) : (
-      <ErrorNote>the núcleo did not answer about this project's folder.</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} gave no reply about this project's folder.</ErrorNote>
     );
   }
   if (found === undefined) return <p className="text-sm text-text-muted">reading the folder…</p>;
@@ -89,7 +90,7 @@ export function OnboardPanel({
         isApiRefusal(onboard.error) ? (
           <RefusalNote refusal={onboard.error} sentences={ONBOARD_SENTENCES} />
         ) : (
-          <ErrorNote>the núcleo did not answer while onboarding.</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} gave no reply while onboarding.</ErrorNote>
         )
       ) : null}
     </div>
@@ -106,5 +107,5 @@ const ONBOARD_SENTENCES: Record<string, string> = {
   not_a_folder: "that path is a file, not a folder.",
   not_absolute: "the folder has to be an absolute path.",
   bad_project_id: "this project's id cannot name a directory, so it cannot be onboarded.",
-  no_machine_root: "this machine has no home directory for the núcleo to keep the record in.",
+  no_machine_root: `this machine has no home directory for the ${DAEMON_NAME} to keep the record in.`,
 };

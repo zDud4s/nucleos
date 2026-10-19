@@ -1,4 +1,5 @@
 // §spec mapa-do-projeto
+import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import type { Anchored, Loss, Orphan } from "../data/project-map";
 import { useOrphanCheck, useRecordAnchor } from "../data/project-map";
@@ -83,7 +84,7 @@ function Failed({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        The núcleo did not answer, so no history was read. That says nothing about the decision
+        The {DAEMON_NAME} gave no reply, so no history was read. That says nothing about the decision
         either way.
       </ErrorNote>
     );
@@ -225,7 +226,7 @@ function Remember({
         <ErrorNote>
           {isApiRefusal(record.error) && record.error.status === 422
             ? "Those files are not in the project any more, so there is nothing to point at. A record has to name a file that is there."
-            : "The núcleo did not take it, so nothing was written down."}
+            : `The ${DAEMON_NAME} did not take it, so nothing was written down.`}
         </ErrorNote>
       ) : null}
     </div>

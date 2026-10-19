@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../../copy";
 import { useKnowledgeHistory } from "../../data/knowledge";
 import { ErrorNote, Quiet, RelativeTime, Well } from "../../ui";
 import "./knowledge.css";
@@ -20,7 +21,7 @@ export function Chain({ id }: ChainProps) {
   if (history.isError) {
     return (
       <ErrorNote>
-        the núcleo did not answer — this one&apos;s history is not known
+        the {DAEMON_NAME} is not responding — this one&apos;s history is not known
       </ErrorNote>
     );
   }

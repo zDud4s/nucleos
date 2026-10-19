@@ -199,7 +199,7 @@ describe("Brain", () => {
     await renderWithRouter(<Brain />, { initialPath: "/brain?view=graph" });
 
     expect(await screen.findByRole("list", { name: "Graph nodes" })).toBeTruthy();
-    expect(await screen.findByText(/knowledge did not answer/i)).toBeTruthy();
+    expect(await screen.findByText(/knowledge is not responding/i)).toBeTruthy();
     expect(screen.queryByText(/the graph is not known/)).toBeNull();
   });
   it("Escape typed in a field does not close the open item; elsewhere it does", async () => {

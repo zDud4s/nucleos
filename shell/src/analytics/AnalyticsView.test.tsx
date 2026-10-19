@@ -327,7 +327,7 @@ describe("AnalyticsView, one project", () => {
     await mount(busy("project"), "ghost");
     // The card first reads "reading…"; wait for the answer, then check it sits in the Analytics card.
     const reason = await screen.findByText("No project by that name.");
-    expect(within(screen.getByRole("article", { name: "Analytics" })).getByText(reason.textContent ?? "")).toBeTruthy();
+    expect(within(screen.getByRole("article", { name: /^Analytics/ })).getByText(reason.textContent ?? "")).toBeTruthy();
   });
 });
 
@@ -426,7 +426,7 @@ describe("refused and stale", () => {
   it("links the three sections and gives the first a heading of its own", async () => {
     await mount(busy());
     const nav = await screen.findByRole("navigation", { name: "Sections" });
-    expect(within(nav).getAllByRole("button").map((button) => button.textContent)).toEqual([
+    expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
       "Summary",
       "Pipeline",
       "Development time",

@@ -1,4 +1,5 @@
 // §spec mapa-do-projeto
+import { DAEMON_NAME } from "../copy";
 import { useState, type ReactNode } from "react";
 import { isApiRefusal } from "../data/client";
 import {
@@ -246,7 +247,7 @@ function Run({ projectId }: { projectId: string }) {
       <p className="max-w-prose text-xs text-text-faint">
         {brain === "cloud"
           ? "The cloud brain answers through the CLI installed on this machine. One question per decision, billed, and the decisions leave the machine."
-          : "The local brain answers through the model on this machine. Nothing leaves and nothing is billed — and where no such model is set up, the núcleo refuses rather than quietly asking the cloud instead."}
+          : `The local brain answers through the model on this machine. Nothing leaves and nothing is billed — and where no such model is set up, the ${DAEMON_NAME} refuses rather than quietly asking the cloud instead.`}
       </p>
 
       <div>
@@ -366,16 +367,16 @@ function Report({ report }: { report: TriageReport }) {
  */
 function Failed({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>The núcleo did not answer, so nothing was triaged and nothing was recorded.</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} gave no reply, so nothing was triaged and nothing was recorded.</ErrorNote>;
   }
 
   const sentence =
     error.status === 503
-      ? "This machine has no local model configured, so the local brain has nothing to answer with. The núcleo refuses rather than spending a cloud you did not ask for — which is the whole reason the choice is yours to make."
+      ? `This machine has no local model configured, so the local brain has nothing to answer with. The ${DAEMON_NAME} refuses rather than spending a cloud you did not ask for — which is the whole reason the choice is yours to make.`
       : error.status === 404
         ? "This project is not there any more, or its folder cannot be read."
         : error.status === 422
-          ? "The núcleo could not read which brain was asked for."
+          ? `The ${DAEMON_NAME} could not read which brain was asked for.`
           : error.detail;
 
   return <ErrorNote>{sentence}</ErrorNote>;
@@ -576,7 +577,7 @@ function Record({
   if (query.isError) {
     return (
       <p className="max-w-prose text-xs text-text-faint">
-        The núcleo could not say what the triager has silenced in this project, so §6.2&rsquo;s
+        The {DAEMON_NAME} could not say what the triager has silenced in this project, so §6.2&rsquo;s
         record is not on screen. What is above is what the map itself is holding, which is less than
         the whole of it.
       </p>

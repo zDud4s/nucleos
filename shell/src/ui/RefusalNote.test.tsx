@@ -76,7 +76,7 @@ describe("RefusalNote", () => {
     const { container } = render(
       <div>
         <RefusalNote refusal={new ApiRefusal(423, "kill_switch", "kill_switch")} />
-        <ErrorNote>the daemon did not answer</ErrorNote>
+        <ErrorNote>the service is unreachable</ErrorNote>
       </div>,
     );
 

@@ -284,6 +284,25 @@ describe("Teams - the table", () => {
     }
   });
 
+  it("sorts the table by a column title and says which way", async () => {
+    daemon.apiFetch.mockImplementation(
+      teamsFetch({
+        teams: [teamView({ id: "vendas", name: "Vendas" }), teamView({ id: "financas", name: "Finanças" })],
+      }),
+    );
+    await renderTeams();
+    const table = await departments();
+    const names = () =>
+      within(table)
+        .getAllByRole("rowheader")
+        .map((cell) => cell.textContent ?? "");
+
+    expect(names()[0]).toContain("Vendas");
+    fireEvent.click(within(table).getByRole("button", { name: /^Team/ }));
+    expect(names()[0]).toContain("Finanças");
+    expect(within(table).getByRole("columnheader", { name: /^Team/ }).getAttribute("aria-sort")).toBe("ascending");
+  });
+
   it("lifts the running work out of the rows and into the strip above them", async () => {
     const team = teamView({ id: "financas", name: "Finanças" });
     const live = teamRun({

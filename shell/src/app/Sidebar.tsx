@@ -4,6 +4,7 @@ import { Check, ChevronsUpDown, LayoutList, PanelLeftClose, Plus, Search } from 
 import { NAV, SYSTEM_ITEM, type NavBadge, type NavItem } from "./nav";
 import type { AutopilotMode } from "../data/system";
 import { readState } from "../ui/state-map";
+import { DAEMON_NAME } from "../copy";
 import mark from "../assets/brand/mark.png";
 
 /**
@@ -436,7 +437,7 @@ function ProjectSwitcher({
   const hereMode = projects?.find((project) => project.id === here)?.mode;
   const name = here ?? "NucleOS";
   // The mode in words where the menu only draws a dot — the button is the workspace's own line.
-  const note = here === undefined ? "the núcleo" : hereMode === undefined ? "project" : modeWord(hereMode);
+  const note = here === undefined ? DAEMON_NAME : hereMode === undefined ? "project" : modeWord(hereMode);
 
   /*
     Closing on a press anywhere else, without a full-screen invisible overlay.

@@ -1,5 +1,6 @@
 // §spec mapa-do-projeto
 import { useMemo, type ReactNode } from "react";
+import { DAEMON_NAME } from "../copy";
 import type { ForeignFile, MapImport, MapModule, Seam } from "../data/project-map";
 import { buildSides, isBlindSpot, type Sides, type Unread } from "./map-sides";
 import { Button, Quiet, Row, Rows, StatCard } from "../ui";
@@ -183,7 +184,7 @@ function collect(
       detail: (
         <>
           <p className="m-0">
-            Nothing should be able to: a Rust file cannot import a TypeScript module, and the núcleo
+            Nothing should be able to: a Rust file cannot import a TypeScript module, and the {DAEMON_NAME}
             resolves an import only inside the file&apos;s own folder. So the map&apos;s rule for
             what a side is is wrong for these files, not your code — report it with this list.
           </p>
@@ -206,7 +207,7 @@ function collect(
       detail: (
         <>
           <p className="m-0">
-            The núcleo only sends imports between files it listed, so this says its two halves have
+            The {DAEMON_NAME} only sends imports between files it listed, so this says its two halves have
             drifted. Report it with this list.
           </p>
           <ImportList lines={sides.strays} label="Imports with an end on no listed file" />
@@ -446,7 +447,7 @@ function SeamWhy({ sides, seam }: { sides: Sides; seam: Seam | null }) {
       {sides.crossing === 0 && sides.sides.length > 1 ? (
         <p className="m-0">
           No import crosses between them, and none could — a Rust file cannot import a TypeScript
-          module, and the núcleo resolves an import only inside the file&apos;s own folder. So this
+          module, and the {DAEMON_NAME} resolves an import only inside the file&apos;s own folder. So this
           says these sides share no source; it does not say they are independent.
         </p>
       ) : null}

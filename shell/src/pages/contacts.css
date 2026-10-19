@@ -47,32 +47,7 @@
   overflow-wrap: anywhere;
 }
 
-/* Search and the verdict filters above the grid. */
-.contacts-tools {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-3);
-  margin: 0 0 var(--space-3);
-}
-
-.contacts-search {
-  min-width: 14rem;
-  min-height: var(--hit-min);
-  padding: 0 var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--text-sm);
-}
-
-.contacts-search:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-}
-
+/* "Show more" under the grid. */
 .contacts-more {
   display: flex;
   justify-content: center;

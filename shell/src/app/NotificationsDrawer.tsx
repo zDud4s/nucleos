@@ -9,6 +9,7 @@ import {
   type PendingNotification,
 } from "../data/feed";
 import { KindBadge } from "../pages/Feed";
+import { DAEMON_NAME } from "../copy";
 import { ErrorNote, RelativeTime } from "../ui";
 
 /**
@@ -115,7 +116,7 @@ export function NotificationsDrawer() {
 
           <div className="app-drawer-body">
             {pending.isError && (
-              <ErrorNote>the núcleo did not answer — what is held is not known</ErrorNote>
+              <ErrorNote>the {DAEMON_NAME} is not responding — what is held is not known</ErrorNote>
             )}
 
             <section className="app-drawer-section">
@@ -153,7 +154,7 @@ export function NotificationsDrawer() {
             <section className="app-drawer-section">
               <h3 className="app-drawer-heading">Latest feed</h3>
               {recent.isError && (
-                <ErrorNote>the núcleo did not answer — the feed could not be read</ErrorNote>
+                <ErrorNote>the {DAEMON_NAME} is not responding — the feed could not be read</ErrorNote>
               )}
               {recent.data === undefined && !recent.isError && (
                 <p className="app-drawer-empty">reading the feed…</p>

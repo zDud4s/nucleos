@@ -1,4 +1,4 @@
-import { useRef, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
+import { useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import {
   fitSeatLabel,
   VIEW_H,
@@ -102,9 +102,11 @@ export function Courtroom({
   /** Entry animation from setup positions. */
   settle?: boolean;
 }) {
-  const seatRefs = useRef<(SVGGElement | null)[]>([]);
+  const seatRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  // The seat the pointer or focus is on: a masked chair shows its name only then.
+  const [hot, setHot] = useState<number | null>(null);
 
-  const onSeatKey = (event: KeyboardEvent<SVGGElement>, at: number, seat: CourtSeat) => {
+  const onSeatKey = (event: KeyboardEvent<HTMLButtonElement>, at: number, seat: CourtSeat) => {
     const last = court.seats.length - 1;
     let to: number | null = null;
     if (event.key === "ArrowRight" || event.key === "ArrowDown") to = Math.min(last, at + 1);
@@ -129,37 +131,81 @@ export function Courtroom({
       <svg
         className={`council-court-svg${settle ? " council-court-settle" : ""}`}
         viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
-        role="group"
-        aria-label="Courtroom"
+        aria-hidden="true"
       >
         <Pediment />
-        <Judge judge={court.judge} selected={selected?.kind === "judge"} onSelect={() => onSelect({ kind: "judge" })} />
+        <Judge judge={court.judge} selected={selected?.kind === "judge"} />
         <Scales balance={court.balance} />
         <Wing wing={court.wing} />
         {court.links.map((link, i) => (
           <Link key={`${link.kind}-${link.from}-${link.to}-${i}`} link={link} where={where} />
         ))}
-        <Lectern
-          court={court}
-          interactive={mode === "session"}
-          selected={lecternSelected}
-          onSelect={() => onSelect({ kind: "lectern" })}
-        />
-        {court.seats.map((seat, i) => (
+        <Lectern court={court} interactive={mode === "session"} selected={lecternSelected} />
+        {court.seats.map((seat) => (
           <Seat
             key={seat.key}
             seat={seat}
-            mode={mode}
             selected={selected?.kind === "seat" && selected.index === seat.index}
+            revealed={hot === seat.index}
             settle={settle === true}
-            setRef={(node) => {
-              seatRefs.current[i] = node;
-            }}
-            onSelect={() => onSelect({ kind: "seat", index: seat.index })}
-            onKeyDown={(event) => onSeatKey(event, i, seat)}
           />
         ))}
       </svg>
+      {/* The SVG is the picture; these real buttons are what the keyboard, the pointer and a screen reader meet. */}
+      <HitButton
+        className="council-court-hit council-court-hit-judge"
+        box={{ x: CX, y: 55, w: 120, h: 30 }}
+        selected={selected?.kind === "judge"}
+        label={`Chairman, ${court.judge.state === "empty" ? "empty" : court.judge.name}`}
+        title={
+          court.judge.state === "empty"
+            ? "Chairman: empty"
+            : court.judge.sub === null
+              ? `Chairman: ${court.judge.name}`
+              : `Chairman: ${court.judge.name} · ${court.judge.sub}`
+        }
+        onSelect={() => onSelect({ kind: "judge" })}
+      />
+      {mode === "session" && (
+        <HitButton
+          className="council-court-hit council-court-hit-lectern"
+          box={{ x: CX, y: LECTERN.y + LECTERN.h / 2, w: LECTERN.w, h: LECTERN.h }}
+          selected={lecternSelected}
+          label="The case"
+          title={court.lectern.full}
+          onSelect={() => onSelect({ kind: "lectern" })}
+        />
+      )}
+      {court.seats.map((seat, i) => (
+        <HitButton
+          key={seat.key}
+          className="council-court-hit council-court-hit-seat"
+          box={{ x: seat.x, y: seat.y, w: seat.r * 2, h: seat.r * 2 }}
+          selected={selected?.kind === "seat" && selected.index === seat.index}
+          label={seatLabel(seat, mode)}
+          title={seatTitle(seat)}
+          setRef={(node) => {
+            seatRefs.current[i] = node;
+          }}
+          onSelect={() => onSelect({ kind: "seat", index: seat.index })}
+          onKeyDown={(event) => onSeatKey(event, i, seat)}
+          onHot={(on) => setHot((now) => (on ? seat.index : now === seat.index ? null : now))}
+        />
+      ))}
+      {/* Under 900px the SVG's small print is hidden; this is the same roster as plain text. The buttons above carry the accessible names. */}
+      <ol className="council-court-roll" aria-hidden="true">
+        {court.seats.map((seat) => (
+          <li key={seat.key} data-state={seat.state}>
+            {[
+              seatLabel(seat, mode).replace(/, /g, " · "),
+              seat.rank !== null ? ordinal(seat.rank) : null,
+              seat.dissent ? "dissent" : null,
+            ]
+              .filter((part): part is string => part !== null)
+              .join(" · ")}
+          </li>
+        ))}
+      </ol>
       {question !== undefined && (
         <textarea
           className="council-court-question"
@@ -200,20 +246,9 @@ function Pediment() {
   );
 }
 
-function Judge({ judge, selected, onSelect }: { judge: CourtJudge; selected: boolean; onSelect: () => void }) {
-  const name = judge.state === "empty" ? "empty" : judge.name;
+function Judge({ judge, selected }: { judge: CourtJudge; selected: boolean }) {
   return (
-    <g
-      role="button"
-      tabIndex={0}
-      className="council-court-judge"
-      data-state={judge.state}
-      aria-pressed={selected}
-      aria-label={`Chairman, ${name}`}
-      onClick={onSelect}
-      onKeyDown={(event) => activate(event, onSelect)}
-    >
-      <title>{judge.sub === null ? `Chairman: ${name}` : `Chairman: ${name} · ${judge.sub}`}</title>
+    <g className="council-court-judge" data-state={judge.state} data-selected={selected || undefined}>
       <rect className="council-court-bench" x={CX - 60} y={40} width={120} height={30} rx={5} />
       <text className="council-court-judge-label" x={CX} y={judge.sub === null ? 59 : 54} textAnchor="middle">
         {clip(judge.label, JUDGE_LABEL_CHARS)}
@@ -315,17 +350,7 @@ function Link({ link, where }: { link: CourtLink; where: Map<string, { x: number
   );
 }
 
-function Lectern({
-  court,
-  interactive,
-  selected,
-  onSelect,
-}: {
-  court: Court;
-  interactive: boolean;
-  selected: boolean;
-  onSelect: () => void;
-}) {
+function Lectern({ court, interactive, selected }: { court: Court; interactive: boolean; selected: boolean }) {
   const { ballots } = court;
   const box = (
     <>
@@ -346,24 +371,9 @@ function Lectern({
   const slot = (i: number) => x0 + i * (w + BALLOT.gap);
   return (
     <>
-      {interactive ? (
-        <g
-          role="button"
-          tabIndex={0}
-          className="council-court-lectern-group"
-          aria-pressed={selected}
-          aria-label="The case"
-          onClick={onSelect}
-          onKeyDown={(event) => activate(event, onSelect)}
-        >
-          <title>{court.lectern.full}</title>
-          {box}
-        </g>
-      ) : (
-        <g className="council-court-lectern-group" data-selected={selected || undefined}>
-          {box}
-        </g>
-      )}
+      <g className="council-court-lectern-group" data-selected={selected || undefined}>
+        {box}
+      </g>
       {ballots !== null && (
         <g className="council-court-tray">
           <rect x={TRAY.x} y={TRAY.y} width={TRAY.w} height={TRAY.h} rx={2} />
@@ -409,20 +419,14 @@ function Lectern({
 
 function Seat({
   seat,
-  mode,
   selected,
+  revealed,
   settle,
-  setRef,
-  onSelect,
-  onKeyDown,
 }: {
   seat: CourtSeat;
-  mode: "setup" | "session";
   selected: boolean;
+  revealed: boolean;
   settle: boolean;
-  setRef: (node: SVGGElement | null) => void;
-  onSelect: () => void;
-  onKeyDown: (event: KeyboardEvent<SVGGElement>) => void;
 }) {
   const { x, y, r } = seat;
   const style = settle
@@ -434,19 +438,13 @@ function Seat({
   const tagY = y + r + (seat.sublabel === null ? 10 : 20);
   return (
     <g
-      ref={setRef}
-      role="button"
-      tabIndex={0}
       className="council-court-seat"
       data-state={seat.state}
       data-masked={seat.masked || undefined}
-      aria-pressed={selected}
-      aria-label={seatLabel(seat, mode)}
+      data-selected={selected || undefined}
+      data-revealed={revealed || undefined}
       style={style}
-      onClick={onSelect}
-      onKeyDown={onKeyDown}
     >
-      <title>{seatTitle(seat)}</title>
       <circle className="council-court-seat-disc" cx={x} cy={y} r={r} />
       {seat.masked ? (
         <>
@@ -486,5 +484,51 @@ function Seat({
         </text>
       )}
     </g>
+  );
+}
+
+/** A transparent HTML button laid over a part of the SVG, positioned in viewBox units. */
+function HitButton({
+  className,
+  box,
+  selected,
+  label,
+  title,
+  setRef,
+  onSelect,
+  onKeyDown,
+  onHot,
+}: {
+  className: string;
+  box: { x: number; y: number; w: number; h: number };
+  selected: boolean;
+  label: string;
+  title: string;
+  setRef?: (node: HTMLButtonElement | null) => void;
+  onSelect: () => void;
+  onKeyDown?: (event: KeyboardEvent<HTMLButtonElement>) => void;
+  onHot?: (on: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      ref={setRef}
+      className={className}
+      aria-pressed={selected}
+      aria-label={label}
+      title={title}
+      style={{
+        left: `${(box.x / VIEW_W) * 100}%`,
+        top: `${(box.y / VIEW_H) * 100}%`,
+        width: `${(box.w / VIEW_W) * 100}%`,
+        height: `${(box.h / VIEW_H) * 100}%`,
+      }}
+      onClick={onSelect}
+      onKeyDown={onKeyDown}
+      onMouseEnter={onHot === undefined ? undefined : () => onHot(true)}
+      onMouseLeave={onHot === undefined ? undefined : () => onHot(false)}
+      onFocus={onHot === undefined ? undefined : () => onHot(true)}
+      onBlur={onHot === undefined ? undefined : () => onHot(false)}
+    />
   );
 }

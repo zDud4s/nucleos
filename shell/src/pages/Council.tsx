@@ -308,9 +308,12 @@ function CouncilList({ rows, answered }: { rows: CouncilSummary[]; answered: boo
       {!answered && <p className="council-loading" role="status">reading the councils…</p>}
       {rows.length > 0 && (
         <Rows label="Councils">
-          {rows.map((row, index) => (
-            <CouncilRow key={row.id} row={row} readOutcome={index < OUTCOME_ROWS} />
-          ))}
+          {/* Deliberating councils lead (stable sort keeps the daemon's order within each group). */}
+          {[...rows]
+            .sort((a, b) => Number(councilIsAlive(b.status)) - Number(councilIsAlive(a.status)))
+            .map((row, index) => (
+              <CouncilRow key={row.id} row={row} readOutcome={index < OUTCOME_ROWS} />
+            ))}
         </Rows>
       )}
     </Panel>

@@ -46,36 +46,11 @@
 /* ------------------------------------------------------------------- page -- */
 
 .brain-page {
-  /* Identity hues — a note, a knowledge layer, an entity. Shared by the list's row marks and the
-     graph's nodes so the two views read with one key. Declared here and on `.brain-force` (which
-     the canvas reads), never as a state tone: see `force-graph.css`. */
-  --brain-note: #8fb4ff;
-  --brain-k-semantic: #c49bff;
-  --brain-k-episodic: #ff9ec7;
-  --brain-k-procedural: #7fdcc0;
-  --brain-k-working: #f5c46b;
-  --brain-project: #f09168;
-  --brain-contact: #9fd36f;
-  --brain-mail: #7ec8e3;
-  --brain-file: #b9c0cc;
-
+  /* The per-category identity hues were retired: nothing read them, and kinds are told apart by
+     label and shape rather than by a colour key. */
   display: flex;
   flex-direction: column;
   gap: var(--space-5);
-}
-
-@media (prefers-color-scheme: light) {
-  .brain-page {
-    --brain-note: #2f62c9;
-    --brain-k-semantic: #7a3fd0;
-    --brain-k-episodic: #c23b7d;
-    --brain-k-procedural: #13836a;
-    --brain-k-working: #a06c00;
-    --brain-project: #b4531f;
-    --brain-contact: #4d8a17;
-    --brain-mail: #1f7fa3;
-    --brain-file: #5f6875;
-  }
 }
 
 /* --------------------------------------------------------------- composer -- */

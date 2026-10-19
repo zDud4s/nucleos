@@ -20,7 +20,7 @@ import {
   ConflictNote,
   Count,
   ErrorNote,
-  Field,
+  ListFilter,
   PageHeader,
   Panel,
   RefusalNote,
@@ -30,6 +30,8 @@ import {
   Section,
   Skeleton,
   StaleNote,
+  useUndoToast,
+  type UndoToastOptions,
 } from "../ui";
 import "./contacts.css";
 
@@ -361,10 +363,9 @@ function groupByContact(rows: Correspondent[]): Correspondent[] {
   return [...groups.values()].flat();
 }
 
-type RosterFilter = "all" | "urgent" | "noise" | "merged" | "writeback";
+type RosterFilter = "urgent" | "noise" | "merged" | "writeback";
 
 const ROSTER_FILTERS: ReadonlyArray<{ key: RosterFilter; label: string }> = [
-  { key: "all", label: "All" },
   { key: "urgent", label: "Urgent" },
   { key: "noise", label: "Noise" },
   { key: "merged", label: "Merged" },
@@ -384,70 +385,69 @@ function matchesFilter(row: Correspondent, filter: RosterFilter, merged: Set<num
       return merged.has(row.contact_id);
     case "writeback":
       return row.outbound_ever === 1;
-    default:
-      return true;
   }
 }
 
 function PeopleRoster({ rows }: { rows: Correspondent[] }) {
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<RosterFilter>("all");
+  const [selected, setSelected] = useState<RosterFilter[]>([]);
   const [shown, setShown] = useState(PAGE_SIZE);
+  const undo = useUndoToast();
   const ordered = groupByContact(rows);
   const merged = mergedContactIds(rows);
   const needle = query.trim().toLowerCase();
   const visible = ordered.filter(
     (row) =>
-      matchesFilter(row, filter, merged) &&
+      // Chips widen, they do not stack: "Urgent" plus "Noise" is both groups, none selected is everyone.
+      (selected.length === 0 || selected.some((key) => matchesFilter(row, key, merged))) &&
       (needle === "" ||
         row.address.toLowerCase().includes(needle) ||
         (row.display_name ?? "").toLowerCase().includes(needle)),
   );
   const drawn = visible.slice(0, shown);
+  const chips = ROSTER_FILTERS.map(({ key, label }) => ({
+    id: key,
+    label,
+    count: ordered.filter((row) => matchesFilter(row, key, merged)).length,
+  }));
   // A grid of profile cards, one per address — the owner's call (2026-10-02):
   // the roster is browsed for people, not scanned down like the mail queue.
   // Each card is the inset rank, the one card a Panel is allowed to hold.
   return (
     <>
-      <div className="contacts-tools" role="search" aria-label="Find people">
-        <Field label="Search people" labelHidden>
-          <input
-            className="contacts-search"
-            type="search"
-            value={query}
-            placeholder="Search by name or address"
-            onChange={(event) => {
-              setQuery(event.target.value);
-              setShown(PAGE_SIZE);
-            }}
-          />
-        </Field>
-        <div className="contacts-actions">
-          {ROSTER_FILTERS.map(({ key, label }) => (
-            <Button
-              key={key}
-              aria-pressed={filter === key}
-              onClick={() => {
-                setFilter(key);
-                setShown(PAGE_SIZE);
-              }}
-            >
-              {label}
-            </Button>
-          ))}
-        </div>
-      </div>
+      <ListFilter
+        noun="people"
+        query={query}
+        onQueryChange={(next) => {
+          setQuery(next);
+          setShown(PAGE_SIZE);
+        }}
+        chips={chips}
+        selected={selected}
+        onToggleChip={(id) => {
+          setSelected((now) =>
+            now.includes(id as RosterFilter)
+              ? now.filter((key) => key !== id)
+              : [...now, id as RosterFilter],
+          );
+          setShown(PAGE_SIZE);
+        }}
+        resultCount={visible.length}
+        onClear={() => {
+          setQuery("");
+          setSelected([]);
+          setShown(PAGE_SIZE);
+        }}
+      />
       {visible.length === 0 ? (
-        <p className="contacts-note" role="status">
-          No one matches{needle === "" ? "" : ` "${query.trim()}"`}
-          {filter === "all" ? "" : ` under ${ROSTER_FILTERS.find((f) => f.key === filter)?.label}`}.
-        </p>
+        <p className="contacts-note">No one matches{needle === "" ? "" : ` "${query.trim()}"`}.</p>
       ) : (
         <ul className="contacts-cards" aria-label="People">
           {drawn.map((row) => (
             <PersonCard
               key={row.address}
               row={row}
+              onVerdictSet={undo.show}
               sameAs={ordered
                 .filter((other) => other.contact_id === row.contact_id && other.address !== row.address)
                 .map((other) => other.address)}
@@ -462,6 +462,7 @@ function PeopleRoster({ rows }: { rows: Correspondent[] }) {
           </Button>
         </div>
       )}
+      {undo.toast}
     </>
   );
 }
@@ -477,8 +478,11 @@ function initials(row: Correspondent): string {
 function PersonCard({
   row,
   sameAs,
+  onVerdictSet,
 }: {
   row: Correspondent;
+  /** Opens the page's undo window after a verdict lands. */
+  onVerdictSet: (options: UndoToastOptions) => void;
   /** The other addresses of this contact — empty unless the row is merged. */
   sameAs: string[];
 }) {
@@ -515,11 +519,16 @@ function PersonCard({
       {merged && <p className="contacts-sameas">Same person as {sameAs.join(", ")}</p>}
       <p className="contacts-meta">
         {row.messages_in} message{row.messages_in === 1 ? "" : "s"} in · last seen{" "}
-        <RelativeTime at={row.last_seen} /> · first seen{" "}
-        <RelativeTime at={row.first_seen} />
+        <RelativeTime at={row.last_seen} />
       </p>
       <div className="contacts-card-actions">
-        <SenderVerdictToggles address={row.address} verdict={row.verdict} onProblem={onProblem} />
+        <SenderVerdictToggles
+          address={row.address}
+          verdict={row.verdict}
+          name={row.display_name ?? row.address}
+          onProblem={onProblem}
+          onVerdictSet={onVerdictSet}
+        />
       </div>
       {problem !== null && <div className="contacts-problem">{problem}</div>}
     </li>
@@ -531,18 +540,30 @@ function PersonCard({
 function SenderVerdictToggles({
   address,
   verdict,
+  name,
   onProblem,
+  onVerdictSet,
 }: {
   address: string;
   verdict: string | null;
+  name: string;
   onProblem: ReportProblem;
+  onVerdictSet: (options: UndoToastOptions) => void;
 }) {
   const mutate = useSenderVerdict();
-  const send = (next: "pin" | "mute" | null) =>
+  const send = (next: "pin" | "mute" | null, isUndo = false) =>
     mutate.mutate(
       { address, verdict: next },
       {
-        onSuccess: () => onProblem(null),
+        onSuccess: () => {
+          onProblem(null);
+          if (isUndo) return;
+          // Undo restores what was there before this press, through the same door.
+          const before = verdict === "pin" || verdict === "mute" ? verdict : null;
+          const said =
+            next === "pin" ? `${name} marked urgent` : next === "mute" ? `${name} marked noise` : `${name} verdict cleared`;
+          onVerdictSet({ message: said, onUndo: () => send(before, true) });
+        },
         onError: (error) => onProblem(<VerdictError error={error} />),
       },
     );

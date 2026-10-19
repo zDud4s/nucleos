@@ -46,7 +46,9 @@ import { useProjects, type ProjectSummary } from "../data/system";
 import {
   Badge,
   Button,
+  Chip,
   ErrorNote,
+  FilterBar,
   FEED_LANES,
   PageHeader,
   Quiet,
@@ -59,6 +61,7 @@ import {
   feedGravityTone,
   type FeedGravity,
 } from "../ui";
+import { DAEMON_NAME } from "../copy";
 import { FeedTrace, duration } from "./FeedTrace";
 import "./feed.css";
 
@@ -307,7 +310,7 @@ export function Feed() {
       setSaid(`${count === 1 ? "1 line" : `${count} lines`} marked seen`);
     } catch {
       posted.current = null;
-      setSaid("the núcleo did not take the mark — nothing changed");
+      setSaid(`the ${DAEMON_NAME} did not take the mark — nothing changed`);
     }
   }
 
@@ -614,6 +617,15 @@ function FeedSearchForm({
     filters.until !== undefined ||
     filters.limit !== undefined;
   const [open, setOpen] = useState(carries);
+  /** The filters in force, one chip each, so a closed panel still says what shaped the page. */
+  const active: { key: keyof FeedSearch; label: string }[] = [];
+  if (filters.kind !== undefined) active.push({ key: "kind", label: `kind: ${filters.kind}` });
+  if (filters.project !== undefined) active.push({ key: "project", label: `project: ${filters.project}` });
+  if (filters.since !== undefined)
+    active.push({ key: "since", label: `since ${rfc3339ToBoundInput(filters.since).replace("T", " ")}` });
+  if (filters.until !== undefined)
+    active.push({ key: "until", label: `until ${rfc3339ToBoundInput(filters.until).replace("T", " ")}` });
+  if (filters.limit !== undefined) active.push({ key: "limit", label: `limit ${filters.limit}` });
 
   return (
     <form
@@ -656,6 +668,24 @@ function FeedSearchForm({
           <ChevronDown className="feed-search-chevron" size={14} aria-hidden="true" />
         </button>
       </div>
+
+      {active.length > 0 ? (
+        <div className="feed-active-filters">
+        <FilterBar
+          label="Active filters"
+          activeCount={active.length}
+          onClear={() =>
+            onChange({ kind: undefined, project: undefined, since: undefined, until: undefined, limit: undefined })
+          }
+        >
+          {active.map((item) => (
+            <Chip key={item.key} pressed onToggle={() => onChange({ [item.key]: undefined })}>
+              {item.label}
+            </Chip>
+          ))}
+        </FilterBar>
+        </div>
+      ) : null}
 
       <div className="feed-filters" id={panelId} hidden={!open}>
         <div className="feed-filter">
@@ -772,7 +802,7 @@ function SearchResults({
     <>
       <p className="feed-frozen">
         <span className="feed-frozen-text">
-          This is a search, so the núcleo is answering about the past and the page has stopped
+          This is a search, so the {DAEMON_NAME} is answering about the past and the page has stopped
           refreshing.
         </span>
         <Button intent="go" onClick={onBack}>
@@ -786,7 +816,7 @@ function SearchResults({
       )}
       {rows === undefined && !query.isError && <Skeleton label="Searching the feed…" lines={3} />}
       {rows !== undefined && rows.length === 0 && (
-        <Quiet says="Nothing matches this search. The núcleo has lines — none of them match; clear a filter to widen it." />
+        <Quiet says={`Nothing matches this search. The ${DAEMON_NAME} has lines — none of them match; clear a filter to widen it.`} />
       )}
       {rows !== undefined && rows.length > 0 && (
         <>
@@ -869,7 +899,7 @@ function LiveView(props: LiveViewProps) {
         }
       >
         <p>
-          Every autonomous thing the núcleo does writes a line here: a job starting, a gate failing, a
+          Every autonomous thing the {DAEMON_NAME} does writes a line here: a job starting, a gate failing, a
           worktree released, an urgent e-mail. A feed line <em>is</em> the notification — nothing pops
           up anywhere else — and this page replays them on the time they happened.
         </p>
@@ -1337,13 +1367,13 @@ function FeedError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
         refusal={error}
         sentences={{
           bad_request:
-            "the núcleo would not accept that question — a date bound must be a full timestamp, a limit a number, and a window at most 31 days",
-          internal: "the núcleo could not read the feed — its database, not your search",
+            `the ${DAEMON_NAME} would not accept that question — a date bound must be a full timestamp, a limit a number, and a window at most 31 days`,
+          internal: `the ${DAEMON_NAME} could not read the feed — its database, not your search`,
         }}
       />
     );
   }
-  return <ErrorNote onRetry={onRetry}>the núcleo did not answer — nothing is known about the feed</ErrorNote>;
+  return <ErrorNote onRetry={onRetry}>the {DAEMON_NAME} is not responding — nothing is known about the feed</ErrorNote>;
 }
 
 /* ----------------------------------------------------------------- helpers -- */

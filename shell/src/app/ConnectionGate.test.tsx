@@ -123,7 +123,7 @@ describe("ConnectionGate", () => {
 
     renderWithQuery(<ConnectionGate>{shell()}</ConnectionGate>);
 
-    expect(screen.getByText(/reaching the núcleo/)).toBeDefined();
+    expect(screen.getByText(/reaching the background service/)).toBeDefined();
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.queryByText("the shell")).toBeNull();
   });

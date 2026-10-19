@@ -25,7 +25,9 @@ import {
   Button,
   ConfirmButton,
   ErrorNote,
+  ListFilter,
   PageHeader,
+  Quiet,
   Modal,
   Panel,
   RefusalNote,
@@ -34,8 +36,13 @@ import {
   StaleNote,
   Teach,
 } from "../ui";
+import { DAEMON_NAME } from "../copy";
 import "./agents.css";
 import { LoadoutPreview } from "./LoadoutPreview";
+
+// Ids of the two filter chips: the headline's own counts, made clickable.
+const NO_MODEL = "no-model";
+const NOBODY_USES = "nobody-uses";
 
 /**
  * Agents — the house catalogue.
@@ -85,6 +92,8 @@ export function Agents() {
   const teams = useTeams();
   const [creating, setCreating] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [chipsOn, setChipsOn] = useState<readonly string[]>([]);
 
   const rows = agents.data ?? [];
   const answered = agents.data !== undefined;
@@ -105,6 +114,21 @@ export function Agents() {
     itself instead of leaving a panel open over a row that is gone.
   */
   const chosen = rows.find((row) => row.id === selected) ?? null;
+
+  // The two counts the headline already states, made into filters. A chip that would match
+  // nothing still shows its zero; "nobody uses" exists only once the departments have answered.
+  const seatless = rows.filter((row) => !canTakeASeat(row)).length;
+  const idle = employmentKnown ? rows.filter((row) => unemployed(employmentOf(row.id, departments))).length : 0;
+  const needle = query.trim().toLowerCase();
+  const shown = rows.filter(
+    (row) =>
+      (needle === "" ||
+        row.name.toLowerCase().includes(needle) ||
+        row.id.toLowerCase().includes(needle) ||
+        row.speciality.toLowerCase().includes(needle)) &&
+      (!chipsOn.includes(NO_MODEL) || !canTakeASeat(row)) &&
+      (!chipsOn.includes(NOBODY_USES) || (employmentKnown && unemployed(employmentOf(row.id, departments)))),
+  );
 
   return (
     <>
@@ -143,8 +167,28 @@ export function Agents() {
 
       {rows.length > 0 && (
         <Panel title="Catalogue">
+          <ListFilter
+            noun="agents"
+            query={query}
+            onQueryChange={setQuery}
+            chips={[
+              { id: NO_MODEL, label: "Without a model", count: seatless },
+              ...(employmentKnown ? [{ id: NOBODY_USES, label: "Nobody uses", count: idle }] : []),
+            ]}
+            selected={chipsOn}
+            onToggleChip={(id) =>
+              setChipsOn((on) => (on.includes(id) ? on.filter((chip) => chip !== id) : [...on, id]))
+            }
+            resultCount={shown.length}
+            onOpenOnly={() => setSelected(shown[0].id)}
+            onClear={() => {
+              setQuery("");
+              setChipsOn([]);
+            }}
+          />
+          {shown.length === 0 && <Quiet says="No agent matches that filter." />}
           <Catalogue
-            rows={rows}
+            rows={shown}
             departments={departments}
             employmentKnown={employmentKnown}
             selected={chosen?.id ?? null}
@@ -203,7 +247,7 @@ function headlineFor(
 function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
-    <ErrorNote onRetry={onRetry}>the núcleo did not answer — nothing is known about the catalogue</ErrorNote>
+    <ErrorNote onRetry={onRetry}>the {DAEMON_NAME} is not responding — nothing is known about the catalogue</ErrorNote>
   );
 }
 
@@ -217,13 +261,13 @@ function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
  * rather than showing the daemon's silence back.
  */
 function SaveRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — this agent was not saved</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding — this agent was not saved</ErrorNote>;
   return (
     <RefusalNote
       refusal={error}
       sentences={{
         conflict: "an agent of that name already exists",
-        bad_request: "the núcleo refused this — check the name, engine, model and tool policy",
+        bad_request: `the ${DAEMON_NAME} refused this — check the name, engine, model and tool policy`,
         not_found: "this agent no longer exists — it may have been deleted elsewhere",
       }}
     />
@@ -249,7 +293,7 @@ function SaveRefusal({ error }: { error: unknown }) {
  * that it does.
  */
 function DeleteRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the núcleo did not answer — this agent was not deleted</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding — this agent was not deleted</ErrorNote>;
   return (
     <RefusalNote
       refusal={error}
@@ -320,7 +364,7 @@ function Catalogue({
       </table>
       <p className="agents-key">
         ◉ directs a team · ● on a team&rsquo;s roster · ■ has tools · □ no tools · ? this shell has no
-        reading for that policy · ≠ renamed since the núcleo learned its id
+        reading for that policy · ≠ renamed since the {DAEMON_NAME} learned its id
       </p>
     </div>
   );
@@ -399,8 +443,8 @@ function Called({ agent }: { agent: Agent }) {
       className={diverged ? "agents-id agents-id-diverged" : "agents-id"}
       title={
         diverged
-          ? `the núcleo knows this one as ${agent.id}; it has been renamed since, and every roster still points at the id`
-          : `the núcleo knows this one as ${agent.id}`
+          ? `the ${DAEMON_NAME} knows this one as ${agent.id}; it has been renamed since, and every roster still points at the id`
+          : `the ${DAEMON_NAME} knows this one as ${agent.id}`
       }
     >
       {/*
@@ -412,7 +456,7 @@ function Called({ agent }: { agent: Agent }) {
         purpose: it comes from `::before`, so it is never in the accessibility
         tree, and the sentence below carries that fact in language instead.
       */}
-      <span className="sr-only">known to the núcleo as </span>
+      <span className="sr-only">known to the {DAEMON_NAME} as </span>
       {agent.id}
       {diverged && (
         <span className="sr-only">
@@ -866,7 +910,7 @@ function AgentEditor({
                 /*
                   Stays open and reseeds from the daemon's answer, the way the charter
                   editor does. Two things come of it: what you see next is what the
-                  núcleo stored rather than what you typed — trimmed, and a blank model
+                  {DAEMON_NAME} stored rather than what you typed — trimmed, and a blank model
                   turned back into the engine's default — and the row above changes
                   under you, which is the acknowledgement that a form closing itself
                   used to be standing in for. The footer says "Saved" as well, because
@@ -969,10 +1013,10 @@ function invalidReason(draft: AgentDraft): string {
  */
 function holdSentence(agent: Agent, employment: Employment, known: boolean): string {
   const work =
-    "an item of a team run, or of a job, is not something this page can see, and it is the other half of what the núcleo checks";
+    `an item of a team run, or of a job, is not something this page can see, and it is the other half of what the ${DAEMON_NAME} checks`;
 
   if (!known) {
-    return `The team list has not answered, so what stands on ${agent.name} is not known here. The núcleo refuses a delete on four grounds: it directs a team, it is on a roster, or it holds an item of a team run or of a job.`;
+    return `The team list has not answered, so what stands on ${agent.name} is not known here. The ${DAEMON_NAME} refuses a delete on four grounds: it directs a team, it is on a roster, or it holds an item of a team run or of a job.`;
   }
 
   if (unemployed(employment)) {
@@ -984,5 +1028,5 @@ function holdSentence(agent: Agent, employment: Employment, known: boolean): str
     employment.staffs.length > 0 ? `is on the roster of ${employment.staffs.join(", ")}` : null,
   ].filter((part) => part !== null);
 
-  return `${agent.name} ${standings.join(" and ")}. The núcleo refuses a delete while that is true — and also while ${work}.`;
+  return `${agent.name} ${standings.join(" and ")}. The ${DAEMON_NAME} refuses a delete while that is true — and also while ${work}.`;
 }

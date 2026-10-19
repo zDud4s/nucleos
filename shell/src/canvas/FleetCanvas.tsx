@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
+import { DAEMON_NAME } from "../copy";
 import {
   Background,
   BaseEdge,
@@ -297,7 +298,7 @@ export function SlotCard({ card, connectable = false }: SlotCardProps) {
               the núcleo is on it rather than implying a person must be. */}
           {detail.status === "conflicted" && (
             <p className="fleet-card-note">
-              The núcleo starts a run to resolve it in the item's own tree.{" "}
+              The {DAEMON_NAME} starts a run to resolve it in the item's own tree.{" "}
               <Link
                 to="/runs"
                 search={{ project: card.project.project_id }}

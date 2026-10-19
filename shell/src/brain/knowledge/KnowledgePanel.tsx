@@ -1,3 +1,4 @@
+import { DAEMON_NAME } from "../../copy";
 import { useMemo, useState } from "react";
 import {
   useApproveKnowledge,
@@ -53,7 +54,7 @@ export function KnowledgePanel({ id, onSelect }: KnowledgePanelProps) {
   const reject = useRejectKnowledge();
   const revert = useRevertKnowledge();
 
-  if (knowledge.isError) return <ErrorNote>the núcleo did not answer — the row is not known</ErrorNote>;
+  if (knowledge.isError) return <ErrorNote>the {DAEMON_NAME} is not responding — the row is not known</ErrorNote>;
   if (knowledge.data === undefined) return <Quiet says="Loading…" />;
   const row = knowledge.data.find((candidate) => candidate.id === id);
   if (row === undefined) {

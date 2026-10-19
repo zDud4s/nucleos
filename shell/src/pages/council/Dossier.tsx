@@ -8,7 +8,7 @@ import {
   type CouncilView,
   type StepView,
 } from "../../data/council";
-import { Button, ErrorNote } from "../../ui";
+import { Button, ErrorNote, Skeleton } from "../../ui";
 import { CouncilRich } from "../CouncilRich";
 import { CouncilSynthesis } from "../CouncilSynthesis";
 import { StepTail } from "../CouncilRounds";
@@ -261,11 +261,31 @@ function ConveneChips({ onPick }: { onPick: (who: Occupant) => void }) {
   const waiting = agents.data === undefined && models.data === undefined && !agents.isError && !models.isError;
   // One catalogue down still leaves the other's chips; both down would leave an empty panel that reads as "nobody".
   const unreadable = agents.isError && models.isError;
+  // Exactly one down: the other's chips stay, and the missing half is named so it does not read as "none exist".
+  const oneDown = agents.isError !== models.isError;
 
   return (
     <>
-      {waiting && <p className="council-dossier-hint">Reading who can sit…</p>}
-      {unreadable && <p className="council-dossier-hint">Couldn't load who can sit.</p>}
+      {waiting && <Skeleton label="Reading who can sit" lines={2} />}
+      {unreadable && (
+        <ErrorNote
+          onRetry={() => {
+            void agents.refetch();
+            void models.refetch();
+          }}
+        >
+          Couldn't load who can sit.
+        </ErrorNote>
+      )}
+      {oneDown && (
+        <ErrorNote
+          onRetry={() => {
+            void (agents.isError ? agents.refetch() : models.refetch());
+          }}
+        >
+          {agents.isError ? "Couldn't load agents." : "Couldn't load models."}
+        </ErrorNote>
+      )}
       {seatable.length > 0 && (
         <div className="council-dossier-chips" role="group" aria-label="Agents">
           {seatable.map((agent) => (

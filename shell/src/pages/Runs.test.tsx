@@ -209,7 +209,7 @@ describe("Runs - the filters live in the route", () => {
     await waitFor(() => {
       const entry = queryClient
         .getQueryCache()
-        .find({ queryKey: keys.runs.search({ status: "timed_out", group: "chat", chatTurns: "hide" }), exact: true });
+        .find({ queryKey: keys.runs.search({ status: "timed_out", group: "chat", chatTurns: "hide", paged: "older" }), exact: true });
       expect(entry).toBeDefined();
     });
     expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=timed_out&group=chat&chat_turns=hide&limit=50");
@@ -233,28 +233,40 @@ describe("Runs - the filters live in the route", () => {
     expect(daemon.apiFetch).not.toHaveBeenCalledWith("/runs?mode=&limit=50");
   });
 
-  it("a scope writes its status into the route and says which one is in force", async () => {
+  it("a status chip writes its status into the route and says which one is in force", async () => {
     daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
 
     const { router } = await renderRuns();
-    const scopes = await screen.findByRole("group", { name: "Show" });
-    const all = within(scopes).getByRole("button", { name: "All" });
-    const failed = within(scopes).getByRole("button", { name: "Failed" });
-    expect(all.getAttribute("aria-pressed")).toBe("true");
+    const bar = await screen.findByRole("group", { name: "Filter runs" });
+    const failed = within(bar).getByRole("button", { name: "Failed" });
     expect(failed.getAttribute("aria-pressed")).toBe("false");
 
     fireEvent.click(failed);
 
-    // The same route model as every other filter — a scope is a status, not a
+    // The same route model as every other filter: a chip is a status, not a
     // second piece of state beside it.
     await waitFor(() => expect(searchOf(router)).toEqual({ status: "failed" }));
     expect(daemon.apiFetch).toHaveBeenCalledWith("/runs?status=failed&group=chat&chat_turns=hide&limit=50");
     await waitFor(() => {
-      expect(within(scopes).getByRole("button", { name: "Failed" }).getAttribute("aria-pressed")).toBe(
+      expect(within(bar).getByRole("button", { name: "Failed" }).getAttribute("aria-pressed")).toBe(
         "true",
       );
     });
-    expect(within(scopes).getByRole("button", { name: "All" }).getAttribute("aria-pressed")).toBe("false");
+
+    // Pressing it again is "all".
+    fireEvent.click(within(bar).getByRole("button", { name: "Failed" }));
+    await waitFor(() => expect(searchOf(router)).toEqual({}));
+  });
+
+  it("the search box writes its text into the route once typing rests", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
+
+    const { router } = await renderRuns();
+    fireEvent.change(await screen.findByRole("searchbox", { name: "Search runs" }), {
+      target: { value: "gate" },
+    });
+
+    await waitFor(() => expect(searchOf(router)).toEqual({ q: "gate" }));
   });
 
   it("an exact status the scopes do not cover opens More filters on arrival", async () => {
@@ -380,6 +392,63 @@ describe("Runs - the index", () => {
     expect(screen.getByText(/showing the newest 50/)).toBeDefined();
     // And the headline counts the page, not the index.
     expect(headlineText()).toBe("the newest 50; none of them still moving");
+  });
+
+  it("loads the next older page under the list through the daemon's cursor", async () => {
+    const newest = Array.from({ length: 50 }, (_, index) => row({ id: 100 - index }));
+    const older = [row({ id: 40, prompt_excerpt: "an older run" })];
+    const base = runsFetch(world({ rows: newest }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) =>
+      path.includes("before=") ? older : await base(path, init),
+    );
+
+    await renderRuns();
+
+    const load = await screen.findByRole("button", { name: "Load older" });
+    fireEvent.click(load);
+
+    // The cursor is the last row on screen: the page older than run 51.
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith(
+        "/runs?group=chat&chat_turns=hide&limit=50&before=51",
+      );
+    });
+    expect(await screen.findByText("an older run")).toBeDefined();
+    const list = screen.getByRole("list", { name: "Runs" });
+    expect(list.children.length).toBe(51);
+    // A short page is the end of the index: no button offers a page that is not there.
+    expect(screen.queryByRole("button", { name: "Load older" })).toBeNull();
+    expect(headlineText()).toBe("51 in the index; none of them still moving");
+  });
+
+  it("offers no older page when the newest one came back short", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
+
+    await renderRuns();
+
+    await screen.findByRole("list", { name: "Runs" });
+    expect(screen.queryByRole("button", { name: "Load older" })).toBeNull();
+    expect(screen.queryByText(/showing the newest/)).toBeNull();
+  });
+
+  it("says a failed Load older beside the list and keeps the rows it has", async () => {
+    const newest = Array.from({ length: 50 }, (_, index) => row({ id: 100 - index }));
+    const base = runsFetch(world({ rows: newest }));
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.includes("before=")) throw new TypeError("Failed to fetch");
+      return await base(path, init);
+    });
+
+    await renderRuns();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Load older" }));
+
+    const alert = (await screen.findByText(/Could not load older runs/)).closest("[role=alert]") as HTMLElement;
+    expect(alert).not.toBeNull();
+    // The failure is this button's, not the list's: the rows stay and are not marked stale.
+    expect(screen.getByRole("list", { name: "Runs" }).children.length).toBe(50);
+    // And the note's own button is the retry.
+    expect(within(alert).getByRole("button", { name: "Load older" })).toBeDefined();
   });
 
   it("keeps an empty filtered list apart from an empty machine", async () => {

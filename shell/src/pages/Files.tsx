@@ -53,6 +53,7 @@ import {
   RelativeTime,
   Row,
   Rows,
+  Skeleton,
   StaleNote,
   Teach,
 } from "../ui";
@@ -1104,12 +1105,11 @@ export function Files() {
   const toolbar = rootUnavailable ? undefined : (
     <div className="fi-toolbar">
       <div className="fi-search">
-        <Field label="Search under this folder" labelHidden>
+        <Field label="Search files by name" labelHidden>
           <input
             ref={searchRef}
             type="search"
             value={qInput}
-            aria-label="Search files by name"
             aria-keyshortcuts="Control+F /"
             placeholder="Search here and below · Ctrl+F"
             onChange={(event) => setQInput(event.target.value)}
@@ -2267,13 +2267,12 @@ function NewFolderForm({ path, create }: { path: string; create: ReturnType<type
       }}
     >
       <div className="fi-new-folder-row">
-        <Field label="New folder">
+        <Field label="New folder name">
           <input
             // eslint-disable-next-line jsx-a11y/no-autofocus -- the field was
             // opened by the button that just vanished; focus belongs here.
             autoFocus
             value={name}
-            aria-label="New folder name"
             onChange={(event) => setName(event.target.value)}
           />
         </Field>
@@ -2537,7 +2536,7 @@ function FileTable(props: FileTableProps) {
         {folder.isError && entries === undefined && (
           <RefusalOrError error={folder.error} sentences={LIST_SENTENCES} what="nothing is known about this folder" />
         )}
-        {!folder.isError && entries === undefined && <p className="fi-loading">Reading the folder…</p>}
+        {!folder.isError && entries === undefined && <Skeleton label="Reading the folder…" lines={4} />}
         {/* `Teach` is for a place nothing has ever been — the root, empty. A
             subfolder that is empty is an ordinary answer, and says so in one line. */}
         {entries !== undefined && entries.length === 0 && path === "" && (
@@ -3592,6 +3591,18 @@ function ContextMenu({
     } else if (event.key === "Escape" || event.key === "Tab") {
       event.preventDefault();
       onClose(true);
+    } else if (event.key.length === 1 && event.key !== " " && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      // Typeahead: a letter jumps to the next item whose text starts with it,
+      // wrapping, as a Windows menu does.
+      const letter = event.key.toLowerCase();
+      for (let step = 1; step <= items.length; step += 1) {
+        const item = items[(current + step + items.length) % items.length];
+        if (item?.textContent?.trim().toLowerCase().startsWith(letter)) {
+          event.preventDefault();
+          item.focus();
+          break;
+        }
+      }
     }
   }
 

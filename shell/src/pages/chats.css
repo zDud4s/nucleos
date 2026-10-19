@@ -2144,6 +2144,16 @@
   padding-top: var(--space-4);
 }
 
+/* The composer keeps its own right-hand gutter on a narrow window, so Send never sits at the edge
+   where a floating dock (the usage widget) can cover it. Owned here on purpose: the composer does
+   not depend on where that widget is drawn. */
+@media (max-width: 60rem) {
+  .chats-composer,
+  .chats-detail-inner > .chats-composer-box {
+    padding-inline-end: var(--space-8);
+  }
+}
+
 /**
  * One box, not a labelled field with a toolbar under it.
  *

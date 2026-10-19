@@ -9,6 +9,7 @@ import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote } from "../ui";
 import { Why } from "./OnItsOwn";
 /* The `pj-` family, as in `OnItsOwn`: the panel draws correctly wherever it is mounted. */
 import "../pages/projects.css";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * The owner's IDE verify switch for one project.
@@ -37,9 +38,9 @@ export function IdeVerifyPanel({
 
   return (
     <Panel title="IDE verify">
-      <Why lead="Lets an IDE session in this project's worktrees reach the núcleo's verify box.">
+      <Why lead={`Lets an IDE session in this project's worktrees reach the ${DAEMON_NAME}'s verify box.`}>
         <p>
-          On by default. While it is on, the núcleo keeps a daemon-owned{" "}
+          On by default. While it is on, the {DAEMON_NAME} keeps a daemon-owned{" "}
           <code>.mcp.json</code> and an approval in{" "}
           <code>.claude/settings.local.json</code> in every IDE worktree of the
           project, hidden from git, and checks for new worktrees every five
@@ -59,7 +60,7 @@ export function IdeVerifyPanel({
 
       {reported === undefined ? (
         <p className="pj-note">
-          The núcleo does not report this switch, so it cannot be changed from
+          The {DAEMON_NAME} does not report this switch, so it cannot be changed from
           here.
         </p>
       ) : stale ? (
@@ -139,7 +140,7 @@ function Report({ answer }: { answer: IdeVerifyAnswer }) {
 function IdeVerifyError({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the núcleo did not answer — IDE verify is unchanged</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} gave no reply — IDE verify is unchanged</ErrorNote>
     );
   }
   return (
@@ -147,7 +148,7 @@ function IdeVerifyError({ error }: { error: unknown }) {
       refusal={error}
       sentences={{
         forbidden: "only the owner's key can switch IDE verify",
-        not_found: "the núcleo has no row for this project",
+        not_found: `the ${DAEMON_NAME} has no row for this project`,
       }}
     />
   );

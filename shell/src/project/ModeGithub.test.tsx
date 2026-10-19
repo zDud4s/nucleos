@@ -431,7 +431,7 @@ describe("what the worktrees may run", () => {
     // `deny` wins, over an `allow` and over a compiled permission — in the section's one visible
     // sentence, in words rather than in the table's verdict names.
     expect(said).toMatch(/A refusal here beats a permission here/i);
-    expect(said).toContain("compiled into the núcleo");
+    expect(said).toContain("compiled into the background service");
     expect(said).toMatch(/never lifts a refusal/i);
 
     // And the worked example, one press away.
