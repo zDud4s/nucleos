@@ -97,6 +97,74 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
+/// Whether `error` is SQLite's "database is locked" (SQLITE_BUSY, any extended code such as
+/// BUSY_SNAPSHOT): another writer held the lock past busy_timeout, and the same write may pass now.
+pub fn is_busy(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == 5)
+}
+
+/// Run `op` up to `attempts` times, pausing `pause` between tries, while `busy` says its error is a
+/// busy database. Any other error, or the last busy one, is returned as it came.
+pub async fn retry_busy<T, E, Fut>(
+    attempts: u32,
+    pause: std::time::Duration,
+    busy: impl Fn(&E) -> bool,
+    mut op: impl FnMut() -> Fut,
+) -> Result<T, E>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        match op().await {
+            Err(error) if attempt < attempts && busy(&error) => {
+                tracing::info!(attempt, "storage: database busy, retrying the write");
+                attempt += 1;
+                tokio::time::sleep(pause).await;
+            }
+            done => return done,
+        }
+    }
+}
+
+/// How many times a write that ends something is tried while the database is busy. Each attempt
+/// already waits the pool's 10s busy_timeout, so the worst case is about 31s. Nothing that settles
+/// a run has an HTTP client waiting on it (they all run on background tasks), which is why this is
+/// more generous than the owner-facing `capture::BUSY_ATTEMPTS`. Never use it in a handler.
+pub const SETTLE_ATTEMPTS: u32 = 3;
+
+/// The pause between two attempts of [`settle_write`].
+pub const SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Tries a write that ends something (a run, an item, a seat) up to [`SETTLE_ATTEMPTS`] times while
+/// the database is busy, and logs at error level when it still fails. Returns whether it landed.
+///
+/// This replaces `let _ = sqlx::query("UPDATE runs SET status = ...")`: a terminal write that is
+/// dropped without a line leaves the run `running` until the next start sweeps it, the team item
+/// or council seat waiting on it stuck, and `cost_usd` NULL. `what` names the table or the kind of
+/// row and `id` its key, so the log line says which one.
+pub async fn settle_write<Fut>(what: &'static str, id: i64, mut op: impl FnMut() -> Fut) -> bool
+where
+    Fut: std::future::Future<Output = Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>>,
+{
+    match retry_busy(SETTLE_ATTEMPTS, SETTLE_PAUSE, is_busy, &mut op).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(
+                what,
+                id,
+                %error,
+                "storage: a terminal write was lost; the row keeps its old state"
+            );
+            false
+        }
+    }
+}
+
 /// A database on disk plus the directory holding it, for the tests that need a real file rather
 /// than `sqlite::memory:` — WAL behaviour, migrations against a fresh file, a handler parked on a
 /// pool while another connection watches it.
@@ -153,6 +221,156 @@ impl TempDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real SQLITE_BUSY: one connection holds the write lock, a second with no busy_timeout writes.
+    async fn a_busy_error() -> sqlx::Error {
+        let (_dir, _holder, other) = locked_database().await;
+        sqlx::query("INSERT INTO t VALUES (2)")
+            .execute(&other)
+            .await
+            .unwrap_err()
+    }
+
+    /// A database file whose write lock is held by the returned connection, and a pool on it that
+    /// does not wait for that lock.
+    async fn locked_database() -> (
+        tempfile::TempDir,
+        std::sync::Arc<tokio::sync::Mutex<sqlx::SqliteConnection>>,
+        SqlitePool,
+    ) {
+        use sqlx::{Connection, Executor};
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("settle.db"))
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let mut holder = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        holder.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
+        holder.execute("BEGIN IMMEDIATE").await.unwrap();
+        holder.execute("INSERT INTO t VALUES (1)").await.unwrap();
+        let other = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.busy_timeout(std::time::Duration::ZERO))
+            .await
+            .unwrap();
+        (
+            dir,
+            std::sync::Arc::new(tokio::sync::Mutex::new(holder)),
+            other,
+        )
+    }
+
+    #[tokio::test]
+    async fn is_busy_moved_keeps_its_answer() {
+        assert!(is_busy(&a_busy_error().await));
+        assert!(!is_busy(&sqlx::Error::RowNotFound));
+        let pool = crate::testdb::fresh_pool().await;
+        let syntax = sqlx::query("SELEC 1").execute(&pool).await.unwrap_err();
+        assert!(!is_busy(&syntax));
+    }
+
+    #[tokio::test]
+    async fn settle_write_retries_a_busy_write_and_lands_it() {
+        use sqlx::Executor;
+        let (_dir, holder, other) = locked_database().await;
+        let mut calls = 0u32;
+        let landed = settle_write("test row", 7, || {
+            calls += 1;
+            let first = calls == 1;
+            let holder = holder.clone();
+            let other = other.clone();
+            async move {
+                let outcome = sqlx::query("INSERT INTO t VALUES (2)")
+                    .execute(&other)
+                    .await;
+                if first {
+                    // The lock is released right after the first attempt failed against it.
+                    holder.lock().await.execute("ROLLBACK").await.unwrap();
+                }
+                outcome
+            }
+        })
+        .await;
+        assert!(landed);
+        assert_eq!(calls, 2);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t WHERE x = 2")
+            .fetch_one(&other)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Collects what the daemon logs while a test runs.
+    #[derive(Clone, Default)]
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> LogSink {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_write_gives_up_after_three_busy_attempts_and_says_so() {
+        let (_dir, _holder, other) = locked_database().await;
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let mut calls = 0u32;
+        let landed = {
+            // Scoped and thread-local: sound because `#[tokio::test]` polls on this thread.
+            let _scope = tracing::subscriber::set_default(subscriber);
+            settle_write("test row", 42, || {
+                calls += 1;
+                let other = other.clone();
+                async move {
+                    sqlx::query("INSERT INTO t VALUES (2)")
+                        .execute(&other)
+                        .await
+                }
+            })
+            .await
+        };
+        assert!(!landed);
+        assert_eq!(calls, SETTLE_ATTEMPTS);
+        let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("ERROR"), "{logged}");
+        assert!(logged.contains("test row"), "{logged}");
+        assert!(logged.contains("42"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn settle_write_does_not_retry_an_error_that_is_not_busy() {
+        let pool = crate::testdb::fresh_pool().await;
+        let mut calls = 0u32;
+        let landed = settle_write("test row", 1, || {
+            calls += 1;
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE no_such_table SET x = 1")
+                    .execute(&pool)
+                    .await
+            }
+        })
+        .await;
+        assert!(!landed);
+        assert_eq!(calls, 1);
+    }
 
     /// Two branches, two migrations, one number, and a merge that says nothing.
     ///

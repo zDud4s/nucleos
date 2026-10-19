@@ -446,42 +446,9 @@ pub const BUSY_ATTEMPTS: u32 = 2;
 /// The pause before a retry, so it does not land on the same writer's next statement.
 pub const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Whether `error` is SQLite's "database is locked" (SQLITE_BUSY, any extended code such as
-/// BUSY_SNAPSHOT): another writer held the lock past busy_timeout, and the same write may pass now.
-pub fn is_busy(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(|db| db.code())
-        .and_then(|code| code.parse::<i32>().ok())
-        .is_some_and(|code| code & 0xff == 5)
-}
-
-/// Run `op` up to `attempts` times, pausing `pause` between tries, while `busy` says its error is a
-/// busy database. Any other error, or the last busy one, is returned as it came.
-pub async fn retry_busy<T, E, Fut>(
-    attempts: u32,
-    pause: std::time::Duration,
-    busy: impl Fn(&E) -> bool,
-    mut op: impl FnMut() -> Fut,
-) -> Result<T, E>
-where
-    Fut: std::future::Future<Output = Result<T, E>>,
-{
-    let mut attempt = 1;
-    loop {
-        match op().await {
-            Err(error) if attempt < attempts && busy(&error) => {
-                tracing::info!(
-                    attempt,
-                    "capture: database busy, retrying the owner's write"
-                );
-                attempt += 1;
-                tokio::time::sleep(pause).await;
-            }
-            done => return done,
-        }
-    }
-}
+// The busy-database helpers live in the shared storage layer now, because writes that end a run
+// need them too; re-exported so the callers here and in `http/knowledge.rs` keep their path.
+pub use nucleos_base::storage::{is_busy, retry_busy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listing {
