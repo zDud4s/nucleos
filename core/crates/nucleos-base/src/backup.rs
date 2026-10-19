@@ -1,4 +1,4 @@
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Serialize;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -11,9 +11,28 @@ use std::time::Duration;
 
 pub const DEFAULT_RETENTION: usize = 10;
 
+/// Automatic copies kept. Two weekly snapshots of a database that is hundreds of megabytes is the
+/// ceiling the owner chose (2026-10-19); the manual copies are never counted against it.
+pub const AUTO_RETENTION: usize = 2;
+
+/// How long the newest automatic copy stays good before the maintenance loop takes another.
+pub const AUTO_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Marks a copy the daemon took on its own, so pruning and listing can tell it from a manual one.
+const AUTO_PREFIX: &str = "auto-";
+
+/// Who took a snapshot: a person pressing the button, or the maintenance loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupKind {
+    Manual,
+    Auto,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupInfo {
     pub name: String,
+    pub kind: BackupKind,
     pub migration_version: Option<i64>,
     pub size_bytes: u64,
 }
@@ -90,9 +109,57 @@ pub async fn take_backup(pool: &SqlitePool, retention: usize) -> Result<BackupIn
         return Err(BackupError::InvalidRetention);
     }
     let db_path = database_path(pool).await?;
-    let (info, _) = snapshot(pool, &db_path).await?;
-    prune_backups(&db_path, retention, &info.name)?;
+    let (info, _) = snapshot(pool, &db_path, BackupKind::Manual).await?;
+    prune_backups(&db_path, retention, &info.name, BackupKind::Manual)?;
     Ok(info)
+}
+
+/// The same snapshot as [`take_backup`], named `auto-nucleos-...` and pruned against its own
+/// retention: only `auto-` files are ever removed here, and a manual backup never counts toward
+/// (or is removed by) the automatic ones.
+pub async fn take_auto_backup(
+    pool: &SqlitePool,
+    retention: usize,
+) -> Result<BackupInfo, BackupError> {
+    if retention == 0 {
+        return Err(BackupError::InvalidRetention);
+    }
+    let db_path = database_path(pool).await?;
+    let (info, _) = snapshot(pool, &db_path, BackupKind::Auto).await?;
+    prune_backups(&db_path, retention, &info.name, BackupKind::Auto)?;
+    Ok(info)
+}
+
+/// Whether the newest automatic copy (taken at `last`, `None` when there is none) is old enough
+/// that another is due. A `last` in the future (a clock that went backwards) is not due.
+pub fn auto_backup_due(last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match last {
+        None => true,
+        Some(last) => now
+            .signed_duration_since(last)
+            .to_std()
+            .is_ok_and(|age| age >= AUTO_INTERVAL),
+    }
+}
+
+/// Takes an automatic copy when [`auto_backup_due`] says so, and returns it; `None` means the
+/// newest one is still fresh. The age comes from the file name, so it survives a daemon restart.
+pub async fn take_auto_backup_if_due(
+    pool: &SqlitePool,
+    retention: usize,
+    now: DateTime<Utc>,
+) -> Result<Option<BackupInfo>, BackupError> {
+    let db_path = database_path(pool).await?;
+    let last = list_backup_files(&db_path)?
+        .into_iter()
+        .filter(|backup| backup.kind == BackupKind::Auto)
+        .filter_map(|backup| split_name(&backup.name).ok().map(|parts| parts.timestamp))
+        .max()
+        .map(|taken| taken.and_utc());
+    if !auto_backup_due(last, now) {
+        return Ok(None);
+    }
+    take_auto_backup(pool, retention).await.map(Some)
 }
 
 pub async fn list_backups(pool: &SqlitePool) -> Result<Vec<BackupInfo>, BackupError> {
@@ -141,7 +208,7 @@ pub async fn apply_pending_restore(db_path: &Path) -> Result<Option<AppliedResto
         let live_pool = open_existing(db_path).await?;
         let safety_result = async {
             verify_backup(&live_pool, &source).await?;
-            snapshot(&live_pool, db_path).await
+            snapshot(&live_pool, db_path, BackupKind::Manual).await
         }
         .await;
         live_pool.close().await;
@@ -235,11 +302,23 @@ async fn database_path(pool: &SqlitePool) -> Result<PathBuf, BackupError> {
     Ok(PathBuf::from(path))
 }
 
-fn validate_name(name: &str) -> Result<(), BackupError> {
+/// The parts of a backup file name: `[auto-]nucleos-<timestamp>-<sequence>.db`.
+struct NameParts<'a> {
+    kind: BackupKind,
+    timestamp: NaiveDateTime,
+    /// `<timestamp>-<sequence>`: fixed width, so it orders chronologically whatever the kind.
+    stem: &'a str,
+}
+
+fn split_name(name: &str) -> Result<NameParts<'_>, BackupError> {
     if name.contains("..") || name.contains('/') || name.contains('\\') {
         return Err(BackupError::InvalidName);
     }
-    let stem = name
+    let (kind, rest) = match name.strip_prefix(AUTO_PREFIX) {
+        Some(rest) => (BackupKind::Auto, rest),
+        None => (BackupKind::Manual, name),
+    };
+    let stem = rest
         .strip_prefix("nucleos-")
         .and_then(|value| value.strip_suffix(".db"))
         .ok_or(BackupError::InvalidName)?;
@@ -247,9 +326,17 @@ fn validate_name(name: &str) -> Result<(), BackupError> {
     if sequence.len() != 4 || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(BackupError::InvalidName);
     }
-    NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%S%.9fZ")
+    let timestamp = NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%S%.9fZ")
         .map_err(|_| BackupError::InvalidName)?;
-    Ok(())
+    Ok(NameParts {
+        kind,
+        timestamp,
+        stem,
+    })
+}
+
+fn validate_name(name: &str) -> Result<(), BackupError> {
+    split_name(name).map(|_| ())
 }
 
 fn resolve_backup(db_path: &Path, name: &str) -> Result<PathBuf, BackupError> {
@@ -297,12 +384,16 @@ fn read_recorded_backup(db_path: &Path, marker: &Path) -> Result<PathBuf, Backup
     Ok(resolved)
 }
 
-fn next_backup_path(db_path: &Path) -> Result<(String, PathBuf), BackupError> {
+fn next_backup_path(db_path: &Path, kind: BackupKind) -> Result<(String, PathBuf), BackupError> {
     let directory = backup_dir(db_path)?;
     fs::create_dir_all(&directory)?;
     let timestamp = Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
+    let prefix = match kind {
+        BackupKind::Manual => "",
+        BackupKind::Auto => AUTO_PREFIX,
+    };
     for sequence in 0..=9999 {
-        let name = format!("nucleos-{timestamp}-{sequence:04}.db");
+        let name = format!("{prefix}nucleos-{timestamp}-{sequence:04}.db");
         let path = directory.join(&name);
         if !path.exists() {
             return Ok((name, path));
@@ -311,8 +402,12 @@ fn next_backup_path(db_path: &Path) -> Result<(String, PathBuf), BackupError> {
     Err(BackupError::ExistingTarget(directory))
 }
 
-async fn snapshot(pool: &SqlitePool, db_path: &Path) -> Result<(BackupInfo, PathBuf), BackupError> {
-    let (name, path) = next_backup_path(db_path)?;
+async fn snapshot(
+    pool: &SqlitePool,
+    db_path: &Path,
+    kind: BackupKind,
+) -> Result<(BackupInfo, PathBuf), BackupError> {
+    let (name, path) = next_backup_path(db_path, kind)?;
     if path.exists() {
         return Err(BackupError::ExistingTarget(path));
     }
@@ -337,6 +432,7 @@ async fn snapshot(pool: &SqlitePool, db_path: &Path) -> Result<(BackupInfo, Path
     Ok((
         BackupInfo {
             name,
+            kind,
             migration_version: Some(version),
             size_bytes,
         },
@@ -356,24 +452,42 @@ fn list_backup_files(db_path: &Path) -> Result<Vec<BackupInfo>, BackupError> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if validate_name(&name).is_err() {
+        let Ok(parts) = split_name(&name) else {
             continue;
-        }
-        backups.push(BackupInfo {
-            name,
-            migration_version: None,
-            size_bytes: entry.metadata()?.len(),
-        });
+        };
+        let kind = parts.kind;
+        let stem = parts.stem.to_owned();
+        backups.push((
+            stem,
+            BackupInfo {
+                name,
+                kind,
+                migration_version: None,
+                size_bytes: entry.metadata()?.len(),
+            },
+        ));
     }
-    backups.sort_by(|left, right| right.name.cmp(&left.name));
-    Ok(backups)
+    // Newest first by the timestamp inside the name, not the whole name: the `auto-` prefix would
+    // otherwise sort every automatic copy ahead of every manual one.
+    backups.sort_by(|left, right| right.0.cmp(&left.0));
+    Ok(backups.into_iter().map(|(_, info)| info).collect())
 }
 
-fn prune_backups(db_path: &Path, retention: usize, just_taken: &str) -> Result<(), BackupError> {
+/// Prunes one kind only: `retention` counts the copies of `kind`, and the other kind is neither
+/// counted nor touched.
+fn prune_backups(
+    db_path: &Path,
+    retention: usize,
+    just_taken: &str,
+    kind: BackupKind,
+) -> Result<(), BackupError> {
     if retention == 0 {
         return Err(BackupError::InvalidRetention);
     }
-    let backups = list_backup_files(db_path)?;
+    let backups: Vec<BackupInfo> = list_backup_files(db_path)?
+        .into_iter()
+        .filter(|backup| backup.kind == kind)
+        .collect();
     let mut keep = HashSet::from([just_taken.to_owned()]);
 
     // A restore staged before another backup request must not have its source pruned away.
@@ -383,6 +497,7 @@ fn prune_backups(db_path: &Path, retention: usize, just_taken: &str) -> Result<(
         && let Some(name) = Path::new(&source)
             .file_name()
             .and_then(|name| name.to_str())
+        && split_name(name).is_ok_and(|parts| parts.kind == kind)
     {
         keep.insert(name.to_owned());
     }
@@ -695,5 +810,152 @@ mod tests {
         assert!(take_backup(&db.pool, 0).await.is_err());
         assert_eq!(list_backups(&db.pool).await.unwrap().len(), 2);
         db.close().await;
+    }
+
+    async fn listed_names(pool: &SqlitePool) -> Vec<String> {
+        list_backups(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|item| item.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_auto_backup_prunes_only_auto_backups() {
+        let db = TempDb::new().await;
+        let manual_first = take_backup(&db.pool, 10).await.unwrap();
+        let manual_second = take_backup(&db.pool, 10).await.unwrap();
+
+        let auto_first = take_auto_backup(&db.pool, 2).await.unwrap();
+        let auto_second = take_auto_backup(&db.pool, 2).await.unwrap();
+        let auto_newest = take_auto_backup(&db.pool, 2).await.unwrap();
+        let names = listed_names(&db.pool).await;
+
+        assert!(
+            !names.contains(&auto_first.name),
+            "the oldest automatic copy is pruned"
+        );
+        assert!(names.contains(&auto_second.name));
+        assert!(names.contains(&auto_newest.name));
+        assert!(
+            names.contains(&manual_first.name) && names.contains(&manual_second.name),
+            "an automatic copy never removes a manual one"
+        );
+
+        // And the other way round: a manual copy with a tiny retention leaves the automatic ones.
+        let manual_newest = take_backup(&db.pool, 1).await.unwrap();
+        let names = listed_names(&db.pool).await;
+        assert!(names.contains(&manual_newest.name));
+        assert!(!names.contains(&manual_second.name));
+        assert!(names.contains(&auto_second.name) && names.contains(&auto_newest.name));
+        assert!(take_auto_backup(&db.pool, 0).await.is_err());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn list_backups_says_which_are_auto() {
+        let db = TempDb::new().await;
+        let manual = take_backup(&db.pool, 5).await.unwrap();
+        let auto = take_auto_backup(&db.pool, 5).await.unwrap();
+        assert!(auto.name.starts_with("auto-nucleos-"));
+        assert!(manual.name.starts_with("nucleos-"));
+
+        let listed = list_backups(&db.pool).await.unwrap();
+        let kind_of = |name: &str| listed.iter().find(|item| item.name == name).unwrap().kind;
+        assert_eq!(kind_of(&manual.name), BackupKind::Manual);
+        assert_eq!(kind_of(&auto.name), BackupKind::Auto);
+        assert_eq!(
+            listed[0].name, auto.name,
+            "newest first by the timestamp, whatever the prefix"
+        );
+        assert_eq!(serde_json::to_value(&listed[0]).unwrap()["kind"], "auto");
+        assert_eq!(serde_json::to_value(&listed[1]).unwrap()["kind"], "manual");
+        db.close().await;
+    }
+
+    #[test]
+    fn an_auto_backup_is_due_only_after_a_week() {
+        let now = Utc::now();
+        let days = chrono::Duration::days;
+        assert!(auto_backup_due(None, now), "no automatic copy yet");
+        assert!(!auto_backup_due(Some(now - days(1)), now));
+        assert!(!auto_backup_due(Some(now - days(6)), now));
+        assert!(auto_backup_due(Some(now - days(7)), now));
+        assert!(auto_backup_due(Some(now - days(30)), now));
+        assert!(
+            !auto_backup_due(Some(now + days(1)), now),
+            "a clock that went backwards does not trigger a copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_auto_backup_is_taken_once_per_interval() {
+        let db = TempDb::new().await;
+        let now = Utc::now();
+
+        let first = take_auto_backup_if_due(&db.pool, AUTO_RETENTION, now)
+            .await
+            .unwrap();
+        assert!(first.is_some(), "the first one is due at once");
+        let again = take_auto_backup_if_due(&db.pool, AUTO_RETENTION, now)
+            .await
+            .unwrap();
+        assert!(again.is_none(), "a fresh automatic copy is not repeated");
+        let next = take_auto_backup_if_due(
+            &db.pool,
+            AUTO_RETENTION,
+            now + chrono::Duration::days(8),
+        )
+        .await
+        .unwrap();
+        assert!(next.is_some(), "a week later the next one is due");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_manual_backup_does_not_postpone_the_automatic_one() {
+        let db = TempDb::new().await;
+        take_backup(&db.pool, 5).await.unwrap();
+        let taken = take_auto_backup_if_due(&db.pool, AUTO_RETENTION, Utc::now())
+            .await
+            .unwrap();
+        assert!(taken.is_some());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_auto_backup_can_be_staged_and_restored() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        create_probe(&db.pool, "kept").await;
+        let auto = take_auto_backup(&db.pool, 2).await.unwrap();
+
+        let staged = stage_restore(&db.pool, &auto.name).await.unwrap();
+        assert_eq!(staged.name, auto.name);
+        create_probe(&db.pool, "lost").await;
+        db.pool.close().await;
+
+        let applied = apply_pending_restore(&db_path)
+            .await
+            .unwrap()
+            .expect("a restore was pending");
+        assert_eq!(applied.restored_from, auto.name);
+        assert_eq!(probe_values(&db_path).await, vec!["kept"]);
+    }
+
+    #[test]
+    fn the_auto_prefix_does_not_loosen_name_validation() {
+        let ok = "auto-nucleos-20260729T010203.000000000Z-0000.db";
+        assert!(validate_name(ok).is_ok());
+        for bad in [
+            "auto-auto-nucleos-20260729T010203.000000000Z-0000.db",
+            "auto-nucleos-20260729T010203.000000000Z-0000.txt",
+            "auto-nucleos-20260729T010203.000000000Z-00.db",
+            "auto-../nucleos-20260729T010203.000000000Z-0000.db",
+            "auto-nucleos-notatime-0000.db",
+        ] {
+            assert!(validate_name(bad).is_err(), "{bad} must be refused");
+        }
     }
 }
