@@ -531,7 +531,7 @@ describe("Browser - the write grant", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Stop submitting" }));
     await afterDwell();
-    fireEvent.click(await screen.findByRole("button", { name: "Stop agents submitting forms on https://jira.example.org:443" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stop form submits" }));
 
     await waitFor(() => {
       expect(world.posted.some((one) => one.path === "/browser/readonly")).toBe(true);
