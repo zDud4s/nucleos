@@ -270,18 +270,24 @@ def daemon_binary_candidates(roots, os_name=None):
 
 
 def run_dir_candidates(main_root, os_name=None):
-    """The daemon binary as `scripts/run-daemon.ps1` stages it: `<parent of root>/.nucleos-run/`.
+    """The daemon binary as `scripts/run-daemon.ps1` stages it: `<dev home>/run/`, where the dev
+    home is `NUCLEOS_DEV_HOME`, else `<system drive>/nucleos-dev` on Windows.
 
     The daemon runs from that copy, not from a cargo target dir, so a machine that only ever
     starts it through the script may have no `nucleos-core` under any target dir at all -- and
     the guard refused every queue operation, `--land` included, for a token it never looked for
     where it was. This is the script's default `-RunDir`; a run dir moved elsewhere is not found.
+    `<parent of root>/.nucleos-run/`, the default before 2026-10-19, is still looked at last, for
+    a daemon staged there that has not been restaged since.
     """
     os_name = os.name if os_name is None else os_name
     names = ("nucleos-core.exe", "nucleos-core") if os_name == "nt" else (
         "nucleos-core", "nucleos-core.exe")
-    run_dir = os.path.join(os.path.dirname(main_root), ".nucleos-run")
-    return [os.path.join(run_dir, name) for name in names]
+    home = os.environ.get("NUCLEOS_DEV_HOME") or (
+        (os.environ.get("SystemDrive") or "C:") + "\\nucleos-dev" if os_name == "nt" else None)
+    run_dirs = ([os.path.join(home, "run")] if home else []) + [
+        os.path.join(os.path.dirname(main_root), ".nucleos-run")]
+    return [os.path.join(run_dir, name) for run_dir in run_dirs for name in names]
 
 
 def daemon_binaries(main_root):
