@@ -80,10 +80,9 @@ export interface Transition {
  * 2. **Speech starting while the agent talks is barge-in, not noise.** It stops the playback in the
  *    same transition that starts recording — one decision, so there is no window in which the answer
  *    is still audible and the person is already being recorded over it.
- * 3. **Speech starting while the agent THINKS is kept, not dropped.** The núcleo queues it
- *    (`send_or_queue`), so the cost of accepting is a wait and the cost of refusing is a lost
- *    sentence. This is the opposite call from the dictation hotkey, which absorbs presses — and the
- *    reason differs too: two dictations race into one window, while two questions merely queue.
+ * 3. **Speech starting while the agent THINKS is ignored.** Reversed by the owner on 2026-10-18:
+ *    it used to be recorded and queued behind the turn in flight (`send_or_queue`), and in use that
+ *    answered a sentence the person had already moved past. Barge-in starts once the answer plays.
  * 4. **One turn at a time.** Sending a new turn abandons whatever answer was still arriving. That is
  *    what somebody who interrupts means, and tracking two would mean deciding which one gets the
  *    speaker.
@@ -132,8 +131,7 @@ export function onConversationEvent(
       switch (event.type) {
         case "answerStarted":
           return { phase: "speaking", action: "nothing" };
-        case "speechStarted":
-          return { phase: "hearing", action: "startRecording" };
+        // `speechStarted` falls to the default: ignored (rule 3).
         // A turn that produced no speech at all, and a turn that was refused, both end the same way:
         // back to listening. The difference is worth showing on screen and is not worth a phase —
         // the microphone's state is identical either way.

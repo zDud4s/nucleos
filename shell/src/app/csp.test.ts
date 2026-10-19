@@ -52,4 +52,17 @@ describe.each(POLICIES)("the %s policy", (_name, policy) => {
     expect(scriptSrc).toContain("'wasm-unsafe-eval'");
     expect(scriptSrc).not.toContain("'unsafe-eval'");
   });
+
+  /**
+   * The conversation mode plays every spoken answer from a `blob:` URL (`data/conversation.ts`,
+   * `play`). With no `media-src` the directive falls back to `default-src 'self'`, which refuses
+   * `blob:` — the `<audio>` element fires `error` and the window says "the answer could not be
+   * played", after the turn was heard and answered. Same shape as the WebAssembly case above: the
+   * pipeline works end to end and the last step is refused by a policy nobody looked at.
+   */
+  it("lets an answer play from a blob: URL", () => {
+    const mediaSrc = (policy["media-src"] ?? "").split(/\s+/);
+
+    expect(mediaSrc).toContain("blob:");
+  });
 });

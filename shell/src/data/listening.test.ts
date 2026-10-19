@@ -100,6 +100,35 @@ beforeEach(() => {
 });
 
 describe("useListening", () => {
+  /* Every frame here is 512 samples AT 16 kHz — Silero's input, and the unit `hangoverFrames` and
+     `PREROLL_FRAMES` count in. A context left at the device's own rate (48 kHz on an ordinary
+     microphone) hands Silero speech three times too fast and shrinks every one of those durations to a
+     third: a 640 ms hangover becomes ~210 ms, so each pause for breath ends a segment, and whisper gets
+     fragments. This suite's fake used to report 16 kHz whatever it was asked, which is how it hid. */
+  it("asks for a 16 kHz context, whatever rate the device runs at", async () => {
+    const asked: Array<AudioContextOptions | undefined> = [];
+    const base = window.AudioContext;
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: class extends (base as unknown as new () => object) {
+        sampleRate: number;
+        constructor(options?: AudioContextOptions) {
+          super();
+          asked.push(options);
+          this.sampleRate = options?.sampleRate ?? 48_000;
+        }
+      },
+    });
+
+    const { result } = await anOpenMicrophone();
+    expect(asked).toEqual([expect.objectContaining({ sampleRate: 16_000 })]);
+    act(() => {
+      result.current.record();
+      sendFrames(1, 0.1);
+    });
+    expect(result.current.take()?.rate).toBe(16_000);
+  });
+
   it("maps loudness the way this suite's amplitudes assume", () => {
     expect(energyOf(new Float32Array(FRAME_SAMPLES).fill(amplitudeFor(0.7)))).toBeCloseTo(0.7, 2);
   });

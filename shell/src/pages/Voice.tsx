@@ -124,7 +124,7 @@ export function Voice() {
      the page because the room draws it in four places — the stage, the captions, the dock and the
      header's badge — and they all read this one view. */
   const chat = useVoiceChat();
-  const voice = useVoiceConversation(chat.chatId);
+  const voice = useVoiceConversation(chat.chatId, { pushToTalk: true });
   const [opening, setOpening] = useState(false);
   /* The same fact as `opening`, readable inside an await. A chord pressed while the button's own
      request is in flight would otherwise open the conversation twice, and two `POST`s before either
@@ -154,6 +154,7 @@ export function Voice() {
   }
 
   useChordRequest(config.data?.armed, press);
+  useSpaceToTalk(on, voice.pressTalk, voice.releaseTalk);
 
   /* The archive: the memos, the dictations and the configuration, in a drawer that is not on the page
      until somebody asks for it. */
@@ -528,6 +529,52 @@ const SILENCE_SENTENCES: Record<SilenceReason, string> = {
 };
 
 /**
+ * Push-to-talk on Space, held, while the conversation is on — the owner's choice of 2026-10-18.
+ *
+ * On the window rather than on a control, so it works wherever focus sits on this page, except where
+ * Space is text. `preventDefault` on both edges is not tidiness: with focus on the Stop button, Space
+ * would otherwise click it on the way up and end the conversation it was meant to talk into. Losing
+ * the window mid-press counts as letting go, or the key-up never arrives and the recording never ends.
+ */
+function useSpaceToTalk(on: boolean, press: () => void, release: () => void) {
+  const handlers = useRef({ press, release });
+  handlers.current = { press, release };
+
+  useEffect(() => {
+    if (!on) return;
+    let held = false;
+    const typing = (target: EventTarget | null) =>
+      target instanceof HTMLElement &&
+      (target.isContentEditable || target.closest("input, textarea, select, [contenteditable]") !== null);
+    const letGo = () => {
+      if (!held) return;
+      held = false;
+      handlers.current.release();
+    };
+    const down = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || typing(event.target)) return;
+      event.preventDefault();
+      if (event.repeat || held) return;
+      held = true;
+      handlers.current.press();
+    };
+    const up = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || !held) return;
+      event.preventDefault();
+      letGo();
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", letGo);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", letGo);
+    };
+  }, [on]);
+}
+
+/**
  * The dock's diagnostics: the microphone's level against the bar, why nothing opened a turn, and
  * anything that stopped the conversation working. What was heard, and what is being assembled, are
  * the captions' now - said once, where the eye already is.
@@ -566,6 +613,7 @@ function ConversationStatus({ voice }: { voice: ConversationView }) {
         </span>
       )}
       {!on && <span>microphone closed</span>}
+      {voice.phase === "listening" && <span>hold Space to talk</span>}
       {voice.silence !== null && <span>{SILENCE_SENTENCES[voice.silence]}</span>}
       {/* A silently dropped segment looks exactly like a failed microphone, so say when the answer was
           heard again and deliberately not treated as a turn. */}

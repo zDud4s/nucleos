@@ -58,7 +58,7 @@ interface FakeProcessor {
 }
 
 let processor: FakeProcessor;
-let player: { onended: (() => void) | null; onerror: (() => void) | null; play: ReturnType<typeof vi.fn> } | null;
+let player: { onended: (() => void) | null; onerror: (() => void) | null; play: ReturnType<typeof vi.fn>; pause: ReturnType<typeof vi.fn> } | null;
 let now: ReturnType<typeof vi.spyOn>;
 
 const QUESTION = "como vai estar o tempo em Lisboa?";
@@ -597,5 +597,96 @@ describe("useVoiceConversation", () => {
 
     // The fake Audio has no captureStream, so nothing can be attached.
     expect(result.current.answerTap.level()).toBe(0);
+  });
+});
+
+/**
+ * Push-to-talk, asked for by the owner on 2026-10-18: the turn is exactly what is said while Space
+ * is held. Speech alone opens nothing, and letting go sends — no closing word.
+ */
+describe("push-to-talk", () => {
+  async function openPushToTalk() {
+    const hook = renderHook(() => useVoiceConversation("chat-1", { pushToTalk: true }));
+    act(() => hook.result.current.toggle());
+    await waitFor(() => expect(hook.result.current.phase).toBe("listening"));
+    return hook.result;
+  }
+
+  it("speech alone opens no turn", async () => {
+    const result = await openPushToTalk();
+
+    act(() => {
+      sendFrames(4, 1);
+      sendFrames(25, 0);
+    });
+
+    expect(result.current.phase).toBe("listening");
+    expect(voice.postSegment).not.toHaveBeenCalled();
+  });
+
+  it("holding records, and letting go sends what was said without a closing word", async () => {
+    voice.postSegment.mockResolvedValueOnce({ text: QUESTION, verdict: "continues" });
+    voice.fetchSpeechUnit.mockResolvedValueOnce({ type: "ended" });
+    const result = await openPushToTalk();
+
+    act(() => result.current.pressTalk());
+    expect(result.current.phase).toBe("hearing");
+    act(() => sendFrames(20, 0.5));
+    act(() => result.current.releaseTalk());
+
+    await waitFor(() =>
+      expect(client.apiFetch).toHaveBeenCalledWith(
+        "/assistant/message",
+        expect.objectContaining({ body: expect.stringContaining(QUESTION) }),
+      ),
+    );
+    expect(voice.postSegment).toHaveBeenCalledTimes(1);
+    expect(result.current.heard).toBe(QUESTION);
+  });
+
+  it("a release that heard nothing goes back to listening and sends nothing", async () => {
+    voice.postSegment.mockResolvedValueOnce({ text: "", verdict: "continues" });
+    const result = await openPushToTalk();
+
+    act(() => result.current.pressTalk());
+    act(() => result.current.releaseTalk());
+
+    await waitFor(() => expect(result.current.phase).toBe("listening"));
+    expect(client.apiFetch).not.toHaveBeenCalledWith("/assistant/message", expect.anything());
+  });
+
+  it("a press while it is thinking does nothing", async () => {
+    let finish!: (value: { turn_id: number }) => void;
+    client.apiFetch.mockImplementation((path: string) => {
+      if (path === "/assistant/message") return new Promise((resolve) => (finish = resolve));
+      throw new Error(`unexpected path: ${path}`);
+    });
+    voice.postSegment.mockResolvedValueOnce({ text: QUESTION, verdict: "continues" });
+    const result = await openPushToTalk();
+    act(() => result.current.pressTalk());
+    act(() => result.current.releaseTalk());
+    await waitFor(() => expect(result.current.phase).toBe("thinking"));
+
+    act(() => result.current.pressTalk());
+
+    expect(result.current.phase).toBe("thinking");
+    void finish;
+  });
+
+  it("pressing while the answer plays interrupts it and records", async () => {
+    voice.postSegment.mockResolvedValueOnce({ text: QUESTION, verdict: "continues" });
+    voice.fetchSpeechUnit
+      .mockResolvedValueOnce({ type: "audio", wav: new Blob(["wav"]) })
+      .mockResolvedValueOnce({ type: "ended" });
+    playGate = new Promise<void>(() => {});
+    const result = await openPushToTalk();
+    act(() => result.current.pressTalk());
+    act(() => result.current.releaseTalk());
+    await waitFor(() => expect(result.current.phase).toBe("speaking"));
+
+    act(() => result.current.pressTalk());
+
+    expect(result.current.phase).toBe("hearing");
+    expect(player?.pause).toHaveBeenCalled();
   });
 });

@@ -109,6 +109,19 @@ export interface ConversationView {
   /** Per-frame reader of the answer's audio — read it in an animation frame, never keep it in React state. */
   answerTap: AnswerTap;
   toggle: () => void;
+  /** Push-to-talk: Space went down. Ignored unless the hook was asked for `pushToTalk`. */
+  pressTalk: () => void;
+  /** ...and came back up: what was recorded is the whole turn. */
+  releaseTalk: () => void;
+}
+
+export interface ConversationOptions {
+  /**
+   * The turn is exactly what is said while a key is held — asked for by the owner on 2026-10-18,
+   * after the closing word proved unreliable to transcribe. The gate stops opening turns (it still
+   * drives the meter), and letting go sends without waiting for "câmbio".
+   */
+  pushToTalk?: boolean;
 }
 
 /**
@@ -117,7 +130,12 @@ export interface ConversationView {
  * `chatId` is read through a ref rather than captured, because the audio graph outlives a re-render
  * and a captured id would keep sending turns to whichever chat was open when the microphone opened.
  */
-export function useVoiceConversation(chatId: string | null): ConversationView {
+export function useVoiceConversation(
+  chatId: string | null,
+  options: ConversationOptions = {},
+): ConversationView {
+  const pushToTalkRef = useRef(options.pushToTalk === true);
+  pushToTalkRef.current = options.pushToTalk === true;
   const [phase, setPhase] = useState<ConversationPhase>("off");
   const [heard, setHeard] = useState<string | null>(null);
   const [trouble, setTrouble] = useState<string | null>(null);
@@ -217,7 +235,12 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
    * trouble rather than a kind of quiet, and wiring the track's own `ended` event is a separate fix.
    */
   const updateListeningDiagnosis = useCallback(() => {
-    if (phaseRef.current !== "listening" || listeningFramesRef.current < SILENCE_AFTER_FRAMES) {
+    // Under push-to-talk silence is the ordinary state, not something to explain.
+    if (
+      pushToTalkRef.current ||
+      phaseRef.current !== "listening" ||
+      listeningFramesRef.current < SILENCE_AFTER_FRAMES
+    ) {
       publishSilence(null);
       return;
     }
@@ -376,7 +399,18 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     try {
       await new Promise<void>((done, fail) => {
         player.onended = () => done();
-        player.onerror = () => fail(new Error("the answer could not be played"));
+        // The engine's own reason, kept: a policy refusal ("URL safety check") and an undecodable
+        // unit ("DEMUXER_ERROR") need opposite fixes and otherwise read as the same sentence.
+        player.onerror = () => {
+          const why = player.error;
+          fail(
+            new Error(
+              why === null
+                ? "the answer could not be played"
+                : `the answer could not be played (${why.code}${why.message ? `: ${why.message}` : ""})`,
+            ),
+          );
+        };
         // Per unit, not per answer: the attack of each unit's first syllable is its loudest, least
         // cancelled moment, and an answer is many units long.
         unitStartedAtRef.current = performance.now();
@@ -430,6 +464,13 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
           elapsedMs,
         );
         if (generationRef.current !== generation) return;
+        if (pushToTalkRef.current) {
+          // The key was held on purpose, so there is no echo to judge and no closing word to wait for.
+          const said = segment.text.trim();
+          if (said === "") dispatchRef.current({ type: "turnDiscarded" });
+          else actOnTurnSignal({ type: "deliver", text: said });
+          return;
+        }
         // A late echo becomes the same empty continuing segment as a 204: no new transition is needed,
         // and the turn stays open for the person's actual words.
         const echo = nearAnswer && isEcho(segment.text, spokenRef.current);
@@ -440,7 +481,10 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
         publishAssembling();
         actOnTurnSignal(next.signal);
       } catch (error) {
-        if (generationRef.current === generation) setTrouble(sentenceFor(error));
+        if (generationRef.current !== generation) return;
+        setTrouble(sentenceFor(error));
+        // Otherwise a failed transcription leaves push-to-talk stuck in `hearing`.
+        if (pushToTalkRef.current) dispatchRef.current({ type: "turnDiscarded" });
       }
     });
   }, [actOnTurnSignal, publishAssembling]);
@@ -601,6 +645,11 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
       updateListeningDiagnosis();
     },
     onSignal: (signal) => {
+      // Refused, so the gate keeps re-arming: under push-to-talk only the key opens and ends a turn.
+      if (pushToTalkRef.current) return false;
+      // Refused rather than merely ignored by the machine, so the gate re-arms: someone still
+      // talking when the answer starts must still be able to barge in.
+      if (signal === "speechStarted" && phaseRef.current === "thinking") return false;
       if (
         signal === "speechStarted" &&
         phaseRef.current === "speaking" &&
@@ -634,6 +683,22 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
 
   const toggle = useCallback(() => dispatchRef.current({ type: "toggled" }), []);
 
+  /* Through the same events the gate would send, so the machine's rules hold unchanged: a press while
+     the answer plays is barge-in, a press while it thinks is ignored (rule 3). */
+  const pressTalk = useCallback(() => {
+    if (!pushToTalkRef.current) return;
+    const now = phaseRef.current;
+    if (now !== "listening" && now !== "speaking") return;
+    turnRef.current = EMPTY_TURN;
+    dispatchRef.current({ type: "speechStarted" });
+  }, []);
+
+  const releaseTalk = useCallback(() => {
+    if (!pushToTalkRef.current) return;
+    if (phaseRef.current !== "hearing" || listenerRef.current?.isRecording() !== true) return;
+    dispatchRef.current({ type: "speechEnded" });
+  }, []);
+
   return {
     phase,
     heard,
@@ -649,6 +714,8 @@ export function useVoiceConversation(chatId: string | null): ConversationView {
     answer,
     answerTap: tapRef.current.tap,
     toggle,
+    pressTalk,
+    releaseTalk,
   };
 }
 

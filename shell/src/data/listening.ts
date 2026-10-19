@@ -27,7 +27,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 
-import { durationMs } from "../lib/audio";
+import { durationMs, TARGET_SAMPLE_RATE } from "../lib/audio";
 import { loadSileroSession, SpeechProbe } from "../lib/silero";
 import {
   energyOf,
@@ -288,7 +288,11 @@ export function useListening(handlers: ListeningHandlers): Listening {
         const AudioContextCtor =
           window.AudioContext ??
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const context = new AudioContextCtor();
+        // 16 kHz, not the device's rate: every frame below is read as 512 samples at 16 kHz — by
+        // Silero, and by every duration the gate counts in frames. At 48 kHz speech reached Silero
+        // three times too fast and a 640 ms hangover ended segments after ~210 ms. The browser
+        // resamples the microphone into the context.
+        const context = new AudioContextCtor({ sampleRate: TARGET_SAMPLE_RATE });
         const source = context.createMediaStreamSource(stream);
         const processor = context.createScriptProcessor(BUFFER_SAMPLES, 1, 1);
         // Zero gain, for the reason `lib/capture.ts` records at length: the graph has to reach

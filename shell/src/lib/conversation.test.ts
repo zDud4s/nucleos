@@ -75,13 +75,13 @@ describe("the conversation mode", () => {
   });
 
   /**
-   * Rule 3, and the opposite call from the dictation hotkey. Two dictations race into one window;
-   * two questions merely queue, and the núcleo already knows how to queue one.
+   * Rule 3, reversed by the owner on 2026-10-18: while the agent thinks, talking does nothing. A
+   * sentence queued behind a turn in flight answered a question nobody was still asking.
    */
-  it("keeps a sentence said while the agent is still thinking", () => {
+  it("ignores speech while the agent is still thinking", () => {
     const interjection = onConversationEvent("thinking", { type: "speechStarted" });
 
-    expect(interjection).toEqual({ phase: "hearing", action: "startRecording" });
+    expect(interjection).toEqual({ phase: "thinking", action: "nothing" });
   });
 
   it("goes back to listening when the turn is refused, rather than waiting for audio that will never come", () => {

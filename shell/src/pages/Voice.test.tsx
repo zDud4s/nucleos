@@ -8,7 +8,12 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
    of which jsdom has. What this page decides about it — when to open a chat, what to draw from the
    view it returns — is exactly what is left to test here. `data/conversation.test.ts` holds the runner
    itself, against a faked audio graph. */
-const conversation = vi.hoisted(() => ({ useVoiceConversation: vi.fn(), toggle: vi.fn() }));
+const conversation = vi.hoisted(() => ({
+  useVoiceConversation: vi.fn(),
+  toggle: vi.fn(),
+  pressTalk: vi.fn(),
+  releaseTalk: vi.fn(),
+}));
 vi.mock("../data/conversation", () => conversation);
 
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
@@ -292,6 +297,8 @@ function aConversation(overrides: Record<string, unknown> = {}) {
     answer: null,
     answerTap: null,
     toggle: conversation.toggle,
+    pressTalk: conversation.pressTalk,
+    releaseTalk: conversation.releaseTalk,
     ...overrides,
   };
 }
@@ -737,5 +744,54 @@ describe("Voice — the room", () => {
     expect(room?.contains(canvas as Element)).toBe(true);
     // The orb stays where it was, inside the room.
     expect(room?.contains(container.querySelector("canvas.voice-orb"))).toBe(true);
+  });
+});
+
+describe("Voice — push-to-talk", () => {
+  beforeEach(() => {
+    conversation.pressTalk.mockReset();
+    conversation.releaseTalk.mockReset();
+  });
+
+  it("asks the conversation for push-to-talk", async () => {
+    await renderRoom({ phase: "listening" });
+
+    // The chat id is null here — this daemon has no chats — so only the options are asserted.
+    const options = conversation.useVoiceConversation.mock.calls.map((call) => call[1]);
+    expect(options).toContainEqual(expect.objectContaining({ pushToTalk: true }));
+  });
+
+  it("holding Space talks and letting go sends, once per press", async () => {
+    await renderRoom({ phase: "listening" });
+    await screen.findByRole("button", { name: /^(Start|Stop) talking$/ });
+
+    fireEvent.keyDown(window, { key: " ", code: "Space" });
+    fireEvent.keyDown(window, { key: " ", code: "Space", repeat: true });
+    fireEvent.keyUp(window, { key: " ", code: "Space" });
+
+    expect(conversation.pressTalk).toHaveBeenCalledTimes(1);
+    expect(conversation.releaseTalk).toHaveBeenCalledTimes(1);
+  });
+
+  it("Space typed into a text field is a space, not a turn", async () => {
+    await renderRoom({ phase: "listening" });
+    await screen.findByRole("button", { name: /^(Start|Stop) talking$/ });
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+
+    fireEvent.keyDown(field, { key: " ", code: "Space" });
+    fireEvent.keyUp(field, { key: " ", code: "Space" });
+
+    expect(conversation.pressTalk).not.toHaveBeenCalled();
+    field.remove();
+  });
+
+  it("Space does nothing while the mode is off", async () => {
+    await renderRoom({ phase: "off" });
+    await screen.findByRole("button", { name: /^(Start|Stop) talking$/ });
+
+    fireEvent.keyDown(window, { key: " ", code: "Space" });
+
+    expect(conversation.pressTalk).not.toHaveBeenCalled();
   });
 });
