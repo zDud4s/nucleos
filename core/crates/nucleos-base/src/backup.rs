@@ -345,7 +345,7 @@ pub async fn apply_pending_compaction(
 async fn apply_compaction(
     db_path: &Path,
     available_space: impl FnOnce(&Path) -> std::io::Result<u64>,
-    vacuum: &str,
+    vacuum: &'static str,
 ) -> Result<Option<Compacted>, BackupError> {
     let marker = compact_marker_path(db_path);
     if !marker.exists() {
@@ -424,7 +424,7 @@ async fn apply_compaction(
 async fn compact_database(
     pool: &SqlitePool,
     db_path: &Path,
-    vacuum: &str,
+    vacuum: &'static str,
 ) -> Result<(u64, PathBuf), BackupError> {
     let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
         .fetch_one(pool)

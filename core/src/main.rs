@@ -101,8 +101,10 @@ async fn main() {
     // (port override only) shares the primary's file and leaves the marker for the primary's next
     // start. A second unconfigured process on the same directory could still race, and SQLite's
     // locks keep the file safe; no exclusive lock is taken here.
-    let owns_database =
-        is_primary || data_dir_override.as_deref().is_some_and(|dir| !dir.is_empty());
+    let owns_database = is_primary
+        || data_dir_override
+            .as_deref()
+            .is_some_and(|dir| !dir.is_empty());
     if owns_database {
         match backup::apply_pending_compaction(&db_path, health::available_space).await {
             Ok(Some(compacted)) => tracing::warn!(
