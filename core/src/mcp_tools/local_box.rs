@@ -180,7 +180,8 @@ impl crate::models::local_agent::ToolBox for LocalToolBox {
 
     fn for_run(&self, run_id: i64) -> Option<Box<dyn crate::models::local_agent::ToolBox>> {
         Some(Box::new(LocalToolBox {
-            tools: NucleosTools::for_box(self.tools.client.for_run(run_id), McpBox::All),
+            tools: NucleosTools::for_box(self.tools.client.for_run(run_id), McpBox::All)
+                .sharing_boundary_with(&self.tools),
             pool: self.pool.clone(),
             allowed: self.allowed,
             granted: self.granted.clone(),
@@ -361,7 +362,7 @@ impl crate::models::local_agent::ToolBox for LocalToolBox {
         // different one.
         let untrusted = effect == ToolEffect::ReadsUntrusted;
         let text = if untrusted {
-            fence_untrusted(&text)
+            fence_untrusted(&text, self.tools.boundary_nonce())
         } else {
             text
         };
