@@ -685,5 +685,12 @@ pub async fn run_retention_loop(state: AppState, auto_backup: bool) {
                 Err(error) => tracing::warn!(%error, "consolidate: pass failed"),
             }
         }
+        // Last, so the pass's deletes are in the file before the log is folded back into it.
+        // Best-effort: a reader holding the log open just means the next hour tries again.
+        match crate::storage::truncate_wal(&state.pool).await {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!("storage: WAL checkpoint skipped, a reader is active"),
+            Err(error) => tracing::warn!(%error, "storage: WAL checkpoint failed"),
+        }
     }
 }

@@ -71,6 +71,11 @@ const MMAP_SIZE_BYTES: i64 = 256 * 1024 * 1024;
 /// heavy lifting.
 const CACHE_SIZE_KIB: i64 = 16 * 1024;
 
+/// After a checkpoint SQLite truncates the `-wal` file down to this size. Without it the file keeps
+/// the size of the largest burst it ever held (47 MB on the owner's machine) for as long as the
+/// daemon runs.
+pub const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
@@ -88,13 +93,123 @@ pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         // documentation: an orphaned row was free to exist and nothing said so.
         .foreign_keys(true)
         .pragma("mmap_size", MMAP_SIZE_BYTES.to_string())
-        .pragma("cache_size", (-CACHE_SIZE_KIB).to_string());
+        .pragma("cache_size", (-CACHE_SIZE_KIB).to_string())
+        .pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES.to_string());
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
         .await?;
     crate::storage::MIGRATOR.run(&pool).await?;
     Ok(pool)
+}
+
+/// Folds the write-ahead log back into the database file and truncates it to nothing. Returns
+/// whether it could: a reader that is mid-query makes SQLite give up with `busy` set rather than
+/// fail, and the next pass simply tries again, so `false` is not an error.
+pub async fn truncate_wal(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(pool)
+        .await?;
+    Ok(busy == 0)
+}
+
+/// What the database file itself occupies, for the "Space" panel. Everything except the page
+/// counts comes from the file system, so a database that is not file-backed reports sizes of zero.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DatabaseStats {
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub page_size: i64,
+    pub page_count: i64,
+    pub freelist_count: i64,
+    /// Pages a `VACUUM` would give back: the freelist, which the file keeps until then.
+    pub reclaimable_bytes: u64,
+}
+
+pub async fn database_stats(pool: &SqlitePool) -> Result<DatabaseStats, sqlx::Error> {
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size").fetch_one(pool).await?;
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count").fetch_one(pool).await?;
+    let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(pool)
+        .await?;
+    let (db_bytes, wal_bytes) = match database_file(pool).await? {
+        Some(path) => (
+            file_len(&path),
+            file_len(&sibling_with_suffix(&path, "-wal")),
+        ),
+        None => (0, 0),
+    };
+    Ok(DatabaseStats {
+        db_bytes,
+        wal_bytes,
+        page_size,
+        page_count,
+        freelist_count,
+        reclaimable_bytes: u64::try_from(freelist_count.saturating_mul(page_size)).unwrap_or(0),
+    })
+}
+
+/// The path of the live database file, or `None` for an in-memory one.
+pub async fn database_file(pool: &SqlitePool) -> Result<Option<std::path::PathBuf>, sqlx::Error> {
+    let rows: Vec<(i64, String, String)> = sqlx::query_as("PRAGMA database_list")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .find_map(|(_, name, file)| (name == "main" && !file.is_empty()).then_some(file))
+        .map(std::path::PathBuf::from))
+}
+
+fn sibling_with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |meta| meta.len())
+}
+
+/// Total size of every file under `path`; zero when it does not exist. Symlinks are not followed,
+/// so a link out of the folder cannot make the number describe somebody else's disk.
+pub fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_size(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |meta| meta.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// What `nucleos.db.*` files left beside the database (`nucleos.db.before-116-revert`, ...) occupy:
+/// everything named `<database>.<something>`. The WAL and shared-memory files are `<database>-wal`
+/// and `<database>-shm`, so the dot keeps them out.
+pub fn loose_files_bytes(db_path: &Path) -> u64 {
+    let (Some(directory), Some(name)) = (
+        db_path.parent(),
+        db_path.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return 0;
+    };
+    let prefix = format!("{name}.");
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            file_name.starts_with(&prefix)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+        .map(|entry| entry.metadata().map_or(0, |meta| meta.len()))
+        .sum()
 }
 
 /// A database on disk plus the directory holding it, for the tests that need a real file rather
@@ -502,5 +617,87 @@ mod tests {
         assert_eq!(row.2.as_deref(), Some("sess-abc"));
         assert_eq!(row.3, Some(0.42));
         db.close().await;
+    }
+
+    /// Fills a scratch table with `rows` rows of about 4 KiB each, in one write.
+    async fn fill_scratch(pool: &SqlitePool, rows: i64) {
+        sqlx::query("CREATE TABLE IF NOT EXISTS scratch (payload TEXT NOT NULL)")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < ?)              INSERT INTO scratch SELECT hex(randomblob(2048)) FROM c",
+        )
+        .bind(rows)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The limit is a per-connection pragma, so it has to be on every connection the pool opens,
+    /// and the checkpoint the retention loop runs has to leave the `-wal` empty rather than at
+    /// whatever size the last burst grew it to.
+    #[tokio::test]
+    async fn the_wal_is_capped_after_a_checkpoint() {
+        let db = TempDb::new().await;
+        let pool = &db.pool;
+
+        let limit: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(limit, WAL_SIZE_LIMIT_BYTES);
+
+        fill_scratch(pool, 200).await;
+        let before = database_stats(pool).await.unwrap();
+        assert!(before.wal_bytes > 0, "the writes sit in the WAL until a checkpoint");
+
+        assert!(truncate_wal(pool).await.unwrap(), "nothing else is reading");
+        let after = database_stats(pool).await.unwrap();
+        assert_eq!(after.wal_bytes, 0);
+        assert!(after.db_bytes >= before.page_size as u64 * 200 / 2);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn the_stats_count_the_pages_a_delete_leaves_behind() {
+        let db = TempDb::new().await;
+        let pool = &db.pool;
+        fill_scratch(pool, 200).await;
+        let full = database_stats(pool).await.unwrap();
+        assert_eq!(full.reclaimable_bytes, 0);
+
+        sqlx::query("DELETE FROM scratch").execute(pool).await.unwrap();
+        let emptied = database_stats(pool).await.unwrap();
+        assert!(emptied.freelist_count > 0);
+        assert_eq!(
+            emptied.reclaimable_bytes,
+            emptied.freelist_count as u64 * emptied.page_size as u64
+        );
+        db.close().await;
+    }
+
+    #[test]
+    fn folder_sizes_sum_nested_files_and_loose_copies_skip_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("nucleos.db");
+        for (name, len) in [
+            ("nucleos.db", 10),
+            ("nucleos.db-wal", 20),
+            ("nucleos.db-shm", 30),
+            ("nucleos.db.before-116-revert", 400),
+            ("nucleos.db.old", 500),
+            ("unrelated.db", 7000),
+        ] {
+            std::fs::write(dir.path().join(name), vec![0_u8; len]).unwrap();
+        }
+        assert_eq!(loose_files_bytes(&db), 900);
+
+        let nested = dir.path().join("backups").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("a"), vec![0_u8; 3]).unwrap();
+        std::fs::write(dir.path().join("backups").join("b"), vec![0_u8; 4]).unwrap();
+        assert_eq!(directory_size(&dir.path().join("backups")), 7);
+        assert_eq!(directory_size(&dir.path().join("missing")), 0);
     }
 }
