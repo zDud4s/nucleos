@@ -248,36 +248,36 @@ function rowOf(roster: readonly ProjectSummary[], id: string): ProjectSummary {
   return found;
 }
 
-/** The index's tabs, in the order they are drawn. */
-function tabs(): HTMLElement[] {
-  const index = screen.getByRole("tablist", { name: "Projects, most urgent first" });
-  return within(index).getAllByRole("tab");
+/** The roster list's options, in the order they are drawn. */
+function options(): HTMLElement[] {
+  const roster = screen.getByRole("listbox", { name: "All projects by urgency" });
+  return within(roster).getAllByRole("option");
 }
 
 /**
- * Which project each tab names, in order.
+ * Which project each option names, in order.
  *
- * A tab's text STARTS with its project's id (`describeProject`), whatever the sentence says after
- * it, so the id is read off the front rather than matched against the whole description.
+ * An option's text STARTS with its project's id, whatever the badge and the reading say after it,
+ * so the id is read off the front rather than matched against the whole row.
  */
-function tabOrder(): string[] {
-  return tabs().map(
-    (tab) =>
-      ROSTER_IDS.find((id) => tab.textContent?.startsWith(id) === true) ??
-      `unnamed: ${tab.textContent ?? ""}`,
+function optionOrder(): string[] {
+  return options().map(
+    (option) =>
+      ROSTER_IDS.find((id) => option.textContent?.startsWith(id) === true) ??
+      `unnamed: ${option.textContent ?? ""}`,
   );
 }
 
-/** The one selected tab — exactly one, or the index is lying about what the panel shows. */
-function selectedTab(): HTMLElement {
-  const chosen = tabs().filter((tab) => tab.getAttribute("aria-selected") === "true");
+/** The one selected option — exactly one, or the list is lying about what the panel shows. */
+function selectedOption(): HTMLElement {
+  const chosen = options().filter((option) => option.getAttribute("aria-selected") === "true");
   expect(chosen).toHaveLength(1);
   return chosen[0];
 }
 
-/** The focus panel under the fan: the selected project's setting, and nobody else's. */
+/** The focus panel beside the fan: the selected project's setting, and nobody else's. */
 function panel(): HTMLElement {
-  return screen.getByRole("tabpanel");
+  return screen.getByRole("region", { name: /^Setting for / });
 }
 
 /**
@@ -303,18 +303,18 @@ function press(key: string): void {
 }
 
 /**
- * Focus and selection land together on the tab at `index`.
+ * Focus and selection land together on the option at `index`.
  *
- * Selection follows focus in this index: the arrow that moves the ring also moves what the panel
- * is about, so a tab that took focus without being selected would be the one mismatch a keyboard
- * user could not see from where they are.
+ * Selection follows focus in this list: the arrow that moves the ring also moves what the panel
+ * is about, so an option that took focus without being selected would be the one mismatch a
+ * keyboard user could not see from where they are.
  */
 async function landsOn(index: number): Promise<void> {
   await waitFor(() => {
-    const all = tabs();
+    const all = options();
     expect(document.activeElement).toBe(all[index]);
     expect(all[index].getAttribute("aria-selected")).toBe("true");
-    expect(all.map((tab) => tab.getAttribute("tabindex"))).toEqual(
+    expect(all.map((option) => option.getAttribute("tabindex"))).toEqual(
       all.map((_, at) => (at === index ? "0" : "-1")),
     );
   });
@@ -322,48 +322,65 @@ async function landsOn(index: number): Promise<void> {
 
 describe("Autopilot - the carousel sets one project at a time, most urgent first", () => {
   /**
-   * The index above the fan is the keyboard's way in; the stage never takes focus.
+   * The roster list is the keyboard's way in; the stage never takes focus.
    *
-   * One tab stop and not four: the selected tab is `tabIndex` 0 and every other is -1, so Tab
-   * enters the index once and leaves it on the next press, and the arrows are what walk it. Three
-   * projects or more are a ring, so the arrows wrap; Home and End go to the ends.
+   * One tab stop and not four: the selected option is `tabIndex` 0 and every other is -1, so Tab
+   * enters the list once and leaves it on the next press, and the arrows are what walk it — down
+   * and right forward, up and left back. Three projects or more are a ring, so the arrows wrap;
+   * Home and End go to the ends. The fan follows the selection.
    */
-  it("the index is a tablist with one tab stop, and the arrows, home and end walk it", async () => {
+  it("the roster list is a listbox with one tab stop, and the arrows, home and end walk it", async () => {
     daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
 
     await renderCockpit();
 
-    const index = await screen.findByRole("tablist", { name: "Projects, most urgent first" });
-    expect(within(index).getAllByRole("tab")).toHaveLength(4);
-    expect(tabs().map((tab) => tab.getAttribute("tabindex"))).toEqual(["0", "-1", "-1", "-1"]);
-    expect(selectedTab()).toBe(tabs()[0]);
+    const roster = await screen.findByRole("listbox", { name: "All projects by urgency" });
+    expect(within(roster).getAllByRole("option")).toHaveLength(4);
+    expect(options().map((option) => option.getAttribute("tabindex"))).toEqual(["0", "-1", "-1", "-1"]);
+    expect(selectedOption()).toBe(options()[0]);
 
-    // Every tab controls the one panel, and the panel is labelled by whichever tab is selected.
-    const shown = panel();
-    expect(shown.id).not.toBe("");
-    for (const tab of tabs()) {
-      expect(tab.id).not.toBe("");
-      expect(tab.getAttribute("aria-controls")).toBe(shown.id);
-    }
-    expect(shown.getAttribute("aria-labelledby")).toBe(tabs()[0].id);
+    // The list controls the one panel, and the panel is named for the selected project.
+    expect(panel().id).not.toBe("");
+    expect(roster.getAttribute("aria-controls")).toBe(panel().id);
+    expect(panel().getAttribute("aria-label")).toBe("Setting for bravo");
 
-    tabs()[0].focus();
+    options()[0].focus();
+    press("ArrowDown");
+    await landsOn(1);
+    expect(panel().getAttribute("aria-label")).toBe("Setting for alpha");
+    // The fan follows: the card in focus is the selected project's.
+    expect(document.querySelector(".ap-fan-card-focus")?.textContent).toContain("alpha");
+
+    press("ArrowUp");
+    await landsOn(0);
     press("ArrowRight");
     await landsOn(1);
-    expect(panel().getAttribute("aria-labelledby")).toBe(tabs()[1].id);
-
     press("ArrowLeft");
     await landsOn(0);
-    // A ring: left of the first is the last, and right of the last is the first again.
-    press("ArrowLeft");
+    // A ring: before the first is the last, and after the last is the first again.
+    press("ArrowUp");
     await landsOn(3);
-    press("ArrowRight");
+    press("ArrowDown");
     await landsOn(0);
 
     press("End");
     await landsOn(3);
     press("Home");
     await landsOn(0);
+  });
+
+  it("selects a project with a click on its row, and the fan follows", async () => {
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: previewRoster() })));
+
+    await renderCockpit();
+
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
+    fireEvent.click(options()[2]);
+    await waitFor(() => {
+      expect(selectedOption().textContent?.startsWith("delta")).toBe(true);
+    });
+    expect(panel().getAttribute("aria-label")).toBe("Setting for delta");
+    expect(document.querySelector(".ap-fan-card-focus")?.textContent).toContain("delta");
   });
 
   /**
@@ -378,21 +395,30 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
 
     await renderCockpit();
 
-    await screen.findByRole("tablist", { name: "Projects, most urgent first" });
-    expect(tabOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
-    expect(selectedTab().textContent?.startsWith("bravo")).toBe(true);
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
+    expect(optionOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
+    expect(selectedOption().textContent?.startsWith("bravo")).toBe(true);
     expect(panel().querySelector(".ap-fan-focus-title strong")?.textContent).toBe("bravo");
 
-    // The list under the index names every project, the focused one marked, with the map's word
-    // for its mode (`active`, the daemon's literal, never "acting").
-    const roster = screen.getByRole("list", { name: "All projects by urgency" });
-    const current = roster.querySelector('[aria-current="true"]');
+    // The stage is drawing, not controls: hidden from assistive technology as a whole, so the
+    // focused card is read off the page by its class and not by any role.
+    const card = document.querySelector(".ap-fan-card-focus");
+    expect(card).not.toBeNull();
+    expect(card?.closest('[aria-hidden="true"]')).not.toBeNull();
+    expect(card?.textContent).toContain("bravo");
+    const cardWords = Array.from(card?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
+    expect(cardWords).toContain("active");
+    expect(cardWords).not.toContain("acting");
+
+    // The list names every project, the focused one selected, with the map's word for its mode
+    // (`active`, the daemon's literal, never "acting").
+    const current = selectedOption();
     expect(current?.textContent).toContain("bravo");
     const words = Array.from(current?.querySelectorAll(".ui-badge") ?? []).map((badge) => badge.textContent);
     expect(words).toContain("active");
     expect(words).not.toContain("acting");
 
-    // And the panels below follow the project the index opened on.
+    // And the panels below follow the project the fan opened on.
     expect(await screen.findByText("Nothing is waiting for a verdict on bravo.")).toBeDefined();
   });
 
@@ -403,17 +429,17 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
    * the change is not confirmed by a new line on screen — that would push the page down under the
    * hand that made it — only by the pressed segment, and aloud.
    */
-  it("does not reorder the index after a mode change and says the change only aloud", async () => {
+  it("does not reorder the list after a mode change and says the change only aloud", async () => {
     const world = cockpitWorld({ projects: previewRoster() });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));
 
     await renderCockpit();
 
-    await screen.findByRole("tablist", { name: "Projects, most urgent first" });
-    tabs()[0].focus();
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
+    options()[0].focus();
     press("ArrowRight");
     await landsOn(1);
-    expect(selectedTab().textContent?.startsWith("alpha")).toBe(true);
+    expect(selectedOption().textContent?.startsWith("alpha")).toBe(true);
 
     fireEvent.click(within(panel()).getByRole("button", { name: "Turn off" }));
 
@@ -424,8 +450,8 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     });
     expect(rowOf(world.projects, "alpha").mode).toBe("off");
 
-    expect(tabOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
-    expect(selectedTab().textContent?.startsWith("alpha")).toBe(true);
+    expect(optionOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
+    expect(selectedOption().textContent?.startsWith("alpha")).toBe(true);
 
     const said = `alpha is now off — ${MODE_MEANING.off}`;
     await waitFor(() => {
@@ -448,7 +474,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
 
     await renderCockpit();
 
-    await screen.findByRole("tablist", { name: "Projects, most urgent first" });
+    await screen.findByRole("listbox", { name: "All projects by urgency" });
 
     // bravo acts: the gate is passed, and the line says how to take it back.
     expect(gate().textContent).toBe(PROMOTION_ACTING);
@@ -461,7 +487,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
           "",
       );
 
-    tabs()[0].focus();
+    options()[0].focus();
     press("ArrowRight");
     await landsOn(1);
     expect(gate().textContent).toBe(PROMOTION_EARNED);
@@ -693,8 +719,8 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
       expect(document.querySelector(".ap-headline")?.textContent).toContain("1 watching in shadow");
     });
 
-    // One project is the whole index: nothing to choose between, so no tablist is drawn.
-    expect(screen.queryByRole("tablist")).toBeNull();
+    // One project is the whole roster: nothing to choose between, so no list is drawn.
+    expect(screen.queryByRole("listbox")).toBeNull();
   });
 
   /**
@@ -1289,7 +1315,7 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
     expect(screen.queryByRole("group", { name: "Project in focus" })).toBeNull();
   });
 
-  it("lists every project by urgency as buttons, with no fan to hide", async () => {
+  it("lists every project by urgency as options, and can hide the fan", async () => {
     const world = cockpitWorld({
       projects: [
         project({ project_id: "alpha", mode: "shadow" }),
@@ -1300,16 +1326,72 @@ describe("Autopilot - agreement, the project in focus, and the page order", () =
 
     await renderCockpit();
 
-    const roster = await screen.findByRole("list", { name: "All projects by urgency" });
-    expect(within(roster).getAllByRole("button")).toHaveLength(2);
-    expect(document.querySelector(".ap-fan-stage")).toBeNull();
+    const roster = await screen.findByRole("listbox", { name: "All projects by urgency" });
+    expect(within(roster).getAllByRole("option")).toHaveLength(2);
+
+    // The fan shows by default, with one line under it naming both ways to walk it and the way to
+    // put it away. No strip of markers and no "1 of N" readout: the list is the index.
+    expect(document.querySelector(".ap-fan-stage")).not.toBeNull();
+    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
+    expect(screen.queryByRole("tablist")).toBeNull();
+    const hint = document.querySelector<HTMLElement>(".ap-fan-pane .ap-fan-hint");
+    expect(hint?.textContent).toContain("on the list, or drag the cards");
+    expect(within(hint!).getByRole("button", { name: "Hide the fan" })).toBeDefined();
+
+    // Hidden, the hint goes with the fan: one line heads the list with the way back, and the list
+    // itself stays.
+    fireEvent.click(screen.getByRole("button", { name: "Hide the fan" }));
+    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
+    expect(document.querySelector(".ap-fan-hint")).toBeNull();
+    expect(document.querySelector(".ap-roster-head")?.textContent).toContain("2 projects, most urgent first");
+    expect(
+      within(screen.getByRole("listbox", { name: "All projects by urgency" })).getAllByRole("option"),
+    ).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Show the fan" }));
+    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
+    expect(document.querySelector(".ap-roster-head")).toBeNull();
+    expect(screen.getByRole("button", { name: "Hide the fan" })).toBeDefined();
+  });
+
+  it("remembers a hidden fan on the next visit", async () => {
+    const world = cockpitWorld({
+      projects: [
+        project({ project_id: "alpha", mode: "shadow" }),
+        project({ project_id: "bravo", mode: "active" }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    localStorage.setItem("nucleos.autopilot.fan", "hidden");
+
+    await renderCockpit();
+
+    expect(await screen.findByRole("button", { name: "Show the fan" })).toBeDefined();
+    expect(document.querySelector(".ap-fan-nofan")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show the fan" }));
+    expect(localStorage.getItem("nucleos.autopilot.fan")).toBeNull();
+  });
+
+  it("shows a single project's card even when the fan was hidden, since there is no toggle to undo it", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+    localStorage.setItem("nucleos.autopilot.fan", "hidden");
+
+    await renderCockpit();
+
+    await screen.findByText("alpha", { selector: ".ap-fan-focus-title strong" });
+    expect(document.querySelector(".ap-fan-nofan")).toBeNull();
+    expect(document.querySelector(".ap-fan-card-focus")?.textContent).toContain("alpha");
     expect(screen.queryByRole("button", { name: /the fan/ })).toBeNull();
   });
 });
 
 describe("Autopilot - the page map and the advanced panels", () => {
-  it("offers a section nav whose entries point at groups that exist", async () => {
-    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld()));
+  it("offers a section nav whose entries land on a heading that says the same thing", async () => {
+    daemon.apiFetch.mockImplementation(
+      cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
+    );
 
     await renderCockpit();
 
@@ -1317,18 +1399,20 @@ describe("Autopilot - the page map and the advanced panels", () => {
     const links = within(nav).getAllByRole("link");
     expect(links.map((link) => link.textContent)).toEqual([
       "Setting",
-      "Brakes",
-      "Evidence",
-      "Jobs",
-      "Records",
+      "Trigger brakes",
+      "Shadow decisions",
+      "Jobs in flight",
+      "Records and feed",
     ]);
     for (const link of links) {
       const id = (link.getAttribute("href") ?? "").replace(/^#/, "");
-      expect(document.getElementById(id)).not.toBeNull();
+      const target = document.getElementById(id);
+      expect(target).not.toBeNull();
+      await waitFor(() => expect(target?.textContent).toContain(link.textContent ?? ""));
     }
   });
 
-  it("keeps the records and the advanced evidence shut until asked", async () => {
+  it("keeps the records shut until asked, and the judge and resolve panels open from the first view", async () => {
     daemon.apiFetch.mockImplementation(
       cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha", mode: "shadow" })] })),
     );
@@ -1337,8 +1421,10 @@ describe("Autopilot - the page map and the advanced panels", () => {
 
     const records = await screen.findByRole("button", { name: "Records and feed" });
     expect(records.getAttribute("aria-expanded")).toBe("false");
+    // Which judge rules a project is a decision only the owner makes: never hidden on first view.
     const advanced = screen.getByRole("button", { name: "Advanced: judge and resolve" });
-    expect(advanced.getAttribute("aria-expanded")).toBe("false");
+    expect(advanced.getAttribute("aria-expanded")).toBe("true");
+    expect(await screen.findByRole("heading", { name: "Judge" })).toBeDefined();
 
     fireEvent.click(records);
     expect(records.getAttribute("aria-expanded")).toBe("true");

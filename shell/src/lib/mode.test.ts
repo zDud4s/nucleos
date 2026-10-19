@@ -129,7 +129,7 @@ describe("MODE_SENTENCES", () => {
 
     // The other two answers are still sentences: nothing in them is a list.
     expect(MODE_SENTENCES.bad_request).toBe("that is not one of the three settings");
-    expect(MODE_SENTENCES.internal).toBe("the núcleo hit an error of its own while changing this");
+    expect(MODE_SENTENCES.internal).toBe("the background service hit an error of its own while changing this");
   });
 });
 
@@ -141,7 +141,7 @@ describe("MODE_SENTENCES", () => {
  * against itself — hence the two guards at the top of the case.
  */
 const OLD_UNPROCESSABLE =
-  "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, the project onboarded to NucleOS, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.";
+  "the background service would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, the project onboarded to NucleOS, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.";
 
 describe("MODE_REFUSAL_PROSE", () => {
   it("the prose form is byte-identical to the sentence it replaces", () => {
@@ -156,7 +156,7 @@ describe("MODE_REFUSAL_PROSE", () => {
     expect(MODE_REFUSAL_PROSE.not_onboarded).toMatch(/has not been onboarded/);
     expect(MODE_REFUSAL_PROSE.not_onboarded).not.toMatch(/\.ai\/|workflow\.md/);
     expect(MODE_REFUSAL_PROSE.internal).toBe(
-      "the núcleo hit an error of its own while changing this",
+      "the background service hit an error of its own while changing this",
     );
   });
 });

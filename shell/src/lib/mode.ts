@@ -1,4 +1,5 @@
 import type { AutopilotMode, ProjectSummary } from "../data/system";
+import { DAEMON_NAME } from "../copy";
 
 /**
  * The rules about a project's three settings, shared by every surface that shows them.
@@ -13,7 +14,7 @@ import type { AutopilotMode, ProjectSummary } from "../data/system";
  *
  * What this module still owns is what the words MEAN and when the third setting is offered, and
  * that is why it is still a module rather than three constants inside the control: something that
- * unlocked on different arithmetic from the one the núcleo enforces would offer a button that
+ * unlocked on different arithmetic from the one the daemon enforces would offer a button that
  * always refuses, and two copies of a sentence about restraint would eventually say two different
  * things about it.
  * The third vocabulary is gone too: the map says `active`, the daemon literal, and that word wins.
@@ -28,7 +29,7 @@ import type { AutopilotMode, ProjectSummary } from "../data/system";
  * two mistakes that matter here.
  */
 export const MODE_MEANING: Record<AutopilotMode, string> = {
-  off: "the núcleo never starts anything here",
+  off: `the ${DAEMON_NAME} never starts anything here`,
   shadow: "it decides and records what it would have done, and enforces none of it",
   active: "it does the thing",
 };
@@ -49,7 +50,7 @@ export function promotionBlocker(project: ProjectSummary, withheld: number): str
   if (withheld === 0) {
     return "every class it has exercised is one the classifier allowed — nothing yet shows it holds back, and restraint is what it needs to prove";
   }
-  return "the núcleo is not offering this project for promotion";
+  return `the ${DAEMON_NAME} is not offering this project for promotion`;
 }
 
 /**
@@ -146,7 +147,7 @@ export const MODE_SENTENCES: {
   internal: string;
 } = {
   unprocessable: {
-    lead: "the núcleo would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these:",
+    lead: `the ${DAEMON_NAME} would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these:`,
     items: [
       { text: "a folder" },
       { text: "the project onboarded to NucleOS" },
@@ -158,7 +159,7 @@ export const MODE_SENTENCES: {
   not_onboarded:
     "this project has not been onboarded — onboard it, confirming the command that decides whether it is green, and try again",
   bad_request: "that is not one of the three settings",
-  internal: "the núcleo hit an error of its own while changing this",
+  internal: `the ${DAEMON_NAME} hit an error of its own while changing this`,
 };
 
 /** One prerequisite as plain words: its text, its path and what follows the path, joined. */
