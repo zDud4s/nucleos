@@ -61,7 +61,7 @@ import "./files.css";
 
 /**
  * Files — the one managed root, browsed, searched, made, filled, moved and
- * removed from this window, plus whatever a person drags in from Windows.
+ * removed from this window, plus whatever a person drags in from the desktop.
  *
  * **Everything on this page assumes `files_root` is configured.** When it is
  * not, every route answers `503` with an EMPTY body (`http.rs:1336-1341`)
@@ -91,7 +91,7 @@ import "./files.css";
  * daemon itself insists on: a folder with something in it.
  *
  * **A file opens where it lives.** Enter, a double-click on its name and the menu's
- * first item hand it to the app Windows gives its kind, by its path on disk
+ * first item hand it to the app the OS gives its kind, by its path on disk
  * (`diskPath`, `openFile`); a download is a copy, and says so in the menu. A
  * program is the one kind never opened from here.
  */
@@ -233,7 +233,7 @@ interface UploadRefusal {
   reason: string;
 }
 
-/** What one batch of uploads came to — a drop from Windows, or a pick from the Upload button. */
+/** What one batch of uploads came to — a drop from the desktop, or a pick from the Upload button. */
 interface UploadReport {
   source: "drop" | "picker";
   truncated: boolean;
@@ -1021,7 +1021,7 @@ export function Files() {
       (error: unknown) => {
         // The opener rejects with a bare string; either way the OS's words come after ours.
         const said = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-        setOpenError({ name, reason: said === "" ? "Windows could not open it" : `Windows could not open it — ${said}` });
+        setOpenError({ name, reason: said === "" ? "Could not open it" : `Could not open it — ${said}` });
       },
     );
   }
@@ -1438,7 +1438,7 @@ export function Files() {
             {/* Under the rows, as their footnote: over them it was one more line
                 between the rule and the first file. */}
             {!searching && !hintRetired && (
-              <p className="fi-hint">Double-click a file to open it in Windows · drop files here to upload · Ctrl- or Shift-click to select several</p>
+              <p className="fi-hint">Double-click a file to open it in its default app · drop files here to upload · Ctrl- or Shift-click to select several</p>
             )}
           </div>
         </div>
@@ -1655,7 +1655,7 @@ function FilesUnavailableTeach() {
         </Button>
       </p>
       <p>
-        The {DAEMON_NAME} keeps one folder for everything this page holds — your uploads, drops from Windows,
+        The {DAEMON_NAME} keeps one folder for everything this page holds — your uploads, drops from your file manager,
         filed mail and team workspaces. It could not create or open that folder when it started; its log names
         the error it hit.
       </p>
@@ -2545,7 +2545,7 @@ function FileTable(props: FileTableProps) {
         {entries !== undefined && entries.length === 0 && path === "" && (
           <Teach title="Nothing has been filed yet">
             <p>
-              Upload a file, make a folder, or drag something in from Windows — a drop lands under the folder you
+              Upload a file, make a folder, or drag something in from your file manager — a drop lands under the folder you
               are looking at.
             </p>
           </Teach>
@@ -2636,7 +2636,7 @@ function FileTable(props: FileTableProps) {
         {ordered.length > 0 && (
           <p id={keysId} className="fi-keys">
             <kbd>↑</kbd> <kbd>↓</kbd> move · <kbd>Shift</kbd>+<kbd>↑</kbd> <kbd>↓</kbd> extend · <kbd>Space</kbd>{" "}
-            select · <kbd>Ctrl</kbd>+<kbd>A</kbd> all · <kbd>Enter</kbd> open in Windows · <kbd>F2</kbd> rename ·{" "}
+            select · <kbd>Ctrl</kbd>+<kbd>A</kbd> all · <kbd>Enter</kbd> open · <kbd>F2</kbd> rename ·{" "}
             <kbd>Delete</kbd> to the trash · <kbd>Ctrl</kbd>+<kbd>X</kbd>, then <kbd>Ctrl</kbd>+<kbd>V</kbd> in another
             folder, move · <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · <kbd>Backspace</kbd> up ·{" "}
             <kbd>Shift</kbd>+<kbd>F10</kbd> more
@@ -2727,7 +2727,7 @@ function useNameFit(cell: HTMLElement | null): number {
 function fileTitle(entry: { name: string; is_dir: boolean }, shown: string): string | undefined {
   const full = shown === entry.name ? null : entry.name;
   if (entry.is_dir) return full ?? undefined;
-  return full === null ? "Double-click to open in Windows" : `${full} — double-click to open in Windows`;
+  return full === null ? "Double-click to open" : `${full} — double-click to open`;
 }
 
 function FileRow({
@@ -3002,7 +3002,7 @@ function SearchResults({
                 <Button
                   variant="link"
                   data-hit={index}
-                  title={hit.is_dir ? undefined : "Double-click to open in Windows"}
+                  title={hit.is_dir ? undefined : "Double-click to open"}
                   onKeyDown={(event) => {
                     if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
                       event.preventDefault();
@@ -3638,7 +3638,7 @@ function ContextMenu({
         <>
           <div role="group" className="fi-context-group">
             <MenuItem primary keys="Enter" onClick={onOpen}>
-              {entry.is_dir ? "Open" : "Open in Windows"}
+              {entry.is_dir ? "Open" : "Open with default app"}
             </MenuItem>
             {!entry.is_dir && <MenuItem onClick={onDownload}>Download a copy</MenuItem>}
             {canRename && (
