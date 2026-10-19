@@ -24,7 +24,7 @@ The shared dispatch mechanism (routing modes, prompt-passing, resume rule, revie
 
 ## Layer model
 
-Two paths are not fixed in this text and are read from `.nucleos/workflow/project.json`, written by the daemon when it materializes the bundle: `state_dir` (the project's mutable state, `~/.nucleos/projects/<id>/`) and `bundle_dir` (the library directory of this bundle version, whose `scripts/` hold the helper scripts). Everywhere else these are written `<state_dir>` and `<bundle_dir>`. State lives outside the working tree, so it can never enter git.
+Two paths are not fixed in this text and are read from `.nucleos/workflow/project.json`, written by the daemon when it materializes the bundle: `state_dir` (the project's mutable state, `~/.nucleos/projects/<id>/`) and `bundle_dir` (the library directory of this bundle version, whose `scripts/` hold the helper scripts). Everywhere else these are written `<state_dir>` and `<bundle_dir>`; both sit under the home directory, which can hold a space, so quote each path you substitute into a command (`python "<bundle_dir>/scripts/x.py"`). State lives outside the working tree, so it can never enter git.
 
 | Layer | Files | Mutability |
 |---|---|---|

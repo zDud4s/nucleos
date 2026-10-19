@@ -129,6 +129,13 @@ class SpecLoop(unittest.TestCase):
         self.write("- [ ] a\n")
         self.assertIn("1 open", ask("segue"))
 
+    def test_the_suggested_start_command_quotes_the_script_path(self):
+        # The library lives under the home directory, which can hold a space ("C:/Users/PC
+        # Multimedia/"); unquoted, the suggested command runs a script that does not exist.
+        nudge = sl.prompt_context({"session_id": "s1", "cwd": str(self.root), "prompt": "a spec"})
+        script = Path(sl.__file__).resolve().as_posix()
+        self.assertIn(f'`python "{script}" start ', nudge)
+
     def test_no_project_json_fails_open(self):
         (self.root / ".nucleos" / "workflow" / "project.json").unlink()
         self.write("- [ ] a\n")
