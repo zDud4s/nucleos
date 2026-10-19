@@ -2561,6 +2561,17 @@ function ModelMenu({
             The {DAEMON_NAME} did not say which models it has
           </DropdownMenuItem>
         )}
+        {catalogue.data?.config_problem != null && (
+          <DropdownMenuItem
+            disabled
+            title={`${catalogue.data.config_problem.path}: ${catalogue.data.config_problem.error}`}
+          >
+            nucleos-models.yaml did not load;{" "}
+            {catalogue.data.config_problem.using === "last_good"
+              ? "the last good copy is in use"
+              : "the built-in models are showing"}
+          </DropdownMenuItem>
+        )}
         {/* One row per company, and its models only on hover. The vendor is the first thing a
             person decides, and a menu that opened on every family of every vendor was a wall of
             names before anybody had chosen whose. Families stay inside a company's one list,

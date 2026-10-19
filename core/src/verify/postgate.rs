@@ -297,8 +297,9 @@ pub async fn start(
     let done = sqlx::query(
         "INSERT INTO postgate_state \
              (project_id, target, last_attempted_sha, running_sha, running_request_id, \
-              running_started_at, last_started_at) \
-         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+              running_started_at, last_started_at, submit_floor) \
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, \
+                 (SELECT COALESCE(MAX(id), 0) FROM verify_requests)) \
          ON CONFLICT(project_id) DO UPDATE SET \
              target = excluded.target, \
              last_attempted_sha = excluded.last_attempted_sha, \
@@ -306,6 +307,7 @@ pub async fn start(
              running_request_id = excluded.running_request_id, \
              running_started_at = CURRENT_TIMESTAMP, \
              last_started_at = CURRENT_TIMESTAMP, \
+             submit_floor = excluded.submit_floor, \
              held_note = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE postgate_state.running_sha IS NULL AND postgate_state.red_phase IS NULL",
@@ -761,7 +763,8 @@ pub async fn begin_bisect(
 pub async fn claim_probe(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Result<bool> {
     let done = sqlx::query(
         "UPDATE postgate_state SET \
-             probe_sha = ?, probe_request_id = NULL, updated_at = CURRENT_TIMESTAMP \
+             probe_sha = ?, probe_request_id = NULL, updated_at = CURRENT_TIMESTAMP, \
+             submit_floor = (SELECT COALESCE(MAX(id), 0) FROM verify_requests) \
          WHERE project_id = ? AND red_phase IS NOT NULL AND probe_sha IS NULL",
     )
     .bind(sha)
@@ -769,6 +772,29 @@ pub async fn claim_probe(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx
     .execute(pool)
     .await?;
     Ok(done.rows_affected() > 0)
+}
+
+/// The verify request already submitted under the claim `project_id` holds right now (its running
+/// gate or its claimed probe), when the ticket id was never stored: a daemon that died between the
+/// submit and `set_request` / `set_probe_request`.
+///
+/// Every claim records `submit_floor`, the newest request id at that moment, and this worker is the
+/// only submitter of `postgate` requests for a project (one gate or probe at a time). So the oldest
+/// postgate request newer than the floor is the one that claim submitted. `None` when there is no
+/// such request, and when the claim predates the column.
+pub async fn orphaned_request(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT v.id FROM verify_requests v \
+           JOIN postgate_state s ON s.project_id = v.project_id \
+          WHERE v.project_id = ? AND v.caller = 'postgate' \
+            AND v.kind = 'test' AND v.scope = 'full' \
+            AND s.submit_floor IS NOT NULL AND v.id > s.submit_floor \
+            AND (s.running_sha IS NOT NULL OR s.probe_sha IS NOT NULL) \
+          ORDER BY v.id LIMIT 1",
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Stores the verify ticket of the probe claimed for `sha`. Refused (`false`) when `sha` is not

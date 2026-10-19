@@ -14347,6 +14347,12 @@ mod tests {
             crate::config::EFFORT_LEVELS.len()
         );
         assert!(body["configured"].is_string());
+        // Always present, so the window can tell "no problem" from "an older daemon". Null here:
+        // tests never read a real models file, and an absent one is the defaults, not a fault.
+        assert!(
+            body.get("config_problem").is_some_and(|v| v.is_null()),
+            "config_problem must be an explicit null when nothing is wrong: {body}"
+        );
     }
 
     /// The agents' `latest_models` read: both vendors by default, one on request, a 400 naming the
@@ -19212,6 +19218,33 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["id"], serde_json::json!(turn_id));
+    }
+
+    /// `GET /assistant/{turn_id}` is granted to a read-only key, and turn ids are sequential
+    /// integers. A conversation id in the answer would hand that key the destination to post to
+    /// (`POST /assistant/message` takes a client-chosen `chat_id`), so the turn view leaves it out.
+    /// `/runs/{id}` keeps it: that route is the run view and the shell links back through it.
+    #[tokio::test]
+    async fn the_turn_view_does_not_name_the_conversation_but_the_run_view_still_does() {
+        let state = test_state().await;
+        let turn_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, created_at, mode, chat_id)
+             VALUES ('hi', 'completed', ?, 'assistant', 'secret-chat') RETURNING id",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let turn = get_json(&state, &format!("/assistant/{turn_id}")).await;
+        assert_eq!(turn["id"], serde_json::json!(turn_id));
+        assert!(
+            turn.get("chat_id").is_none(),
+            "the turn view leaked the conversation id: {turn}"
+        );
+
+        let run = get_json(&state, &format!("/runs/{turn_id}")).await;
+        assert_eq!(run["chat_id"], serde_json::json!("secret-chat"));
     }
 
     #[tokio::test]

@@ -559,6 +559,20 @@ pub fn item_verdict(
 /// The same defensive ceiling used by the knowledge history walk.
 const MAX_CHAIN_HOPS: usize = 50;
 
+/// The run a run hands the standalone unit's verdict to, as a SQL expression over the `runs` row
+/// aliased `r`: its `successor_run_id`, else for a `superseded` run the newest run resumed on a
+/// grant of its proposals, else NULL. [`chain_end`] is the same rule step by step; the sweep needs
+/// it as SQL to pick units whose chain has ended without walking each one.
+const NEXT_HOP_SQL: &str = "COALESCE(r.successor_run_id,
+        CASE WHEN r.status = 'superseded' THEN
+            (SELECT g.run_id
+               FROM action_grants g
+               JOIN proposals p ON p.id = g.proposal_id
+              WHERE p.run_id = r.id
+              ORDER BY g.run_id DESC
+              LIMIT 1)
+        END)";
+
 /// Follow handoffs and approval resumes to the run that owns the standalone unit's verdict.
 async fn chain_end(pool: &SqlitePool, run_id: i64) -> sqlx::Result<i64> {
     let mut current = run_id;
@@ -765,9 +779,9 @@ pub async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u64> {
 /// This follows the `job_notes.delivered_at IS NULL` queue precedent: because both the verdict and
 /// trace are durable, a crash between the verdict and credit is repaired by the next sweep. Only
 /// final units take a batch slot, and final units are visited oldest first by their monotonic ids.
-/// The item prefilter exactly mirrors `item_verdict`. The run prefilter uses the unit run's own
-/// terminal status; a terminal handoff or approval run whose chain tail is still live can therefore
-/// take a slot until that tail ends, when `credit_run` follows the chain and credits it.
+/// The item prefilter exactly mirrors `item_verdict`. The run prefilter follows the unit's handoff
+/// or approval-resume chain to its tail, as `chain_end` does, and requires the tail to be terminal,
+/// so a terminal run whose chain is still live holds no slot until that tail ends.
 async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
     let final_item_placeholders = vec!["?"; FINAL_ITEM_STATUSES.len()].join(", ");
     let terminal_job_placeholders =
@@ -804,15 +818,33 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
 
     let terminal_run_placeholders =
         vec!["?"; crate::execution::runs::TERMINAL_RUN_STATUSES.len()].join(", ");
+    // A unit's verdict belongs to the run at the end of its chain (`chain_end`), so the slot goes
+    // to a unit whose chain TAIL is terminal, not to one whose own run is. The recursion is
+    // `chain_end` in SQL: a `successor_run_id` first, else, for a `superseded` run, the newest
+    // grant resumed from its proposals; capped at the same `MAX_CHAIN_HOPS`. Each row carries its
+    // own next hop (`nxt`), so the tail is the row with none left, or the one at the cap.
     let mut run_query = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT DISTINCT rk.run_id
-           FROM run_knowledge rk
-           JOIN runs r ON r.id = rk.run_id
-          WHERE rk.credited_at IS NULL
-            AND rk.item_id IS NULL
-            AND r.job_id IS NULL
-            AND r.status IN ({terminal_run_placeholders})
-          ORDER BY rk.run_id
+        "WITH RECURSIVE chain(unit_id, cur, nxt, hops) AS (
+             SELECT u.run_id, r.id, {NEXT_HOP_SQL}, 0
+               FROM (SELECT DISTINCT rk.run_id
+                       FROM run_knowledge rk
+                       JOIN runs r0 ON r0.id = rk.run_id
+                      WHERE rk.credited_at IS NULL
+                        AND rk.item_id IS NULL
+                        AND r0.job_id IS NULL) u
+               JOIN runs r ON r.id = u.run_id
+             UNION ALL
+             SELECT c.unit_id, r.id, {NEXT_HOP_SQL}, c.hops + 1
+               FROM chain c
+               JOIN runs r ON r.id = c.nxt
+              WHERE c.hops < {MAX_CHAIN_HOPS}
+         )
+         SELECT c.unit_id
+           FROM chain c
+           JOIN runs tail ON tail.id = c.cur
+          WHERE (c.nxt IS NULL OR c.hops >= {MAX_CHAIN_HOPS})
+            AND tail.status IN ({terminal_run_placeholders})
+          ORDER BY c.unit_id
           LIMIT ?"
     )));
     for status in crate::execution::runs::TERMINAL_RUN_STATUSES {
@@ -1939,6 +1971,68 @@ mod tests {
         assert_eq!(credit_run(&pool, superseded).await?, 1);
         let resumed = counters(&pool, resume_knowledge).await?;
         assert_eq!((resumed.0, resumed.1, resumed.2), (1, 1, 0));
+        Ok(())
+    }
+
+    /// `credit_run` follows a handoff or an approval resume to the run that owns the verdict and
+    /// credits nothing while that run is live. A unit it cannot yet credit is never stamped, so
+    /// one that took a slot would take it again on every pass until its chain ended.
+    #[tokio::test]
+    async fn a_terminal_run_whose_chain_tail_is_live_takes_no_slot_in_a_sweep_pass()
+    -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let stuck = seed(&pool, "machine", None, "stuck").await?;
+
+        // A handoff predecessor that ended `completed`, its successor still running.
+        let predecessor = seed_run(&pool, "completed", Some(0), None, None).await?;
+        let successor = seed_run(&pool, "running", None, None, None).await?;
+        sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+            .bind(successor)
+            .bind(predecessor)
+            .execute(&pool)
+            .await?;
+        record(&pool, predecessor, None, &[scored(stuck, true)]).await?;
+
+        // An approval turn left `superseded`, the run resumed on its grant still going.
+        let superseded = seed_run(&pool, "superseded", None, None, None).await?;
+        let resume = seed_run(&pool, "running", None, None, None).await?;
+        let proposal = sqlx::query(
+            "INSERT INTO proposals (kind, status, run_id, reasoning, created_at)
+             VALUES ('action-approval', 'approved', ?, 'r', ?)",
+        )
+        .bind(superseded)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await?
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO action_grants (run_id, tool_name, proposal_id, created_at)
+             VALUES (?, 'Bash', ?, ?)",
+        )
+        .bind(resume)
+        .bind(proposal)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await?;
+        record(&pool, superseded, None, &[scored(stuck, true)]).await?;
+
+        // Both are older than the final run, so a batch of one reaches it only if they hold no slot.
+        let final_knowledge = seed(&pool, "machine", None, "final").await?;
+        let final_run = seed_run(&pool, "completed", Some(0), Some("passed"), None).await?;
+        record(&pool, final_run, None, &[scored(final_knowledge, true)]).await?;
+
+        assert_eq!(sweep_at_most(&pool, 1).await?, 1);
+        let credited = counters(&pool, final_knowledge).await?;
+        assert_eq!((credited.0, credited.1, credited.2), (1, 1, 1));
+
+        // The moment a tail ends, its unit is final and the next pass credits it.
+        sqlx::query(
+            "UPDATE runs SET status = 'completed', exit_code = 0, gate_status = 'passed' WHERE id = ?",
+        )
+        .bind(successor)
+        .execute(&pool)
+        .await?;
+        assert_eq!(sweep_at_most(&pool, 1).await?, 1);
         Ok(())
     }
 

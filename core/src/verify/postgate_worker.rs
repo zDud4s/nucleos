@@ -554,7 +554,16 @@ async fn launch(
     deadline: Instant,
 ) -> Step {
     let pool = &executor.pool;
-    let request = match submit_full(executor, Caller::Postgate, project_root, sha, deadline).await {
+    let request = match submit_full(
+        executor,
+        project_id,
+        Caller::Postgate,
+        project_root,
+        sha,
+        deadline,
+    )
+    .await
+    {
         Ok(id) => id,
         Err(reason) => return give_up(pool, project_id, sha, reason).await,
     };
@@ -573,13 +582,38 @@ async fn launch(
 
 /// Prepares the postgate worktree at `sha` and submits the full gate for it as `caller`; returns
 /// the ticket id, or the reason nothing could be submitted.
+///
+/// A request the previous daemon submitted under this very claim and never got to record is
+/// adopted instead of submitted again (`verify_postgate::orphaned_request`).
 async fn submit_full(
     executor: &Arc<Executor>,
+    project_id: &str,
     caller: Caller,
     project_root: &Path,
     sha: &str,
     deadline: Instant,
 ) -> Result<i64, String> {
+    match verify_postgate::orphaned_request(&executor.pool, project_id).await {
+        Ok(Some(request)) => {
+            tracing::info!(
+                project = project_id,
+                sha,
+                request,
+                "postgate: adopting the ticket submitted before the daemon stopped"
+            );
+            return Ok(request);
+        }
+        Ok(None) => {}
+        // Not fatal: the worst case is the duplicate this lookup exists to avoid.
+        Err(error) => {
+            tracing::warn!(
+                project = project_id,
+                sha,
+                %error,
+                "postgate: cannot look for an earlier ticket"
+            );
+        }
+    }
     let tree = git_exec::prepare_postgate_worktree(project_root, sha, deadline).await?;
     let args = VerifyArgs {
         kind: Kind::Test,
@@ -677,7 +711,8 @@ async fn launch_probe(
         RedPhase::FlakeCheck => Caller::FlakeCheck,
         RedPhase::Bisect => Caller::Bisect,
     };
-    let request = match submit_full(executor, caller, project_root, sha, deadline).await {
+    let request = match submit_full(executor, project_id, caller, project_root, sha, deadline).await
+    {
         Ok(id) => id,
         Err(reason) => {
             tracing::warn!(project = project_id, sha, %reason, "postgate: probe not launched");
@@ -1310,6 +1345,46 @@ mod tests {
         assert_eq!(count(&f.pool, "verify_requests").await, 1);
     }
 
+    /// The window `a_gate_started_but_never_submitted...` leaves out: the request WAS submitted and
+    /// the daemon died before `set_request`. Submitting again would queue the whole gate twice.
+    #[tokio::test]
+    async fn a_gate_submitted_but_never_recorded_adopts_its_request_instead_of_submitting_another()
+    {
+        let f = fixture(Some(GATE_ON)).await;
+        let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+        let Step::Started { request, .. } = step else {
+            unreachable!()
+        };
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
+
+        // The crash: the ticket id never reached `postgate_state`.
+        sqlx::query(
+            "UPDATE postgate_state SET running_request_id = NULL WHERE project_id = 'alpha'",
+        )
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+        assert_eq!(
+            step,
+            Step::Started {
+                sha: f.tip.clone(),
+                request
+            }
+        );
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.running_request_id, Some(request));
+        assert_eq!(
+            count(&f.pool, "verify_requests").await,
+            1,
+            "the request already submitted was adopted, not queued a second time"
+        );
+    }
+
     #[tokio::test]
     async fn the_same_tip_is_not_gated_twice() {
         let f = fixture(Some(GATE_ON)).await;
@@ -1545,6 +1620,93 @@ mod tests {
             count(&f.pool, "verify_requests").await,
             1,
             "the running probe was followed, never resubmitted"
+        );
+    }
+
+    /// The same window for a probe: submitted, then the daemon died before `set_probe_request`.
+    #[tokio::test]
+    async fn a_probe_submitted_but_never_recorded_adopts_its_request_instead_of_submitting_another()
+    {
+        let f = fixture(Some(GATE_ON)).await;
+        let base = f.tip.clone();
+        let c2 = commit_file(
+            &f.root, "b.txt", "b
+", "c2",
+        );
+        let c3 = commit_file(
+            &f.root, "c.txt", "c
+", "c3",
+        );
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &base)
+            .await
+            .unwrap();
+        assert!(
+            verify_postgate::start(&f.pool, "alpha", "main", &c3, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            verify_postgate::finish_red(&f.pool, "alpha", &c3, &["gate_command".to_owned()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            verify_postgate::begin_bisect(&f.pool, "alpha", &c3)
+                .await
+                .unwrap()
+        );
+
+        let step = step_of(&f).await.expect("a pass for alpha");
+        let Step::Probe { sha, request } = step else {
+            panic!("the middle candidate is probed first: {step:?}")
+        };
+        assert_eq!(sha, c2);
+        assert_eq!(count(&f.pool, "verify_requests").await, 1);
+
+        // The crash: the probe is claimed and submitted, its ticket id was never stored.
+        sqlx::query("UPDATE postgate_state SET probe_request_id = NULL WHERE project_id = 'alpha'")
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        let step = step_of(&f).await.expect("a pass for alpha");
+        assert_eq!(step, Step::Probe { sha: c2, request });
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.probe_request_id, Some(request));
+        assert_eq!(
+            count(&f.pool, "verify_requests").await,
+            1,
+            "the probe already submitted was adopted, not queued a second time"
+        );
+    }
+
+    /// Adoption is bounded by the claim: a request from an EARLIER claim is never taken for the
+    /// current one, or a new tip would inherit the previous tip's verdict.
+    #[tokio::test]
+    async fn a_request_older_than_the_claim_is_not_adopted() {
+        let f = fixture(Some(GATE_ON)).await;
+        let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+        let Step::Started { request, .. } = step else {
+            unreachable!()
+        };
+        // That gate ends and a new one is claimed: the floor moves past the old request.
+        verify_postgate::abandon(&f.pool, "alpha", &f.tip)
+            .await
+            .unwrap();
+        assert!(
+            verify_postgate::start(&f.pool, "alpha", "main", &f.tip, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            verify_postgate::orphaned_request(&f.pool, "alpha")
+                .await
+                .unwrap(),
+            None,
+            "request {request} belongs to the claim before this one"
         );
     }
 

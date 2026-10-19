@@ -1677,6 +1677,42 @@ describe("Chats - a model that cannot work tools", () => {
   });
 });
 
+describe("Chats - a models file that would not load", () => {
+  // The daemon logs the failure and keeps serving, which leaves the owner staring at a menu that
+  // lacks the model they configured. The menu has to say why, where they are looking.
+  it("names the problem in the model menu, and says nothing when there is none", async () => {
+    const problem = {
+      path: "C:/Users/x/.nucleos/nucleos-models.yaml",
+      error: "claude_model: invalid type at line 1",
+      using: "defaults" as const,
+    };
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.split("?")[0] === "/assistant/models") {
+        const models = (await base(path, init)) as AssistantModels;
+        return { ...models, config_problem: problem };
+      }
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    expect(await screen.findByText(/nucleos-models\.yaml did not load/i)).toBeDefined();
+    expect(screen.getByText(/built-in models are showing/i)).toBeDefined();
+  });
+
+  it("is silent when the daemon reports no problem", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }));
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    await screen.findByText("Which model answers");
+    expect(screen.queryByText(/did not load/i)).toBeNull();
+  });
+});
+
 /* --------------------------------------------- a third route: OpenRouter -- */
 
 describe("Chats - a model reached over OpenRouter", () => {
