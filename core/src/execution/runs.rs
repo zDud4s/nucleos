@@ -731,7 +731,7 @@ pub mod tests {
         .unwrap()
         .last_insert_rowid();
 
-        let loop_task = tokio::spawn(run_retention_loop(state.clone()));
+        let loop_task = tokio::spawn(run_retention_loop(state.clone(), false));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
@@ -10125,6 +10125,62 @@ tests:
             "awaiting_approval",
             "a completed run's queued merge is the point of the run, not a leftover"
         );
+    }
+
+    async fn backup_feed_kinds(pool: &sqlx::SqlitePool) -> Vec<String> {
+        let mut kinds: Vec<String> = crate::feed::list_feed(pool, None, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect();
+        kinds.reverse();
+        kinds
+    }
+
+    #[tokio::test]
+    async fn the_retention_step_takes_one_automatic_backup_and_says_so() {
+        let db = crate::storage::TempDb::new().await;
+        let now = chrono::Utc::now();
+        let mut failing = false;
+
+        run_auto_backup_step(&db.pool, now, &mut failing).await;
+        run_auto_backup_step(&db.pool, now, &mut failing).await;
+
+        let listed = crate::backup::list_backups(&db.pool).await.unwrap();
+        assert_eq!(listed.len(), 1, "the second tick finds the copy still fresh");
+        assert_eq!(listed[0].kind, crate::backup::BackupKind::Auto);
+        assert_eq!(backup_feed_kinds(&db.pool).await, vec!["backup_taken"]);
+        assert!(!failing);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_automatic_backup_is_announced_once_until_it_recovers() {
+        let db = crate::storage::TempDb::new().await;
+        let now = chrono::Utc::now();
+        let mut failing = false;
+        // A file where the backups directory should be: the snapshot cannot even choose a name.
+        let blocker = db.path().join("backups");
+        std::fs::write(&blocker, b"in the way").unwrap();
+
+        run_auto_backup_step(&db.pool, now, &mut failing).await;
+        run_auto_backup_step(&db.pool, now, &mut failing).await;
+        assert!(failing);
+        assert_eq!(
+            backup_feed_kinds(&db.pool).await,
+            vec!["backup_failed"],
+            "an hourly retry must not write a line an hour"
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        run_auto_backup_step(&db.pool, now, &mut failing).await;
+        assert!(!failing);
+        assert_eq!(
+            backup_feed_kinds(&db.pool).await,
+            vec!["backup_failed", "backup_taken"]
+        );
+        db.close().await;
     }
 
     #[tokio::test]

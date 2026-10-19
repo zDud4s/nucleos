@@ -140,6 +140,8 @@ const LANE_OF: Record<string, FeedLane> = {
   resume_did_not_act: "machine",
   secret_stored: "machine",
   secret_forgotten: "machine",
+  backup_taken: "machine",
+  backup_failed: "machine",
 };
 
 /** The kinds this module places by name. For the completeness test. */

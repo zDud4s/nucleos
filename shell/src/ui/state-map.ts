@@ -285,6 +285,10 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // A credential set or forgotten from the app. The line names the key and never the value.
     secret_stored: { tone: "info", label: "credential set" },
     secret_forgotten: { tone: "info", label: "credential forgotten" },
+    // The weekly database copy the retention loop takes (`execution/runs/lifecycle.rs`). Taken is a
+    // record; failed is a fault the owner should see, once per streak, not once per hourly retry.
+    backup_taken: { tone: "info", label: "automatic backup taken" },
+    backup_failed: { tone: "danger", label: "automatic backup failed" },
     "web.read": { tone: "info", label: "web page read" },
   },
   /** Rule settings are shell derivations: armed is stated, capped is a ceiling, and never-fires is a fault. */
