@@ -1616,7 +1616,10 @@ function pageHeadline(rootUnavailable: boolean, entries: Entry[] | undefined, fa
     dirs > 0 ? `${dirs} folder${dirs === 1 ? "" : "s"}` : null,
     // "totalling" ties the bytes to the files: a folder is never measured, and
     // "2 folders, 1 file, 2.0 KB" read as the size of everything here.
-    files > 0 ? `${files} file${files === 1 ? "" : "s"} totalling ${formatBytes(totalBytes)}` : null,
+    //
+    // The value and its unit are joined by a no-break space so "3.4 MB" never
+    // wraps between them at narrow widths (testing-library collapses it to a space).
+    files > 0 ? `${files} file${files === 1 ? "" : "s"} totalling ${formatBytes(totalBytes).replace(" ", "\u00a0")}` : null,
   ].filter((part): part is string => part !== null);
   return parts.join(", ") + asOf;
 }
