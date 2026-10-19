@@ -130,6 +130,9 @@ async fn main() {
 
     startup::reconcile_after_restart(&pool).await;
 
+    // Before anything can launch a Claude run, so the first run's credential is already watched.
+    execution::runner::watch_claude_auth(pool.clone());
+
     let token_value = match secrets::daemon_token(
         secrets::load_secret(TOKEN_KEY),
         // Only a FIRST start mints: a token already in the store is returned as it is, prefixed or
