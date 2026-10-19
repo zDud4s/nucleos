@@ -1,7 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { DAEMON_NAME } from "../copy";
 import { ApiRefusal } from "../data/client";
-import { useCancelPairing, useStartPairing, type Channel, type PairingCode } from "../data/channels";
+import { keys } from "../data/keys";
+import {
+  useCancelPairing,
+  usePairingStatus,
+  useStartPairing,
+  type Channel,
+  type PairedIdentity,
+  type PairingCode,
+} from "../data/channels";
 import { Button, CopyButton, ErrorNote, Modal, RefusalNote } from "../ui";
 import "./pairing.css";
 
@@ -14,6 +23,19 @@ export interface PairingDialogProps {
 const SENTENCES = {
   channel_not_configured: "this channel has no secrets yet: add the channel's secrets first, then ask for a code",
 };
+
+const ENDED = {
+  expired: "this code expired",
+  exhausted: "too many wrong attempts: this code is no longer valid",
+  superseded: "a newer code replaced this one",
+};
+
+function describe(identity: PairedIdentity): string {
+  const who = identity.sender_name ?? identity.sender_ref;
+  const where = `${identity.conversation_kind} ${identity.conversation_ref}`;
+  const parent = identity.parent !== null ? " and its parent group" : "";
+  return `${who} in ${where}${parent}`;
+}
 
 function clock(ms: number): string {
   const total = Math.max(0, Math.ceil(ms / 1000));
@@ -40,16 +62,10 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
   const [code, setCode] = useState<PairingCode | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const asked = useRef(false);
+  const queryClient = useQueryClient();
 
   const { mutateAsync, reset } = start;
-  useEffect(() => {
-    if (!open) {
-      asked.current = false;
-      setCode(null);
-      return;
-    }
-    if (asked.current) return;
-    asked.current = true;
+  const ask = useCallback(() => {
     mutateAsync().then(
       (pairing) => {
         setCode(pairing);
@@ -61,7 +77,34 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
         // The error stays on the mutation, where the render below reads it.
       },
     );
-  }, [open, mutateAsync, reset]);
+  }, [mutateAsync, reset]);
+
+  useEffect(() => {
+    if (!open) {
+      asked.current = false;
+      setCode(null);
+      return;
+    }
+    if (asked.current) return;
+    asked.current = true;
+    ask();
+  }, [open, ask]);
+
+  // The poll runs only with the dialog open and a code in hand. `useStartPairing` seeds `waiting`
+  // into the cache on every POST, so a fresh code restarts the poll even after a terminal state.
+  const status = usePairingStatus(channel.id, { enabled: open && code !== null, expiresAt: code?.expires_at });
+  const state = code === null ? undefined : status.data?.state;
+
+  useEffect(() => {
+    if (state !== "paired") return;
+    void queryClient.invalidateQueries({ queryKey: keys.channels.identities(channel.id) });
+    void queryClient.invalidateQueries({ queryKey: keys.channels.all });
+  }, [state, queryClient, channel.id]);
+
+  function again() {
+    setCode(null);
+    ask();
+  }
 
   useEffect(() => {
     if (!open || code === null) return;
@@ -98,7 +141,21 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
       {error !== null && !(error instanceof ApiRefusal) && (
         <ErrorNote>the {DAEMON_NAME} did not answer the request for a code</ErrorNote>
       )}
-      {code !== null && (
+      {code !== null && status.data?.state === "paired" && (
+        <div className="pairing-done" role="status">
+          <p>
+            Paired {describe(status.data.identity)}.
+            {status.data.identity.home ? " This conversation is now the home of the channel." : ""}
+          </p>
+        </div>
+      )}
+      {code !== null && state !== undefined && state in ENDED && (
+        <div className="pairing-ended">
+          <p className="pairing-expired">{ENDED[state as keyof typeof ENDED]}</p>
+          <Button onClick={again}>Get a new code</Button>
+        </div>
+      )}
+      {code !== null && state !== "paired" && !(state !== undefined && state in ENDED) && (
         <div className="pairing-code">
           <p>Send this to the bot in the conversation you want to pair:</p>
           <div className="pairing-code-command">
@@ -107,12 +164,23 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
           </div>
           <p className="pairing-code-digits">{code.code}</p>
           {remaining > 0 ? (
-            <p className="pairing-countdown">
-              expires in <span>{clock(remaining)}</span>
-            </p>
+            <>
+              <p className="pairing-countdown">
+                expires in <span>{clock(remaining)}</span>
+              </p>
+              {state === "waiting" && status.data?.state === "waiting" && (
+                <p role="status">
+                  waiting for {code.command}… {status.data.attempts_left} attempts left
+                </p>
+              )}
+            </>
           ) : (
-            <p className="pairing-expired">expired: close this and ask for a new code</p>
+            <div className="pairing-ended">
+              <p className="pairing-expired">{ENDED.expired}</p>
+              <Button onClick={again}>Get a new code</Button>
+            </div>
           )}
+          {status.isError && <ErrorNote>the {DAEMON_NAME} did not answer the status request</ErrorNote>}
           {channel.state === "offline" && (
             <p>the bot only answers when the adapter is back online; the code is valid until then</p>
           )}

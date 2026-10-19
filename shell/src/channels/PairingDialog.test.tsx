@@ -51,10 +51,34 @@ async function flush() {
   });
 }
 
-function answer(code = CODE) {
-  client.apiFetch.mockImplementation((_path: string, init?: { method?: string }) =>
-    Promise.resolve(init?.method === "POST" ? code : undefined),
-  );
+const WAITING = { state: "waiting", expires_at: CODE.expires_at, attempts_left: 5 };
+const PAIRED = {
+  state: "paired",
+  paired_at: "2026-10-19T10:31:00Z",
+  identity: {
+    sender_ref: "42",
+    sender_name: "Duarte",
+    conversation_ref: "-1001",
+    conversation_kind: "group",
+    parent: null,
+    home: false,
+  },
+};
+
+/** POST answers with `code`; each GET takes the next status of `statuses`, the last one repeating. */
+function answer(code = CODE, statuses: object[] = [WAITING]) {
+  let i = 0;
+  client.apiFetch.mockImplementation((_path: string, init?: { method?: string }) => {
+    if (init?.method === "POST") return Promise.resolve(code);
+    if (init?.method === "DELETE") return Promise.resolve(undefined);
+    return Promise.resolve(statuses[Math.min(i++, statuses.length - 1)]);
+  });
+}
+
+async function tick(ms = 3000) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
 }
 
 beforeEach(() => {
@@ -101,7 +125,7 @@ describe("PairingDialog", () => {
     expect(screen.getByText("/pair 482913")).toBeTruthy();
   });
 
-  it("counts down and says expired without asking the daemon", async () => {
+  it("counts down and says expired from the local clock", async () => {
     mount(<PairingDialog channel={channel()} open onOpenChange={() => {}} />);
     await flush();
     expect(screen.getByText("10:00")).toBeTruthy();
@@ -113,7 +137,7 @@ describe("PairingDialog", () => {
       await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
     });
     expect(screen.getByText(/expired/i)).toBeTruthy();
-    expect(client.apiFetch).toHaveBeenCalledTimes(1);
+    expect(calls("POST")).toHaveLength(1);
   });
 
   it("offers to copy the command", async () => {
@@ -177,6 +201,136 @@ describe("PairingDialog", () => {
     const cached = JSON.stringify(queryClient.getQueryCache().getAll().map((q) => q.state.data));
     expect(cached).not.toContain("482913");
     expect(JSON.stringify(localStorage)).not.toContain("482913");
+  });
+
+  describe("status", () => {
+    const gets = () => client.apiFetch.mock.calls.filter(([, init]) => init === undefined || (init as { method?: string }).method === undefined);
+    const open = () => mount(<PairingDialog channel={channel()} open onOpenChange={() => {}} />);
+
+    it("keeps polling while waiting and shows the attempts left", async () => {
+      answer(CODE, [WAITING, { ...WAITING, attempts_left: 4 }]);
+      open();
+      await flush();
+      expect(screen.getByText(/waiting for \/pair 482913… 5 attempts left/)).toBeTruthy();
+      const before = gets().length;
+      await tick();
+      expect(gets().length).toBeGreaterThan(before);
+      expect(screen.getByText(/waiting for \/pair 482913… 4 attempts left/)).toBeTruthy();
+    });
+
+    it("does not stop polling on none, shows no error and keeps the code", async () => {
+      answer(CODE, [{ state: "none" }, WAITING]);
+      open();
+      await flush();
+      const afterFirst = gets().length;
+      expect(screen.getByText("/pair 482913")).toBeTruthy();
+      await tick();
+      expect(gets().length).toBeGreaterThan(afterFirst);
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByText("/pair 482913")).toBeTruthy();
+      expect(screen.getByText(/waiting for/)).toBeTruthy();
+    });
+
+    it("stops repeating none once the local expiry has passed", async () => {
+      answer(CODE, [{ state: "none" }]);
+      open();
+      await flush();
+      await tick(10 * 60 * 1000 + 1000);
+      const settled = gets().length;
+      await tick(30000);
+      expect(gets().length).toBe(settled);
+    });
+
+    it("shows who, where and home on paired, invalidates and stops", async () => {
+      answer(CODE, [{ ...PAIRED, identity: { ...PAIRED.identity, home: true } }]);
+      open();
+      const spy = vi.spyOn(queryClient, "invalidateQueries");
+      await flush();
+      expect(screen.getByText(/Duarte/)).toBeTruthy();
+      expect(screen.getByText(/group/)).toBeTruthy();
+      expect(screen.getByText(/-1001/)).toBeTruthy();
+      expect(screen.getByText(/home/i)).toBeTruthy();
+      const keysCalled = spy.mock.calls.map(([f]) => JSON.stringify((f as { queryKey: unknown }).queryKey));
+      expect(keysCalled).toContain(JSON.stringify(["channels", "telegram", "identities"]));
+      expect(keysCalled).toContain(JSON.stringify(["channels"]));
+      await tick();
+      const settled = gets().length;
+      await tick(30000);
+      expect(gets().length).toBe(settled);
+    });
+
+    it("falls back to the sender_ref and mentions the parent group", async () => {
+      answer(CODE, [
+        {
+          ...PAIRED,
+          identity: { ...PAIRED.identity, sender_name: null, conversation_kind: "thread", parent: "-1000" },
+        },
+      ]);
+      open();
+      await flush();
+      expect(screen.getByText(/42/)).toBeTruthy();
+      expect(screen.getByText(/and its parent group/)).toBeTruthy();
+    });
+
+    it.each([
+      ["expired", { state: "expired", expires_at: CODE.expires_at }],
+      ["exhausted", { state: "exhausted", attempts_left: 0 }],
+      ["superseded", { state: "superseded" }],
+    ])("says %s and offers a new code", async (_name, status) => {
+      answer(CODE, [status]);
+      open();
+      await flush();
+      expect(screen.getByRole("button", { name: "Get a new code" })).toBeTruthy();
+      const settled = gets().length;
+      await tick(30000);
+      expect(gets().length).toBe(settled);
+    });
+
+    it("re-seeds after expired: a new code restarts the poll", async () => {
+      answer(CODE, [WAITING, { state: "expired", expires_at: CODE.expires_at }]);
+      open();
+      await flush();
+      await tick();
+      expect(screen.getByRole("button", { name: "Get a new code" })).toBeTruthy();
+      answer(
+        { ...CODE, code: "111222", command: "/pair 111222" },
+        [{ ...WAITING }],
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Get a new code" }));
+      });
+      await flush();
+      expect(calls("POST")).toHaveLength(2);
+      expect(screen.getByText("/pair 111222")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Get a new code" })).toBeNull();
+      const before = gets().length;
+      await tick();
+      expect(gets().length).toBeGreaterThan(before);
+    });
+
+    it("stops polling and leaves no timers when closed", async () => {
+      const view = open();
+      await flush();
+      view.rerender(
+        <QueryClientProvider client={queryClient}>
+          <PairingDialog channel={channel()} open={false} onOpenChange={() => {}} />
+        </QueryClientProvider>,
+      );
+      await flush();
+      const settled = client.apiFetch.mock.calls.length;
+      await tick(60000);
+      expect(client.apiFetch.mock.calls.length).toBe(settled);
+    });
+
+    it("shows a note when the status request fails and keeps the code", async () => {
+      client.apiFetch.mockImplementation((_path: string, init?: { method?: string }) =>
+        init?.method === "POST" ? Promise.resolve(CODE) : Promise.reject(new Error("down")),
+      );
+      open();
+      await flush();
+      expect(screen.getByText(/did not answer the status request/i)).toBeTruthy();
+      expect(screen.getByText("/pair 482913")).toBeTruthy();
+    });
   });
 
   it("asks for a fresh code when reopened", async () => {
