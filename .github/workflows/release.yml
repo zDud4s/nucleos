@@ -141,5 +141,7 @@ jobs:
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir release-assets
           python3 scripts/release-manifest.py verify --dir release-assets --version "$version"
           python3 scripts/release-manifest.py sums --dir release-assets --version "$version"
-          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          # The install scripts ride along as assets, so `releases/latest/download/install.sh` always
+          # matches the release they install. They are not in SHA256SUMS: they are what verifies it.
+          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS scripts/install.sh scripts/install.ps1             --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
