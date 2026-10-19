@@ -374,6 +374,51 @@
   column-gap: var(--space-3);
 }
 
+.browser-row-head > .browser-url {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Below 60rem the origin gets a line of its own and the badges and time wrap
+   underneath, so the host no longer breaks into three lines beside them. */
+@media (max-width: 60rem) {
+  .browser-row-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-3);
+  }
+
+  .browser-row-head > .browser-url {
+    flex: 1 0 100%;
+  }
+}
+
+/* Revoke and Stop submitting sit on one line while they fit and stack when
+   they do not. The armed label (it carries the whole origin) is reserved inside
+   each button, so it must be allowed to wrap: nowrap here is what pushed the
+   pair out of the card on both sides. Equal widths are given up for that. */
+.browser-row .browser-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  min-width: 0;
+}
+
+.browser-row .browser-actions > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.browser-row .browser-actions .ui-button {
+  max-width: 100%;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /**
  * The two things hung below the grants: what has been submitted under them,
  * and the door that forgets the profile entirely.
