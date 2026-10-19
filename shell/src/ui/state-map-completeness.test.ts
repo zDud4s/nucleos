@@ -90,6 +90,7 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   "feed.rs": { kind: [] },
   "execution/job/spawn.rs": { kind: [] },
   "integrations/notify.rs": { kind: [] },
+  "execution/runner/auth_watch.rs": { kind: ["run_on_api_key", "run_on_subscription", "run_rate_limited"] },
   "execution/runs/spawn.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
 };
