@@ -9339,10 +9339,18 @@ mod tests {
     async fn the_consent_listing_shows_every_command_and_diffs_an_update_against_what_runs() {
         let mut state = test_state().await;
         let (_lib, library) = library_with(&[
-            ("harness", "1.0", "description: x
-"),
-            ("harness", "1.1", "description: x
-"),
+            (
+                "harness",
+                "1.0",
+                "description: x
+",
+            ),
+            (
+                "harness",
+                "1.1",
+                "description: x
+",
+            ),
         ]);
         std::fs::write(library.join("harness/1.0/graph.yaml"), TWO_NODE_GRAPH).unwrap();
         std::fs::write(
@@ -9355,8 +9363,13 @@ mod tests {
         .unwrap();
         state.workflow_library = Some(library);
         let _home = with_project_home(&mut state);
-        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test
-").await;
+        let _dir = project_with_rules(
+            &state,
+            "alpha",
+            "gate_command: cargo test
+",
+        )
+        .await;
 
         // Before anything is pinned there is nothing to diff against: every command is new.
         let (status, first) = workflow_call(
