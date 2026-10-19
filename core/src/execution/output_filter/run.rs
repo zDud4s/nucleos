@@ -212,6 +212,7 @@ fn run_spawned(commands: Vec<Command>, log_dir: &Path) -> i32 {
     drop(tx);
 
     let mut sink = Sink::new(log_dir, LOG_CAP_BYTES);
+    sink.announce(&mut std::io::stdout());
     for chunk in rx {
         sink.push(&chunk);
     }
@@ -353,6 +354,21 @@ impl Sink {
             .extend_from_slice(&bytes[..bytes.len().min(room)]);
     }
 
+    /// Prints ONE line before any output is read, flushed, saying where the full log is. The view
+    /// only appears when the command exits; if the CLI kills the call first (the Bash tool's
+    /// timeout), this line is all the agent ever sees.
+    fn announce(&self, out: &mut impl Write) {
+        let place = match &self.log.failed {
+            Some(_) => "full log unavailable".to_string(),
+            None => format!("full log: {}", self.log.current_path().display()),
+        };
+        let _ = writeln!(
+            out,
+            "nucleos: output is filtered until the command exits; {place}"
+        );
+        let _ = out.flush();
+    }
+
     /// Prints the view and returns `code`. `note` is appended to the footer.
     fn finish(mut self, code: i32, note: Option<&str>, out: &mut impl Write) -> i32 {
         if !self.partial.is_empty() {
@@ -416,6 +432,7 @@ fn drain_stream(mut input: impl Read, mut emit: impl FnMut(&[u8])) -> Option<i32
 /// The output filtered and logged; `input` is a command's merged output ending in the sentinel.
 fn filter_stream(input: impl Read, mut out: impl Write, log_dir: &Path, cap: u64) -> i32 {
     let mut sink = Sink::new(log_dir, cap);
+    sink.announce(&mut out);
     let sentinel = drain_stream(input, |bytes| sink.push(bytes));
     match sentinel {
         Some(code) => sink.finish(code, None, &mut out),
@@ -503,6 +520,33 @@ mod tests {
             printed.contains(&files[0].0),
             "the footer does not name the log: {printed}"
         );
+    }
+
+    #[test]
+    fn the_first_line_says_where_the_full_log_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let mut out = Vec::new();
+
+        filter_stream(
+            "alpha\n\n\u{1e}NUCLEOS-EXIT:0\n".as_bytes(),
+            &mut out,
+            &log_dir,
+            1_000_000,
+        );
+
+        let printed = String::from_utf8(out).unwrap();
+        let first = printed.lines().next().unwrap();
+        assert!(
+            first.starts_with("nucleos: output is filtered until the command exits; full log: "),
+            "{printed}"
+        );
+        assert!(!first.contains("NUCLEOS-EXIT"), "{first}");
+        let files = log_files(&log_dir);
+        let path = first.rsplit("full log: ").next().unwrap();
+        assert!(path.ends_with(&files[0].0), "{first} vs {files:?}");
+        let footer_line = printed.lines().last().unwrap();
+        assert!(footer_line.ends_with(path), "{footer_line} vs {path}");
     }
 
     #[test]

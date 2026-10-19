@@ -28,8 +28,14 @@ pub const LINE_MAX_CHARS: usize = 500;
 pub const LOG_CAP_BYTES: u64 = 64 * 1024 * 1024;
 /// A command longer than this is left alone rather than wrapped.
 pub const MAX_WRAPPED_BYTES: usize = 128 * 1024;
-/// The Windows command line is 32767 characters; the encoded command stays well under it.
+/// The filter runtime re-passes the encoded command via `-EncodedCommand` on a Windows command
+/// line of 32767 characters, so the encoded part alone stays well under it.
 pub const MAX_ENCODED_CHARS: usize = 30_000;
+/// The whole wrapped PowerShell command (exe path and log dir included) is capped here. Measured
+/// with Claude Code 2.1.296: the CLI hands the command to powershell.exe through an environment
+/// variable (`CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT`); a 31_000-char command ran, a 33_000-char one
+/// failed with `ENAMETOOLONG: name too long, uv_spawn`.
+pub const MAX_POWERSHELL_COMMAND_CHARS: usize = 31_000;
 /// The line the Bash wrapper prints after the command, carrying its exit status.
 pub const EXIT_SENTINEL: &str = "\u{1e}NUCLEOS-EXIT:";
 /// The flag that routes a process into the filter runtime. It is also how a wrapped command is
@@ -207,11 +213,15 @@ pub fn wrap_powershell(command: &str, exe: &Path, log_dir: &Path) -> Option<Stri
     if encoded.len() > MAX_ENCODED_CHARS {
         return None;
     }
-    Some(format!(
+    let wrapped = format!(
         "$__nucleosShell = (Get-Process -Id $PID).Path; & {} {FLAG} --log {} --shell $__nucleosShell --encoded {encoded}",
         quote_powershell(&forward(exe)),
         quote_powershell(&forward(log_dir)),
-    ))
+    );
+    if wrapped.chars().count() > MAX_POWERSHELL_COMMAND_CHARS {
+        return None;
+    }
+    Some(wrapped)
 }
 
 /// PURE: the tool input a hook should hand back so a foreground Bash or PowerShell command runs
@@ -547,6 +557,19 @@ mod tests {
 
         assert_eq!(decoded, format!("{command}\n{PS_POSTAMBLE}"));
         assert!(PS_POSTAMBLE.contains("exit $global:LASTEXITCODE"));
+    }
+
+    #[test]
+    fn the_powershell_wrapper_caps_the_whole_command_not_only_the_encoded_part() {
+        let exe = Path::new("/bin/nucleos-core");
+        // About 20_000 encoded chars: fits MAX_ENCODED_CHARS on its own.
+        let command = "a".repeat(7_000);
+        let short_dir = Path::new("/data/run-output/7");
+        let wrapped = wrap_powershell(&command, exe, short_dir).unwrap();
+        assert!(wrapped.chars().count() <= MAX_POWERSHELL_COMMAND_CHARS);
+
+        let long_dir = PathBuf::from(format!("/data/{}", "d".repeat(12_000)));
+        assert!(wrap_powershell(&command, exe, &long_dir).is_none());
     }
 
     #[test]

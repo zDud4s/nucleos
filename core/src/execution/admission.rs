@@ -85,6 +85,9 @@ struct Inner {
     grants: Vec<Grant>,
     waiters: VecDeque<Waiter>,
     finished: HashMap<i64, Duration>,
+    /// Per run with queued waiters: how many, and when the current busy period began. Bounded by
+    /// the queue itself.
+    open: HashMap<i64, (usize, Instant)>,
     finished_order: VecDeque<i64>,
     demand_set_at: Option<Instant>,
     next_verify_id: u64,
@@ -99,6 +102,26 @@ impl Inner {
     fn demand_active(&self, now: Instant) -> bool {
         self.demand_set_at
             .is_some_and(|at| now.saturating_duration_since(at) < VERIFY_DEMAND_TTL)
+    }
+
+    /// A waiter of `run_id` joined the queue. The first one of a run opens a busy period.
+    fn enter_queue(&mut self, run_id: i64, now: Instant) {
+        self.open.entry(run_id).or_insert((0, now)).0 += 1;
+    }
+
+    /// A waiter of `run_id` left the queue (granted, given up, removed). The last one closes the
+    /// busy period and its length joins the finished total: waits of one run that overlap lose the
+    /// run that time once, not once per waiter.
+    fn leave_queue(&mut self, run_id: i64, now: Instant) {
+        let Some((count, started)) = self.open.get_mut(&run_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            let started = *started;
+            self.open.remove(&run_id);
+            self.record_wait(run_id, now.saturating_duration_since(started));
+        }
     }
 
     fn record_wait(&mut self, run_id: i64, waited: Duration) {
@@ -127,7 +150,7 @@ impl Inner {
             let Some(waiter) = self.waiters.pop_front() else {
                 break;
             };
-            self.record_wait(waiter.run_id, now.saturating_duration_since(waiter.since));
+            self.leave_queue(waiter.run_id, now);
             self.grants.push(Grant {
                 run_id: Some(waiter.run_id),
                 tool_use_id: Some(waiter.tool_use_id),
@@ -142,7 +165,7 @@ impl Inner {
 
     fn remove_waiter(&mut self, index: usize, now: Instant) {
         if let Some(waiter) = self.waiters.remove(index) {
-            self.record_wait(waiter.run_id, now.saturating_duration_since(waiter.since));
+            self.leave_queue(waiter.run_id, now);
         }
     }
 }
@@ -168,6 +191,7 @@ impl AdmissionBook {
                 grants: Vec::new(),
                 waiters: VecDeque::new(),
                 finished: HashMap::new(),
+                open: HashMap::new(),
                 finished_order: VecDeque::new(),
                 demand_set_at: None,
                 next_verify_id: 0,
@@ -229,13 +253,16 @@ impl AdmissionBook {
                 }
                 inner.waiters[index].last_poll = now;
             }
-            None => inner.waiters.push_back(Waiter {
-                run_id,
-                tool_use_id: tool_use_id.to_string(),
-                weight,
-                since: now,
-                last_poll: now,
-            }),
+            None => {
+                inner.enter_queue(run_id, now);
+                inner.waiters.push_back(Waiter {
+                    run_id,
+                    tool_use_id: tool_use_id.to_string(),
+                    weight,
+                    since: now,
+                    last_poll: now,
+                });
+            }
         }
         if inner.pump(self.capacity, now) > 0 {
             self.announce(&inner, false);
@@ -416,18 +443,16 @@ impl AdmissionBook {
         self.lock().verify_wake = Some(wake);
     }
 
-    /// Time a run spent queued: finished waits plus the ones still going.
+    /// Time a run spent queued: the union of its waiting intervals, so two calls waiting in
+    /// parallel for 10 s cost the run 10 s, not 20.
     pub fn queued_time(&self, run_id: i64) -> Duration {
         let now = Instant::now();
         let inner = self.lock();
         let finished = inner.finished.get(&run_id).copied().unwrap_or_default();
-        inner
-            .waiters
-            .iter()
-            .filter(|waiter| waiter.run_id == run_id)
-            .fold(finished, |total, waiter| {
-                total + now.saturating_duration_since(waiter.since)
-            })
+        match inner.open.get(&run_id) {
+            Some((_, started)) => finished + now.saturating_duration_since(*started),
+            None => finished,
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -796,6 +821,35 @@ mod tests {
         assert!(is_waiting(&book.request(2, "c", 1)));
         advance(Duration::from_secs(4)).await;
         assert_eq!(book.queued_time(2).as_secs(), 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parallel_waits_of_one_run_are_not_summed() {
+        let book = book(1);
+        assert!(is_granted(&book.request(1, "h", 1)));
+        assert!(is_waiting(&book.request(2, "a", 1)));
+        assert!(is_waiting(&book.request(2, "b", 1)));
+        advance(Duration::from_secs(10)).await;
+        assert_eq!(book.queued_time(2).as_secs(), 10, "ongoing, two waiters");
+        assert!(book.release(2, "a"));
+        assert!(book.release(2, "b"));
+        assert_eq!(book.queued_time(2).as_secs(), 10, "finished, two waiters");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partly_overlapping_waits_of_one_run_count_their_union() {
+        let book = book(1);
+        assert!(is_granted(&book.request(1, "h", 1)));
+        assert!(is_waiting(&book.request(2, "a", 1)));
+        advance(Duration::from_secs(5)).await;
+        assert!(is_waiting(&book.request(2, "b", 1)));
+        advance(Duration::from_secs(5)).await;
+        // "a" waited 0-10, "b" is still queued.
+        assert!(book.release(2, "a"));
+        assert_eq!(book.queued_time(2).as_secs(), 10);
+        advance(Duration::from_secs(5)).await;
+        assert!(book.release(2, "b"));
+        assert_eq!(book.queued_time(2).as_secs(), 15);
     }
 
     #[tokio::test(start_paused = true)]

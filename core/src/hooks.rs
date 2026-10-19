@@ -3057,6 +3057,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_allowed_powershell_test_command_in_a_run_is_rewritten_through_filter_run() {
+        let state = test_state().await;
+        let cwd = tempfile::TempDir::new().unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(cwd.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let body = serde_json::json!({
+            "run_id": run_id,
+            "tool_name": "PowerShell",
+            "tool_input": {"command": "cargo test -p demo"},
+        })
+        .to_string();
+
+        let answer = decide_raw(&app, &body).await;
+
+        assert_eq!(answer["decision"], "allow", "{answer}");
+        let command = answer["updated_input"]["command"]
+            .as_str()
+            .expect("a recognized PowerShell command in a run carries updated_input.command");
+        assert!(command.contains("--filter-run"), "{command}");
+        assert!(command.contains("--encoded"), "{command}");
+    }
+
+    /// The rewrite rides on an `asking` answer too (`pretooluse_decision` rewrites for `allow` and
+    /// `asking`): a person is asked about the filtered form, and saying yes runs it.
+    #[tokio::test]
+    async fn an_asking_answer_for_a_recognized_command_carries_the_rewrite() {
+        let state = test_state().await;
+        let run_id = rooted_turn_on(
+            &state,
+            "C:/Projects/nucleos",
+            crate::chats::PermissionMode::Auto,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        // A pipe into `tee` is never allowed outright, yet `cargo test` is a recognized kind.
+        let answer = decide_raw(&app, &bash(run_id, PARKED)).await;
+
+        assert_eq!(answer["decision"], "asking", "{answer}");
+        let command = answer["updated_input"]["command"]
+            .as_str()
+            .expect("an asking answer carries the rewrite too");
+        assert!(command.contains("--filter-run"), "{command}");
+        assert!(command.contains(PARKED), "{command}");
+    }
+
+    #[tokio::test]
     async fn a_parked_or_denied_command_is_never_rewritten() {
         let state = test_state().await;
         let cwd = tempfile::TempDir::new().unwrap();
