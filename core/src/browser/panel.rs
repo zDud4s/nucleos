@@ -623,6 +623,7 @@ mod tests {
 
     fn state_over(pool: sqlx::SqlitePool, browser: BrowserRuntime) -> AppState {
         AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,

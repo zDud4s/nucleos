@@ -678,6 +678,7 @@ mod tests {
         use crate::execution::runner::FakeCommandRunner;
         use std::sync::Arc;
         AppState {
+            startup_config: Default::default(),
             token: Token("test-token".into()),
             pool: crate::testdb::fresh_pool().await,
             telegram_doctrine: None,

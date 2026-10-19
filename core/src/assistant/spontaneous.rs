@@ -513,6 +513,7 @@ mod tests {
 
     async fn test_state() -> AppState {
         AppState {
+            startup_config: Default::default(),
             token: Token("t".into()),
             pool: crate::testdb::fresh_pool().await,
             telegram_doctrine: None,

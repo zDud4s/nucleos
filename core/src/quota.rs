@@ -1287,6 +1287,7 @@ mod tests {
 
     async fn state_with_quota(pool: SqlitePool, quota: QuotaRuntime) -> crate::state::AppState {
         crate::state::AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,

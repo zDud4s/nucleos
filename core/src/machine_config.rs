@@ -278,6 +278,91 @@ pub fn setting_for(rel: &str) -> Option<&'static Setting> {
     SETTINGS.iter().find(|setting| setting.path == path)
 }
 
+/* --------------------------------------------------------------- reading health -- */
+
+/// The longest `problem` a [`FileCheck`] carries, in characters. A parser's message can quote the
+/// value that offended it, and a page or a feed line has no use for a paragraph of it.
+pub const PROBLEM_MAX_CHARS: usize = 300;
+
+/// Whether one settings file on disk reads, as `GET /config/machine` and the health readout say it.
+///
+/// Nine of the ten loaders are fail-soft (see the module header), so a file that does not parse
+/// leaves the daemon running on defaults and the owner, who does not read logs, believing otherwise.
+/// This is the same validator the write door runs, applied to what is already on disk.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct FileCheck {
+    /// The row's file name relative to [`root`], as [`Setting::path`].
+    pub path: &'static str,
+    /// Whether anything is on disk. An absent file is valid: defaults are its contract.
+    pub exists: bool,
+    pub valid: bool,
+    /// Why it does not read, cut to [`PROBLEM_MAX_CHARS`]. `None` exactly when `valid`.
+    pub problem: Option<String>,
+}
+
+/// `text` cut to [`PROBLEM_MAX_CHARS`] characters, the last being an ellipsis when something went.
+fn cut_problem(text: &str) -> String {
+    if text.chars().count() <= PROBLEM_MAX_CHARS {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(PROBLEM_MAX_CHARS - 1).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+/// The verdict on one row, from the result of reading its file. A caller that already holds the
+/// text (the settings route serves it) judges that same read instead of opening the file twice.
+///
+/// A file that exists but cannot be read as text (a directory, bad UTF-8, a permission) is invalid,
+/// and says only the I/O error's kind: its full text embeds the absolute path, which a message
+/// served to a page and written to a feed should not carry.
+pub fn check_read(setting: &Setting, read: &std::io::Result<String>) -> FileCheck {
+    let (exists, verdict) = match read {
+        Ok(contents) => (true, (setting.validate)(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, Ok(())),
+        Err(error) => (true, Err(format!("could not be read ({:?})", error.kind()))),
+    };
+    let problem = verdict.err().map(|text| cut_problem(&text));
+    FileCheck {
+        path: setting.path,
+        exists,
+        valid: problem.is_none(),
+        problem,
+    }
+}
+
+/// Runs every row's validator over the file on disk. Absent is valid (defaults are the contract).
+pub fn check_all(root: &std::path::Path) -> Vec<FileCheck> {
+    SETTINGS
+        .iter()
+        .map(|setting| check_read(setting, &std::fs::read_to_string(root.join(setting.path))))
+        .collect()
+}
+
+/// The feed kind a file that did not parse at startup is recorded under.
+pub const CONFIG_UNREADABLE_KIND: &str = "config_unreadable";
+
+/// Writes one machine-level feed line per file in `checks` that does not parse, and returns how many.
+///
+/// Called once at startup with what the loaders started from, so a line says the daemon began on
+/// defaults for that file. The text names the file and not the parser's message: the message can
+/// quote the offending value, and a feed line travels on to Telegram. Best effort, like every other
+/// startup note: a feed that cannot be written must not stop the daemon.
+pub async fn report_unreadable(pool: &sqlx::SqlitePool, checks: &[FileCheck]) -> usize {
+    let mut written = 0;
+    for check in checks.iter().filter(|check| !check.valid) {
+        let summary = format!(
+            "{} did not parse; the daemon started on its defaults for it",
+            display_path(check.path)
+        );
+        match crate::feed::append(pool, None, CONFIG_UNREADABLE_KIND, &summary, None, None).await {
+            Ok(_) => written += 1,
+            Err(error) => tracing::warn!(%error, "could not record an unreadable settings file"),
+        }
+    }
+    written
+}
+
 /* ------------------------------------------------------------ the other half -- */
 
 /// One credential this machine holds, named so the page can ask for it without ever being told it.
@@ -685,5 +770,96 @@ url: http://example.com:8080
         if let (Some(root), Some(council)) = (root(), crate::council::config_path()) {
             assert_eq!(council, root.join(COUNCIL_FILE));
         }
+    }
+
+    /// A directory holding the given `(file, contents)` pairs, as `~/.nucleos` would.
+    fn root_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, contents) in files {
+            std::fs::write(dir.path().join(name), contents).expect("write");
+        }
+        dir
+    }
+
+    /// Defaults are an absent file's contract, so absence is never a finding.
+    #[test]
+    fn check_all_says_an_absent_file_is_valid() {
+        let root = root_with(&[]);
+        let checks = check_all(root.path());
+        assert_eq!(checks.len(), SETTINGS.len(), "one check per row");
+        for check in &checks {
+            assert!(!check.exists, "{} is not on disk", check.path);
+            assert!(check.valid, "{} is absent, hence valid", check.path);
+            assert_eq!(check.problem, None);
+        }
+    }
+
+    /// The finding names the one file at fault, and leaves a file that parses alone.
+    #[test]
+    fn check_all_names_the_file_that_does_not_parse() {
+        let root = root_with(&[
+            (EMAIL_FILE, "enabled: [this is not a bool}\n"),
+            (WEB_FILE, ""),
+        ]);
+        let checks = check_all(root.path());
+        let bad: Vec<_> = checks.iter().filter(|check| !check.valid).collect();
+        assert_eq!(bad.len(), 1, "only email.yaml is broken: {bad:?}");
+        assert_eq!(bad[0].path, EMAIL_FILE);
+        assert!(bad[0].exists);
+        assert!(bad[0].problem.as_deref().is_some_and(|p| !p.is_empty()));
+        let web = checks.iter().find(|check| check.path == WEB_FILE).unwrap();
+        assert!(web.exists && web.valid && web.problem.is_none());
+    }
+
+    /// A parser message that quotes a huge value is cut, and the cut says it.
+    #[test]
+    fn check_all_cuts_a_long_problem() {
+        let long = "x".repeat(2000);
+        let cut = cut_problem(&long);
+        assert_eq!(cut.chars().count(), PROBLEM_MAX_CHARS);
+        assert!(cut.ends_with('\u{2026}'));
+        assert_eq!(cut_problem("short"), "short");
+        let exact = "y".repeat(PROBLEM_MAX_CHARS);
+        assert_eq!(cut_problem(&exact), exact, "at the limit nothing is cut");
+
+        // End to end: whatever a validator says about a long offending value stays inside the cap.
+        let body = format!("mode: {long}\n");
+        let root = root_with(&[(ROUTER_FILE, body.as_str())]);
+        let checks = check_all(root.path());
+        let router = checks
+            .iter()
+            .find(|check| check.path == ROUTER_FILE)
+            .unwrap();
+        assert!(!router.valid);
+        assert!(router.problem.as_ref().unwrap().chars().count() <= PROBLEM_MAX_CHARS);
+    }
+
+    /// One feed line per file that did not parse, none for the files that did.
+    #[tokio::test]
+    async fn an_unreadable_file_at_startup_writes_one_feed_line() {
+        let pool = crate::testdb::fresh_pool().await;
+        let root = root_with(&[
+            (EMAIL_FILE, "enabled: [this is not a bool}\n"),
+            (WEB_FILE, ""),
+        ]);
+        let checks = check_all(root.path());
+
+        assert_eq!(report_unreadable(&pool, &checks).await, 1);
+
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as("SELECT kind, summary, project_id FROM feed")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, CONFIG_UNREADABLE_KIND);
+        assert_eq!(
+            rows[0].1,
+            "~/.nucleos/email.yaml did not parse; the daemon started on its defaults for it"
+        );
+        assert_eq!(rows[0].2, None, "a machine-level line, no project");
+
+        let clean = root_with(&[]);
+        assert_eq!(report_unreadable(&pool, &check_all(clean.path())).await, 0);
     }
 }

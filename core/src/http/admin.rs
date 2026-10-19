@@ -327,12 +327,20 @@ pub(super) async fn get_machine_config(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let root = machine_config_root(&state)?;
     let read_root = root.clone();
+    let startup = state.startup_config.clone();
     let rows = tokio::task::spawn_blocking(move || {
         crate::machine_config::SETTINGS
             .iter()
             .map(|setting| {
                 let target = read_root.join(setting.path);
-                let contents = std::fs::read_to_string(&target).ok();
+                let read = std::fs::read_to_string(&target);
+                // Judged from the read that is served, so the verdict and the text beside it can
+                // never be about two different versions of the file.
+                let check = crate::machine_config::check_read(setting, &read);
+                // What the daemon started on, if it recorded anything for this file; a state that
+                // recorded nothing means "nothing was wrong".
+                let at_startup = startup.iter().find(|entry| entry.path == setting.path);
+                let contents = read.ok();
                 serde_json::json!({
                     "path": setting.path,
                     "display": crate::machine_config::display_path(setting.path),
@@ -340,6 +348,12 @@ pub(super) async fn get_machine_config(
                     "what": setting.what,
                     "takes_effect": setting.takes_effect,
                     "exists": contents.is_some(),
+                    "valid": check.valid,
+                    "problem": check.problem,
+                    "at_startup": {
+                        "valid": at_startup.is_none_or(|entry| entry.valid),
+                        "problem": at_startup.and_then(|entry| entry.problem.clone()),
+                    },
                     "contents": contents,
                     "resolved": target.display().to_string(),
                 })

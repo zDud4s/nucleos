@@ -1371,6 +1371,7 @@ mod tests {
 
     async fn state_with(pool: sqlx::SqlitePool, propose: bool) -> AppState {
         AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,

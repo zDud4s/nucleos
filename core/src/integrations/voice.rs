@@ -2110,6 +2110,7 @@ mod tests {
     /// An `AppState` whose voice runtime is whatever the test needs and whose runner never runs.
     async fn conversing_state(voice: VoiceRuntime) -> AppState {
         AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("t".into()),
             pool: pool().await,
             runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),

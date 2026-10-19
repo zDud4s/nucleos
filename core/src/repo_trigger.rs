@@ -639,6 +639,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let pool = crate::testdb::fresh_pool().await;
         let state = crate::state::AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("test-token".into()),
             pool,
             telegram_doctrine: None,

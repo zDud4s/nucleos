@@ -157,6 +157,9 @@ function machineWorld(): MachineConfig {
       what: `what ${area} does`,
       takes_effect: "when the daemon restarts",
       exists: false,
+      valid: true,
+      problem: null,
+      at_startup: { valid: true, problem: null },
       contents: null,
       resolved: `C:/Users/someone/.nucleos/${area}.yaml`,
     })),
@@ -1274,6 +1277,60 @@ describe("System - this machine's settings", () => {
     // back to a file they cannot see to look for a line nobody named.
     expect(await screen.findByText(/did not find expected node content/)).toBeDefined();
     expect(world.machine.settings.find((row) => row.path === "browser.yaml")?.exists).toBe(false);
+  });
+});
+
+describe("System - a settings file that does not read", () => {
+  it("a file that does not parse says so and shows why", async () => {
+    const world = systemWorld();
+    world.machine.settings = world.machine.settings.map((row) =>
+      row.path === "email.yaml"
+        ? {
+            ...row,
+            exists: true,
+            contents: "enabled: [oops\n",
+            valid: false,
+            problem: "did not find expected ',' or ']' at line 2",
+          }
+        : row,
+    );
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    await openSettingsFile("email");
+    const panel = (await screen.findByRole("heading", { name: "email" })).closest("section") as HTMLElement;
+    expect(within(panel).getByText("does not parse")).toBeDefined();
+    expect(within(panel).getByText(/did not find expected ',' or '\]' at line 2/)).toBeDefined();
+    // A healthy file beside it carries neither the badge nor the note.
+    await openSettingsFile("web");
+    const web = (await screen.findByRole("heading", { name: "web" })).closest("section") as HTMLElement;
+    expect(within(web).queryByText("does not parse")).toBeNull();
+  });
+
+  it("a file the daemon started without says a restart is needed", async () => {
+    const world = systemWorld();
+    // Broken when the daemon read it, fixed on disk since: valid now, defaults in force.
+    world.machine.settings = world.machine.settings.map((row) =>
+      row.path === "voice.yaml"
+        ? {
+            ...row,
+            exists: true,
+            contents: "enabled: false\n",
+            at_startup: { valid: false, problem: "bad chord" },
+          }
+        : row,
+    );
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    await openSettingsFile("voice");
+    const panel = (await screen.findByRole("heading", { name: "voice" })).closest("section") as HTMLElement;
+    expect(
+      within(panel).getByText("the daemon started on defaults — restart after fixing"),
+    ).toBeDefined();
+    expect(within(panel).queryByText("does not parse")).toBeNull();
   });
 });
 

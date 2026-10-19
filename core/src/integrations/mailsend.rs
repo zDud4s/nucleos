@@ -302,6 +302,7 @@ mod tests {
     async fn test_state(email: EmailRuntime) -> AppState {
         let pool = crate::testdb::fresh_pool().await;
         AppState {
+            startup_config: Default::default(),
             // Recognisable on purpose: this is the value a fallback would reach for.
             token: Token("control-token".into()),
             pool,

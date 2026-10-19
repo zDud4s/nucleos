@@ -202,7 +202,13 @@ function SettingPanel({
   return (
     <Panel
       title={setting.area}
-      aside={<StateBadge domain="machine_file" state={setting.exists ? "configured" : "unconfigured"} />}
+      aside={
+        <>
+          {!setting.valid && <StateBadge domain="machine_file" state="unreadable" />}
+          {!setting.at_startup.valid && <StateBadge domain="machine_file" state="started_on_defaults" />}
+          <StateBadge domain="machine_file" state={setting.exists ? "configured" : "unconfigured"} />
+        </>
+      }
     >
       <p className="sy-note">{setting.what}</p>
 
@@ -268,6 +274,14 @@ function SettingPanel({
           {saved && !dirty ? <>saved &mdash; {setting.takes_effect}</> : null}
         </span>
       </div>
+
+      {/* Why the file on disk does not read, in the parser's words: the daemon runs on defaults
+          for it, and nobody reads the log that says so. */}
+      {!setting.valid && setting.problem != null && (
+        <ErrorNote>
+          {setting.display} does not parse: {setting.problem}
+        </ErrorNote>
+      )}
 
       {/* The parser's own words. A generic "invalid" would send somebody back to
           a file they cannot see to look for a line nobody named. */}

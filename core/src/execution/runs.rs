@@ -134,6 +134,7 @@ pub mod testkit {
             ..Default::default()
         });
         let state = AppState {
+            startup_config: Default::default(),
             token: Token("test-token".into()),
             pool,
             telegram_doctrine: None,

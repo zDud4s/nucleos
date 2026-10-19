@@ -1217,6 +1217,7 @@ mod tests {
         // Run tokens are resolved against the `runs` table, so this can no longer be a bare pool.
         let pool = crate::testdb::fresh_pool().await;
         AppState {
+            startup_config: Default::default(),
             token: Token(token.to_string()),
             pool,
             telegram_doctrine: None,

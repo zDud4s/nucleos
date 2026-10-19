@@ -1443,6 +1443,7 @@ mod tests {
 
     async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
         AppState {
+            startup_config: Default::default(),
             token: crate::auth::Token("t".into()),
             pool: crate::testdb::fresh_pool().await,
             telegram_doctrine: None,

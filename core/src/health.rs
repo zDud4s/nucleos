@@ -261,6 +261,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         devtime,
         distiller,
         embeddings,
+        machine_config,
     ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
@@ -307,6 +308,10 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         run_subsystem("devtime_ingest", devtime_probe(state.pool.clone())),
         run_subsystem("distiller", distiller_probe(state.pool.clone())),
         run_subsystem("embeddings", embeddings_probe()),
+        run_subsystem(
+            "machine_config",
+            machine_config_probe(state.machine_config_root.clone()),
+        ),
     );
     let subsystems = vec![
         pool,
@@ -327,6 +332,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         devtime,
         distiller,
         embeddings,
+        machine_config,
     ];
 
     HealthReadout {
@@ -396,6 +402,37 @@ async fn cli_probe() -> SubsystemReadout {
         exec_probe(resolved.to_string_lossy().into_owned(), "--version").await
     })
     .await
+}
+
+/// PURE: the machine-settings row, from what [`crate::machine_config::check_all`] found.
+///
+/// `degraded` and never `down`: the daemon runs on defaults for a file that does not parse, which
+/// is the fail-soft posture on purpose, and the row exists so that is not silent. The tally is the
+/// only detail it carries; the file names and the parser's text belong to `GET /config/machine`,
+/// because this readout is a closed vocabulary with no text in it.
+fn machine_config_row(checks: &[crate::machine_config::FileCheck]) -> SubsystemReadout {
+    let unreadable = checks.iter().filter(|check| !check.valid).count() as i64;
+    if unreadable == 0 {
+        return SubsystemReadout::ok("machine_config");
+    }
+    let mut row = SubsystemReadout::degraded("machine_config", FailureCategory::Unknown);
+    row.counts = Some(std::collections::BTreeMap::from([(
+        "unreadable",
+        unreadable,
+    )]));
+    row
+}
+
+/// Reads this machine's settings files off the async threads. No home directory means every file
+/// is absent, which is valid.
+async fn machine_config_probe(root: Option<PathBuf>) -> SubsystemReadout {
+    let Some(root) = root else {
+        return SubsystemReadout::ok("machine_config");
+    };
+    match tokio::task::spawn_blocking(move || crate::machine_config::check_all(&root)).await {
+        Ok(checks) => machine_config_row(&checks),
+        Err(_) => SubsystemReadout::down("machine_config", FailureCategory::Unknown),
+    }
 }
 
 /// What `router.yaml` asks of the daemon, before anybody has asked the router anything.
@@ -2087,5 +2124,46 @@ url: http://127.0.0.1:{port}
         );
         let row = distiller_row(tally);
         assert_eq!(row.counts.unwrap().get("capture_open"), Some(&2));
+    }
+
+    fn file_check(path: &'static str, problem: Option<&str>) -> crate::machine_config::FileCheck {
+        crate::machine_config::FileCheck {
+            path,
+            exists: true,
+            valid: problem.is_none(),
+            problem: problem.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn machine_config_row_degrades_with_one_unreadable_file() {
+        let row = machine_config_row(&[
+            file_check("web.yaml", None),
+            file_check(
+                "email.yaml",
+                Some("expected a bool at line 1 \"secret-ish\""),
+            ),
+        ]);
+        assert_eq!(
+            (row.name, row.status),
+            ("machine_config", HealthState::Degraded)
+        );
+        assert_eq!(row.reason, Some(FailureCategory::Unknown));
+        assert_eq!(row.counts.as_ref().unwrap().get("unreadable"), Some(&1));
+        // The closed vocabulary: no file name and no parser text reach the readout.
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(
+            !json.contains("email.yaml") && !json.contains("secret-ish"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn machine_config_row_is_ok_when_everything_parses() {
+        let row =
+            machine_config_row(&[file_check("web.yaml", None), file_check("voice.yaml", None)]);
+        assert_eq!((row.name, row.status), ("machine_config", HealthState::Ok));
+        assert!(row.reason.is_none() && row.counts.is_none());
+        assert_eq!(machine_config_row(&[]).status, HealthState::Ok);
     }
 }

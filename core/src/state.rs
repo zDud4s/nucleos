@@ -384,6 +384,11 @@ pub struct AppState {
     /// rather than guessing at a root. It is also what the test state carries, so the hundreds of
     /// tests that never touch these routes need no directory to exist.
     pub machine_config_root: Option<std::path::PathBuf>,
+    /// What each settings file looked like when the daemon read them at startup: the answer to
+    /// "did it start on this file, or on defaults because the file did not parse". Computed once in
+    /// `main.rs` beside the loaders and never refreshed, so `GET /config/machine` can set it against
+    /// the file as it is now. Empty in the test state, which reads as "nothing was wrong".
+    pub startup_config: Arc<Vec<crate::machine_config::FileCheck>>,
     /// Where this machine's credentials live.
     ///
     /// A trait object for the reason `runner` and `assistants` are: there is no fake backend for
