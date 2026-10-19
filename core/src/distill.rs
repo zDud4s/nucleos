@@ -619,16 +619,18 @@ pub(crate) async fn process_one_with(
     let inputs = match gather(pool, &row).await {
         Ok(Some(inputs)) => inputs,
         Ok(None) => {
-            let _ = sqlx::query(
-                "UPDATE distill_queue SET status = ?, error = ?, finished_at = ?
+            crate::storage::settle_write("distill queue row", row.id, || {
+                sqlx::query(
+                    "UPDATE distill_queue SET status = ?, error = ?, finished_at = ?
                   WHERE id = ? AND status = ?",
-            )
-            .bind(STATUS_FAILED)
-            .bind("gone: the job no longer exists")
-            .bind(now.to_rfc3339())
-            .bind(row.id)
-            .bind(STATUS_RUNNING)
-            .execute(pool)
+                )
+                .bind(STATUS_FAILED)
+                .bind("gone: the job no longer exists")
+                .bind(now.to_rfc3339())
+                .bind(row.id)
+                .bind(STATUS_RUNNING)
+                .execute(pool)
+            })
             .await;
             return;
         }
