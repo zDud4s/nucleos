@@ -1356,12 +1356,8 @@ pub async fn rolled_up(
     older: &[(String, String)],
 ) -> Option<String> {
     let prompt = rolled_up_prompt(older)?;
-    let asked = crate::map::intent::ask_once(
-        runner,
-        prompt,
-        "rotation summary",
-        Some(ROLLED_UP_STANDING),
-    );
+    let asked =
+        crate::map::intent::ask_once(runner, prompt, "rotation summary", Some(ROLLED_UP_STANDING));
     let answer = match tokio::time::timeout(ROLLED_UP_TIMEOUT, asked).await {
         Ok(Ok(answer)) => answer,
         Ok(Err(error)) => {
