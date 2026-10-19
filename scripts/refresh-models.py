@@ -211,9 +211,9 @@ def normalise_id(model_id: str) -> str:
 
 
 def per_million(cell: str) -> float | None:
-    """`$0.25 / MTok<sup>1</sup>` -> 0.25. Anything else -> None (never a guess)."""
+    """`$0.25 / MTok<sup>1</sup>` or `$8 USD / MTok` -> the number. Anything else -> None (never a guess)."""
     text = re.sub(r"<sup>.*?</sup>", "", cell).strip()
-    found = re.fullmatch(r"\$([0-9]+(?:\.[0-9]+)?)\s*/\s*MTok", text)
+    found = re.fullmatch(r"\$([0-9]+(?:\.[0-9]+)?)(?:\s*USD)?\s*/\s*MTok", text)
     return float(found.group(1)) if found else None
 
 
@@ -272,7 +272,71 @@ def anthropic_prices(markdown: str):
             prices[model_id]["tiers"] = sorted(above, key=lambda tier: tier["min_prompt_tokens"])
     for model_id in unreadable:
         prices[model_id] = {field: None for field in PRICE_FIELDS} | {"source": "anthropic"}
+    problems += anthropic_fast_prices(markdown, prices)
+    problems += anthropic_geo_us(markdown, prices)
     return prices, problems
+
+
+def feature_section(markdown: str, heading: str) -> str | None:
+    """The text under one `### heading` of the page, up to the next heading of level two or three."""
+    start = markdown.find(f"### {heading}")
+    if start < 0:
+        return None
+    following = re.search(r"\n#{2,3} ", markdown[start + 4:])
+    return markdown[start: start + 4 + following.start()] if following else markdown[start:]
+
+
+def anthropic_fast_prices(markdown: str, prices: dict[str, dict]) -> list[str]:
+    """Write each model's `fast` rates from "Fast mode pricing" into `prices`; return the problems.
+
+    A row may name several models ("Claude Opus 5 / Claude Opus 4.8"). Without a readable rate a model
+    gets no `fast` at all, which the daemon reads as "a fast request is unpriced" — never the
+    standard rate, which would undercount it by the fast premium.
+    """
+    section = feature_section(markdown, "Fast mode pricing")
+    rows = table_rows(section, 0, len(section)) if section else {}
+    if rows.get("Model") != ["Input", "Output"]:
+        return ["anthropic: no readable fast mode table — fast requests stay unpriced"]
+    problems: list[str] = []
+    for name, cells in rows.items():
+        if name == "Model":
+            continue
+        rate_in, rate_out = (per_million(cell) for cell in cells[:2])
+        for display in name.split(" / "):
+            model_id = normalise_id(slug(display))
+            if rate_in is None or rate_out is None:
+                problems.append(f"anthropic: could not read the fast price of {model_id} — fast stays unpriced")
+            elif model_id not in prices:
+                problems.append(f"anthropic: fast mode prices {model_id}, which has no base price — not written")
+            elif prices[model_id].get("input") is not None:   # an unreadable base is already a problem
+                prices[model_id]["fast"] = {"input": rate_in, "output": rate_out}
+    return problems
+
+
+def model_version(model_id: str) -> tuple[int, int] | None:
+    """`claude-opus-4-6` -> (4, 6), `claude-fable-5` -> (5, 0); any other shape -> None."""
+    found = re.fullmatch(r"claude-[a-z]+-(\d+)(?:-(\d+))?", model_id)
+    return (int(found.group(1)), int(found.group(2) or 0)) if found else None
+
+
+def anthropic_geo_us(markdown: str, prices: dict[str, dict]) -> list[str]:
+    """Write `geo_us_mult` from "Data residency pricing" into `prices`; return the problems.
+
+    The page states it once for a range of models ("For Claude 4.6 and later models, ... a 1.1x
+    multiplier on all token pricing categories"), so it goes on every priced model of that version or
+    later. Older models reject `inference_geo` outright (400), so they never need it.
+    """
+    section = feature_section(markdown, "Data residency pricing") or ""
+    since = re.search(r"For Claude (\d+)\.(\d+) and later models", section)
+    mult = re.search(r"([0-9]+(?:\.[0-9]+)?)x multiplier on all token pricing categories", section)
+    if since is None or mult is None:
+        return ["anthropic: no readable data residency multiplier — US-only requests stay unpriced"]
+    first = (int(since.group(1)), int(since.group(2)))
+    for model_id, price in prices.items():
+        version = model_version(model_id)
+        if version is not None and version >= first and price.get("input") is not None:
+            price["geo_us_mult"] = float(mult.group(1))
+    return []
 
 
 def claude_effort_support() -> tuple[set[str], set[str], set[str]]:
@@ -465,8 +529,11 @@ def per_token_to_million(raw) -> float | None:
 def openrouter_tiers(overrides) -> list[dict] | None:
     """`pricing.overrides` as the daemon's `tiers`, or `None` when any override is one it cannot price.
 
-    Only the prompt-length shape is understood: `min_prompt_tokens` plus rates, the same meaning as a
-    tier's `min_prompt_tokens` (the tier from that many prompt tokens on). An override keyed on the
+    Only the prompt-length shape is understood: `min_prompt_tokens` plus rates. OpenRouter's N means
+    "over N": it publishes 100000 for Claude Haiku 5.5, which Anthropic prices higher "for prompts over
+    100,000 tokens", and 272000 for the GPT models OpenAI prices higher over 272K. The daemon's tier
+    starts AT its threshold, so N is written as N + 1, the number the Anthropic page gives too; the
+    cross-check warns when the two disagree. An override keyed on the
     time of day (`utc_days` / `utc_start` / `utc_end`), or on anything else, makes the whole model
     unsupported: its price depends on when the request ran, and guessing which would be a wrong cost.
     A tier carries only the rates its override names; the rest stay the base ones.
@@ -480,7 +547,7 @@ def openrouter_tiers(overrides) -> list[dict] | None:
         threshold = override.get("min_prompt_tokens")
         if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0:
             return None
-        tier: dict = {"min_prompt_tokens": threshold}
+        tier: dict = {"min_prompt_tokens": threshold + 1}
         for name, field in OPENROUTER_PRICE_FIELDS.items():
             if name in override:
                 rate = per_token_to_million(override[name])
@@ -525,10 +592,16 @@ def openrouter_prices(served: dict[str, dict]):
 
 
 def crosscheck(vendor: dict[str, dict], other: dict[str, dict]):
-    """The vendor's prices, unchanged, and one warning per field that differs from OpenRouter by > 1%."""
+    """The vendor's prices, unchanged, and one warning per field that differs from OpenRouter by > 1%,
+    plus one when the two start a model's tiers at different prompt lengths."""
     warnings: list[str] = []
     for model_id, mine in vendor.items():
         theirs = other.get(model_id, {})
+        if model_id in other:
+            starts = [[tier["min_prompt_tokens"] for tier in side.get("tiers", [])] for side in (mine, theirs)]
+            if starts[0] != starts[1]:
+                warnings.append(f"{model_id} tiers: anthropic from {starts[0]} vs openrouter from {starts[1]}"
+                                " prompt tokens — keeping anthropic's")
         for field in PRICE_FIELDS:
             a, b = mine.get(field), theirs.get(field)
             if a is None or b is None or a == 0:
@@ -785,8 +858,10 @@ PRICE_BANNER = """# ────────────────────
 # tokens, lidos em `prices_as_of`. O daemon usa-os só para o custo ESTIMADO do devtime; nunca é a
 # fatura. Um modelo sem preço legível fica com `null` e o script sai com 1. Um preço por tamanho do
 # prompt (Haiku 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de
-# `min_prompt_tokens` tokens de prompt e traz só as tarifas que muda. Um preço por hora do dia não é
-# escrito. Editar à mão é desfeito na próxima passagem.
+# `min_prompt_tokens` tokens de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode
+# (as da cache escalam com ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo
+# sem eles deixa esses pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é
+# desfeito na próxima passagem.
 # ─────────────────────────────────────────────────────────────"""
 
 
@@ -804,6 +879,11 @@ def render_price_row(model_id: str, price: dict) -> str:
     fields = [f"{field}: {render_number(price.get(field))}" for field in PRICE_FIELDS]
     if price.get("tiers"):
         fields.append("tiers: [" + ", ".join(render_tier(tier) for tier in price["tiers"]) + "]")
+    if price.get("fast"):
+        fast = price["fast"]
+        fields.append(f"fast: {{ input: {render_number(fast['input'])}, output: {render_number(fast['output'])} }}")
+    if price.get("geo_us_mult") is not None:
+        fields.append(f"geo_us_mult: {render_number(price['geo_us_mult'])}")
     return f"  {model_id}: {{ {', '.join(fields)}, source: {price['source']} }}"
 
 

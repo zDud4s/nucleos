@@ -251,7 +251,32 @@ def cases():
     yield ("pricing_markdown_fixture_parses_to_per_million_prices",
            prices["claude-opus-4-7"],
            {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25, "cache_write_1h": 10.0,
-            "source": "anthropic"})
+            "source": "anthropic", "fast": {"input": 10.0, "output": 50.0}, "geo_us_mult": 1.1})
+    yield ("a fast row naming two models prices both, and a table after it is not read as fast rates",
+           (prices["claude-sonnet-5"]["fast"], prices["claude-opus-4-7"]["fast"]["input"]),
+           ({"input": 10.0, "output": 50.0}, 10.0))
+    yield ("the residency multiplier goes on 4.6 and later only; an older model never gets one",
+           (prices["claude-haiku-5-5"]["geo_us_mult"], "geo_us_mult" in prices["claude-opus-4-1"]),
+           (1.1, False))
+    yield ("a model the fast table does not name has no fast rate (a fast request stays unpriced)",
+           "fast" in prices["claude-haiku-5-5"], False)
+    yield ("model_version reads the family's version, and nothing else",
+           [refresh_models.model_version(i) for i in ["claude-opus-4-6", "claude-fable-5", "gpt-5.5"]],
+           [(4, 6), (5, 0), None])
+    unfast = PRICING_MD.replace("| Input          | Output         |", "| In | Out |")
+    prices, problems = refresh_models.anthropic_prices(unfast)
+    yield ("a fast table that changed shape writes no fast rate and is a problem",
+           ("fast" in prices["claude-opus-4-7"], len(problems)), (False, 1))
+    orphan_fast = PRICING_MD.replace("Claude Opus 4.7 / Claude Sonnet 5 |", "Claude Opus 4.7 / Claude Opus 9 |")
+    prices, problems = refresh_models.anthropic_prices(orphan_fast)
+    yield ("a fast rate for a model with no base price is not written and is a problem",
+           ("claude-opus-9" in prices, prices["claude-opus-4-7"]["fast"]["input"], len(problems)),
+           (False, 10.0, 1))
+    reworded = PRICING_MD.replace("1.1x multiplier", "surcharge")
+    prices, problems = refresh_models.anthropic_prices(reworded)
+    yield ("a residency sentence it cannot read writes no multiplier and is a problem",
+           ("geo_us_mult" in prices["claude-opus-4-7"], len(problems)), (False, 1))
+    prices, problems = refresh_models.anthropic_prices(PRICING_MD)
     yield ("a footnote marker does not stop a price from parsing",
            prices["claude-sonnet-5"]["input"], 2.0)
     yield ("a retired model's link is not part of its id",
@@ -259,7 +284,7 @@ def cases():
     yield ("a model priced by prompt length is one entry: the base tier plus a tier over 100,000 tokens",
            (prices["claude-haiku-5-5"], problems),
            ({"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125, "cache_write_1h": 0.2,
-             "source": "anthropic",
+             "source": "anthropic", "geo_us_mult": 1.1,
              "tiers": [{"min_prompt_tokens": 100_001, "input": 0.5, "output": 2.5, "cache_read": 0.05,
                         "cache_write": 0.625, "cache_write_1h": 1.0}]}, []))
     orphan = "\n".join(line for line in PRICING_MD.splitlines() if "up to 100,000" not in line)
@@ -313,11 +338,12 @@ def cases():
            openai["gpt-5.5"],
            {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": None, "cache_write_1h": None,
             "source": "openrouter"})
-    yield ("a prompt-length override becomes a tier carrying only the rates it overrides",
+    yield ("a prompt-length override becomes a tier carrying only the rates it overrides, from N + 1"
+           " because OpenRouter's N is 'over N'",
            openai["gpt-6-tiered"],
            {"input": 2.0, "output": 10.0, "cache_read": None, "cache_write": None, "cache_write_1h": 4.0,
             "source": "openrouter",
-            "tiers": [{"min_prompt_tokens": 272000, "input": 4.0, "output": 20.0, "cache_read": 0.4}]})
+            "tiers": [{"min_prompt_tokens": 272001, "input": 4.0, "output": 20.0, "cache_read": 0.4}]})
     yield ("batch variants and other vendors are not priced; time-of-day overrides are named, never priced",
            (sorted(openai), sorted(unsupported)), (["gpt-5.5", "gpt-6-tiered"], ["gpt-mixed", "gpt-night"]))
     yield ("anthropic entries come back apart, normalised, for the cross-check only",
@@ -330,6 +356,14 @@ def cases():
            (merged["claude-opus-4-7"]["input"], len(warnings)), (5.0, 1))
     merged, warnings = refresh_models.crosscheck(vendor, {"claude-opus-4-7": {"input": 5.04}})
     yield ("a divergence under 1% is not warned", warnings, [])
+    tiered = {"claude-haiku-5-5": {"input": 0.1, "source": "anthropic", "tiers": [{"min_prompt_tokens": 100_001}]}}
+    merged, warnings = refresh_models.crosscheck(tiered, {"claude-haiku-5-5": {
+        "input": 0.1, "tiers": [{"min_prompt_tokens": 100_001}]}})
+    yield ("tiers starting at the same prompt length are not warned", warnings, [])
+    merged, warnings = refresh_models.crosscheck(tiered, {"claude-haiku-5-5": {
+        "input": 0.1, "tiers": [{"min_prompt_tokens": 100_000}]}})
+    yield ("tiers starting one token apart are warned and the vendor's threshold wins",
+           (merged["claude-haiku-5-5"]["tiers"], len(warnings)), ([{"min_prompt_tokens": 100_001}], 1))
 
     # --- prices: rendering and splicing ----------------------------------------------
     original = ('local_assistant_model: "qwen"\n\n# banner\nassistant_choices:\n  - { id: "opus" }\n\n'
@@ -357,12 +391,20 @@ def cases():
            '  claude-haiku-5-5: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125, '
            'cache_write_1h: 0.2, tiers: [{ min_prompt_tokens: 100001, input: 0.5, output: 2.5 }], '
            'source: anthropic }')
+    yield ("a row with fast and residency rates writes both after its tiers",
+           refresh_models.render_price_row("claude-opus-5-5", {
+               "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 8.0,
+               "source": "anthropic", "fast": {"input": 8.0, "output": 40.0}, "geo_us_mult": 1.1}),
+           '  claude-opus-5-5: { input: 4.0, output: 20.0, cache_read: 0.2, cache_write: 5.0, '
+           'cache_write_1h: 8.0, fast: { input: 8.0, output: 40.0 }, geo_us_mult: 1.1, source: anthropic }')
     good = '{"data": [{"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001"}}]}'
     with fake_bodies({refresh_models.PRICING_DOC: PRICING_MD, refresh_models.OPENROUTER_MODELS: good}):
         blocks, complained = refresh_models.refresh_prices("2026-10-18")
     yield ("a clean read writes both sources and does not complain",
            ("claude-opus-4-7:" in blocks["model_prices"], "gpt-5.5:" in blocks["model_prices"], complained),
            (True, True, False))
+    yield ("a clean read writes the fast and residency rates",
+           "fast: { input: 10.0, output: 50.0 }, geo_us_mult: 1.1" in blocks["model_prices"], True)
     yield ("a clean read writes the tiered model with its tier",
            "claude-haiku-5-5: { input: 0.1" in blocks["model_prices"]
            and "min_prompt_tokens: 100001" in blocks["model_prices"], True)
@@ -397,6 +439,26 @@ title: Pricing
 | Concept | Details |
 | --- | --- |
 | **Billing unit** | CCU |
+
+## Feature-specific pricing
+
+### Data residency pricing
+
+For Claude 4.6 and later models, specifying US-only inference through the `inference_geo` parameter incurs a 1.1x multiplier on all token pricing categories, including input tokens, output tokens, cache writes, and cache reads.
+
+### Fast mode pricing
+
+[Fast mode](https://example/fast-mode) provides faster output at premium pricing.
+
+| Model                             | Input          | Output         |
+| --------------------------------- | -------------- | -------------- |
+| Claude Opus 4.7 / Claude Sonnet 5 | $10 USD / MTok | $50 USD / MTok |
+
+### Batch processing
+
+| Model | Batch input | Batch output |
+| :---- | :---- | :---- |
+| Claude Opus 4.7 | $2.50 / MTok | $12.50 / MTok |
 """
 
 
