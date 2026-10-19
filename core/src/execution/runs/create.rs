@@ -471,6 +471,10 @@ pub(super) async fn create_run_with(
         )
     });
     let mut gate_config = GateConfig::NotConfigured;
+    // The project's ceiling, when it names one. Only a worktree run reads it, because that is the
+    // only mode with a project to read the file for - and it is the mode all autonomous work runs
+    // in. Everything else keeps the house ceiling, which is what `None` means here.
+    let mut max_turns: Option<i64> = None;
     let mut node_artifacts: Option<std::path::PathBuf> = None;
 
     if mode == "worktree" {
@@ -487,13 +491,20 @@ pub(super) async fn create_run_with(
         // measured after it lands on the job's branch, by the gate the merge runs; gating it here as
         // well would spend a second cold build to reach a verdict about a tree nobody merges from,
         // and the two verdicts could disagree — the tree it built in is not the tree the job ships.
-        gate_config = match (
-            node.is_some() || item.is_some(),
-            crate::config::load_schedule_rules(
-                state.machine_config_root.as_deref(),
-                worktree_project_id,
-            ),
-        ) {
+        let rules = crate::config::load_schedule_rules(
+            state.machine_config_root.as_deref(),
+            worktree_project_id,
+        );
+        // Read OUTSIDE the gate's branch below, deliberately. A node and an item are not gated
+        // here, but they are still runs of this project's work, and the ceiling is what stops one
+        // that will not finish - the case this key exists for is a job item, which reaches this
+        // function down the very arm that skips the gate.
+        //
+        // An unreadable file leaves this `None` and the run on the house ceiling rather than
+        // refusing: the gate below already turns that into `Unreadable`, which stops the run with a
+        // reason. A second refusal here would report the same fault as a different one.
+        max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
+        gate_config = match (node.is_some() || item.is_some(), rules) {
             (true, _) => GateConfig::NotConfigured,
             (false, Ok(rules)) => {
                 let scoped_final = rules.scoped_final();
@@ -973,6 +984,7 @@ pub(super) async fn create_run_with(
             Some(run_tools) => mcp.with_loadout(run_tools),
             None => mcp,
         }),
+        max_turns,
     );
 
     Ok(id)

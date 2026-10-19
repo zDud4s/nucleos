@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn the_turn_ceiling_lets_the_answer_arrive() {
         // Asserted against the runner's own pure functions, because this is the one property of the
-        // request that no fake can observe: `FakeCommandRunner` records `max_turns` nowhere and
+        // request that no fake can observe: `FakeCommandRunner` records `max_turns` but
         // enforces no ceiling, so a value that strangles every real run would ship green.
         //
         // `Some(1)` reads like "ask once" and is not: `TurnCounter` counts `assistant` messages,

@@ -707,6 +707,10 @@ pub(super) async fn spawn_handoff_if_needed(
     classifier_governs_tools: bool,
     model: Option<String>,
     effort: Option<String>,
+    // Inherited, for the reason the fields above it are: a successor is the same node continuing
+    // the same task, and re-resolving the ceiling here would let a handoff quietly run under a
+    // different one than the work it continues.
+    max_turns: Option<i64>,
 ) {
     let successor = match prepare_handoff_successor(&state.pool, run_id).await {
         Ok(Some(successor)) => successor,
@@ -785,5 +789,6 @@ pub(super) async fn spawn_handoff_if_needed(
         // choice, and a second opinion halfway through one task would be a different run.
         None,
         JobNodeMcp::for_run(successor.id, successor.job_id),
+        max_turns,
     );
 }

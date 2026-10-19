@@ -370,23 +370,23 @@ pub async fn resume_for_correction(
     let correction = write_correction(&state.pool, &draft).await?;
 
     let daemon_token = mint_run_token(&state.pool, correction).await;
-    let gate_config =
-        match crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id)
-        {
-            Ok(rules) => {
-                let scoped_final = rules.scoped_final();
-                rules
-                    .gate_command
-                    .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
-                        command,
-                        project_root: project_root.clone(),
-                        scoped_final,
-                    })
-            }
-            Err(error) => {
-                GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
-            }
-        };
+    let rules =
+        crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id);
+    // A correction is the same work continuing, so it runs under the ceiling the project names.
+    let max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
+    let gate_config = match rules {
+        Ok(rules) => {
+            let scoped_final = rules.scoped_final();
+            rules
+                .gate_command
+                .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                    command,
+                    project_root: project_root.clone(),
+                    scoped_final,
+                })
+        }
+        Err(error) => GateConfig::Unreadable(format!("gate configuration is unreadable: {error}")),
+    };
     let governed_by_classifier = classifier_governs_tools(
         "worktree",
         crate::execution::runner::ToolPolicy::Unrestricted,
@@ -436,6 +436,7 @@ pub async fn resume_for_correction(
         }),
         // No job MCP: `after_gate_failed` only ever corrects a run outside jobs.
         None,
+        max_turns,
     );
     Ok(correction)
 }
@@ -1065,10 +1066,14 @@ pub(super) async fn continue_paused_run(
 
     // After the commit, because the resume row does not exist to be UPDATEd before it.
     let daemon_token = mint_run_token(&state.pool, resume_id).await;
-    let gate_config = match crate::config::load_schedule_rules(
-        state.machine_config_root.as_deref(),
-        &wt_project_id,
-    ) {
+    let rules =
+        crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &wt_project_id);
+    // A resumed run is the same work continuing, so it runs under the same ceiling the project
+    // names - read here rather than carried on the row, because the row would hold what the file
+    // said when the run first started and an operator who raised the ceiling to let this very run
+    // finish would find the old one still in force.
+    let max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
+    let gate_config = match rules {
         Ok(rules) => {
             let scoped_final = rules.scoped_final();
             rules
@@ -1169,6 +1174,7 @@ pub(super) async fn continue_paused_run(
             resume: true,
         }),
         JobNodeMcp::for_run(resume_id, job_id),
+        max_turns,
     );
 
     Ok(resume_id)
