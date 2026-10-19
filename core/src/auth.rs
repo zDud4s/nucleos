@@ -3753,7 +3753,7 @@ mod tests {
 
     /// A project's workflows are the owner's, to read and to change.
     ///
-    /// Eight routes, all out of every table, and the reads are the half worth arguing for. A
+    /// Nine routes, all out of every table, and the reads are the half worth arguing for. A
     /// workflow is the *instructions an agent is given*: which nodes run, on which model, behind
     /// which gate. A run able to read the graph it is being executed by is a run reading the shape
     /// of its own supervision, and one able to write it could switch the review node off. The
@@ -3774,6 +3774,7 @@ mod tests {
             (Method::POST, "/projects/{id}/workflows/{name}/update"),
             (Method::GET, "/projects/{id}/workflows/{name}/diff"),
             (Method::GET, "/projects/{id}/workflows/{name}/graph"),
+            (Method::GET, "/projects/{id}/workflows/{name}/consent"),
             (Method::POST, "/projects/{id}/workflows/{name}/nodes/{node}"),
             (Method::POST, "/projects/{id}/workflows/adopt"),
             // The only routes that write into the library every project reads its workflows from.

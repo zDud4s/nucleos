@@ -118,6 +118,89 @@ export function useWorkflowDiff(projectId: string, name: string | null) {
   });
 }
 
+/** How one command compares with the one the project runs today. */
+export type CommandChange = "new" | "unchanged" | "changed";
+
+/** One command node, exactly as the bundle declares it. */
+export interface ConsentCommand {
+  node: string;
+  label: string;
+  /** Verbatim. Never shortened, never summarised: the string is what will run. */
+  command: string;
+  cwd: string | null;
+  timeout: string | null;
+  change: CommandChange;
+  /** Present only when `change` is `changed`. */
+  previous_command?: string;
+  previous_cwd?: string;
+  /** What this project runs instead, when its own overlay replaces the command. */
+  project_override?: string;
+  /** Switched off in this project: in the graph, and not run. */
+  disabled: boolean;
+}
+
+/** A command the version running today has and the new one dropped. */
+export interface ConsentRemoved {
+  node: string;
+  command: string;
+  cwd: string | null;
+}
+
+/** What installing or updating to `version` would let run in this project. */
+export interface WorkflowConsent {
+  version: string;
+  /** The version the project runs today. `null` for a first install: nothing to diff against. */
+  baseline: string | null;
+  baseline_source?: "project" | "library";
+  commands: ConsentCommand[];
+  removed: ConsentRemoved[];
+}
+
+/**
+ * Every command a bundle version would run here, verbatim, set against what runs today.
+ *
+ * Asked for when somebody opens the install or update step, and never in the background: the
+ * answer is read off the daemon's disk, and it only matters at the one moment a person is about to
+ * agree. `retry: false` because every refusal is settled — no such bundle, a graph that will not
+ * parse — and asking again answers the same thing.
+ */
+export function useWorkflowConsent(projectId: string, name: string, version: string | null) {
+  return useQuery({
+    queryKey: keys.projects.workflowConsent(projectId, name, version ?? ""),
+    queryFn: () =>
+      apiFetch<WorkflowConsent>(
+        `/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(name)}/consent?version=${encodeURIComponent(version ?? "")}`,
+      ),
+    enabled: version !== null,
+    retry: false,
+    // A bundle is a folder of files and does not change while somebody reads it; but a person who
+    // closes the step and opens it again after editing the library expects the new text, and a
+    // cached listing from before the edit is a consent to something that is no longer there.
+    gcTime: 0,
+  });
+}
+
+/**
+ * What differs from what runs today, and nothing else.
+ *
+ * The diff is the defence against a patch release that adds one line to a node that used to run
+ * the tests, so it is the short list: commands that changed, commands that are new, commands that
+ * were dropped. A first install has no baseline and so no delta; the full listing is what shows.
+ * Empty means nothing about what runs moved, and the page then has nothing to say.
+ */
+export function commandDelta(consent: WorkflowConsent): {
+  changed: ConsentCommand[];
+  added: ConsentCommand[];
+  removed: ConsentRemoved[];
+} {
+  if (consent.baseline === null) return { changed: [], added: [], removed: [] };
+  return {
+    changed: consent.commands.filter((line) => line.change === "changed"),
+    added: consent.commands.filter((line) => line.change === "new"),
+    removed: consent.removed,
+  };
+}
+
 /**
  * Everything that changes a pin, through one hook shape.
  *

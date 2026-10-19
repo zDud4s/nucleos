@@ -60,6 +60,7 @@
 //! reported separately as `update_available`, because "somebody published 1.1" and "the 1.0 you
 //! pinned is not the 1.0 you have" are opposite facts that would send a person to opposite places.
 
+pub mod consent;
 pub mod graph;
 pub mod hooks;
 pub mod materialize;
