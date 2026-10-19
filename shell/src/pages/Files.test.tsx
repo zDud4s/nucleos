@@ -360,7 +360,7 @@ describe("Files — downloading", () => {
 
 /* ----------------------------------------------------------------- open -- */
 
-describe("Files — opening in Windows", () => {
+describe("Files — opening in the default app", () => {
   it("opens a double-clicked file with its app, by its full path, and downloads nothing", async () => {
     daemon.apiFetch.mockImplementation(
       makeFilesDaemon({
@@ -389,14 +389,14 @@ describe("Files — opening in Windows", () => {
     expect(opener.openPath).not.toHaveBeenCalled();
   });
 
-  it("says Windows could not open it when the opener refuses", async () => {
+  it("says it could not be opened when the opener refuses", async () => {
     daemon.apiFetch.mockImplementation(makeFilesDaemon({ list: () => [entry({ name: "notes.xyz" })] }));
     opener.openPath.mockRejectedValue("no application is associated");
 
     renderWithQuery(<Files />);
     fireEvent.doubleClick(await screen.findByText("notes.xyz"));
 
-    expect(await screen.findByText("Windows could not open it — no application is associated")).toBeDefined();
+    expect(await screen.findByText("Could not open it — no application is associated")).toBeDefined();
   });
 
   it("opens nothing on one mouse click on a file — only a folder opens on one", async () => {
@@ -945,7 +945,7 @@ describe("Files — reachable without a mouse", () => {
     fireEvent.keyDown(name ?? wrap, { key: "F10", shiftKey: true });
 
     const menu = await screen.findByRole("menu", { name: "Actions for report.docx" });
-    expect(document.activeElement).toBe(within(menu).getByRole("menuitem", { name: "Open in Windows" }));
+    expect(document.activeElement).toBe(within(menu).getByRole("menuitem", { name: "Open with default app" }));
     fireEvent.keyDown(document.activeElement ?? menu, { key: "ArrowDown" });
     expect(document.activeElement).toBe(within(menu).getByRole("menuitem", { name: "Download a copy" }));
 

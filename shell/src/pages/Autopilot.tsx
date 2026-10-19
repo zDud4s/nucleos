@@ -88,6 +88,7 @@ import {
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
+import { projectPathPlaceholder } from "../lib/platform";
 import { OnboardPanel } from "../project/Onboard";
 import { JudgeOpinionLine, JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
 import { RefusedActionsPanel, SkippedItemsPanel } from "./AutopilotRecords";
@@ -1282,7 +1283,7 @@ function FocusSetting({
             type="text"
             value={root}
             spellCheck={false}
-            placeholder={"C:\\path\\to\\the\\project"}
+            placeholder={projectPathPlaceholder()}
             onChange={(event) => setRoot(event.target.value)}
           />
           <Button
