@@ -3369,6 +3369,339 @@ gate_command: git --version
         );
     }
 
+    // ---- a push of the integration branch waits for the post-land gate, never for its caller ------
+
+    const GATED_RULES: &str = "gate_command: x\ngate_after_land: true\n";
+    /// A well-formed sha no commit of the fixture has: "the gate last judged some other tip green".
+    const OTHER_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A repository with a remote, a rostered project `alpha` whose rules are `rules`, and a pool.
+    async fn gated_push_fixture(
+        rules: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        sqlx::SqlitePool,
+    ) {
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gatedpush-");
+        let remote = remote_beside(container.path(), &repo);
+        let machine_root = container.path().join("machine");
+        write_autopilot_rules(&machine_root, rules);
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        (container, repo, remote, machine_root, pool)
+    }
+
+    fn push_request(repo: &Path, branch: &str, id: i64) -> crate::execution::vcs::ClaimedRequest {
+        crate::execution::vcs::ClaimedRequest {
+            id,
+            op: crate::execution::vcs::Op::Push {
+                remote: "origin".into(),
+                branch: branch.into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: None,
+            integration_branch: None,
+        }
+    }
+
+    async fn execute_push(
+        repo: &Path,
+        machine_root: &Path,
+        pool: &sqlx::SqlitePool,
+        branch: &str,
+    ) -> Outcome {
+        use crate::execution::vcs::VcsExecutor;
+        GitExecutor {
+            machine_root: Some(machine_root.to_path_buf()),
+            pool: Some(pool.clone()),
+            ..GitExecutor::default()
+        }
+        .execute(&push_request(repo, branch, 1))
+        .await
+    }
+
+    fn remote_has(remote: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(remote)
+            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+            .output()
+            .expect("git should start")
+            .status
+            .success()
+    }
+
+    #[tokio::test]
+    async fn a_push_of_a_green_integration_tip_goes_out_at_once() {
+        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let tip = sha_of(&repo, "refs/heads/master");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", &tip)
+            .await
+            .expect("the gate judged the tip green");
+
+        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+
+        assert!(
+            matches!(&outcome, Outcome::Succeeded { sha: Some(sha), .. } if *sha == tip),
+            "expected the push to go out, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&remote, "refs/heads/master"), tip);
+    }
+
+    #[tokio::test]
+    async fn a_tip_covered_by_a_verification_counts_as_green() {
+        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let tip = sha_of(&repo, "refs/heads/master");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", OTHER_SHA)
+            .await
+            .expect("some other tip is green");
+        sqlx::query("UPDATE postgate_state SET covered_sha = ? WHERE project_id = 'alpha'")
+            .bind(&tip)
+            .execute(&pool)
+            .await
+            .expect("cover the tip");
+
+        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(sha_of(&remote, "refs/heads/master"), tip);
+    }
+
+    #[tokio::test]
+    async fn a_push_of_a_pending_integration_tip_parks_and_the_remote_does_not_move() {
+        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let tip = sha_of(&repo, "refs/heads/master");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", OTHER_SHA)
+            .await
+            .expect("some other tip is green");
+
+        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+
+        match outcome {
+            Outcome::AwaitingGate { sha, reason } => {
+                assert_eq!(sha, tip, "the park carries the sha it decided on");
+                assert!(reason.contains(&tip), "the reason names the sha: {reason}");
+                assert!(
+                    reason.contains("post-land gate"),
+                    "and what it waits for: {reason}"
+                );
+            }
+            other => panic!("expected the push to park, got {other:?}"),
+        }
+        assert!(
+            !remote_has(&remote, "master"),
+            "nothing may reach the remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_with_no_gate_state_at_all_parks_too() {
+        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+
+        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+
+        assert!(
+            matches!(outcome, Outcome::AwaitingGate { .. }),
+            "got {outcome:?}"
+        );
+        assert!(!remote_has(&remote, "master"));
+    }
+
+    #[tokio::test]
+    async fn a_push_of_another_branch_ignores_the_gate() {
+        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        // The gate is not green for anything, and `feat/x` is not the integration branch.
+        let outcome = execute_push(&repo, &machine_root, &pool, "feat/x").await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            sha_of(&remote, "refs/heads/feat/x"),
+            sha_of(&repo, "refs/heads/feat/x")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_without_gate_after_land_ignores_the_gate() {
+        let (_container, repo, remote, machine_root, pool) =
+            gated_push_fixture("gate_command: x\n").await;
+
+        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            sha_of(&repo, "refs/heads/master")
+        );
+    }
+
+    /// No `gate_command` means no gate will ever run, so parking would wait for ever: fail open.
+    #[tokio::test]
+    async fn gate_after_land_without_a_gate_command_pushes_at_once() {
+        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(
+            "gate_after_land: true
+",
+        )
+        .await;
+
+        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            sha_of(&repo, "refs/heads/master")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executor_without_a_database_pushes_as_before() {
+        use crate::execution::vcs::VcsExecutor;
+        let (_container, repo, remote, machine_root, _pool) = gated_push_fixture(GATED_RULES).await;
+
+        let outcome = GitExecutor {
+            machine_root: Some(machine_root),
+            ..GitExecutor::default()
+        }
+        .execute(&push_request(&repo, "master", 1))
+        .await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert!(remote_has(&remote, "master"));
+    }
+
+    /// The whole loop through the real queue: the push parks, a parked row is not claimed (so there
+    /// is no hot loop), a green write requeues it, and the next claim pushes the tip.
+    #[tokio::test]
+    async fn a_green_write_releases_a_parked_push_and_it_then_goes_out() {
+        use crate::execution::vcs::{Op, Origin, ResolvedRepo};
+
+        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let tip = sha_of(&repo, "refs/heads/master");
+        let resolved = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+        let op = Op::Push {
+            remote: "origin".into(),
+            branch: "master".into(),
+        };
+        let id = crate::execution::vcs::submit(&pool, &resolved, &op, Origin::Shell)
+            .await
+            .expect("admit the push");
+
+        let claimed = crate::execution::vcs::claim_next(&pool, "alpha")
+            .await
+            .expect("claim")
+            .expect("the push is queued");
+        let outcome = execute_push_claimed(&machine_root, &pool, &claimed).await;
+        assert!(
+            matches!(outcome, Outcome::AwaitingGate { .. }),
+            "got {outcome:?}"
+        );
+        crate::execution::vcs::finish(&pool, id, outcome)
+            .await
+            .expect("record the park");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the status");
+        assert_eq!(status, "awaiting_gate");
+        assert!(
+            crate::execution::vcs::claim_next(&pool, "alpha")
+                .await
+                .expect("claim")
+                .is_none(),
+            "a parked push is not claimable"
+        );
+        assert!(!remote_has(&remote, "master"));
+
+        // The gate turns the tip green; the write itself requeues the parked push.
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", &tip)
+            .await
+            .expect("green");
+        let claimed = crate::execution::vcs::claim_next(&pool, "alpha")
+            .await
+            .expect("claim")
+            .expect("the green write requeued the push");
+        assert_eq!(claimed.id, id);
+        let outcome = execute_push_claimed(&machine_root, &pool, &claimed).await;
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(sha_of(&remote, "refs/heads/master"), tip);
+    }
+
+    async fn execute_push_claimed(
+        machine_root: &Path,
+        pool: &sqlx::SqlitePool,
+        claimed: &crate::execution::vcs::ClaimedRequest,
+    ) -> Outcome {
+        use crate::execution::vcs::VcsExecutor;
+        GitExecutor {
+            machine_root: Some(machine_root.to_path_buf()),
+            pool: Some(pool.clone()),
+            ..GitExecutor::default()
+        }
+        .execute(claimed)
+        .await
+    }
+
+    /// Released by every write that makes a sha green, not only `mark_covered`.
+    #[tokio::test]
+    async fn finish_green_requeues_a_parked_push_too() {
+        let (_container, repo, _remote, _machine_root, pool) =
+            gated_push_fixture(GATED_RULES).await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at, repo_key)
+             VALUES ('push', '{\"op\":\"push\",\"remote\":\"origin\",\"branch\":\"master\"}', 'alpha', ?,
+                     'shell', 'awaiting_gate', '2026-10-19T00:00:00+00:00', 'alpha')
+             RETURNING id",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .fetch_one(&pool)
+        .await
+        .expect("park a push");
+        let tip = sha_of(&repo, "refs/heads/master");
+        assert!(
+            crate::verify::postgate::start(&pool, "alpha", "master", &tip, None)
+                .await
+                .expect("start the gate")
+        );
+
+        assert!(
+            crate::verify::postgate::finish_green(&pool, "alpha", &tip)
+                .await
+                .expect("finish green")
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the status");
+        assert_eq!(status, "queued");
+    }
+
     /// A rebase nobody has open is computed in isolation and published by compare-and-swap.
     ///
     /// The assertion is on the SHAPE of the result, not just that the ref moved: the rebased tip's

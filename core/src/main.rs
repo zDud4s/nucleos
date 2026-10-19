@@ -753,6 +753,7 @@ async fn main() {
         runner: primary_runner,
         triage_runner,
         local_triage_disabled,
+        utility_model: models_config.utility_model(),
         assistants,
         files_root,
         files_trash,

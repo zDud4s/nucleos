@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
@@ -20,6 +20,7 @@ use crate::config::VerifyConfig;
 use crate::execution::admission::{AdmissionBook, VerifyGrant};
 use crate::gate::{self, ArgvOutcome};
 use crate::tests_map::{self, MapState};
+use crate::verify::resolve;
 use crate::verify::runs::{self as verify_runs, Claimed, Request, State, Submitted};
 use crate::verify_sched::{self, Candidate};
 use crate::warm;
@@ -35,6 +36,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(30 * 60);
 /// How often a unit looks again at a warm dir the sweep is removing.
 const REMOVING_POLL: Duration = Duration::from_millis(100);
 const GIB: u64 = 1024 * 1024 * 1024;
+/// Budget for the few git reads that find a post-merge gate unit's `NUCLEOS_GATE_BASE`.
+const GATE_BASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Weight of a unit: what the heavy-command broker charges for the same program.
 /// `cargo` (any case, with or without `.exe`) weighs 2, everything else 1, never above `capacity`.
@@ -371,6 +374,38 @@ impl Executor {
             }
         }
     }
+
+    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate requested; empty for any other unit.
+    ///
+    /// The gate runs in a worktree at the target's tip, where `gate-diff.sh` defaults its base to
+    /// the merge base with `master` — `HEAD` itself — and so gates nothing. Computed here, from
+    /// the stored state, rather than when the unit is queued: crash recovery and bisect probes run
+    /// units the tick that queued them never saw.
+    async fn gate_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
+        let (verify_runs::REQUESTED_BY_POSTGATE, Some(project)) =
+            (claimed.requested_by.as_str(), claimed.project_id.as_deref())
+        else {
+            return Vec::new();
+        };
+        let deadline = Instant::now() + GATE_BASE_TIMEOUT;
+        match resolve::postgate_gate_base(
+            &self.pool,
+            project,
+            Path::new(&claimed.worktree),
+            deadline,
+        )
+        .await
+        {
+            Some(base) => vec![("NUCLEOS_GATE_BASE".to_owned(), base)],
+            None => {
+                tracing::warn!(
+                    id = claimed.id,
+                    "verify executor: no gate base; the unit runs with gate-diff's own default"
+                );
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Runs one claimed unit to its terminal row. The reservation is released when it drops.
@@ -381,7 +416,8 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
             reservation.hold_dir(dir).await;
         }
     }
-    let env = executor.warm_env(&claimed).await;
+    let mut env = executor.warm_env(&claimed).await;
+    env.extend(executor.gate_env(&claimed).await);
     let argv = final_argv(&executor.config.broker_prefix, &claimed.argv);
     let timeout_ms = if claimed.timeout_ms > 0 {
         u64::try_from(claimed.timeout_ms).unwrap_or(u64::MAX)
@@ -905,6 +941,7 @@ mod tests {
             id: 0,
             project_id: Some("proj".to_owned()),
             worktree: wt.path().to_string_lossy().into_owned(),
+            requested_by: "agent".to_owned(),
             argv: strings(&["git", "--version"]),
             weight: 1,
             timeout_ms: 1000,
@@ -920,6 +957,131 @@ mod tests {
             .expect("NUCLEOS_PROBE_DIR is in the env");
         assert_eq!(value, expected);
         assert!(expected.is_dir());
+    }
+
+    /// Runs git in `dir`, asserts it succeeded, and returns its trimmed stdout.
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository with three empty commits; returns its dir and the shas, oldest first.
+    fn history() -> (tempfile::TempDir, Vec<String>) {
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q"]);
+        let shas = (0..3)
+            .map(|n| {
+                git_in(
+                    repo.path(),
+                    &["commit", "-q", "--allow-empty", "-m", &format!("c{n}")],
+                );
+                git_in(repo.path(), &["rev-parse", "HEAD"])
+            })
+            .collect();
+        (repo, shas)
+    }
+
+    async fn store_postgate(pool: &SqlitePool, last_green: Option<&str>, covered: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, last_green_sha, covered_sha) \
+             VALUES ('proj', 'main', ?, ?)",
+        )
+        .bind(last_green)
+        .bind(covered)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn claimed_in(worktree: &Path, requested_by: &str) -> Claimed {
+        Claimed {
+            id: 0,
+            project_id: Some("proj".to_owned()),
+            worktree: worktree.to_string_lossy().into_owned(),
+            requested_by: requested_by.to_owned(),
+            argv: strings(&["git", "--version"]),
+            weight: 1,
+            timeout_ms: 1000,
+        }
+    }
+
+    fn gate_base(env: &[(String, String)]) -> Option<&str> {
+        env.iter()
+            .find(|(var, _)| var == "NUCLEOS_GATE_BASE")
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_diffs_from_the_last_green_ancestor() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_takes_the_newer_of_covered_and_green() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[0]), Some(&shas[1])).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_with_no_green_ancestor_diffs_from_the_root_commit() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+
+        // No state at all.
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+
+        // A green that is not in this history (nor even a commit here) is no base either.
+        store_postgate(&ex.pool, Some(&"0".repeat(40)), None).await;
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_ignores_a_green_that_is_not_an_ancestor() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        // Recorded as green, then the gated commit moved back before it.
+        store_postgate(&ex.pool, Some(&shas[2]), None).await;
+        git_in(repo.path(), &["reset", "-q", "--hard", &shas[0]]);
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_unit_the_gate_did_not_request_gets_no_gate_base() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        let claimed = claimed_in(repo.path(), "agent");
+        assert!(ex.gate_env(&claimed).await.is_empty());
     }
 
     #[test]

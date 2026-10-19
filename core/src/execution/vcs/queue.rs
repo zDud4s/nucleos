@@ -265,6 +265,19 @@ pub enum Outcome {
     /// merge it computes carries exactly that blob, so a map edited after the approval waits
     /// again. Nothing is published and the computed merge is dropped, as for `Blocked`.
     AwaitingOwner { map_blob: String, reason: String },
+    /// A push of the integration branch whose tip the post-land gate has not judged green. **Not
+    /// terminal and not claimable**, like `AwaitingOwner`, but the one waited on is the daemon and not
+    /// a person: when the gate turns a sha green, `release_awaiting_gate` puts the row back to
+    /// `queued` and the push re-resolves the tip and decides afresh. Nothing was pushed. A red tip
+    /// does not fail the push: `revert_on_red` moves the branch to a revert, which is gated, turns
+    /// green, and is what is pushed in the end.
+    ///
+    /// **`sha` is the tip the decision was made on**, persisted in `output_tail` (never `result_sha`,
+    /// which is a statement about what reached the remote and is read as such by tickets and the
+    /// resolver; a parked row pushed nothing). The drain re-checks it against the gate's state right
+    /// after the park, and the worker's sweep compares it to the state later, so a green written
+    /// between the decision and the park is never lost.
+    AwaitingGate { sha: String, reason: String },
     /// Never reached an argv — the row itself was unexecutable, which is a defect in the row and not
     /// a result of the operation.
     ///
@@ -295,6 +308,7 @@ impl Outcome {
             Outcome::Blocked { .. } => "blocked",
             Outcome::Escalated { .. } => "escalated",
             Outcome::AwaitingOwner { .. } => "awaiting_owner",
+            Outcome::AwaitingGate { .. } => "awaiting_gate",
             Outcome::Failed { .. } | Outcome::Unexecutable { .. } => "failed",
         }
     }
@@ -494,11 +508,14 @@ pub async fn finish<'e, E: sqlx::SqliteExecutor<'e>>(
         Outcome::Unexecutable { reason } => (None, Some(reason), None, None),
         // Not terminal: `finished_at` stays NULL below, and no output was produced to keep.
         Outcome::AwaitingOwner { reason, .. } => (None, Some(reason), None, None),
+        // The parked sha rides in `output_tail`, see `Outcome::AwaitingGate`. The column is not
+        // pruned for a non-terminal row, and `result_sha` stays NULL: nothing was pushed.
+        Outcome::AwaitingGate { sha, reason } => (None, Some(reason), None, Some(sha)),
     };
     let finished = sqlx::query(
         "UPDATE vcs_requests
             SET status = ?1,
-                finished_at = CASE WHEN ?1 = 'awaiting_owner' THEN NULL ELSE ?2 END,
+                finished_at = CASE WHEN ?1 IN ('awaiting_owner', 'awaiting_gate') THEN NULL ELSE ?2 END,
                 result_sha = ?3, failure_reason = ?4, exit_code = ?5, output_tail = ?6,
                 pending_map_blob = COALESCE(?8, pending_map_blob),
                 unexecutable = ?9

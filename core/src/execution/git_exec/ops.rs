@@ -367,7 +367,20 @@ pub(super) async fn push(
         Ok(sha) => sha,
         Err(outcome) => return outcome,
     };
+    push_sha(project_root, remote, branch, sha, deadline).await
+}
 
+/// Pushes `sha` as `refs/heads/<branch>`. Split from [`push`] so the executor can resolve the tip
+/// first, decide on that sha (the post-land gate's green check) and then push exactly the sha it
+/// decided on, instead of resolving a second time and risking a different one.
+pub(super) async fn push_sha(
+    project_root: &Path,
+    remote: &str,
+    branch: &str,
+    sha: String,
+    deadline: std::time::Instant,
+) -> Outcome {
+    let reference = format!("refs/heads/{branch}");
     let refspec = format!("{sha}:{reference}");
     let pushed = match git(
         project_root,

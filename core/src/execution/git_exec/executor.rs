@@ -223,7 +223,8 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 }
             }
             crate::execution::vcs::Op::Push { remote, branch } => {
-                push(project_root, remote.as_str(), branch.as_str(), deadline).await
+                self.push_when_gated_green(request, remote.as_str(), branch.as_str(), deadline)
+                    .await
             }
             crate::execution::vcs::Op::Tag { name, at } => {
                 tag(project_root, name.as_str(), at.as_str(), deadline).await
@@ -274,6 +275,78 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 }
                 publish(project_root, target.as_str(), computed, deadline).await
             }
+        }
+    }
+}
+
+impl GitExecutor {
+    /// A push never waits in its caller's face: with `gate_after_land` on, a push of the project's
+    /// integration branch goes out at once when the post-land gate has judged the sha green, and
+    /// otherwise parks (`Outcome::AwaitingGate`) until the gate turns green - the gate's green writes
+    /// requeue the row (`vcs::release_awaiting_gate`) and the push then re-resolves and re-decides.
+    ///
+    /// Any other push, a project without `gate_after_land`, an executor without a database, and any
+    /// state that cannot be read behave exactly as before: this only ever DELAYS a push on positive
+    /// evidence that the project asked for it, and a failure to find that evidence must not hold a
+    /// push back. The sha is resolved once and decided on, and that same sha is what is pushed.
+    async fn push_when_gated_green(
+        &self,
+        request: &crate::execution::vcs::ClaimedRequest,
+        remote: &str,
+        branch: &str,
+        deadline: std::time::Instant,
+    ) -> Outcome {
+        let project_root = Path::new(&request.project_root);
+        let Some(pool) = self.pool.as_ref() else {
+            return push(project_root, remote, branch, deadline).await;
+        };
+        // Fails open like an unreadable rules file: with no `gate_command` no gate will ever run, so
+        // a push parked for it would wait for ever.
+        let gate_after_land =
+            crate::config::load_schedule_rules(self.machine_root.as_deref(), &request.project_id)
+                .map(|rules| rules.gate_after_land && rules.gate_command.is_some())
+                .unwrap_or(false);
+        if !gate_after_land {
+            return push(project_root, remote, branch, deadline).await;
+        }
+        let on_the_integration_branch = matches!(
+            crate::execution::land::integration_branch(
+                pool,
+                &request.project_id,
+                project_root,
+                deadline,
+            )
+            .await,
+            Ok(integration) if integration.as_str() == branch
+        );
+        if !on_the_integration_branch {
+            return push(project_root, remote, branch, deadline).await;
+        }
+        let sha = match revision(project_root, &format!("refs/heads/{branch}"), deadline).await {
+            Ok(sha) => sha,
+            Err(outcome) => return outcome,
+        };
+        let green = match crate::verify::postgate::load(pool, &request.project_id).await {
+            Ok(state) => state.is_some_and(|state| state.is_green(&sha)),
+            Err(error) => {
+                tracing::warn!(
+                    vcs_request_id = request.id,
+                    %error,
+                    "could not read the post-land gate's state; parking the push of the \
+                     integration branch until it can be"
+                );
+                false
+            }
+        };
+        if green {
+            return push_sha(project_root, remote, branch, sha, deadline).await;
+        }
+        Outcome::AwaitingGate {
+            sha: sha.clone(),
+            reason: format!(
+                "{branch} is at {sha}, which the post-land gate has not judged green; the push \
+                 waits for the post-land gate and goes out by itself once it is"
+            ),
         }
     }
 }
