@@ -98,21 +98,6 @@ pub(super) struct AutopilotKillResponse {
     pub(super) engaged: bool,
 }
 
-#[derive(serde::Serialize)]
-pub(super) struct BudgetResponse {
-    pub(super) limit_usd: Option<f64>,
-    pub(super) period: String,
-    pub(super) hourly_limit_usd: Option<f64>,
-    pub(super) per_run_reserve_usd: f64,
-    pub(super) time_cost_per_hour_usd: f64,
-    pub(super) window_spend_usd: f64,
-    pub(super) hourly_spend_usd: f64,
-    pub(super) paused: bool,
-    pub(super) reason: Option<String>,
-    /// The spend ceiling of one relay chain (0194) — beside the house budget, not part of it.
-    pub(super) relay_chain_limit_usd: f64,
-}
-
 #[derive(Deserialize)]
 pub(super) struct BudgetRequest {
     pub(super) limit_usd: Option<f64>,
@@ -393,14 +378,14 @@ pub(super) async fn get_quota(State(state): State<AppState>) -> Json<crate::quot
 
 pub(super) async fn get_autopilot_budget(
     State(state): State<AppState>,
-) -> Result<Json<BudgetResponse>, StatusCode> {
+) -> Result<Json<budget::BudgetSnapshot>, StatusCode> {
     budget_response(&state).await.map(Json)
 }
 
 pub(super) async fn post_autopilot_budget(
     State(state): State<AppState>,
     Json(body): Json<BudgetRequest>,
-) -> Result<Json<BudgetResponse>, StatusCode> {
+) -> Result<Json<budget::BudgetSnapshot>, StatusCode> {
     let period = budget::BudgetPeriod::from_db_str(&body.period).ok_or(StatusCode::BAD_REQUEST)?;
     // Refused before anything is written, so a bad ceiling never lands half a request. Zero is a
     // valid answer — it refuses every relay — and a negative or non-finite one is not a ceiling.
@@ -485,36 +470,12 @@ pub(super) async fn post_attention_heartbeat(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-pub(super) async fn budget_response(state: &AppState) -> Result<BudgetResponse, StatusCode> {
-    let now = chrono::Utc::now();
-    let config = budget::load_budget_config(&state.pool)
+pub(super) async fn budget_response(
+    state: &AppState,
+) -> Result<budget::BudgetSnapshot, StatusCode> {
+    budget::snapshot(&state.pool, chrono::Utc::now())
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let window_spend_usd = budget::window_spend(&state.pool, now)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let hourly_spend_usd = budget::hourly_spend(&state.pool, now)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let relay_chain_limit_usd = budget::load_relay_chain_limit(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let (paused, reason) = match budget::budget_permits_new_run(&state.pool, now).await {
-        budget::BudgetDecision::Allow => (false, None),
-        budget::BudgetDecision::Pause { reason, .. } => (true, Some(reason)),
-    };
-    Ok(BudgetResponse {
-        limit_usd: config.limit_usd,
-        period: config.period.as_db_str().to_string(),
-        hourly_limit_usd: config.hourly_limit_usd,
-        per_run_reserve_usd: config.per_run_reserve_usd,
-        time_cost_per_hour_usd: config.time_cost_per_hour_usd,
-        window_spend_usd,
-        hourly_spend_usd,
-        paused,
-        reason,
-        relay_chain_limit_usd,
-    })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// The mode door's refusals on the wire.
