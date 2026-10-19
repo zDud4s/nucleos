@@ -21,12 +21,8 @@ import {
   Section,
   StaleNote,
 } from "../ui";
-import {
-  DecisionRefusal,
-  ReadFrom,
-  ToolInput,
-  useOrderFreeze,
-} from "./Waiting";
+import { DecisionRefusal, useOrderFreeze } from "./waiting/shared";
+import { ReadFrom, ToolInput } from "./waiting/ToolInput";
 // The records wear the Waiting cards: the same head, the same facts, the same well for a payload.
 import "./waiting.css";
 
