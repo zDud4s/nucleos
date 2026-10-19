@@ -1,6 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { File as FileIcon, Folder as FolderIcon } from "lucide-react";
-import { keys } from "../../data/keys";
 import { formatBytes, joinPath, middleEllipsis, useFolder, type Entry, type SortColumn, type SortDirection } from "../../data/files";
 import { Button, Panel, Quiet, RelativeTime, Skeleton, StaleNote, Teach } from "../../ui";
 import { LIST_SENTENCES, MOVE_SENTENCES, RefusalOrError, remPx } from "./shared";

@@ -1,5 +1,4 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { keys } from "../../data/keys";
 import type { Entry } from "../../data/files";
 
 /* --------------------------------------------------------- context menu -- */
