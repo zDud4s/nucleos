@@ -279,7 +279,10 @@ mod tests {
 
         let _reopen = Reopen;
         assert!(begin_draining());
-        assert!(!begin_draining(), "the second request must not start a second wait");
+        assert!(
+            !begin_draining(),
+            "the second request must not start a second wait"
+        );
 
         assert_eq!(
             claim(&pool, "project-a", Owner::Run(fresh)).await.unwrap(),
@@ -296,7 +299,10 @@ mod tests {
         );
 
         let app = Router::new()
-            .route("/runs", post(|| async { "started" }).get(|| async { "listed" }))
+            .route(
+                "/runs",
+                post(|| async { "started" }).get(|| async { "listed" }),
+            )
             .route("/hooks/pretooluse", post(|| async { "hooked" }))
             .route("/assistant/message", post(|| async { "sent" }))
             .layer(axum::middleware::from_fn(refuse_new_work));
@@ -385,21 +391,20 @@ mod tests {
 
         let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let finished_when_stopped = Arc::new(AtomicBool::new(false));
-        let outcome = drain_until_idle(
-            &pool,
-            Duration::from_secs(10),
-            Duration::from_millis(10),
-            {
-                let (stops, finished, seen) =
-                    (stops.clone(), finished.clone(), finished_when_stopped.clone());
+        let outcome =
+            drain_until_idle(&pool, Duration::from_secs(10), Duration::from_millis(10), {
+                let (stops, finished, seen) = (
+                    stops.clone(),
+                    finished.clone(),
+                    finished_when_stopped.clone(),
+                );
                 move || {
                     seen.store(finished.load(Ordering::SeqCst), Ordering::SeqCst);
                     stops.fetch_add(1, Ordering::SeqCst);
                 }
-            },
-        )
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         finisher.await.unwrap();
 
         assert_eq!(outcome, DrainOutcome::Stopped);

@@ -23603,8 +23603,7 @@ mod tests {
     async fn shutdown_needs_the_control_scope() {
         let state = test_state().await;
         let reader = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
-        let creator =
-            store_api_token_at_level(&state, "creator", ApiTokenLevel::RunCreating).await;
+        let creator = store_api_token_at_level(&state, "creator", ApiTokenLevel::RunCreating).await;
 
         for (method, path) in [
             ("POST", "/system/shutdown"),

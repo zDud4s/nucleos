@@ -703,7 +703,10 @@ async fn post_system_shutdown(
                     tracing::warn!("no run is live: stopping the daemon for the update");
                 }
                 Ok(crate::shutdown::DrainOutcome::TimedOut { live_runs }) => {
-                    tracing::warn!(live_runs, "the update drain timed out; the daemon carries on");
+                    tracing::warn!(
+                        live_runs,
+                        "the update drain timed out; the daemon carries on"
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(
