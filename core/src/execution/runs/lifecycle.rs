@@ -726,7 +726,7 @@ mod terminal_write_ratchet {
                 .strip_prefix(&src)
                 .unwrap()
                 .to_string_lossy()
-                .replace('\', "/");
+                .replace('\\', "/");
             for line in discarded_terminal_writes(&source) {
                 let at = format!("{relative}:{line}");
                 if !ALLOWED.contains(&at.as_str()) {
