@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import difflib
 import re
@@ -121,7 +120,7 @@ SHIPPED_CLAUDE = ["opus", "sonnet", "fable"]
 # (`core/src/price_refresh`); this script never reads, writes or re-banners them.
 KEY = "assistant_choices"
 
-BANNER = f"""# ─────────────────────────────────────────────────────────────
+BANNER = """# ─────────────────────────────────────────────────────────────
 # Escrito por `scripts/refresh-models.py`. Editável à mão — o script substitui apenas este bloco e
 # deixa o resto do ficheiro intacto — mas uma edição manual é desfeita na próxima passagem dele.
 #

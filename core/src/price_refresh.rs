@@ -1082,4 +1082,86 @@ mod tests {
             })
         );
     }
+
+    /// The parser is a port of a script and is otherwise tested against fixtures alone; this reads
+    /// the pages it was written for, through the daemon's own `fetch` (the body cap and the
+    /// `User-Agent` included), so a vendor changing a page's shape fails here and not in a
+    /// production log.
+    ///
+    /// A line is a problem unless it is one of the two notes a healthy run prints: a cross-check
+    /// disagreement with OpenRouter ("keeping anthropic's") or an `openai/*` model priced by time of
+    /// day. Those two are printed for a human, not asserted on, because the vendors can differ by
+    /// a cent on a given day and that is not this parser's fault.
+    #[tokio::test]
+    #[ignore = "needs the internet: reads the real Anthropic pricing page and OpenRouter catalogue; run by hand when the vendor pages change: cargo test -p nucleos-core --lib the_real_pricing_pages -- --ignored --nocapture"]
+    async fn the_real_pricing_pages_are_read_without_a_problem() {
+        let client = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .build()
+            .unwrap();
+        let (pricing, catalogue) = tokio::join!(
+            fetch(&client, parse::PRICING_DOC),
+            fetch(&client, parse::OPENROUTER_MODELS)
+        );
+        assert!(
+            pricing.is_some() && catalogue.is_some(),
+            "a source was not fetched (pricing page: {}, OpenRouter catalogue: {}) — see the \
+             warning above, or check the connection",
+            pricing.is_some(),
+            catalogue.is_some()
+        );
+
+        let (blocks, lines) = parse::refresh_from_bodies(
+            pricing.as_deref(),
+            catalogue.as_deref(),
+            &Utc::now().date_naive().to_string(),
+        );
+        for line in &lines {
+            eprintln!("{line}");
+        }
+        let blocks = blocks.expect(
+            "a source did not parse, so a page changed shape — the lines printed above say which",
+        );
+        let problems: Vec<&String> = lines
+            .iter()
+            .filter(|line| {
+                !line.contains("keeping anthropic's") && !line.contains("override by time of day")
+            })
+            .collect();
+        assert!(
+            problems.is_empty(),
+            "problems reading the pages: {problems:#?}"
+        );
+
+        // The blocks must also make a models file the daemon accepts, with the shapes the cost
+        // accounting depends on.
+        let spliced = parse::splice_price_blocks(&models_file(), &blocks);
+        let config = crate::config::parse_models_config(&spliced)
+            .expect("the spliced file parses as a models file");
+        let claude: Vec<_> = config
+            .model_prices
+            .iter()
+            .filter(|(id, _)| id.starts_with("claude-"))
+            .collect();
+        assert!(
+            claude
+                .iter()
+                .any(|(_, price)| price.input.is_some() && price.output.is_some()),
+            "no claude-* model with an input and an output price: {claude:#?}"
+        );
+        assert!(
+            claude.iter().any(|(_, price)| price.fast.is_some()),
+            "no claude-* model with a fast rate — the fast mode table was not read"
+        );
+        assert!(
+            claude.iter().any(|(_, price)| price.geo_us_mult.is_some()),
+            "no claude-* model with a geo_us_mult — the data residency multiplier was not read"
+        );
+        assert!(
+            config.model_prices.iter().any(|(id, price)| {
+                id.starts_with("gpt-") && price.source.as_deref() == Some("openrouter")
+            }),
+            "no gpt-* model priced from OpenRouter"
+        );
+    }
 }
