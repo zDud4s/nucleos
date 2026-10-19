@@ -136,6 +136,14 @@ impl State {
         self.running_sha.is_some()
     }
 
+    /// The post-land gate has judged `sha` green: it is the last green sha, or a tip a daemon
+    /// verification covered. Pending, running and red are all "not green" - a push of the
+    /// integration branch waits on this, and a red is answered by `revert_on_red` moving the branch
+    /// to a revert, which is gated in turn and is what then gets pushed.
+    pub fn is_green(&self, sha: &str) -> bool {
+        self.last_green_sha.as_deref() == Some(sha) || self.covered_sha.as_deref() == Some(sha)
+    }
+
     /// The note for a unit whose `key` (its group, or the gate command) is red on the target:
     /// `already failing on <target>@<sha>`. `None` when `key` is not red or no sha is known.
     pub fn already_failing(&self, key: &str) -> Option<String> {
@@ -456,6 +464,8 @@ pub async fn finish_green(pool: &SqlitePool, project_id: &str, sha: &str) -> sql
     )
     .await?;
     tx.commit().await?;
+    // After the commit, so a released push re-reads a state that already says green.
+    crate::execution::vcs::release_awaiting_gate(pool, project_id).await;
     Ok(true)
 }
 
@@ -594,6 +604,7 @@ pub async fn mark_covered(
     )
     .await?;
     tx.commit().await?;
+    crate::execution::vcs::release_awaiting_gate(pool, project_id).await;
     Ok(())
 }
 
@@ -641,6 +652,7 @@ pub async fn settle_covered(
     )
     .await?;
     tx.commit().await?;
+    crate::execution::vcs::release_awaiting_gate(pool, project_id).await;
     Ok(true)
 }
 
@@ -735,6 +747,7 @@ pub async fn flake_green(pool: &SqlitePool, project_id: &str, red_sha: &str) -> 
     )
     .await?;
     tx.commit().await?;
+    crate::execution::vcs::release_awaiting_gate(pool, project_id).await;
     Ok(true)
 }
 

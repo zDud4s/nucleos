@@ -5435,4 +5435,165 @@ mod tests {
         assert_eq!(finished_at_of(&pool, id).await, None);
         assert_eq!(failure_reason_of(&pool, id).await, "r");
     }
+
+    #[test]
+    fn a_park_for_the_gate_is_its_own_non_terminal_status() {
+        let outcome = Outcome::AwaitingGate {
+            sha: "abc".to_owned(),
+            reason: "r".to_owned(),
+        };
+        assert_eq!(outcome.status(), "awaiting_gate");
+        assert!(!TERMINAL_STATUSES.contains(&"awaiting_gate"));
+    }
+
+    #[tokio::test]
+    async fn finishing_with_a_gate_park_records_the_reason_and_no_end() {
+        let pool = test_pool().await;
+        let id = row_in_status(&pool, "alpha", "feat/x", "running").await;
+        finish(
+            &pool,
+            id,
+            Outcome::AwaitingGate {
+                sha: "abc".into(),
+                reason: "waits".into(),
+            },
+        )
+        .await
+        .expect("finish with a park");
+        let (result_sha, parked_sha): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT result_sha, output_tail FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(result_sha, None, "a parked row pushed nothing");
+        assert_eq!(parked_sha.as_deref(), Some("abc"));
+        assert_eq!(status_of(&pool, id).await, "awaiting_gate");
+        assert_eq!(finished_at_of(&pool, id).await, None);
+        assert_eq!(failure_reason_of(&pool, id).await, "waits");
+        assert_eq!(
+            waiting_on_a_person(&pool).await.unwrap().len(),
+            0,
+            "a park for the gate waits on the daemon, not on a person"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_parked_for_the_gate_is_not_claimed_until_it_is_released() {
+        let pool = test_pool().await;
+        let id = row_in_status(&pool, "alpha", "feat/x", "awaiting_gate").await;
+        assert!(
+            claim_next(&pool, "alpha").await.unwrap().is_none(),
+            "a parked row must not be claimable, or it would spin"
+        );
+        // Another project's release leaves it alone.
+        assert_eq!(release_awaiting_gate(&pool, "beta").await, 0);
+        assert_eq!(status_of(&pool, id).await, "awaiting_gate");
+
+        assert_eq!(release_awaiting_gate(&pool, "alpha").await, 1);
+        assert_eq!(status_of(&pool, id).await, "queued");
+        assert_eq!(claim_next(&pool, "alpha").await.unwrap().unwrap().id, id);
+    }
+
+    /// The race: the gate's green lands between the push's decision and the park, so its release
+    /// matched no row. The drain re-reads the state after persisting the park and releases it.
+    #[tokio::test]
+    async fn a_green_written_before_the_park_lands_does_not_strand_the_row() {
+        let pool = test_pool().await;
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", "tip1")
+            .await
+            .expect("the gate went green");
+        let id = row_in_status(&pool, "alpha", "feat/x", "queued").await;
+        let executor = FakeVcsExecutor::reporting(Outcome::AwaitingGate {
+            sha: "tip1".into(),
+            reason: "r".into(),
+        });
+
+        drain_once(&pool, "alpha", &executor).await;
+
+        assert_eq!(status_of(&pool, id).await, "queued", "released, not stuck");
+    }
+
+    #[tokio::test]
+    async fn a_park_on_a_sha_that_is_still_pending_stays_parked() {
+        let pool = test_pool().await;
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", "other")
+            .await
+            .expect("some other tip is green");
+        let id = row_in_status(&pool, "alpha", "feat/x", "queued").await;
+        let executor = FakeVcsExecutor::reporting(Outcome::AwaitingGate {
+            sha: "tip1".into(),
+            reason: "r".into(),
+        });
+
+        drain_once(&pool, "alpha", &executor).await;
+
+        assert_eq!(status_of(&pool, id).await, "awaiting_gate");
+    }
+
+    async fn park_with_sha(pool: &sqlx::SqlitePool, sha: &str) -> i64 {
+        let id = row_in_status(pool, "alpha", "feat/x", "awaiting_gate").await;
+        sqlx::query("UPDATE vcs_requests SET output_tail = ? WHERE id = ?")
+            .bind(sha)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("record the parked sha");
+        id
+    }
+
+    /// A restart: the row is parked, the stored state already says green, nobody will wake it.
+    #[tokio::test]
+    async fn the_sweep_releases_a_row_parked_on_a_sha_that_is_green_in_stored_state() {
+        let pool = test_pool().await;
+        let id = park_with_sha(&pool, "tip1").await;
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", "tip1")
+            .await
+            .expect("green");
+        // The green write above already released it; park it again as a restart would find it.
+        sqlx::query("UPDATE vcs_requests SET status = 'awaiting_gate' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(sweep_awaiting_gate(&pool).await, 1);
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_leaves_a_row_whose_sha_is_still_pending() {
+        let pool = test_pool().await;
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", "old")
+            .await
+            .expect("an older tip is green");
+        sqlx::query(
+            "UPDATE postgate_state SET last_attempted_sha = 'tip1' WHERE project_id = 'alpha'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let id = park_with_sha(&pool, "tip1").await;
+
+        assert_eq!(sweep_awaiting_gate(&pool).await, 0);
+        assert_eq!(status_of(&pool, id).await, "awaiting_gate");
+    }
+
+    /// A later tip went green and the gate is no longer on the parked sha: the push re-resolves.
+    #[tokio::test]
+    async fn the_sweep_releases_a_row_when_a_different_tip_went_green() {
+        let pool = test_pool().await;
+        let id = park_with_sha(&pool, "tip1").await;
+        crate::verify::postgate::mark_covered(&pool, "alpha", "master", "tip2")
+            .await
+            .expect("a later tip is green");
+        sqlx::query("UPDATE vcs_requests SET status = 'awaiting_gate' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(sweep_awaiting_gate(&pool).await, 1);
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
 }
