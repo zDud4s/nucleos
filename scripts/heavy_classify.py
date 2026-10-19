@@ -219,6 +219,11 @@ def _classify_cargo(args) -> Verdict:
     if i is None:
         return Verdict()
     sub, rest = args[i], args[i + 1:]
+    # `cargo "$@"` in a helper function, `cargo @args` in PowerShell: the subcommand only
+    # exists at run time, so it may be a full build. Found 2026-10-19, when such a helper
+    # ran a batch of tests and clippy outside the queue.
+    if "$" in sub or sub.startswith("@"):
+        return _heavy("cargo", 2)
     if sub == "tauri":
         if rest and rest[0] == "build":
             return _heavy("cargo", 2)
