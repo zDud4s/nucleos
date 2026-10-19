@@ -245,221 +245,25 @@ def cases():
                [{"id": "g", "label": "G", "brain": "cloud", "runner": "codex", "efforts": []}]
            ).splitlines()[-1], True)
 
-
-    # --- prices: Anthropic's page ------------------------------------------------
-    prices, problems = refresh_models.anthropic_prices(PRICING_MD)
-    yield ("pricing_markdown_fixture_parses_to_per_million_prices",
-           prices["claude-opus-4-7"],
-           {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25, "cache_write_1h": 10.0,
-            "source": "anthropic", "fast": {"input": 10.0, "output": 50.0}, "geo_us_mult": 1.1})
-    yield ("a fast row naming two models prices both, and a table after it is not read as fast rates",
-           (prices["claude-sonnet-5"]["fast"], prices["claude-opus-4-7"]["fast"]["input"]),
-           ({"input": 10.0, "output": 50.0}, 10.0))
-    yield ("the residency multiplier goes on 4.6 and later only; an older model never gets one",
-           (prices["claude-haiku-5-5"]["geo_us_mult"], "geo_us_mult" in prices["claude-opus-4-1"]),
-           (1.1, False))
-    yield ("a model the fast table does not name has no fast rate (a fast request stays unpriced)",
-           "fast" in prices["claude-haiku-5-5"], False)
-    yield ("model_version reads the family's version, and nothing else",
-           [refresh_models.model_version(i) for i in ["claude-opus-4-6", "claude-fable-5", "gpt-5.5"]],
-           [(4, 6), (5, 0), None])
-    unfast = PRICING_MD.replace("| Input          | Output         |", "| In | Out |")
-    prices, problems = refresh_models.anthropic_prices(unfast)
-    yield ("a fast table that changed shape writes no fast rate and is a problem",
-           ("fast" in prices["claude-opus-4-7"], len(problems)), (False, 1))
-    orphan_fast = PRICING_MD.replace("Claude Opus 4.7 / Claude Sonnet 5 |", "Claude Opus 4.7 / Claude Opus 9 |")
-    prices, problems = refresh_models.anthropic_prices(orphan_fast)
-    yield ("a fast rate for a model with no base price is not written and is a problem",
-           ("claude-opus-9" in prices, prices["claude-opus-4-7"]["fast"]["input"], len(problems)),
-           (False, 10.0, 1))
-    reworded = PRICING_MD.replace("1.1x multiplier", "surcharge")
-    prices, problems = refresh_models.anthropic_prices(reworded)
-    yield ("a residency sentence it cannot read writes no multiplier and is a problem",
-           ("geo_us_mult" in prices["claude-opus-4-7"], len(problems)), (False, 1))
-    prices, problems = refresh_models.anthropic_prices(PRICING_MD)
-    yield ("a footnote marker does not stop a price from parsing",
-           prices["claude-sonnet-5"]["input"], 2.0)
-    yield ("a retired model's link is not part of its id",
-           "claude-opus-4-1" in prices, True)
-    yield ("a model priced by prompt length is one entry: the base tier plus a tier over 100,000 tokens",
-           (prices["claude-haiku-5-5"], problems),
-           ({"input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125, "cache_write_1h": 0.2,
-             "source": "anthropic", "geo_us_mult": 1.1,
-             "tiers": [{"min_prompt_tokens": 100_001, "input": 0.5, "output": 2.5, "cache_read": 0.05,
-                        "cache_write": 0.625, "cache_write_1h": 1.0}]}, []))
-    orphan = "\n".join(line for line in PRICING_MD.splitlines() if "up to 100,000" not in line)
-    prices, problems = refresh_models.anthropic_prices(orphan)
-    yield ("a tier with no base row is unreadable: written without price, and a problem",
-           (prices["claude-haiku-5-5"]["input"], "tiers" in prices["claude-haiku-5-5"], len(problems)),
-           (None, False, 1))
-    odd = PRICING_MD.replace("(for prompts over 100,000 tokens)", "(for prompts between 1 and 2 tokens)")
-    prices, problems = refresh_models.anthropic_prices(odd)
-    yield ("a tier phrase it cannot read is never guessed at",
-           (prices["claude-haiku-5-5"]["input"], len(problems)), (None, 1))
-    broken = PRICING_MD.replace("| $25 / MTok |", "| ask sales |")
-    prices, problems = refresh_models.anthropic_prices(broken)
-    yield ("price_unreadable_is_written_without_price_and_exits_1 (parser half)",
-           (prices["claude-opus-4-7"], len(problems)),
-           ({"input": None, "output": None, "cache_read": None, "cache_write": None, "cache_write_1h": None,
-             "source": "anthropic"}, 1))
-    renamed = PRICING_MD.replace("Output tokens", "Output")
-    yield ("pricing_page_format_change_fails_loudly (parser half): a renamed column is None, not a guess",
-           refresh_models.anthropic_prices(renamed), None)
-    yield ("a page with no Model pricing section is None",
-           refresh_models.anthropic_prices("# Pricing\n\nnothing here\n"), None)
-    yield ("normalise_id drops context and date suffixes and dots in claude ids",
-           [refresh_models.normalise_id(i) for i in
-            ["Claude-Sonnet-5[1m]", "claude-sonnet-5-20261001", "claude-opus-4.6", "gpt-5.5", "claude-x-latest"]],
-           ["claude-sonnet-5", "claude-sonnet-5", "claude-opus-4-6", "gpt-5.5", "claude-x"])
-
-    # --- prices: OpenRouter ---------------------------------------------------------
-    catalogue = served(
-        {"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001",
-                                              "input_cache_read": "0.000000125"}},
-        {"id": "openai/gpt-5.5:batch", "pricing": {"prompt": "0.0000006", "completion": "0.000005"}},
-        {"id": "openai/gpt-6-tiered", "pricing": {
-            "prompt": "0.000002", "completion": "0.00001", "input_cache_write_1h": "0.000004",
-            "overrides": [{"min_prompt_tokens": 272000, "prompt": "0.000004", "completion": "0.00002",
-                           "input_cache_read": "0.0000004"}]}},
-        {"id": "openai/gpt-night", "pricing": {
-            "prompt": "0.000002", "completion": "0.00001",
-            "overrides": [{"utc_days": [0, 1], "utc_start": "00:00", "utc_end": "06:00", "prompt": "0.000001"}]}},
-        {"id": "openai/gpt-mixed", "pricing": {
-            "prompt": "0.000002", "completion": "0.00001",
-            "overrides": [{"min_prompt_tokens": 1000, "prompt": "0.000003"},
-                          {"utc_start": "00:00", "utc_end": "06:00", "prompt": "0.000001"}]}},
-        {"id": "anthropic/claude-opus-4.7", "pricing": {"prompt": "0.000005", "completion": "0.000025",
-                                                         "input_cache_read": "0.0000005",
-                                                         "input_cache_write": "0.00000625"}},
-        {"id": "google/gemini-x", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
-    )
-    openai, unsupported, crosscheck = refresh_models.openrouter_prices(catalogue)
-    yield ("openrouter_pricing_sample_converts_per_token_to_per_million",
-           openai["gpt-5.5"],
-           {"input": 1.25, "output": 10.0, "cache_read": 0.125, "cache_write": None, "cache_write_1h": None,
-            "source": "openrouter"})
-    yield ("a prompt-length override becomes a tier carrying only the rates it overrides, from N + 1"
-           " because OpenRouter's N is 'over N'",
-           openai["gpt-6-tiered"],
-           {"input": 2.0, "output": 10.0, "cache_read": None, "cache_write": None, "cache_write_1h": 4.0,
-            "source": "openrouter",
-            "tiers": [{"min_prompt_tokens": 272001, "input": 4.0, "output": 20.0, "cache_read": 0.4}]})
-    yield ("batch variants and other vendors are not priced; time-of-day overrides are named, never priced",
-           (sorted(openai), sorted(unsupported)), (["gpt-5.5", "gpt-6-tiered"], ["gpt-mixed", "gpt-night"]))
-    yield ("anthropic entries come back apart, normalised, for the cross-check only",
-           crosscheck["claude-opus-4-7"]["output"], 25.0)
-    vendor = {"claude-opus-4-7": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25,
-                                  "source": "anthropic"}}
-    other = {"claude-opus-4-7": {"input": 5.2, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25}}
-    merged, warnings = refresh_models.crosscheck(vendor, other)
-    yield ("crosscheck_divergence_is_warned_and_vendor_price_wins",
-           (merged["claude-opus-4-7"]["input"], len(warnings)), (5.0, 1))
-    merged, warnings = refresh_models.crosscheck(vendor, {"claude-opus-4-7": {"input": 5.04}})
-    yield ("a divergence under 1% is not warned", warnings, [])
-    tiered = {"claude-haiku-5-5": {"input": 0.1, "source": "anthropic", "tiers": [{"min_prompt_tokens": 100_001}]}}
-    merged, warnings = refresh_models.crosscheck(tiered, {"claude-haiku-5-5": {
-        "input": 0.1, "tiers": [{"min_prompt_tokens": 100_001}]}})
-    yield ("tiers starting at the same prompt length are not warned", warnings, [])
-    merged, warnings = refresh_models.crosscheck(tiered, {"claude-haiku-5-5": {
-        "input": 0.1, "tiers": [{"min_prompt_tokens": 100_000}]}})
-    yield ("tiers starting one token apart are warned and the vendor's threshold wins",
-           (merged["claude-haiku-5-5"]["tiers"], len(warnings)), ([{"min_prompt_tokens": 100_001}], 1))
-
-    # --- prices: rendering and splicing ----------------------------------------------
+    # --- splice: the daemon's price blocks are not ours -------------------------------
+    # `prices_as_of` / `model_prices` are written by the daemon (`core/src/price_refresh`). Splicing
+    # `assistant_choices` must carry them through byte for byte, banner comments included.
+    prices_tail = ('# Prices, written by the daemon.\nprices_as_of: "2026-01-01"\n'
+                   '# per-model rates\nmodel_prices:\n  old: { input: 1.0 }\n\nembedding_model: x\n')
     original = ('local_assistant_model: "qwen"\n\n# banner\nassistant_choices:\n  - { id: "opus" }\n\n'
-                'prices_as_of: "2026-01-01"\nmodel_prices:\n  old: { input: 1.0 }\n\nembedding_model: x\n')
-    block = refresh_models.render_prices(
-        {"claude-opus-4-7": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write": 6.25,
-                             "source": "anthropic"}}, "2026-10-18")
-    spliced = refresh_models.splice(original, "model_prices", block["model_prices"])
-    spliced = refresh_models.splice(spliced, "prices_as_of", block["prices_as_of"])
-    yield ("splice_replaces_model_prices_block_and_leaves_other_keys_intact",
-           ("old:" in spliced, 'prices_as_of: "2026-10-18"' in spliced,
-            'local_assistant_model: "qwen"' in spliced, "assistant_choices:" in spliced,
-            "embedding_model: x" in spliced, spliced.count("model_prices:")),
-           (False, True, True, True, True, 1))
-    yield ("a price row is flow-style with explicit nulls",
-           refresh_models.render_price_row("gpt-5.5", {"input": 1.25, "output": 10.0, "cache_read": 0.125,
-                                                       "cache_write": None, "source": "openrouter"}),
-           '  gpt-5.5: { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: null, '
-           'cache_write_1h: null, source: openrouter }')
-    yield ("a tiered row writes its tiers inline, each with only the rates it carries",
-           refresh_models.render_price_row("claude-haiku-5-5", {
-               "input": 0.1, "output": 0.5, "cache_read": 0.01, "cache_write": 0.125, "cache_write_1h": 0.2,
-               "source": "anthropic",
-               "tiers": [{"min_prompt_tokens": 100_001, "input": 0.5, "output": 2.5}]}),
-           '  claude-haiku-5-5: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125, '
-           'cache_write_1h: 0.2, tiers: [{ min_prompt_tokens: 100001, input: 0.5, output: 2.5 }], '
-           'source: anthropic }')
-    yield ("a row with fast and residency rates writes both after its tiers",
-           refresh_models.render_price_row("claude-opus-5-5", {
-               "input": 4.0, "output": 20.0, "cache_read": 0.2, "cache_write": 5.0, "cache_write_1h": 8.0,
-               "source": "anthropic", "fast": {"input": 8.0, "output": 40.0}, "geo_us_mult": 1.1}),
-           '  claude-opus-5-5: { input: 4.0, output: 20.0, cache_read: 0.2, cache_write: 5.0, '
-           'cache_write_1h: 8.0, fast: { input: 8.0, output: 40.0 }, geo_us_mult: 1.1, source: anthropic }')
-    good = '{"data": [{"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001"}}]}'
-    with fake_bodies({refresh_models.PRICING_DOC: PRICING_MD, refresh_models.OPENROUTER_MODELS: good}):
-        blocks, complained = refresh_models.refresh_prices("2026-10-18")
-    yield ("a clean read writes both sources and does not complain",
-           ("claude-opus-4-7:" in blocks["model_prices"], "gpt-5.5:" in blocks["model_prices"], complained),
-           (True, True, False))
-    yield ("a clean read writes the fast and residency rates",
-           "fast: { input: 10.0, output: 50.0 }, geo_us_mult: 1.1" in blocks["model_prices"], True)
-    yield ("a clean read writes the tiered model with its tier",
-           "claude-haiku-5-5: { input: 0.1" in blocks["model_prices"]
-           and "min_prompt_tokens: 100001" in blocks["model_prices"], True)
-    with fake_bodies({refresh_models.PRICING_DOC: broken, refresh_models.OPENROUTER_MODELS: good}):
-        blocks, complained = refresh_models.refresh_prices("2026-10-18")
-    yield ("price_unreadable_is_written_without_price_and_exits_1",
-           ("claude-opus-4-7: { input: null" in blocks["model_prices"], complained), (True, True))
-    with fake_bodies({refresh_models.PRICING_DOC: renamed, refresh_models.OPENROUTER_MODELS: good}):
-        yield ("pricing_page_format_change_fails_loudly: nothing written, complained",
-               refresh_models.refresh_prices("2026-10-18"), (None, True))
-    with no_network():
-        yield ("an unreachable pricing page writes nothing and complains",
-               refresh_models.refresh_prices("2026-10-18"), (None, True))
-
-
-PRICING_MD = """---
-title: Pricing
----
-
-## Model pricing
-
-| Model | Base input tokens | 5m cache writes | 1h cache writes | Cache hits and refreshes | Output tokens |
-| :---- | :---- | :---- | :---- | :---- | :---- |
-| Claude Opus 4.7 | $5 / MTok | $6.25 / MTok | $10 / MTok | $0.50 / MTok | $25 / MTok |
-| Claude Sonnet 5 | $2 / MTok<sup>3</sup> | $2.50 / MTok | $4 / MTok | $0.20 / MTok | $10 / MTok<sup>3</sup> |
-| Claude Opus 4.1 ([retired, except on Bedrock](https://example/deprecations)) | $15 / MTok | $18.75 / MTok | $30 / MTok | $1.50 / MTok | $75 / MTok |
-| Claude Haiku 5.5 (for prompts up to 100,000 tokens) | $0.10 / MTok | $0.125 / MTok | $0.20 / MTok | $0.01 / MTok | $0.50 / MTok |
-| Claude Haiku 5.5 (for prompts over 100,000 tokens) | $0.50 / MTok | $0.625 / MTok | $1 / MTok | $0.05 / MTok | $2.50 / MTok |
-
-## Cloud platform pricing
-
-| Concept | Details |
-| --- | --- |
-| **Billing unit** | CCU |
-
-## Feature-specific pricing
-
-### Data residency pricing
-
-For Claude 4.6 and later models, specifying US-only inference through the `inference_geo` parameter incurs a 1.1x multiplier on all token pricing categories, including input tokens, output tokens, cache writes, and cache reads.
-
-### Fast mode pricing
-
-[Fast mode](https://example/fast-mode) provides faster output at premium pricing.
-
-| Model                             | Input          | Output         |
-| --------------------------------- | -------------- | -------------- |
-| Claude Opus 4.7 / Claude Sonnet 5 | $10 USD / MTok | $50 USD / MTok |
-
-### Batch processing
-
-| Model | Batch input | Batch output |
-| :---- | :---- | :---- |
-| Claude Opus 4.7 | $2.50 / MTok | $12.50 / MTok |
-"""
+                + prices_tail)
+    spliced = refresh_models.splice(original, refresh_models.KEY, refresh_models.render([hosted("a/b", "A")]))
+    yield ("an assistant_choices splice leaves the price blocks and their banners verbatim",
+           (prices_tail in spliced, 'id: "opus"' in spliced, 'id: "a/b"' in spliced,
+            'local_assistant_model: "qwen"' in spliced, spliced.count("assistant_choices:")),
+           (True, False, True, True, 1))
+    yield ("a second splice of the same block is a no-op",
+           refresh_models.splice(spliced, refresh_models.KEY, refresh_models.render([hosted("a/b", "A")])),
+           spliced)
+    yield ("the script owns assistant_choices alone: no price constant or helper is left",
+           [name for name in ("OWNED_KEYS", "PRICING_DOC", "refresh_prices", "anthropic_prices",
+                              "openrouter_prices", "render_prices") if hasattr(refresh_models, name)],
+           [])
 
 
 def refresh_hosted_one(model_id, name):

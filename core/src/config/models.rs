@@ -120,13 +120,25 @@ pub struct ModelsConfig {
     /// `catalogue` joins the two.
     #[serde(default = "default_assistant_choices")]
     pub assistant_choices: Vec<AssistantChoice>,
-    /// When `scripts/refresh-models.py` last read the vendors' price pages (`YYYY-MM-DD`), or `None`
-    /// when it never has. Shown beside every estimated cost so its age is visible (spec devtime §4.4).
+    /// When the vendors' price pages were last read (`YYYY-MM-DD`), or `None` when they never have
+    /// been. Written by the daemon's own price refresh ([`crate::price_refresh`]), or by
+    /// `scripts/refresh-models.py` run by hand. Shown beside every estimated cost so its age is
+    /// visible (spec devtime §4.4).
     #[serde(default)]
     pub prices_as_of: Option<String>,
+    /// Whether the daemon refreshes `prices_as_of` and `model_prices` by itself: when they go stale,
+    /// and when the devtime page meets a model it has no price for. Absent means `true`.
+    ///
+    /// The refresh reads two public pages (Anthropic's pricing page and OpenRouter's model
+    /// catalogue) and sends nothing about the user, their models or their usage. `false` stops the
+    /// background refresh only; the "refresh prices" button still runs, because pressing it is
+    /// asking for exactly that.
+    #[serde(default = "default_auto_refresh_prices")]
+    pub auto_refresh_prices: bool,
     /// Vendor-published prices, USD per million tokens, keyed by normalised model id. Written by the
-    /// script, never by hand: there is no hand-kept price catalogue (owner, 2026-10-17). Read per
-    /// request like the rest of this file, so a refresh needs no restart.
+    /// daemon's price refresh (or the script it replaced), never by hand: there is no hand-kept
+    /// price catalogue (owner, 2026-10-17). Read per request like the rest of this file, so a
+    /// refresh needs no restart.
     ///
     /// Filled by [`parse_models_config`] from `raw_model_prices`, entry by entry, so one unreadable
     /// entry costs that entry and never the file.
@@ -795,6 +807,7 @@ impl Default for ModelsConfig {
             embedding_model: default_embedding_model(),
             assistant_choices: default_assistant_choices(),
             prices_as_of: None,
+            auto_refresh_prices: default_auto_refresh_prices(),
             model_prices: std::collections::BTreeMap::new(),
             raw_model_prices: serde_yaml::Value::Null,
             price_warnings: Vec::new(),
@@ -807,6 +820,12 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
 
 pub(super) fn default_embedding_model() -> String {
     DEFAULT_EMBEDDING_MODEL.to_string()
+}
+
+/// On unless the file says otherwise: stale prices are a wrong cost shown as a right one, and the
+/// refresh sends nothing about the user (see [`ModelsConfig::auto_refresh_prices`]).
+pub(super) fn default_auto_refresh_prices() -> bool {
+    true
 }
 
 pub(super) fn deserialize_optional_model<'de, D>(

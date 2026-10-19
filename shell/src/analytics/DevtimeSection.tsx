@@ -4,13 +4,14 @@ import {
   useDevtime,
   useDevtimeFindings,
   useMarkFinding,
+  useRefreshPrices,
   type DevtimeFinding,
   type DevtimeOverview,
   type ModelTokens,
   type Verdict,
 } from "../data/devtime";
 import { compactTokens, humanMinutes } from "../data/project-readings";
-import { AreaChart, Badge, ErrorNote, ShareBar, Skeleton, StaleNote, usd } from "../ui";
+import { AreaChart, Badge, Button, ErrorNote, ShareBar, Skeleton, StaleNote, usd } from "../ui";
 import {
   COST_KEYS,
   KIND_KEYS,
@@ -225,6 +226,7 @@ function InterruptionsPanel({ report }: { report: DevtimeOverview }) {
 
 function TokensPanel({ report }: { report: DevtimeOverview }) {
   const { tokens } = report;
+  const refresh = useRefreshPrices();
   const range = costRange(tokens.cost_low, tokens.cost_high);
   const sum = (row: ModelTokens) => row.input + row.cache_read + row.cache_creation + row.output;
   const hit = (row: ModelTokens) => {
@@ -267,9 +269,16 @@ function TokensPanel({ report }: { report: DevtimeOverview }) {
       ) : null}
       <p className="an-note">
         {tokens.prices_as_of === null
-          ? "No prices yet: run scripts/refresh-models.py."
-          : `Estimated, prices of ${tokens.prices_as_of}. Never compared with an invoice.`}
+          ? "No prices yet."
+          : `Estimated, prices of ${tokens.prices_as_of}. Never compared with an invoice.`}{" "}
+        <Button variant="quiet" disabled={refresh.isPending} onClick={() => refresh.mutate()}>
+          {refresh.isPending ? "Refreshing…" : "Refresh prices"}
+        </Button>
       </p>
+      {tokens.price_refresh?.ok === false ? (
+        <p className="an-note">{`Last price refresh failed: ${tokens.price_refresh.problems.join("; ")}`}</p>
+      ) : null}
+      {refresh.isError ? <ErrorNote>The price refresh could not be started.</ErrorNote> : null}
     </>
   );
 }

@@ -24764,6 +24764,13 @@ mod tests {
             global["tokens"]["cost_usd"].is_null(),
             "no message, so nothing priced: {global}"
         );
+        // Present and `null`: no price refresh has run (none is installed under tests).
+        assert!(
+            global["tokens"]
+                .get("price_refresh")
+                .is_some_and(serde_json::Value::is_null),
+            "{global}"
+        );
         // `days_series[].cost_usd` is on every day, `null` rather than absent when unpriced.
         let unpriced = |day: &serde_json::Value| day.get("cost_usd").is_some_and(|c| c.is_null());
         assert!(series.iter().all(unpriced), "{global}");
@@ -24936,7 +24943,45 @@ mod tests {
         )
         .await;
         assert_eq!(post.status(), StatusCode::FORBIDDEN);
+        let refresh = api_token_request(
+            state.clone(),
+            "POST",
+            "/analytics/devtime/prices/refresh",
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(refresh.status(), StatusCode::FORBIDDEN);
         db.close().await;
+    }
+
+    /// The "refresh prices" button answers 200 with a status even when the refresh cannot run —
+    /// under tests there is no models file, so no refresher — and the status has the shape the
+    /// shell reads.
+    #[tokio::test]
+    async fn the_price_refresh_button_answers_a_status_even_when_it_cannot_refresh() {
+        let state = test_state().await;
+        let response = api_token_request(
+            state.clone(),
+            "POST",
+            "/analytics/devtime/prices/refresh",
+            "test-token",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = json_body(response).await;
+        assert_eq!(status["ok"], false, "{status}");
+        assert!(
+            status["at"].as_str().is_some_and(|at| !at.is_empty()),
+            "{status}"
+        );
+        assert!(status["prices_as_of"].is_null(), "{status}");
+        assert_eq!(
+            status["problems"].as_array().map(Vec::len),
+            Some(1),
+            "{status}"
+        );
     }
 }
 

@@ -66,6 +66,15 @@ export interface ModelTokens {
   cost_low: number | null; cost_high: number | null;
 }
 
+/** Outcome of the daemon's last price refresh (`POST /analytics/devtime/prices/refresh` answers 200 even when `ok` is false). */
+export interface PriceRefreshStatus {
+  /** RFC3339. */
+  at: string;
+  ok: boolean;
+  prices_as_of: string | null;
+  problems: string[];
+}
+
 export interface DevtimeTokens {
   by_model: ModelTokens[];
   cache_hit_ratio: number | null;
@@ -78,6 +87,8 @@ export interface DevtimeTokens {
   unpriced_models: string[];
   /** `"<model id>: <reason>"` per price the daemon dropped as unreadable from nucleos-models.yaml. */
   dropped_prices: string[];
+  /** The daemon's last price refresh; `null` when none ran since it started. */
+  price_refresh: PriceRefreshStatus | null;
   previous: { cost_usd: number | null; cache_hit_ratio: number | null };
 }
 
@@ -144,6 +155,8 @@ export function devtimeMarkPath(findingKey: string, days: AnalyticsDays): string
   return `/analytics/devtime/findings/${encodeURIComponent(findingKey)}/mark?days=${days}`;
 }
 
+export const DEVTIME_PRICES_REFRESH_PATH = "/analytics/devtime/prices/refresh";
+
 export function useDevtime(projectId: string | undefined, days: AnalyticsDays) {
   return useQuery({
     queryKey: projectId === undefined ? keys.analytics.devtime(days) : keys.projects.devtime(projectId, days),
@@ -172,6 +185,19 @@ export function useMarkFinding(days: AnalyticsDays) {
     // Another finding of the same rule shows the same precision: re-read every findings page.
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["analytics", "devtime-findings"] });
+      void queryClient.invalidateQueries({ queryKey: keys.projects.all });
+    },
+  });
+}
+
+/** Runs a price refresh in the daemon now, then re-reads every devtime overview (the cost depends on the prices). */
+export function useRefreshPrices() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch<PriceRefreshStatus>(DEVTIME_PRICES_REFRESH_PATH, { method: "POST" }),
+    retry: false,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["analytics", "devtime"] });
       void queryClient.invalidateQueries({ queryKey: keys.projects.all });
     },
   });

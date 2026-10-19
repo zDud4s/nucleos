@@ -3,7 +3,9 @@
 //!
 //! Development time (spec analytics-devtime §5.3) beside them: `/analytics/devtime` and
 //! `/analytics/devtime/findings`, each also under `/projects/{id}/…`, and the global
-//! `POST /analytics/devtime/findings/{key}/mark`, handed to `crate::analytics::devtime`.
+//! `POST /analytics/devtime/findings/{key}/mark`, handed to `crate::analytics::devtime`, and
+//! `POST /analytics/devtime/prices/refresh`, the "refresh prices" button, handed to
+//! `crate::price_refresh`.
 
 use axum::response::Response;
 
@@ -19,6 +21,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/analytics/devtime/findings/{key}/mark",
             post(post_devtime_mark),
+        )
+        .route(
+            "/analytics/devtime/prices/refresh",
+            post(post_devtime_prices_refresh),
         )
         .route("/projects/{id}/analytics/devtime", get(get_project_devtime))
         .route(
@@ -139,12 +145,22 @@ async fn devtime(
     if let crate::analytics::Scope::Project(id) = scope {
         known_project(state, id, "devtime analytics").await?;
     }
-    // Re-read per request, so a `refresh-models.py` run needs no restart (spec §4.4).
+    // Re-read per request, so a price refresh (the daemon's own, or the script's) needs no
+    // restart (spec §4.4).
     let models = crate::config::models_config_now();
-    crate::analytics::devtime::devtime_overview(&state.pool, &models, scope, window, now)
-        .await
-        .map(Json)
-        .map_err(|error| failed(error, "devtime analytics"))
+    let mut overview =
+        crate::analytics::devtime::devtime_overview(&state.pool, &models, scope, window, now)
+            .await
+            .map_err(|error| failed(error, "devtime analytics"))?;
+    // A model with no price may be one the vendors listed since the last refresh: this starts one
+    // in the background (when allowed) and the next view reads its prices.
+    crate::price_refresh::note_unpriced(
+        &overview.tokens.unpriced_models,
+        models.auto_refresh_prices,
+        now,
+    );
+    overview.tokens.price_refresh = crate::price_refresh::last_status();
+    Ok(Json(overview))
 }
 
 pub(super) async fn get_devtime(
@@ -268,6 +284,14 @@ pub(super) struct MarkBody {
     verdict: String,
     #[serde(default)]
     cause: Option<String>,
+}
+
+/// The "refresh prices" button: refreshes now, whatever `auto_refresh_prices` says, and answers
+/// with how it went. 200 even when it failed — a vendor page that is down is the status's news, not
+/// a broken request — so the page shows `problems` rather than a generic error.
+pub(super) async fn post_devtime_prices_refresh() -> Json<crate::price_refresh::PriceRefreshStatus>
+{
+    Json(crate::price_refresh::refresh_now(chrono::Utc::now()).await)
 }
 
 /// Global: a finding's key names it in every project, so there is no per-project variant

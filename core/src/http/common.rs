@@ -406,8 +406,8 @@ pub(super) fn chars(text: &str) -> Vec<char> {
 /// Re-read per request rather than held on `AppState`, which every caller of this depends on: a
 /// pinned choice travels as `--model` on the turn itself, so a name added to the file is one this
 /// daemon can already run — and a catalogue cached at startup would spend a whole daemon lifetime
-/// refusing it. `scripts/refresh-models.py` rewrites this file, and nothing should have to be
-/// restarted for that to take.
+/// refusing it. The daemon's price refresh (`crate::price_refresh`) and `scripts/refresh-models.py`
+/// both rewrite this file, and nothing should have to be restarted for that to take.
 ///
 /// An unreadable or missing file answers with the built-in defaults rather than an error, matching
 /// what startup does: a picker that fails closed leaves somebody unable to change a model because
