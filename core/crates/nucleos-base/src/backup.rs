@@ -269,6 +269,185 @@ pub async fn apply_pending_restore(db_path: &Path) -> Result<Option<AppliedResto
     }))
 }
 
+/// What a compaction did, for the startup log.
+#[derive(Debug, Clone)]
+pub struct Compacted {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub safety_backup: PathBuf,
+}
+
+/// How many times the database (plus its WAL) must fit in the free space before a compaction is
+/// tried: the `pre-compact` copy is one, the rebuilt file `VACUUM` writes is another, and its
+/// rollback journal is up to a third. The owner's 440 MB database wants ~1.3 GB free, which is what
+/// keeps a full disk from being the thing a "reclaim space" button causes.
+const COMPACTION_ROOM_FACTOR: u64 = 3;
+
+/// Safety copies taken by [`apply_pending_compaction`]. The name deliberately does not parse as a
+/// backup name (`split_name` wants `nucleos-`): the copy is neither listed, restorable by the
+/// Backups tab, nor reached by either retention. Only the newest one is kept.
+const PRE_COMPACT_PREFIX: &str = "pre-compact-";
+
+/// Schedules a compaction for the next start. Idempotent, and refused while a restore is pending:
+/// the restore replaces the file, so compacting around it would be compacting the wrong database.
+pub async fn stage_compaction(pool: &SqlitePool) -> Result<(), BackupError> {
+    let db_path = database_path(pool).await?;
+    if pending_marker_path(&db_path).exists() {
+        return Err(BackupError::PendingRestoreExists);
+    }
+    fs::write(compact_marker_path(&db_path), b"")?;
+    Ok(())
+}
+
+/// Whether a compaction is scheduled for the next start.
+pub fn compaction_pending(db_path: &Path) -> bool {
+    compact_marker_path(db_path).exists()
+}
+
+/// Compacts the database file when a compaction was scheduled, before the pool opens. The caller
+/// runs it AFTER [`apply_pending_restore`] and BEFORE `storage::open`, on the primary daemon only.
+///
+/// `available_space` answers how many bytes the volume holding the database directory has free;
+/// it is a parameter so the test can say "no room" without filling a disk.
+///
+/// Every failure leaves the marker in place (so the next start retries) and the database untouched
+/// or intact: `VACUUM` is atomic, and the `pre-compact` copy is verified before it runs. Not having
+/// room is not a failure: it forgets the request, because retrying a disk that is still full on
+/// every start would only make every start slow.
+pub async fn apply_pending_compaction(
+    db_path: &Path,
+    available_space: impl FnOnce(&Path) -> std::io::Result<u64>,
+) -> Result<Option<Compacted>, BackupError> {
+    let marker = compact_marker_path(db_path);
+    if !marker.exists() {
+        return Ok(None);
+    }
+    if pending_marker_path(db_path).exists() {
+        return Err(BackupError::PendingRestoreExists);
+    }
+    if !db_path.exists() {
+        // Nothing to compact; `storage::open` will create a fresh one.
+        remove_if_exists(&marker)?;
+        return Ok(None);
+    }
+    let directory = db_path.parent().ok_or_else(|| {
+        BackupError::Verification("database path has no parent directory".to_owned())
+    })?;
+
+    let size = file_len(db_path) + file_len(&sqlite_sidecars(db_path)[0]);
+    let needed = size.saturating_mul(COMPACTION_ROOM_FACTOR);
+    let free = available_space(directory)?;
+    if free < needed {
+        tracing::warn!(
+            free_bytes = free,
+            needed_bytes = needed,
+            "database compaction skipped for lack of disk space; the request is forgotten"
+        );
+        remove_if_exists(&marker)?;
+        return Ok(None);
+    }
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(false)
+                .busy_timeout(Duration::from_secs(10)),
+        )
+        .await?;
+    let result = compact_database(&pool, db_path).await;
+    // Closing the last connection folds the WAL away, so the sizes below are the whole story.
+    pool.close().await;
+    let (before_bytes, safety_backup) = result?;
+
+    let version = verified_version(db_path).await?;
+    let safety_version = verified_version(&safety_backup).await?;
+    if version != safety_version {
+        return Err(BackupError::Verification(format!(
+            "compacted database has migration version {version}, its safety copy {safety_version}"
+        )));
+    }
+    let after_bytes = file_len(db_path);
+
+    // Best effort from here: the compaction is done and verified, only housekeeping is left. The
+    // marker goes last among the fallible steps that matter; if it cannot be removed the next
+    // start compacts an already compact file, which is slow but harmless.
+    if let Err(error) = prune_pre_compact_copies(directory, &safety_backup) {
+        tracing::warn!(%error, "could not remove older pre-compact copies");
+    }
+    fs::remove_file(&marker)?;
+    Ok(Some(Compacted {
+        before_bytes,
+        after_bytes,
+        safety_backup,
+    }))
+}
+
+/// The three steps on one connection: fold the WAL in, copy to a verified safety file, `VACUUM`.
+/// Returns the size of the file before `VACUUM` and where the safety copy is.
+async fn compact_database(
+    pool: &SqlitePool,
+    db_path: &Path,
+) -> Result<(u64, PathBuf), BackupError> {
+    let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(pool)
+        .await?;
+    if busy != 0 {
+        return Err(BackupError::Verification(
+            "the database is in use by another process".to_owned(),
+        ));
+    }
+    let before_bytes = file_len(db_path);
+
+    let directory = backup_dir(db_path)?;
+    fs::create_dir_all(&directory)?;
+    let safety_path = directory.join(format!(
+        "{PRE_COMPACT_PREFIX}{}.db",
+        Utc::now().format("%Y%m%dT%H%M%S%.9fZ")
+    ));
+    if safety_path.exists() {
+        return Err(BackupError::ExistingTarget(safety_path));
+    }
+    if let Err(error) = sqlx::query("VACUUM INTO ?")
+        .bind(safety_path.to_string_lossy().into_owned())
+        .execute(pool)
+        .await
+    {
+        let _ = remove_if_exists(&safety_path);
+        return Err(BackupError::Database(error));
+    }
+    if let Err(error) = verify_backup(pool, &safety_path).await {
+        let _ = remove_if_exists(&safety_path);
+        return Err(error);
+    }
+
+    sqlx::query("VACUUM").execute(pool).await?;
+    Ok((before_bytes, safety_path))
+}
+
+/// Removes every `pre-compact-*.db` in `backups/` except `keep`.
+fn prune_pre_compact_copies(db_directory: &Path, keep: &Path) -> Result<(), BackupError> {
+    let directory = db_directory.join("backups");
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path != keep
+            && entry.file_type()?.is_file()
+            && name.starts_with(PRE_COMPACT_PREFIX)
+            && name.ends_with(".db")
+        {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map_or(0, |meta| meta.len())
+}
+
 async fn verify_backup(live_pool: &SqlitePool, backup_path: &Path) -> Result<i64, BackupError> {
     let live_version = latest_migration(live_pool).await?;
     let backup_version = verified_version(backup_path).await?;
@@ -286,6 +465,14 @@ fn pending_marker_path(db_path: &Path) -> PathBuf {
 
 fn safety_marker_path(db_path: &Path) -> PathBuf {
     db_path.with_extension("pending-restore-safety")
+}
+
+/// `nucleos.db.compact-pending`: appended to the whole file name, so it cannot collide with the
+/// `with_extension` markers above, and `storage::loose_files_bytes` counts it (an empty file).
+fn compact_marker_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(".compact-pending");
+    PathBuf::from(name)
 }
 
 fn replacement_path(db_path: &Path) -> PathBuf {
@@ -949,6 +1136,173 @@ mod tests {
             .expect("a restore was pending");
         assert_eq!(applied.restored_from, auto.name);
         assert_eq!(probe_values(&db_path).await, vec!["kept"]);
+    }
+
+    /// A scratch table with `kept` rows left and many more deleted, so the file holds free pages a
+    /// `VACUUM` can give back. Returns the rows that remain.
+    async fn seed_free_pages(pool: &SqlitePool, kept: i64) -> Vec<(i64, String)> {
+        sqlx::query("CREATE TABLE scratch (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400)
+             INSERT INTO scratch SELECT i, hex(randomblob(2048)) FROM c",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM scratch WHERE id > ?")
+            .bind(kept)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query_as("SELECT id, payload FROM scratch ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn scratch_rows(path: &Path) -> Vec<(i64, String)> {
+        let pool = open_read_only(path).await;
+        let rows = sqlx::query_as("SELECT id, payload FROM scratch ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        rows
+    }
+
+    fn pre_compact_files(db_path: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(db_path.parent().unwrap().join("backups")) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(PRE_COMPACT_PREFIX))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_pending_compaction_shrinks_the_file_and_keeps_every_row() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        let rows = seed_free_pages(&db.pool, 40).await;
+        assert_eq!(rows.len(), 40);
+        stage_compaction(&db.pool).await.unwrap();
+        assert!(compaction_pending(&db_path));
+        db.pool.close().await;
+
+        let compacted = apply_pending_compaction(&db_path, |_| Ok(u64::MAX))
+            .await
+            .unwrap()
+            .expect("a compaction was pending");
+
+        assert!(
+            compacted.after_bytes < compacted.before_bytes,
+            "{compacted:?}: the deleted rows' pages are given back"
+        );
+        assert_eq!(compacted.after_bytes, file_len(&db_path));
+        assert!(!compaction_pending(&db_path), "the marker is consumed");
+        assert_eq!(scratch_rows(&db_path).await, rows, "every row survives");
+        assert_eq!(
+            scratch_rows(&compacted.safety_backup).await,
+            rows,
+            "the safety copy holds the same rows"
+        );
+        assert_eq!(pre_compact_files(&db_path), vec![compacted.safety_backup]);
+        assert!(
+            list_backup_files(&db_path).unwrap().is_empty(),
+            "a pre-compact copy is not a listed backup, so no retention can reach it"
+        );
+        assert!(
+            apply_pending_compaction(&db_path, |_| Ok(u64::MAX))
+                .await
+                .unwrap()
+                .is_none(),
+            "with no marker there is nothing to do"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_compaction_keeps_only_the_newest_safety_copy() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        seed_free_pages(&db.pool, 40).await;
+        db.pool.close().await;
+        for _ in 0..2 {
+            fs::write(compact_marker_path(&db_path), b"").unwrap();
+            apply_pending_compaction(&db_path, |_| Ok(u64::MAX))
+                .await
+                .unwrap()
+                .expect("a compaction was pending");
+        }
+        assert_eq!(pre_compact_files(&db_path).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_compaction_without_room_on_disk_is_skipped_and_forgotten() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        let rows = seed_free_pages(&db.pool, 40).await;
+        stage_compaction(&db.pool).await.unwrap();
+        db.pool.close().await;
+        let size_before = file_len(&db_path);
+
+        let result = apply_pending_compaction(&db_path, |_| Ok(size_before))
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "no room, nothing done");
+        assert!(!compaction_pending(&db_path), "and the request is forgotten");
+        assert_eq!(file_len(&db_path), size_before, "the file is untouched");
+        assert!(pre_compact_files(&db_path).is_empty());
+        assert_eq!(scratch_rows(&db_path).await, rows);
+    }
+
+    #[tokio::test]
+    async fn a_failing_space_probe_keeps_the_request_and_the_file() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        stage_compaction(&db.pool).await.unwrap();
+        db.pool.close().await;
+
+        let result = apply_pending_compaction(&db_path, |_| {
+            Err(std::io::Error::other("the probe is unavailable"))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(compaction_pending(&db_path), "the next start retries");
+    }
+
+    #[tokio::test]
+    async fn a_compaction_is_refused_while_a_restore_is_pending() {
+        let db = TempDb::new().await;
+        let db_path = db.path().join("nucleos.db");
+        let backup = take_backup(&db.pool, 5).await.unwrap();
+        stage_restore(&db.pool, &backup.name).await.unwrap();
+
+        assert!(matches!(
+            stage_compaction(&db.pool).await,
+            Err(BackupError::PendingRestoreExists)
+        ));
+        assert!(!compaction_pending(&db_path), "no marker was written");
+
+        // A marker that got there anyway is not honoured until the restore has been applied.
+        fs::write(compact_marker_path(&db_path), b"").unwrap();
+        db.pool.close().await;
+        assert!(matches!(
+            apply_pending_compaction(&db_path, |_| Ok(u64::MAX)).await,
+            Err(BackupError::PendingRestoreExists)
+        ));
+        assert!(compaction_pending(&db_path));
+        assert!(pre_compact_files(&db_path).is_empty());
     }
 
     #[test]

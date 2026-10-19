@@ -1203,6 +1203,80 @@ mod tests {
         db.close().await;
     }
 
+    #[tokio::test]
+    async fn storage_compact_route_requires_the_bearer_token() {
+        let response =
+            backup_request(test_state().await, "POST", "/system/storage/compact", None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn storage_report(state: AppState) -> serde_json::Value {
+        let response = backup_request(state, "GET", "/system/storage", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn storage_compact_route_schedules_a_compaction_for_the_next_start() {
+        let (state, db) = file_test_state().await;
+        let marker = db.path().join("nucleos.db.compact-pending");
+        assert_eq!(
+            storage_report(state.clone()).await["compaction_pending"],
+            false
+        );
+
+        let response = backup_request(
+            state.clone(),
+            "POST",
+            "/system/storage/compact",
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let staged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(staged["applies"], "on next daemon start");
+        assert!(marker.exists(), "the request is a marker beside the file");
+        assert_eq!(storage_report(state.clone()).await["compaction_pending"], true);
+
+        // Asking twice is the same request, not an error.
+        let again = backup_request(
+            state.clone(),
+            "POST",
+            "/system/storage/compact",
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn storage_compact_route_is_refused_while_a_restore_is_pending() {
+        let (state, db) = file_test_state().await;
+        let taken = backup::take_backup(&state.pool, 5).await.unwrap();
+        backup::stage_restore(&state.pool, &taken.name)
+            .await
+            .unwrap();
+
+        let response = backup_request(
+            state.clone(),
+            "POST",
+            "/system/storage/compact",
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(!db.path().join("nucleos.db.compact-pending").exists());
+        assert_eq!(storage_report(state).await["compaction_pending"], false);
+        db.close().await;
+    }
+
     /// Seeds a team, and optionally a job of two items whose runs carry a peak each.
     ///
     /// Plain SQL rather than reaching into `pressure`'s own test helpers: those are private to that

@@ -1194,6 +1194,17 @@ pub fn free_space_for_worktrees(project_root: &Path) -> io::Result<u64> {
     disk_free_space(existing_root)
 }
 
+/// How much room is left on the volume holding `path`, or its nearest existing ancestor (a path
+/// that is about to be created still lives on a volume). Blocking, like
+/// [`free_space_for_worktrees`].
+pub fn available_space(path: &Path) -> io::Result<u64> {
+    let existing = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no existing ancestor"))?;
+    disk_free_space(existing)
+}
+
 #[cfg(windows)]
 fn disk_free_space(path: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;

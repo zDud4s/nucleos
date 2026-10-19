@@ -95,6 +95,23 @@ async fn main() {
             "failed to apply pending database restore; continuing startup and retrying next start: {e}"
         ),
     }
+    // After the restore (which may replace the file) and before the pool opens (nothing else holds
+    // the file). Primary only: a secondary instance has a data directory of its own, but this is
+    // the step that rewrites a database, and only the machine's daemon should ever do that.
+    if is_primary {
+        match backup::apply_pending_compaction(&db_path, health::available_space).await {
+            Ok(Some(compacted)) => tracing::warn!(
+                "compacted the database from {} to {} bytes; safety copy at {}",
+                compacted.before_bytes,
+                compacted.after_bytes,
+                compacted.safety_backup.display()
+            ),
+            Ok(None) => tracing::info!("no database compaction to apply"),
+            Err(e) => tracing::error!(
+                "failed to compact the database; continuing startup and retrying next start: {e}"
+            ),
+        }
+    }
     let pool = storage::open(&db_path)
         .await
         .expect("failed to open local database");

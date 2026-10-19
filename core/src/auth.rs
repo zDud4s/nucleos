@@ -1254,6 +1254,7 @@ mod tests {
             .route("/backup", post(|| async {}))
             .route("/backups", get(|| async {}))
             .route("/backups/{name}/restore", post(|| async {}))
+            .route("/system/storage/compact", post(|| async {}))
             .route("/autopilot/state", get(|| async {}).post(|| async {}))
             .route("/autopilot/kill", get(|| async {}).post(|| async {}))
             .route("/autopilot/budget", get(|| async {}).post(|| async {}))
@@ -2473,6 +2474,7 @@ mod tests {
             ("POST", "/autopilot/state"),
             ("POST", "/proposals/7/approve"),
             ("POST", "/backups/snapshot.db/restore"),
+            ("POST", "/system/storage/compact"),
             ("POST", "/api-tokens"),
             ("GET", "/api-tokens"),
             // Reading the folder is an allowlisted read; changing it is not. A read-only key that
@@ -2535,6 +2537,7 @@ mod tests {
             // An orchestrator turn holds the control token: see `RUN_CREATING_ROUTES`'s doc.
             ("POST", "/assistant/message"),
             ("POST", "/backups/snapshot.db/restore"),
+            ("POST", "/system/storage/compact"),
             ("POST", "/api-tokens"),
             ("GET", "/api-tokens"),
             ("POST", "/files/folder"),

@@ -36,6 +36,8 @@ pub(super) fn routes() -> Router<AppState> {
         // In no `auth.rs` table on purpose, like `/config/machine`: it names the data directory's
         // layout and sizes, which a read-only key has no use for.
         .route("/system/storage", get(get_system_storage))
+        // Same reasoning, and the same default: it rewrites the database file on the next start.
+        .route("/system/storage/compact", post(post_system_storage_compact))
         .route("/backups/{name}/restore", post(post_backup_restore))
         .route("/api-tokens", get(list_api_tokens).post(create_api_token))
         .route(
@@ -198,6 +200,29 @@ pub(super) struct StorageReport {
     loose_bytes: u64,
     /// When the newest automatic backup was taken, from its file name.
     auto_backup_last: Option<String>,
+    /// A compaction is scheduled for the next start (`POST /system/storage/compact`).
+    compaction_pending: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct StagedCompaction {
+    applies: &'static str,
+}
+
+/// Schedules a `VACUUM` for the next daemon start, before the pool opens. Never runs one here: a
+/// compaction holds the file for as long as it takes, which no request should wait on. 409 while a
+/// restore is pending.
+pub(super) async fn post_system_storage_compact(
+    State(state): State<AppState>,
+) -> Result<Json<StagedCompaction>, StatusCode> {
+    backup::stage_compaction(&state.pool)
+        .await
+        .map(|()| {
+            Json(StagedCompaction {
+                applies: "on next daemon start",
+            })
+        })
+        .map_err(|error| backup_status(&error))
 }
 
 pub(super) async fn get_system_storage(
@@ -213,6 +238,7 @@ pub(super) async fn get_system_storage(
         .await
         .ok()
         .flatten();
+    let compaction_pending = db_path.as_deref().is_some_and(backup::compaction_pending);
     let data_dir = db_path
         .as_deref()
         .and_then(std::path::Path::parent)
@@ -240,6 +266,7 @@ pub(super) async fn get_system_storage(
         logs_bytes,
         loose_bytes,
         auto_backup_last,
+        compaction_pending,
     }))
 }
 
