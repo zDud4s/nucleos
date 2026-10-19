@@ -142,6 +142,21 @@ pub fn auto_backup_due(last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool 
     }
 }
 
+/// When the newest automatic copy was taken, read from its file name; `None` when there is none.
+pub async fn newest_auto_backup(pool: &SqlitePool) -> Result<Option<DateTime<Utc>>, BackupError> {
+    let db_path = database_path(pool).await?;
+    newest_auto_backup_at(&db_path)
+}
+
+fn newest_auto_backup_at(db_path: &Path) -> Result<Option<DateTime<Utc>>, BackupError> {
+    Ok(list_backup_files(db_path)?
+        .into_iter()
+        .filter(|backup| backup.kind == BackupKind::Auto)
+        .filter_map(|backup| split_name(&backup.name).ok().map(|parts| parts.timestamp))
+        .max()
+        .map(|taken| taken.and_utc()))
+}
+
 /// Takes an automatic copy when [`auto_backup_due`] says so, and returns it; `None` means the
 /// newest one is still fresh. The age comes from the file name, so it survives a daemon restart.
 pub async fn take_auto_backup_if_due(
@@ -150,12 +165,7 @@ pub async fn take_auto_backup_if_due(
     now: DateTime<Utc>,
 ) -> Result<Option<BackupInfo>, BackupError> {
     let db_path = database_path(pool).await?;
-    let last = list_backup_files(&db_path)?
-        .into_iter()
-        .filter(|backup| backup.kind == BackupKind::Auto)
-        .filter_map(|backup| split_name(&backup.name).ok().map(|parts| parts.timestamp))
-        .max()
-        .map(|taken| taken.and_utc());
+    let last = newest_auto_backup_at(&db_path)?;
     if !auto_backup_due(last, now) {
         return Ok(None);
     }

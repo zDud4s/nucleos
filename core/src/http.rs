@@ -1136,6 +1136,60 @@ mod tests {
         db.close().await;
     }
 
+    #[tokio::test]
+    async fn storage_route_requires_the_bearer_token() {
+        let response = backup_request(test_state().await, "GET", "/system/storage", None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn storage_route_reports_the_free_pages_after_a_delete() {
+        let (state, db) = file_test_state().await;
+        sqlx::query("CREATE TABLE scratch (payload TEXT NOT NULL)")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 200)              INSERT INTO scratch SELECT hex(randomblob(2048)) FROM c",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM scratch")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        // A copy nothing prunes, and an automatic backup to read the date from.
+        std::fs::write(db.path().join("nucleos.db.before-116-revert"), vec![0_u8; 1000]).unwrap();
+        let backup_dir = db.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(
+            backup_dir.join("auto-nucleos-20261019T030000.000000000Z-0000.db"),
+            vec![0_u8; 40],
+        )
+        .unwrap();
+
+        let response =
+            backup_request(state.clone(), "GET", "/system/storage", Some("test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let freelist = report["freelist_count"].as_i64().unwrap();
+        let page_size = report["page_size"].as_i64().unwrap();
+        assert!(freelist > 0, "the deleted rows' pages are on the freelist: {report}");
+        assert_eq!(report["reclaimable_bytes"].as_i64().unwrap(), freelist * page_size);
+        assert!(report["db_bytes"].as_u64().unwrap() > 0);
+        assert!(report["wal_bytes"].is_u64());
+        assert_eq!(report["loose_bytes"], 1000);
+        assert_eq!(report["backups_bytes"], 40);
+        assert!(report["files_bytes"].is_null(), "the test state has no files folder");
+        assert_eq!(report["auto_backup_last"], "2026-10-19T03:00:00Z");
+        db.close().await;
+    }
+
     /// Seeds a team, and optionally a job of two items whose runs carry a peak each.
     ///
     /// Plain SQL rather than reaching into `pressure`'s own test helpers: those are private to that
