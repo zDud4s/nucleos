@@ -329,8 +329,37 @@ pub fn codex_cli_args(
     }
     // Trailing positional, after every flag that takes a value, so a prompt can never be consumed as
     // the argument of the option before it.
-    args.push(request.prompt.clone());
+    args.push(prompt_with_filter_rule(request));
     Ok(args)
+}
+
+/// The prompt, plus the instruction to route test and build commands through the output filter.
+///
+/// Codex has no PreToolUse hook to rewrite a command, so the rule travels in the prompt. Only a run
+/// with a shell (`Unrestricted`) and a run id gets it; anything else, or a missing executable or data
+/// directory, leaves the prompt exactly as it was.
+fn prompt_with_filter_rule(request: &RunRequest) -> String {
+    if request.tool_policy != crate::execution::runner::ToolPolicy::Unrestricted {
+        return request.prompt.clone();
+    }
+    let run_id = request
+        .env
+        .iter()
+        .find(|(key, _)| key == "NUCLEOS_RUN_ID")
+        .and_then(|(_, value)| value.parse::<i64>().ok());
+    let (Some(id), Some(exe), Some(data)) = (
+        run_id,
+        std::env::current_exe().ok().filter(|p| p.is_file()),
+        crate::daemon_client::data_dir(),
+    ) else {
+        return request.prompt.clone();
+    };
+    let instruction = crate::execution::output_filter::codex_instruction(
+        &exe,
+        &crate::execution::output_filter::run_log_dir(&data, id),
+        cfg!(windows),
+    );
+    format!("{}\n\n{instruction}", request.prompt)
 }
 
 /// Usage reported by a `codex exec` transcript's final `turn.completed` event.
@@ -737,5 +766,69 @@ impl CommandRunner for CodexCliRunner {
             compacted: false,
             model_requested: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with(tool_policy: ToolPolicy, env: Vec<(String, String)>) -> RunRequest {
+        RunRequest {
+            prompt: "run the tests".to_string(),
+            env,
+            cwd: None,
+            permission: Permission::Default,
+            resume_session_id: None,
+            mcp_config: None,
+            mcp_job: None,
+            mcp_team_run: None,
+            tool_policy,
+            progress_timeout: None,
+            max_turns: None,
+            session_id: None,
+            fork_session: false,
+            include_partial_messages: false,
+            images: Vec::new(),
+            steerable: false,
+            classifier_governs_tools: false,
+            ambient_mcp: false,
+            model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
+            messages: None,
+            request_tx: None,
+            allowed_mcp_tools: None,
+            background_tasks: false,
+        }
+    }
+
+    #[test]
+    fn a_codex_run_with_a_shell_is_told_to_filter_its_test_commands() {
+        let request = request_with(
+            ToolPolicy::Unrestricted,
+            vec![("NUCLEOS_RUN_ID".to_string(), "42".to_string())],
+        );
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        let last = args.last().unwrap();
+        assert!(last.starts_with("run the tests"), "{last}");
+        assert!(last.contains("--filter-run"), "{last}");
+    }
+
+    #[test]
+    fn an_mcp_only_codex_turn_gets_no_filter_instruction() {
+        let request = request_with(
+            ToolPolicy::McpOnly,
+            vec![("NUCLEOS_RUN_ID".to_string(), "42".to_string())],
+        );
+        let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
+        assert_eq!(args.last().unwrap(), "run the tests");
     }
 }

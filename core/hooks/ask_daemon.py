@@ -9,7 +9,8 @@ are what follows:
 
 A run (NUCLEOS_RUN_ID present) gets the full safety gate on `PreToolUse`: allows emit the
 recognized hookSpecificOutput approval contract, while denials and pending approvals emit the
-empirically proven legacy block contract.
+empirically proven legacy block contract. Just before an allow, a shell command first waits
+for the daemon's admission to run (`admit_heavy`), the one leg here that fails open.
 
 An interactive session gets one narrow question instead: is this a git operation the
 VCS queue performs? If so it is queued and this call is refused; otherwise this hook
@@ -78,6 +79,14 @@ SEGMENT_SEPARATORS = "\n\r;|&()`{}"
 GIT_FLAGS_WITH_VALUES = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path")
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8791"
+
+# One admission poll waits this long for the daemon's answer. The daemon holds a poll for at
+# most 25 seconds, so this is what decides a poll that went quiet, not the daemon.
+ADMIT_POLL_TIMEOUT_SECONDS = 40
+# The total time `admit_heavy` may spend waiting. Kept below `autopilot::HOOK_TIMEOUT_SECONDS`
+# (3600, the timeout written onto the tool-event hook entries), so the hook returns and lets the
+# command run before the CLI would kill it.
+ADMIT_HOOK_BUDGET_SECONDS = 3300
 
 
 def governed_git_verb(command: str) -> str:
@@ -159,18 +168,20 @@ def _verb_in(tokens) -> str:
     return ""
 
 
-def approve(reason: str = "autopilot: allowed") -> None:
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": reason,
-                }
-            }
-        )
-    )
+def approve(reason: str = "autopilot: allowed", updated_input=None) -> None:
+    """Allows the tool call, optionally rewriting its input.
+
+    A rewrite (`updatedInput`) rides only on an allow, and a malformed one (anything but
+    an object) is dropped so the command runs unfiltered (fail-open).
+    """
+    output = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": reason,
+    }
+    if isinstance(updated_input, dict):
+        output["updatedInput"] = updated_input
+    print(json.dumps({"hookSpecificOutput": output}))
     sys.exit(0)
 
 
@@ -581,6 +592,7 @@ def report_outcome(payload: dict) -> None:
                 "tool_input": payload.get("tool_input", {}),
                 "tool_response": payload.get("tool_response", {}),
                 "event": payload.get("hook_event_name", ""),
+                "tool_use_id": payload.get("tool_use_id"),
             }
         ).encode()
         request = urllib.request.Request(
@@ -936,6 +948,7 @@ def main() -> None:
     if not isinstance(decision, dict):
         deny("daemon returned a non-object decision body - failing closed")
 
+    rewrite = decision.get("updated_input")
     verdict = decision.get("decision")
     if verdict == "asking":
         decision = wait_for_answer(daemon_url, token, run_id)
@@ -944,7 +957,8 @@ def main() -> None:
         deny(decision.get("reason", ""))
     if verdict != "allow":
         deny(f"daemon returned an unrecognized decision {verdict!r} - failing closed")
-    approve(decision.get("reason", "autopilot: allowed"))
+    admit_heavy(daemon_url, token, run_id, payload)
+    approve(decision.get("reason", "autopilot: allowed"), rewrite)
 
 
 def wait_for_answer(daemon_url, token, run_id):
@@ -980,6 +994,51 @@ def wait_for_answer(daemon_url, token, run_id):
     if not isinstance(answered, dict):
         deny("daemon returned a non-object answer body - failing closed")
     return answered
+
+
+def admit_heavy(daemon_url, token, run_id, payload) -> None:
+    """Waits until the daemon admits a shell command to run, and returns when it may.
+
+    The one fail-open leg on the PreToolUse path. The gate has already decided this call is
+    allowed; admission only ORDERS heavy work between runs so two builds do not start together.
+    An unreachable daemon, a bad body, an answer other than `waiting`, or the hook budget running
+    out all mean the same thing: run the command. Failing closed here would turn a scheduling
+    nicety into a refusal the gate never made. Never prints, never denies, never rewrites.
+    """
+    try:
+        tool_name = payload.get("tool_name")
+        tool_use_id = payload.get("tool_use_id")
+        if tool_name not in ("Bash", "PowerShell"):
+            return
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            return
+        body = json.dumps(
+            {
+                "run_id": run_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_input": payload.get("tool_input", {}),
+            }
+        ).encode()
+        deadline = time.monotonic() + ADMIT_HOOK_BUDGET_SECONDS
+        while True:
+            request = urllib.request.Request(
+                f"{daemon_url}/hooks/admit",
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=ADMIT_POLL_TIMEOUT_SECONDS) as response:
+                answer = json.loads(response.read())
+            if not isinstance(answer, dict) or answer.get("admission") != "waiting":
+                return
+            if time.monotonic() > deadline:
+                return
+    except Exception:
+        return
 
 
 if __name__ == "__main__":

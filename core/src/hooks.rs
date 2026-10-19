@@ -3006,6 +3006,99 @@ mod tests {
         assert_eq!(decision.reason, "recognized non-mutating shell command");
     }
 
+    /// As `decide_as` with the control token, but the raw answer body: the `updated_input` the
+    /// CLI reads lives beside `Decision`'s fields, which `Decision` itself cannot deserialize.
+    async fn decide_raw(app: &Router, body: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/hooks/pretooluse-decision")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_allowed_test_command_in_a_run_is_rewritten_through_filter_run() {
+        let state = test_state().await;
+        let cwd = tempfile::TempDir::new().unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(cwd.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let answer = decide_raw(&app, &bash(run_id, "cargo test -p demo")).await;
+
+        assert_eq!(answer["decision"], "allow");
+        let command = answer["updated_input"]["command"]
+            .as_str()
+            .expect("a recognized command in a run carries updated_input.command");
+        assert!(command.contains("--filter-run"), "{command}");
+        assert!(
+            command.contains("cargo test -p demo\n)"),
+            "the original command rides verbatim: {command}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_or_denied_command_is_never_rewritten() {
+        let state = test_state().await;
+        let cwd = tempfile::TempDir::new().unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(cwd.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        for command in [PARKED, "rm -rf /tmp/x"] {
+            let answer = decide_raw(&app, &bash(run_id, command)).await;
+            assert!(answer.get("updated_input").is_none(), "{command}: {answer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_allowed_command_is_not_rewritten() {
+        let state = test_state().await;
+        let cwd = tempfile::TempDir::new().unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(cwd.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let answer = decide_raw(&app, &bash(run_id, "ls -la")).await;
+        assert_eq!(answer["decision"], "allow");
+        assert!(answer.get("updated_input").is_none(), "{answer}");
+
+        // Run 0 is out of flight: a recognized command still carries no rewrite.
+        let outside = decide_raw(&app, &bash(0, "cargo test -p demo")).await;
+        assert!(outside.get("updated_input").is_none(), "{outside}");
+    }
+
     /// The hook's pending path, and the classifier's verdict that reaches it, asserted together so
     /// the two cannot drift apart. `echo hi` stood here until `classifier.rs` learned that saying
     /// something is not doing something; the command changed, the path under test did not.
@@ -8068,6 +8161,7 @@ mod tests {
                 tool_name: "Read".to_owned(),
                 tool_input: serde_json::json!({}),
                 tool_response: serde_json::json!({"success": true}),
+                tool_use_id: None,
                 event: "PostToolUse".to_owned(),
             }),
         )
@@ -8110,6 +8204,7 @@ mod tests {
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({"command": "echo hi"}),
                 tool_response: serde_json::json!({"success": false}),
+                tool_use_id: None,
                 event: "PostToolUseFailure".to_owned(),
             }),
         )

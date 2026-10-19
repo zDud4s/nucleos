@@ -38,6 +38,24 @@ pub const PORT_VAR: &str = "NUCLEOS_PORT";
 /// The environment variable that moves a daemon's database and logs somewhere of their own.
 pub const DATA_DIR_VAR: &str = "NUCLEOS_DATA_DIR";
 
+/// PURE: the data directory, given what `DATA_DIR_VAR` said.
+///
+/// Mirrors `main.rs` (the `data_dir` match after `DATA_DIR_VAR` is read) exactly: a non-empty
+/// override wins, otherwise the platform's local data directory for `dev.nucleos.NucleOS`. `None`
+/// only when the platform has no home directory.
+pub fn data_dir_from(configured: Option<&str>) -> Option<std::path::PathBuf> {
+    match configured.filter(|dir| !dir.is_empty()) {
+        Some(dir) => Some(std::path::PathBuf::from(dir)),
+        None => directories::ProjectDirs::from("dev", "nucleos", "NucleOS")
+            .map(|dirs| dirs.data_local_dir().to_path_buf()),
+    }
+}
+
+/// The data directory this process uses, read from the environment the way `main` reads it.
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    data_dir_from(std::env::var(DATA_DIR_VAR).ok().as_deref())
+}
+
 /// PURE: the port to bind, given what the environment said.
 ///
 /// Anything that is not a usable port falls back to the default rather than refusing to start —

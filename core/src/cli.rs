@@ -735,6 +735,11 @@ async fn workflow_package() {
 }
 
 pub(super) async fn run_subcommand() -> bool {
+    // First, and positional on purpose: an argv-mode command may itself contain `--print-token`.
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(rest) = crate::execution::output_filter::run::filter_run_args(&argv) {
+        std::process::exit(crate::execution::output_filter::run::main(rest));
+    }
     if std::env::args().any(|a| a == "--print-token") {
         print_token();
         return true;
