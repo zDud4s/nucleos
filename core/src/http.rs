@@ -4934,8 +4934,16 @@ mod tests {
 
         let after = get_json(&state, "/projects/alpha/map").await;
         assert_eq!(after["layers"]["modules"]["core/src/c.rs"], 2, "{after}");
+        // The climb c -> a is gone (c re-froze above a). The owner's move of b to 7 still stands
+        // and puts a (1) under what it imports, which is a violation of the owner's making, but
+        // an old one: the baseline holds the a -> b edge, so nothing is `new` any more.
+        let violations = after["layers"]["violations"].as_array().unwrap();
         assert!(
-            after["layers"]["violations"].as_array().unwrap().is_empty(),
+            violations.iter().all(|v| v["new"] == false),
+            "no violation may stay new after accepting the graph: {after}"
+        );
+        assert!(
+            violations.iter().all(|v| v["from"] != "core/src/c.rs"),
             "{after}"
         );
         assert_eq!(after["layers"]["modules"]["core/src/b.rs"], 7, "{after}");
