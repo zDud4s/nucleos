@@ -147,17 +147,39 @@
 
 /* --------------------------------------------------------------- new job -- */
 
-/* Between the header and the meter, so opening it pushes the page down and
-   never sideways. No `display` here: the `hidden` attribute is what closes it. */
+/**
+ * A drawer on the right edge, in the notifications drawer's dress, over the page and not in
+ * it. Between the header and the rack it pushed the rack and the columns down by a form's
+ * height, hiding the headline and the trouble the page exists to put first. Non-modal still:
+ * no scrim, no focus trap, and what is under it stays readable. No `display` here: the
+ * `hidden` attribute is what closes it.
+ */
 .fleet-compose {
-  margin-bottom: var(--space-5);
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: var(--z-overlay);
+  width: min(32rem, 100vw);
+  height: 100vh;
+  overflow-y: auto;
+  overscroll-behavior: none;
+  padding: var(--space-4);
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+/* The drawer is the surface; the panel inside it is only a heading and a body. */
+.fleet-compose > .ui-panel {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .fleet-new-job {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  max-width: 48rem;
 }
 
 .fleet-new-job-prompt {
@@ -175,7 +197,7 @@
  */
 .fleet-new-job-where {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
   gap: var(--space-3);
 }
 
