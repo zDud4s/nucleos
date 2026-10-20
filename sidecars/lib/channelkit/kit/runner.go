@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"time"
 
 	"nucleoschannelkit/backoff"
 	"nucleoschannelkit/clock"
@@ -25,11 +26,17 @@ type Runner struct {
 	// Guard may veto an action before Execute by returning the ack to send
 	// instead (capability guard, D-B7). Nil means no guard.
 	Guard func(contract.Capabilities, contract.Action) *contract.Ack
+	// ShutdownGrace bounds how long Run, once its context is cancelled, waits for
+	// in-flight executions and their final acks. Zero means DefaultShutdownGrace.
+	ShutdownGrace time.Duration
 }
 
 // Run polls the outbox until ctx ends or the core answers with a fatal status.
 // A network or 5xx failure backs off (backoff.Outbox) and resumes. Run returns
-// only after every goroutine it started has finished; a cancelled ctx returns nil.
+// only after every goroutine it started has finished or, once ctx is cancelled,
+// after ShutdownGrace at the latest (a stuck adapter is abandoned then); a
+// cancelled ctx returns nil. In-flight executions keep their lease renewal and
+// settle their ack, with retries, within that grace (see runAction).
 func (r *Runner) Run(ctx context.Context) error {
 	clk := r.Clock
 	if clk == nil {
@@ -44,9 +51,20 @@ func (r *Runner) Run(ctx context.Context) error {
 	client := r.Client.WithStats(r.Stats)
 	caps := r.Adapter.Capabilities()
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
+	// hard outlives ctx by the shutdown grace: renewals and acks run on it.
+	hard, hardCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer hardCancel()
 
+	var wg sync.WaitGroup
+	err := r.loop(ctx, hard, &wg, clk, client, caps)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	r.drain(ctx, clk, done)
+	return err
+}
+
+// loop polls the outbox until ctx ends or a fatal error, dispatching what it gets.
+func (r *Runner) loop(ctx, hard context.Context, wg *sync.WaitGroup, clk clock.Clock, client *Client, caps contract.Capabilities) error {
 	delay := backoff.Outbox.Base
 	for {
 		batch, err := client.Poll(ctx, outboxWaitSecs)
@@ -66,7 +84,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		delay = backoff.Outbox.Base
 		for _, it := range batch.Items {
-			r.dispatch(ctx, &wg, client, caps, it)
+			r.dispatch(ctx, hard, wg, client, caps, it)
 		}
 		for _, conv := range batch.Typing {
 			wg.Add(1)
@@ -81,12 +99,12 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 // dispatch starts the goroutine that handles one outbox item.
-func (r *Runner) dispatch(ctx context.Context, wg *sync.WaitGroup, client *Client, caps contract.Capabilities, it Item) {
+func (r *Runner) dispatch(ctx, hard context.Context, wg *sync.WaitGroup, client *Client, caps contract.Capabilities, it Item) {
 	if it.Rescue != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.ackLogged(ctx, client, it.ID, *it.Rescue)
+			r.ackLogged(hard, client, it.ID, *it.Rescue)
 		}()
 		return
 	}
@@ -102,35 +120,6 @@ func (r *Runner) dispatch(ctx context.Context, wg *sync.WaitGroup, client *Clien
 	go func() {
 		defer wg.Done()
 		defer r.Inflight.Done(key)
-		r.runAction(ctx, client, caps, it.Action)
+		r.runAction(ctx, hard, client, caps, it.Action)
 	}()
-}
-
-// runAction executes one leased action and acknowledges the outcome, renewing
-// the lease meanwhile. B30b replaces this body with the full version.
-func (r *Runner) runAction(ctx context.Context, client *Client, caps contract.Capabilities, a contract.Action) {
-	id := a.ActionID()
-	if r.Guard != nil {
-		if ack := r.Guard(caps, a); ack != nil {
-			r.ackLogged(ctx, client, id, *ack)
-			return
-		}
-	}
-	lease := NewRenewer(client).Start(ctx, id)
-	defer lease.Stop()
-
-	r.Stats.Executions.Add(1)
-	refs, err := r.Adapter.Execute(ctx, a)
-	ack, send := AckFromResult(refs, err)
-	if !send {
-		return
-	}
-	r.ackLogged(ctx, client, id, ack)
-}
-
-// ackLogged sends an ack with retry and logs a failure to settle it.
-func (r *Runner) ackLogged(ctx context.Context, client *Client, id uint64, ack contract.Ack) {
-	if _, err := client.AckWithRetry(ctx, id, ack); err != nil && ctx.Err() == nil {
-		logf("channelkit: ack %d: %v", id, err)
-	}
 }
