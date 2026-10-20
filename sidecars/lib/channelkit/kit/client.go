@@ -28,6 +28,7 @@ type Client struct {
 	token   string
 	http    *http.Client
 	clock   clock.Clock
+	stats   *Stats // optional, set by WithStats
 }
 
 // NewClient builds a Client, filling the defaults.
