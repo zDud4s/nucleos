@@ -68,6 +68,7 @@ type Core struct {
 	media      map[string]storedMedia
 	mediaSeq   int
 	mediaLimit int64
+	outbox     *queue // guarded by mu; created by mountOutbox
 }
 
 // New starts the fake core; it is closed when the test ends. clk is the same
@@ -95,9 +96,6 @@ func New(t testing.TB, clk *clock.Fake) *Core {
 	t.Cleanup(c.srv.Close)
 	return c
 }
-
-// mountOutbox registers the outbox long-poll route. It is a no-op until B28b.
-func (c *Core) mountOutbox() {}
 
 // mountAck registers the ack and renew routes. It is a no-op until B29.
 func (c *Core) mountAck() {}
