@@ -25,7 +25,12 @@
 #
 # This script never kills anything. If the daemon is already running from the copy, it refuses
 # (exit 3) and says so; stopping it is the owner's decision. When only `--mcp-tools` servers hold
-# the copy, it says that instead, since the daemon itself is then already stopped.
+# the copy (stdio MCP servers other Claude sessions spawned; the daemon is then already stopped),
+# it does not refuse and does not touch them: Windows lets a running image be RENAMED though not
+# overwritten or deleted, so each held file is moved aside to <name>.old-<stamp>-<pid> in the same
+# dir and fresh files are staged. The servers keep running from the renamed image, new sessions get
+# the new exe, and a later run sweeps the *.old-* files nothing holds any more. If a rename fails,
+# it falls back to the exit-3 refusal.
 #
 # Exit codes: 2 bad arguments, 3 the daemon is already running (or the port is taken),
 # 4 build output missing; a build failure exits with the build's own code; otherwise the
@@ -53,7 +58,9 @@ function Fail([int]$Code, [string]$Message) {
 
 # --- 2a. the runtime dir ---------------------------------------------------------------------
 if ([string]::IsNullOrEmpty($RunDir)) {
-    $RunDir = Join-Path (Split-Path -Parent $RepoRoot) '.nucleos-run'
+    # The dev home, never the parent of the checkout: that holds one folder per project.
+    $DevHome = if ($env:NUCLEOS_DEV_HOME) { $env:NUCLEOS_DEV_HOME } else { Join-Path "$env:SystemDrive\" 'nucleos-dev' }
+    $RunDir = Join-Path $DevHome 'run'
 }
 elseif (-not [IO.Path]::IsPathRooted($RunDir)) {
     Fail 2 "-RunDir must be an absolute path (got '$RunDir')"
@@ -88,7 +95,13 @@ if ($Port -eq 0) {
 
 # --- 2d. is the copy running? A running image cannot be opened with FileShare.None -------------
 $held = @()
+$moveAside = @()   # held files that only --mcp-tools servers hold: renamed at stage time
+$toolPids = @()
 if (Test-Path -LiteralPath $RunDir) {
+    # Images moved aside by an earlier run: delete the ones nothing holds any more, quietly.
+    foreach ($old in @(Get-ChildItem -LiteralPath $RunDir -File -Filter '*.exe.old-*' -ErrorAction SilentlyContinue)) {
+        try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
+    }
     $candidates = @(Get-ChildItem -LiteralPath $RunDir -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ieq 'nucleos-core.exe' -or $_.Name -like '*-sidecar.exe' })
     foreach ($f in $candidates) {
@@ -99,10 +112,11 @@ if (Test-Path -LiteralPath $RunDir) {
         catch [IO.IOException] { $held += $f.FullName }
     }
 }
+$refusal = $null
 if ($held.Count -gt 0) {
     # The same exe also runs as `--mcp-tools`, the stdio MCP server a Claude session spawns. It
-    # holds the image just as the daemon does, but naming it "the daemon" sends the owner looking
-    # for a daemon that is already stopped.
+    # holds the image just as the daemon does, but it is not the daemon: its image is moved aside
+    # (see the header) instead of refusing.
     $daemons = @()
     $tools = @()
     foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
@@ -110,23 +124,18 @@ if ($held.Count -gt 0) {
         if (-not $path -or -not ($held | Where-Object { $_ -ieq $path })) { continue }
         if ([string]$p.CommandLine -match '(^|\s)--mcp-tools(\s|$)') { $tools += $p } else { $daemons += $p }
     }
-    if ($daemons.Count -eq 0 -and $tools.Count -gt 0) {
-        $byPid = @{}
-        foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $byPid[[int]$p.ProcessId] = $p }
-        $who = @($tools | ForEach-Object {
-                $parent = $byPid[[int]$_.ParentProcessId]
-                if ($parent) { "pid $($_.ProcessId) under $($parent.Name) $($parent.ProcessId)" } else { "pid $($_.ProcessId)" }
-            }) -join ', '
-        $ids = @($tools | ForEach-Object { $_.ProcessId }) -join ','
-        Fail 3 ("the daemon is not running, but $($tools.Count) MCP tool server(s) (--mcp-tools) hold " +
-            "the copy in $RunDir ($who), and a running image cannot be replaced. Stop them -- " +
-            "Stop-Process -Id $ids -- then reconnect those sessions with /mcp. Nothing was built or copied.")
+    # Every held file needs a --mcp-tools owner; one held by something unidentified is refused.
+    $unowned = @($held | Where-Object { $h1 = $_; -not ($tools | Where-Object { $_.ExecutablePath -ieq $h1 }) })
+    if ($daemons.Count -eq 0 -and $tools.Count -gt 0 -and $unowned.Count -eq 0) {
+        $moveAside = $held
+        $toolPids = @($tools | ForEach-Object { $_.ProcessId })
     }
-    $who = if ($daemons.Count -gt 0) { " (pid " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ', ') + ")" } else { "" }
-    Fail 3 ("the daemon is running from $RunDir$who; stop it first -- Ctrl+C its terminal, " +
-        "or schtasks /End /TN ""NucleOS Daemon"". Nothing was built or copied.")
+    else {
+        $who = if ($daemons.Count -gt 0) { " (pid " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ', ') + ")" } else { "" }
+        Fail 3 ("the daemon is running from $RunDir$who; stop it first -- Ctrl+C its terminal, " +
+            "or schtasks /End /TN ""NucleOS Daemon"". Nothing was built or copied.")
+    }
 }
-
 # --- 2e. is something already answering on the port? -----------------------------------------
 if (-not $NoStart) {
     $answers = $false
@@ -173,6 +182,27 @@ if (-not $NoBuild) {
 $core = Join-Path $out 'nucleos-core.exe'
 if (-not (Test-Path -LiteralPath $core)) {
     Fail 4 "build output missing: $core (build first, or drop -NoBuild)"
+}
+if ($moveAside.Count -gt 0) {
+    $suffix = ".old-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + "-$PID"
+    $moved = @()
+    try {
+        foreach ($m in $moveAside) {
+            Rename-Item -LiteralPath $m -NewName ((Split-Path -Leaf $m) + $suffix) -ErrorAction Stop
+            $moved += ((Split-Path -Leaf $m) + $suffix)
+        }
+    }
+    catch {
+        # Put back what was moved, so the refusal leaves the run dir as it found it.
+        foreach ($n in $moved) {
+            try { Rename-Item -LiteralPath (Join-Path $RunDir $n) -NewName $n.Substring(0, $n.Length - $suffix.Length) -ErrorAction Stop } catch { }
+        }
+        Fail 3 ("the daemon is not running, but $($toolPids.Count) MCP tool server(s) (--mcp-tools, pid " +
+            ($toolPids -join ', ') + ") hold the copy in $RunDir and it could not be moved aside ($($_.Exception.Message)). " +
+            "Stop them -- Stop-Process -Id " + ($toolPids -join ',') + " -- then reconnect those sessions with /mcp. Nothing was copied.")
+    }
+    [Console]::Error.WriteLine("run-daemon: $($toolPids.Count) MCP tool server(s) hold the copy; moved the held image(s) aside to " +
+        ($moved -join ', ') + " and staging fresh")
 }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $sidecars = @(Get-ChildItem -LiteralPath $out -Filter '*-sidecar.exe' -File)

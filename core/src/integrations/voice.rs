@@ -2116,6 +2116,7 @@ mod tests {
             runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            utility_model: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             // A doctrine is a Telegram channel's standing instruction. A conversation held at this
             // machine has none by definition, so `None` here is the value under test, not a stub.

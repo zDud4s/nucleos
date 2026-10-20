@@ -33,6 +33,8 @@ iana-time-zone = "0.1.65"
 croner = "3.0.1"
 directories = "6.0.0"
 keyring = { version = "4.1.5", features = ["windows-native-keyring-store"] }
+# Sizes the heavy-command admission budget (CPU count).
+num_cpus = "1"
 rand = "0.10.2"
 # `native-tls` is NOT optional and must not be trimmed as an unused feature. Without a TLS backend
 # `reqwest` builds fine and every `https://` request fails at runtime with "error sending request
@@ -105,3 +107,5 @@ libc = "0.2"
 nucleos-core = { path = ".", features = ["testkit"] }
 tempfile = "3.27.0"
 sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
+# `tokio::time::pause` / `start_paused` for the admission book's clock tests.
+tokio = { version = "1.53.0", features = ["test-util"] }

@@ -31,6 +31,21 @@ pub async fn posttooluse_outcome(
     };
     payload.run_id = run_id;
 
+    // A command PreToolUse sent through the output filter comes back rewritten; the decision row
+    // stores the original, so every consumer below must see that one.
+    if let Some(original) =
+        crate::execution::output_filter::original_input(&payload.tool_name, &payload.tool_input)
+    {
+        payload.tool_input = original;
+    }
+
+    // First, before the in-flight check below: a finished run's grant must still come back.
+    release_admission(
+        crate::execution::admission::installed().as_deref(),
+        run_id,
+        payload.tool_use_id.as_deref(),
+    );
+
     // Validated against runs actually in flight, exactly as `pretooluse_decision` validates it
     // before trusting anything derived from it: the hook's environment sits inside the same
     // cooperative trust model as the token, so the daemon never blindly trusts a run_id it did not
@@ -64,6 +79,19 @@ pub async fn posttooluse_outcome(
     // to retry or appeal — this route only ever records, and a failure to record is this daemon's
     // problem, not the CLI's.
     StatusCode::OK
+}
+
+/// Gives back the admission grant a finished tool call held. False when there is no book, no
+/// usable `tool_use_id`, or the call held nothing (a light command, or a second report).
+pub(crate) fn release_admission(
+    book: Option<&crate::execution::admission::AdmissionBook>,
+    run_id: i64,
+    tool_use_id: Option<&str>,
+) -> bool {
+    match (book, tool_use_id) {
+        (Some(book), Some(id)) if !id.is_empty() => book.release(run_id, id),
+        _ => false,
+    }
 }
 
 /// The reason an orchestrator turn is refused a tool that would act. A constant because the tests
@@ -182,4 +210,54 @@ pub(super) async fn a_park_here_would_only_destroy(
     .unwrap_or(None);
 
     answer.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_admission;
+    use crate::execution::admission::{AdmissionBook, Poll};
+    use std::time::Duration;
+
+    fn book(capacity: u32) -> AdmissionBook {
+        AdmissionBook::new(
+            capacity,
+            Duration::from_secs(900),
+            Duration::from_secs(7200),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_outcome_with_a_tool_use_id_releases_its_grant() {
+        let book = book(1);
+        assert!(matches!(
+            book.request(4, "toolu_done", 1),
+            Poll::Granted { .. }
+        ));
+        assert_eq!(book.free(), 0);
+
+        // An outcome without the id, or for another run's call, gives nothing back.
+        assert!(!release_admission(Some(&book), 4, None));
+        assert!(!release_admission(Some(&book), 4, Some("")));
+        assert!(!release_admission(Some(&book), 5, Some("toolu_done")));
+        assert!(!release_admission(None, 4, Some("toolu_done")));
+        assert_eq!(book.free(), 0);
+
+        assert!(release_admission(Some(&book), 4, Some("toolu_done")));
+        assert_eq!(book.free(), 1);
+        // The hook can fire twice (PostToolUse and a retry); the second is a no-op.
+        assert!(!release_admission(Some(&book), 4, Some("toolu_done")));
+        assert_eq!(book.free(), 1);
+    }
+
+    #[test]
+    fn the_payload_carries_the_tool_use_id_the_hook_echoes() {
+        let payload: crate::hooks::PostToolUsePayload = serde_json::from_value(serde_json::json!({
+            "run_id": 4,
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_x",
+            "event": "PostToolUse"
+        }))
+        .unwrap();
+        assert_eq!(payload.tool_use_id.as_deref(), Some("toolu_x"));
+    }
 }

@@ -140,17 +140,25 @@ pub async fn get_run_stop(
         elapsed_seconds_since_created(&row.created_at, row.completed_at.as_deref())
             .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(crate::execution::run_stop::build_response(
-        id,
-        row.status,
-        kind,
-        &row.mode,
-        elapsed_seconds,
-        row.exit_code,
-        row.stderr,
-        row.successor_run_id,
-        decisions,
-    )))
+    // Time spent queued for heavy-command admission is not charged to the wall clock, so the
+    // verdict's ceiling grows by it.
+    let admission_wait_seconds = crate::execution::admission::installed()
+        .map_or(0, |book| book.queued_time(id).as_secs() as i64);
+
+    Ok(Json(
+        crate::execution::run_stop::build_response(
+            id,
+            row.status,
+            kind,
+            &row.mode,
+            elapsed_seconds,
+            row.exit_code,
+            row.stderr,
+            row.successor_run_id,
+            decisions,
+        )
+        .with_admission_wait(admission_wait_seconds),
+    ))
 }
 
 /// PURE: whether a run status means the run is over for good.
@@ -599,7 +607,7 @@ pub(super) async fn run_auto_backup_step(
 
 /// Retention for everything finished work leaves behind: a run's transcript and events, its
 /// entries in the activity feed, councils that are over, queued VCS output tails, and briefing
-/// traces. The sixth sweep consolidates durable gate and refused-action histories on its own
+/// traces. The filtered command-output logs of a run go with its transcript, on the same window. The sixth sweep consolidates durable gate and refused-action histories on its own
 /// six-hour interval.
 ///
 /// One loop rather than six, because they are the same sweep at different windows and splitting
@@ -628,6 +636,21 @@ pub async fn run_retention_loop(state: AppState, auto_backup: bool) {
                 "runs: transcripts past the retention window"
             ),
             Err(error) => tracing::warn!(%error, "runs: transcript retention sweep failed"),
+        }
+        if let Some(data) = crate::daemon_client::data_dir() {
+            match crate::execution::output_filter::prune_logs(
+                &state.pool,
+                &data,
+                TERMINAL_RUN_STATUSES,
+                transcript_retention_days(),
+                now,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(dirs = n, "runs: output logs past the retention window"),
+                Err(error) => tracing::warn!(%error, "runs: output log sweep failed"),
+            }
         }
         match crate::feed::prune(&state.pool, crate::feed::retention_days(), now).await {
             Ok(0) => {}

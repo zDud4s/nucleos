@@ -213,6 +213,11 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     shadow_run_completed: { tone: "shadow", label: "shadow run completed" },
     worktree_run_completed: { tone: "info", label: "worktree run completed" },
     run_launched_unclassified: { tone: "danger", label: "run launched without the classifier" },
+    // Which credential the Claude CLI spends (`core/src/execution/runner/auth_watch.rs`), said on a
+    // change only. A key is Ember: it bills outside the subscription until a hand logs back in.
+    run_on_api_key: { tone: "paused", label: "runs billed to an API key" },
+    run_on_subscription: { tone: "info", label: "runs back on the subscription" },
+    run_rate_limited: { tone: "danger", label: "usage limit reached" },
     token_efficiency: { tone: "info", label: "efficiency observation" },
     // A provider's usage window crossed one of the owner's thresholds (`core/src/quota.rs`, design
     // D11). Held Ember and not Stated Blue: unlike a slot, this one waits on a hand — the reader

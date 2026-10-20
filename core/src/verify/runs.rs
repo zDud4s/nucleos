@@ -235,6 +235,7 @@ pub struct Claimed {
     pub id: i64,
     pub project_id: Option<String>,
     pub worktree: String,
+    pub requested_by: String,
     pub argv: Vec<String>,
     pub weight: i64,
     pub timeout_ms: i64,
@@ -362,20 +363,29 @@ pub async fn claim(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Claimed>> 
     // The tuple is the `RETURNING` clause's own shape and lives only until the `map` below builds
     // `Claimed`; a named struct would repeat the column order in two places.
     #[allow(clippy::type_complexity)]
-    let row: Option<(i64, Option<String>, String, String, i64, Option<i64>)> = sqlx::query_as(
+    let row: Option<(
+        i64,
+        Option<String>,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+    )> = sqlx::query_as(
         "UPDATE verify_runs SET status = 'running', started_at = ? \
          WHERE id = ? AND status = 'queued' \
-         RETURNING id, project_id, worktree, argv, weight, timeout_ms",
+         RETURNING id, project_id, worktree, requested_by, argv, weight, timeout_ms",
     )
     .bind(started_at)
     .bind(id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(id, project_id, worktree, argv, weight, timeout_ms)| Claimed {
+        |(id, project_id, worktree, requested_by, argv, weight, timeout_ms)| Claimed {
             id,
             project_id,
             worktree,
+            requested_by,
             argv: serde_json::from_str(&argv).unwrap_or_default(),
             weight,
             timeout_ms: timeout_ms.unwrap_or(0),

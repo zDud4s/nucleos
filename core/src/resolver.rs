@@ -857,8 +857,11 @@ const HANDOFF_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 /// successor and ended more than `HANDOFF_GRACE` ago, and its worktree holds a committed merge: no
 /// `MERGE_HEAD`, a second parent, and a HEAD that is not the base it was opened on. Idempotent from
 /// existing rows alone: `resolved_by IS NULL` is the brake, and a refusal is remembered in memory
-/// per (request, head) so it is reported once instead of every tick. Fails closed under the kill
-/// switch.
+/// per (request, head) so it is not even looked at again every tick. The announcement itself is
+/// deduplicated durably (`announce_once`): the in-memory set is empty after every restart, but the
+/// feed is not, so a still-escalated request is not re-announced each time the daemon starts. A
+/// request that is moot (its source branch is gone, or already part of its target) is not announced
+/// at all. Fails closed under the kill switch.
 async fn land_finished(
     pool: &sqlx::SqlitePool,
     refused: &mut std::collections::HashSet<(i64, String)>,
@@ -920,27 +923,25 @@ async fn land_finished(
             // merge): said once per request, because the escalation would otherwise sit
             // `resolving` with nobody told. The empty head is the dedupe key.
             if refused.insert((row.id, String::new())) {
+                // Nobody has anything to do for a request whose branch is gone or already landed.
+                if request_is_moot(pool, &row).await {
+                    tracing::debug!(
+                        vcs_request_id = row.id,
+                        "resolver: not announcing a failed resolution of a moot request"
+                    );
+                    continue;
+                }
                 let why = if row.run_status == "completed" {
                     "its run ended without a finished merge commit"
                 } else {
                     "its run failed"
                 };
                 let summary = format!(
-                    "{}'s conflict resolution on {} was not handed to the queue: {why};                      it needs a person",
+                    "{}'s conflict resolution on {} was not handed to the queue: {why}; \
+                     it needs a person",
                     row.project_id, row.branch
                 );
-                if let Err(error) = crate::integrations::notify::deliver_or_defer(
-                    pool,
-                    crate::execution::land::RESOLUTION_FAILED_KIND,
-                    &summary,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        %error,
-                        "resolver: could not notify about a resolution that ended without a merge"
-                    );
-                }
+                announce_once(pool, &summary).await;
             }
             continue;
         };
@@ -970,24 +971,15 @@ async fn land_finished(
         match row.gate_status.as_deref() {
             None | Some("passed") => {}
             Some(gate) => {
-                refused.insert((row.id, head));
                 let summary = format!(
-                    "{}'s conflict resolution on {} is merged but its run's gate {gate}; \
+                    "{}'s conflict resolution on {} at {} is merged but its run's gate {gate}; \
                      it was not handed to the queue and needs a person",
-                    row.project_id, row.branch
+                    row.project_id,
+                    row.branch,
+                    short_head(&head)
                 );
-                if let Err(error) = crate::integrations::notify::deliver_or_defer(
-                    pool,
-                    crate::execution::land::RESOLUTION_FAILED_KIND,
-                    &summary,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        %error,
-                        "resolver: could not notify about a resolution whose gate did not pass"
-                    );
-                }
+                refused.insert((row.id, head));
+                announce_once(pool, &summary).await;
                 continue;
             }
         }
@@ -1023,28 +1015,85 @@ async fn land_finished(
                 "resolver: handed a finished resolution to the queue"
             ),
             Err(refusal) => {
+                let head8 = short_head(&head).to_owned();
                 refused.insert((row.id, head));
                 // `NotAdmitted` was already announced by `land::submit` itself.
                 if !matches!(refusal, crate::execution::land::LandRefusal::NotAdmitted(_)) {
                     let summary = format!(
-                        "{}'s conflict resolution on {} was not handed to the queue: {}",
+                        "{}'s conflict resolution on {} at {head8} was not handed to the queue: {}",
                         row.project_id,
                         row.branch,
                         refusal.message()
                     );
-                    if let Err(error) = crate::integrations::notify::deliver_or_defer(
-                        pool,
-                        crate::execution::land::RESOLUTION_FAILED_KIND,
-                        &summary,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%error, "resolver: could not notify about a refused resolution");
-                    }
+                    announce_once(pool, &summary).await;
                 }
             }
         }
     }
+}
+
+/// The first 8 characters of a commit id, enough to tell one head from the next in a sentence.
+fn short_head(head: &str) -> &str {
+    head.get(..8).unwrap_or(head)
+}
+
+/// Announces `summary` as a failed resolution unless the very same line was announced before.
+///
+/// "Before" is read from the `feed` (never pruned) and `pending_notifications` (delivered or not),
+/// so it survives a daemon restart, which empties the in-memory brake in `land_finished`. A failed
+/// lookup announces anyway: a repeated line costs less than a silent one.
+async fn announce_once(pool: &sqlx::SqlitePool, summary: &str) {
+    let kind = crate::execution::land::RESOLUTION_FAILED_KIND;
+    let already: Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM feed WHERE kind = ?1 AND summary = ?2)
+             OR EXISTS (SELECT 1 FROM pending_notifications WHERE kind = ?1 AND summary = ?2)",
+    )
+    .bind(kind)
+    .bind(summary)
+    .fetch_one(pool)
+    .await;
+    match already {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(%error, "resolver: could not check whether a resolution was announced");
+        }
+    }
+    if let Err(error) = crate::integrations::notify::deliver_or_defer(pool, kind, summary).await {
+        tracing::warn!(%error, "resolver: could not notify about a failed resolution");
+    }
+}
+
+/// Whether an escalated merge has nothing left to resolve: its source branch no longer exists, or is
+/// already an ancestor of its target. Any doubt answers `false`, so the request is announced.
+async fn request_is_moot(pool: &sqlx::SqlitePool, row: &Finished) -> bool {
+    let Ok(crate::execution::vcs::Op::Merge { source, target }) =
+        crate::execution::vcs::Op::from_stored(&row.op, &row.args)
+    else {
+        return false;
+    };
+    let Ok(repo) = crate::execution::vcs::resolve_repo(pool, &row.project_id).await else {
+        return false;
+    };
+    let root = std::path::PathBuf::from(repo.root());
+    // `branch_exists` answers `false` for a directory git cannot read, and "gone" must mean the
+    // branch is gone, not that the repository moved.
+    if !root.join(".git").exists() {
+        return false;
+    }
+    let deadline = std::time::Instant::now() + crate::execution::git_exec::OPERATION_TIMEOUT;
+    match crate::execution::git_exec::branch_exists(&root, source.as_str(), deadline).await {
+        Ok(false) => return true,
+        Ok(true) => {}
+        Err(_) => return false,
+    }
+    match crate::execution::git_exec::branch_exists(&root, target.as_str(), deadline).await {
+        Ok(true) => {}
+        _ => return false,
+    }
+    crate::execution::git_exec::is_ancestor(&root, source.as_str(), target.as_str(), deadline)
+        .await
+        .unwrap_or(false)
 }
 
 /// Whether the project's queue already holds a merge whose source is `branch`, in any status.
@@ -2022,6 +2071,104 @@ mod tests {
                  once: {summaries:?}"
             );
         }
+    }
+
+    async fn resolution_failed_summaries(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed WHERE kind = ?")
+            .bind(crate::execution::land::RESOLUTION_FAILED_KIND)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The in-memory set is empty after every restart; the feed is not. A request announced before
+    /// the restart is not announced again by the first pass after it.
+    #[tokio::test]
+    async fn a_resolution_announced_before_a_restart_is_not_announced_again() {
+        let pool = test_pool().await;
+        let _scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-restart-",
+            "completed",
+            Progress::MidMerge,
+        )
+        .await;
+
+        let mut before_restart = Default::default();
+        land_finished(&pool, &mut before_restart).await;
+        let mut after_restart = Default::default();
+        land_finished(&pool, &mut after_restart).await;
+
+        let summaries = resolution_failed_summaries(&pool).await;
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+    }
+
+    /// The same, for a resolution whose gate did not pass (announced per head).
+    #[tokio::test]
+    async fn a_gate_refusal_announced_before_a_restart_is_not_announced_again() {
+        let pool = test_pool().await;
+        let _scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-restart-gate-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "failed").await;
+
+        let mut before_restart = Default::default();
+        land_finished(&pool, &mut before_restart).await;
+        let mut after_restart = Default::default();
+        land_finished(&pool, &mut after_restart).await;
+
+        let summaries = resolution_failed_summaries(&pool).await;
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+    }
+
+    #[tokio::test]
+    async fn an_announcement_reads_with_single_spaces() {
+        let pool = test_pool().await;
+        let _scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-spaces-",
+            "completed",
+            Progress::MidMerge,
+        )
+        .await;
+
+        land_finished(&pool, &mut Default::default()).await;
+
+        let summaries = resolution_failed_summaries(&pool).await;
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert!(!summaries[0].contains("  "), "{}", summaries[0]);
+    }
+
+    /// Nobody has anything to do for an escalation whose source branch no longer exists. The scenario's
+    /// source, `feat/x`, is not checked out anywhere (the worktree is on the run branch), so it is
+    /// deleted outright.
+    #[tokio::test]
+    async fn a_resolution_whose_source_is_gone_is_not_announced() {
+        let pool = test_pool().await;
+        let _scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-moot-",
+            "completed",
+            Progress::MidMerge,
+        )
+        .await;
+        let root: String = sqlx::query_scalar("SELECT project_root FROM autopilot_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(git_at(
+            std::path::Path::new(&root),
+            &["branch", "-D", "feat/x"]
+        ));
+
+        land_finished(&pool, &mut Default::default()).await;
+
+        let summaries = resolution_failed_summaries(&pool).await;
+        assert!(summaries.is_empty(), "{summaries:?}");
     }
 
     #[tokio::test]

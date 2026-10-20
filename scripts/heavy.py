@@ -1372,22 +1372,31 @@ def _config_target_dir(path: Path) -> str | None:
     return str(val if val.is_absolute() else base / val)
 
 
+def _dev_home() -> Path:
+    """The one directory this machine's dev-only NucleOS state lives in (target pools, the staged
+    daemon): NUCLEOS_DEV_HOME, else `<system drive>/nucleos-dev` on Windows, else
+    `~/.local/share/nucleos-dev`.
+
+    Owner decision, 2026-10-19: never the parent of the checkout, which holds one folder per
+    project and which NucleOS had filled with pools, run copies and logs. Not under the user
+    profile either: cargo cannot link under a path with a space, and `C:/Users/Some Name/` has
+    one. And not the installed app's data dir: this is dev-build state, not the product's."""
+    env = os.environ.get("NUCLEOS_DEV_HOME")
+    if env:
+        return Path(env)
+    if os.name == "nt":
+        return Path((os.environ.get("SystemDrive") or "C:") + "\\") / "nucleos-dev"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".local" / "share") / "nucleos-dev"
+
+
 def _td_root() -> Path:
     """Where the pool's target dirs (`.cargo-target-pool-<k>`) live: NUCLEOS_HEAVY_TD_ROOT,
-    else the parent of the main checkout."""
+    else the dev home."""
     env = os.environ.get("NUCLEOS_HEAVY_TD_ROOT")
     if env:
         return Path(env)
-    here = Path(__file__).resolve().parents[1]
-    try:
-        out = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                             cwd=str(here), capture_output=True, text=True, timeout=20)
-        common = out.stdout.strip()
-        if out.returncode == 0 and common:
-            return Path(common).resolve().parent.parent
-    except Exception:
-        pass
-    return here.parent
+    return _dev_home()
 
 
 def _own_target_dir_config(argv: list[str], root: str, cwd: str | None) -> bool:
