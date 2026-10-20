@@ -144,6 +144,8 @@ pub async fn propose(
     .await?;
 
     transaction.commit().await?;
+    // After the commit, so a woken reader finds the row.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -518,6 +520,22 @@ mod tests {
     #[test]
     fn a_job_is_not_excluded_from_itself() {
         assert_eq!(pair(7, 7), None);
+    }
+
+    /// Asking for an exclusion wakes the proposals topic.
+    ///
+    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_exclusion_propose_bumps_proposals() {
+        let pool = test_pool().await;
+        let low = add_job(&pool, "alpha").await;
+        let high = add_job(&pool, "alpha").await;
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow();
+
+        propose(&pool, low, high, &[]).await.unwrap();
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 
     /// Asking writes a request and NOT a rule.
