@@ -9,12 +9,42 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import type { Channel } from "../data/channels";
+import { keys } from "../data/keys";
 import { renderWithRouter } from "../test/harness";
 import { ChannelCard } from "./ChannelCard";
 
+const inOneHour = () => new Date(Date.now() + 3_600_000).toISOString();
+const identitiesOf = (channel: string) =>
+  channel === "telegram"
+    ? {
+        channel,
+        home: "-100123:5",
+        identities: [
+          {
+            sender_ref: "4242", sender_name: "Duarte", role: "owner",
+            conversations: [
+              { conversation_ref: "-100123:5", kind: "thread", parent: "-100123", home: true, covers_threads: false, created_at: "2026-10-18T10:00:00Z" },
+            ],
+          },
+        ],
+        projects: [],
+      }
+    : { channel, home: null, identities: [], projects: [] };
+
 beforeEach(() => {
   daemon.apiFetch.mockReset();
-  daemon.apiFetch.mockResolvedValue({ name: "telegram", asked: true });
+  daemon.apiFetch.mockImplementation(async (path: string, init?: { method?: string }) => {
+    const method = init?.method ?? "GET";
+    if (/\/channels\/[^/]+\/identities$/.test(path)) return identitiesOf(path.split("/")[2]);
+    if (/\/channels\/[^/]+\/pairing$/.test(path)) {
+      if (method === "POST") {
+        return { code: "123456", command: "/pair 123456", expires_at: inOneHour(), attempts_left: 5 };
+      }
+      if (method === "GET") return { state: "waiting", expires_at: inOneHour(), attempts_left: 5 };
+      return undefined;
+    }
+    return { name: "telegram", asked: true };
+  });
 });
 
 const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
@@ -145,6 +175,71 @@ describe("ChannelCard", () => {
     expect(screen.getByText("incompatible")).toBeTruthy();
     expect(screen.getByText(/contract the núcleo refused/)).toBeTruthy();
     expect(screen.getByText(/update the adapter/i)).toBeTruthy();
+  });
+
+  it("opens the pairing dialog from Pair on a configured channel and closes it on Cancel", async () => {
+    await renderWithRouter(<ChannelCard channel={telegram} primary={null} />);
+    fireEvent.click(screen.getByRole("button", { name: "Pair" }));
+    expect(await screen.findByText("Pair a conversation on Telegram")).toBeTruthy();
+    await waitFor(() =>
+      expect(daemon.apiFetch.mock.calls.some(([p, i]) => p === "/channels/telegram/pairing" && i?.method === "POST")).toBe(true),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByText("Pair a conversation on Telegram")).toBeNull());
+  });
+
+  it("shows the identities panel inside the card, with the empty state for a channel nobody is paired on", async () => {
+    const first = await renderWithRouter(<ChannelCard channel={telegram} primary="telegram" />);
+    expect(await screen.findByText(/Duarte/)).toBeTruthy();
+    first.unmount();
+    await renderWithRouter(<ChannelCard channel={discord} primary="telegram" />);
+    expect(await screen.findByText("nobody is paired on this channel yet")).toBeTruthy();
+  });
+
+  it("passes primary to the identities panel only for the primary channel", async () => {
+    // The removal warning about notifications is the panel's only use of `primary`.
+    const first = await renderWithRouter(<ChannelCard channel={telegram} primary="telegram" />);
+    await screen.findByText(/Duarte/);
+    fireEvent.click(screen.getAllByRole("button", { name: /remove/i })[0]);
+    expect(await screen.findByText("notifications will stop until you pick a new home")).toBeTruthy();
+    first.unmount();
+    await renderWithRouter(<ChannelCard channel={telegram} primary="discord" />);
+    await screen.findByText(/Duarte/);
+    fireEvent.click(screen.getAllByRole("button", { name: /remove/i })[0]);
+    await screen.findByText("this channel will have no home conversation");
+    expect(screen.queryByText("notifications will stop until you pick a new home")).toBeNull();
+  });
+
+  it("refreshes the channel readout when a pairing completes", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string, init?: { method?: string }) => {
+      const method = init?.method ?? "GET";
+      if (/\/identities$/.test(path)) return identitiesOf("telegram");
+      if (path === "/channels/telegram/pairing" && method === "POST") {
+        return { code: "123456", command: "/pair 123456", expires_at: inOneHour(), attempts_left: 5 };
+      }
+      if (path === "/channels/telegram/pairing" && method === "GET") {
+        return {
+          state: "paired", paired_at: new Date().toISOString(),
+          identity: { sender_ref: "4242", sender_name: "Duarte", conversation_ref: "-100123:5", conversation_kind: "thread", parent: "-100123", home: true },
+        };
+      }
+      return undefined;
+    });
+    const { queryClient } = await renderWithRouter(<ChannelCard channel={telegram} primary={null} />);
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    fireEvent.click(screen.getByRole("button", { name: "Pair" }));
+    await waitFor(() =>
+      expect(spy.mock.calls.some(([f]) => JSON.stringify(f?.queryKey) === JSON.stringify(keys.channels.all))).toBe(true),
+    );
+  });
+
+  it("says a pairing code is waiting, without ever showing the code", async () => {
+    const waiting = { ...telegram, pairing: { expires_at: inOneHour(), attempts_left: 4 } };
+    const { container } = await renderWithRouter(<ChannelCard channel={waiting} primary={null} />);
+    expect(screen.getByText(/a pairing code is waiting/)).toBeTruthy();
+    expect(container.textContent).not.toMatch(/\d{6}/);
+    const idle = await renderWithRouter(<ChannelCard channel={telegram} primary={null} />);
+    expect(idle.container.textContent).not.toMatch(/a pairing code is waiting/);
   });
 
   it("does not break before the first hello (adapter and capabilities null)", async () => {

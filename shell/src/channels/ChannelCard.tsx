@@ -1,11 +1,15 @@
+import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import type { Channel, ChannelState } from "../data/channels";
 import { sidecarKeyOf, useRestartSidecar } from "../data/system";
+import { Button } from "../ui";
 import { ConfirmButton } from "../ui/ConfirmButton";
 import { RefusalNote } from "../ui/RefusalNote";
 import { RelativeTime } from "../ui/readings";
 import { CapabilityList } from "./CapabilityList";
+import { IdentitiesPanel } from "./IdentitiesPanel";
+import { PairingDialog } from "./PairingDialog";
 import { PrimaryChannelControl } from "./PrimaryChannelControl";
 import "./card.css";
 
@@ -56,6 +60,7 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
   const key = sidecarKeyOf(channel.health_row);
   const { outbox, drops } = channel;
   const configured = channel.state !== "not_configured";
+  const [pairing, setPairing] = useState(false);
 
   return (
     <section className="ch-card" aria-label={channel.label}>
@@ -104,8 +109,19 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
           {channel.health_row} in health
         </Link>
         {key !== null && configured ? <RestartButton name={key} /> : null}
+        {configured ? (
+          <Button variant="quiet" onClick={() => setPairing(true)}>
+            Pair
+          </Button>
+        ) : null}
       </div>
+      {configured && channel.pairing !== null ? (
+        // Only the existence of the code is shown; the code itself lives in the dialog.
+        <p className="ui-quiet">a pairing code is waiting</p>
+      ) : null}
       {configured ? <PrimaryChannelControl channel={channel} primary={primary} /> : null}
+      {configured ? <IdentitiesPanel channel={channel} primary={channel.id === primary} /> : null}
+      {configured ? <PairingDialog channel={channel} open={pairing} onOpenChange={setPairing} /> : null}
     </section>
   );
 }
