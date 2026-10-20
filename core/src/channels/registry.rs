@@ -142,10 +142,6 @@ pub fn project_for_conversation(config: &ChannelConfig, conversation_ref: &str) 
 /// 30 s long-poll open, so 45 s tolerates one slow round trip.
 pub const ONLINE_WINDOW: chrono::Duration = chrono::Duration::seconds(45);
 
-/// Mirrors `access::MAX_PAIR_ATTEMPTS` (D.7); the pairing chunk owns the constant and replaces
-/// this copy.
-const PAIR_ATTEMPTS_LIMIT: u32 = 5;
-
 /// What the hub last learned from one adapter's `hello` and requests.
 #[derive(Debug, Clone)]
 pub struct Seen {
@@ -488,94 +484,43 @@ pub struct ChannelsReadout {
     pub channels: Vec<ChannelStatus>,
 }
 
-fn parse_time(text: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
-}
-
 async fn home_of(pool: &SqlitePool, channel: &str) -> sqlx::Result<Option<HomeReadout>> {
-    let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT conversation_ref, conversation_kind, parent, sender_ref \
-         FROM channel_identities WHERE channel = ? AND home = 1",
-    )
-    .bind(channel)
-    .fetch_optional(pool)
-    .await?;
-    Ok(
-        row.and_then(|(conversation_ref, kind, parent, sender_ref)| {
-            Some(HomeReadout {
-                conversation_ref,
-                kind: serde_json::from_value(serde_json::Value::String(kind)).ok()?,
-                parent,
-                sender_ref,
-            })
-        }),
-    )
+    Ok(super::access::home_identity(pool, channel)
+        .await?
+        .map(|home| HomeReadout {
+            conversation_ref: home.conversation_ref,
+            kind: home.conversation_kind,
+            parent: home.parent,
+            sender_ref: home.sender_ref,
+        }))
 }
 
 async fn identity_counts(pool: &SqlitePool, channel: &str) -> sqlx::Result<IdentityCounts> {
-    let (senders, conversations): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(DISTINCT sender_ref), COUNT(DISTINCT conversation_ref) \
-         FROM channel_identities WHERE channel = ?",
-    )
-    .bind(channel)
-    .fetch_one(pool)
-    .await?;
+    let (senders, conversations) = super::access::identity_counts(pool, channel).await?;
     Ok(IdentityCounts {
-        senders: senders as u32,
-        conversations: conversations as u32,
+        senders,
+        conversations,
     })
 }
 
+/// The active code's deadline, from the pairing status (the one place that reads the table).
 async fn pairing_of(
     pool: &SqlitePool,
     channel: &str,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<PairingReadout>> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT expires_at, attempts FROM channel_pairing_codes WHERE channel = ? \
-         AND superseded_at IS NULL AND cancelled_at IS NULL AND paired_at IS NULL \
-         AND expires_at > ?",
+    Ok(
+        match super::access::pairing_status(pool, channel, now).await? {
+            super::access::PairingStatus::Waiting {
+                expires_at,
+                attempts_left,
+            } => Some(PairingReadout {
+                expires_at,
+                attempts_left,
+            }),
+            _ => None,
+        },
     )
-    .bind(channel)
-    .bind(stamp(now))
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|(expires_at, attempts)| {
-        Some(PairingReadout {
-            expires_at: parse_time(&expires_at)?,
-            attempts_left: PAIR_ATTEMPTS_LIMIT.saturating_sub(attempts.max(0) as u32),
-        })
-    }))
-}
-
-async fn outbox_counts_of(pool: &SqlitePool, channel: &str) -> sqlx::Result<OutboxCounts> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT state, COUNT(*) FROM channel_outbox WHERE channel = ? GROUP BY state",
-    )
-    .bind(channel)
-    .fetch_all(pool)
-    .await?;
-    let oldest: Option<String> = sqlx::query_scalar(
-        "SELECT MIN(due_at) FROM channel_outbox WHERE channel = ? AND state = 'pending'",
-    )
-    .bind(channel)
-    .fetch_one(pool)
-    .await?;
-    let mut counts = OutboxCounts {
-        oldest_due_at: oldest.as_deref().and_then(parse_time),
-        ..OutboxCounts::default()
-    };
-    for (state, n) in rows {
-        match state.as_str() {
-            "pending" => counts.pending = n as u32,
-            "leased" => counts.leased = n as u32,
-            "failed" => counts.failed = n as u32,
-            _ => {}
-        }
-    }
-    Ok(counts)
 }
 
 /// `GET /channels`: one status per compiled manifest. Presence, cache and drops come from memory;
@@ -620,7 +565,7 @@ pub async fn list(state: &AppState) -> sqlx::Result<ChannelsReadout> {
             home: home_of(pool, id).await?,
             identities: identity_counts(pool, id).await?,
             pairing: pairing_of(pool, id, now).await?,
-            outbox: outbox_counts_of(pool, id).await?,
+            outbox: super::outbox::counts(pool, id).await?,
             drops: presence.drops(id),
         });
     }
@@ -1033,10 +978,11 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class, \
-             state, due_at, attempts, created_at) VALUES \
+             state, due_at, attempts, created_at, settled_at) VALUES \
              ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'pending', \
-              '2026-10-19T09:00:00Z', 0, 't'), \
-             ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'failed', 't', 3, 't')",
+              '2026-10-19T09:00:00Z', 0, 't', NULL), \
+             ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'failed', 't', 3, 't', \
+              '2999-01-01T00:00:00Z')",
         )
         .execute(&st.pool)
         .await

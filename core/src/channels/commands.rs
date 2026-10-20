@@ -1,8 +1,12 @@
 //! Chat commands (flow D, Anexo D D.8): the port of `shortcuts/router.go`. P0 holds the `Intent`
 //! type; A2 owns the real routing and `execute`.
 //!
-//! `execute`, `answer_capture` and `capture_target` take `ingest::Inbound` and `contract::InMessage`,
-//! which do not exist yet; the chunk that adds those types adds the three functions too.
+//! `execute`, `answer_capture` and `capture_target` take `ingest::Inbound` and `contract::InMessage`
+//! as annex D says. In A1 the placeholder `route` only ever yields `Pair` and `Chat`, and
+//! `capture_target` finds nothing, so `execute` and `answer_capture` are unreachable until A2.
+
+use super::{contract, ingest, media};
+use crate::state::AppState;
 
 /// What a message asks for. Port of `shortcuts.Intent` plus the channel-only commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +161,37 @@ fn note_command(trimmed: &str) -> Option<String> {
 fn has_prefix_fold(s: &str, prefix: &str) -> bool {
     s.get(..prefix.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Runs a command and enqueues its answer in the same conversation. A2: until then `route` never
+/// yields an intent that reaches here, so nothing in A1 calls it.
+pub async fn execute(
+    _state: &AppState,
+    _at: &ingest::Inbound<'_>,
+    _intent: Intent,
+) -> sqlx::Result<()> {
+    todo!()
+}
+
+/// Which capture request a message answers, if any. Placeholder: A1 has no capture requests on the
+/// outbox yet, so nothing is ever a capture answer; A2 replaces the body.
+pub async fn capture_target(
+    _state: &AppState,
+    _at: &ingest::Inbound<'_>,
+    _message: &contract::InMessage,
+) -> sqlx::Result<Option<i64>> {
+    Ok(None)
+}
+
+/// Answers a capture with typed text only. A2: reachable only through a `Some` from
+/// `capture_target`, which A1 never returns.
+pub async fn answer_capture(
+    _state: &AppState,
+    _at: &ingest::Inbound<'_>,
+    _job: i64,
+    _input: &media::TurnInput,
+) -> sqlx::Result<()> {
+    todo!()
 }
 
 #[cfg(test)]

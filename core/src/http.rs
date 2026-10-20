@@ -1527,15 +1527,68 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    /// Whether the route already has a real handler (RA: hello, events, media; RB: outbox, ack,
+    /// renew). A real handler speaks for ONE channel, so the control key, which has none, gets a
+    /// 403 from it. This covers the adapter-facing contract routes only: the management routes
+    /// (RC) are Control-only and answer the control key themselves, see
+    /// `management_control_probe`.
+    fn has_real_handler(path: &str) -> bool {
+        path.ends_with("/hello")
+            || path.ends_with("/events")
+            || path.contains("/media")
+            || path.contains("/outbox")
+    }
+
+    /// What the control key gets from an empty-bodied probe of a management route. Everything but
+    /// `GET /channels` (still the A2 stub) has a real handler: the pairing reads and writes
+    /// succeed (200/201/204), forgetting an unknown sender is a 404 named refusal, and the two
+    /// routes that take a JSON body refuse the empty one (400).
+    fn management_control_probe(method: &str, path: &str) -> StatusCode {
+        match (method, path) {
+            ("GET", "/channels") => StatusCode::NOT_IMPLEMENTED,
+            ("PUT", "/channels/primary") => StatusCode::BAD_REQUEST,
+            ("GET", p) if p.ends_with("/pairing") => StatusCode::OK,
+            ("POST", p) if p.ends_with("/pairing") => StatusCode::CREATED,
+            ("DELETE", p) if p.ends_with("/pairing") => StatusCode::NO_CONTENT,
+            ("GET", p) if p.ends_with("/identities") => StatusCode::OK,
+            ("DELETE", p) if p.contains("/identities/") => StatusCode::NOT_FOUND,
+            ("PUT", p) if p.ends_with("/home") => StatusCode::BAD_REQUEST,
+            _ => StatusCode::NOT_IMPLEMENTED,
+        }
+    }
+
+    /// What a channel key gets from an empty-bodied probe of a contract route: the real handlers
+    /// refuse the empty body (400) or the unknown id (404), and an empty outbox poll is a 200;
+    /// the rest are still 501 stubs.
+    fn channel_key_probe(method: &str, path: &str) -> StatusCode {
+        match (method, path) {
+            ("GET", p) if p.contains("/media/") => StatusCode::NOT_FOUND,
+            ("GET", p) if p.ends_with("/outbox") => StatusCode::OK,
+            (_, p) if p.ends_with("/renew") => StatusCode::NOT_FOUND,
+            (_, p) if has_real_handler(p) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::NOT_IMPLEMENTED,
+        }
+    }
+
     #[tokio::test]
     async fn control_reaches_every_channel_route_stub() {
         let state = test_state().await;
-        for (method, path) in CHANNEL_CONTRACT_STUBS
-            .iter()
-            .chain(CHANNEL_MANAGEMENT_STUBS.iter())
-        {
+        for (method, path) in CHANNEL_CONTRACT_STUBS {
             let status = channel_status(&state, method, path, Some("test-token")).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+            let expected = if has_real_handler(path) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            assert_eq!(status, expected, "{method} {path}");
+        }
+        for (method, path) in CHANNEL_MANAGEMENT_STUBS {
+            let status = channel_status(&state, method, path, Some("test-token")).await;
+            assert_eq!(
+                status,
+                management_control_probe(method, path),
+                "{method} {path}"
+            );
         }
     }
 
@@ -1548,7 +1601,7 @@ mod tests {
                 .unwrap();
         for (method, path) in CHANNEL_CONTRACT_STUBS {
             let status = channel_status(&state, method, path, Some(&key)).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+            assert_eq!(status, channel_key_probe(method, path), "{method} {path}");
         }
         for (method, path) in CHANNEL_MANAGEMENT_STUBS {
             let status = channel_status(&state, method, path, Some(&key)).await;
