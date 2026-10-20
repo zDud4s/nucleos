@@ -9,6 +9,7 @@ import (
 
 	"nucleoschannelkit/contract"
 	"nucleoschannelkit/contract/fixtures"
+	"nucleoschannelkit/kit"
 )
 
 // telegramCaps reads the capabilities of hello/telegram-full.json.
@@ -190,4 +191,43 @@ func TestAdapterTestExecuteValidReportsExecuteErrors(t *testing.T) {
 	if len(problems) == 0 || !strings.Contains(strings.Join(problems, "\n"), "boom") {
 		t.Fatalf("problems = %v, want the Execute error", problems)
 	}
+}
+
+func TestAdapterTestEditShapeRefusalIsAcceptedOnlyOnMismatch(t *testing.T) {
+	refuse := kit.Permanent("edit_unsupported_shape")
+	part := contract.OutPart{Type: contract.OutText, Text: "x"}
+	mismatch := contract.Edit{ID: 1, Parts: []contract.OutPart{part}, TargetPlatformRefs: []string{"a", "b"}}
+	matching := contract.Edit{ID: 2, Parts: []contract.OutPart{part, part}, TargetPlatformRefs: []string{"a", "b"}}
+	caps := telegramCaps(t)
+
+	if err := executeOne(context.Background(), &fakeAdapter{caps: caps, err: refuse}, mismatch); err != nil {
+		t.Fatalf("refusal on a shape mismatch = %v, want accepted", err)
+	}
+	if err := executeOne(context.Background(), &fakeAdapter{caps: caps, err: refuse}, matching); err == nil {
+		t.Fatal("refusal on matching shapes was accepted")
+	}
+	if err := executeOne(context.Background(), &fakeAdapter{caps: caps, err: kit.Permanent("invalid_action")}, mismatch); err == nil {
+		t.Fatal("another permanent reason was accepted")
+	}
+	if err := executeOne(context.Background(), &fakeAdapter{caps: caps, err: &kit.ExecError{Reason: "edit_unsupported_shape", Retryable: true}}, mismatch); err == nil {
+		t.Fatal("a retryable refusal was accepted")
+	}
+}
+
+func TestAdapterTestExecuteValidAcceptsEditShapeRefusalOnTheSharedFixture(t *testing.T) {
+	ad := &editRefuser{fakeAdapter{caps: telegramCaps(t)}}
+	_, _, problems := executeValid(context.Background(), ad)
+	if len(problems) != 0 {
+		t.Fatalf("problems = %v, want none (edit.json has 2 refs and 1 part)", problems)
+	}
+}
+
+// editRefuser refuses every edit with edit_unsupported_shape.
+type editRefuser struct{ fakeAdapter }
+
+func (r *editRefuser) Execute(ctx context.Context, a contract.Action) ([]string, error) {
+	if _, ok := a.(contract.Edit); ok {
+		return nil, kit.Permanent("edit_unsupported_shape")
+	}
+	return r.fakeAdapter.Execute(ctx, a)
 }
