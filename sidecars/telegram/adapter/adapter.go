@@ -13,6 +13,9 @@ import (
 // SendBot is the part of the Telegram client the adapter sends through; tests fake it.
 type SendBot interface {
 	SendHTMLEx(ctx context.Context, p telegram.SendParams) (int64, error)
+	EditMessageText(ctx context.Context, chatID, messageID int64, text, parseMode string, buttons [][]telegram.Button) error
+	SendChatAction(ctx context.Context, to telegram.Destination, action string) error
+	AnswerCallbackQueryCtx(ctx context.Context, callbackID, text string) error
 }
 
 // MediaDownloader fetches the bytes of a media id from the core; *kit.Client satisfies it.
@@ -48,23 +51,6 @@ func (a *Adapter) Execute(ctx context.Context, act contract.Action) ([]string, e
 	}
 	return nil, kit.Permanent("invalid_action")
 }
-
-// ---- STUBS: B45 deletes execEdit, execAnswer and Typing from this block. ----
-
-func (a *Adapter) execEdit(context.Context, contract.Edit) ([]string, error) {
-	return nil, kit.Permanent("unsupported_edit")
-}
-
-func (a *Adapter) execAnswer(context.Context, contract.AnswerAction) ([]string, error) {
-	return nil, kit.Permanent("unsupported_answer")
-}
-
-// Typing is a stub until B45.
-func (a *Adapter) Typing(context.Context, string) error {
-	return kit.Permanent("unsupported_typing")
-}
-
-// ---- END B45 STUBS ----
 
 // ---- STUB: B46 deletes execMedia from this block. ----
 
