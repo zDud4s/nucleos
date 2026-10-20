@@ -663,6 +663,47 @@ pub async fn budget_permits_new_run(pool: &SqlitePool, now: DateTime<Utc>) -> Bu
     }
 }
 
+/// The budget as the wire and the channel texts show it: the configuration, what has been spent
+/// against it and whether a new run would be admitted right now.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BudgetSnapshot {
+    pub limit_usd: Option<f64>,
+    pub period: String,
+    pub hourly_limit_usd: Option<f64>,
+    pub per_run_reserve_usd: f64,
+    pub time_cost_per_hour_usd: f64,
+    pub window_spend_usd: f64,
+    pub hourly_spend_usd: f64,
+    pub paused: bool,
+    pub reason: Option<String>,
+    /// The spend ceiling of one relay chain (0194) — beside the house budget, not part of it.
+    pub relay_chain_limit_usd: f64,
+}
+
+/// Reads the whole budget picture at `now`. Errors only when a read fails; a pause is a value.
+pub async fn snapshot(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<BudgetSnapshot> {
+    let config = load_budget_config(pool).await?;
+    let window_spend_usd = window_spend(pool, now).await?;
+    let hourly_spend_usd = hourly_spend(pool, now).await?;
+    let relay_chain_limit_usd = load_relay_chain_limit(pool).await?;
+    let (paused, reason) = match budget_permits_new_run(pool, now).await {
+        BudgetDecision::Allow => (false, None),
+        BudgetDecision::Pause { reason, .. } => (true, Some(reason)),
+    };
+    Ok(BudgetSnapshot {
+        limit_usd: config.limit_usd,
+        period: config.period.as_db_str().to_string(),
+        hourly_limit_usd: config.hourly_limit_usd,
+        per_run_reserve_usd: config.per_run_reserve_usd,
+        time_cost_per_hour_usd: config.time_cost_per_hour_usd,
+        window_spend_usd,
+        hourly_spend_usd,
+        paused,
+        reason,
+        relay_chain_limit_usd,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1684,6 +1725,56 @@ mod tests {
             budget_permits_new_run(&pool, now).await,
             BudgetDecision::Pause { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_of_an_unlimited_house_is_not_paused() {
+        let pool = test_pool().await;
+        let now = ts("2026-07-20T12:00:00Z");
+
+        let snap = snapshot(&pool, now).await.unwrap();
+
+        assert_eq!(snap.limit_usd, None);
+        assert_eq!(snap.hourly_limit_usd, None);
+        assert!(!snap.paused);
+        assert_eq!(snap.reason, None);
+        assert_eq!(snap.window_spend_usd, 0.0);
+        assert_eq!(snap.hourly_spend_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_over_budget_is_paused_with_a_reason() {
+        let pool = test_pool().await;
+        set_budget_config(
+            &pool,
+            &BudgetConfig {
+                limit_usd: Some(2.0),
+                period: BudgetPeriod::Monthly,
+                hourly_limit_usd: None,
+                per_run_reserve_usd: 0.5,
+                time_cost_per_hour_usd: 3.0,
+            },
+        )
+        .await
+        .unwrap();
+        let now = ts("2026-07-20T12:00:00Z");
+        insert_run(
+            &pool,
+            "worktree",
+            Some("a"),
+            Some(1.8),
+            "2026-07-10T09:00:00Z",
+            Some("2026-07-10T09:10:00Z"),
+        )
+        .await;
+
+        let snap = snapshot(&pool, now).await.unwrap();
+
+        assert_eq!(snap.limit_usd, Some(2.0));
+        assert_eq!(snap.period, "monthly");
+        assert!(snap.paused);
+        assert!(snap.reason.is_some_and(|reason| !reason.is_empty()));
+        assert!(snap.window_spend_usd > 1.0);
     }
 
     #[tokio::test]

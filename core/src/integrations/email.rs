@@ -723,6 +723,117 @@ pub async fn get_cursor(pool: &sqlx::SqlitePool, mailbox: &str) -> sqlx::Result<
     }))
 }
 
+/// One inbound message as the mail list shows it.
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct QueuedEmail {
+    pub id: i64,
+    pub from_addr: String,
+    pub from_name: Option<String>,
+    pub subject: Option<String>,
+    pub received_at: String,
+    pub triage_class: Option<String>,
+    pub triage_summary: Option<String>,
+    pub triaged_at: Option<String>,
+    pub has_attachments: i64,
+    /// The standing human decision about this sender — `pin`, `mute`, or none.
+    ///
+    /// Carried on the row rather than fetched per sender, because it is what the button in the list
+    /// has to be drawn from: without it every row would have to ask separately, and a list of forty
+    /// messages would open forty requests to render forty small pieces of state.
+    pub sender_verdict: Option<String>,
+}
+
+/// The inbound mail list, newest arrival first, optionally narrowed by a search.
+///
+/// `search` is the already-trimmed, non-empty text of `?q=`; the FTS expression is derived from it
+/// here. Searching narrows this list rather than being a list of its own, so the ordering, the limit
+/// and the `inbound` filter are stated once and hold either way. 0058 indexes only what survives
+/// triage — sender, subject, and the locally-written summary — so a search for a word that was only
+/// ever in a body finds nothing, which is the correct answer once the body is gone.
+///
+/// Newest arrival first — the order a mailbox is read in. Deliberately NOT by triage time: a
+/// verdict landing now would otherwise drag a week-old message to the top, and a list that
+/// reorders itself while you read it is one you lose your place in.
+///
+/// This list is the mail that came in; the user's own sent mail is held for what it says about a
+/// correspondent, and filtering it also stops sent mail consuming `limit` slots.
+///
+/// Sorting `received_at` as text is a chronological sort because the sidecar normalises the
+/// server's INTERNALDATE to UTC (`...Z`), so every value shares one offset. `id` breaks ties
+/// within a second, which a bulk delivery produces routinely. `failed` sorts with the rest rather
+/// than being hidden: it is the class most likely to be requeued, so it must stay findable.
+pub async fn queue_search(
+    pool: &sqlx::SqlitePool,
+    limit: i64,
+    search: Option<&str>,
+) -> sqlx::Result<Vec<QueuedEmail>> {
+    let search = search.map(|raw| (raw, crate::search::fts_query(raw)));
+
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, from_addr, from_name, subject, received_at, triage_class, triage_summary,
+                triaged_at, has_attachments, NULL AS sender_verdict
+           FROM emails
+          WHERE direction = 'inbound'",
+    );
+    if let Some((raw, fts)) = &search {
+        builder
+            .push(" AND (subject LIKE ")
+            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
+            .push(" ESCAPE '\\' OR from_addr LIKE ")
+            .push_bind(format!("%{}%", crate::search::escape_like(raw)))
+            .push(" ESCAPE '\\'");
+        if fts.is_empty() {
+            builder.push(" OR 0");
+        } else {
+            builder
+                .push(" OR id IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ")
+                .push_bind(fts)
+                .push(")");
+        }
+        builder.push(")");
+    }
+    builder
+        .push(" ORDER BY received_at DESC, id DESC LIMIT ")
+        .push_bind(limit);
+
+    let mut queue = builder
+        .build_query_as::<QueuedEmail>()
+        .fetch_all(pool)
+        .await?;
+
+    // Filled in afterwards rather than joined in SQL, because matching `emails.from_addr` to a
+    // contact means applying `contacts::normalize_address` — which strips a display name's angle
+    // brackets as well as lowercasing. Writing that as `LOWER(TRIM(...))` in the query would be a
+    // second, subtly different definition of the same rule, and it would disagree exactly for the
+    // senders whose header carries a name. One definition, applied here.
+    //
+    // The set is every address whose contact carries a standing verdict — only what a human pinned
+    // or muted, so it is small regardless of how much mail there is.
+    let overrides: Vec<(String, String)> = sqlx::query_as(
+        "SELECT addresses.address, overrides.verdict
+           FROM contact_overrides AS overrides
+           JOIN contact_addresses AS addresses
+             ON addresses.contact_id = overrides.contact_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let by_address: std::collections::HashMap<String, String> = overrides.into_iter().collect();
+    for message in &mut queue {
+        message.sender_verdict = by_address
+            .get(&crate::integrations::contacts::normalize_address(
+                &message.from_addr,
+            ))
+            .cloned();
+    }
+
+    Ok(queue)
+}
+
+/// The inbound mail list with no search; the shape the channel layer asks for.
+pub async fn queue(pool: &sqlx::SqlitePool, limit: i64) -> sqlx::Result<Vec<QueuedEmail>> {
+    queue_search(pool, limit, None).await
+}
+
 #[cfg(test)]
 mod tests {
     /// The account whose mailbox these tests read: the address every fixture message is from, so a `Sent` folder holding them is this account's own.
@@ -2283,6 +2394,175 @@ mod tests {
                 last_uid: 41,
                 updated_at: "2026-07-28T10:00:00+00:00".to_string(),
             })
+        );
+    }
+
+    async fn insert_inbound(
+        pool: &sqlx::SqlitePool,
+        uid: i64,
+        from_addr: &str,
+        subject: &str,
+        received_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, subject,
+                                 received_at, ingested_at, direction)
+             VALUES (?, 'INBOX', 1, ?, ?, ?, ?, ?, 'inbound')",
+        )
+        .bind(format!("<q{uid}@x>"))
+        .bind(uid)
+        .bind(from_addr)
+        .bind(subject)
+        .bind(received_at)
+        .bind(received_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_lists_inbound_mail_newest_first() {
+        let pool = test_pool().await;
+        insert_inbound(&pool, 1, "a@x.com", "oldest", "2026-07-28T09:00:00Z").await;
+        insert_inbound(&pool, 2, "b@x.com", "newest", "2026-07-28T11:00:00Z").await;
+        insert_inbound(&pool, 3, "c@x.com", "middle", "2026-07-28T10:00:00Z").await;
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, subject,
+                                 received_at, ingested_at, direction)
+             VALUES ('<sent@x>', 'Sent', 1, 9, 'me@x.com', 'mine',
+                     '2026-07-28T12:00:00Z', '2026-07-28T12:00:00Z', 'outbound')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let subjects: Vec<Option<String>> = queue(&pool, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|mail| mail.subject)
+            .collect();
+        assert_eq!(
+            subjects,
+            vec![
+                Some("newest".to_string()),
+                Some("middle".to_string()),
+                Some("oldest".to_string())
+            ]
+        );
+        assert_eq!(queue(&pool, 2).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_search_narrows_by_subject_and_sender() {
+        let pool = test_pool().await;
+        insert_inbound(
+            &pool,
+            1,
+            "rita@example.com",
+            "Fatura de julho",
+            "2026-07-28T09:00:00Z",
+        )
+        .await;
+        insert_inbound(
+            &pool,
+            2,
+            "bruno@example.com",
+            "Almoco",
+            "2026-07-28T10:00:00Z",
+        )
+        .await;
+
+        let by_subject = queue_search(&pool, 10, Some("Fatura")).await.unwrap();
+        assert_eq!(by_subject.len(), 1);
+        assert_eq!(by_subject[0].from_addr, "rita@example.com");
+
+        let by_sender = queue_search(&pool, 10, Some("bruno")).await.unwrap();
+        assert_eq!(by_sender.len(), 1);
+        assert_eq!(by_sender[0].subject.as_deref(), Some("Almoco"));
+
+        assert!(
+            queue_search(&pool, 10, Some("inexistente"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Nothing searchable reaches MATCH as an empty expression: answered, not an error.
+        assert!(
+            queue_search(&pool, 10, Some("\"\"\""))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(queue_search(&pool, 10, None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_search_fills_sender_verdict_for_a_pinned_or_muted_contact() {
+        let pool = test_pool().await;
+        insert_inbound(
+            &pool,
+            1,
+            "Maria Silva <Maria@Example.com>",
+            "one",
+            "2026-07-28T09:00:00Z",
+        )
+        .await;
+        insert_inbound(&pool, 2, "joao@example.com", "two", "2026-07-28T10:00:00Z").await;
+        insert_inbound(
+            &pool,
+            3,
+            "stranger@example.com",
+            "three",
+            "2026-07-28T11:00:00Z",
+        )
+        .await;
+
+        for (address, verdict) in [("maria@example.com", "pin"), ("joao@example.com", "mute")] {
+            let contact_id =
+                sqlx::query("INSERT INTO contacts (display_name, created_at) VALUES (NULL, ?)")
+                    .bind("2026-07-28T08:00:00Z")
+                    .execute(&pool)
+                    .await
+                    .unwrap()
+                    .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO contact_addresses (
+                     address, contact_id, first_seen, last_seen, messages_in, outbound_ever
+                 )
+                 VALUES (?, ?, ?, ?, 1, 0)",
+            )
+            .bind(address)
+            .bind(contact_id)
+            .bind("2026-07-28T08:00:00Z")
+            .bind("2026-07-28T08:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO contact_overrides (contact_id, verdict, set_at) VALUES (?, ?, ?)",
+            )
+            .bind(contact_id)
+            .bind(verdict)
+            .bind("2026-07-28T08:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let verdicts: Vec<(String, Option<String>)> = queue_search(&pool, 10, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|mail| (mail.subject.unwrap(), mail.sender_verdict))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("three".to_string(), None),
+                ("two".to_string(), Some("mute".to_string())),
+                ("one".to_string(), Some("pin".to_string())),
+            ]
         );
     }
 }

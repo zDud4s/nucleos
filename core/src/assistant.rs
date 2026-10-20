@@ -364,6 +364,7 @@ mod tests {
             token: Token("t".into()),
             pool: test_pool().await,
             telegram_doctrine: None,
+            channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,

@@ -904,6 +904,7 @@ mod tests {
             token: crate::auth::Token("control-token".into()),
             pool: test_pool().await,
             telegram_doctrine: None,
+            channels: Default::default(),
             runner,
             triage_runner: None,
             local_triage_disabled: None,

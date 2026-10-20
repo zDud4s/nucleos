@@ -173,7 +173,7 @@ pub enum Refusal {
     /// an archived row as gone (`archived_at IS NULL`), so a relay follows the same rule rather than
     /// inventing a second meaning of "absent" that only this module believes.
     NoSuchDestination { to_chat_id: String },
-    /// The sending turn's `origin` is `Origin::Telegram`. Named on its own rather than left to fall
+    /// The sending turn's `origin` is remote (`Origin::is_remote`: Telegram or any channel). Named on its own rather than left to fall
     /// out of some other rule, because a boundary that only holds by accident of what else happens
     /// to be configured is not one a reader can trust — see this module's header.
     TelegramOrigin,
@@ -280,7 +280,7 @@ pub async fn admit(
     // because no cheaper rule happened to catch a Telegram turn first would move with whatever else
     // is configured — a local model wired in tomorrow could quietly let one through — and a security
     // boundary nobody can point at is not one anybody can trust.
-    if origin == crate::assistant::Origin::Telegram {
+    if origin.is_remote() {
         return Err(Refusal::TelegramOrigin);
     }
 
@@ -784,6 +784,34 @@ mod tests {
         .await
         .expect_err("a Telegram-origin turn must be refused");
         assert_eq!(refusal, Refusal::TelegramOrigin);
+    }
+
+    /// A channel-origin turn is remote exactly like Telegram; a Shell turn on the same chats is not.
+    #[tokio::test]
+    async fn channel_origin_may_not_relay_but_shell_may() {
+        let pool = test_pool().await;
+        let now = timestamp("2026-08-22T00:00:00Z");
+        seed_chat(&pool, "A", false).await;
+        seed_chat(&pool, "B", false).await;
+        seed_owner_present(&pool, now).await;
+        let run_id = seed_chain(&pool, &["A"]).await;
+
+        let refusal = admit(
+            &pool,
+            "A",
+            "B",
+            run_id,
+            Origin::Channel("telegram"),
+            "relayed words",
+            now,
+        )
+        .await
+        .expect_err("a channel-origin turn must be refused");
+        assert_eq!(refusal, Refusal::TelegramOrigin);
+
+        admit(&pool, "A", "B", run_id, Origin::Shell, "relayed words", now)
+            .await
+            .expect("a Shell turn is not remote and must pass");
     }
 
     /// A chain of `["A", "B"]` relaying back into `"A"` closes a cycle at the root, and the
