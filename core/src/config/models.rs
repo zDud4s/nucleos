@@ -15,6 +15,11 @@ pub struct ModelsConfig {
     /// Named here rather than in `~/.nucleos/voice.yaml` because pinning models is this file's whole job.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
     pub voice_cleanup_model: Option<String>,
+    /// The cheap model background one-shots (the rotation compactor) ask the runner for. Absent
+    /// picks the active runner's own default (`model_catalog::utility_default`), so a file written
+    /// before this key existed keeps working and a Codex machine is never sent a Claude alias.
+    #[serde(default, deserialize_with = "deserialize_optional_model")]
+    pub utility_model: Option<String>,
     /// Which agent CLI answers a run. Absent — or naming anything startup does not recognise — keeps
     /// the proven Claude path, so the second runner ships dark until an operator asks for it by
     /// name, the same posture `local_triage_model` gives local inference.
@@ -652,6 +657,18 @@ impl ModelsConfig {
         choices
     }
 
+    /// The model for cheap background one-shots: the explicit `utility_model` when set, else the
+    /// active runner's default among the models known now. `None` means the runner's own model.
+    pub fn utility_model(&self) -> Option<String> {
+        if let Some(explicit) = &self.utility_model {
+            return Some(explicit.clone());
+        }
+        crate::models::model_catalog::utility_default(
+            self.active_runner(),
+            &crate::models::model_catalog::cached_or_fallback(),
+        )
+    }
+
     /// Which agent CLI this daemon runs. Unknown names fall to `claude`, exactly as `main.rs` does.
     pub fn active_runner(&self) -> &str {
         match self.primary_runner.as_deref() {
@@ -848,6 +865,7 @@ impl Default for ModelsConfig {
             codex_model: "gpt-5.6-terra".to_string(),
             local_triage_model: None,
             voice_cleanup_model: None,
+            utility_model: None,
             primary_runner: None,
             plan_model: None,
             review_model: None,
@@ -1345,5 +1363,41 @@ codex_model: gpt-a
         let (fixed, problem) = cached_models_config(&path, &cache);
         assert_eq!(fixed.claude_model, "sonnet-fixed");
         assert_eq!(problem, None);
+    }
+}
+
+#[cfg(test)]
+mod utility_model_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_utility_model_wins_over_the_runner_default() {
+        let mut config = ModelsConfig {
+            utility_model: Some("my-cheap-model".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.utility_model().as_deref(), Some("my-cheap-model"));
+        config.primary_runner = Some("codex".to_string());
+        assert_eq!(config.utility_model().as_deref(), Some("my-cheap-model"));
+    }
+
+    #[test]
+    fn absent_utility_model_on_claude_falls_to_the_haiku_alias() {
+        assert_eq!(
+            ModelsConfig::default().utility_model().as_deref(),
+            Some("haiku")
+        );
+    }
+
+    #[test]
+    fn the_key_is_optional_and_blank_means_absent() {
+        let parsed: ModelsConfig = serde_yaml::from_str(
+            "claude_model: a
+codex_model: b
+utility_model: \"\"
+",
+        )
+        .unwrap();
+        assert_eq!(parsed.utility_model, None);
     }
 }

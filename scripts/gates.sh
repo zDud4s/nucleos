@@ -445,6 +445,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     # Hermetic like its neighbours: the network is behind one seam the test swaps out, so this
     # runs green on a machine with no route to OpenRouter at all.
     run "models: refresh"   . "$py" scripts/test-refresh-models.py
+    run "git: worktree sync" . "$py" scripts/test-post-checkout.py
     # One version for shell, core and sidecars: every manifest must agree with VERSION.
     run "release: versions" . "$py" scripts/bump-version.py --check
     run "release: bump"     . "$py" scripts/test-bump-version.py

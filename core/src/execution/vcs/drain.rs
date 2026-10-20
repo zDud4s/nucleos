@@ -357,6 +357,9 @@ pub async fn drain_once(
                 Outcome::AwaitingOwner { .. } => {
                     format!("vcs request {id} changes the test map and waits for your approval")
                 }
+                Outcome::AwaitingGate { reason, .. } => {
+                    format!("vcs request {id} parked — {reason}")
+                }
                 other => format!("vcs request {id} {}", other.status()),
             };
             let _ = crate::feed::append(
@@ -373,6 +376,12 @@ pub async fn drain_once(
             // `drain_once`). Only a landing that really succeeded leaves a target dir to drop.
             if matches!(outcome, Outcome::Succeeded { .. }) {
                 crate::execution::land::clean_after_landing(pool, &claimed);
+            }
+            // The push decided "not green" while its row was `running`, and a green written since
+            // found nothing to release. Looking again AFTER the park is persisted closes that
+            // window: either the gate's release saw the parked row, or this re-read sees its green.
+            if let Outcome::AwaitingGate { sha, .. } = &outcome {
+                release_if_green(pool, claimed.project_id.as_str(), sha).await;
             }
         }
         // Not a lost write: `finish` is scoped to `status = 'running'`, so this is the row being
@@ -424,6 +433,122 @@ pub(super) fn wake_worker() {
     WORKER_WAKE.send_modify(|count| *count = count.wrapping_add(1));
 }
 
+/// The post-land gate just made a sha green: puts every push of `project_id` that was parked in
+/// `awaiting_gate` back to `queued` and wakes the worker. Returns how many rows it requeued.
+///
+/// **Every parked push is released, not only the one waiting for this sha.** A parked push does not
+/// remember a sha it must wait for: it re-resolves the branch tip when it is claimed again and
+/// decides afresh (`Outcome::AwaitingGate`), so a tip that is still pending simply parks again. That
+/// costs one cheap re-claim and removes any way for a wake to be missed by comparing shas wrongly.
+///
+/// Best-effort and called after the gate's own commit: a failure here is logged and not propagated,
+/// because the gate's write has already happened and must not be reported as failed for it. The
+/// worker's sweep (`sweep_awaiting_gate`) finds a row this missed.
+pub async fn release_awaiting_gate(pool: &sqlx::SqlitePool, project_id: &str) -> u64 {
+    let released = sqlx::query(
+        "UPDATE vcs_requests SET status = 'queued', failure_reason = NULL, started_at = NULL
+          WHERE project_id = ? AND status = 'awaiting_gate'",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await;
+    match released {
+        Ok(done) => {
+            if done.rows_affected() > 0 {
+                wake_worker();
+            }
+            done.rows_affected()
+        }
+        Err(error) => {
+            tracing::warn!(project_id, %error, "could not release the pushes waiting for the post-land gate");
+            0
+        }
+    }
+}
+
+/// Releases `project_id`'s parked pushes when the stored gate state already judges `sha` green.
+async fn release_if_green(pool: &sqlx::SqlitePool, project_id: &str, sha: &str) {
+    match crate::verify::postgate::load(pool, project_id).await {
+        Ok(Some(state)) if state.is_green(sha) => {
+            release_awaiting_gate(pool, project_id).await;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(project_id, %error, "could not re-read the post-land gate's state after parking a push");
+        }
+    }
+}
+
+/// Whether a push parked on `parked` should be tried again given the stored gate `state`.
+///
+/// Yes when `parked` is green. Also yes when some OTHER sha is green and `parked` is no longer
+/// anything the gate is working on (not attempted, running or red): a later tip went green, so the
+/// push re-resolves the tip and decides afresh. The state carries no ordering, so "newer" is
+/// approximated by "the gate has moved on from `parked`"; a parked sha the gate has simply not
+/// started yet may re-park once per sweep until it does, which is bounded and rare.
+pub(super) fn parked_push_may_proceed(
+    state: &crate::verify::postgate::State,
+    parked: &str,
+) -> bool {
+    if state.is_green(parked) {
+        return true;
+    }
+    let other_green = [&state.last_green_sha, &state.covered_sha]
+        .into_iter()
+        .flatten()
+        .any(|green| green != parked);
+    let gate_still_on_it = [
+        &state.last_attempted_sha,
+        &state.running_sha,
+        &state.red_sha,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|sha| sha == parked);
+    other_green && !gate_still_on_it
+}
+
+/// Releases parked pushes whose wake was missed (a restart, a failed release, a lost race): for each
+/// project with `awaiting_gate` rows, one state load, and a release only when
+/// [`parked_push_may_proceed`] holds for some parked row. Not unconditional, because a re-park
+/// writes a feed line each time. Returns how many rows it requeued.
+pub async fn sweep_awaiting_gate(pool: &sqlx::SqlitePool) -> u64 {
+    let parked: Vec<(String, Option<String>)> = match sqlx::query_as(
+        "SELECT project_id, output_tail FROM vcs_requests WHERE status = 'awaiting_gate'",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(parked) => parked,
+        Err(error) => {
+            tracing::warn!(%error, "vcs: could not look for pushes parked for the post-land gate");
+            return 0;
+        }
+    };
+    let mut by_project: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (project_id, sha) in parked {
+        by_project
+            .entry(project_id)
+            .or_default()
+            .push(sha.unwrap_or_default());
+    }
+    let mut released = 0;
+    for (project_id, shas) in by_project {
+        let state = match crate::verify::postgate::load(pool, &project_id).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(project_id, %error, "vcs: could not read the post-land gate's state for a parked push");
+                continue;
+            }
+        };
+        let Some(state) = state else { continue };
+        if shas.iter().any(|sha| parked_push_may_proceed(&state, sha)) {
+            released += release_awaiting_gate(pool, &project_id).await;
+        }
+    }
+    released
+}
+
 /// Drains every repository with queued work, forever. Spawned once by `main.rs`.
 ///
 /// One task per repository per tick, rather than a loop over repositories: draining them in sequence
@@ -452,6 +577,9 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
         // Marked seen BEFORE the query: a wake fired after this point makes `changed()` return at
         // once, so a request enqueued while this pass runs is never slept through.
         wake.borrow_and_update();
+        // At start and on every tick: parked pushes survive a restart and a missed wake, and the
+        // query below only sees `queued`. Before it, so a row released here drains in this pass.
+        sweep_awaiting_gate(&pool).await;
         let repositories: Vec<String> = match sqlx::query_scalar(
             "SELECT DISTINCT repo_key FROM vcs_requests WHERE status = 'queued'",
         )

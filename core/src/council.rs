@@ -908,6 +908,7 @@ mod tests {
             runner,
             triage_runner: None,
             local_triage_disabled: None,
+            utility_model: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             files_root: None,
             files_trash: None,

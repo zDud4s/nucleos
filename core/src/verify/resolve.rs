@@ -300,12 +300,29 @@ pub(super) async fn cover_base(
         )));
     }
 
+    newest_proof(&state, worktree_root, deadline)
+        .await?
+        .ok_or_else(|| {
+            VerifyError::Unprocessable(format!(
+                "no green or covered commit of {branch} is in this worktree's history; merge {branch} first",
+                branch = branch.as_str()
+            ))
+        })
+}
+
+/// The newest of the gate's `covered_sha` / `last_green_sha` that resolves in `worktree_root` and
+/// is an ancestor of its `HEAD`, or `None` when neither qualifies.
+async fn newest_proof(
+    state: &verify_postgate::State,
+    worktree_root: &Path,
+    deadline: Instant,
+) -> Result<Option<String>, VerifyError> {
     let mut kept: Vec<String> = Vec::new();
-    for candidate in [state.covered_sha, state.last_green_sha]
+    for candidate in [&state.covered_sha, &state.last_green_sha]
         .into_iter()
         .flatten()
     {
-        let Ok(sha) = resolve_commit(worktree_root, &candidate, deadline).await else {
+        let Ok(sha) = resolve_commit(worktree_root, candidate, deadline).await else {
             continue;
         };
         if kept.contains(&sha) {
@@ -317,22 +334,57 @@ pub(super) async fn cover_base(
     }
 
     match kept.as_slice() {
-        [] => Err(VerifyError::Unprocessable(format!(
-            "no green or covered commit of {branch} is in this worktree's history; merge {branch} first",
-            branch = branch.as_str()
-        ))),
-        [only] => Ok(only.clone()),
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
         [first, second] => {
             // The newer of the two is the one the other is an ancestor of; unrelated proofs are
             // both valid bases, and the first (`covered_sha`) is the more recently measured.
             if is_ancestor(worktree_root, first, second, deadline).await? {
-                Ok(second.clone())
+                Ok(Some(second.clone()))
             } else {
-                Ok(first.clone())
+                Ok(Some(first.clone()))
             }
         }
         _ => unreachable!("there are two candidates at most"),
     }
+}
+
+/// The `NUCLEOS_GATE_BASE` for a unit the post-merge gate runs in `worktree_root`: what the
+/// project's `gate_command` (`gate-diff.sh`) diffs `HEAD` from to choose its targets.
+///
+/// The newest green or covered commit that `HEAD` descends from; with none, the repository's root
+/// commit, so the diff spans the whole tree and every target is selected. Never empty on success:
+/// the gate worktree sits at the target's tip, where `gate-diff.sh`'s own default base (the merge
+/// base with `master`) is `HEAD` itself and selects nothing. `None` only when git cannot answer.
+/// Read from the stored state at run time because a unit is started again by crash recovery and by
+/// bisect probes, not only by the tick that first queued it.
+pub(super) async fn postgate_gate_base(
+    pool: &SqlitePool,
+    project_id: &str,
+    worktree_root: &Path,
+    deadline: Instant,
+) -> Option<String> {
+    let state = verify_postgate::load(pool, project_id).await.ok().flatten();
+    if let Some(state) = state
+        && let Ok(Some(sha)) = newest_proof(&state, worktree_root, deadline).await
+    {
+        return Some(sha);
+    }
+    let roots = git(
+        worktree_root,
+        &["rev-list", "--max-parents=0", "HEAD"],
+        deadline,
+    )
+    .await
+    .ok()?;
+    if !roots.succeeded() {
+        return None;
+    }
+    roots
+        .stdout
+        .lines()
+        .next()
+        .map(|root| root.trim().to_owned())
 }
 
 /// Whether `ancestor` is an ancestor of `descendant` (or the same commit) in `repo`.

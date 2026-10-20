@@ -424,6 +424,11 @@ impl CommandRunner for ClaudeCliRunner {
                     if let Some(request_tx) = request_tx.take() {
                         let _ = request_tx.send(());
                     }
+                    if let Some(source) = super::auth_watch::api_key_source(&v) {
+                        super::auth_watch::report(super::auth_watch::AuthSignal::Source(
+                            source.to_string(),
+                        ));
+                    }
                     let advertised = advertised_tools_from_init(&v);
                     if let Some(reason) =
                         advertised_tools_violate(request.tool_policy, advertised.as_deref())
@@ -445,6 +450,10 @@ impl CommandRunner for ClaudeCliRunner {
                         // A turn that ended has no tool call left running, whatever it opened.
                         open_tools.clear();
                         turn_ended = true;
+                        // `line` is the `result` that ended the turn, which is all the 429 test reads.
+                        super::auth_watch::report(super::auth_watch::AuthSignal::TurnEnded {
+                            rate_limited: failed_on_rate_limit(&line),
+                        });
                         usage = turn.usage;
                         if turn.cost_usd.is_some() {
                             cost_usd = Some(splitter.spent());

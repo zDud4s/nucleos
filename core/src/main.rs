@@ -130,6 +130,9 @@ async fn main() {
 
     startup::reconcile_after_restart(&pool).await;
 
+    // Before anything can launch a Claude run, so the first run's credential is already watched.
+    execution::runner::watch_claude_auth(pool.clone());
+
     let token_value = match secrets::daemon_token(
         secrets::load_secret(TOKEN_KEY),
         // Only a FIRST start mints: a token already in the store is returned as it is, prefixed or
@@ -750,6 +753,7 @@ async fn main() {
         runner: primary_runner,
         triage_runner,
         local_triage_disabled,
+        utility_model: models_config.utility_model(),
         assistants,
         files_root,
         files_trash,
@@ -1031,12 +1035,37 @@ async fn main() {
     // `POST /verify` submits to it, so the handlers need the very instance the worker drains: it is
     // parked in `verify::install` (an `OnceLock`, because `AppState` is built literally in dozens of
     // places) before the worker starts. The restart above hands interrupted units straight back to it.
+    let admission = Arc::new(execution::admission::AdmissionBook::from_config(
+        &verify_config.admission,
+    ));
+    let admission_enabled = verify_config.admission.enabled;
     let verify_executor = verify::exec::Executor::new(
         state.pool.clone(),
         verify_config,
         machine_config_root.clone(),
     );
     verify::install(verify_executor.clone());
+    if admission_enabled {
+        // The runs' heavy commands and verify units draw on one budget, verify first.
+        execution::admission::install(admission.clone());
+        verify_executor.share_budget(admission.clone());
+        // Reclaim the grants and waiters of runs that no longer exist.
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                let live: std::collections::HashSet<i64> = sweep_state
+                    .run_handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .keys()
+                    .copied()
+                    .collect();
+                admission.sweep(&live);
+            }
+        });
+    }
     // Off for every project unless its rules set `gate_after_land`.
     tokio::spawn(verify::postgate_worker::run_postgate_worker(
         verify_executor.clone(),

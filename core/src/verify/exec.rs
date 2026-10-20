@@ -10,15 +10,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tokio::sync::Notify;
 
 use crate::config::VerifyConfig;
+use crate::execution::admission::{AdmissionBook, VerifyGrant};
 use crate::gate::{self, ArgvOutcome};
 use crate::tests_map::{self, MapState};
+use crate::verify::resolve;
 use crate::verify::runs::{self as verify_runs, Claimed, Request, State, Submitted};
 use crate::verify_sched::{self, Candidate};
 use crate::warm;
@@ -34,6 +36,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(30 * 60);
 /// How often a unit looks again at a warm dir the sweep is removing.
 const REMOVING_POLL: Duration = Duration::from_millis(100);
 const GIB: u64 = 1024 * 1024 * 1024;
+/// Budget for the few git reads that find a post-merge gate unit's `NUCLEOS_GATE_BASE`.
+const GATE_BASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Weight of a unit: what the heavy-command broker charges for the same program.
 /// `cargo` (any case, with or without `.exe`) weighs 2, everything else 1, never above `capacity`.
@@ -109,6 +113,8 @@ pub struct Executor {
     in_flight: Mutex<InFlight>,
     /// A warm sweep is running; the next tick skips rather than overlap it.
     sweeping: AtomicBool,
+    /// The runs' heavy-command budget, shared once at startup ([`Self::share_budget`]).
+    admission: OnceLock<Arc<AdmissionBook>>,
 }
 
 /// Holds a unit's weight and warm dirs; gives them back on drop, whatever path ended the unit.
@@ -116,6 +122,8 @@ struct Reservation {
     executor: Arc<Executor>,
     weight: i64,
     dirs: Vec<PathBuf>,
+    /// The unit's share of the runs' budget; returned when the reservation drops.
+    _admission: Option<VerifyGrant>,
 }
 
 impl Reservation {
@@ -162,7 +170,14 @@ impl Executor {
             wake: Arc::new(Notify::new()),
             in_flight: Mutex::new(InFlight::default()),
             sweeping: AtomicBool::new(false),
+            admission: OnceLock::new(),
         })
+    }
+
+    /// Draw units from the runs' heavy-command budget too, and get woken when it frees up.
+    pub fn share_budget(&self, book: Arc<AdmissionBook>) {
+        book.set_verify_wake(self.wake.clone());
+        let _ = self.admission.set(book);
     }
 
     /// Short critical sections only; never held across an `.await`.
@@ -227,9 +242,16 @@ impl Executor {
             let picked = {
                 let mut state = self.lock();
                 let capacity = self.capacity();
+                let book = self.admission.get();
+                // The most a unit can ever be granted: with a shared book, the smaller of the
+                // two capacities, or a unit heavier than the book would never be picked.
+                let ceiling = match book {
+                    Some(book) => capacity.min(i64::from(book.capacity())).max(1),
+                    None => capacity,
+                };
                 // A row queued under a larger capacity would never fit: charge it the whole
-                // capacity instead. Picked, reserved and released with this same value.
-                let charge = |weight: i64| weight.clamp(1, capacity);
+                // ceiling instead. Picked, reserved and released with this same value.
+                let charge = |weight: i64| weight.clamp(1, ceiling);
                 let candidates: Vec<Candidate> = queued
                     .iter()
                     .map(|q| Candidate {
@@ -240,23 +262,57 @@ impl Executor {
                         enqueued_ms: q.enqueued_ms,
                     })
                     .collect();
-                let free = capacity - state.used;
-                let chosen =
-                    verify_sched::pick(&candidates, free, &state.last_start, now_ms(), aging_ms)
-                        .and_then(|id| queued.iter().find(|q| q.id == id));
-                chosen.map(|chosen| {
-                    let weight = charge(chosen.weight);
-                    state.used += weight;
-                    (chosen.id, weight, chosen.project_id.clone())
-                })
+                let own_free = capacity - state.used;
+                // With a shared book a unit also needs the runs' budget to have room.
+                let free = match book {
+                    Some(book) => own_free.min(i64::from(book.free())),
+                    None => own_free,
+                };
+                let pick = |free: i64, last_start: &HashMap<Option<String>, u64>| {
+                    verify_sched::pick(&candidates, free, last_start, now_ms(), aging_ms)
+                        .and_then(|id| queued.iter().find(|q| q.id == id))
+                };
+                let chosen = pick(free, &state.last_start);
+                match (chosen, book) {
+                    (Some(chosen), book) => {
+                        let weight = charge(chosen.weight);
+                        let grant = match book {
+                            Some(book) => {
+                                let grant =
+                                    book.try_take_verify(u32::try_from(weight).unwrap_or(1));
+                                if grant.is_none() {
+                                    // Lost the room to a run between the read and the take.
+                                    book.set_verify_demand(true);
+                                    break;
+                                }
+                                grant
+                            }
+                            None => None,
+                        };
+                        state.used += weight;
+                        Some((chosen.id, weight, chosen.project_id.clone(), grant))
+                    }
+                    (None, Some(book)) => {
+                        // Held back by the shared budget alone: hold the runs back in turn.
+                        let blocked =
+                            free < own_free && pick(own_free, &state.last_start).is_some();
+                        book.set_verify_demand(blocked);
+                        if blocked {
+                            break;
+                        }
+                        None
+                    }
+                    (None, None) => None,
+                }
             };
-            let Some((id, weight, project)) = picked else {
+            let Some((id, weight, project, grant)) = picked else {
                 break;
             };
             let reservation = Reservation {
                 executor: Arc::clone(self),
                 weight,
                 dirs: Vec::new(),
+                _admission: grant,
             };
             let claimed = match verify_runs::claim(&self.pool, id).await {
                 Ok(Some(claimed)) => claimed,
@@ -318,6 +374,38 @@ impl Executor {
             }
         }
     }
+
+    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate requested; empty for any other unit.
+    ///
+    /// The gate runs in a worktree at the target's tip, where `gate-diff.sh` defaults its base to
+    /// the merge base with `master` — `HEAD` itself — and so gates nothing. Computed here, from
+    /// the stored state, rather than when the unit is queued: crash recovery and bisect probes run
+    /// units the tick that queued them never saw.
+    async fn gate_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
+        let (verify_runs::REQUESTED_BY_POSTGATE, Some(project)) =
+            (claimed.requested_by.as_str(), claimed.project_id.as_deref())
+        else {
+            return Vec::new();
+        };
+        let deadline = Instant::now() + GATE_BASE_TIMEOUT;
+        match resolve::postgate_gate_base(
+            &self.pool,
+            project,
+            Path::new(&claimed.worktree),
+            deadline,
+        )
+        .await
+        {
+            Some(base) => vec![("NUCLEOS_GATE_BASE".to_owned(), base)],
+            None => {
+                tracing::warn!(
+                    id = claimed.id,
+                    "verify executor: no gate base; the unit runs with gate-diff's own default"
+                );
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Runs one claimed unit to its terminal row. The reservation is released when it drops.
@@ -328,7 +416,8 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
             reservation.hold_dir(dir).await;
         }
     }
-    let env = executor.warm_env(&claimed).await;
+    let mut env = executor.warm_env(&claimed).await;
+    env.extend(executor.gate_env(&claimed).await);
     let argv = final_argv(&executor.config.broker_prefix, &claimed.argv);
     let timeout_ms = if claimed.timeout_ms > 0 {
         u64::try_from(claimed.timeout_ms).unwrap_or(u64::MAX)
@@ -479,6 +568,7 @@ pub async fn run_executor(executor: Arc<Executor>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::admission::{AdmissionBook, Poll};
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
@@ -710,6 +800,93 @@ mod tests {
         worker.abort();
     }
 
+    /// An executor of `capacity` that shares `book` with the runs' admission.
+    async fn sharing(capacity: u32, root: &Path, book: &Arc<AdmissionBook>) -> Arc<Executor> {
+        let ex = executor(capacity, root).await;
+        ex.share_budget(Arc::clone(book));
+        ex
+    }
+
+    fn private_book(capacity: u32) -> Arc<AdmissionBook> {
+        Arc::new(AdmissionBook::new(
+            capacity,
+            Duration::from_secs(900),
+            Duration::from_secs(7200),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_unit_waits_while_runs_hold_the_shared_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(1);
+        // A heavy command of a run holds the whole shared budget; the executor alone has room.
+        assert!(matches!(book.request(1, "a", 1), Poll::Granted { .. }));
+        let ex = sharing(4, root.path(), &book).await;
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 1))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 0);
+        assert_eq!(ex.lock().used, 0, "a refused take leaves no weight behind");
+        let waiting = ex.get(submitted.id).await.unwrap().unwrap();
+        assert_eq!(waiting.status, verify_runs::STATUS_QUEUED);
+
+        assert!(book.release(1, "a"));
+        assert_eq!(ex.start_ready().await, 1);
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        assert_eq!(book.free(), 1, "the unit gives its grant back when it ends");
+    }
+
+    #[tokio::test]
+    async fn a_unit_the_shared_budget_cannot_fit_raises_demand() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(2);
+        assert!(matches!(book.request(1, "a", 1), Poll::Granted { .. }));
+        let ex = sharing(4, root.path(), &book).await;
+        // Two units wide: the executor fits it, the shared budget (one free) does not.
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 2))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 0);
+        assert!(
+            book.snapshot().verify_demand,
+            "a unit that only the shared budget holds back must hold the runs back in turn"
+        );
+
+        assert!(book.release(1, "a"));
+        assert_eq!(ex.start_ready().await, 1);
+        assert!(
+            !book.snapshot().verify_demand,
+            "demand drops once the queue is empty"
+        );
+        wait_terminal(&ex, submitted.id).await;
+    }
+
+    #[tokio::test]
+    async fn a_unit_heavier_than_the_shared_book_still_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let book = private_book(1);
+        let ex = sharing(4, root.path(), &book).await;
+        // Two units wide, but the shared book holds one: it is charged the book's whole capacity.
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 2))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        assert!(
+            !book.snapshot().verify_demand,
+            "a unit that fits once clamped must not hold the runs back"
+        );
+        let state = wait_terminal(&ex, submitted.id).await;
+        assert_eq!(state.status, verify_runs::STATUS_PASSED);
+        assert_eq!(book.free(), 1, "the unit gives its grant back when it ends");
+    }
+
     #[tokio::test]
     async fn a_dir_in_use_cannot_be_reserved_for_removal() {
         let root = tempfile::tempdir().unwrap();
@@ -764,6 +941,7 @@ mod tests {
             id: 0,
             project_id: Some("proj".to_owned()),
             worktree: wt.path().to_string_lossy().into_owned(),
+            requested_by: "agent".to_owned(),
             argv: strings(&["git", "--version"]),
             weight: 1,
             timeout_ms: 1000,
@@ -779,6 +957,131 @@ mod tests {
             .expect("NUCLEOS_PROBE_DIR is in the env");
         assert_eq!(value, expected);
         assert!(expected.is_dir());
+    }
+
+    /// Runs git in `dir`, asserts it succeeded, and returns its trimmed stdout.
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository with three empty commits; returns its dir and the shas, oldest first.
+    fn history() -> (tempfile::TempDir, Vec<String>) {
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q"]);
+        let shas = (0..3)
+            .map(|n| {
+                git_in(
+                    repo.path(),
+                    &["commit", "-q", "--allow-empty", "-m", &format!("c{n}")],
+                );
+                git_in(repo.path(), &["rev-parse", "HEAD"])
+            })
+            .collect();
+        (repo, shas)
+    }
+
+    async fn store_postgate(pool: &SqlitePool, last_green: Option<&str>, covered: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, last_green_sha, covered_sha) \
+             VALUES ('proj', 'main', ?, ?)",
+        )
+        .bind(last_green)
+        .bind(covered)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn claimed_in(worktree: &Path, requested_by: &str) -> Claimed {
+        Claimed {
+            id: 0,
+            project_id: Some("proj".to_owned()),
+            worktree: worktree.to_string_lossy().into_owned(),
+            requested_by: requested_by.to_owned(),
+            argv: strings(&["git", "--version"]),
+            weight: 1,
+            timeout_ms: 1000,
+        }
+    }
+
+    fn gate_base(env: &[(String, String)]) -> Option<&str> {
+        env.iter()
+            .find(|(var, _)| var == "NUCLEOS_GATE_BASE")
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_diffs_from_the_last_green_ancestor() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_takes_the_newer_of_covered_and_green() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[0]), Some(&shas[1])).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_with_no_green_ancestor_diffs_from_the_root_commit() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+
+        // No state at all.
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+
+        // A green that is not in this history (nor even a commit here) is no base either.
+        store_postgate(&ex.pool, Some(&"0".repeat(40)), None).await;
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_postgate_unit_ignores_a_green_that_is_not_an_ancestor() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        // Recorded as green, then the gated commit moved back before it.
+        store_postgate(&ex.pool, Some(&shas[2]), None).await;
+        git_in(repo.path(), &["reset", "-q", "--hard", &shas[0]]);
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[0].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_unit_the_gate_did_not_request_gets_no_gate_base() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        let claimed = claimed_in(repo.path(), "agent");
+        assert!(ex.gate_env(&claimed).await.is_empty());
     }
 
     #[test]
