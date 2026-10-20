@@ -44,7 +44,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 keyring = { version = "4.1.5", features = ["windows-native-keyring-store"] }
-tauri = { version = "2", features = ["tray-icon"] }
+# `unstable`: `Window::add_child` and `Manager::get_webview`/`get_window`, which the integrated
+# browser (`browser.rs`) builds its child webviews with.
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -72,6 +74,13 @@ tauri-plugin-notification = "2"
 # CI builds the release bundle with this on. Dev and update-shell builds leave it off, so
 # they never spawn a daemon nor offer updates.
 release-bundle = []
+
+[target.'cfg(windows)'.dependencies]
+# WebView2 itself, for `browser.rs`: back/forward/stop, `CanGoBack`/`CanGoForward` and the
+# `ProcessFailed` event, none of which tauri wraps. Already in Cargo.lock at this version
+# (0.39.1, a dependency of wry 0.57 and tauri-runtime-wry 2.12), so this declares what is built
+# rather than adding a crate; only the shell package's own dependency list in the lock changes.
+webview2-com = "0.39"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The Linux webview, named so lib.rs can switch its media stream on and answer its microphone

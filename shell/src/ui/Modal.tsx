@@ -1,6 +1,7 @@
 import { useRef, type ReactNode, type RefObject } from "react";
 import { XIcon } from "lucide-react";
 import { Dialog as DialogPrimitive } from "radix-ui";
+import { OverlayReporter } from "./overlay";
 
 /**
  * `sm` for a question and its two answers; `md` for a short form; `lg` for a short flow of a few
@@ -85,6 +86,7 @@ export function Modal({
           // Radix warns when there is no Description; omitting it is a legitimate choice here.
           {...(description === undefined ? { "aria-describedby": undefined } : {})}
         >
+          <OverlayReporter />
           <div className="ui-modal-head">
             <DialogPrimitive.Title className="ui-modal-title">{title}</DialogPrimitive.Title>
             <DialogPrimitive.Close className="ui-icon-button ui-modal-close" aria-label="Close" title="Close">

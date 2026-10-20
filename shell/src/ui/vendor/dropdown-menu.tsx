@@ -3,6 +3,7 @@ import { CheckIcon, ChevronRightIcon, CircleIcon } from "lucide-react"
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/cn"
+import { OverlayReporter } from "../overlay"
 
 function DropdownMenu({
   ...props
@@ -44,7 +45,10 @@ function DropdownMenuContent({
           className
         )}
         {...props}
-      />
+      >
+        <OverlayReporter />
+        {props.children}
+      </DropdownMenuPrimitive.Content>
     </DropdownMenuPrimitive.Portal>
   )
 }

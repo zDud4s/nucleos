@@ -16,6 +16,7 @@ import {
   CommandItem,
   CommandList,
 } from "./vendor/command";
+import { useReportOverlay } from "./overlay";
 
 /** One row of the palette. */
 export interface PaletteItem {
@@ -146,6 +147,8 @@ export interface PaletteProviderProps {
  */
 export function PaletteProvider({ children }: PaletteProviderProps) {
   const [open, setOpen] = useState(false);
+  // Native webviews paint above the DOM; tell the overlay registry while the palette is up.
+  useReportOverlay(open);
   const [query, setQuery] = useState("");
   const [groups, setGroups] = useState<PaletteGroup[]>([]);
 
