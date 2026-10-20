@@ -230,6 +230,76 @@ func TestMediaInCaptionLandsOnThePart(t *testing.T) {
 	assertDecodes(t, ev)
 }
 
+// countText returns how many text parts carry the given text.
+func countText(ev contract.Event, text string) int {
+	n := 0
+	for _, p := range ev.Message.Parts {
+		if *p.Type == contract.PartText && *p.Text == text {
+			n++
+		}
+	}
+	return n
+}
+
+// The contract gives image and file a caption of their own, so a captioned photo carries it there and
+// nowhere else: a second, text copy would show the model the same words twice.
+func TestMediaInCaptionIsNotRepeatedAsText(t *testing.T) {
+	msg := mediaMsg()
+	msg.Document = &telegram.Document{FileID: "d", FileName: "x.pdf"}
+	msg.Photo = []telegram.PhotoSize{{FileID: "p"}}
+	msg.Caption = "o relatório"
+	ev := baseEvent(t, msg)
+	files := map[string][]byte{"p": {1}, "d": {2}}
+	if err := AttachMedia(context.Background(), &ev, msg, &fakeBot{files: files}, &fakeUploader{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := countText(ev, "o relatório"); n != 0 {
+		t.Fatalf("caption repeated as %d text part(s): %+v", n, ev.Message.Parts)
+	}
+	for _, p := range ev.Message.Parts {
+		if (*p.Type == contract.PartImage || *p.Type == contract.PartFile) && (p.Caption == nil || *p.Caption != "o relatório") {
+			t.Fatalf("part lost its caption: %+v", p)
+		}
+	}
+	assertDecodes(t, ev)
+}
+
+// An audio part has no caption field, so the caption of a voice note is its one text part.
+func TestMediaInVoiceCaptionIsTheTextPartOnly(t *testing.T) {
+	msg := mediaMsg()
+	msg.Voice = &telegram.Voice{FileID: "v", Duration: 2}
+	msg.Caption = "listen"
+	ev := baseEvent(t, msg)
+	if err := AttachMedia(context.Background(), &ev, msg, &fakeBot{files: map[string][]byte{"v": {1}}}, &fakeUploader{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := countText(ev, "listen"); n != 1 {
+		t.Fatalf("want one text part, got %d: %+v", n, ev.Message.Parts)
+	}
+	for _, p := range ev.Message.Parts {
+		if *p.Type == contract.PartAudio && p.Caption != nil {
+			t.Fatalf("audio part carries a caption: %+v", p)
+		}
+	}
+	assertDecodes(t, ev)
+}
+
+// If the captioned photo cannot be carried, the caption (the user's instruction) must not vanish with it.
+func TestMediaInCaptionSurvivesAFailedPhoto(t *testing.T) {
+	msg := mediaMsg()
+	msg.Photo = []telegram.PhotoSize{{FileID: "p"}}
+	msg.Caption = "o ecrã de erro"
+	ev := baseEvent(t, msg)
+	up := &fakeUploader{err: fmt.Errorf("wrapped: %w", kit.ErrMediaTooLarge)}
+	if err := AttachMedia(context.Background(), &ev, msg, &fakeBot{files: map[string][]byte{"p": {1}}}, up); err != nil {
+		t.Fatal(err)
+	}
+	if n := countText(ev, "o ecrã de erro"); n != 1 {
+		t.Fatalf("want the caption as one text part, got %d: %+v", n, ev.Message.Parts)
+	}
+	assertUnsupported(t, ev, "photo")
+}
+
 func TestMediaInTooLargeUploadBecomesUnsupported(t *testing.T) {
 	msg := mediaMsg()
 	msg.Document = &telegram.Document{FileID: "d", FileName: "big.bin"}
@@ -359,7 +429,6 @@ func TestMediaInFullMessageMatchesFixture(t *testing.T) {
 		case contract.PartAudio:
 			ms := uint64(4000)
 			parts[i].DurationMS = &ms
-			parts[i].Caption = str("legenda")
 		case contract.PartImage, contract.PartFile:
 			parts[i].Caption = str("legenda")
 		}

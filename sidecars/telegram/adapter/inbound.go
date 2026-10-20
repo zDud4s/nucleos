@@ -115,10 +115,16 @@ func messageTime(msg *telegram.Message) *string {
 	return &at
 }
 
-// messageText is the text of a message, or its caption when it is media with an instruction.
+// messageText is the text of a message, or its caption when the caption has no part of its own to ride
+// on. The contract gives image and file a caption field, so on a photo or a document AttachMedia puts
+// the caption there and it is not repeated as text; a voice note, an audio file or a message the
+// contract only reports as unsupported has no such field, and its caption is its text.
 func messageText(msg *telegram.Message) string {
 	if msg.Text != "" {
 		return msg.Text
+	}
+	if len(msg.Photo) > 0 || msg.Document != nil {
+		return ""
 	}
 	return msg.Caption
 }

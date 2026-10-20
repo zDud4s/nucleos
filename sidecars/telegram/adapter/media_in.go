@@ -71,13 +71,13 @@ func AttachMedia(ctx context.Context, ev *contract.Event, msg *telegram.Message,
 
 	if v := msg.Voice; v != nil {
 		mime := cleanMime(v.MimeType, "audio/ogg")
-		if err := add("voice", v.FileID, v.FileSize, mime, audioPart(mime, v.Duration, msg.Caption)); err != nil {
+		if err := add("voice", v.FileID, v.FileSize, mime, audioPart(mime, v.Duration)); err != nil {
 			return err
 		}
 	}
 	if a := msg.Audio; a != nil {
 		mime := cleanMime(a.MimeType, "audio/mpeg")
-		if err := add("audio", a.FileID, a.FileSize, mime, audioPart(mime, a.Duration, msg.Caption)); err != nil {
+		if err := add("audio", a.FileID, a.FileSize, mime, audioPart(mime, a.Duration)); err != nil {
 			return err
 		}
 	}
@@ -119,12 +119,30 @@ func AttachMedia(ctx context.Context, ev *contract.Event, msg *telegram.Message,
 			break
 		}
 	}
-	parts := make([]contract.InPart, 0, len(existing)+len(added))
+	parts := make([]contract.InPart, 0, len(existing)+len(added)+1)
+	if captionLost(msg, added) {
+		parts = append(parts, textPart(msg.Caption))
+	}
 	parts = append(parts, existing[:at]...)
 	parts = append(parts, added...)
 	parts = append(parts, existing[at:]...)
 	ev.Message.Parts = parts
 	return nil
+}
+
+// captionLost reports that the caption of a photo or document, which Inbound left off the text parts
+// because the media part was to carry it, has no home: every image and file failed to upload and
+// became unsupported. The caption is the user's instruction and goes in as a text part instead.
+func captionLost(msg *telegram.Message, added []contract.InPart) bool {
+	if msg.Caption == "" || msg.Text != "" || (len(msg.Photo) == 0 && msg.Document == nil) {
+		return false
+	}
+	for _, p := range added {
+		if *p.Type == contract.PartImage || *p.Type == contract.PartFile {
+			return false
+		}
+	}
+	return true
 }
 
 // fetchAndUpload returns the part built for the uploaded media, or nil when the media cannot be
@@ -152,14 +170,14 @@ func fetchAndUpload(ctx context.Context, bot FileBot, up Uploader, fileID string
 	return &part, nil
 }
 
-func audioPart(mime string, seconds int, caption string) func(string) contract.InPart {
+func audioPart(mime string, seconds int) func(string) contract.InPart {
 	return func(mediaID string) contract.InPart {
 		typ := contract.PartAudio
 		ms := uint64(0)
 		if seconds > 0 {
 			ms = uint64(seconds) * 1000
 		}
-		return withCaption(contract.InPart{Type: &typ, Media: &mediaID, Mime: &mime, DurationMS: &ms}, caption)
+		return contract.InPart{Type: &typ, Media: &mediaID, Mime: &mime, DurationMS: &ms}
 	}
 }
 
