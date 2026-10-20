@@ -33,6 +33,9 @@ tests:
         - scripts/test-run-daemon.py
         - scripts/refresh-models.py
         - scripts/test-refresh-models.py
+        # Writes .githooks/ (gitignored); the post-checkout hook it writes is run by the test.
+        - scripts/install-hooks.sh
+        - scripts/test-post-checkout.py
         - core/assets/nucleos-dev/scripts/
         # One version across manifests (gates.sh hooks: "release: *").
         - VERSION
@@ -79,7 +82,6 @@ tests:
     - scripts/csp-in-the-window.mjs
     - scripts/tool-surface.mjs
     - scripts/doctor.sh
-    - scripts/install-hooks.sh
     - scripts/leave-nothing-behind.mjs
     - scripts/update-shell.ps1
     # Deletes regenerable build output on the owner's machine; run by hand.

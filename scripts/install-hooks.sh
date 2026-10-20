@@ -161,6 +161,58 @@ cat > "$target/pre-rebase" <<'HOOK_EOF'
 queue_guard "rebase" "git rebase <onto>"
 HOOK_EOF
 
+cat > "$target/post-checkout" <<'HOOK_EOF'
+#!/bin/sh
+# A worktree made by hand asks the daemon for the project's workflow.
+#
+# The daemon materializes the pinned workflows (`.nucleos/workflow/`, skills, cockpits, the
+# `AGENTS.md` block) into the main checkout and into every tree it opens itself
+# (`workflows::materialize::into_worktree`). A `git worktree add` run by a person or a session got
+# none of it, so a workflow session in such a tree ran without its rules. `nucleos-core
+# --workflow-sync <tree>` does the same sync for any tree; this calls it at the one moment a tree
+# is born. Covered by scripts/test-post-checkout.py, which runs this text.
+#
+# Fail-soft: a tree without its workflow still has its code, so a missing or refusing daemon is a
+# line on stderr, never a failed `git worktree add`. Re-run the sync by hand once the daemon is up.
+
+# post-checkout <previous HEAD> <new HEAD> <1 = branch checkout>. Only `git worktree add` (and a
+# clone, which has no hooksPath yet) checks out from the null object, all zeros in any hash length.
+case "$1" in
+  *[!0]*) exit 0 ;;
+esac
+[ "$3" = "1" ] || exit 0
+
+# Every git process the daemon starts carries this marker (QUEUE_MARKER in
+# core/src/execution/git_exec/transport.rs). Its own trees are synced by `into_worktree`, and its
+# `integration-*`/`postgate-*` trees must never be: it resets them and measures the commit as it is.
+[ -n "$NUCLEOS_QUEUE_EXEC" ] && exit 0
+
+tree="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || exit 0
+beside="$(dirname "$(dirname "$common")")/.nucleos-run"
+
+# Where scripts/run-daemon.ps1 stages the daemon, in the order core/hooks/ask_daemon.py
+# (`run_dir_candidates`) looks: the dev home, then the pre-2026-10-19 run dir beside the checkout.
+home="${NUCLEOS_DEV_HOME:-${SystemDrive:-C:}/nucleos-dev}"
+core=""
+for dir in "$home/run" "$beside"; do
+  for name in nucleos-core.exe nucleos-core; do
+    if [ -z "$core" ] && [ -f "$dir/$name" ]; then
+      core="$dir/$name"
+    fi
+  done
+done
+
+if [ -z "$core" ]; then
+  echo "post-checkout: no staged nucleos-core found; this worktree has no workflow until the daemon syncs it (nucleos-core --workflow-sync \"$tree\")" >&2
+  exit 0
+fi
+if ! "$core" --workflow-sync "$tree" >/dev/null; then
+  echo "post-checkout: the workflow sync of this worktree did not happen; re-run: \"$core\" --workflow-sync \"$tree\"" >&2
+fi
+exit 0
+HOOK_EOF
+
 cat > "$target/nucleos-queue-guard" <<'HOOK_EOF'
 # Sourced by pre-merge-commit, pre-push and pre-rebase. Not a hook itself, and not executable.
 #
@@ -236,9 +288,9 @@ fi
 
 # nucleos-queue-guard is sourced, not run, so it is deliberately left non-executable.
 chmod +x "$target"/pre-commit "$target"/commit-msg "$target"/pre-merge-commit \
-  "$target"/pre-push "$target"/pre-rebase
+  "$target"/pre-push "$target"/pre-rebase "$target"/post-checkout
 
 git config core.hooksPath "$hooks_dir"
 
-echo "installed: .githooks/{pre-commit,commit-msg,pre-merge-commit,pre-push,pre-rebase,nucleos-queue-guard}"
+echo "installed: .githooks/{pre-commit,commit-msg,pre-merge-commit,pre-push,pre-rebase,post-checkout,nucleos-queue-guard}"
 echo "core.hooksPath = $(git config core.hooksPath)"

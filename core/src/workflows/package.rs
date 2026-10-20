@@ -61,18 +61,11 @@ struct Owns {
     hooks: serde_yaml::Value,
 }
 
-/// Whether `name` is an interpreter's cache rather than something an author wrote. Running a
-/// bundle's own script tests leaves `__pycache__/` beside them, and copying it would make the
-/// version's hash depend on which Python last ran there.
-fn is_cache(name: &std::ffi::OsStr) -> bool {
-    name == "__pycache__" || Path::new(name).extension().is_some_and(|ext| ext == "pyc")
-}
-
 /// Copy one file or directory tree, files only, skipping symlinks for the reason
 /// `workflows::copy_tree` gives: following one would copy whatever it points at into the library.
 fn copy_into(from: &Path, to: &Path, count: &mut usize) -> std::io::Result<()> {
     let kind = std::fs::symlink_metadata(from)?.file_type();
-    if kind.is_symlink() || from.file_name().is_some_and(is_cache) {
+    if kind.is_symlink() || from.file_name().is_some_and(workflows::is_cache) {
         return Ok(());
     }
     if kind.is_dir() {
