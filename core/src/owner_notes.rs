@@ -14,6 +14,16 @@ use sqlx::SqlitePool;
 
 /// Where a note was written from. Checked before the insert.
 pub const ORIGINS: [&str; 2] = ["shell", "telegram"];
+
+/// Whether a note may carry this origin: the shell, the v1 `telegram`, or `channel:<id>` for a
+/// channel whose manifest is compiled in.
+pub fn origin_allowed(origin: &str) -> bool {
+    origin == "shell"
+        || origin == "telegram"
+        || origin
+            .strip_prefix("channel:")
+            .is_some_and(|id| crate::channels::registry::by_id(id).is_some())
+}
 /// The two states a note can be in. Archiving hides a note; nothing is ever deleted.
 pub const STATES: [&str; 2] = ["active", "archived"];
 
@@ -90,6 +100,44 @@ pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, 
     Ok(id)
 }
 
+impl From<NoteError> for crate::capture::AnswerError {
+    fn from(error: NoteError) -> Self {
+        match error {
+            NoteError::Empty => Self::Empty,
+            NoteError::UnknownOrigin => Self::UnknownOrigin,
+            NoteError::Db(error) => Self::Db(error),
+            other @ (NoteError::UnknownState | NoteError::NotFound) => {
+                Self::Internal(format!("{other:?}"))
+            }
+        }
+    }
+}
+
+/// One attempt at an owner's answer to a capture request: the note, its link and the request's
+/// close commit together or not at all, so a retry after a busy database never finds half of the
+/// previous try. Returns the note's id and whether the request was released.
+pub(crate) async fn answer_capture_in(
+    pool: &SqlitePool,
+    job_id: i64,
+    text: &str,
+    origin: &str,
+) -> Result<(i64, bool), crate::capture::AnswerError> {
+    async fn step(
+        pool: &SqlitePool,
+        job_id: i64,
+        text: &str,
+        origin: &str,
+    ) -> Result<(i64, bool), NoteError> {
+        let mut tx = pool.begin().await?;
+        let note_id = create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
+        let released =
+            crate::capture::close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now()).await?;
+        tx.commit().await?;
+        Ok((note_id, released))
+    }
+    Ok(step(pool, job_id, text, origin).await?)
+}
+
 /// Files a note already linked to a job (`relates job:<id>`), on the caller's connection so the
 /// caller's transaction decides whether it stands. The job is not looked up: the caller holds the
 /// request that names it.
@@ -126,7 +174,7 @@ async fn insert_note_in(
     if text.is_empty() {
         return Err(NoteError::Empty);
     }
-    if !ORIGINS.contains(&origin) {
+    if !origin_allowed(origin) {
         return Err(NoteError::UnknownOrigin);
     }
     let at = now();
@@ -543,6 +591,8 @@ pub async fn teach(
     let taught = format!("knowledge:{knowledge_id} proposal:{proposal_id}");
     record_raw(&mut tx, note_id, "taught", Some(&taught), &at).await?;
     tx.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok((knowledge_id, proposal_id, link_id))
 }
 
@@ -1353,6 +1403,64 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn note_origin_accepts_channel_id_of_a_compiled_manifest() {
+        assert!(origin_allowed("channel:telegram"));
+        assert!(origin_allowed("shell"));
+        assert!(origin_allowed("telegram"));
+    }
+
+    #[test]
+    fn note_origin_rejects_unknown_channel_and_empty_id() {
+        assert!(!origin_allowed("channel:nonexistent"));
+        assert!(!origin_allowed("channel:"));
+        assert!(!origin_allowed("channel"));
+        assert!(!origin_allowed(""));
+    }
+
+    #[tokio::test]
+    async fn capture_answer_accepts_a_channel_origin() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO capture_requests
+                 (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (7, 'web', '[]', 'why?', 'open', '2099-01-01T00:00:00', '2026-10-07T10:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (note_id, released) = crate::capture::answer(&pool, 7, "x", "channel:telegram")
+            .await
+            .unwrap();
+        assert!(released);
+        let note = get(&pool, note_id).await.unwrap();
+        assert_eq!(note.origin, "channel:telegram");
+        let (state, linked): (String, Option<i64>) =
+            sqlx::query_as("SELECT state, note_id FROM capture_requests WHERE job_id = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((state.as_str(), linked), ("answered", Some(note_id)));
+        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_note_links")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(links, 1);
+    }
+
+    #[tokio::test]
+    async fn wake_signal_owner_note_teach_bumps_proposals() {
+        let pool = test_pool().await;
+        let id = create(&pool, "a lesson to teach", "shell").await.unwrap();
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow_and_update();
+        teach(&pool, id, crate::knowledge::Kind::Memory, None, None)
+            .await
+            .unwrap();
+        // Other tests of this binary share the global bus: assert a lower bound only.
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 
     #[tokio::test]

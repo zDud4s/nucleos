@@ -1,8 +1,9 @@
 //! Deciding a proposal as a service function: `approve`, with the answers an HTTP door needs but no
 //! HTTP types in the way it is called.
 //!
-//! Started with the four kinds that start no run (`contact-merge`, `refinement`, `calendar-event`,
-//! `github-action`); the handler delegates exactly those and keeps the rest until they move here.
+//! Started with the kinds that start no run (`contact-merge`, `refinement`, `calendar-event`,
+//! `github-action`, `fleet-exclusion`, `agent-recruit`, `team-action`) and now the default
+//! `action-approval`; the handler keeps only `browser-wheel` until it moves here.
 //! The messages are the ones the handler has always sent: moving the code must not change what a
 //! person reads.
 
@@ -71,7 +72,7 @@ pub struct ApproveInput {
 ///
 /// Reads the proposal for its kind and dispatches; the kind never changes and every branch is a
 /// compare-and-set on `status = 'pending'`, so a second decision racing this one loses there.
-/// A kind that has not moved here yet is a `BadRequest`: the handler never sends one.
+/// `browser-wheel` has not moved here yet and is a `BadRequest`: the handler never sends it.
 pub async fn approve(state: &AppState, id: i64, input: ApproveInput) -> Result<Value, DecideError> {
     let proposal = super::get(&state.pool, id)
         .await
@@ -85,9 +86,70 @@ pub async fn approve(state: &AppState, id: i64, input: ApproveInput) -> Result<V
         "refinement" => approve_refinement(state, id, input.scope.as_deref()).await,
         "calendar-event" => approve_calendar_event(state, id).await,
         "github-action" => approve_github_action(state, id).await,
-        other => Err(DecideError::BadRequest(format!(
-            "a `{other}` proposal is not approved here"
-        ))),
+        "fleet-exclusion" => approve_fleet_exclusion(state, id).await,
+        "agent-recruit" => approve_agent_recruit(state, id, input.hire).await,
+        "team-action" => approve_team_action(state, id).await,
+        "browser-wheel" => Err(DecideError::BadRequest(
+            "a `browser-wheel` proposal is not approved here".to_owned(),
+        )),
+        _ => approve_action_approval(state, id, &proposal).await,
+    }
+}
+
+/// The default branch: an action approval resumes the paused run it was filed for.
+async fn approve_action_approval(
+    state: &AppState,
+    id: i64,
+    proposal: &super::Proposal,
+) -> Result<Value, DecideError> {
+    // Uncancellable: the approval commits a transaction and only then spawns the resumed run, so a
+    // request dropped in between leaves a `running` run nothing will ever drive.
+    use crate::execution::runs::ResumeError;
+    let state = state.clone();
+    let pool = state.pool.clone();
+    let resumed =
+        uncancellable(async move { crate::execution::runs::resume_approved_run(&state, id).await })
+            .await
+            .map_err(|_| DecideError::Internal("the approval task did not finish".to_owned()))?;
+    match resumed {
+        Ok(resume_id) => {
+            // Spec B D12: a person's approval is the label of the park the resolver observed.
+            if let Some(run_id) = proposal.run_id {
+                crate::judge::resolve_review::label_from_decision(
+                    &pool,
+                    run_id,
+                    proposal.tool_input.as_deref(),
+                    crate::judge::resolve_review::PersonsDecision::Approve,
+                )
+                .await;
+            }
+            Ok(json!({ "resume_run_id": resume_id }))
+        }
+        Err(ResumeError::ProposalNotFound) => Err(DecideError::NotFound),
+        Err(ResumeError::ProposalNotPending) => Err(DecideError::AlreadyDecided),
+        // The two 409s mean opposite things — "somebody already answered this" and "this can never
+        // be answered" — and the reason is the only thing that separates them.
+        Err(ResumeError::NotResumable(reason)) => {
+            tracing::warn!(
+                proposal_id = id,
+                reason,
+                "approved proposal is not resumable"
+            );
+            Err(DecideError::Conflict(format!(
+                "this approval cannot resume the run: {reason}"
+            )))
+        }
+        // The approval never returns this, but the `match` is exhaustive.
+        Err(ResumeError::BelongsToAJob) => Err(DecideError::Conflict(
+            "this run is a job's node, and the job's own policy decides what happens to it"
+                .to_owned(),
+        )),
+        Err(ResumeError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "approving a proposal failed");
+            Err(DecideError::Internal(
+                "the approval could not be recorded".to_owned(),
+            ))
+        }
     }
 }
 
@@ -175,6 +237,106 @@ async fn approve_calendar_event(state: &AppState, id: i64) -> Result<Value, Deci
             tracing::warn!(proposal_id = id, %error, "approving a calendar proposal failed");
             Err(DecideError::Internal(
                 "the event could not be written".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn approve_fleet_exclusion(state: &AppState, id: i64) -> Result<Value, DecideError> {
+    // Starts no run. Uncancellable for the reason the others are: the rule and the decision that
+    // authorised it commit together, and a request dropped mid-flight must not leave a job parked
+    // by a rule whose proposal still reads `pending` beside it.
+    use crate::governance::exclusion::{Approved, DecisionError as ExclusionError};
+    let state = state.clone();
+    let decided =
+        uncancellable(async move { crate::governance::exclusion::approve(&state.pool, id).await })
+            .await
+            .map_err(|_| DecideError::Internal("the approval task did not finish".to_owned()))?;
+    match decided {
+        Ok(Approved::Written(exclusion_id)) => Ok(json!({ "exclusion_id": exclusion_id })),
+        // 200 and not an error: the person answered, and the answer was recorded. What changed is
+        // that the question had stopped mattering while it waited, and a screen that showed this
+        // as a failure would send them looking for a rule that was right not to be written.
+        Ok(Approved::Stale) => Ok(json!({
+            "exclusion_id": Value::Null,
+            "closed": "the jobs it named have ended, so no rule was written",
+        })),
+        Err(ExclusionError::NotFound) => Err(DecideError::NotFound),
+        Err(ExclusionError::NotPending) => Err(DecideError::AlreadyDecided),
+        Err(ExclusionError::Malformed) => {
+            tracing::warn!(
+                proposal_id = id,
+                "an exclusion request carried no usable pair"
+            );
+            Err(DecideError::Invalid(
+                "this request names no usable pair of jobs".to_owned(),
+            ))
+        }
+        Err(ExclusionError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "approving an exclusion failed");
+            Err(DecideError::Internal(
+                "the rule could not be written".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn approve_agent_recruit(
+    state: &AppState,
+    id: i64,
+    edited: Option<crate::agent::AgentRequest>,
+) -> Result<Value, DecideError> {
+    // The only kind that grows the house rather than releasing something: approving writes an
+    // `agents` row and a `team_members` row in one transaction with the decision. Uncancellable so
+    // a dropped request cannot leave an agent hired into a team nobody agreed to.
+    use crate::team::HireError;
+    let state = state.clone();
+    let hired =
+        uncancellable(async move { crate::team::approve_recruit(&state.pool, id, edited).await })
+            .await
+            .map_err(|_| DecideError::Internal("the approval task did not finish".to_owned()))?;
+    match hired {
+        Ok(agent_id) => Ok(json!({ "agent_id": agent_id })),
+        Err(HireError::NotFound) => Err(DecideError::NotFound),
+        Err(HireError::NotPending) => Err(DecideError::AlreadyDecided),
+        Err(HireError::Malformed) => Err(DecideError::Invalid(
+            "this request does not describe an agent this daemon can create".to_owned(),
+        )),
+        // 409 and a sentence: the team went away while the request waited, and the person can
+        // still dismiss the proposal or recreate the team.
+        Err(HireError::NoSuchTeam(team_id)) => Err(DecideError::Conflict(format!(
+            "`{team_id}` no longer exists, so there is no team to hire them into"
+        ))),
+        Err(HireError::Refused(why)) => Err(DecideError::Conflict(why)),
+        Err(HireError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "hiring an agent failed");
+            Err(DecideError::Internal(
+                "the agent could not be written".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn approve_team_action(state: &AppState, id: i64) -> Result<Value, DecideError> {
+    // The only kind where approving DOES NOTHING but say yes: `team::execute_due_actions` carries
+    // the action out on the next tick. A `pending` row survives a restart; an `await` in a handler
+    // does not. Uncancellable all the same: the decision commits.
+    let state = state.clone();
+    let decided = uncancellable(async move {
+        crate::proposals::transition(&state.pool, id, "approved", "approved by user").await
+    })
+    .await
+    .map_err(|_| DecideError::Internal("the approval task did not finish".to_owned()))?;
+    match decided {
+        Ok(true) => Ok(json!({
+            "queued": "the department's action will be carried out shortly",
+        })),
+        // The compare-and-set lost: somebody decided this while the request was in flight.
+        Ok(false) => Err(DecideError::AlreadyDecided),
+        Err(error) => {
+            tracing::warn!(proposal_id = id, %error, "approving a team action failed");
+            Err(DecideError::Internal(
+                "the approval could not be recorded".to_owned(),
             ))
         }
     }
@@ -378,6 +540,7 @@ mod tests {
             council: Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+            utility_model: None,
         }
     }
 
@@ -416,6 +579,57 @@ mod tests {
         let (status, body) = error.into_http(id);
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, "this suggestion has already been decided");
+    }
+
+    #[tokio::test]
+    async fn decide_approve_team_action_queues_and_second_call_is_already_decided() {
+        let state = test_state().await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO proposals (kind, status, reasoning, created_at) VALUES ('team-action', 'pending', 'send the summary', ?) RETURNING id",
+        )
+        .bind("2026-10-19T08:00:00+00:00")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let first = approve(&state, id, ApproveInput::default()).await.unwrap();
+        assert_eq!(
+            first,
+            json!({ "queued": "the department's action will be carried out shortly" })
+        );
+
+        let second = approve(&state, id, ApproveInput::default()).await;
+        assert!(
+            matches!(second, Err(DecideError::AlreadyDecided)),
+            "{second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_approve_action_approval_unknown_is_not_found() {
+        let state = test_state().await;
+        // No proposal 424242 exists, so the read at the top of `approve` answers before any kind
+        // is chosen; the default branch is never reached with a missing row.
+        let result = approve(&state, 424_242, ApproveInput::default()).await;
+        assert!(matches!(result, Err(DecideError::NotFound)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn decide_approve_action_approval_twice_is_already_decided() {
+        let state = test_state().await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO proposals (kind, status, reasoning, created_at) VALUES ('action-approval', 'approved', 'run the tests', ?) RETURNING id",
+        )
+        .bind("2026-10-19T08:00:00+00:00")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let result = approve(&state, id, ApproveInput::default()).await;
+        assert!(
+            matches!(result, Err(DecideError::AlreadyDecided)),
+            "{result:?}"
+        );
     }
 
     #[test]

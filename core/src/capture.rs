@@ -476,20 +476,6 @@ impl std::fmt::Display for AnswerError {
     }
 }
 
-impl From<crate::owner_notes::NoteError> for AnswerError {
-    fn from(error: crate::owner_notes::NoteError) -> Self {
-        use crate::owner_notes::NoteError;
-        match error {
-            NoteError::Empty => Self::Empty,
-            NoteError::UnknownOrigin => Self::UnknownOrigin,
-            NoteError::Db(error) => Self::Db(error),
-            other @ (NoteError::UnknownState | NoteError::NotFound) => {
-                Self::Internal(format!("{other:?}"))
-            }
-        }
-    }
-}
-
 /// The owner's answer becomes a note linked to the job; it also closes the request and releases the
 /// job when the request is still open. A late answer keeps its note and releases nothing. Returns
 /// the note's id and whether the request was released.
@@ -499,7 +485,6 @@ pub async fn answer(
     text: &str,
     origin: &str,
 ) -> Result<(i64, bool), AnswerError> {
-    use crate::owner_notes::NoteError;
     let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM capture_requests WHERE job_id = ?")
         .bind(job_id)
         .fetch_optional(pool)
@@ -514,27 +499,12 @@ pub async fn answer(
     retry_busy(
         BUSY_ATTEMPTS,
         BUSY_PAUSE,
-        |error: &NoteError| matches!(error, NoteError::Db(db) if is_busy(db)),
-        || answer_once(pool, job_id, text, origin),
+        |error: &AnswerError| matches!(error, AnswerError::Db(db) if is_busy(db)),
+        // The transactional step (note, link and close in one commit) lives with the notes SQL; it
+        // is reached through the crate-root alias so this module never names the notes' tables.
+        || crate::capture_answer_step(pool, job_id, text, origin),
     )
     .await
-    .map_err(AnswerError::from)
-}
-
-/// One attempt at an answer: the note, its link and the request's close commit together or not at
-/// all, so a retry after a busy database never finds half of the previous try.
-async fn answer_once(
-    pool: &SqlitePool,
-    job_id: i64,
-    text: &str,
-    origin: &str,
-) -> Result<(i64, bool), crate::owner_notes::NoteError> {
-    let mut tx = pool.begin().await?;
-    let note_id =
-        crate::owner_notes::create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
-    let released = close_answered_in(&mut tx, job_id, note_id, Utc::now()).await?;
-    tx.commit().await?;
-    Ok((note_id, released))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,11 +1029,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((state.as_str(), note), (STATE_ANSWERED, Some(note_id)));
-        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_note_links")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(links, 1);
         let (_, late) = answer(&pool, 7, "a second thought", "shell").await.unwrap();
         assert!(!late, "a late answer keeps its note and releases nothing");
     }

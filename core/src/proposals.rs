@@ -119,6 +119,8 @@ pub async fn create_action_approval(
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -194,6 +196,8 @@ pub async fn create_refused_action(
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -265,6 +269,8 @@ pub async fn create_skipped_item(
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -303,6 +309,8 @@ pub async fn create_contact_merge(
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -356,6 +364,8 @@ pub async fn create_calendar_event(
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -408,6 +418,8 @@ pub async fn create_github_action(
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -517,6 +529,8 @@ pub async fn create_agent_recruit(
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -602,6 +616,8 @@ pub async fn create_wheel_request(pool: &SqlitePool, ask: WheelAsk<'_>) -> sqlx:
     .await?;
 
     transaction.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(proposal_id)
 }
 
@@ -2369,5 +2385,56 @@ mod tests {
         let recruits = list_pending_recruits(&pool, None).await.unwrap().len();
         assert_eq!(recruits, 2);
         assert_eq!(count_pending_recruits(&pool).await.unwrap(), recruits);
+    }
+
+    #[tokio::test]
+    async fn wake_signal_proposal_creators_bump_proposals() {
+        let pool = test_pool().await;
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow_and_update();
+        create_action_approval(&pool, 999_999, None, Some("p"), "Bash", "asked", None)
+            .await
+            .unwrap();
+        create_refused_action(&pool, 999_999, None, "Bash", "refused", None, None)
+            .await
+            .unwrap();
+        create_skipped_item(&pool, 999_999, None, Some("p"), "Bash", "set aside", None)
+            .await
+            .unwrap();
+        create_contact_merge(&pool, 1, 2, "same person")
+            .await
+            .unwrap();
+        create_calendar_event(&pool, 1, "Lunch", "2026-10-21T12:00", 60, "UTC", "invited")
+            .await
+            .unwrap();
+        create_github_action(&pool, "issue", "needs filing", "{}")
+            .await
+            .unwrap();
+        create_agent_recruit(
+            &pool,
+            "team",
+            "team-run",
+            "slug",
+            &serde_json::json!({"name": "Ana"}),
+            "needed",
+        )
+        .await
+        .unwrap();
+        create_wheel_request(
+            &pool,
+            WheelAsk {
+                run_id: None,
+                project_id: "p",
+                session_id: 1,
+                requested_url: "https://example.com/",
+                final_url: "https://example.com/",
+                origin: "https://example.com",
+                reasoning: "login",
+            },
+        )
+        .await
+        .unwrap();
+        // Other tests of this binary share the global bus: assert a lower bound only.
+        assert!(rx.borrow().wrapping_sub(before) >= 8);
     }
 }
