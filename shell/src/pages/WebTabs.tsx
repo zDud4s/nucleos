@@ -1,45 +1,56 @@
 import { Navigate, useNavigate, useRouterState } from "@tanstack/react-router";
+import { useState } from "react";
 import { useBrowserSessions } from "../data/browser";
-import { Count, Tabs, TabsContent, TabsList, TabsTrigger } from "../ui";
+import { Count } from "../ui";
 import { Browser, SessionsHeader } from "./Browser";
+import { BrowserPage } from "./BrowserPage";
 import { Web, WebHeader } from "./Web";
 
 /**
- * Web and Browser as one page with two real tabs.
+ * The Web page: the integrated browser is the main surface and the Archive (or the legacy
+ * Sessions view) is a side panel beside it.
  *
- * The owner decided on 2026-10-03 to merge the two pages under one rail entry. The tabs
- * are Radix Tabs driven by the URL, rather than the Link strip System.tsx uses, because
- * these are two whole pages with their own data and a tab must keep working on a reload
- * and on a deep link such as /web/pages/42. /browser survives only as a redirect, so
- * old bookmarks and feed rows that still point at it land on the Sessions tab.
+ * Routes are unchanged: /web is the browser alone, /web/archive and /web/pages/$pageId open the
+ * browser with the Archive panel shown (the detail selected as before). /browser and
+ * /web/sessions only redirect to /web. The panel sits in a flex row BESIDE the browser
+ * placeholder, never over it: native webviews paint above the DOM, so an overlapping panel would
+ * be hidden by them.
  *
- * Sessions is the page's front, at /web, and the archive sits behind it at /web/archive
- * (owner, 2026-10-08): what somebody opens Web for is a browser. /web/sessions was the
- * Sessions tab's own address until then and now forwards to /web, as /browser does.
- *
- * The Sessions panel stays mounted (hidden) while the Archive is open: its "keep these?" question
- * is held in local state and outranks everything, because the window it asks about has already
- * closed, so switching tabs must not throw it away. A session asking for the wheel is counted on
- * its tab, and the sidecar's badge shows in both headers, so neither is invisible from Archive.
- *
- * Only the header swaps per tab; the tab list and panels sit in one stable tree, because a
- * list that was remounted on every switch dropped keyboard focus from the tab just selected.
+ * Archive visibility follows the URL so a reload and a deep link keep working; the Sessions
+ * panel is local state. Sessions stays mounted (hidden) for the whole page life: its "keep
+ * these?" question lives in local state and outranks everything, because the window it asks
+ * about has already closed, so toggling panels must not throw it away. A session asking for the
+ * wheel is counted on its toggle.
  */
-export function webTabOf(pathname: string): "archive" | "sessions" {
-  return pathname === "/web/archive" || pathname.startsWith("/web/pages/") ? "archive" : "sessions";
+export function webPanelOf(pathname: string): "archive" | null {
+  return pathname === "/web/archive" || pathname.startsWith("/web/pages/") ? "archive" : null;
 }
 
 export function WebTabs() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navigate = useNavigate();
-  const tab = webTabOf(pathname);
+  const [sessionsOpen, setSessionsOpen] = useState(false);
+  const archiveOpen = webPanelOf(pathname) === "archive";
+  const showSessions = sessionsOpen && !archiveOpen;
   const asking = (useBrowserSessions().data ?? []).filter((row) => row.mode === "wheel-requested").length;
 
+  const toggleArchive = () => {
+    setSessionsOpen(false);
+    void navigate({ to: archiveOpen ? "/web" : "/web/archive" });
+  };
+  const toggleSessions = () => {
+    setSessionsOpen(!showSessions);
+    if (archiveOpen) void navigate({ to: "/web" });
+  };
+
   return (
-    <Tabs className="web-tabs" value={tab} onValueChange={(next) => void navigate({ to: next === "sessions" ? "/web" : "/web/archive" })}>
-      {tab === "archive" ? <WebHeader /> : <SessionsHeader />}
-      <TabsList aria-label="Web views">
-        <TabsTrigger value="sessions">
+    <div className="web-split">
+      {archiveOpen ? <WebHeader /> : <SessionsHeader />}
+      <div className="web-split-toolbar" role="toolbar" aria-label="Web panels">
+        <button type="button" className="web-panel-toggle" aria-pressed={archiveOpen} onClick={toggleArchive}>
+          Archive
+        </button>
+        <button type="button" className="web-panel-toggle" aria-pressed={showSessions} onClick={toggleSessions}>
           Sessions
           {asking > 0 && (
             <>
@@ -47,16 +58,20 @@ export function WebTabs() {
               <Count n={asking} noun="asking" />
             </>
           )}
-        </TabsTrigger>
-        <TabsTrigger value="archive">Archive</TabsTrigger>
-      </TabsList>
-      <TabsContent value="sessions" forceMount hidden={tab !== "sessions"}>
-        <Browser embedded />
-      </TabsContent>
-      <TabsContent value="archive">
-        <Web embedded />
-      </TabsContent>
-    </Tabs>
+        </button>
+      </div>
+      <div className="web-split-row">
+        <div className="web-split-main">
+          <BrowserPage />
+        </div>
+        <aside className="web-side" aria-label="Side panel" hidden={!archiveOpen && !showSessions}>
+          <div hidden={!showSessions}>
+            <Browser embedded />
+          </div>
+          {archiveOpen && <Web embedded />}
+        </aside>
+      </div>
+    </div>
   );
 }
 

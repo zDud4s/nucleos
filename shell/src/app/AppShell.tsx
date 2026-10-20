@@ -13,6 +13,7 @@ import { ConnectionGate } from "./ConnectionGate";
 import { CaptureChord } from "./CaptureChord";
 import { ConversationChord } from "./ConversationChord";
 import { DesktopNotifier } from "./DesktopNotifier";
+import { OverlayProvider } from "../ui/overlay";
 import { GlobalSearch } from "./GlobalSearch";
 import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
@@ -98,6 +99,7 @@ function Frame() {
   useHotkeyRegistration();
 
   return (
+    <OverlayProvider>
     <PaletteProvider>
       {/*
         Around everything, because the dictation chords are answered on every page and the Voice page
@@ -187,6 +189,7 @@ function Frame() {
       </div>
       </DictationProvider>
     </PaletteProvider>
+    </OverlayProvider>
   );
 }
 

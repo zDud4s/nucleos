@@ -11,6 +11,7 @@ import {
 import { KindBadge } from "../pages/Feed";
 import { DAEMON_NAME } from "../copy";
 import { ErrorNote, RelativeTime } from "../ui";
+import { useReportOverlay } from "../ui/overlay";
 
 /**
  * The notifications drawer: what the calendar is holding, and the last lines of
@@ -31,6 +32,7 @@ import { ErrorNote, RelativeTime } from "../ui";
  */
 export function NotificationsDrawer() {
   const [open, setOpen] = useState(false);
+  useReportOverlay(open);
   const trigger = useRef<HTMLButtonElement>(null);
 
   /**

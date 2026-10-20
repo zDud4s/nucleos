@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { clearWebDraft } from "./Web";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
@@ -22,42 +22,55 @@ beforeEach(() => {
   daemon.apiFetch.mockImplementation(daemonFetch(daemonState()));
 });
 
-const TABLIST = "Web views";
+vi.mock("./BrowserPage", () => ({ BrowserPage: () => <div data-testid="browser-page" /> }));
 
-describe("the Web page tabs", () => {
-  it("renders one Web header with Sessions first and selected", async () => {
+const archiveToggle = () => screen.getByRole("button", { name: "Archive" });
+
+describe("the Web page split", () => {
+  it("renders one Web header with the browser as the main surface and no panel", async () => {
     await renderApp({ initialPath: "/web" });
 
     expect(await screen.findAllByRole("heading", { level: 1, name: "Web" })).toHaveLength(1);
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    const list = screen.getByRole("tablist", { name: TABLIST });
-    expect(within(list).getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["Sessions", "Archive"]);
-    expect(await screen.findByRole("tab", { name: "Sessions", selected: true })).toBeDefined();
+    expect(await screen.findByTestId("browser-page")).toBeDefined();
+    expect(archiveToggle().getAttribute("aria-pressed")).toBe("false");
+    expect(screen.queryByRole("complementary", { name: "Side panel" })).toBeNull();
   });
 
-  it("switches tabs by moving the URL", async () => {
+  it("toggles the Archive panel by moving the URL, keeping the browser mounted", async () => {
     const { router } = await renderApp({ initialPath: "/web" });
-    await screen.findByRole("tab", { name: "Sessions", selected: true });
-    expect(await screen.findByRole("heading", { level: 2, name: "Live sessions" })).toBeDefined();
+    const browser = await screen.findByTestId("browser-page");
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "Archive" }));
+    fireEvent.click(archiveToggle());
     await waitFor(() => expect(router.state.location.pathname).toBe("/web/archive"));
+    await waitFor(() => expect(archiveToggle().getAttribute("aria-pressed")).toBe("true"));
+    expect(screen.getByTestId("browser-page")).toBe(browser);
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "Sessions" }));
+    fireEvent.click(archiveToggle());
     await waitFor(() => expect(router.state.location.pathname).toBe("/web"));
+    expect(screen.getByTestId("browser-page")).toBe(browser);
   });
 
-  it("opens the tab its URL names", async () => {
-    const first = await renderApp({ initialPath: "/web/pages/42" });
-    expect(await screen.findByRole("tab", { name: "Archive", selected: true })).toBeDefined();
-    first.unmount();
+  it("shows the Archive panel on the archive URLs", async () => {
+    for (const path of ["/web/pages/42", "/web/archive"]) {
+      const { unmount } = await renderApp({ initialPath: path });
+      await waitFor(() => expect(archiveToggle().getAttribute("aria-pressed")).toBe("true"));
+      expect(screen.getByTestId("browser-page")).toBeDefined();
+      unmount();
+    }
+  });
 
-    const second = await renderApp({ initialPath: "/web/archive" });
-    expect(await screen.findByRole("tab", { name: "Archive", selected: true })).toBeDefined();
-    second.unmount();
+  it("opens the Sessions panel beside the browser and closes it when Archive opens", async () => {
+    const { router } = await renderApp({ initialPath: "/web" });
+    const sessions = await screen.findByRole("button", { name: /^Sessions/ });
 
-    await renderApp({ initialPath: "/web" });
-    expect(await screen.findByRole("tab", { name: "Sessions", selected: true })).toBeDefined();
+    fireEvent.click(sessions);
+    expect(await screen.findByRole("heading", { level: 2, name: "Live sessions" })).toBeDefined();
+    expect(sessions.getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(archiveToggle());
+    await waitFor(() => expect(router.state.location.pathname).toBe("/web/archive"));
+    expect(sessions.getAttribute("aria-pressed")).toBe("false");
   });
 
   it("forwards /browser and the old /web/sessions to /web", async () => {
@@ -78,20 +91,5 @@ describe("the Web page tabs", () => {
       expect(rail.getByRole("link", { name: "Web" }).getAttribute("aria-current")).toBe("page");
       unmount();
     }
-  });
-
-  it("keeps the tablist mounted and focus on the tab when switching by keyboard", async () => {
-    const { router } = await renderApp({ initialPath: "/web" });
-    await screen.findByRole("tab", { name: "Sessions", selected: true });
-
-    const list = screen.getByRole("tablist", { name: TABLIST });
-    const sessions = screen.getByRole("tab", { name: "Sessions" });
-    act(() => sessions.focus());
-    fireEvent.keyDown(sessions, { key: "ArrowRight" });
-
-    await waitFor(() => expect(router.state.location.pathname).toBe("/web/archive"));
-    expect(await screen.findByRole("tab", { name: "Archive", selected: true })).toBeDefined();
-    expect(screen.getByRole("tablist", { name: TABLIST })).toBe(list);
-    expect(document.activeElement).toBe(screen.getByRole("tab", { name: "Archive" }));
   });
 });

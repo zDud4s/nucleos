@@ -335,14 +335,79 @@
   overflow-wrap: anywhere;
 }
 
-/* ------------------------------------------------------------------ tabs == */
+/* ----------------------------------------------------------------- split == */
 
-/* The header's rule and the tab list's rule sat 78px apart with nothing between them. Under tabs
-   the tab list is the page's rule, so the header gives its own up. Scoped to this page's tabs:
-   `PageHeader` is shared, and elsewhere its rule is the only one. */
-.web-tabs > .ui-page-header {
+/* The browser fills the row; the side panel sits beside it, never over it (native webviews paint
+   above the DOM). */
+.web-split {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.web-split > .ui-page-header {
   margin-bottom: 0;
-  border-bottom: none;
+}
+
+.web-split-toolbar {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2) 0;
+}
+
+.web-panel-toggle {
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm, 4px);
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.web-panel-toggle[aria-pressed="true"] {
+  opacity: 1;
+  font-weight: 600;
+}
+
+.web-split-row {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: var(--space-4);
+}
+
+.web-split-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.web-side {
+  flex: 0 0 26rem;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.web-side[hidden] {
+  display: none;
+}
+
+/* The panel is narrow whatever the window: stack the archive list over the reader and, with a page
+   open, show only the reader with its way back. */
+.web-side .web-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.web-side .web-layout-reading .web-list {
+  display: none;
+}
+
+.web-side .web-layout-reading .web-back {
+  display: inline-block;
 }
 
 /* The go marker on a disabled Read rendered as a stray glyph in front of a greyed word; the
