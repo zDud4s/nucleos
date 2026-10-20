@@ -273,6 +273,7 @@ the contract, not a snapshot.
 | `channels/commands.rs` | Chat commands: the `Intent` type and the router that maps a chat message to one. |
 | `channels/conformance.rs` | Test-only: contract conformance scenarios. |
 | `channels/contract.rs` | Channel contract types: the shapes adapters and the núcleo exchange. |
+| `channels/contract/conformance.rs` | Test-only: runs every fixture of the shared contract tree (`sidecars/lib/channelkit/contract/fixtures/index.json`) through the strict decoders: index vs tree, coverage, and valid/invalid conformance. |
 | `channels/contract/decode.rs` | Strict two-stage decoding of the adapter contract: the engine (`decode`, `Shape`, `ErrorCode`, `ContractError`, duplicate-key pass), the hand-written T7 grammars, and the hello, error, media, ack and renew shapes. |
 | `channels/contract/decode/event.rs` | The `event` and `event_response` shapes (D2) and the valid event -> `InboundEvent` conversion. |
 | `channels/contract/decode/outbox.rs` | The `outbox_response` and `action` shapes (D3): the wire types and validation of what the núcleo sends an adapter. |
