@@ -288,6 +288,8 @@ the contract, not a snapshot.
 | `channels/replies.rs` | Turn cycle and queue notices sent back to a channel. |
 | `channels/routing.rs` | Notifications to the primary channel. |
 | `channels/routing/policy.rs` | Per-channel notification policy: resolving, merging and storing it. |
+| `channels/routing/seed.rs` | Routing cursors per channel (seed, reseed, turn watermark) and the routing state readout. |
+| `channels/routing/announce.rs` | Feed lines to the primary channel's outbox (policy, project thread or prefix, 24 h TTL). |
 | `channels/schema.rs` | Test-only: checks that migrations 0220-0227 create the channel tables, indexes and CHECKs. |
 | `channels/strings.rs` | Single table of user-visible channel text. |
 | `channels/testkit.rs` | Test-only: helpers that build a real `AppState` over a fresh pool. |

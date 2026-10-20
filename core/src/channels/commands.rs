@@ -193,17 +193,100 @@ pub async fn execute(
             tracing::error!("a pairing command reached commands::execute");
             return Ok(());
         }
-        Intent::Mail
-        | Intent::Inbox
-        | Intent::Note(_)
-        | Intent::Kill { .. }
-        | Intent::Cancel
-        | Intent::Cap { .. }
-        | Intent::Approve(_)
-        | Intent::Reject(_)
-        | Intent::Chat(_) => todo!(),
+        Intent::Mail => run_mail(state, now).await,
+        Intent::Inbox => {
+            let queue = crate::integrations::email::queue(&state.pool, INBOX_LIMIT).await?;
+            strings::render_inbox(&queue)
+        }
+        Intent::Note(text) => run_note(state, at, &text).await,
+        Intent::Kill { on } => {
+            crate::governance::autopilot::set_kill_switch(&state.pool, on).await?;
+            strings::render(&if on {
+                Text::KillEngaged
+            } else {
+                Text::KillDisengaged
+            })
+        }
+        // The only answer when nothing runs is `NothingToCancel`: no pause notice and no touch on
+        // the queue, so a queue that was held stays held and a free one stays free. When a turn is
+        // stopped, `stop_chat` owns the single pause notice; the reply here never repeats it.
+        Intent::Cancel => match crate::assistant::stop_chat(state, &at.key.chat_id()).await {
+            None => strings::render(&Text::NothingToCancel),
+            Some((turn, _)) => strings::render(&Text::Cancelled { turn }),
+        },
+        Intent::Approve(id) => {
+            let decided =
+                crate::proposals::approve(state, id, crate::proposals::ApproveInput::default())
+                    .await
+                    .map(|_| ());
+            decision_reply(decided, Text::Approved { id })
+        }
+        Intent::Reject(id) => {
+            let decided = crate::proposals::reject(state, id).await;
+            decision_reply(decided, Text::Rejected { id })
+        }
+        Intent::Cap { .. } | Intent::Chat(_) => todo!(),
     };
     say(state, &at.key, reply, now).await
+}
+
+/// How many queued mails `/inbox` reads: the same bound the HTTP door uses.
+const INBOX_LIMIT: i64 = 200;
+
+/// `/mail`: triage what is waiting. An unarmed pillar is an answer of its own.
+async fn run_mail(state: &AppState, now: chrono::DateTime<chrono::Utc>) -> String {
+    if !state.email.armed.load(std::sync::atomic::Ordering::Relaxed) {
+        return strings::render(&Text::MailNotArmed);
+    }
+    match crate::governance::triage::triage_on_request(state, now).await {
+        Ok(outcome) => strings::render_triage(&outcome),
+        Err(crate::governance::triage::TriageError(status)) => strings::render(&Text::NotSent {
+            refusal: format!("mail triage failed ({status})"),
+        }),
+    }
+}
+
+/// `/note <text>`: files the text as a note whose origin is this channel. The text never reaches a
+/// log line or an error reply.
+async fn run_note(state: &AppState, at: &ingest::Inbound<'_>, text: &str) -> String {
+    if text.trim().is_empty() {
+        return strings::render(&Text::NoteUsage);
+    }
+    let origin = crate::assistant::Origin::Channel(at.channel).as_wire();
+    match crate::owner_notes::create(&state.pool, text, origin).await {
+        Ok(id) => strings::render(&Text::Noted { id }),
+        Err(error) => {
+            tracing::warn!(channel = at.channel, %error, "a channel note could not be saved");
+            strings::render(&Text::NoteFailed)
+        }
+    }
+}
+
+/// The reply to an approve or reject: `done` when it went through, "already handled" when somebody
+/// decided first or the proposal is gone, the refusal sentence otherwise.
+fn decision_reply(result: Result<(), crate::proposals::DecideError>, done: Text) -> String {
+    use crate::proposals::DecideError;
+    match result {
+        Ok(()) => strings::render(&done),
+        Err(DecideError::AlreadyDecided | DecideError::NotFound) => {
+            strings::render(&Text::AlreadyHandled)
+        }
+        Err(error) => {
+            let refusal = match error {
+                DecideError::Conflict(message)
+                | DecideError::Invalid(message)
+                | DecideError::BadRequest(message)
+                | DecideError::BadGateway(message)
+                | DecideError::Status(_, message)
+                    if !message.is_empty() =>
+                {
+                    message
+                }
+                _ => "the decision could not be recorded".to_string(),
+            };
+            strings::render(&Text::NotSent { refusal })
+        }
+    }
 }
 
 /// Queues a plain text answer in the conversation the command came from and wakes its channel.
@@ -520,5 +603,162 @@ mod tests {
                 text: "kill off".to_string()
             })
         );
+    }
+
+    #[tokio::test]
+    async fn execute_mail_not_armed_says_so() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Mail).await;
+        assert_eq!(the_one_answer(&state).await, "Mail is not armed.");
+    }
+
+    #[tokio::test]
+    async fn execute_inbox_lists_queued_mail() {
+        let state = crate::channels::testkit::state().await;
+        sqlx::query(
+            "INSERT INTO emails (message_id, mailbox, uidvalidity, uid, from_addr, subject,
+                                 received_at, ingested_at, direction)
+             VALUES ('<i1@x>', 'INBOX', 1, 1, 'rita@example.com', 'July invoice',
+                     '2026-07-28T09:00:00Z', '2026-07-28T09:00:00Z', 'inbound')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        run(&state, Intent::Inbox).await;
+        let answer = the_one_answer(&state).await;
+        assert!(answer.contains("rita@example.com"), "{answer}");
+        assert!(answer.contains("July invoice"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn execute_note_creates_with_channel_origin() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Note("buy milk".to_string())).await;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT note_text, origin FROM owner_notes")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![("buy milk".to_string(), "channel:fake".to_string())]
+        );
+        let answer = the_one_answer(&state).await;
+        assert!(answer.starts_with("Noted (#"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn execute_note_bare_answers_usage() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Note(String::new())).await;
+        assert_eq!(the_one_answer(&state).await, "Usage: /note <text>");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_notes")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_kill_on_off_sets_switch_and_answers() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Kill { on: true }).await;
+        assert!(
+            crate::governance::autopilot::kill_switch_engaged(&state.pool)
+                .await
+                .unwrap()
+        );
+        run(&state, Intent::Kill { on: false }).await;
+        assert!(
+            !crate::governance::autopilot::kill_switch_engaged(&state.pool)
+                .await
+                .unwrap()
+        );
+        let texts: Vec<String> = queued(&state).await.into_iter().map(|q| q.2).collect();
+        assert_eq!(texts, vec!["Kill switch ENGAGED", "Kill switch DISENGAGED"]);
+    }
+
+    #[tokio::test]
+    async fn execute_cancel_nothing_running_leaves_the_queue_hold_as_it_was() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Cancel).await;
+        // The only message is the exact text, with no pause notice beside it. The hold itself is
+        // private to the assistant module, where the `stop_chat` test asserts it stays as it was.
+        assert_eq!(the_one_answer(&state).await, "Nothing to stop.");
+    }
+
+    #[tokio::test]
+    async fn execute_cancel_stops_turn_and_does_not_repeat_pause_text() {
+        let state = crate::channels::testkit::state().await;
+        let turn: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('slow', 'running', 'assistant', 'fake:c1', '2026-10-20T00:00:00Z')
+             RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        // No process is registered for the chat, so the stop takes the kill path, which needs a handle.
+        let task = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(turn, task.abort_handle());
+
+        run(&state, Intent::Cancel).await;
+
+        let answer = the_one_answer(&state).await;
+        assert_eq!(answer, format!("Cancelled turn {turn}."));
+        assert!(!answer.to_lowercase().contains("paused"), "{answer}");
+        task.abort();
+    }
+
+    async fn a_proposal(state: &AppState, status: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO proposals
+             (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+             VALUES ('action-approval', ?, NULL, NULL, NULL, 'Bash', 'why', NULL, ?, NULL)
+             RETURNING id",
+        )
+        .bind(status)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn execute_approve_maps_already_decided() {
+        let state = crate::channels::testkit::state().await;
+        let decided = a_proposal(&state, "approved").await;
+        run(&state, Intent::Approve(decided)).await;
+        run(&state, Intent::Approve(987_654)).await;
+        let texts: Vec<String> = queued(&state).await.into_iter().map(|q| q.2).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "That one was already handled.",
+                "That one was already handled."
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_reject_resolves_a_pending_proposal() {
+        let state = crate::channels::testkit::state().await;
+        let id = a_proposal(&state, "pending").await;
+        run(&state, Intent::Reject(id)).await;
+        assert_eq!(the_one_answer(&state).await, format!("Rejected #{id}."));
+        let status: String = sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "rejected");
+        // A second reject finds it decided.
+        run(&state, Intent::Reject(id)).await;
+        let last = queued(&state).await.pop().unwrap().2;
+        assert_eq!(last, "That one was already handled.");
     }
 }

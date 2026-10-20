@@ -1226,6 +1226,14 @@ mod tests {
         one_call_is_sanctioned(source, &format!("{needle}s::create_linked_to_job_in"))
     }
 
+    /// `channels/commands.rs` may name the notes module in exactly one place: the call `/note` uses
+    /// to file the text. `/note` is the owner writing a note from a channel; `commands.rs` only
+    /// forwards it and never reads notes back.
+    fn commands_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        one_call_is_sanctioned(source, &format!("{needle}s::create("))
+    }
+
     /// True when the production code of `source` names the notes module only inside `call`, and
     /// exactly once.
     fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
@@ -1295,7 +1303,30 @@ mod tests {
     }
 
     #[test]
-    fn no_core_module_but_five_mentions_owner_notes() {
+    fn the_commands_rule_holds_one_call_and_nothing_else() {
+        let needle = ["owner", "note"].join("_");
+        let call = format!("match crate::{needle}s::create(&state.pool, text, origin).await {{}}");
+        assert!(commands_mentions_are_sanctioned(&call));
+        assert!(!commands_mentions_are_sanctioned(&format!(
+            "{call}\n{call}"
+        )));
+        assert!(!commands_mentions_are_sanctioned(&format!(
+            "use crate::{needle}s;\n{call}"
+        )));
+        assert!(!commands_mentions_are_sanctioned(&format!(
+            "{call}\nlet n = crate::{needle}s::get(&pool, 1).await;"
+        )));
+        assert!(!commands_mentions_are_sanctioned("fn nothing() {}"));
+        assert!(commands_mentions_are_sanctioned(&format!(
+            "{call}\n// mentions {needle}s"
+        )));
+        assert!(commands_mentions_are_sanctioned(&format!(
+            "{call}\n#[cfg(test)]\nmod tests {{\nSELECT 1 FROM {needle}s;\n}}"
+        )));
+    }
+
+    #[test]
+    fn no_core_module_but_six_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1312,6 +1343,9 @@ mod tests {
         // distiller's dossier read the notes linked to a project, as context only.
         // `capture.rs` is the other: one call, `create_linked_to_job_in`. A channel capture answer is
         // the owner writing a note; `capture.rs` only forwards it and never reads notes back.
+        // `channels/commands.rs` is the third: one call, `create(`, for `/note`. That command is the
+        // owner writing a note from a channel; `commands.rs` only forwards it and never reads notes
+        // back (plan A2 C2b).
         // `lib.rs` only declares the module (`pub mod owner_notes;`) since the core lib/bin split.
         let allowed = ["owner_notes.rs", "http.rs", "main.rs", "lib.rs"];
         let needle = ["owner", "note"].join("_");
@@ -1346,12 +1380,22 @@ mod tests {
                 );
                 continue;
             }
+            if name == "commands.rs"
+                && crate::source_scan::module_path(&path).starts_with("channels/")
+            {
+                assert!(
+                    commands_mentions_are_sanctioned(&source),
+                    "channels/commands.rs may name the notes only in its one call to create \
+                     (`/note` is the owner writing a note; it never reads notes back)"
+                );
+                continue;
+            }
             assert!(
                 !source.contains(&needle),
                 "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
                  http.rs and main.rs (spec D4), from distill.rs through one read call, and from \
-                 capture.rs through one write call, only, so that nothing in the agent's memory \
-                 can read them",
+                 capture.rs and channels/commands.rs through one write call each, only, so that \
+                 nothing in the agent's memory can read them",
                 path.display()
             );
         }

@@ -74,6 +74,10 @@ pub enum Text {
         project: String,
     },
     MailNotArmed,
+    Feed {
+        kind: String,
+        summary: String,
+    },
 }
 
 fn usd(v: f64) -> String {
@@ -168,6 +172,7 @@ pub fn render(text: &Text) -> String {
         Text::PairInvalid => "That pairing code is invalid or expired.".to_string(),
         Text::ProjectPrefix { project } => format!("[{project}] "),
         Text::MailNotArmed => "Mail is not armed.".to_string(),
+        Text::Feed { kind, summary } => format!("{kind}: {summary}"),
     }
 }
 
@@ -387,6 +392,10 @@ mod tests {
                 project: "alpha".into(),
             },
             Text::MailNotArmed,
+            Text::Feed {
+                kind: "job_done".into(),
+                summary: "built".into(),
+            },
         ];
         for t in &all {
             let s = render(t);

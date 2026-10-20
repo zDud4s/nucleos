@@ -523,6 +523,12 @@ async fn pairing_of(
     )
 }
 
+/// Whether every required secret of `id` is present, from the in-memory cache alone (no query).
+/// An unknown or never-checked channel is not configured.
+pub(crate) fn is_configured(state: &AppState, id: &str) -> bool {
+    by_id(id).is_some_and(|manifest| state.channels.presence.secrets_status(manifest).0)
+}
+
 /// `GET /channels`: one status per compiled manifest. Presence, cache and drops come from memory;
 /// SQLite answers the small per-channel aggregates.
 pub async fn list(state: &AppState) -> sqlx::Result<ChannelsReadout> {
