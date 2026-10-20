@@ -174,6 +174,25 @@ function runsFetch(state: RunsWorld): (path: string, init?: RequestInit) => Prom
   };
 }
 
+/**
+ * Every run row on the page.
+ *
+ * The index splits its rows into lists — the runs that need somebody, the ones
+ * still moving, then one table per day — all named "Runs …", so a test that
+ * counts rows counts across them instead of reading one list's children.
+ */
+function runRows(): HTMLElement[] {
+  return screen
+    .queryAllByRole("list", { name: /^Runs\b/ })
+    .flatMap((list) => Array.from(list.children) as HTMLElement[]);
+}
+
+/** The rows, once the index has drawn at least one list of them. */
+async function findRunRows(): Promise<HTMLElement[]> {
+  await screen.findAllByRole("list", { name: /^Runs\b/ });
+  return runRows();
+}
+
 /** The page header's headline sentence, which is plain text and not a live region. */
 function headlineText(): string | null {
   return document.querySelector(".ui-page-headline")?.textContent ?? null;
@@ -237,7 +256,8 @@ describe("Runs - the filters live in the route", () => {
     daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
 
     const { router } = await renderRuns();
-    const bar = await screen.findByRole("group", { name: "Filter runs" });
+    // The scope is one joined control of its own, beside the search group.
+    const bar = await screen.findByRole("group", { name: "Status" });
     const failed = within(bar).getByRole("button", { name: "Failed" });
     expect(failed.getAttribute("aria-pressed")).toBe("false");
 
@@ -315,8 +335,9 @@ describe("Runs - conversations", () => {
 
     await renderRuns();
 
-    const list = await screen.findByRole("list", { name: "Runs" });
-    expect(list.children.length).toBe(2);
+    // One row each, in the lists the index splits them into (the running
+    // conversation is lifted out of the history).
+    expect((await findRunRows()).length).toBe(2);
     const link = screen.getByRole("link", { name: "Refactor the gate" });
     expect(link.getAttribute("href")).toBe("/chats/c-1");
     expect(screen.getByText("40 turns")).toBeDefined();
@@ -384,8 +405,7 @@ describe("Runs - the index", () => {
 
     await renderRuns();
 
-    const list = await screen.findByRole("list", { name: "Runs" });
-    expect(list.children.length).toBe(50);
+    expect((await findRunRows()).length).toBe(50);
     // A list that came back exactly at the ceiling may have been cut, and saying
     // so is the difference between "that is everything" and "that is the first
     // fifty".
@@ -414,8 +434,7 @@ describe("Runs - the index", () => {
       );
     });
     expect(await screen.findByText("an older run")).toBeDefined();
-    const list = screen.getByRole("list", { name: "Runs" });
-    expect(list.children.length).toBe(51);
+    expect(runRows().length).toBe(51);
     // A short page is the end of the index: no button offers a page that is not there.
     expect(screen.queryByRole("button", { name: "Load older" })).toBeNull();
     expect(headlineText()).toBe("51 in the index; none of them still moving");
@@ -426,7 +445,7 @@ describe("Runs - the index", () => {
 
     await renderRuns();
 
-    await screen.findByRole("list", { name: "Runs" });
+    await findRunRows();
     expect(screen.queryByRole("button", { name: "Load older" })).toBeNull();
     expect(screen.queryByText(/showing the newest/)).toBeNull();
   });
@@ -446,7 +465,7 @@ describe("Runs - the index", () => {
     const alert = (await screen.findByText(/Could not load older runs/)).closest("[role=alert]") as HTMLElement;
     expect(alert).not.toBeNull();
     // The failure is this button's, not the list's: the rows stay and are not marked stale.
-    expect(screen.getByRole("list", { name: "Runs" }).children.length).toBe(50);
+    expect(runRows().length).toBe(50);
     // And the note's own button is the retry.
     expect(within(alert).getByRole("button", { name: "Load older" })).toBeDefined();
   });
@@ -482,32 +501,118 @@ describe("Runs - the index", () => {
     expect(link.getAttribute("href")).toBe("/runs/7");
     expect(screen.queryByRole("link", { name: /run 7/ })).toBeNull();
     // The id is still on the row — demoted to metadata, not dropped.
-    const list = screen.getByRole("list", { name: "Runs" });
-    expect(list.textContent).toContain("run 7");
+    const [item] = await findRunRows();
+    expect(item?.textContent).toContain("run 7");
   });
 
-  it("every row states id, mode, project, time and cost on one metadata line", async () => {
+  it("every row states id, project, mode, time and cost, once each, in the header's column order", async () => {
     const rows = [row({ id: 7 }), row({ id: 8, status: "failed" })];
     daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
 
     await renderRuns();
 
-    const list = await screen.findByRole("list", { name: "Runs" });
-    expect(list.children.length).toBe(2);
-    for (const item of Array.from(list.children)) {
-      const metas = item.querySelectorAll(".runs-row-meta");
-      // Exactly one: two metadata lines on one row is how a column stops
-      // lining up with the row above it.
-      expect(metas.length).toBe(1);
-      const cells = Array.from(metas[0].children).map((cell) => cell.className);
-      expect(cells).toEqual([
-        "runs-row-id",
-        "runs-row-mode",
+    const items = await findRunRows();
+    expect(items.length).toBe(2);
+    for (const item of items) {
+      // The state, the title (which carries the id) and the facts are the row's
+      // own cells; the facts are one wrapper that the stylesheet dissolves into
+      // the table's grid, so the header's columns are these cells in this order.
+      expect(Array.from(item.children).map((cell) => cell.className)).toEqual([
+        "runs-row-state",
+        "runs-row-main",
+        "runs-row-facts",
+      ]);
+      // Exactly one id: two would be how a column stops lining up with the row above.
+      expect(item.querySelectorAll(".runs-row-id").length).toBe(1);
+      const facts = item.querySelector(".runs-row-facts") as HTMLElement;
+      expect(Array.from(facts.children).map((cell) => cell.className)).toEqual([
         "runs-row-project",
+        "runs-row-mode",
         "ui-reading-time",
         "runs-row-cost",
       ]);
     }
+  });
+
+  it("states the column header once, over the first day, and dates each day", async () => {
+    daemon.apiFetch.mockImplementation(
+      runsFetch(
+        world({
+          rows: [
+            row({ id: 9, created_at: "2026-08-18T12:00:00Z" }),
+            row({ id: 8, created_at: "2026-08-17T12:30:00Z" }),
+            row({ id: 7, created_at: "2026-08-17T12:00:00Z" }),
+          ],
+        }),
+      ),
+    );
+
+    await renderRuns();
+
+    const lists = await screen.findAllByRole("list", { name: /^Runs\b/ });
+    // One table per day, newest day first, each under a heading that dates it.
+    expect(lists.map((list) => list.children.length)).toEqual([1, 2]);
+    expect(document.querySelectorAll(".runs-head").length).toBe(1);
+    const heads = Array.from(document.querySelectorAll(".runs-day-head")).map(
+      (head) => head.querySelector(".runs-day-date")?.textContent,
+    );
+    expect(heads).toEqual(["18 August", "17 August"]);
+  });
+
+  it("lifts runs that await approval or are moving above the history, and never draws one twice", async () => {
+    const rows = [
+      row({ id: 9, status: "running", completed_at: null, prompt_excerpt: "moving now" }),
+      row({ id: 8, status: "awaiting_approval", completed_at: null, prompt_excerpt: "needs a yes" }),
+      row({ id: 7, status: "completed", prompt_excerpt: "long done" }),
+    ];
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
+
+    await renderRuns();
+
+    const needs = await screen.findByRole("region", { name: "Needs you" });
+    expect(within(needs).getByRole("link", { name: "needs a yes" })).toBeDefined();
+    const moving = screen.getByRole("region", { name: "Moving" });
+    expect(within(moving).getByRole("link", { name: "moving now" })).toBeDefined();
+    const history = screen.getByRole("region", { name: "History" });
+    expect(within(history).getByRole("link", { name: "long done" })).toBeDefined();
+    // History holds what is left, not a second copy of the two above it.
+    expect(within(history).queryByRole("link", { name: "needs a yes" })).toBeNull();
+    expect(within(history).queryByRole("link", { name: "moving now" })).toBeNull();
+    expect(screen.getAllByRole("link", { name: "moving now" }).length).toBe(1);
+    expect(runRows().length).toBe(3);
+  });
+
+  it("a filtered list is one table: nothing is lifted out of the answer", async () => {
+    const rows = [
+      row({ id: 9, status: "running", completed_at: null, prompt_excerpt: "moving now" }),
+      row({ id: 7, status: "completed", prompt_excerpt: "long done" }),
+    ];
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
+
+    await renderRuns("/runs?q=now");
+
+    await findRunRows();
+    expect(screen.queryByRole("region", { name: "Moving" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Needs you" })).toBeNull();
+    expect(screen.queryAllByRole("list", { name: /^Runs\b/ }).length).toBe(1);
+    expect(runRows().length).toBe(2);
+  });
+
+  it("counts what the loaded list holds beside each status segment", async () => {
+    const rows = [
+      row({ id: 9, status: "running", completed_at: null }),
+      row({ id: 8, status: "running", completed_at: null }),
+      row({ id: 7, status: "failed" }),
+    ];
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows })));
+
+    await renderRuns();
+
+    const scope = await screen.findByRole("group", { name: "Status" });
+    await waitFor(() => expect(within(scope).getByRole("button", { name: "Running 2" })).toBeDefined());
+    expect(within(scope).getByRole("button", { name: "Failed 1" })).toBeDefined();
+    // Nothing awaits approval: an empty segment is just its label.
+    expect(within(scope).getByRole("button", { name: "Awaiting approval" })).toBeDefined();
   });
 
   it("a completed run shows its word and no badge, and every other state keeps one", async () => {
@@ -516,8 +621,7 @@ describe("Runs - the index", () => {
 
     await renderRuns();
 
-    const list = await screen.findByRole("list", { name: "Runs" });
-    const [done, broke] = Array.from(list.children).map(
+    const [done, broke] = (await findRunRows()).map(
       (item) => item.querySelector(".runs-row-state") as HTMLElement,
     );
     // The normal recedes: the column is coloured only where something happened.
@@ -533,10 +637,7 @@ describe("Runs - the index", () => {
 
     await renderRuns();
 
-    const list = await screen.findByRole("list", { name: "Runs" });
-    const costs = Array.from(list.querySelectorAll(".runs-row-cost")).map(
-      (cell) => cell.textContent,
-    );
+    const costs = (await findRunRows()).map((item) => item.querySelector(".runs-row-cost")?.textContent);
     // Absent is not zero: "$0.00" would claim the run was free, which is a
     // different fact from nobody having priced it.
     expect(costs).toEqual(["cost not recorded", money(0.0123)]);
@@ -551,10 +652,7 @@ describe("Runs - the index", () => {
 
     await renderRuns();
 
-    const list = await screen.findByRole("list", { name: "Runs" });
-    const costs = Array.from(list.querySelectorAll(".runs-row-cost")).map(
-      (cell) => cell.textContent,
-    );
+    const costs = (await findRunRows()).map((item) => item.querySelector(".runs-row-cost")?.textContent);
     // Nothing has been priced yet, which is not the ledger failing to record it.
     expect(costs).toEqual(["", ""]);
   });
@@ -951,7 +1049,7 @@ describe("Runs - presets", () => {
     // The router's report across all runs moved to System -> Health; what stays
     // here is the per-row trail: what ran, as a column, and the advice only
     // where it differs.
-    it("shows what ran as a column of the metadata line and, in shadow, the advice that differed", async () => {
+    it("shows what ran as a cell of the row's facts and, in shadow, the advice that differed", async () => {
       daemon.apiFetch.mockImplementation(
         runsFetch(
           world({
@@ -971,12 +1069,12 @@ describe("Runs - presets", () => {
       );
       await renderRuns();
       const ran = await screen.findByText("sonnet · high");
-      // In the metadata line, beside the id and the cost, not on a line of its own.
-      expect(ran.closest(".runs-row-meta")).not.toBeNull();
+      // Among the row's facts, beside the project and the cost, not on a line of its own.
+      expect(ran.closest(".runs-row-facts")).not.toBeNull();
       expect(ran.className).toContain("runs-row-ran");
-      expect(screen.getByText("opus · low").closest(".runs-row-meta")).not.toBeNull();
+      expect(screen.getByText("opus · low").closest(".runs-row-facts")).not.toBeNull();
       const advice = screen.getByText("→ router: haiku · low");
-      expect(advice.closest(".runs-row-meta")).toBeNull();
+      expect(advice.closest(".runs-row-facts")).toBeNull();
       expect(screen.getAllByText(/^→ router:/)).toHaveLength(1);
     });
 
@@ -1024,7 +1122,7 @@ describe("Runs - chat turns", () => {
     expect(origin.getAttribute("href")).toBe("/chats/c-1");
 
     // The default is not a filter: nothing offers to clear it.
-    expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Clear \d+ filters?$/ })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "More filters" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Show chat turns" }));

@@ -48,6 +48,7 @@ import {
   Button,
   Chip,
   ErrorNote,
+  Field,
   FilterBar,
   FEED_LANES,
   PageHeader,
@@ -655,15 +656,9 @@ function FeedSearchForm({
       }}
     >
       <div className="feed-search-bar" role="search" aria-label="Search the feed">
-        <input
-          className="feed-search-input"
-          name="q"
-          type="search"
-          defaultValue={filters.q ?? ""}
-          key={filters.q ?? ""}
-          placeholder="Search the feed"
-          aria-label="Search the feed"
-        />
+        <Field label="Search the feed" labelHidden>
+          <input name="q" type="search" defaultValue={filters.q ?? ""} key={filters.q ?? ""} placeholder="Search the feed" />
+        </Field>
         <button
           type="button"
           className="feed-search-more"
@@ -1069,7 +1064,7 @@ function SequenceDetail({ sequence, time, now }: { sequence: FeedSequence; time:
           <dt>Owner</dt>
           <dd className="feed-detail-mono">{sequence.owner ?? "the machine itself"}</dd>
           <dt>{sequence.family === "series" ? "Lines" : "Lasted"}</dt>
-          <dd>{sequenceOpenPhrase(sequence, now)}</dd>
+          <dd className="feed-detail-mono">{sequenceOpenPhrase(sequence, now)}</dd>
           {sequence.attempts !== null && (
             <>
               <dt>Attempts</dt>
