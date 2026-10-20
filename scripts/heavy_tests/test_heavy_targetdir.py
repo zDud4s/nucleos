@@ -246,23 +246,32 @@ class TargetDirTests(unittest.TestCase):
         self.assert_pool(seen)
         self.assert_no_branch_dirs()
 
-    def test_default_root_is_parent_of_main_checkout(self) -> None:
-        # Without NUCLEOS_HEAVY_TD_ROOT the pool lives in the parent of the main checkout.
+    def test_default_root_is_the_dev_home_never_the_projects_dir(self) -> None:
+        # Without NUCLEOS_HEAVY_TD_ROOT the pool lives in the dev home — never the parent of the
+        # main checkout, which holds one folder per project (owner decision, 2026-10-19).
         # Asked of `_td_root()` directly: a black-box run here would lease a REAL pool dir
         # of this machine.
         import importlib.util
         spec = importlib.util.spec_from_file_location("heavy_td_root_probe", HEAVY)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        saved = os.environ.pop("NUCLEOS_HEAVY_TD_ROOT", None)
+        keys = ("NUCLEOS_HEAVY_TD_ROOT", "NUCLEOS_DEV_HOME", "XDG_DATA_HOME")
+        saved = {k: os.environ.pop(k, None) for k in keys}
         try:
-            # The main checkout, not ROOT: run from a linked worktree, ROOT is that worktree.
+            # Never under a path with a space either: cargo cannot link there.
+            self.assertNotIn(" ", str(mod._td_root()))
+            self.assertEqual(mod._td_root().name, "nucleos-dev")
+            os.environ["NUCLEOS_DEV_HOME"] = str(self.tmp / "home")
+            self.assertEqual(mod._td_root(), self.tmp / "home")
             common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                                     cwd=str(ROOT), capture_output=True, text=True, check=True)
-            self.assertEqual(real(mod._td_root()), real(Path(common.stdout.strip()).parent.parent))
+            os.environ.pop("NUCLEOS_DEV_HOME")
+            self.assertNotEqual(real(mod._td_root()), real(Path(common.stdout.strip()).parent.parent))
         finally:
-            if saved is not None:
-                os.environ["NUCLEOS_HEAVY_TD_ROOT"] = saved
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
 
     def test_detached_and_reserved_branch_names_get_a_pool_dir(self) -> None:
         # These used to fall back to a slug from the directory name; now they are ordinary

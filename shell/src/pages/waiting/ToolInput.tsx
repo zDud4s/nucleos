@@ -68,9 +68,26 @@ export function ToolInput({ raw }: { raw: string | null }) {
 /* ---------------------------------------------------------------- the provenance -- */
 
 /** One thing a turn read before it reached for an action. */
-interface ReadEntry {
+export interface ReadEntry {
   tool?: unknown;
   arguments?: unknown;
+}
+
+/**
+ * The turn's reads, or `null` when there is nothing to show.
+ *
+ * Its own function because the card has to know *before* it renders whether the context column
+ * has anything in it: a column of nothing would still take its 40% of the row.
+ */
+export function readEntries(raw: string | null): ReadEntry[] | null {
+  if (raw === null || raw.trim() === "") return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    return parsed as ReadEntry[];
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -89,15 +106,8 @@ interface ReadEntry {
  * direction that makes a contaminated action look clean.
  */
 export function ReadFrom({ raw }: { raw: string | null }) {
-  if (raw === null || raw.trim() === "") return null;
-  let entries: ReadEntry[];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.length === 0) return null;
-    entries = parsed as ReadEntry[];
-  } catch {
-    return null;
-  }
+  const entries = readEntries(raw);
+  if (entries === null) return null;
   return (
     <div className="waiting-provenance">
       <p className="waiting-provenance-head">this turn had read</p>

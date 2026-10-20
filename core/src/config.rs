@@ -401,6 +401,23 @@ pub struct AutopilotRules {
     /// `observe`. Its only reader is `hooks::observe_verification`.
     #[serde(default)]
     pub verify_guard: VerifyGuardMode,
+    /// Extra command prefixes this project counts as a test, check or build command. Absent means
+    /// only the compiled defaults in `governance::command_kind`.
+    #[serde(default)]
+    pub command_kinds: CommandKinds,
+}
+
+/// The `command_kinds:` key. Absent means only the compiled defaults; each entry is a command
+/// prefix matched like a project shell rule.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CommandKinds {
+    #[serde(default)]
+    pub test: Vec<String>,
+    #[serde(default)]
+    pub check: Vec<String>,
+    #[serde(default)]
+    pub build: Vec<String>,
 }
 
 impl AutopilotRules {
@@ -1497,6 +1514,33 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
                 "the refusal must name the key: {error}"
             );
         }
+    }
+
+    #[test]
+    fn command_kinds_key_parses_and_a_misspelt_kind_is_refused() {
+        let rules = rules_from(
+            "command_kinds:\n  test: [\"just t\"]\n  check: [\"just lint\", \"just fmt\"]\n  build: [\"just ship\"]\n",
+        )
+        .expect("a command_kinds block parses");
+        assert_eq!(rules.command_kinds.test, vec!["just t".to_string()]);
+        assert_eq!(
+            rules.command_kinds.check,
+            vec!["just lint".to_string(), "just fmt".to_string()]
+        );
+        assert_eq!(rules.command_kinds.build, vec!["just ship".to_string()]);
+
+        let absent = rules_from("gate_command: x\n").expect("no command_kinds key still parses");
+        assert_eq!(absent.command_kinds, CommandKinds::default());
+
+        let partial = rules_from("command_kinds:\n  test: [\"just t\"]\n")
+            .expect("a block naming one kind parses");
+        assert!(partial.command_kinds.check.is_empty());
+        assert!(partial.command_kinds.build.is_empty());
+
+        assert!(
+            rules_from("command_kinds:\n  tests: [\"just t\"]\n").is_err(),
+            "a misspelt kind is a startup error, not a silently ignored line"
+        );
     }
 
     #[test]

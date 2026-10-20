@@ -11,7 +11,35 @@ vi.mock("./client", async (original) => ({
 
 import { createAppQueryClient } from "../app/queryClient";
 import { keys } from "./keys";
-import { useCreateNote, useRemoveLink, useSearchOwnerNotes, useTeachNote } from "./owner-notes";
+import {
+  originLabel,
+  useCreateNote,
+  useRemoveLink,
+  useSearchOwnerNotes,
+  useTeachNote,
+} from "./owner-notes";
+
+describe("originLabel", () => {
+  it("keeps shell as is", () => {
+    expect(originLabel("shell")).toBe("shell");
+  });
+  it("capitalises the channel id without a cache", () => {
+    expect(originLabel("channel:telegram")).toBe("Telegram");
+  });
+  it("uses the cached channel label", () => {
+    expect(originLabel("channel:telegram", [{ id: "telegram", label: "Telegram Bot" }])).toBe(
+      "Telegram Bot",
+    );
+  });
+  it("falls back to the capitalised id when the cache lacks the channel", () => {
+    expect(originLabel("channel:discord", [{ id: "telegram", label: "Telegram Bot" }])).toBe(
+      "Discord",
+    );
+  });
+  it("labels the legacy telegram origin", () => {
+    expect(originLabel("telegram")).toBe("Telegram");
+  });
+});
 
 function setup() {
   const client = createAppQueryClient();

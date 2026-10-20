@@ -94,7 +94,7 @@ describe("leaving the roster, from inside the project", () => {
     );
     await waitFor(() => expect(document.activeElement?.contains(quiet)).toBe(true));
     // And the roster follows the daemon: the project is gone because the query was refetched.
-    expect(document.querySelector('a[href="/projects/spent/state"].rs-quiet-item')).toBeNull();
+    expect(document.querySelector('a[href="/projects/spent/state"]')).toBeNull();
   });
 
   /** The roster says nothing about a removal when it was reached any other way. */

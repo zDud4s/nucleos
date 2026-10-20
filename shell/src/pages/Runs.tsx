@@ -21,6 +21,7 @@ import {
   type Preset,
 } from "../data/presets";
 import { routeTriple } from "../data/route";
+import { dayHeading, dayKey } from "../lib/timeline";
 import { useKillSwitch, useProjects, type ProjectSummary } from "../data/system";
 import {
   Button,
@@ -194,6 +195,7 @@ export function Runs() {
         filters={filters}
         showChats={showChats}
         projects={projects.data}
+        counts={rows === undefined ? undefined : scopeCounts(rows, older.more)}
         onChange={applyFilters}
       />
 
@@ -218,10 +220,10 @@ export function Runs() {
 /* -------------------------------------------------------------- filters -- */
 
 /**
- * The status chips a person reaches for: what is moving, what awaits approval,
+ * The status segments a person reaches for: what is moving, what awaits approval,
  * what went wrong. With none on, every run shows. `failed` alone and not
  * "failed, timed out or interrupted": `GET /runs` binds `status` to exactly one
- * value (`core/src/runs.rs`, `search` — `AND status = ?`), so a chip that
+ * value (`core/src/runs.rs`, `search` — `AND status = ?`), so a segment that
  * promised three would be a request the daemon cannot answer. The exact
  * statuses are one disclosure away.
  */
@@ -237,23 +239,53 @@ const SCOPE_STATUSES = new Set(SCOPES.map((scope) => scope.id));
 const SEARCH_DEBOUNCE_MS = 350;
 
 /**
- * The filters, bound to the route.
+ * What each status segment holds, as the text beside its label.
  *
- * One `ListFilter`: the search box and the status chips (none on is "all"). The
- * chips and the selects commit on change; the text commits once typing rests,
- * since a navigation per keystroke would put a history entry behind every
- * letter. Project, mode, the other statuses and the chat turns sit behind one
+ * Read off the rows already loaded and not asked of the daemon: `GET /runs` has
+ * no count route, and a second query per segment for a figure beside a label is
+ * not worth a poll. So it is a reading of *this list* — it follows the search
+ * and the project, it is the loaded page's, and a `+` says an older page may
+ * hold more. Zero is left unsaid: an empty segment is just its label, and while
+ * another status is pressed the other segments are empty by construction, not
+ * because nothing ran. A conversation counts as running when any turn of it is
+ * (the same reading its state cell gives), so the number matches the rows.
+ */
+function scopeCounts(rows: RunSearchResult[], more: boolean): Record<string, string> {
+  const counts: Record<string, string> = {};
+  for (const scope of SCOPES) {
+    const n = rows.filter((row) => stateOf(row) === scope.id).length;
+    if (n > 0) counts[scope.id] = more ? `${n}+` : String(n);
+  }
+  return counts;
+}
+
+/**
+ * The filters, bound to the route, on one line.
+ *
+ * The search box (a `ListFilter`, which owns `/` and Escape), then the status
+ * scope as one joined control, then **More filters** pinned to the far end. The
+ * scope is `ModeSwitch`'s own track and segment (`.ui-switch`), with
+ * `aria-pressed` as a chip has: none pressed is "all". Pressing a segment and
+ * the selects commit on change; the text commits once typing rests, since a
+ * navigation per keystroke would put a history entry behind every letter.
+ * Project, mode, the other statuses and the chat turns sit behind one
  * `Disclosure`, open on arrival when any of them is in force.
+ *
+ * Below 60rem the groups wrap whole — the search takes a line, the scope and the
+ * disclosure share the next — and never mid-group (`runs.css`).
  */
 function RunFilterBar({
   filters,
   showChats,
   projects,
+  counts,
   onChange,
 }: {
   filters: RunFilters;
   showChats: boolean;
   projects: ProjectSummary[] | undefined;
+  /** Per-status text beside each segment; absent while the list is loading. */
+  counts: Record<string, string> | undefined;
   onChange: (patch: Partial<RunSearch>) => void;
 }) {
   // Open on arrival when a filter it holds is in force: a project, a mode, chat
@@ -301,20 +333,45 @@ function RunFilterBar({
     onChange({ project: undefined, status: undefined, mode: undefined, q: undefined });
   }
 
-  const chipsOn = filters.status !== undefined && SCOPE_STATUSES.has(filters.status);
-  const listFilterCovers = chipsOn || routeQ !== "";
+  // Every filter in force besides the text, so the search's Clear says how many
+  // it will turn off: it is `clearAll`, which also drops a project and a mode.
+  // (One Clear, here; the old second "Clear filters" for a project or a mode on
+  // its own is no longer needed.)
+  const inForce = [filters.status, filters.project, filters.mode].filter(
+    (value): value is string => value !== undefined,
+  );
 
   return (
-    <div className="runs-filters">
-      <ListFilter
-        noun="runs"
-        query={draft}
-        onQueryChange={setDraft}
-        chips={SCOPES}
-        selected={chipsOn && filters.status !== undefined ? [filters.status] : []}
-        onToggleChip={(id) => onChange({ status: filters.status === id ? undefined : id })}
-        onClear={clearAll}
-      />
+    <div className="runs-bar">
+      <div className="runs-search">
+        <ListFilter
+          noun="runs"
+          query={draft}
+          onQueryChange={setDraft}
+          selected={inForce}
+          onClear={clearAll}
+        />
+      </div>
+
+      <div className="ui-switch runs-scope" role="group" aria-label="Status">
+        {SCOPES.map((scope) => (
+          <button
+            key={scope.id}
+            type="button"
+            className="ui-switch-seg"
+            aria-pressed={filters.status === scope.id}
+            onClick={() => onChange({ status: filters.status === scope.id ? undefined : scope.id })}
+          >
+            {scope.label}
+            {counts?.[scope.id] !== undefined && (
+              <>
+                {" "}
+                <span className="ui-count">{counts[scope.id]}</span>
+              </>
+            )}
+          </button>
+        ))}
+      </div>
 
       {otherStatus !== undefined && (
         // A status the chips cannot show, kept in sight and removable, so the
@@ -326,14 +383,6 @@ function RunFilterBar({
         >
           status: {readState("run", otherStatus)?.label ?? otherStatus}{" "}
           <span aria-hidden="true">×</span>
-        </Button>
-      )}
-
-      {isFiltered(filters) && !listFilterCovers && (
-        // The filter bar offers its own Clear only for what it holds (text and
-        // chips); a project or a mode alone still needs a way out.
-        <Button variant="quiet" onClick={clearAll}>
-          Clear filters
         </Button>
       )}
 
@@ -370,7 +419,7 @@ function RunFilterBar({
           </Field>
 
           <Field label="Other status">
-            {/* Only the statuses the chips above do not already offer, in the
+            {/* Only the statuses the segments above do not already offer, in the
                 badge's own words from the one table: choosing "failed" has one
                 place to be done, not two. */}
             <select
@@ -485,18 +534,45 @@ function RunList({
     );
   }
 
+  // Attention first, then history. A run that waits on a person and a run that
+  // is still moving are the two things on this page that can change under the
+  // reader's eyes or need them, so they lift out of the pile into rows of their
+  // own, and the table under them is what has already happened, by day.
+  //
+  // Only on the unfiltered index. A filter is an answer to one question, and
+  // splitting its answer into "Needs you / Moving / the rest" would answer a
+  // different one: pressing Failed wants the failures in one table, and a search
+  // wants its matches in one. So a filtered list is the history table alone —
+  // still by day, since the day is still the thing that dates a row — and every
+  // run, whatever its state, is a row of it. Nothing is ever drawn in both.
+  const split = filtered ? { waiting: [], moving: [], rest: rows } : partition(rows);
+  const attention = split.waiting.length + split.moving.length > 0;
+  const now = Date.now();
+
   return (
-    <>
-      <RunsHead />
-      <Rows label="Runs">
-        {rows.map((row) =>
-          row.chat_id != null && row.turns != null ? (
-            <ConversationRow key={`chat-${row.chat_id}`} row={row} filters={filters} />
-          ) : (
-            <RunRow key={row.id} row={row} />
-          ),
-        )}
-      </Rows>
+    <div className="runs-index">
+      {split.waiting.length > 0 && (
+        <Section label="Needs you">
+          <Rows label="Runs awaiting approval">
+            {split.waiting.map((row) => runRowOf(row, filters, "attention"))}
+          </Rows>
+        </Section>
+      )}
+      {split.moving.length > 0 && (
+        <Section label="Moving">
+          <Rows label="Runs still moving">
+            {split.moving.map((row) => runRowOf(row, filters, "attention"))}
+          </Rows>
+        </Section>
+      )}
+      {split.rest.length > 0 &&
+        (attention ? (
+          <Section label="History">
+            <HistoryTable rows={split.rest} filters={filters} now={now} level={3} />
+          </Section>
+        ) : (
+          <HistoryTable rows={split.rest} filters={filters} now={now} level={2} />
+        ))}
       {older.failed ? (
         <ErrorNote onRetry={older.load} retryLabel="Load older">
           Could not load older runs — the ones above are still current.
@@ -517,72 +593,251 @@ function RunList({
           </div>
         )
       )}
-    </>
+    </div>
   );
 }
 
 /**
- * Names the metadata columns once, above the list.
+ * The state a row is *read* as: a conversation with a turn still running is
+ * running, whatever its latest turn settled as (the same reading `ConversationRow`
+ * draws its badge from), so the segments' counts, the attention region and the
+ * badge cannot disagree about one row.
+ */
+function stateOf(row: RunSearchResult): string {
+  return isConversation(row) && (row.running_turns ?? 0) > 0 ? "running" : row.status;
+}
+
+function isConversation(row: RunSearchResult): boolean {
+  return row.chat_id != null && row.turns != null;
+}
+
+/**
+ * The unfiltered index split by what it asks of the reader: runs awaiting
+ * approval, runs moving, and the rest. Order within each is the daemon's
+ * (newest first), which `Array.filter` keeps.
+ */
+function partition(rows: RunSearchResult[]): {
+  waiting: RunSearchResult[];
+  moving: RunSearchResult[];
+  rest: RunSearchResult[];
+} {
+  const waiting: RunSearchResult[] = [];
+  const moving: RunSearchResult[] = [];
+  const rest: RunSearchResult[] = [];
+  for (const row of rows) {
+    const state = stateOf(row);
+    if (state === "awaiting_approval") waiting.push(row);
+    else if (runIsAlive(state)) moving.push(row);
+    else rest.push(row);
+  }
+  return { waiting, moving, rest };
+}
+
+/** How a row is laid out: a line of the table, a richer line of the attention region, or a turn nested in a conversation. */
+type RowKind = "table" | "attention" | "turn";
+
+function rowClass(kind: RowKind): string {
+  return kind === "table"
+    ? "runs-row runs-row-table"
+    : kind === "attention"
+      ? "runs-row runs-row-attn"
+      : "runs-row runs-row-compact";
+}
+
+function runRowOf(row: RunSearchResult, filters: RunFilters, kind: RowKind): ReactNode {
+  return isConversation(row) ? (
+    <ConversationRow key={`chat-${row.chat_id}`} row={row} filters={filters} kind={kind} />
+  ) : (
+    <RunRow key={row.id} row={row} kind={kind} />
+  );
+}
+
+/** Consecutive rows of one local calendar day, under the heading that dates them. */
+interface DayGroup {
+  key: string;
+  title: string;
+  date: string;
+  rows: RunSearchResult[];
+}
+
+/**
+ * Groups the list by the day each run was created. Consecutive, not bucketed:
+ * the daemon sends newest first, so a day is already contiguous, and a bucket
+ * map would only reorder the day a polled row slid across midnight into. A
+ * timestamp that does not parse gets a group of its own rather than a heading
+ * that says "Invalid Date".
+ */
+function groupByDay(rows: RunSearchResult[], now: number): DayGroup[] {
+  const groups: DayGroup[] = [];
+  for (const row of rows) {
+    const at = Date.parse(row.created_at);
+    const key = Number.isNaN(at) ? "undated" : dayKey(at);
+    const last = groups[groups.length - 1];
+    if (last?.key === key) {
+      last.rows.push(row);
+      continue;
+    }
+    const heading = Number.isNaN(at) ? { title: "Undated", date: "" } : dayHeading(at, now);
+    groups.push({ key, ...heading, rows: [row] });
+  }
+  return groups;
+}
+
+/**
+ * The history: one column header, then a box of rows per day.
  *
- * Presentation only (`aria-hidden`): each row's cells carry `title`s for the same
- * words, and below the container width where the columns collapse the header is
- * hidden and the cells name themselves with a short prefix instead (`runs.css`).
+ * The header and every row share one grid (`--runs-cols`), which is the point of
+ * the redesign: the old rows were two-line blocks whose title spanned the
+ * columns above it, so the header named columns the rows did not have. Now
+ * each row's cells sit in the header's columns, and the run id is the second
+ * line of the title cell, where it is a handle for the run named above it.
+ *
+ * `level` is the day heading's rank: under the "History" section when there is an
+ * attention region above it, directly under the page's title when there is not.
+ */
+function HistoryTable({
+  rows,
+  filters,
+  now,
+  level,
+}: {
+  rows: RunSearchResult[];
+  filters: RunFilters;
+  now: number;
+  level: 2 | 3;
+}) {
+  const Heading = level === 3 ? "h3" : "h2";
+  const idPrefix = useId();
+  return (
+    <div className="runs-history">
+      <RunsHead />
+      {groupByDay(rows, now).map((day) => {
+        const headingId = `${idPrefix}-${day.key}`;
+        return (
+          <section key={day.key} className="runs-day" aria-labelledby={headingId}>
+            <Heading className="runs-day-head" id={headingId}>
+              <span className="runs-day-title">{day.title}</span>
+              {day.date !== "" && <span className="runs-day-date">{day.date}</span>}
+              <span className="ui-count">{day.rows.length}</span>
+            </Heading>
+            <Rows label={`Runs, ${day.title}${day.date === "" ? "" : ` ${day.date}`}`}>
+              {day.rows.map((row) => runRowOf(row, filters, "table"))}
+            </Rows>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Names the table's columns once, above the first day.
+ *
+ * Presentation only (`aria-hidden`): each cell carries a `title` for the same
+ * word. Below the width where the columns collapse the header is hidden and the
+ * cells name themselves with a short prefix instead (`runs.css`).
  */
 function RunsHead() {
   return (
     <div className="runs-head" aria-hidden="true">
       <div className="runs-head-grid">
-        <span className="runs-head-state">State</span>
-        <span className="runs-head-meta">
-          <span>Run</span>
-          <span>Mode</span>
-          <span>Project</span>
-          <span>When</span>
-          <span>Model</span>
-          <span className="runs-head-cost">Cost</span>
-        </span>
+        <span>State</span>
+        <span>Run</span>
+        <span>Project</span>
+        <span>Mode</span>
+        <span>Model</span>
+        <span className="runs-head-end">When</span>
+        <span className="runs-head-end">Cost</span>
       </div>
     </div>
   );
 }
 
-/** One run as a row: the old list's row, now also what a conversation's turns are drawn with. */
-function RunRow({ row }: { row: RunSearchResult }) {
-  // What ran is a column of the metadata line, not a line of its own: it is a
-  // fact every routed row has, and a third line under every row made the whole
-  // list a third taller to say it.
-  const ran = routeTriple([row.model, row.effort]);
+/**
+ * The state cell, the title cell and the facts cell(s) every row is made of.
+ *
+ * The facts are one wrapper so that the same row is two layouts without a second
+ * markup: `display: contents` hands each fact to the table grid when the row is
+ * wide, and the wrapper is a wrapping line under the title when it is not
+ * (`runs.css`).
+ */
+function RunCells({
+  state,
+  main,
+  facts,
+}: {
+  state: ReactNode;
+  main: ReactNode;
+  facts: ReactNode;
+}) {
   return (
-    <Row className="runs-row">
-      <span className="runs-row-state">
-        <RunState status={row.status} />
-      </span>
-      <Link to={`/runs/${row.id}`} className="runs-row-name">
-        {row.prompt_excerpt}
-      </Link>
-      <p className="runs-row-meta">
-        <span className="runs-row-id" title="Run">run {row.id}</span>
-        <span className="runs-row-mode" title="Mode">{row.mode}</span>
-        <span className="runs-row-project" title="Project">
-          {row.project_id ?? "no project"}
-        </span>
-        <RelativeTime at={row.created_at} />
-        {ran !== null && <span className="runs-row-ran" title="Model">{ran}</span>}
-        <span
-          className="runs-row-cost"
-          title="Cost"
-          data-unrecorded={costOf(row) === "cost not recorded" ? "" : undefined}
-        >
-          {costOf(row)}
-        </span>
-      </p>
-      {row.launched_by_chat_id != null && (
-        <Link to={`/chats/${row.launched_by_chat_id}`} className="runs-row-origin">
-          from chat {row.launched_by_chat_title ?? row.launched_by_chat_id}
-        </Link>
-      )}
-      <RouteAdvice row={row} />
+    <>
+      <span className="runs-row-state">{state}</span>
+      <div className="runs-row-main">{main}</div>
+      <div className="runs-row-facts">{facts}</div>
+    </>
+  );
+}
+
+/** One run as a row: also what a conversation's turns are drawn with (`kind="turn"`). */
+function RunRow({ row, kind }: { row: RunSearchResult; kind: RowKind }) {
+  // What ran is a cell of the facts, not a line of its own: it is a fact every
+  // routed row has, and a third line under every row made the whole list a
+  // third taller to say it.
+  const ran = routeTriple([row.model, row.effort]);
+  const cost = costOf(row);
+  return (
+    <Row className={rowClass(kind)}>
+      <RunCells
+        state={<RunState status={row.status} />}
+        main={
+          <>
+            <Link to={`/runs/${row.id}`} className="runs-row-name">
+              {row.prompt_excerpt}
+            </Link>
+            <p className="runs-row-sub">
+              <span className="runs-row-id" title="Run">run {row.id}</span>
+              {row.launched_by_chat_id != null && (
+                <Link to={`/chats/${row.launched_by_chat_id}`} className="runs-row-origin">
+                  from chat {row.launched_by_chat_title ?? row.launched_by_chat_id}
+                </Link>
+              )}
+            </p>
+            <RouteAdvice row={row} />
+          </>
+        }
+        facts={
+          <>
+            <span className="runs-row-project" title="Project">
+              {row.project_id ?? "no project"}
+            </span>
+            <span className="runs-row-mode" data-mode={row.mode} title="Mode">{row.mode}</span>
+            {ran !== null && <span className="runs-row-ran" title="Model">{ran}</span>}
+            <When at={row.created_at} since={kind === "attention"} />
+            <span
+              className="runs-row-cost"
+              title="Cost"
+              data-unrecorded={cost === "cost not recorded" ? "" : undefined}
+            >
+              {cost}
+            </span>
+          </>
+        }
+      />
     </Row>
+  );
+}
+
+/**
+ * The time cell: the bare relative time, or "started …" on the attention rows,
+ * where it is how long the run has been going and not a column of dates.
+ */
+function When({ at, since }: { at: string; since: boolean }) {
+  if (!since) return <RelativeTime at={at} />;
+  return (
+    <span className="runs-row-when">
+      started <RelativeTime at={at} />
+    </span>
   );
 }
 
@@ -591,7 +846,15 @@ function RunRow({ row }: { row: RunSearchResult }) {
  * The row is the folded `GET /runs?group=chat` row; the turns are not fetched
  * until it is opened.
  */
-function ConversationRow({ row, filters }: { row: RunSearchResult; filters: RunFilters }) {
+function ConversationRow({
+  row,
+  filters,
+  kind,
+}: {
+  row: RunSearchResult;
+  filters: RunFilters;
+  kind: RowKind;
+}) {
   const [open, setOpen] = useState(false);
   const turnsId = useId();
   const chatId = row.chat_id ?? "";
@@ -599,33 +862,41 @@ function ConversationRow({ row, filters }: { row: RunSearchResult; filters: RunF
   const running = row.running_turns ?? 0;
   const name = row.chat_title ?? row.prompt_excerpt;
   return (
-    <Row className="runs-row">
-      <span className="runs-row-state">
-        <RunState status={running > 0 ? "running" : row.status} />
-      </span>
-      <Link to={`/chats/${chatId}`} className="runs-row-name">
-        {name}
-      </Link>
-      <p className="runs-row-meta">
-        <span className="runs-row-id">{turns === 1 ? "1 turn" : `${turns} turns`}</span>
-        <span className="runs-row-mode">chat</span>
-        <span className="runs-row-project">{row.project_id ?? "no project"}</span>
-        <RelativeTime at={row.created_at} />
-        <span className="runs-row-cost" data-unrecorded={row.cost_usd === null ? "" : undefined}>
-          {row.cost_usd === null ? "cost not recorded" : money(row.cost_usd)}
-        </span>
-      </p>
-      <p className="runs-row-turns">
-        {running > 0 && <span className="runs-row-running">{`${running} running`}</span>}
-        <Button
-          variant="quiet"
-          aria-expanded={open}
-          aria-controls={turnsId}
-          onClick={() => setOpen(!open)}
-        >
-          {open ? "Hide turns" : "Show turns"}
-        </Button>
-      </p>
+    <Row className={rowClass(kind)}>
+      <RunCells
+        state={<RunState status={stateOf(row)} />}
+        main={
+          <>
+            <Link to={`/chats/${chatId}`} className="runs-row-name">
+              {name}
+            </Link>
+            <p className="runs-row-sub">
+              <span className="runs-row-id">{turns === 1 ? "1 turn" : `${turns} turns`}</span>
+              {running > 0 && <span className="runs-row-running">{`${running} running`}</span>}
+              <span className="runs-row-toggle">
+                <Button
+                  variant="quiet"
+                  aria-expanded={open}
+                  aria-controls={turnsId}
+                  onClick={() => setOpen(!open)}
+                >
+                  {open ? "Hide turns" : "Show turns"}
+                </Button>
+              </span>
+            </p>
+          </>
+        }
+        facts={
+          <>
+            <span className="runs-row-project">{row.project_id ?? "no project"}</span>
+            <span className="runs-row-mode" data-mode="chat">chat</span>
+            <When at={row.created_at} since={kind === "attention"} />
+            <span className="runs-row-cost" data-unrecorded={row.cost_usd === null ? "" : undefined}>
+              {row.cost_usd === null ? "cost not recorded" : money(row.cost_usd)}
+            </span>
+          </>
+        }
+      />
       <div id={turnsId} className="runs-turns" hidden={!open}>
         {open && <ConversationTurns chatId={chatId} filters={filters} name={name} total={turns} />}
       </div>
@@ -656,7 +927,7 @@ function ConversationTurns({
     <>
       <Rows label={`Turns of ${name}`}>
         {turns.data.map((turn) => (
-          <RunRow key={turn.id} row={turn} />
+          <RunRow key={turn.id} row={turn} kind="turn" />
         ))}
       </Rows>
       {total > turns.data.length && (
@@ -671,11 +942,12 @@ function ConversationTurns({
 /**
  * Where a shadow router disagreed with what ran.
  *
- * What ran is already a column of the metadata line (`RunRow`), so this is only
- * the extra line, and only when the advice differs: a matching one is the normal
- * case and would be a line on every row. The "→" prefix and the italic (see
- * `.runs-row-route-advice`) are what set it apart from the facts above it now
- * that it is no longer a quieter *colour* — faint text failed the contrast floor.
+ * What ran is already a column of the row (`RunRow`), so this is only the extra
+ * line under the title, and only when the advice differs: a matching one is the
+ * normal case and would be a line on every row. The "→" prefix and the italic
+ * (see `.runs-row-route-advice`) are what set it apart from the facts beside it
+ * now that it is no longer a quieter *colour* — faint text failed the contrast
+ * floor.
  *
  * The router's report across all runs lives on System → Health, not here: it
  * ignores this page's filters and serves a config decision (shadow to apply, per

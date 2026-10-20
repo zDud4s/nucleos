@@ -23,7 +23,20 @@ import { keys } from "./keys";
 /* ----------------------------------------------------------------- shapes -- */
 
 export type NoteState = "active" | "archived";
-export type NoteOrigin = "shell" | "telegram";
+// The bare "telegram" member is transitional until phase 4; remove it then.
+export type NoteOrigin = "shell" | "telegram" | `channel:${string}`;
+
+const capitalise = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** Human label for a note origin. Pure: pass the cached channel list if you have one. */
+export function originLabel(
+  origin: NoteOrigin,
+  channels?: ReadonlyArray<{ id: string; label: string }>,
+): string {
+  if (origin === "shell") return "shell";
+  const id = origin.startsWith("channel:") ? origin.slice("channel:".length) : origin;
+  return channels?.find((c) => c.id === id)?.label ?? capitalise(id);
+}
 
 export const LINK_TYPES = ["relates", "supports", "contradicts", "details", "supersedes"] as const;
 export type LinkType = (typeof LINK_TYPES)[number];

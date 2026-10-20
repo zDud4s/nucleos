@@ -191,6 +191,31 @@ pub fn runner_by_id(id: &str) -> Option<&'static str> {
     None
 }
 
+/// The cheap model a background one-shot should ask `runner` for, or `None` when the runner has no
+/// known cheap tier (the caller then keeps the runner's own model). PURE.
+///
+/// Claude takes its CLI alias (`haiku`, resolved by the CLI to the newest Haiku). Codex has no
+/// alias, so it is the newest known OpenAI id with `mini` in it: by `created` when the vendor said,
+/// else the last one listed.
+pub fn utility_default(runner: &str, known: &[Discovered]) -> Option<String> {
+    match runner {
+        "claude" => Some("haiku".to_owned()),
+        "codex" => {
+            let minis: Vec<&Discovered> = known
+                .iter()
+                .filter(|m| m.provider == "openai" && m.id.to_lowercase().contains("mini"))
+                .collect();
+            let newest = minis
+                .iter()
+                .enumerate()
+                .max_by_key(|(index, m)| (m.created, *index))
+                .map(|(_, m)| *m)?;
+            Some(newest.id.clone())
+        }
+        _ => None,
+    }
+}
+
 /// Effort levels a family takes when no config entry says otherwise.
 pub fn default_efforts(provider: &str, family: &str) -> Vec<String> {
     let levels: &[&str] = match (provider, family) {
@@ -1749,5 +1774,58 @@ mod tests {
         .await;
         assert_eq!(absent.source, "fallback");
         assert_eq!(absent.ttl(), FRESH_FOR, "an absent source is not a failure");
+    }
+
+    fn utility_found(id: &str, provider: &'static str, created: Option<i64>) -> Discovered {
+        let (_, family) = family_of(id);
+        Discovered {
+            id: id.to_string(),
+            label: id.to_string(),
+            provider,
+            family,
+            runner: if provider == "openai" {
+                "codex"
+            } else {
+                "claude"
+            },
+            efforts: Vec::new(),
+            created,
+        }
+    }
+
+    #[test]
+    fn utility_default_is_the_haiku_alias_for_claude() {
+        assert_eq!(utility_default("claude", &[]).as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn utility_default_picks_the_newest_codex_mini() {
+        let known = [
+            utility_found("gpt-6-mini", "openai", Some(100)),
+            utility_found("gpt-6.1-mini", "openai", Some(300)),
+            utility_found("gpt-6-sol", "openai", Some(900)),
+            utility_found("claude-mini-x", "anthropic", Some(999)),
+            utility_found("gpt-5-mini", "openai", Some(200)),
+        ];
+        assert_eq!(
+            utility_default("codex", &known).as_deref(),
+            Some("gpt-6.1-mini")
+        );
+        let undated = [
+            utility_found("gpt-5-mini", "openai", None),
+            utility_found("gpt-6-mini", "openai", None),
+        ];
+        assert_eq!(
+            utility_default("codex", &undated).as_deref(),
+            Some("gpt-6-mini")
+        );
+    }
+
+    #[test]
+    fn utility_default_is_none_without_a_codex_mini_or_for_an_unknown_runner() {
+        let known = [utility_found("gpt-6-sol", "openai", Some(1))];
+        assert_eq!(utility_default("codex", &known), None);
+        assert_eq!(utility_default("codex", &[]), None);
+        assert_eq!(utility_default("ollama", &known), None);
     }
 }

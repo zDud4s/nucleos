@@ -905,6 +905,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
     } = launch;
     let pool = state.pool.clone();
     let daemon_runner = state.runner.clone();
+    let utility_model = state.utility_model.clone();
     let assistants = state.assistants.clone();
     let deadlines = turn_deadlines(state.run_timeout, state.progress_timeout, tool_policy);
     let control_token = state.token.0.clone();
@@ -1333,10 +1334,18 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     // would otherwise recreate the session `rotate` just forgot. A completed turn
                     // only; a cancelled one has not settled anything worth carrying forward.
                     if status == "completed" {
+                        // Deterministic unless `NUCLEOS_ROOT_ROTATE_LLM` is on; any failure of the
+                        // model falls back to it inside the summarizer.
+                        let one_shot = rotation::RunnerModel {
+                            runner: daemon_runner.as_ref(),
+                            model: utility_model.clone(),
+                        };
+                        let summarizer =
+                            rotation::LlmSummarizer::new(&one_shot, rotation::llm_enabled());
                         match rotation::rotate(
                             &pool,
                             &*rotation::root_nodes(&pool),
-                            &rotation::DeterministicSummarizer,
+                            &summarizer,
                             &turn.slot.chat_id,
                             id,
                             context_fill,
@@ -1475,6 +1484,7 @@ mod tests {
             runner,
             triage_runner: None,
             local_triage_disabled: None,
+            utility_model: None,
             assistants: Arc::new(crate::assistants::NoAssistants),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

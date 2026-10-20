@@ -96,7 +96,7 @@ def hold_with_process(run_dir: Path, *args: str) -> subprocess.Popen:
     )
 
 
-def test_mcp_tool_servers_holding_the_copy_are_not_called_the_daemon():
+def test_mcp_tool_servers_holding_the_copy_are_moved_aside_not_killed_or_refused():
     with tempfile.TemporaryDirectory() as tmp:
         # Long form: the 8.3 temp path a process reports would not match the run dir listing.
         base = Path(tmp).resolve()
@@ -106,14 +106,34 @@ def test_mcp_tool_servers_holding_the_copy_are_not_called_the_daemon():
         tools = hold_with_process(run_dir, "--mcp-tools")
         try:
             done = run("-TargetDir", str(target), "-RunDir", str(run_dir), "-NoBuild", "-NoStart")
+            assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+            assert "moved the held image(s) aside" in done.stderr, done.stderr
+            aside = list(run_dir.glob("nucleos-core.exe.old-*"))
+            assert len(aside) == 1, aside
+            assert aside[0].name in done.stderr, done.stderr
+            assert (run_dir / "nucleos-core.exe").read_bytes() == b"fake nucleos-core"
+            assert len(list(run_dir.glob("*-sidecar.exe"))) == len(SIDECARS)
+            assert tools.poll() is None, "the MCP tool server was killed"
         finally:
             tools.kill()
             tools.wait()
-        assert done.returncode == 3, (done.returncode, done.stdout, done.stderr)
-        assert "the daemon is not running" in done.stderr, done.stderr
-        assert "--mcp-tools" in done.stderr, done.stderr
-        assert f"Stop-Process -Id {tools.pid}" in done.stderr, done.stderr
 
+
+def test_a_stale_moved_aside_image_is_swept_but_a_held_one_is_kept():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp).resolve()
+        target = fake_target(base)
+        run_dir = base / "run"
+        run_dir.mkdir()
+        stale = run_dir / "nucleos-core.exe.old-20200101-000000-1"
+        stale.write_bytes(b"stale")
+        done = run("-TargetDir", str(target), "-RunDir", str(run_dir), "-NoBuild", "-NoStart")
+        assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+        assert not stale.exists(), "an unheld moved-aside image was not swept"
+        with open(run_dir / "nucleos-core.exe.old-keep", "wb") as keep:
+            keep.write(b"x")
+            held = run("-TargetDir", str(target), "-RunDir", str(run_dir), "-NoBuild", "-NoStart")
+        assert held.returncode == 0, (held.returncode, held.stdout, held.stderr)
 
 def test_a_daemon_holding_the_copy_is_named_by_pid():
     with tempfile.TemporaryDirectory() as tmp:
@@ -179,7 +199,8 @@ def test_a_busy_port_is_refused_before_staging():
 
 test_staging_copies_the_daemon_and_every_sidecar_and_touches_no_source()
 test_a_run_dir_exe_in_use_is_refused_and_left_alone()
-test_mcp_tool_servers_holding_the_copy_are_not_called_the_daemon()
+test_mcp_tool_servers_holding_the_copy_are_moved_aside_not_killed_or_refused()
+test_a_stale_moved_aside_image_is_swept_but_a_held_one_is_kept()
 test_a_daemon_holding_the_copy_is_named_by_pid()
 test_a_relative_or_nested_run_dir_is_refused_before_anything_is_made()
 test_a_missing_build_output_is_named()

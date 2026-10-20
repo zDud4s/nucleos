@@ -591,7 +591,12 @@ pub(super) fn spawn_run(
             // context and pays for the whole prompt again, so the column describes the attempt that
             // is running rather than the first one that was tried.
             record_authored_prompt(&pool, id, runner.authored_prompt(&request)).await;
-            let result = tokio::time::timeout(
+            // The wall clock does not charge the time this run spent queued for heavy-command
+            // admission, so it runs through the admission book rather than a bare timeout.
+            let admission = crate::execution::admission::installed();
+            let result = crate::execution::admission::with_wall_clock(
+                admission.as_deref(),
+                id,
                 run_timeout,
                 runner.run_prompt_with_context_fill(
                     request,
@@ -601,6 +606,10 @@ pub(super) fn spawn_run(
                 ),
             )
             .await;
+            // Every attempt: a dead attempt must never keep holding a grant or a queue place.
+            if let Some(book) = admission.as_ref() {
+                book.release_run(id);
+            }
             let completed_at = chrono::Utc::now().to_rfc3339();
             // Every terminal write below is guarded on the run still being `running`. This body is
             // not the only writer racing for the last word: `finalize_termination` aborts the task,

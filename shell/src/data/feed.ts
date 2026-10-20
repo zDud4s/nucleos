@@ -525,9 +525,9 @@ export function readEfficiencySignal(summary: string): EfficiencyReading | null 
 
 /* ── The notification selection policy ─────────────────────────────────────
  *
- * Which feed kinds still reach Telegram. The preference is stored in the
- * núcleo (`notify_policy.rs`) and RESOLVED in the sidecar; everything below is
- * presentation of those two, and decides nothing on its own.
+ * Which feed kinds still reach a messaging channel. The preference is stored in
+ * the núcleo (`notify_policy.rs`) and RESOLVED in the núcleo's routing;
+ * everything below is presentation of those two, and decides nothing on its own.
  */
 
 /** The body of `GET`/`PUT /notifications/policy`, as it is on the wire. */
@@ -539,6 +539,52 @@ export interface NotifyRule {
 export interface NotifyPolicy {
   families: NotifyRule[];
   kinds: NotifyRule[];
+}
+
+/** The body of `GET /notifications/policy?channel=<channel>`. */
+export interface ChannelNotifyPolicy {
+  channel: string;
+  primary: boolean;
+  default: NotifyPolicy;
+  overrides: NotifyPolicy;
+  resolved: NotifyPolicy;
+}
+
+function mergeRules(defaults: NotifyRule[], overrides: NotifyRule[]): NotifyRule[] {
+  const over = new Map(overrides.map((r) => [r.selector, r]));
+  const merged = defaults.map((r) => ({ ...(over.get(r.selector) ?? r) }));
+  const known = new Set(defaults.map((r) => r.selector));
+  for (const r of overrides) if (!known.has(r.selector)) merged.push({ ...r });
+  return merged;
+}
+
+/**
+ * The channel's overrides laid over the default policy: an override wins for the
+ * same `(scope, selector)`, and channel-only rules follow the default's rows in
+ * stored order. The longest-prefix match is NOT done here; it stays in `groupKinds`.
+ */
+export function mergePolicy(defaults: NotifyPolicy, overrides: NotifyPolicy): NotifyPolicy {
+  return {
+    families: mergeRules(defaults.families, overrides.families),
+    kinds: mergeRules(defaults.kinds, overrides.kinds),
+  };
+}
+
+/**
+ * Where a rule's effective value comes from: `override` when the channel changes
+ * it (or the selector only exists on the channel), `pinned` when the channel
+ * stores the same value as the default, `default` when it inherits.
+ */
+export function ruleSource(
+  selector: string,
+  scope: "families" | "kinds",
+  defaults: NotifyPolicy,
+  overrides: NotifyPolicy,
+): "default" | "override" | "pinned" {
+  const over = overrides[scope].find((r) => r.selector === selector);
+  if (!over) return "default";
+  const base = defaults[scope].find((r) => r.selector === selector);
+  return base && base.enabled === over.enabled ? "pinned" : "override";
 }
 
 /**

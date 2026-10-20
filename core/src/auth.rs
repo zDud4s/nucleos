@@ -178,6 +178,11 @@ const ASK_WAIT_ROUTE: &str = "/hooks/ask-wait";
 /// now completing the loop instead of opening it.
 const POSTTOOLUSE_ROUTE: &str = "/hooks/posttooluse";
 
+/// The fourth door of the same tool call: it waits for machine capacity AFTER the gate allowed the
+/// call. It never decides anything, and the hook side fails open — a daemon that does not answer
+/// lets the command run.
+const ADMIT_ROUTE: &str = "/hooks/admit";
+
 /// The only knowledge route a run's key reaches; it writes a working-layer row in the caller's own
 /// job and nothing else.
 const FINDING_ROUTE: &str = "/knowledge/findings";
@@ -570,6 +575,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
                 && (path == HOOK_ROUTE
                     || path == ASK_WAIT_ROUTE
                     || path == POSTTOOLUSE_ROUTE
+                    || path == ADMIT_ROUTE
                     || path == FINDING_ROUTE
                     || path == VERIFY_ROUTE
                     || path == VERIFY_STATUS_ROUTE
@@ -1278,6 +1284,7 @@ mod tests {
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
             local_triage_disabled: None,
+            utility_model: None,
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3136,6 +3143,18 @@ mod tests {
         for (method, pattern) in READ_ONLY_ROUTES {
             assert!(!permits(&run, method, pattern));
         }
+    }
+
+    /// The fourth door of the same tool call: a run waits for machine capacity here after the gate
+    /// allowed. By POST only, and a literal path: nothing underneath it is granted.
+    #[test]
+    fn a_run_token_reaches_the_admission_route() {
+        let run = Scope::Run(1);
+        assert!(permits(&run, &Method::POST, ADMIT_ROUTE));
+        for method in [Method::GET, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!permits(&run, &method, ADMIT_ROUTE), "{method}");
+        }
+        assert!(!permits(&run, &Method::POST, "/hooks/admit/other"));
     }
 
     /// A job node verifies its own worktree through the daemon, so the run key reaches the two

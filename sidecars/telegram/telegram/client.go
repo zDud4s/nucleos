@@ -46,6 +46,8 @@ type Message struct {
 	// without it would give every reply chain in an ordinary group a key of its own, and on the day
 	// that ships every one of those conversations loses its session.
 	IsTopicMessage bool `json:"is_topic_message"`
+	// Date is when Telegram received the message, in unix seconds; 0 when absent.
+	Date int64 `json:"date"`
 	// From is who typed it, which is not the same question as which chat it arrived in: a group
 	// chat id authorises a room, and a room's membership changes without anyone reconfiguring
 	// this sidecar.
@@ -60,6 +62,15 @@ type Message struct {
 	// ReplyToMessage is the message this one answers, when the owner used Telegram's reply.
 	// A capture request is answered this way: the request's own text carries its #cap<job_id> mark.
 	ReplyToMessage *Message `json:"reply_to_message"`
+
+	Sticker   *Sticker   `json:"sticker"`
+	Video     *Video     `json:"video"`
+	VideoNote *VideoNote `json:"video_note"`
+	Animation *Animation `json:"animation"`
+	Audio     *Audio     `json:"audio"`
+	Contact   *Contact   `json:"contact"`
+	Location  *Location  `json:"location"`
+	Poll      *Poll      `json:"poll"`
 }
 
 // SenderID is the id of whoever sent the message, or 0 when Telegram sent no `from` (channel posts,
@@ -74,11 +85,81 @@ func (m *Message) SenderID() int64 {
 type Voice struct {
 	FileID   string `json:"file_id"`
 	Duration int    `json:"duration"`
+	MimeType string `json:"mime_type"`
+	FileSize int    `json:"file_size"`
 }
 
 type Document struct {
 	FileID   string `json:"file_id"`
 	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int    `json:"file_size"`
+}
+
+type Sticker struct {
+	FileID     string `json:"file_id"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+	IsAnimated bool   `json:"is_animated"`
+	IsVideo    bool   `json:"is_video"`
+	Emoji      string `json:"emoji"`
+	FileSize   int    `json:"file_size"`
+}
+
+type Video struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int    `json:"file_size"`
+}
+
+type VideoNote struct {
+	FileID   string `json:"file_id"`
+	Length   int    `json:"length"`
+	Duration int    `json:"duration"`
+	FileSize int    `json:"file_size"`
+}
+
+type Animation struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration"`
+	FileName string `json:"file_name"`
+	MimeType string `json:"mime_type"`
+	FileSize int    `json:"file_size"`
+}
+
+type Audio struct {
+	FileID    string `json:"file_id"`
+	Duration  int    `json:"duration"`
+	Performer string `json:"performer"`
+	Title     string `json:"title"`
+	FileName  string `json:"file_name"`
+	MimeType  string `json:"mime_type"`
+	FileSize  int    `json:"file_size"`
+}
+
+type Contact struct {
+	PhoneNumber string `json:"phone_number"`
+	FirstName   string `json:"first_name"`
+	LastName    string `json:"last_name"`
+	UserID      int64  `json:"user_id"`
+}
+
+type Location struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
+
+type PollOption struct {
+	Text       string `json:"text"`
+	VoterCount int    `json:"voter_count"`
+}
+
+type Poll struct {
+	ID       string       `json:"id"`
+	Question string       `json:"question"`
+	Options  []PollOption `json:"options"`
 }
 
 type PhotoSize struct {
@@ -91,10 +172,12 @@ type PhotoSize struct {
 type File struct {
 	FileID   string `json:"file_id"`
 	FilePath string `json:"file_path"`
+	FileSize int    `json:"file_size"`
 }
 
 type Chat struct {
-	ID int64 `json:"id"`
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
 }
 
 // Destination is where a message goes: the chat, and the forum topic inside it when there is one.
@@ -148,6 +231,11 @@ type User struct {
 	// IsBot is mandatory in the Bot API. The sidecar never calls getMe, so it does not know its own
 	// id; "a bot wrote it" is what identifies a capture request in an authorised chat.
 	IsBot bool `json:"is_bot"`
+	// The display fields are optional in the Bot API (only first_name is mandatory). The v2 adapter
+	// composes the contract's sender.name from them; v1 never reads them.
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Username  string `json:"username"`
 }
 
 type Button struct {

@@ -328,6 +328,10 @@ pub(super) fn session_git_reason(
         "awaiting_owner" => "it changes the test map, so it is held until the owner approves \
                              it. Do not run it again; the owner's decision is the next step."
             .to_owned(),
+        "awaiting_gate" => format!(
+            "the push is parked: {why}. The daemon pushes it by itself once the gate is green; do \
+             not run it again."
+        ),
         status => {
             debug_assert!(
                 !settled,

@@ -1,0 +1,6 @@
+{ "event_id": "upd-88125",
+  "at": "2026-10-19T10:31:00+01:00",
+  "conversation": {"ref": "-100777", "kind": "group"},
+  "sender": {"ref": "4242", "name": "Duarte"},
+  "type": "message",
+  "message": { "ref": "12", "parts": [ {"type": "image", "media": "m_20", "mime": "image/jpeg"} ] } }

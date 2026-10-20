@@ -3,6 +3,7 @@
 pub mod autopilot;
 pub mod budget;
 pub mod classifier;
+pub mod command_kind;
 pub mod exclusion;
 pub mod pii_shadow;
 pub mod priority;

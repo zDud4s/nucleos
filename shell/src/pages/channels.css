@@ -1,0 +1,13 @@
+/* Channels page: the routing warning and the card grid. No colour of its own beyond the shared tokens. */
+.ch-page { display: flex; flex-direction: column; gap: var(--space-3, 12px); }
+.ch-routing-warning {
+  margin: 0;
+  padding: var(--space-2, 8px) var(--space-3, 12px);
+  border: 1px dashed var(--line, rgba(128, 128, 128, 0.5));
+  border-radius: 8px;
+}
+.ch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--space-3, 12px);
+}
