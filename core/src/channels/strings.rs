@@ -176,31 +176,138 @@ pub fn pair_command(code: &str) -> String {
     format!("/pair {code}")
 }
 
-/// Body is A2's (S1); only A2 calls it.
-pub fn render_proposals(list: &[crate::proposals::Proposal]) -> String {
-    let _ = list;
-    todo!("A2/S1")
+/// One proposal as the list shows it: id, kind, tool, then the reasoning and project when present.
+fn format_proposal(p: &crate::proposals::Proposal) -> String {
+    let mut out = format!(
+        "proposal {} ({}): {}",
+        p.id,
+        p.kind,
+        p.tool_name.as_deref().unwrap_or("?")
+    );
+    if !p.reasoning.is_empty() {
+        out.push_str("\nwhy: ");
+        out.push_str(&p.reasoning);
+    }
+    if let Some(project) = p.project_id.as_deref().filter(|s| !s.is_empty()) {
+        out.push_str("\nproject: ");
+        out.push_str(project);
+    }
+    out
 }
 
-/// Body is A2's (S1); only A2 calls it.
+/// The `/proposals` reply: one block per open proposal (the hub attaches the buttons separately).
+pub fn render_proposals(list: &[crate::proposals::Proposal]) -> String {
+    if list.is_empty() {
+        return render(&Text::NoProposals);
+    }
+    list.iter()
+        .map(format_proposal)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The `/projects [filter]` reply; the filter matches the project id case-insensitively as a substring.
 pub fn render_projects(
     list: &[crate::governance::autopilot::ProjectSummary],
     filter: Option<&str>,
 ) -> String {
-    let _ = (list, filter);
-    todo!("A2/S1")
+    let filter = filter.map(str::trim).filter(|f| !f.is_empty());
+    let needle = filter.map(str::to_lowercase);
+    let records: Vec<String> = list
+        .iter()
+        .filter(|p| {
+            needle
+                .as_deref()
+                .is_none_or(|n| p.project_id.to_lowercase().contains(n))
+        })
+        .map(|p| {
+            let root = p
+                .project_root
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .unwrap_or("-");
+            format!(
+                "**{}**\nMode: {} · Pending: {}\nRoot: {}",
+                p.project_id,
+                p.mode.as_db_str(),
+                p.pending,
+                root
+            )
+        })
+        .collect();
+    if records.is_empty() {
+        return match filter {
+            Some(f) => format!("No project matches \"{f}\"."),
+            None => "No projects registered in NucleOS.".to_string(),
+        };
+    }
+    format!("Registered projects:\n\n{}", records.join("\n\n"))
 }
 
-/// Body is A2's (S1); only A2 calls it.
+/// The `/inbox` reply: unread mail first, then up to ten already-triaged messages.
 pub fn render_inbox(list: &[crate::integrations::email::QueuedEmail]) -> String {
-    let _ = list;
-    todo!("A2/S1")
+    if list.is_empty() {
+        return "Nothing in the mailbox yet.".to_string();
+    }
+    let mut waiting: Vec<String> = Vec::new();
+    let mut judged: Vec<String> = Vec::new();
+    for mail in list {
+        let who = mail
+            .from_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if mail.from_addr.is_empty() {
+                "(unknown sender)"
+            } else {
+                mail.from_addr.as_str()
+            });
+        match mail.triage_class.as_deref().filter(|c| !c.is_empty()) {
+            None => waiting.push(format!(
+                "· {who} — {}",
+                mail.subject.as_deref().unwrap_or("(no subject)")
+            )),
+            Some(class) => {
+                if judged.len() < 10 {
+                    let summary = mail
+                        .triage_summary
+                        .as_deref()
+                        .or(mail.subject.as_deref())
+                        .unwrap_or("");
+                    judged.push(format!("[{class}] {who} — {summary}"));
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    if !waiting.is_empty() {
+        out.push(format!(
+            "Waiting to be read ({}) — send /mail to triage:",
+            waiting.len()
+        ));
+        out.extend(waiting);
+    }
+    if !judged.is_empty() {
+        out.push(String::new());
+        out.push("Already read:".to_string());
+        out.extend(judged);
+    }
+    out.join("\n")
 }
 
-/// Body is A2's (S1); only A2 calls it.
+/// The `/mail` reply: what the pass started, not verdicts (those arrive through the feed).
 pub fn render_triage(outcome: &crate::governance::triage::TriageOutcome) -> String {
-    let _ = outcome;
-    todo!("A2/S1")
+    if outcome.run_id.is_none() {
+        let reason = outcome
+            .reason
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .unwrap_or("nothing to do");
+        return format!("No triage started: {reason}");
+    }
+    format!(
+        "Reading {} message(s) — the verdicts arrive here in a few minutes",
+        outcome.queued
+    )
 }
 
 #[cfg(test)]
@@ -319,6 +426,141 @@ mod tests {
     #[test]
     fn nothing_to_cancel_is_exact() {
         assert_eq!(render(&Text::NothingToCancel), "Nothing to stop.");
+    }
+
+    fn proposal(id: i64, kind: &str, tool: &str, why: &str) -> crate::proposals::Proposal {
+        crate::proposals::Proposal {
+            id,
+            kind: kind.into(),
+            status: "pending".into(),
+            run_id: None,
+            session_id: None,
+            project_id: None,
+            tool_name: Some(tool.into()),
+            reasoning: why.into(),
+            tool_input: None,
+            read_from: None,
+            created_at: "2026-10-20T00:00:00Z".into(),
+            decided_at: None,
+            job_id: None,
+            run_stage: None,
+            item_ordinal: None,
+            item_description: None,
+            run_status: None,
+            run_cwd: None,
+            run_prompt: None,
+            run_recent: None,
+            team_run_id: None,
+            team_name: None,
+            team_request: None,
+            asked_by: None,
+            asked_for: None,
+            job_low_task: None,
+            job_high_task: None,
+        }
+    }
+
+    fn project(id: &str, pending: i64) -> crate::governance::autopilot::ProjectSummary {
+        crate::governance::autopilot::ProjectSummary {
+            project_id: id.into(),
+            mode: crate::governance::autopilot::Mode::Shadow,
+            project_root: Some("C:/p".into()),
+            pending,
+            classes_ready: 0,
+            classes_total: 0,
+            withheld_classes_ready: 0,
+            promotable: false,
+            open_review_items: 0,
+            open_proposals: 0,
+            open_shadow_decisions: 0,
+            wip_limit: None,
+            queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
+        }
+    }
+
+    fn mail(
+        from_name: Option<&str>,
+        subject: &str,
+        class: Option<&str>,
+        summary: Option<&str>,
+    ) -> crate::integrations::email::QueuedEmail {
+        crate::integrations::email::QueuedEmail {
+            id: 1,
+            from_addr: "a@example.com".into(),
+            from_name: from_name.map(Into::into),
+            subject: Some(subject.into()),
+            received_at: "2026-10-20T00:00:00Z".into(),
+            triage_class: class.map(Into::into),
+            triage_summary: summary.map(Into::into),
+            triaged_at: None,
+            has_attachments: 0,
+            sender_verdict: None,
+        }
+    }
+
+    #[test]
+    fn render_proposals_lists_id_kind_and_summary() {
+        let s = render_proposals(&[
+            proposal(12, "action_approval", "Bash", "needs a shell"),
+            proposal(13, "recruit", "Hire", "more hands"),
+        ]);
+        assert!(s.contains("12") && s.contains("action_approval") && s.contains("Bash"));
+        assert!(s.contains("needs a shell") && s.contains("13") && s.contains("recruit"));
+        assert_eq!(render_proposals(&[]), "No open proposals.");
+    }
+
+    #[test]
+    fn render_projects_filters_case_insensitively() {
+        let list = [project("Alpha", 2), project("beta", 0)];
+        let s = render_projects(&list, Some("ALP"));
+        assert!(s.contains("Alpha") && !s.contains("beta"), "{s}");
+        assert!(s.contains("Pending: 2"), "{s}");
+        let all = render_projects(&list, None);
+        assert!(all.contains("Alpha") && all.contains("beta"), "{all}");
+        assert!(render_projects(&list, Some("zzz")).contains("No project matches"));
+    }
+
+    #[test]
+    fn render_inbox_shows_sender_subject_and_class() {
+        let s = render_inbox(&[
+            mail(Some("Ana"), "Invoice", None, None),
+            mail(None, "Hello", Some("urgent"), Some("asks for a call")),
+        ]);
+        assert!(s.contains("Ana") && s.contains("Invoice"), "{s}");
+        assert!(s.contains("[urgent]") && s.contains("a@example.com"), "{s}");
+        assert!(s.contains("asks for a call"), "{s}");
+        assert_eq!(render_inbox(&[]), "Nothing in the mailbox yet.");
+    }
+
+    #[test]
+    fn render_triage_reports_queued_and_reason() {
+        use crate::governance::triage::TriageOutcome;
+        let started = render_triage(&TriageOutcome {
+            queued: 3,
+            run_id: Some(9),
+            reason: None,
+        });
+        assert!(started.contains('3'), "{started}");
+        let idle = render_triage(&TriageOutcome {
+            queued: 0,
+            run_id: None,
+            reason: Some("mail is not armed".into()),
+        });
+        assert!(idle.contains("mail is not armed"), "{idle}");
+    }
+
+    #[test]
+    fn pair_command_has_the_exact_phrase() {
+        assert_eq!(pair_command("482913"), "/pair 482913");
+    }
+
+    #[test]
+    fn help_text_names_approve_and_reject_in_english_only() {
+        let s = render(&Text::Help);
+        assert!(s.contains("approve N") && s.contains("reject N"), "{s}");
+        assert!(!s.contains("aprovar") && !s.contains("rejeitar"), "{s}");
     }
 
     #[test]

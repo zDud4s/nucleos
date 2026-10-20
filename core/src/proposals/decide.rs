@@ -1,9 +1,9 @@
 //! Deciding a proposal as a service function: `approve`, with the answers an HTTP door needs but no
 //! HTTP types in the way it is called.
 //!
-//! Started with the kinds that start no run (`contact-merge`, `refinement`, `calendar-event`,
-//! `github-action`, `fleet-exclusion`, `agent-recruit`, `team-action`) and now the default
-//! `action-approval`; the handler keeps only `browser-wheel` until it moves here.
+//! Every kind is decided here: `contact-merge`, `refinement`, `calendar-event`, `github-action`,
+//! `fleet-exclusion`, `agent-recruit`, `team-action`, `browser-wheel` and the default
+//! `action-approval`.
 //! The messages are the ones the handler has always sent: moving the code must not change what a
 //! person reads.
 
@@ -55,6 +55,39 @@ impl DecideError {
             Self::Status(status, message) => (status, message),
         }
     }
+
+    /// The bare status a reject door answers with. A reject never has a body, so the message of a
+    /// variant that carries one goes to the log and nowhere else.
+    pub fn into_status(self) -> StatusCode {
+        match self {
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::AlreadyDecided => StatusCode::CONFLICT,
+            Self::Conflict(message) => {
+                tracing::warn!(%message, "a rejection was refused as a conflict");
+                StatusCode::CONFLICT
+            }
+            Self::Invalid(message) => {
+                tracing::warn!(%message, "a rejection was refused as invalid");
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            Self::BadRequest(message) => {
+                tracing::warn!(%message, "a rejection was refused as a bad request");
+                StatusCode::BAD_REQUEST
+            }
+            Self::BadGateway(message) => {
+                tracing::warn!(%message, "a rejection failed on a call to another service");
+                StatusCode::BAD_GATEWAY
+            }
+            Self::Internal(message) => {
+                tracing::warn!(%message, "a rejection failed on our side");
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Self::Status(status, message) => {
+                tracing::warn!(%message, %status, "a rejection was refused with its own status");
+                status
+            }
+        }
+    }
 }
 
 /// What a person may add to an approval. Every field is optional, and each is read by one kind only.
@@ -72,7 +105,6 @@ pub struct ApproveInput {
 ///
 /// Reads the proposal for its kind and dispatches; the kind never changes and every branch is a
 /// compare-and-set on `status = 'pending'`, so a second decision racing this one loses there.
-/// `browser-wheel` has not moved here yet and is a `BadRequest`: the handler never sends it.
 pub async fn approve(state: &AppState, id: i64, input: ApproveInput) -> Result<Value, DecideError> {
     let proposal = super::get(&state.pool, id)
         .await
@@ -89,10 +121,351 @@ pub async fn approve(state: &AppState, id: i64, input: ApproveInput) -> Result<V
         "fleet-exclusion" => approve_fleet_exclusion(state, id).await,
         "agent-recruit" => approve_agent_recruit(state, id, input.hire).await,
         "team-action" => approve_team_action(state, id).await,
-        "browser-wheel" => Err(DecideError::BadRequest(
-            "a `browser-wheel` proposal is not approved here".to_owned(),
-        )),
+        "browser-wheel" => approve_browser_wheel(state.clone(), id, input.seat).await,
         _ => approve_action_approval(state, id, &proposal).await,
+    }
+}
+
+/// Rejects proposal `id`; the bare `Ok(())` is the 204 of the HTTP door.
+///
+/// Every kind is decided here, and the default `action-approval` discards the paused run it was
+/// filed for. A failed task is `Internal`, which the door answers 500 with no body.
+pub async fn reject(state: &AppState, id: i64) -> Result<(), DecideError> {
+    let proposal = super::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a proposal to reject failed");
+            DecideError::Internal("the proposal could not be read".to_owned())
+        })?
+        .ok_or(DecideError::NotFound)?;
+    match proposal.kind.as_str() {
+        "browser-wheel" => reject_browser_wheel(state.clone(), id).await,
+        "contact-merge" => reject_contact_merge(state, id).await,
+        "refinement" => reject_refinement(state, id).await,
+        "calendar-event" => reject_calendar_event(state, id).await,
+        "github-action" => reject_github_action(state, id).await,
+        "fleet-exclusion" => reject_fleet_exclusion(state, id).await,
+        "agent-recruit" => reject_agent_recruit(state, id).await,
+        "team-action" => reject_team_action(state, id).await,
+        _ => reject_action_approval(state, id).await,
+    }
+}
+
+async fn reject_fleet_exclusion(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // Refusing an edge leaves nothing behind, because drawing it changed nothing: no rule was
+    // written, no run was paused, no worktree is held. It is the one refusal with no second half
+    // to undo.
+    use crate::governance::exclusion::DecisionError as ExclusionError;
+    let state = state.clone();
+    let rejected =
+        uncancellable(async move { crate::governance::exclusion::reject(&state.pool, id).await })
+            .await
+            .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match rejected {
+        Ok(()) => Ok(()),
+        Err(ExclusionError::NotFound) => Err(DecideError::NotFound),
+        Err(ExclusionError::NotPending) => Err(DecideError::AlreadyDecided),
+        Err(ExclusionError::Malformed) => Err(DecideError::Invalid(
+            "this request names no usable pair of jobs".to_owned(),
+        )),
+        Err(ExclusionError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "rejecting an exclusion failed");
+            Err(DecideError::Internal(
+                "the decision could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn reject_agent_recruit(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // Refusing leaves nothing behind, because nothing was created: no agent, no roster row, no run
+    // held. And it is deliberately not a permanent no — the NEXT run of that department meets the
+    // same gap and may ask again, which is right. Nobody said the director should stop asking; they
+    // said not this one.
+    let state = state.clone();
+    let rejected =
+        uncancellable(
+            async move { super::transition(&state.pool, id, "rejected", "not hired").await },
+        )
+        .await
+        .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match rejected {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(DecideError::AlreadyDecided),
+        Err(error) => {
+            tracing::warn!(proposal_id = id, %error, "refusing a recruitment failed");
+            Err(DecideError::Internal(
+                "the decision could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn reject_team_action(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // Refusing closes the action as well as the proposal, in that order: the proposal is the
+    // decision and the action is what is left to do about it, and leaving the second `pending`
+    // would keep it in the department's queue ceiling forever, blocking the next request over a
+    // question already answered.
+    let state = state.clone();
+    let rejected = uncancellable(async move {
+        let decided = super::transition(&state.pool, id, "rejected", "rejected by user").await?;
+        if decided {
+            crate::team::refuse_action(&state.pool, id).await?;
+        }
+        Ok::<bool, sqlx::Error>(decided)
+    })
+    .await
+    .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match rejected {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(DecideError::AlreadyDecided),
+        Err(error) => {
+            tracing::warn!(proposal_id = id, %error, "rejecting a team action failed");
+            Err(DecideError::Internal(
+                "the decision could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn reject_action_approval(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // Uncancellable: rejecting flips the proposal first and discards the paused run second, and the
+    // first half cannot be replayed — a retry finds the proposal no longer `pending` and answers 409.
+    let state = state.clone();
+    let rejected = uncancellable(async move { super::reject_proposal(&state.pool, id).await })
+        .await
+        .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match rejected {
+        Ok(()) => Ok(()),
+        Err(super::RejectError::NotFound) => Err(DecideError::NotFound),
+        Err(super::RejectError::NotPending) => Err(DecideError::AlreadyDecided),
+        Err(super::RejectError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "rejecting a proposal failed");
+            Err(DecideError::Internal(
+                "the decision could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+/// The wheel was not given (spec §4.4), and the session goes with the refusal.
+///
+/// Spec §4.4's diagram draws an arrow back to `agente_conduz`, and this is deliberately narrower —
+/// `browser_wheel`'s module comment carries the reasoning. In short: the wall that caused the request
+/// is still there, §4.5 already says the run continues without that page, and giving the wheel back
+/// would need a second place where the two processes can disagree about who is driving.
+async fn reject_browser_wheel(state: AppState, id: i64) -> Result<(), DecideError> {
+    let session_id = super::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a wheel request to refuse failed");
+            DecideError::Internal("the proposal could not be read".to_owned())
+        })?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(Value::as_i64));
+
+    if !super::transition(&state.pool, id, "rejected", "wheel refused")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "rejecting a wheel request failed");
+            DecideError::Internal("the decision could not be recorded".to_owned())
+        })?
+    {
+        return Err(DecideError::AlreadyDecided);
+    }
+    if let Some(session_id) = session_id
+        && let Err(error) = crate::browser::wheel::refuse(&state, session_id).await
+    {
+        // Logged and not returned. The refusal is recorded and that is the part the person asked
+        // for; a session left open by a sidecar that did not answer is retired on its next restart.
+        tracing::warn!(session = session_id, error = %error, "closing a refused wheel's session failed");
+    }
+    Ok(())
+}
+
+async fn reject_contact_merge(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // `reject_merge` records the refused pair in the same transaction as the status, which is what
+    // stops the heuristic asking the identical question forever. Wiring the approval without this
+    // would have been worse than wiring neither: the suggestion you refused would come back on every
+    // sweep, and a suggestion that ignores your answer is not a suggestion.
+    let state = state.clone();
+    let rejected =
+        uncancellable(
+            async move { crate::integrations::contacts::reject_merge(&state.pool, id).await },
+        )
+        .await
+        .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match rejected {
+        Ok(()) => Ok(()),
+        // The guarded SELECT and the compare-and-set both report a proposal that is no longer
+        // pending this way; either means another decision got there first.
+        Err(sqlx::Error::RowNotFound) => Err(DecideError::AlreadyDecided),
+        Err(error) => {
+            tracing::warn!(proposal_id = id, %error, "rejecting a contact merge failed");
+            Err(DecideError::Internal(
+                "the decision could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn reject_refinement(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // Unlike the calendar's refusal, this one leaves a row: `refine::reject` marks the refinement
+    // `rejected` rather than dropping it, because what the agent kept trying to learn and was told
+    // no to is the record the layer's history exists to keep.
+    let state = state.clone();
+    let refused = uncancellable(async move { crate::knowledge::reject(&state.pool, id).await })
+        .await
+        .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match refused {
+        Ok(_) => Ok(()),
+        Err(crate::knowledge::DecisionError::NotFound) => Err(DecideError::NotFound),
+        Err(crate::knowledge::DecisionError::NotPending) => Err(DecideError::AlreadyDecided),
+        Err(crate::knowledge::DecisionError::Malformed) => Err(DecideError::Invalid(
+            "this proposal does not name a refinement".to_owned(),
+        )),
+    }
+}
+
+async fn reject_calendar_event(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // Refusing a suggested block leaves nothing behind: it is a suggestion declined, not a meeting
+    // cancelled, so the calendar never learns it was offered.
+    use crate::integrations::calendar::DecisionError;
+    let state = state.clone();
+    let rejected = uncancellable(async move {
+        crate::integrations::calendar::reject_proposed_event(&state.pool, id).await
+    })
+    .await
+    .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match rejected {
+        Ok(()) => Ok(()),
+        Err(DecisionError::NotFound) => Err(DecideError::NotFound),
+        Err(DecisionError::NotPending) => Err(DecideError::AlreadyDecided),
+        Err(DecisionError::Malformed) => Err(DecideError::Invalid(
+            "this proposal carries no usable event".to_owned(),
+        )),
+        Err(DecisionError::Db(error)) => {
+            tracing::warn!(proposal_id = id, %error, "rejecting a calendar proposal failed");
+            Err(DecideError::Internal(
+                "the decision could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+async fn reject_github_action(state: &AppState, id: i64) -> Result<(), DecideError> {
+    // Refusing leaves nothing behind, because nothing was done: `github::submit` files the proposal
+    // and returns, and the operation reaches `gh` only on the approval path. So this is a status
+    // flip with no second half — the opposite of the approve side, which claims the row BEFORE
+    // spawning precisely because there IS one there.
+    //
+    // Its absence was invisible until somebody refused one by hand: the fallback knows only
+    // `action-approval`, so a `github-action` came back 409 about a proposal sitting there pending.
+    let state = state.clone();
+    let rejected = uncancellable(async move {
+        super::transition(&state.pool, id, "rejected", "rejected by user").await
+    })
+    .await
+    .map_err(|_| DecideError::Internal("the rejection task did not finish".to_owned()))?;
+    match rejected {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(DecideError::AlreadyDecided),
+        Err(error) => {
+            tracing::warn!(proposal_id = id, %error, "refusing a github action failed");
+            Err(DecideError::Internal(
+                "the decision could not be recorded".to_owned(),
+            ))
+        }
+    }
+}
+
+/// A person took the wheel (spec §4.4, rules 1 and 3).
+///
+/// The `transition` below is the load-bearing line, and its position is the argument: it is a
+/// compare-and-set on `status = 'pending'`, so exactly one of two concurrent approvals wins — and the
+/// one that wins is the one that then hands over the browser. Handing over first and recording
+/// afterwards would let both callers open a window; recording without handing over would leave a
+/// proposal saying a person is driving something that was never started.
+///
+/// Uncancellable for the same reason as the other arms: a request dropped in between would leave the
+/// decision recorded and the window unopened.
+async fn approve_browser_wheel(
+    state: AppState,
+    id: i64,
+    seat: Option<String>,
+) -> Result<Value, DecideError> {
+    let choice = match seat.as_deref() {
+        None => None,
+        Some("shell") => Some(crate::browser::wheel::SeatChoice::Shell),
+        Some("window") => Some(crate::browser::wheel::SeatChoice::Window),
+        Some(_) => {
+            return Err(DecideError::BadRequest(
+                "seat must be \"shell\" or \"window\"".to_owned(),
+            ));
+        }
+    };
+    let session_id = super::get(&state.pool, id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "reading a wheel request failed");
+            DecideError::Internal("the proposal could not be read".to_owned())
+        })?
+        .and_then(|proposal| proposal.tool_input)
+        .and_then(|input| serde_json::from_str::<Value>(&input).ok())
+        .and_then(|input| input.get("session_id").and_then(Value::as_i64))
+        .ok_or_else(|| DecideError::Invalid("this wheel request names no session".to_owned()))?;
+
+    // An explicit shell seat that is not on offer is refused BEFORE the decision is made: once the
+    // proposal is approved, a refusal would strand the row in `wheel-requested`. Reads only the
+    // database, so it does not depend on the pillar being on.
+    if choice == Some(crate::browser::wheel::SeatChoice::Shell) {
+        let offered = crate::browser::session_row(&state.pool, session_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(proposal_id = id, %error, "reading a wheel session failed");
+                DecideError::Internal("the session could not be read".to_owned())
+            })?
+            .is_some_and(|row| row.closed_at.is_none() && row.shell_eligible);
+        if !offered {
+            return Err(DecideError::Conflict(
+                json!({ "error": "seat_unavailable" }).to_string(),
+            ));
+        }
+    }
+
+    let transitioned = super::transition(&state.pool, id, "approved", "wheel accepted")
+        .await
+        .map_err(|error| {
+            tracing::warn!(proposal_id = id, %error, "accepting a wheel request failed");
+            DecideError::Internal("the decision could not be recorded".to_owned())
+        })?;
+    if !transitioned {
+        return Err(DecideError::AlreadyDecided);
+    }
+
+    let handover = state.clone();
+    match uncancellable(async move {
+        crate::browser::wheel::accept_with_seat(&handover, session_id, choice).await
+    })
+    .await
+    .map_err(|_| DecideError::Internal("the handover task did not finish".to_owned()))?
+    {
+        Ok((row, nonce)) => {
+            let mut answer = json!({ "session": row });
+            if let Some(nonce) = nonce {
+                answer["seat_nonce"] = Value::String(nonce);
+            }
+            Ok(answer)
+        }
+        // `NotFound` would say "there is no proposal"; the sentence here is about the session.
+        Err(crate::browser::wheel::WheelError::NoSuchSession) => Err(DecideError::Status(
+            StatusCode::NOT_FOUND,
+            "the session this wheel was asked for is gone".to_owned(),
+        )),
+        // The window did not open (spec §4.4a). The session is recorded as a failed delivery and the
+        // proposal carries the reason; it does NOT go back to the agent.
+        Err(error) => Err(DecideError::BadGateway(error.to_string())),
     }
 }
 
@@ -630,6 +1003,272 @@ mod tests {
             matches!(result, Err(DecideError::AlreadyDecided)),
             "{result:?}"
         );
+    }
+
+    /// A pending wheel request whose payload names `session_id` (or nothing, with `None`).
+    async fn a_wheel_request(pool: &sqlx::SqlitePool, session_id: Option<i64>) -> i64 {
+        let tool_input = session_id.map(|session| json!({ "session_id": session }).to_string());
+        sqlx::query_scalar(
+            "INSERT INTO proposals (kind, status, reasoning, tool_input, created_at) \
+             VALUES ('browser-wheel', 'pending', 'login', ?, ?) RETURNING id",
+        )
+        .bind(tool_input)
+        .bind("2026-10-19T08:00:00+00:00")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A `wheel-requested` session row, not shell-eligible.
+    async fn a_wheel_session(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO browser_sessions \
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                 final_url, rule, mode, opened_at) \
+             VALUES ('s1', 7, 'acme', 'ephemeral', 'run-7', 'https://jira.example.org/login', \
+                     'https://jira.example.org/login', 'project-site', 'wheel-requested', \
+                     '2026-08-16T10:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn status_of(pool: &sqlx::SqlitePool, id: i64) -> String {
+        super::super::get(pool, id).await.unwrap().unwrap().status
+    }
+
+    #[tokio::test]
+    async fn decide_approve_browser_wheel_with_unknown_seat_is_invalid() {
+        let state = test_state().await;
+        let session = a_wheel_session(&state.pool).await;
+        let id = a_wheel_request(&state.pool, Some(session)).await;
+        let input = ApproveInput {
+            seat: Some("sofa".to_owned()),
+            ..Default::default()
+        };
+
+        let result = approve(&state, id, input).await;
+        assert!(
+            matches!(result, Err(DecideError::BadRequest(_))),
+            "{result:?}"
+        );
+        assert_eq!(status_of(&state.pool, id).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn decide_approve_browser_wheel_bad_request_is_400() {
+        let state = test_state().await;
+        let id = a_wheel_request(&state.pool, Some(1)).await;
+        let input = ApproveInput {
+            seat: Some("sofa".to_owned()),
+            ..Default::default()
+        };
+
+        let error = approve(&state, id, input).await.unwrap_err();
+        assert_eq!(
+            error.into_http(id),
+            (
+                StatusCode::BAD_REQUEST,
+                "seat must be \"shell\" or \"window\"".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_approve_browser_wheel_naming_no_session_is_422() {
+        let state = test_state().await;
+        let id = a_wheel_request(&state.pool, None).await;
+
+        let error = approve(&state, id, ApproveInput::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_http(id),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "this wheel request names no session".to_owned()
+            )
+        );
+        assert_eq!(status_of(&state.pool, id).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn decide_approve_browser_wheel_shell_seat_not_offered_is_409() {
+        let state = test_state().await;
+        let session = a_wheel_session(&state.pool).await;
+        let id = a_wheel_request(&state.pool, Some(session)).await;
+        let input = ApproveInput {
+            seat: Some("shell".to_owned()),
+            ..Default::default()
+        };
+
+        let error = approve(&state, id, input).await.unwrap_err();
+        assert_eq!(
+            error.into_http(id),
+            (
+                StatusCode::CONFLICT,
+                json!({ "error": "seat_unavailable" }).to_string()
+            )
+        );
+        assert_eq!(
+            status_of(&state.pool, id).await,
+            "pending",
+            "the decision must not have been made"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_approve_browser_wheel_gateway_failure_is_502() {
+        // The pillar is off in the test state, so the handover fails after the decision is made.
+        let state = test_state().await;
+        let session = a_wheel_session(&state.pool).await;
+        let id = a_wheel_request(&state.pool, Some(session)).await;
+
+        let error = approve(&state, id, ApproveInput::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_http(id),
+            (
+                StatusCode::BAD_GATEWAY,
+                "the browser pillar is off".to_owned()
+            )
+        );
+        assert_eq!(status_of(&state.pool, id).await, "approved");
+    }
+
+    #[tokio::test]
+    async fn decide_approve_browser_wheel_session_gone_is_404() {
+        let mut state = test_state().await;
+        state.browser = Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            ..crate::browser::BrowserRuntime::disabled()
+        });
+        let id = a_wheel_request(&state.pool, Some(999_999)).await;
+
+        let error = approve(&state, id, ApproveInput::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_http(id),
+            (
+                StatusCode::NOT_FOUND,
+                "the session this wheel was asked for is gone".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_approve_browser_wheel_twice_is_already_decided() {
+        let state = test_state().await;
+        let session = a_wheel_session(&state.pool).await;
+        let id = a_wheel_request(&state.pool, Some(session)).await;
+
+        // The first call decides it (and fails to hand over, the pillar being off).
+        let _ = approve(&state, id, ApproveInput::default()).await;
+        let second = approve(&state, id, ApproveInput::default()).await;
+        assert!(
+            matches!(second, Err(DecideError::AlreadyDecided)),
+            "{second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_reject_unknown_proposal_is_not_found() {
+        let state = test_state().await;
+        let result = reject(&state, 999_999).await;
+        assert!(matches!(result, Err(DecideError::NotFound)), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn decide_reject_contact_merge_twice_is_already_decided() {
+        let state = test_state().await;
+        let keep = a_contact(&state.pool).await;
+        let absorb = a_contact(&state.pool).await;
+        let id = crate::proposals::create_contact_merge(&state.pool, keep, absorb, "same name")
+            .await
+            .unwrap();
+
+        reject(&state, id).await.unwrap();
+        assert_eq!(status_of(&state.pool, id).await, "rejected");
+
+        let second = reject(&state, id).await;
+        assert!(
+            matches!(second, Err(DecideError::AlreadyDecided)),
+            "{second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_reject_twice_is_already_decided() {
+        let state = test_state().await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO proposals (kind, status, reasoning, created_at) VALUES ('team-action', 'pending', 'send the summary', ?) RETURNING id",
+        )
+        .bind("2026-10-19T08:00:00+00:00")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        reject(&state, id).await.unwrap();
+        assert_eq!(status_of(&state.pool, id).await, "rejected");
+
+        let second = reject(&state, id).await;
+        assert!(
+            matches!(second, Err(DecideError::AlreadyDecided)),
+            "{second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_reject_action_approval_unknown_is_not_found() {
+        let state = test_state().await;
+        // The read at the top of `reject` answers before any kind is chosen, so the default branch
+        // is never reached with a missing row.
+        let result = reject(&state, 424_242).await;
+        assert!(matches!(result, Err(DecideError::NotFound)), "{result:?}");
+    }
+
+    #[test]
+    fn decide_error_into_status_maps_each_variant_and_carries_no_body() {
+        // `into_status` returns a bare `StatusCode`: the type is what guarantees no body, and the
+        // messages below are given only to show they do not change the answer.
+        let cases = [
+            (DecideError::NotFound, StatusCode::NOT_FOUND),
+            (DecideError::AlreadyDecided, StatusCode::CONFLICT),
+            (DecideError::Conflict("c".to_owned()), StatusCode::CONFLICT),
+            (
+                DecideError::Invalid("i".to_owned()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                DecideError::BadRequest("b".to_owned()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                DecideError::BadGateway("g".to_owned()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                DecideError::Internal("x".to_owned()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                DecideError::Internal(String::new()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                DecideError::Status(StatusCode::FORBIDDEN, "s".to_owned()),
+                StatusCode::FORBIDDEN,
+            ),
+        ];
+        for (error, status) in cases {
+            let label = format!("{error:?}");
+            let answered: StatusCode = error.into_status();
+            assert_eq!(answered, status, "{label}");
+        }
     }
 
     #[test]

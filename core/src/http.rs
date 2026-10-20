@@ -21988,6 +21988,30 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A reject never has a body: the person asked to refuse and the status is the whole answer.
+    #[tokio::test]
+    async fn reject_unknown_proposal_returns_404_with_an_empty_body() {
+        let app = build_router(test_state().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/proposals/999999/reject")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "a reject answers with no body: {body:?}");
+    }
+
     #[tokio::test]
     async fn approve_endpoint_resumes_and_returns_the_resume_run_id() {
         let state = test_state().await;
