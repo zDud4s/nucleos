@@ -2,6 +2,7 @@ package kit
 
 import (
 	"context"
+	"errors"
 	"runtime/debug"
 	"time"
 
@@ -70,7 +71,14 @@ func (r *Runner) execute(ctx context.Context, a contract.Action) (refs []string,
 
 // ackLogged sends an ack with retry and logs a failure to settle it.
 func (r *Runner) ackLogged(ctx context.Context, client *Client, id uint64, ack contract.Ack) {
-	if _, err := client.AckWithRetry(ctx, id, ack); err != nil && ctx.Err() == nil {
+	_, err := client.AckWithRetry(ctx, id, ack)
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrFatal):
+		// 401/403/409 on an ack: no retry can fix it, the process must terminate.
+		logf("channelkit: ack %d: %v", id, err)
+		r.failFatal(err)
+	case ctx.Err() == nil:
 		logf("channelkit: ack %d: %v", id, err)
 	}
 }

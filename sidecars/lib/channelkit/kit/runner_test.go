@@ -20,7 +20,11 @@ type loopAdapter struct {
 	executed []uint64
 }
 
-func (l *loopAdapter) Capabilities() contract.Capabilities { return contract.Capabilities{} }
+// Capabilities declares the one required field (max_text), so the Runner's hello is valid.
+func (l *loopAdapter) Capabilities() contract.Capabilities {
+	mt := 4096
+	return contract.Capabilities{MaxText: &mt}
+}
 
 func (l *loopAdapter) Execute(ctx context.Context, a contract.Action) ([]string, error) {
 	l.mu.Lock()

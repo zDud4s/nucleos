@@ -237,8 +237,8 @@ func TestRunnerExecAckRetriedOnServerErrorWithSingleExecutionAndRenewal(t *testi
 			st, att, _ := g.core.Delivery(id)
 			t.Fatalf("action never reached done: state %q attempts %d", st, att)
 		}
-		g.clk.Advance(RenewInterval) // fires the ack backoff and the lease renewal
-		time.Sleep(time.Millisecond)
+		g.clk.Advance(RenewInterval)      // fires the ack backoff and the lease renewal
+		time.Sleep(25 * time.Millisecond) // let the renewal and the ack retry re-arm before the next step
 	}
 	g.waitInflight(0)
 	stop()
