@@ -69,6 +69,7 @@ type Core struct {
 	mediaSeq   int
 	mediaLimit int64
 	outbox     *queue // guarded by mu; created by mountOutbox
+	fallback   func(reason string, failed contract.Action)
 }
 
 // New starts the fake core; it is closed when the test ends. clk is the same
@@ -96,9 +97,6 @@ func New(t testing.TB, clk *clock.Fake) *Core {
 	t.Cleanup(c.srv.Close)
 	return c
 }
-
-// mountAck registers the ack and renew routes. It is a no-op until B29.
-func (c *Core) mountAck() {}
 
 // URL is the base URL of the fake core.
 func (c *Core) URL() string { return c.srv.URL }
@@ -316,6 +314,9 @@ func (c *Core) handleHello(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	c.hello = &h
 	c.helloCount++
+	// A new adapter process owns no lease: release them all without counting a
+	// delivery again (the 10th delivery without ok fails instead of re-pending).
+	c.outbox.ReleaseAll()
 	hook := c.onHello
 	c.notifyLocked()
 	c.mu.Unlock()
