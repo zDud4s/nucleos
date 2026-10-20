@@ -1094,6 +1094,26 @@ async fn main() {
     tokio::spawn(integrations::notify::run_flush_loop(state.clone()));
     // Messages a previous daemon left waiting are sent once, here; afterwards every slot release drains.
     tokio::spawn(assistant::drain_waiting_queues(state.clone()));
+    // Channel loops start only when a channel instance exists (a channel with its secrets present),
+    // which never happens in phase 1: the A2 bodies stay unreachable. Seeding runs first so the
+    // turn watermark and the routing cursors exist before the first discover/route_once.
+    if !channels::registry::all().is_empty() && channels::registry::channel_instances_exist(&state)
+    {
+        let cadence = channels::bus::Cadence::default();
+        channels::routing::seed_all(&state).await;
+        tokio::spawn(channels::replies::run_replies_loop(
+            state.clone(),
+            channels::bus::ChannelsBus::from_wake(),
+            cadence.clone(),
+        ));
+        tokio::spawn(channels::routing::run_routing_loop(
+            state.clone(),
+            channels::bus::ChannelsBus::from_wake(),
+            cadence,
+        ));
+    }
+    // Hourly TTL pruning of the channel tables; cheap, always on.
+    tokio::spawn(channels::run_housekeeping(state.clone()));
 
     // The email pillar starts only after its hook barrier has been PROVEN, and the proof can only
     // be attempted once this listener is serving — the hook reaches the daemon over HTTP, and a

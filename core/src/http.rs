@@ -121,6 +121,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(analytics::routes())
         .merge(analytics_pipeline::routes())
         .merge(brains::routes())
+        .merge(crate::channels::routes())
         .merge(chat_edit::routes())
         .merge(chat_turns::routes())
         .merge(chats::routes())
@@ -1475,6 +1476,84 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    /// The seven adapter-facing routes of D.6/D.9/D.10, for the channel `telegram`.
+    const CHANNEL_CONTRACT_STUBS: [(&str, &str); 7] = [
+        ("PUT", "/channels/telegram/hello"),
+        ("POST", "/channels/telegram/events"),
+        ("POST", "/channels/telegram/media"),
+        ("GET", "/channels/telegram/media/m1"),
+        ("GET", "/channels/telegram/outbox"),
+        ("POST", "/channels/telegram/outbox/1/ack"),
+        ("POST", "/channels/telegram/outbox/1/renew"),
+    ];
+
+    /// The management routes of D.7: Control only, never a channel key.
+    const CHANNEL_MANAGEMENT_STUBS: [(&str, &str); 8] = [
+        ("GET", "/channels"),
+        ("PUT", "/channels/primary"),
+        ("GET", "/channels/telegram/pairing"),
+        ("POST", "/channels/telegram/pairing"),
+        ("DELETE", "/channels/telegram/pairing"),
+        ("GET", "/channels/telegram/identities"),
+        ("DELETE", "/channels/telegram/identities/4242"),
+        ("PUT", "/channels/telegram/identities/4242/home"),
+    ];
+
+    async fn channel_status(
+        state: &AppState,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+    ) -> StatusCode {
+        let mut request = Request::builder().method(method).uri(path);
+        if let Some(bearer) = bearer {
+            request = request.header("Authorization", format!("Bearer {bearer}"));
+        }
+        build_router(state.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn channel_routes_need_a_token() {
+        let state = test_state().await;
+        let status = channel_status(&state, "PUT", "/channels/telegram/hello", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn control_reaches_every_channel_route_stub() {
+        let state = test_state().await;
+        for (method, path) in CHANNEL_CONTRACT_STUBS
+            .iter()
+            .chain(CHANNEL_MANAGEMENT_STUBS.iter())
+        {
+            let status = channel_status(&state, method, path, Some("test-token")).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_key_reaches_only_its_own_contract_routes() {
+        let state = test_state().await;
+        let key =
+            crate::auth::mint_service_token(&state.pool, crate::auth::Service::Channel("telegram"))
+                .await
+                .unwrap();
+        for (method, path) in CHANNEL_CONTRACT_STUBS {
+            let status = channel_status(&state, method, path, Some(&key)).await;
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+        }
+        for (method, path) in CHANNEL_MANAGEMENT_STUBS {
+            let status = channel_status(&state, method, path, Some(&key)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        let status = channel_status(&state, "POST", "/channels/fake/events", Some(&key)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use axum::{
     extract::{MatchedPath, Request, State},
     http::{Method, StatusCode, header},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use rand::RngExt;
 use subtle::ConstantTimeEq;
@@ -203,6 +203,32 @@ const EMAIL_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/email/cursor"),
     (Method::POST, "/email/incoming"),
 ];
+
+/// The contract routes of a messaging channel's own key (D.15.1): the seven an adapter calls, and
+/// nothing else. Never a prefix: `/channels/{channel}/pairing`, `/identities` and `/home` live under
+/// the same `/channels/{channel}/` stem and are the owner's, so a `/channels/{channel}/*` grant would
+/// let an adapter pair itself. `{channel}` matches any segment here; `channel_path_admits` then
+/// requires it to be the key's own channel id.
+const CHANNEL_ROUTES: &[(Method, &str)] = &[
+    (Method::PUT, "/channels/{channel}/hello"),
+    (Method::POST, "/channels/{channel}/events"),
+    (Method::POST, "/channels/{channel}/media"),
+    (Method::GET, "/channels/{channel}/media/{media_id}"),
+    (Method::GET, "/channels/{channel}/outbox"),
+    (Method::POST, "/channels/{channel}/outbox/{id}/ack"),
+    (Method::POST, "/channels/{channel}/outbox/{id}/renew"),
+];
+
+/// PURE: whether the concrete request path belongs to the scope's own channel. For a channel key the
+/// second segment must be exactly the channel id (no case folding, no decoding: `Telegram` and
+/// `telegram%2e` are other channels); every other scope is not channel-bound and passes.
+fn channel_path_admits(scope: &Scope, path: &str) -> bool {
+    let Scope::Service(Service::Channel(id)) = scope else {
+        return true;
+    };
+    let mut segments = path.trim_matches('/').split('/');
+    segments.next() == Some("channels") && segments.next() == Some(*id)
+}
 
 /// Routes that expose state without changing it.
 ///
@@ -551,6 +577,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
         }
         Scope::Service(Service::Email) => listed(EMAIL_ROUTES),
         Scope::Service(Service::Council) => listed(COUNCIL_ROUTES),
+        Scope::Service(Service::Channel(_)) => listed(CHANNEL_ROUTES),
         Scope::TeamRun(_) => listed(TEAM_ROUTES),
         Scope::ApiToken(ApiTokenLevel::ReadOnly) => listed(READ_ONLY_ROUTES),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
@@ -904,6 +931,9 @@ pub fn mint_team_token(team_run_id: &str) -> (String, String) {
 pub enum Service {
     Email,
     Council,
+    /// A messaging channel's adapter, by its manifest id (`registry::by_id`). Its key opens only
+    /// `CHANNEL_ROUTES` under its own `/channels/<id>/`.
+    Channel(&'static str),
 }
 
 impl Service {
@@ -913,6 +943,7 @@ impl Service {
         match self {
             Service::Email => "email",
             Service::Council => "council",
+            Service::Channel(id) => id,
         }
     }
 
@@ -920,7 +951,7 @@ impl Service {
         match name {
             "email" => Some(Service::Email),
             "council" => Some(Service::Council),
-            _ => None,
+            other => crate::channels::registry::by_id(other).map(|m| Service::Channel(m.id)),
         }
     }
 }
@@ -1163,6 +1194,22 @@ pub async fn require_token(
             req.extensions_mut().insert(turn);
         }
     }
+    // Cross-channel isolation (§7.3): a channel key reaches only its own `/channels/<id>/` routes.
+    // The one 403 of this middleware that carries a body, so an adapter wired to the wrong channel
+    // can tell a misconfiguration from a missing grant.
+    if allowed && !channel_path_admits(&scope, req.uri().path()) {
+        tracing::warn!(
+            ?scope,
+            method = %req.method(),
+            path = %req.uri().path(),
+            "refused a channel key on another channel's path"
+        );
+        return Ok((
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({ "error": "channel_mismatch" })),
+        )
+            .into_response());
+    }
     if !allowed {
         tracing::warn!(
             ?scope,
@@ -1171,6 +1218,12 @@ pub async fn require_token(
             "refused a request outside the caller's scope"
         );
         return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Any admitted request of a channel key is a sign of life for that adapter, not only the
+    // long-poll (E.9). Refusals above never reach this line.
+    if let Scope::Service(Service::Channel(id)) = &scope {
+        state.channels.presence.touch_poll(*id, chrono::Utc::now());
     }
 
     // Handlers that care WHICH run is calling read this rather than believing the request body;
@@ -4451,6 +4504,309 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "{uri} stays closed to a chat key"
             );
+        }
+    }
+
+    // ---- messaging channel keys (D.15.1, §7.3) ------------------------------------------------
+
+    /// The seven contract routes of a channel, as concrete (method, suffix) pairs under
+    /// `/channels/<id>`.
+    const CHANNEL_CONTRACT_CALLS: &[(&str, &str)] = &[
+        ("PUT", "hello"),
+        ("POST", "events"),
+        ("POST", "media"),
+        ("GET", "media/m_1"),
+        ("GET", "outbox"),
+        ("POST", "outbox/7/ack"),
+        ("POST", "outbox/7/renew"),
+    ];
+
+    /// The owner's routes under or beside the same stem, as concrete (method, path) pairs.
+    const CHANNEL_MANAGEMENT_CALLS: &[(&str, &str)] = &[
+        ("GET", "/channels"),
+        ("GET", "/channels/primary"),
+        ("PUT", "/channels/primary"),
+        ("POST", "/channels/telegram/pairing"),
+        ("GET", "/channels/telegram/identities"),
+        ("DELETE", "/channels/telegram/identities/4242"),
+        ("PUT", "/channels/telegram/home"),
+    ];
+
+    /// Stand-ins for the contract routes, the management routes and a few control routes, behind
+    /// the real middleware.
+    fn channel_router(state: AppState) -> Router {
+        use axum::routing::{delete, put};
+        Router::new()
+            .route("/channels/{channel}/hello", put(|| async {}))
+            .route("/channels/{channel}/events", post(|| async {}))
+            .route("/channels/{channel}/media", post(|| async {}))
+            .route("/channels/{channel}/media/{media_id}", get(|| async {}))
+            .route("/channels/{channel}/outbox", get(|| async {}))
+            .route("/channels/{channel}/outbox/{id}/ack", post(|| async {}))
+            .route("/channels/{channel}/outbox/{id}/renew", post(|| async {}))
+            .route("/channels", get(|| async {}))
+            .route("/channels/primary", get(|| async {}).put(|| async {}))
+            .route("/channels/{channel}/pairing", post(|| async {}))
+            .route("/channels/{channel}/identities", get(|| async {}))
+            .route("/channels/{channel}/identities/{id}", delete(|| async {}))
+            .route("/channels/{channel}/home", put(|| async {}))
+            .route("/runs", get(|| async {}).post(|| async {}))
+            .route("/proposals/{id}/approve", post(|| async {}))
+            .route("/autopilot/kill", get(|| async {}).post(|| async {}))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_token,
+            ))
+            .with_state(state)
+    }
+
+    async fn channel_response(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn channel_key_opens_the_seven_contract_routes_of_its_own_channel() {
+        let state = test_state("control").await;
+        let key = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        let app = channel_router(state);
+        for (method, suffix) in CHANNEL_CONTRACT_CALLS {
+            let uri = format!("/channels/telegram/{suffix}");
+            let (status, _) = channel_response(&app, method, &uri, &key).await;
+            assert_eq!(status, StatusCode::OK, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_key_on_another_channels_routes_gets_the_channel_mismatch_body() {
+        let state = test_state("control").await;
+        let key = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        let app = channel_router(state);
+        for (method, suffix) in CHANNEL_CONTRACT_CALLS {
+            let uri = format!("/channels/fake/{suffix}");
+            let (status, body) = channel_response(&app, method, &uri, &key).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({ "error": "channel_mismatch" }),
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_key_for_fake_is_isolated_from_telegram_too() {
+        let state = test_state("control").await;
+        let fake_key = mint_service_token(&state.pool, Service::Channel("fake"))
+            .await
+            .unwrap();
+        let app = channel_router(state);
+        let (own, _) = channel_response(&app, "POST", "/channels/fake/events", &fake_key).await;
+        assert_eq!(own, StatusCode::OK);
+        let (other, _) =
+            channel_response(&app, "POST", "/channels/telegram/events", &fake_key).await;
+        assert_eq!(other, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn channel_key_is_refused_on_lookalike_channel_ids() {
+        let state = test_state("control").await;
+        let key = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        let app = channel_router(state);
+        for id in ["Telegram", "telegram%2e", "telegram2", "%74elegram"] {
+            let uri = format!("/channels/{id}/events");
+            let (status, _) = channel_response(&app, "POST", &uri, &key).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_key_gets_a_bare_403_on_every_management_route_and_control_gets_200() {
+        let state = test_state("control").await;
+        let key = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        let app = channel_router(state);
+        for (method, uri) in CHANNEL_MANAGEMENT_CALLS {
+            let (status, body) = channel_response(&app, method, uri, &key).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert!(body.is_empty(), "{method} {uri} must be a bare 403");
+            let (status, _) = channel_response(&app, method, uri, "control").await;
+            assert_eq!(status, StatusCode::OK, "control {method} {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_key_is_refused_on_control_routes() {
+        let state = test_state("control").await;
+        let key = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        let app = channel_router(state);
+        for (method, uri) in [
+            ("GET", "/runs"),
+            ("POST", "/runs"),
+            ("POST", "/proposals/1/approve"),
+            ("POST", "/autopilot/kill"),
+        ] {
+            assert_eq!(
+                status_of(&app, method, uri, &key).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_scope_is_not_reachable_with_the_email_or_council_keys() {
+        let state = test_state("control").await;
+        let email = mint_service_token(&state.pool, Service::Email)
+            .await
+            .unwrap();
+        let council = mint_service_token(&state.pool, Service::Council)
+            .await
+            .unwrap();
+        let app = channel_router(state);
+        for key in [email, council] {
+            assert_eq!(
+                status_of(&app, "POST", "/channels/telegram/events", &key).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_scope_resolves_to_service_channel() {
+        let state = test_state("control").await;
+        let key = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        assert!(key.starts_with("telegram."));
+        assert!(matches!(
+            resolve(&state, &key).await,
+            Some(Scope::Service(Service::Channel("telegram")))
+        ));
+        let (_, secret) = key.split_once('.').unwrap();
+        assert!(resolve(&state, &format!("fake.{secret}")).await.is_none());
+        assert!(resolve(&state, "unknown-channel.x").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_scope_minting_again_replaces_the_previous_key() {
+        let state = test_state("control").await;
+        let first = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        let second = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        assert!(resolve(&state, &first).await.is_none());
+        assert!(resolve(&state, &second).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn channel_scope_touches_presence_on_admitted_requests_only() {
+        let state = test_state("control").await;
+        let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+        let hello = crate::channels::contract::Hello {
+            kind: "telegram".to_owned(),
+            version: crate::channels::contract::CONTRACT_VERSION.to_owned(),
+            capabilities: crate::channels::contract::Capabilities::default(),
+        };
+        crate::channels::registry::record_hello(&state, "telegram", &hello, epoch)
+            .await
+            .unwrap();
+        let key = mint_service_token(&state.pool, Service::Channel("telegram"))
+            .await
+            .unwrap();
+        let presence_state = state.clone();
+        let app = channel_router(state);
+
+        // Refused (another channel's path, then a management route): presence stays untouched.
+        assert_eq!(
+            status_of(&app, "POST", "/channels/fake/events", &key).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_of(&app, "POST", "/channels/telegram/pairing", &key).await,
+            StatusCode::FORBIDDEN
+        );
+        let seen = presence_state.channels.presence.seen("telegram").unwrap();
+        assert_eq!(seen.last_poll_at, Some(epoch));
+
+        // Admitted, on a route that is not the long-poll: presence moves.
+        assert_eq!(
+            status_of(&app, "POST", "/channels/telegram/events", &key).await,
+            StatusCode::OK
+        );
+        let seen = presence_state.channels.presence.seen("telegram").unwrap();
+        assert!(seen.last_poll_at.is_some_and(|at| at > epoch));
+    }
+
+    #[test]
+    fn channel_scope_table_lists_only_the_contract_routes() {
+        let scope = Scope::Service(Service::Channel("telegram"));
+        for (method, suffix) in CHANNEL_CONTRACT_CALLS {
+            let method: Method = method.parse().unwrap();
+            assert!(permits(
+                &scope,
+                &method,
+                &format!("/channels/telegram/{suffix}")
+            ));
+        }
+        for (method, path) in CHANNEL_MANAGEMENT_CALLS {
+            let method: Method = method.parse().unwrap();
+            assert!(!permits(&scope, &method, path), "{method} {path}");
+        }
+        assert!(channel_path_admits(&scope, "/channels/telegram/events"));
+        assert!(!channel_path_admits(&scope, "/channels/fake/events"));
+        assert!(!channel_path_admits(&scope, "/runs"));
+        assert!(channel_path_admits(
+            &Scope::Control,
+            "/channels/fake/events"
+        ));
+    }
+
+    #[test]
+    fn channel_scope_manifest_ids_never_collide_with_other_key_prefixes() {
+        for manifest in crate::channels::registry::all() {
+            assert!(!matches!(
+                manifest.id,
+                "email" | "council" | "api" | "team" | "chat"
+            ));
+            assert!(
+                manifest.id.parse::<i64>().is_err(),
+                "{} would read as a run id",
+                manifest.id
+            );
+            assert!(!manifest.id.contains([':', '.']));
         }
     }
 }
