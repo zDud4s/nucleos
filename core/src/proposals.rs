@@ -1691,9 +1691,9 @@ mod tests {
     async fn seed_department(pool: &sqlx::SqlitePool) {
         for (id, name) in [("dir", "Ana"), ("spec", "Rui")] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, 's', 'p', 'claude', 'none', '2026-10-10T00:00:00Z',
+                 VALUES (?, ?, 's', 'p', 'claude', '[]', '2026-10-10T00:00:00Z',
                          '2026-10-10T00:00:00Z')",
             )
             .bind(id)

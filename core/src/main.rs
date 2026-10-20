@@ -129,6 +129,7 @@ async fn main() {
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
     startup::reconcile_after_restart(&pool).await;
+    startup::install_agents(&pool).await;
 
     // Before anything can launch a Claude run, so the first run's credential is already watched.
     execution::runner::watch_claude_auth(pool.clone());

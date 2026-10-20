@@ -1450,8 +1450,8 @@ mod tests {
     async fn live_team_run_with_token(state: &AppState, id: &str) -> String {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
-                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
-             VALUES ('director', 'Director', 'plans', 'p', 'claude', NULL, 'mcp_only',
+                 (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
+             VALUES ('director', 'Director', 'plans', 'p', 'claude', NULL, '[\"mcp.nucleos\"]',
                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .execute(&state.pool)

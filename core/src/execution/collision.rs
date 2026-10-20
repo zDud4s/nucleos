@@ -845,9 +845,9 @@ mod tests {
         let now = "2026-08-08T00:00:00Z";
         let director = format!("{id}-director");
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES (?, 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES (?, 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(&director)
         .bind(now)

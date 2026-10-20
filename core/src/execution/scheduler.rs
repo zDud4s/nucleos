@@ -1073,9 +1073,9 @@ mod tests {
     async fn seed_team(state: &AppState, team_id: &str) {
         let now = "2026-07-18T09:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(now)
         .bind(now)

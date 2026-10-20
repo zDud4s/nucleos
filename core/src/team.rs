@@ -902,8 +902,8 @@ mod tests {
     async fn insert_agent(state: &AppState, id: &str, engine: &str) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
-                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
-             VALUES (?, ?, 'writes things', 'you write things', ?, NULL, 'mcp_only',
+                 (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
+             VALUES (?, ?, 'writes things', 'you write things', ?, NULL, '[\"mcp.nucleos\"]',
                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .bind(id)
@@ -2852,7 +2852,7 @@ mod tests {
             .unwrap();
         // Engine defaults to the DIRECTOR's, which is the only defensible guess: a specialist of a
         // department that runs on one engine running on the same surprises nobody.
-        assert_eq!(agent.engine, "claude");
+        assert_eq!(agent.engine.as_deref(), Some("claude"));
         // Through the view, because the tests have a `roster` of their own that shadows the module
         // function — and the view is what the shell reads anyway.
         assert!(
@@ -3010,9 +3010,9 @@ mod tests {
                 name: "Contracts lawyer".to_owned(),
                 speciality: "reads contracts".to_owned(),
                 prompt: "You are a lawyer.".to_owned(),
-                engine: "local".to_owned(),
+                engine: Some("local".to_owned()),
                 model: None,
-                tool_policy: "mcp_only".to_owned(),
+                capabilities: vec!["mcp.nucleos".to_owned()],
             }),
         )
         .await;
@@ -3033,9 +3033,9 @@ mod tests {
                 name: "House counsel".to_owned(),
                 speciality: "reads contracts".to_owned(),
                 prompt: "You are a lawyer.".to_owned(),
-                engine: "claude".to_owned(),
+                engine: Some("claude".to_owned()),
                 model: Some("claude-sonnet-5".to_owned()),
-                tool_policy: "none".to_owned(),
+                capabilities: Vec::new(),
             }),
         )
         .await
@@ -3045,7 +3045,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(agent.name, "House counsel");
-        assert_eq!(agent.tool_policy, "none");
+        assert_eq!(agent.tool_policy(), "none");
     }
 
     /// Refusing is "not this one", never "stop asking". The next run of that department meets the
@@ -3500,11 +3500,13 @@ mod tests {
             name: "copywriter".to_owned(),
             speciality: "writes".to_owned(),
             prompt: "write".to_owned(),
-            engine: "claude".to_owned(),
+            engine: Some("claude".to_owned()),
             model: None,
             // Not `mcp_only`: this test is about what the terminal write records, and the MCP
             // branch would put a config file in the machine's temp directory to prove nothing.
-            tool_policy: "unrestricted".to_owned(),
+            capabilities: vec!["shell".to_owned()],
+            source: "user".to_owned(),
+            package_ref: None,
             created_at: "2026-08-26T00:00:00Z".to_owned(),
             updated_at: "2026-08-26T00:00:00Z".to_owned(),
         };
@@ -3582,10 +3584,12 @@ mod tests {
                 name: "copywriter".to_owned(),
                 speciality: "writes".to_owned(),
                 prompt: "write".to_owned(),
-                engine: "claude".to_owned(),
+                engine: Some("claude".to_owned()),
                 model: None,
                 // Not `mcp_only`, for the reason the pressure test above gives.
-                tool_policy: "unrestricted".to_owned(),
+                capabilities: vec!["shell".to_owned()],
+                source: "user".to_owned(),
+                package_ref: None,
                 created_at: "2026-08-26T00:00:00Z".to_owned(),
                 updated_at: "2026-08-26T00:00:00Z".to_owned(),
             };
@@ -3656,9 +3660,11 @@ mod tests {
             name: "copywriter".to_owned(),
             speciality: "writes".to_owned(),
             prompt: "write".to_owned(),
-            engine: "claude".to_owned(),
+            engine: Some("claude".to_owned()),
             model: None,
-            tool_policy: "unrestricted".to_owned(),
+            capabilities: vec!["shell".to_owned()],
+            source: "user".to_owned(),
+            package_ref: None,
             created_at: "2026-08-26T00:00:00Z".to_owned(),
             updated_at: "2026-08-26T00:00:00Z".to_owned(),
         };
@@ -3883,11 +3889,15 @@ mod tests {
             name: "researcher".to_owned(),
             speciality: "reads".to_owned(),
             prompt: "read".to_owned(),
-            engine: "local".to_owned(),
+            engine: Some("local".to_owned()),
             model: Some(model.to_owned()),
             // Not `mcp_only`: what is under test is which server answered, and the MCP branch
-            // would write a config file into the machine's temp directory to prove nothing.
-            tool_policy: "unrestricted".to_owned(),
+            // would write a config file into the machine's temp directory to prove nothing. No
+            // capability at all: a local pin that asks for one it cannot translate (`shell`) is
+            // refused at launch, and `none` is the policy this fixture always meant.
+            capabilities: Vec::new(),
+            source: "user".to_owned(),
+            package_ref: None,
             created_at: "2026-08-26T00:00:00Z".to_owned(),
             updated_at: "2026-08-26T00:00:00Z".to_owned(),
         }
@@ -4025,7 +4035,11 @@ mod tests {
             ("unrestricted", Vec::new()),
         ] {
             let agent = crate::agent::Agent {
-                tool_policy: policy.to_owned(),
+                capabilities: if policy == "mcp_only" {
+                    vec!["mcp.nucleos".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 ..local_member("a-frontier-moe")
             };
             let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
@@ -4051,7 +4065,7 @@ mod tests {
         .await;
         let run = team_run_for_member(&state, "tr-cloud-routed").await;
         let agent = crate::agent::Agent {
-            engine: "claude".to_owned(),
+            engine: Some("claude".to_owned()),
             model: Some("claude-sonnet-5".to_owned()),
             ..local_member("unused")
         };
@@ -4079,6 +4093,171 @@ mod tests {
         assert_eq!(decision.as_deref(), Some("rt_team"));
     }
 
+    /// A router whose primary is Claude and whose alternate is Codex, a fake runner behind each.
+    async fn claude_and_codex(
+        state: &mut AppState,
+        advice: serde_json::Value,
+    ) -> (
+        std::sync::Arc<crate::execution::runner::FakeCommandRunner>,
+        std::sync::Arc<crate::execution::runner::FakeCommandRunner>,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        use crate::models::route_advice::{
+            Available, Mode, RoutedRunner, Router, RouterConfig, RunnerKind,
+        };
+        let (url, sent) = crate::router_client::test_support::stub_router(200, advice).await;
+        let claude = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        let codex = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        let config = RouterConfig {
+            mode: Mode::Off,
+            url,
+            surfaces: [("team", Mode::Apply)].into_iter().collect(),
+            ..RouterConfig::off()
+        };
+        let router = std::sync::Arc::new(Router::new(
+            config,
+            Available {
+                kind: RunnerKind::Claude,
+                runner: claude.clone(),
+                default_model: "claude-sonnet-5".into(),
+                models: vec!["claude-*".into()],
+            },
+            vec![Available {
+                kind: RunnerKind::Codex,
+                runner: codex.clone(),
+                default_model: "gpt-5.5".into(),
+                models: vec!["gpt-*".into()],
+            }],
+        ));
+        state.runner = std::sync::Arc::new(RoutedRunner {
+            inner: claude.clone(),
+            router,
+        });
+        (claude, codex, sent)
+    }
+
+    /// Spec 2026-10-20 section 8: a `codex` member used to run on the daemon's own (Claude) runner.
+    /// It launches on the Codex runner, with the flags of its derived policy, and asks nobody.
+    #[tokio::test]
+    async fn a_codex_team_member_launches_in_the_codex_runner_with_its_policy() {
+        let (mut state, _root) = state_with_root().await;
+        let (claude, codex, mut sent) = claude_and_codex(
+            &mut state,
+            serde_json::json!({
+                "decision_id": "rt_unused", "runner": "claude", "model": "claude-opus-5",
+                "effort": "high", "estimated_cost_usd": 0.2, "rule": "hard",
+            }),
+        )
+        .await;
+        let run = team_run_for_member(&state, "tr-codex-member").await;
+        let agent = crate::agent::Agent {
+            engine: Some("codex".to_owned()),
+            model: Some("gpt-5.5".to_owned()),
+            capabilities: vec!["mcp.nucleos".to_owned()],
+            ..local_member("unused")
+        };
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+        assert_eq!(settled_run(&state, run_id).await.0, "completed");
+        assert!(
+            codex.last_prompt.lock().unwrap().is_some(),
+            "Codex never ran"
+        );
+        assert!(
+            claude.last_prompt.lock().unwrap().is_none(),
+            "Claude ran a codex member"
+        );
+        assert_eq!(
+            *codex.last_tool_policy.lock().unwrap(),
+            Some(crate::execution::runner::ToolPolicy::McpOnly)
+        );
+        assert_eq!(
+            *codex.last_model.lock().unwrap(),
+            Some(Some("gpt-5.5".to_owned()))
+        );
+        assert!(sent.try_recv().is_err(), "a pinned seat asked the adviser");
+    }
+
+    /// A package member with no engine of its own is routed: the router is asked among the engines
+    /// that can run its capabilities, and what it names launches, with the package's prompt.
+    #[tokio::test]
+    async fn a_package_team_member_with_no_engine_is_routed() {
+        let (mut state, _root) = state_with_root().await;
+        let (claude, codex, mut sent) = claude_and_codex(
+            &mut state,
+            serde_json::json!({
+                "decision_id": "rt_pkg", "runner": "codex", "model": "gpt-5.5",
+                "effort": "high", "estimated_cost_usd": 0.2, "rule": "hard",
+            }),
+        )
+        .await;
+        let home = tempfile::tempdir().unwrap();
+        let package = home.path().join("agents/demo/1.0.0");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("agent.md"),
+            "---\nname: demo\nversion: 1.0.0\ndescription: A demo.\ncapabilities: [shell]\n---\nDemo body line.\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("output.md"), "Report.\n").unwrap();
+        state.machine_config_root = Some(home.path().to_path_buf());
+        let run = team_run_for_member(&state, "tr-package-member").await;
+        let agent = crate::agent::Agent {
+            engine: None,
+            model: None,
+            capabilities: vec!["shell".to_owned()],
+            source: "package".to_owned(),
+            package_ref: Some("demo@1.0.0".to_owned()),
+            ..local_member("unused")
+        };
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+        assert_eq!(settled_run(&state, run_id).await.0, "completed");
+        let asked = sent.try_recv().expect("the router was asked");
+        assert_eq!(asked["runners"], serde_json::json!(["claude", "codex"]));
+        assert!(claude.last_prompt.lock().unwrap().is_none());
+        let prompt = codex
+            .last_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Codex ran");
+        assert!(
+            prompt.contains("Demo body line."),
+            "the package prompt is missing: {prompt}"
+        );
+        let decision: Option<String> =
+            sqlx::query_scalar("SELECT route_decision_id FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(decision.as_deref(), Some("rt_pkg"));
+    }
+
+    /// A local pin that asks for a capability the local engine cannot translate fails the launch
+    /// with the reason, instead of running with less than was asked.
+    #[tokio::test]
+    async fn a_local_member_asking_for_a_shell_fails_with_the_reason() {
+        let (state, _root) = state_with_root().await;
+        let run = team_run_for_member(&state, "tr-local-shell").await;
+        let agent = crate::agent::Agent {
+            capabilities: vec!["shell".to_owned()],
+            ..local_member("a-frontier-moe")
+        };
+        let (run_id, session_id) = open_run(&state, &run.id, "find it", false).await.unwrap();
+
+        spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
+
+        let (status, _, stderr) = settled_run(&state, run_id).await;
+        assert_eq!(status, "failed");
+        assert!(stderr.unwrap_or_default().contains("shell"));
+    }
+
     /// A team member reads its own memory and its team's, nobody else's, and the briefing leaves a
     /// trace that names the rows it considered.
     #[tokio::test]
@@ -4088,7 +4267,7 @@ mod tests {
         state.runner = fake.clone();
         let run = team_run_for_member(&state, "tr-loadout").await;
         let agent = crate::agent::Agent {
-            engine: "claude".to_owned(),
+            engine: Some("claude".to_owned()),
             model: Some("claude-sonnet-5".to_owned()),
             ..local_member("unused")
         };
@@ -4153,9 +4332,16 @@ mod tests {
     /// A cloud member whose tools are on, ready for the loadout tests below.
     fn loadout_member(tool_policy: &str) -> crate::agent::Agent {
         crate::agent::Agent {
-            engine: "claude".to_owned(),
+            engine: Some("claude".to_owned()),
             model: Some("claude-sonnet-5".to_owned()),
-            tool_policy: tool_policy.to_owned(),
+            capabilities: vec![
+                if tool_policy == "mcp_only" {
+                    "mcp.nucleos"
+                } else {
+                    "shell"
+                }
+                .to_owned(),
+            ],
             ..local_member("unused")
         }
     }
@@ -5400,8 +5586,8 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         sqlx::query(
             "INSERT INTO agents
-                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
-             VALUES ('director', 'Director', 'plans', 'p', 'claude', NULL, 'mcp_only',
+                 (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
+             VALUES ('director', 'Director', 'plans', 'p', 'claude', NULL, '[\"mcp.nucleos\"]',
                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .execute(&pool)
@@ -5477,7 +5663,7 @@ mod tests {
         super::lifecycle::cancel(&state, &run.id).await.unwrap();
 
         let agent = crate::agent::Agent {
-            engine: "claude".to_owned(),
+            engine: Some("claude".to_owned()),
             model: None,
             ..local_member("unused")
         };
@@ -5522,7 +5708,7 @@ mod tests {
             .await
             .unwrap();
             let agent = crate::agent::Agent {
-                engine: "claude".to_owned(),
+                engine: Some("claude".to_owned()),
                 model: None,
                 ..local_member("unused")
             };

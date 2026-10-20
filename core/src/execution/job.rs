@@ -2331,9 +2331,9 @@ mod tests {
         let pool = test_pool().await;
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(&now)
         .bind(&now)
@@ -2367,9 +2367,9 @@ mod tests {
     async fn seed_agent(pool: &sqlx::SqlitePool, id: &str, speciality: &str, prompt: &str) {
         let now = "2026-08-20T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'claude', 'inherit', ?, ?)",
+             VALUES (?, ?, ?, ?, 'claude', '[]', ?, ?)",
         )
         .bind(id)
         .bind(format!("Agent {id}"))
@@ -2549,9 +2549,9 @@ mod tests {
         let pool = test_pool().await;
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(&now)
         .bind(&now)

@@ -1311,9 +1311,9 @@ mod tests {
     async fn seed_pressure_team(pool: &sqlx::SqlitePool, with_a_job: bool) {
         for agent in ["director", "Nucleo"] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, 'a speciality', 'a prompt', 'claude', 'unrestricted',
+                 VALUES (?, ?, 'a speciality', 'a prompt', 'claude', '[\"shell\"]',
                          '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
             )
             .bind(agent)
@@ -19344,9 +19344,9 @@ mod tests {
     async fn team_in(pool: &sqlx::SqlitePool, team_id: &str) {
         let now = "2026-08-20T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -23226,9 +23226,9 @@ mod tests {
     async fn agent_in(pool: &sqlx::SqlitePool, agent_id: &str) {
         let now = "2026-10-09T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES (?, ?, 'remembering', 'recall', 'claude', 'inherit', ?, ?)",
+             VALUES (?, ?, 'remembering', 'recall', 'claude', '[]', ?, ?)",
         )
         .bind(agent_id)
         .bind(format!("Agent {agent_id}"))
@@ -24861,8 +24861,8 @@ mod tests {
     async fn loadout_seed_agent_and_team(pool: &sqlx::SqlitePool) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
-                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
-             VALUES ('scout', 'Scout', 'reads', 'p', 'claude', NULL, 'mcp_only',
+                 (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
+             VALUES ('scout', 'Scout', 'reads', 'p', 'claude', NULL, '[\"mcp.nucleos\"]',
                      '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')",
         )
         .execute(pool)

@@ -396,9 +396,9 @@ mod tests {
         let now = "2026-08-19T00:00:00+00:00";
         for id in ["a", "b"] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, 'tests', 'work', 'claude', 'inherit', ?, ?)",
+                 VALUES (?, ?, 'tests', 'work', 'claude', '[]', ?, ?)",
             )
             .bind(id)
             .bind(format!("Agent {id}"))

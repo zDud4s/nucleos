@@ -176,3 +176,23 @@ pub(super) async fn reconcile_after_restart(pool: &sqlx::SqlitePool) {
         Err(error) => tracing::warn!(%error, "orphaned-worktree reconciliation failed"),
     }
 }
+
+/// Installs the embedded agent packages under `~/.nucleos/agents` and registers their catalog rows.
+///
+/// Never stops the daemon: a package that cannot install is an agent that is unavailable, said out
+/// loud here, while the others install.
+pub(super) async fn install_agents(pool: &sqlx::SqlitePool) {
+    let Some(home) = machine_config::root().map(|root| root.join("agents")) else {
+        return;
+    };
+    let report = agents::install::install_all(pool, &home).await;
+    for error in &report.errors {
+        tracing::warn!(package = %error.reference, "agent unavailable: {}", error.message);
+    }
+    if !report.installed.is_empty() {
+        tracing::info!(
+            installed = report.installed.len(),
+            "installed agent packages"
+        );
+    }
+}

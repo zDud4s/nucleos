@@ -723,7 +723,7 @@ pub async fn item_context(pool: &SqlitePool, item: ItemRef, current_run: i64) ->
 /// Side-effect free on purpose: `quota::quota_permits_new_run` announces a blind brake and clears
 /// markers, which is the scheduler's job, and a live sidecar call could cost the run 25 seconds.
 /// Fails open like the brake itself — an unreadable policy or reading holds nothing.
-async fn braked_runners(pool: &SqlitePool) -> Vec<RunnerKind> {
+pub async fn braked_runners(pool: &SqlitePool) -> Vec<RunnerKind> {
     let Ok(policy) = crate::quota::load_brake_policy(pool).await else {
         return Vec::new();
     };
