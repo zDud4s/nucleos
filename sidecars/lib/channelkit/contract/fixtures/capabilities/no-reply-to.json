@@ -1,0 +1,15 @@
+{ "missing": "reply_to",
+  "hello": { "kind": "fake", "version": "1.0.0",
+             "capabilities": { "buttons": true, "edit": true, "typing": true, "threads": true,
+                               "max_text": 4096, "media_in": ["audio", "image", "file"],
+                               "media_out": ["image", "file", "audio"] } },
+  "setup": { "identities": [ {"sender_ref": "4242", "conversation_ref": "4242", "home": true} ] },
+  "steps": [
+    { "core": {"do": "capture_requested", "capture": 3, "summary": "Which option, A or B?"},
+      "expect": { "actions": [ { "type": "send", "conversation": "4242",
+                                 "parts": [ {"type": "text", "$contains": ["/cap 3"]} ] } ] } },
+    { "event": { "event_id": "nr-1", "conversation": {"ref": "4242", "kind": "private"},
+                 "sender": {"ref": "4242", "name": "Duarte"}, "type": "message",
+                 "message": {"ref": "101", "parts": [ {"type": "text", "text": "/cap 3 option B"} ]} },
+      "expect": { "response": {"accepted": true},
+                  "state": { "capture": {"id": 3, "answer": "option B"} } } } ] }

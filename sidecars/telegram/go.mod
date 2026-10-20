@@ -9,3 +9,7 @@ go 1.26
 // govulncheck against go1.26.1, 2026-08-16: 13 vulnerabilities reachable from this module's own
 // code, fixed across go1.26.2 through go1.26.6. Zero after.
 toolchain go1.26.6
+
+require nucleoschannelkit v0.0.0
+
+replace nucleoschannelkit => ../lib/channelkit

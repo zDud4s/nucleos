@@ -129,6 +129,10 @@ export function Reasoning({ children }: { children: string }) {
  */
 export interface QueueText {
   title: string;
+  /** The section's anchor, for the header's index to jump to. */
+  id: string;
+  /** What the header's index calls the queue after its count: "4 action approvals" gives "action approvals". */
+  index: (n: number) => string;
   /** The absence, in the fewest words that are still true. */
   says: string;
   /** What this section is for. */
@@ -138,6 +142,8 @@ export interface QueueText {
 export const QUEUES = {
   wheel: {
     title: "Browser access requests",
+    id: "waiting-wheel",
+    index: (n) => `browser access ${n === 1 ? "request" : "requests"}`,
     says: "nothing has asked for browser access",
     why: (
       <>
@@ -152,6 +158,8 @@ export const QUEUES = {
   },
   approvals: {
     title: "Action approvals",
+    id: "waiting-approvals",
+    index: (n) => `action ${n === 1 ? "approval" : "approvals"}`,
     says: "nothing is waiting to be let through",
     why: (
       <>
@@ -164,6 +172,8 @@ export const QUEUES = {
   },
   teamActions: {
     title: "Team actions",
+    id: "waiting-team-actions",
+    index: (n) => `team ${n === 1 ? "action" : "actions"}`,
     says: "no team is waiting on an action",
     why: (
       <>
@@ -175,6 +185,8 @@ export const QUEUES = {
   },
   recruits: {
     title: "Recruitment",
+    id: "waiting-recruits",
+    index: () => "recruitment",
     says: "no team has asked for a specialist",
     why: (
       <>
@@ -186,6 +198,8 @@ export const QUEUES = {
   },
   merges: {
     title: "Contact merges",
+    id: "waiting-merges",
+    index: (n) => `contact ${n === 1 ? "merge" : "merges"}`,
     says: "no two contacts look like the same person",
     why: (
       <>
@@ -198,6 +212,8 @@ export const QUEUES = {
   },
   exclusions: {
     title: "Keep jobs apart?",
+    id: "waiting-exclusions",
+    index: () => "to keep apart",
     says: "no job has asked to be kept apart from another",
     why: (
       <>
@@ -209,6 +225,8 @@ export const QUEUES = {
   },
   git: {
     title: "Git queue",
+    id: "waiting-git",
+    index: () => "in the git queue",
     says: "nothing in the git queue needs your approval",
     why: (
       <>
@@ -253,6 +271,7 @@ export const QUEUES = {
  * outline is the same whichever shape a section is in.
  */
 export function Queue({
+  id,
   title,
   view,
   what,
@@ -262,6 +281,8 @@ export function Queue({
   notes,
   children,
 }: {
+  /** The anchor the header's index jumps to; it sits on the wrapper, which exists even when empty. */
+  id: string;
   title: string;
   view: Reading<unknown>;
   /** What is being read, for the sentence a wait or a failure puts on screen. */
@@ -356,6 +377,7 @@ export function Queue({
 
   return (
     <div
+      id={id}
       className="waiting-queue"
       ref={root}
       onFocusCapture={noteFocus}

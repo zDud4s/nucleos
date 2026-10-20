@@ -4,6 +4,8 @@ import { BrainPanel } from "./BrainPanel";
 import type { GModel } from "./graph-types";
 import type { NoteDetail, NotesGraph } from "../data/owner-notes";
 import { renderWithRouter } from "../test/harness";
+import { createAppQueryClient } from "../app/queryClient";
+import { keys } from "../data/keys";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -73,6 +75,41 @@ async function panel(g: NotesGraph = graph, onSelect?: (id: string) => void) {
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
+});
+
+describe("BrainPanel origin", () => {
+  const TELEGRAM_NOTE = { ...NOTE, origin: "channel:telegram" as const };
+
+  it("shows a channel origin by its fallback name, not the raw id", async () => {
+    serve(detail({ note: TELEGRAM_NOTE }));
+    await panel();
+    expect(screen.getByText("Telegram")).toBeTruthy();
+    expect(screen.queryByText("channel:telegram")).toBeNull();
+  });
+
+  it("uses the label of a cached channels list when there is one", async () => {
+    serve(detail({ note: TELEGRAM_NOTE }));
+    const queryClient = createAppQueryClient();
+    queryClient.setQueryData(keys.channels.all, {
+      contract_version: "1",
+      primary: null,
+      routing: { state: "off" },
+      channels: [{ id: "telegram", label: "Telegram Bot" }],
+    });
+    wide = graph;
+    await renderWithRouter(<BrainPanel nodeId="n:4" graph={graph} model={model} />, {
+      initialPath: "/brain",
+      queryClient,
+    });
+    await screen.findByText("Rust owns the state");
+    expect(screen.getByText("Telegram Bot")).toBeTruthy();
+  });
+
+  it("keeps showing shell for a note written in the shell", async () => {
+    serve(detail());
+    await panel();
+    expect(screen.getByText("shell")).toBeTruthy();
+  });
 });
 
 describe("BrainPanel", () => {

@@ -282,101 +282,258 @@
 
 /* ================================================================ filters == */
 
-/* A strip on the page, not a card on it: the list below is the one box. */
-.runs-filters {
+/* One line at the design width: the search takes whatever the other two leave,
+   the status scope keeps its own width, and More filters is pinned to the end.
+   `stretch` so the input, the joined segments and the disclosure toggle all stand
+   at one height. Below 60rem the groups wrap whole (see the query under this). */
+.runs-bar {
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-end;
-  gap: var(--space-3) var(--space-4);
-  margin-bottom: var(--space-4);
+  align-items: stretch;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
 }
 
-/* `.ui-switch` puts itself at the top of a flex row; here it lines up with the
-   bottoms of the fields beside it. */
-.runs-filters > .runs-scope {
-  align-self: flex-end;
+@media (max-width: 60rem) {
+  .runs-search {
+    flex-basis: 100%;
+  }
 }
 
-/* One height along the strip: the segments and the Search button take the
-   field's own block padding, so they stand level with the inputs beside them. */
-.runs-scope .ui-switch-seg,
-.runs-search > .ui-button {
-  padding-block: var(--space-2);
-}
-
-/* The one field that grows: a prompt search is a phrase, the rest are words
-   chosen from a list. Its submit sits against it, so it cannot read as the
-   button that applies every filter. */
+/* `ListFilter` brings its own `.ui-filter-bar` (the input and, when a filter is
+   on, its Clear). It stays on one line inside this group: the input is what
+   gives way, the Clear never drops under it. */
 .runs-search {
   display: flex;
   flex: 1 1 18rem;
-  align-items: flex-end;
-  gap: var(--space-2);
   min-width: 0;
 }
 
-.runs-search > .ui-field {
+.runs-search > .ui-filter-bar {
   flex: 1 1 auto;
-}
-
-/* The field primitive's 14rem floor is for a form; in a strip that wraps it is
-   what would push the row past a narrow window. */
-.runs-filters .ui-field input,
-.runs-filters .ui-field select {
+  flex-wrap: nowrap;
   min-width: 0;
 }
 
-.runs-filters-aside {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--space-3);
-  padding-bottom: var(--space-2);
+.runs-search .ui-list-filter-input {
+  min-width: 0;
+  min-height: var(--hit-min);
+  font-size: var(--text-sm);
+}
+
+/* `.ui-switch` puts itself at the top of a flex row; here it is as tall as the
+   search box beside it. The segments are the shared ones (rung and mark for the
+   pressed one, `aria-pressed` for the state), with the count beside the label.
+   Pressed is not inert here: pressing it again is "all". */
+.runs-bar > .runs-scope {
+  align-self: stretch;
+}
+
+.runs-scope .ui-switch-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+/* The shared track clips (`overflow: hidden`), so the focus ring goes inside it. */
+.runs-scope .ui-switch-seg:focus-visible {
+  outline-offset: -2px;
+}
+
+/* Muted and not the count's usual faint: the pressed segment is a rung up the
+   ladder, and faint is only guaranteed 4.5:1 down to Raised, not on a tint. */
+.runs-scope .ui-count {
+  color: var(--text-muted);
+}
+
+.runs-bar > .ui-button {
+  align-self: center;
+}
+
+/* The disclosure is `toggle + region` in one wrapper. Dissolved here so the
+   toggle is a member of the strip (pinned right) and the open region is a full
+   line under it, which is what a wrapper that kept its own box could not be. */
+.runs-bar > .ui-disclosure {
+  display: contents;
+}
+
+.runs-bar .ui-disclosure-toggle {
+  margin-left: auto;
+}
+
+.runs-bar .ui-disclosure-region {
+  flex: 1 0 100%;
+  padding-top: 0;
 }
 
 .runs-more {
   display: flex;
   flex-wrap: wrap;
-  flex-basis: 100%;
+  align-items: flex-end;
   gap: var(--space-3) var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
 }
 
-.runs-more[hidden] {
-  display: none;
+/* The field primitive's 14rem floor is for a form; in a strip that wraps it is
+   what would push the row past a narrow window. */
+.runs-more .ui-field input,
+.runs-more .ui-field select {
+  min-width: 0;
+}
+
+.runs-more .runs-check {
+  padding-block: var(--space-2);
 }
 
 /* =================================================================== list == */
 
-/* A row is a state, then the request, then the facts about it. The badge holds
-   its own column so the excerpts of twelve rows start on one left edge; the
-   name and the metadata share the second, one above the other.
+/* The whole index is one container, so the header, the attention rows and the
+   table all decide their layout by the width they are actually given: the same
+   viewport is a different width with the rail open.
 
-   8rem and not 6rem for the badge: `.ui-badge` is `white-space: nowrap`, so the
-   longest run state — "awaiting approval" — does not wrap. At 6rem it overran
-   its track and painted itself over the first word of the excerpt. */
-.runs-row {
+   One definition of the table's columns, used by the header and every row. That
+   is what keeps "Cost" over the costs: change a track here and both move. The
+   state track is 8rem and not 6rem for the badge: `.ui-badge` is `nowrap`, so the
+   longest run state, "awaiting approval", does not wrap, and at 6rem it painted
+   itself over the first word of the title. The title is the one flexible track;
+   the figures are right-aligned in theirs. */
+.runs-index {
+  --runs-state: 8rem;
+  --runs-cols: var(--runs-state) minmax(11rem, 1fr) 6rem 4.5rem 7rem 4.75rem 5rem;
+  container: runs-index / inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* The history: the column header, then a box of rows per day. */
+.runs-history {
+  min-width: 0;
+}
+
+/* A day's heading, in Feed's idiom: the weekday (or Today, Yesterday) as the fast
+   read and the date beside it as the checkable one, the day's count at the far
+   end. Not sticky as Feed's is: the column header is already holding the top,
+   and a day here is a short box, not a long scroll. */
+.runs-day + .runs-day {
+  margin-top: var(--space-5);
+}
+
+.runs-day-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-2);
+  padding-inline: var(--space-1);
+}
+
+.runs-day-title {
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+  color: var(--text);
+}
+
+.runs-day-date {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--text-muted);
+}
+
+.runs-day-head .ui-count {
+  margin-left: auto;
+}
+
+/* Column names, once, over the first day; held at the top while the table
+   scrolls under it. Hidden until the index is wide enough for columns (below),
+   where the cells name themselves instead. Its padding is the row's own (a
+   row's inline padding plus the list's hairline border), so a word stands over
+   the cell it names. */
+.runs-head {
+  display: none;
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  margin-bottom: var(--space-2);
+  border-bottom: var(--hairline) solid var(--border);
+  background: var(--bg);
+}
+
+.runs-head-grid {
   display: grid;
-  grid-template-columns: 8rem minmax(0, 1fr);
+  grid-template-columns: var(--runs-cols);
+  gap: 0 var(--space-3);
+  padding: var(--space-2) calc(var(--space-4) + var(--hairline));
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.runs-head-end {
+  text-align: right;
+}
+
+/* A row is a state, then what the run is, then the facts about it. This is the
+   narrow layout, and the base: the facts are a wrapping line under the title.
+   The wide layout (a table row) is the query further down. Isolated so the
+   controls lifted over the row's link (`z-index: 1`) stay under the sticky
+   header instead of painting over it as the list scrolls. */
+.runs-row {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  grid-template-columns: var(--runs-state) minmax(0, 1fr);
   align-items: baseline;
   gap: var(--space-1) var(--space-3);
+  transition: background var(--dur-quick) var(--ease);
+}
+
+/* One rung up the ladder, never a hue. */
+.runs-row:hover {
+  background: var(--surface-raised);
+}
+
+/* The whole row is the target, so the whole row carries the focus ring: the link
+   inside it is only the text, and `.ui-rows` clips anything drawn outside it. */
+.runs-row:has(.runs-row-name:focus-visible) {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
 
 .runs-row-state {
+  grid-column: 1;
   justify-self: start;
 }
 
-/* The normal state, receded: the map's word, no pill. */
+/* The normal state, receded: the map's word, no pill. It has the badge's own
+   box (padding, transparent border, size) so its letters stand where the
+   badges' letters stand and the column reads as one column of labels. */
 .runs-row-settled {
+  display: inline-block;
+  padding: 0.1rem var(--space-2);
+  border: 1px solid transparent;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--text-muted);
+  color: var(--text-faint);
+}
+
+.runs-row-main {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
 }
 
 /* The excerpt is what the run IS, so it is the link — an id is a handle, not a
    name. Two lines, because a prompt can be a paragraph and a list of twelve
    runs must stay a list. */
 .runs-row-name {
-  grid-column: 2;
   max-width: var(--measure-prose);
   color: var(--text);
   font-size: var(--text-sm);
@@ -393,13 +550,14 @@
   text-decoration: underline;
 }
 
+/* The ring is the row's (above), not a second one round the words. */
+.runs-row-name:focus-visible {
+  outline: none;
+}
+
 /* The whole row opens the run, not only its excerpt: the link's ::after covers
    the row, and the things inside a row that are their own targets (the chat it
    came from, the turns toggle and the expanded turns) sit above it. */
-.runs-row {
-  position: relative;
-}
-
 .runs-row-name::after {
   content: "";
   position: absolute;
@@ -407,177 +565,202 @@
 }
 
 .runs-row-origin,
-.runs-row-turns,
+.runs-row-toggle,
 .runs-turns {
   position: relative;
   z-index: 1;
 }
 
-.runs-row:hover {
-  background: color-mix(in srgb, var(--text) 4%, var(--surface));
-}
-
-/* One metadata line under the name, on fixed columns so id, mode, project, time
-   and cost line up down the list instead of moving with every excerpt. */
-.runs-row-meta {
-  grid-column: 2;
-  display: grid;
-  grid-template-columns: 4.5rem 5.5rem 7rem 7rem minmax(0, 1fr) 9.5rem;
+/* Under the title: the run's id, where it is a handle for the run named above
+   it, and what else belongs to the title's cell (the chat it came from, a
+   conversation's turn count and toggle). */
+.runs-row-sub {
+  display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: var(--space-3);
+  gap: 0 var(--space-3);
   margin: 0;
 }
 
-/* Muted, not faint: faint on the row's surface measured 3.45:1, under the
-   4.5:1 floor, and the cost at the end of this line is the one figure worth
-   reading down the column. */
+/* Everything the daemon produced is mono and tabular, so the figures stand in
+   columns. Muted, not faint, for the facts worth reading down a column: faint
+   is the floor and these are not decoration. The id is the handle and the one
+   cell that recedes to faint. */
 .runs-row-id,
-.runs-row-mode,
 .runs-row-project,
+.runs-row-mode,
 .runs-row-ran,
 .runs-row-cost,
-.runs-row-meta .ui-reading-time {
+.runs-row-when,
+.runs-row-running,
+.runs-row-facts .ui-reading-time {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
   white-space: nowrap;
 }
 
-/* What ran (`model · effort`) is the fifth column and gets the slack: a model
-   name is the one cell here whose length varies, so it is allowed to truncate
-   rather than push the cost off its column. The columns are placed explicitly
-   because a conversation row has no such cell and its cost must still land in
-   the last column, under the cost of the runs around it. */
-.runs-row-ran {
-  grid-column: 5;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.runs-row-id {
+  color: var(--text-faint);
 }
 
-/* The money is the one figure worth reading down the column, so it ends the
-   metadata line rather than sitting in the middle of the words. */
-.runs-row-cost {
-  grid-column: 6;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
+/* `real` is the default and what nearly every row is, so it recedes; `shadow`
+   is the system's Deliberating Violet in text, because a run that only
+   deliberated is a different fact from one that acted. */
+.runs-row-mode[data-mode="real"] {
+  color: var(--text-faint);
 }
 
-/* Which conversation started this run, under the name and in its column, as
-   quiet as the metadata: it says where the run came from, not what it did. */
+.runs-row-mode[data-mode="shadow"] {
+  color: var(--tone-shadow-fg);
+}
+
+.runs-row-cost:empty {
+  display: none;
+}
+
+.runs-row-cost[data-unrecorded] {
+  color: var(--text-faint);
+}
+
+/* Which conversation started this run, in the title's cell and as quiet as the
+   id: it says where the run came from, not what it did. */
 .runs-row-origin {
-  grid-column: 2;
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
 
-/* A conversation row's toggle line sits under the name, in the text column. */
-.runs-row-turns {
+.runs-row-facts {
   grid-column: 2;
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: var(--space-3);
-  margin: 0;
+  gap: 0 var(--space-3);
+  min-width: 0;
 }
 
-/* How many of the conversation's turns are running, quiet beside the toggle. */
-.runs-row-running {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text-muted);
+/* Narrow, the cells that are not self-evident say what they are, since there is
+   no header over them. The id already reads "run 12" and the time as a time. */
+.runs-row-table .runs-row-project::before,
+.runs-row-compact .runs-row-project::before {
+  content: "project ";
 }
 
-/* The expanded turns line up with the text column, not the state glyph. */
+.runs-row-table .runs-row-mode::before,
+.runs-row-compact .runs-row-mode::before {
+  content: "mode ";
+}
+
+.runs-row-table .runs-row-cost::before,
+.runs-row-compact .runs-row-cost::before {
+  content: "cost ";
+}
+
+/* "cost not recorded" already names itself. */
+.runs-row-table .runs-row-cost[data-unrecorded]::before,
+.runs-row-compact .runs-row-cost[data-unrecorded]::before {
+  content: none;
+}
+
+/* A conversation's expanded turns, under the row and in the title's column. */
 .runs-turns {
   grid-column: 2;
 }
 
-/* Each row is its own container, so the metadata line decides by the width the
-   row actually has. The fixed columns need about 44rem of row, and the "what
-   ran" column added to them needs about ten more; under that they ran past the
-   excerpt's column and `.ui-rows` clipped the time and the cost off the edge at
-   800px. Narrower, the facts wrap as a line of words instead. */
-.runs-row {
-  container-type: inline-size;
+/* The attention rows: the same parts, drawn larger. The title steps up to the
+   reading size and its cell gets air, so a run that needs somebody or is moving
+   weighs more than a line of the table below it. */
+.runs-row-attn .runs-row-name {
+  font-size: var(--text-md);
 }
 
-@container (max-width: 54rem) {
-  .runs-row-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0 var(--space-3);
-  }
-
-  .runs-row-cost {
-    grid-column: auto;
-    text-align: left;
-  }
-
-  .runs-row-ran {
-    grid-column: auto;
-    overflow: visible;
-  }
+.runs-row-attn .runs-row-main {
+  padding-block: var(--space-1);
 }
 
-/* Column names for the metadata line, once above the list, on the row's own
-   grid (8rem state, then the same six tracks as `.runs-row-meta`) so the words
-   sit over their columns. It sticks to the top of the scrolling page while the
-   list is long. The width question is the rows' question, so it is a container
-   of its own with the same 54rem threshold: where the metadata wraps into a line
-   of words the header goes, and the words name themselves (below). */
-.runs-head {
-  container-type: inline-size;
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  background: var(--bg, var(--surface));
-}
+/* Wide enough for columns. The facts dissolve into the row's grid, one per
+   track, in the order the header names them; the row's other cells keep theirs.
+   Cells are placed by column so a run with no model (or a conversation, which
+   has none) leaves its track empty instead of pulling the time into it.
 
-.runs-head-grid {
-  display: grid;
-  grid-template-columns: 8rem minmax(0, 1fr);
-  gap: var(--space-1) var(--space-3);
-  padding: var(--space-2) var(--space-4);
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.runs-head-meta {
-  display: grid;
-  grid-template-columns: 4.5rem 5.5rem 7rem 7rem minmax(0, 1fr) 9.5rem;
-  gap: var(--space-3);
-}
-
-.runs-head-cost {
-  text-align: right;
-}
-
-@container (max-width: 54rem) {
-  .runs-head-grid {
-    display: none;
-  }
-}
-
-/* Where the header is gone, the cells that are not self-evident say what they
-   are. The id already reads "run 12" and the time reads as a time. */
-@container (max-width: 54rem) {
-  .runs-row-mode::before {
-    content: "mode ";
+   54rem: the tracks above need about 53 of row, and under that they ran past the
+   title's track and `.ui-rows` clipped the time and the cost off the edge at
+   800px. This is a container's width, not the viewport's (the rail changes it),
+   which is why it is not the house 60rem. */
+@container runs-index (min-width: 54rem) {
+  .runs-head {
+    display: block;
   }
 
-  .runs-row-project::before {
-    content: "project ";
+  .runs-row-table {
+    grid-template-columns: var(--runs-cols);
   }
 
-  .runs-row-cost::before {
-    content: "cost ";
+  .runs-row-table .runs-row-facts {
+    display: contents;
   }
 
-  /* An empty cell has nothing to label, and "cost not recorded" already names itself. */
-  .runs-row-cost:empty::before,
-  .runs-row-cost[data-unrecorded]::before {
+  .runs-row-table .runs-row-project {
+    grid-column: 3;
+  }
+
+  .runs-row-table .runs-row-mode {
+    grid-column: 4;
+  }
+
+  .runs-row-table .runs-row-ran {
+    grid-column: 5;
+  }
+
+  .runs-row-table .runs-row-facts > .ui-reading-time,
+  .runs-row-table .runs-row-facts > .ui-reading-raw {
+    grid-column: 6;
+    text-align: right;
+  }
+
+  .runs-row-table .runs-row-cost {
+    grid-column: 7;
+    text-align: right;
+  }
+
+  /* The one cell here whose length varies is the model, and a project id can be
+     long: both truncate (the full text is in the cell's `title`) rather than
+     push the figures off their tracks. */
+  .runs-row-table .runs-row-project,
+  .runs-row-table .runs-row-ran {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* A figure column that has to say "cost not recorded" wraps it in two lines,
+     faint, rather than widen for the one row that has to. */
+  .runs-row-table .runs-row-cost[data-unrecorded] {
+    white-space: normal;
+    text-wrap: balance;
+  }
+
+  .runs-row-table .runs-row-project::before,
+  .runs-row-table .runs-row-mode::before,
+  .runs-row-table .runs-row-cost::before {
     content: none;
+  }
+
+  .runs-row-attn {
+    grid-template-columns: var(--runs-state) minmax(0, 1fr) auto;
+  }
+
+  .runs-row-attn .runs-row-facts {
+    grid-column: 3;
+    justify-content: flex-end;
+    gap: 0 var(--space-4);
+  }
+
+  .runs-row-table .runs-turns,
+  .runs-row-attn .runs-turns {
+    grid-column: 1 / -1;
+    margin-left: calc(var(--runs-state) + var(--space-3));
   }
 }
 
@@ -944,12 +1127,11 @@
   color: var(--text-muted);
 }
 
-/* The router's advice, under the metadata line, only when it differs from what
-   ran. Muted, not faint (faint measured 3.45:1 here, under the 4.5:1 floor), so
-   what sets it apart from the facts above is not colour: it is italic and the
-   text itself leads with an arrow. */
+/* The router's advice, under the title and the id, only when it differs from
+   what ran. Muted, not faint (faint measured 3.45:1 here, under the 4.5:1 floor),
+   so what sets it apart from the facts beside it is not colour: it is italic and
+   the text itself leads with an arrow. */
 .runs-row-route {
-  grid-column: 2;
   display: flex;
   flex-wrap: wrap;
   gap: 0 var(--space-3);

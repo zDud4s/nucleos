@@ -92,6 +92,8 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   "integrations/notify.rs": { kind: [] },
   "execution/runner/auth_watch.rs": { kind: ["run_on_api_key", "run_on_subscription", "run_rate_limited"] },
   "execution/runs/spawn.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
+  // `announce_once` binds `crate::execution::land::RESOLUTION_FAILED_KIND` to a local first.
+  "resolver.rs": { kind: ["land_resolution_failed"] },
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
 };
 

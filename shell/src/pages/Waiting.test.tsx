@@ -673,10 +673,11 @@ describe("Waiting - batch action approvals", () => {
 
     await renderWaiting();
     await screen.findByRole("checkbox", { name: "Select approval #1" });
-    const selectAll = within(bulkBar()).getByRole("button", { name: "Select all" }) as HTMLButtonElement;
-    const clear = within(bulkBar()).getByRole("button", { name: "Clear" }) as HTMLButtonElement;
-    // Nothing is selected, so there is nothing to clear.
-    expect(clear.disabled).toBe(true);
+    // Select all is a box in the bar, in the column of the row boxes.
+    const selectAll = within(bulkBar()).getByRole("checkbox", { name: "Select all" }) as HTMLInputElement;
+    // Nothing is selected, so there is nothing to clear: the button is not drawn yet.
+    expect(within(bulkBar()).queryByRole("button", { name: "Clear" })).toBeNull();
+    expect(selectAll.checked).toBe(false);
     expect(selectAll.disabled).toBe(false);
 
     fireEvent.click(selectAll);
@@ -684,10 +685,31 @@ describe("Waiting - batch action approvals", () => {
     expect((screen.getByRole("checkbox", { name: "Select approval #4" }) as HTMLInputElement).checked).toBe(true);
     expect(screen.getByText("4 of 4 selected")).toBeDefined();
 
-    fireEvent.click(clear);
+    fireEvent.click(within(bulkBar()).getByRole("button", { name: "Clear" }));
     expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(false);
     expect((screen.getByRole("checkbox", { name: "Select approval #4" }) as HTMLInputElement).checked).toBe(false);
     expect(screen.getByText("0 of 4 selected")).toBeDefined();
+    expect(within(bulkBar()).queryByRole("button", { name: "Clear" })).toBeNull();
+  });
+
+  it("Select all is partial while some rows are ticked, and unticking it clears the rest", async () => {
+    daemon.apiFetch.mockImplementation(
+      waitingFetch(waitingWorld({ approvals: [1, 2, 3].map((id) => proposal({ id })) })),
+    );
+
+    await renderWaiting();
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Select approval #2" }));
+    const selectAll = within(bulkBar()).getByRole("checkbox", { name: "Select all" }) as HTMLInputElement;
+    expect(selectAll.checked).toBe(false);
+    expect(selectAll.indeterminate).toBe(true);
+
+    // A click on a partial box completes the set; a click on the full one empties it.
+    fireEvent.click(selectAll);
+    expect(screen.getByText("3 of 3 selected")).toBeDefined();
+    expect(selectAll.checked).toBe(true);
+    expect(selectAll.indeterminate).toBe(false);
+    fireEvent.click(selectAll);
+    expect(screen.getByText("0 of 3 selected")).toBeDefined();
   });
 
   it("draws the bar only when there is more than one row to pick from", async () => {
@@ -699,40 +721,44 @@ describe("Waiting - batch action approvals", () => {
     await screen.findByRole("checkbox", { name: "Select approval #1" });
 
     expect(document.querySelector(".waiting-bulk")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Select all" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Select all" })).toBeNull();
   });
 
-  it("keeps the batch decisions disabled until something is selected", async () => {
+  it("offers the batch decisions only once something is selected", async () => {
     daemon.apiFetch.mockImplementation(
       waitingFetch(waitingWorld({ approvals: [1, 2, 3].map((id) => proposal({ id })) })),
     );
 
     await renderWaiting();
     await screen.findByRole("checkbox", { name: "Select approval #1" });
-    // The bar is drawn whole from two rows up and does not change size as boxes are ticked, so an
-    // empty selection disables its decisions instead of removing them.
-    const approveAll = within(bulkBar()).getByRole("button", { name: "Approve" }) as HTMLButtonElement;
-    const declineAll = within(bulkBar()).getByRole("button", { name: "Decline" }) as HTMLButtonElement;
-    expect(approveAll.disabled).toBe(true);
-    expect(declineAll.disabled).toBe(true);
+    // Two disabled buttons under "0 of 3 selected" were chrome for something that cannot be done
+    // yet, so the bar's decisions appear with the first tick and go with the last.
+    expect(within(bulkBar()).queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(within(bulkBar()).queryByRole("button", { name: "Decline" })).toBeNull();
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Select approval #2" }));
+    const approveAll = within(bulkBar()).getByRole("button", { name: "Approve" }) as HTMLButtonElement;
+    const declineAll = within(bulkBar()).getByRole("button", { name: "Decline" }) as HTMLButtonElement;
     expect(approveAll.disabled).toBe(false);
     expect(declineAll.disabled).toBe(false);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select approval #2" }));
+    expect(within(bulkBar()).queryByRole("button", { name: "Approve" })).toBeNull();
   });
 
-  it("offers Select all from two rows up, and disables it once every row is selected", async () => {
+  it("offers Select all from two rows up, and shows it ticked once every row is selected", async () => {
     daemon.apiFetch.mockImplementation(
       waitingFetch(waitingWorld({ approvals: [proposal({ id: 1 }), proposal({ id: 2 })] })),
     );
 
     await renderWaiting();
     await screen.findByRole("checkbox", { name: "Select approval #1" });
-    const selectAll = within(bulkBar()).getByRole("button", { name: "Select all" }) as HTMLButtonElement;
+    const selectAll = within(bulkBar()).getByRole("checkbox", { name: "Select all" }) as HTMLInputElement;
     expect(selectAll.disabled).toBe(false);
+    expect(selectAll.checked).toBe(false);
 
     fireEvent.click(selectAll);
-    expect(selectAll.disabled).toBe(true);
+    expect(selectAll.checked).toBe(true);
     expect(screen.getByText("2 of 2 selected")).toBeDefined();
   });
 
@@ -1149,6 +1175,57 @@ describe("Waiting - the sections that are not there", () => {
 
 /* --------------------------------------------------------------- the route -- */
 
+describe("Waiting - the header is an index", () => {
+  it("names each queue with something in it, with its count, and links to its section", async () => {
+    const world = waitingWorld({
+      approvals: [1, 2, 3, 4].map((id) => proposal({ id })),
+      teamActions: [proposal({ id: 210, kind: "team-action" }), proposal({ id: 211, kind: "team-action" })],
+      recruits: [proposal({ id: 301, tool_input: JSON.stringify(agentRequest()) })],
+      merges: [merge({ proposal_id: 21 }), merge({ proposal_id: 22 })],
+      vcs: [vcsRow({ id: 63, status: "awaiting_owner" })],
+    });
+    daemon.apiFetch.mockImplementation(waitingFetch(world));
+
+    await renderWaiting();
+
+    const index = await screen.findByRole("navigation", { name: "Queues with something waiting" });
+    const links = within(index).getAllByRole("link");
+    expect(links.map((link) => link.textContent)).toEqual([
+      "4 action approvals",
+      "2 team actions",
+      "1 recruitment",
+      "2 contact merges",
+      "1 in the git queue",
+    ]);
+    // Each link points at a section that is really there, and the section holds that queue.
+    const targets = links.map((link) => (link.getAttribute("href") ?? "").replace(/^#/, ""));
+    expect(targets).toEqual([
+      "waiting-approvals",
+      "waiting-team-actions",
+      "waiting-recruits",
+      "waiting-merges",
+      "waiting-git",
+    ]);
+    for (const [at, title] of ["Action approvals", "Team actions", "Recruitment", "Contact merges", "Git queue"].entries()) {
+      const section = document.getElementById(targets[at]);
+      expect(section, targets[at]).not.toBeNull();
+      expect(within(section as HTMLElement).getByRole("heading", { level: 2, name: title })).toBeDefined();
+    }
+    // The queues with nothing in them are the sentence below, not links.
+    expect(screen.getByText(/^Nothing waiting in:/).textContent).toContain("Browser access requests");
+    expect(within(index).queryByText(/browser access/)).toBeNull();
+  });
+
+  it("is not drawn when nothing is waiting", async () => {
+    daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
+
+    await renderWaiting();
+
+    await screen.findByText(/^Nothing waiting in:/);
+    expect(screen.queryByRole("navigation", { name: "Queues with something waiting" })).toBeNull();
+  });
+});
+
 describe("Waiting - the route", () => {
   it("is registered, so the rail reaches the page and not the placeholder", async () => {
     daemon.apiFetch.mockImplementation(waitingFetch(waitingWorld()));
@@ -1351,8 +1428,12 @@ describe("Waiting - one verb pair", () => {
     expect(await screen.findByRole("button", { name: "Approve" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Decline, run continues" })).toBeDefined();
     const stop = screen.getByRole("button", { name: "Decline, stop run" });
-    // The three sit together in the card's one row of actions.
-    expect(stop.closest(".waiting-actions-split")).not.toBeNull();
+    // The three sit together in the card's one cluster of actions, and the one that ends the run
+    // is the outline that says so.
+    expect(stop.closest(".waiting-cluster")).not.toBeNull();
+    expect(stop.className).toContain("ui-button-danger");
+    expect(screen.getByRole("button", { name: "Approve" }).className).toContain("ui-button-approve");
+    expect(screen.getByRole("button", { name: "Decline, run continues" }).className).toContain("ui-button-ghost");
     expect(screen.queryByRole("button", { name: /Reject|Refuse/ })).toBeNull();
 
     // Armed, every one still begins with the verb it had at rest, and the consequence follows.

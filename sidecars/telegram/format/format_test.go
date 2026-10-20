@@ -1,6 +1,7 @@
 package format
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -181,5 +182,96 @@ func TestInlinePlaceholdersCannotBeForgedByTheInput(t *testing.T) {
 	}
 	if strings.ContainsRune(got, 0) {
 		t.Errorf("ToHTML() = %q, want no NUL bytes left in the output", got)
+	}
+}
+
+// assertBalanced fails unless every tag opened in chunk is closed in it, in order. Telegram parses each
+// message on its own, so an unclosed <b> in one chunk is a rejected send, not a style carried over.
+func assertBalanced(t *testing.T, i int, chunk string) {
+	t.Helper()
+	var stack []string
+	for _, m := range regexp.MustCompile(`<(/?)([a-z]+)[^>]*>`).FindAllStringSubmatch(chunk, -1) {
+		if m[1] == "" {
+			stack = append(stack, m[2])
+			continue
+		}
+		if len(stack) == 0 || stack[len(stack)-1] != m[2] {
+			t.Fatalf("chunk %d closes <%s> that is not the innermost open tag: %q", i, m[2], chunk)
+		}
+		stack = stack[:len(stack)-1]
+	}
+	if len(stack) != 0 {
+		t.Fatalf("chunk %d leaves %v open: %q", i, stack, chunk)
+	}
+}
+
+// A single span longer than the limit has to be closed at each piece boundary and reopened in the next
+// piece, like <pre> already is.
+func TestChunkClosesAndReopensALongSpan(t *testing.T) {
+	const limit = 120
+	body := strings.Repeat("word ", 60) // 300 runes, no newline
+	cases := map[string]struct{ open, close string }{
+		"bold":   {"<b>", "</b>"},
+		"italic": {"<i>", "</i>"},
+		"code":   {"<code>", "</code>"},
+		"link":   {`<a href="https://x.test/a?b=1&amp;c=2">`, "</a>"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			source := "before " + c.open + body + c.close + " after"
+			chunks := Chunk(source, limit)
+			if len(chunks) < 3 {
+				t.Fatalf("want the span spread over several chunks, got %d", len(chunks))
+			}
+			var plain strings.Builder
+			for i, chunk := range chunks {
+				if n := utf8.RuneCountInString(chunk); n > limit {
+					t.Errorf("chunk %d length = %d, want <= %d", i, n, limit)
+				}
+				assertBalanced(t, i, chunk)
+				plain.WriteString(StripTags(chunk))
+			}
+			if got, want := plain.String(), StripTags(source); got != want {
+				t.Errorf("text lost or reordered:\n got %q\nwant %q", got, want)
+			}
+			if c.open[:2] == "<a" {
+				for i, chunk := range chunks[1 : len(chunks)-1] {
+					if !strings.Contains(chunk, c.open) {
+						t.Errorf("middle chunk %d lost the link's href: %q", i+1, chunk)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Nested spans are closed innermost first and reopened outermost first.
+func TestChunkReopensNestedSpansInOrder(t *testing.T) {
+	const limit = 48
+	source := "<b>" + "<i>" + strings.Repeat("x ", 80) + "</i>" + "</b>"
+	chunks := Chunk(source, limit)
+	if len(chunks) < 3 {
+		t.Fatalf("got %d chunks", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if utf8.RuneCountInString(chunk) > limit {
+			t.Errorf("chunk %d too long: %d", i, utf8.RuneCountInString(chunk))
+		}
+		assertBalanced(t, i, chunk)
+	}
+	if !strings.HasPrefix(chunks[1], "<b><i>") {
+		t.Errorf("second chunk must reopen b then i: %q", chunks[1])
+	}
+}
+
+// A span that fits whole is left alone, and plain text is untouched.
+func TestChunkLeavesShortSpansAlone(t *testing.T) {
+	source := strings.Repeat("a", 30) + "<b>bold</b>" + strings.Repeat("c", 40)
+	got := Chunk(source, 50)
+	if strings.Join(got, "") != source {
+		t.Fatalf("content changed: %q", got)
+	}
+	for i, c := range got {
+		assertBalanced(t, i, c)
 	}
 }

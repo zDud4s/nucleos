@@ -54,6 +54,7 @@ export function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }
 
   return (
     <Queue
+      id={QUEUES.merges.id}
       title={QUEUES.merges.title}
       view={view}
       what="the suggested merges"
@@ -72,57 +73,59 @@ export function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }
     >
       <Rows label={QUEUES.merges.title} className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((suggestion) => (
-          <Row className="waiting-card" dense={dense(items.length)} key={suggestion.proposal_id}>
-            <div className="waiting-card-head">
-              <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>
-                merge #{suggestion.proposal_id}
-              </span>
-              <RelativeTime at={suggestion.created_at} />
-            </div>
-            <Reasoning>{suggestion.reasoning}</Reasoning>
-            <div className="waiting-merge">
-              <MergeSideView side={suggestion.keep} role="kept" />
-              <MergeSideView side={suggestion.absorb} role="absorbed" />
-            </div>
-            {/* Said before the button rather than after the 409: the daemon
-                refuses a merge whose two people carry decisions that
-                contradict, and the remedy is to settle one of them first. */}
-            {verdictsConflict(suggestion) && (
-              <ConflictNote>
-                These two carry standing decisions that disagree, so the daemon
-                will refuse the merge — settle one of them and decide this
-                again.
-              </ConflictNote>
-            )}
-            <div className="waiting-actions">
-              <ConfirmButton
-                label={`Merge #${suggestion.proposal_id}`}
-                confirmLabel="Merge — they are one person"
-                subject={`#${suggestion.proposal_id}`}
-                variant="approve"
-                disabled={decide.isPending}
-                onArmedChange={onArmedChange}
-                onConfirm={() =>
-                  decide.mutate({
-                    proposalId: suggestion.proposal_id,
-                    verdict: "approve",
-                  })
-                }
-              />
-              <ConfirmButton
-                label={`Decline merge #${suggestion.proposal_id}`}
-                confirmLabel="Decline — they are different people"
-                subject={`#${suggestion.proposal_id}`}
-                variant="quiet"
-                disabled={decide.isPending}
-                onArmedChange={onArmedChange}
-                onConfirm={() =>
-                  decide.mutate({
-                    proposalId: suggestion.proposal_id,
-                    verdict: "reject",
-                  })
-                }
-              />
+          <Row className="waiting-card waiting-item" dense={dense(items.length)} key={suggestion.proposal_id}>
+            <div className="waiting-item-main">
+              <div className="waiting-card-head">
+                <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>
+                  merge #{suggestion.proposal_id}
+                </span>
+                <RelativeTime at={suggestion.created_at} />
+              </div>
+              <Reasoning>{suggestion.reasoning}</Reasoning>
+              <div className="waiting-merge">
+                <MergeSideView side={suggestion.keep} role="kept" />
+                <MergeSideView side={suggestion.absorb} role="absorbed" />
+              </div>
+              {/* Said before the button rather than after the 409: the daemon
+                  refuses a merge whose two people carry decisions that
+                  contradict, and the remedy is to settle one of them first. */}
+              {verdictsConflict(suggestion) && (
+                <ConflictNote>
+                  These two carry standing decisions that disagree, so the daemon
+                  will refuse the merge — settle one of them and decide this
+                  again.
+                </ConflictNote>
+              )}
+              <div className="waiting-cluster">
+                <ConfirmButton
+                  label={`Merge #${suggestion.proposal_id}`}
+                  confirmLabel="Merge — they are one person"
+                  subject={`#${suggestion.proposal_id}`}
+                  variant="approve"
+                  disabled={decide.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() =>
+                    decide.mutate({
+                      proposalId: suggestion.proposal_id,
+                      verdict: "approve",
+                    })
+                  }
+                />
+                <ConfirmButton
+                  label={`Decline merge #${suggestion.proposal_id}`}
+                  confirmLabel="Decline — they are different people"
+                  subject={`#${suggestion.proposal_id}`}
+                  variant="ghost"
+                  disabled={decide.isPending}
+                  onArmedChange={onArmedChange}
+                  onConfirm={() =>
+                    decide.mutate({
+                      proposalId: suggestion.proposal_id,
+                      verdict: "reject",
+                    })
+                  }
+                />
+              </div>
             </div>
           </Row>
         ))}
