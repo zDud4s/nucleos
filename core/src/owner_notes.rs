@@ -100,6 +100,7 @@ pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, 
     Ok(id)
 }
 
+// Lives here, not in `capture.rs`, so that `capture.rs` names the notes module in exactly one place.
 impl From<NoteError> for crate::capture::AnswerError {
     fn from(error: NoteError) -> Self {
         match error {
@@ -111,31 +112,6 @@ impl From<NoteError> for crate::capture::AnswerError {
             }
         }
     }
-}
-
-/// One attempt at an owner's answer to a capture request: the note, its link and the request's
-/// close commit together or not at all, so a retry after a busy database never finds half of the
-/// previous try. Returns the note's id and whether the request was released.
-pub(crate) async fn answer_capture_in(
-    pool: &SqlitePool,
-    job_id: i64,
-    text: &str,
-    origin: &str,
-) -> Result<(i64, bool), crate::capture::AnswerError> {
-    async fn step(
-        pool: &SqlitePool,
-        job_id: i64,
-        text: &str,
-        origin: &str,
-    ) -> Result<(i64, bool), NoteError> {
-        let mut tx = pool.begin().await?;
-        let note_id = create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
-        let released =
-            crate::capture::close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now()).await?;
-        tx.commit().await?;
-        Ok((note_id, released))
-    }
-    Ok(step(pool, job_id, text, origin).await?)
 }
 
 /// Files a note already linked to a job (`relates job:<id>`), on the caller's connection so the
@@ -1239,7 +1215,21 @@ mod tests {
     /// and `//` comment lines are skipped.
     fn distill_mentions_are_sanctioned(source: &str) -> bool {
         let needle = ["owner", "note"].join("_");
-        let call = format!("{needle}s::active_note_texts_for_project");
+        one_call_is_sanctioned(source, &format!("{needle}s::active_note_texts_for_project"))
+    }
+
+    /// `capture.rs` may name the notes module in exactly one place: the call that files the owner's
+    /// answer as a note. A channel capture answer is the owner writing a note; `capture.rs` only
+    /// forwards it and never reads notes back.
+    fn capture_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        one_call_is_sanctioned(source, &format!("{needle}s::create_linked_to_job_in"))
+    }
+
+    /// True when the production code of `source` names the notes module only inside `call`, and
+    /// exactly once.
+    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
         let mut calls = 0;
         // Cut at the test module itself, not at any `#[cfg(test)]`: a test-only helper above it
         // would otherwise hide the production code that follows from the sweep.
@@ -1254,7 +1244,7 @@ mod tests {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            let here = line.matches(call.as_str()).count();
+            let here = line.matches(call).count();
             if line.matches(needle.as_str()).count() != here {
                 return false;
             }
@@ -1286,7 +1276,26 @@ mod tests {
     }
 
     #[test]
-    fn no_core_module_but_four_mentions_owner_notes() {
+    fn the_capture_rule_holds_one_call_and_nothing_else() {
+        let needle = ["owner", "note"].join("_");
+        let call =
+            format!("let id = crate::{needle}s::create_linked_to_job_in(&mut tx, t, o, j).await?;");
+        assert!(capture_mentions_are_sanctioned(&call));
+        assert!(!capture_mentions_are_sanctioned(&format!("{call}\n{call}")));
+        assert!(!capture_mentions_are_sanctioned(&format!(
+            "use crate::{needle}s;\n{call}"
+        )));
+        assert!(!capture_mentions_are_sanctioned(&format!(
+            "{call}\nlet n = crate::{needle}s::get(&pool, 1).await;"
+        )));
+        assert!(!capture_mentions_are_sanctioned("fn nothing() {}"));
+        assert!(capture_mentions_are_sanctioned(&format!(
+            "{call}\n// mentions {needle}s"
+        )));
+    }
+
+    #[test]
+    fn no_core_module_but_five_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1301,6 +1310,8 @@ mod tests {
         // `distill.rs` is the one sanctioned exception, and only for its single call to
         // `active_note_texts_for_project`: D4 of `.ai/specs/2026-10-05-destilador-design.md` lets the
         // distiller's dossier read the notes linked to a project, as context only.
+        // `capture.rs` is the other: one call, `create_linked_to_job_in`. A channel capture answer is
+        // the owner writing a note; `capture.rs` only forwards it and never reads notes back.
         // `lib.rs` only declares the module (`pub mod owner_notes;`) since the core lib/bin split.
         let allowed = ["owner_notes.rs", "http.rs", "main.rs", "lib.rs"];
         let needle = ["owner", "note"].join("_");
@@ -1327,11 +1338,20 @@ mod tests {
                 );
                 continue;
             }
+            if crate::source_scan::is_top_level(&path) && name == "capture.rs" {
+                assert!(
+                    capture_mentions_are_sanctioned(&source),
+                    "capture.rs may name the notes only in its one call to \
+                     create_linked_to_job_in (the owner's answer is a note being written)"
+                );
+                continue;
+            }
             assert!(
                 !source.contains(&needle),
                 "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
-                 http.rs and main.rs (spec D4), and from distill.rs through one call, only, so \
-                 that nothing in the agent's memory can read them",
+                 http.rs and main.rs (spec D4), from distill.rs through one read call, and from \
+                 capture.rs through one write call, only, so that nothing in the agent's memory \
+                 can read them",
                 path.display()
             );
         }

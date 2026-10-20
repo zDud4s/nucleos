@@ -500,11 +500,30 @@ pub async fn answer(
         BUSY_ATTEMPTS,
         BUSY_PAUSE,
         |error: &AnswerError| matches!(error, AnswerError::Db(db) if is_busy(db)),
-        // The transactional step (note, link and close in one commit) lives with the notes SQL; it
-        // is reached through the crate-root alias so this module never names the notes' tables.
-        || crate::capture_answer_step(pool, job_id, text, origin),
+        || answer_step(pool, job_id, text, origin),
     )
     .await
+}
+
+/// One attempt at an owner's answer: the note, its link and the request's close commit together or
+/// not at all, so a retry after a busy database never finds half of the previous try. Returns the
+/// note's id and whether the request was released.
+async fn answer_step(
+    pool: &SqlitePool,
+    job_id: i64,
+    text: &str,
+    origin: &str,
+) -> Result<(i64, bool), AnswerError> {
+    let mut tx = pool.begin().await.map_err(AnswerError::Db)?;
+    // The one call this module makes into the owner's notes (sanctioned by the guard in
+    // `owner_notes.rs`); its error converts through the `From` impl that lives beside `NoteError`.
+    let note_id =
+        crate::owner_notes::create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
+    let released = close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now())
+        .await
+        .map_err(AnswerError::Db)?;
+    tx.commit().await.map_err(AnswerError::Db)?;
+    Ok((note_id, released))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

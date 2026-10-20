@@ -69,9 +69,6 @@ pub use nucleos_base::notes;
 pub use nucleos_base::notify_policy;
 pub mod onboarding;
 pub mod owner_notes;
-// A neutral name for `capture::answer`'s transactional step, so `capture.rs` can reach the notes
-// SQL without mentioning the module (the guard in `owner_notes.rs` allows only a few files to).
-pub(crate) use owner_notes::answer_capture_in as capture_answer_step;
 pub mod ownership;
 pub mod presets;
 pub use nucleos_base::pressure;
