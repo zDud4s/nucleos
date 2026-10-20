@@ -87,11 +87,11 @@ func (a *Adapter) execSend(ctx context.Context, s contract.Send) ([]string, erro
 	}
 	for i, p := range s.Parts {
 		if p.Type != contract.OutText {
-			ref, err := a.execMedia(ctx, dest, p, sendOpts{replyTo: replyTo, silent: s.Silent})
+			mediaRefs, err := a.execMedia(ctx, dest, p, sendOpts{replyTo: replyTo, silent: s.Silent})
 			if err != nil {
 				return fail(err)
 			}
-			refs = append(refs, ref)
+			refs = append(refs, mediaRefs...)
 			replyTo = 0
 			continue
 		}
@@ -107,6 +107,14 @@ func (a *Adapter) execSend(ctx context.Context, s contract.Send) ([]string, erro
 			refs = append(refs, strconv.FormatInt(id, 10))
 			replyTo = 0 // reply_to only on the first message
 		}
+	}
+	if lastText < 0 && len(buttons) > 0 {
+		// No text piece to carry the buttons: they get a message of their own.
+		ref, err := a.sendButtonsOnly(ctx, dest, buttons, s.Silent)
+		if err != nil {
+			return fail(err)
+		}
+		refs = append(refs, ref)
 	}
 	return refs, nil
 }

@@ -16,6 +16,7 @@ type SendBot interface {
 	EditMessageText(ctx context.Context, chatID, messageID int64, text, parseMode string, buttons [][]telegram.Button) error
 	SendChatAction(ctx context.Context, to telegram.Destination, action string) error
 	AnswerCallbackQueryCtx(ctx context.Context, callbackID, text string) error
+	SendMediaEx(ctx context.Context, kind telegram.MediaKind, p telegram.SendMediaParams, r io.Reader) (telegram.MediaSent, error)
 }
 
 // MediaDownloader fetches the bytes of a media id from the core; *kit.Client satisfies it.
@@ -51,12 +52,3 @@ func (a *Adapter) Execute(ctx context.Context, act contract.Action) ([]string, e
 	}
 	return nil, kit.Permanent("invalid_action")
 }
-
-// ---- STUB: B46 deletes execMedia from this block. ----
-
-// execMedia sends one image, file or audio part and returns its message ref.
-func (a *Adapter) execMedia(context.Context, telegram.Destination, contract.OutPart, sendOpts) (string, error) {
-	return "", kit.Permanent("unsupported_media")
-}
-
-// ---- END B46 STUB ----
