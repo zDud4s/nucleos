@@ -6,6 +6,7 @@ package adaptertest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"reflect"
@@ -296,11 +297,31 @@ func executeValid(ctx context.Context, ad kit.Adapter) (executed int, skipped, p
 			skipped = append(skipped, fmt.Sprintf("%s (%s)", e.File, ack.Failed.Reason))
 			continue
 		}
-		if _, err := ad.Execute(ctx, a); err != nil {
+		if err := executeOne(ctx, ad, a); err != nil {
 			problems = append(problems, fmt.Sprintf("%s: Execute: %v", e.File, err))
 			continue
 		}
 		executed++
 	}
 	return executed, skipped, problems
+}
+
+// executeOne executes a and returns its error, except for the one refusal the contract
+// allows: a permanent edit_unsupported_shape on an edit whose number of parts differs from
+// its number of target_platform_refs (spec section 6.2, decision Q8: an adapter edits only
+// when the shapes match and otherwise refuses, and the core re-sends as a new send). The
+// kit cannot render, so parts stand for pieces; an adapter that refuses an edit whose
+// shapes match still fails.
+func executeOne(ctx context.Context, ad kit.Adapter, a contract.Action) error {
+	_, err := ad.Execute(ctx, a)
+	if err == nil {
+		return nil
+	}
+	e, ok := a.(contract.Edit)
+	var ee *kit.ExecError
+	if ok && errors.As(err, &ee) && !ee.Retryable && ee.Reason == "edit_unsupported_shape" &&
+		len(e.Parts) != len(e.TargetPlatformRefs) {
+		return nil
+	}
+	return err
 }

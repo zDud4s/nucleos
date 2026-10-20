@@ -49,20 +49,16 @@ func TestConformanceCapabilities(t *testing.T) {
 	adaptertest.CheckCapabilities(t, Capabilities())
 }
 
-// The shared outbox/edit.json holds one text piece over two target refs, which the adapter's own
-// rule (a different piece count than message count is edit_unsupported_shape, so the core falls back
-// to a fresh send) rejects. adaptertest.ExecuteValid fails any Execute error, so it reports exactly
-// that one file. This test pins the conflict: every other valid action runs clean, the edit is the
-// only report, and its reason is edit_unsupported_shape and not something else.
+// The shared outbox/edit.json holds one text piece over two target refs, which the adapter refuses
+// with edit_unsupported_shape so the core falls back to a fresh send; adaptertest.ExecuteValid
+// accepts that refusal on a shape mismatch, so every valid action reports clean.
 func TestConformanceExecuteValid(t *testing.T) {
 	bot, dl := &conformBot{}, newDownloader()
 	rec := &recordTB{TB: t}
 	adaptertest.ExecuteValid(rec, New(bot, dl))
 
-	if len(rec.errs) != 1 ||
-		!strings.HasPrefix(rec.errs[0], "outbox/edit.json: Execute:") ||
-		!strings.Contains(rec.errs[0], "edit_unsupported_shape") {
-		t.Fatalf("ExecuteValid reports = %q, want exactly outbox/edit.json failing with edit_unsupported_shape", rec.errs)
+	if len(rec.errs) != 0 {
+		t.Fatalf("ExecuteValid reports = %q, want none", rec.errs)
 	}
 
 	// send-full: text, image, file, audio in order; then send-text and send-unknown-field (valid for
