@@ -237,8 +237,27 @@ func TestRunnerExecAckRetriedOnServerErrorWithSingleExecutionAndRenewal(t *testi
 			st, att, _ := g.core.Delivery(id)
 			t.Fatalf("action never reached done: state %q attempts %d", st, att)
 		}
-		g.clk.Advance(RenewInterval)      // fires the ack backoff and the lease renewal
-		time.Sleep(25 * time.Millisecond) // let the renewal and the ack retry re-arm before the next step
+		time.Sleep(25 * time.Millisecond) // let the renewal and the ack retry (re)arm their timers
+		renews, armed := g.core.Calls(fakecore.RouteRenew), g.clk.Pending()
+		g.clk.Advance(RenewInterval) // fires the ack backoff and the lease renewal
+		// Each step must be seen through before the next advance: two advances
+		// without a renewal in between (a slow renewal under -race) would move
+		// the fake clock past the 60s lease and make the core redeliver, which
+		// is a test artifact, not a second execution. Waiting for the renewal
+		// is enough; an ack retry that was not armed yet just fires on the next
+		// step, whose lease is fresh.
+		// The timers must also be armed again (as many pending as before the
+		// advance) so the next advance cannot miss the renewal.
+		for g.core.Calls(fakecore.RouteRenew) <= renews || g.clk.Pending() < armed {
+			if st, _, _ := g.core.Delivery(id); st == fakecore.StateDone {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("renewal did not follow the advance: renew calls %d (was %d), timers %d (was %d)",
+					g.core.Calls(fakecore.RouteRenew), renews, g.clk.Pending(), armed)
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 	g.waitInflight(0)
 	stop()
