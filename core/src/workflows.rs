@@ -155,6 +155,16 @@ pub fn file_hashes(dir: &Path) -> std::io::Result<BTreeMap<String, String>> {
     Ok(found)
 }
 
+/// Whether `name` is an interpreter's cache rather than something an author wrote.
+///
+/// The workflow runs a bundle's scripts where the library keeps them, and Python leaves
+/// `__pycache__/` beside every module it imports. Neither the hash nor a packaged copy may see it:
+/// counted, it made a version read as drifted once any session had run it, and copied, it made the
+/// hash depend on which Python ran there last.
+pub(crate) fn is_cache(name: &std::ffi::OsStr) -> bool {
+    name == "__pycache__" || Path::new(name).extension().is_some_and(|ext| ext == "pyc")
+}
+
 fn walk(
     dir: &Path,
     prefix: &str,
@@ -184,7 +194,7 @@ fn walk(
         // second and reported as itself by the first. A bundle that linked out of the library would
         // otherwise be hashed against a tree nobody meant to publish.
         let kind = entry.file_type()?;
-        if kind.is_symlink() {
+        if kind.is_symlink() || is_cache(&entry.file_name()) {
             continue;
         }
         if kind.is_dir() {
@@ -1228,6 +1238,24 @@ mod tests {
         right.insert("a".to_string(), "x".to_string());
         right.insert("bc".to_string(), "y".to_string());
         assert_ne!(digest_of(&left), digest_of(&right));
+    }
+
+    /// The workflow runs its scripts from the library (`python "<bundle_dir>/scripts/x.py"`), and
+    /// Python leaves `__pycache__/` beside any module it imports. Packaging never copies that cache,
+    /// so hashing it made every version a session had run read as drifted, and the daemon refused
+    /// to materialize it anywhere — measured 2026-10-20 on `nucleos-dev@2.0.4`.
+    #[test]
+    fn an_interpreter_cache_beside_a_bundles_scripts_is_not_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[("scripts/x.py", "print()")]);
+        let dir = root.join("harness").join("1.0");
+        let before = digest_of(&file_hashes(&dir).unwrap());
+
+        std::fs::create_dir_all(dir.join("scripts/__pycache__")).unwrap();
+        std::fs::write(dir.join("scripts/__pycache__/x.cpython-311.pyc"), "bytes").unwrap();
+        std::fs::write(dir.join("scripts/stray.pyc"), "bytes").unwrap();
+
+        assert_eq!(digest_of(&file_hashes(&dir).unwrap()), before);
     }
 
     #[test]
