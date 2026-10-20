@@ -1,6 +1,36 @@
 // @vitest-environment node
-import { describe, expect, it } from "vitest";
-import { isAggregateTimeout, sidecarKeyOf, subsystemCounts, wantsAttention, type HealthReadout } from "./system";
+import { QueryClient } from "@tanstack/react-query";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { keys } from "./keys";
+import {
+  isAggregateTimeout,
+  useChannelNotifyPolicy,
+  useSetChannelNotifyPolicy,
+  useSetNotifyPolicy,
+  sidecarKeyOf,
+  subsystemCounts,
+  wantsAttention,
+  type HealthReadout,
+} from "./system";
+
+// The hooks are exercised without a DOM: react-query's hook entry points hand back
+// the options object they were given, and `useQueryClient` hands back a real client.
+const h = vi.hoisted(() => ({ client: null as unknown, apiFetch: null as unknown }));
+vi.mock("@tanstack/react-query", async (orig) => {
+  const actual = await orig<typeof import("@tanstack/react-query")>();
+  return {
+    ...actual,
+    useQuery: (o: unknown) => o,
+    useMutation: (o: unknown) => o,
+    useQueryClient: () => h.client,
+  };
+});
+vi.mock("./client", async (orig) => {
+  const actual = await orig<typeof import("./client")>();
+  h.apiFetch = vi.fn(async () => undefined);
+  return { ...actual, apiFetch: h.apiFetch };
+});
+
 
 function readout(status: HealthReadout["status"], subsystems: HealthReadout["subsystems"] = []): HealthReadout {
   return { status, subsystems };
@@ -86,5 +116,59 @@ describe("subsystemCounts", () => {
     ]);
     // A row with no tallies has nothing to list.
     expect(subsystemCounts({ name: "github", status: "ok" })).toEqual([]);
+  });
+});
+
+describe("per-channel notification policy hooks", () => {
+  let client: QueryClient;
+  beforeEach(() => {
+    client = new QueryClient();
+    h.client = client;
+    (h.apiFetch as ReturnType<typeof vi.fn>).mockClear();
+  });
+
+  it("reads one channel's policy with an encoded id, the per-channel key and no poll", async () => {
+    const q = useChannelNotifyPolicy("tele gram") as unknown as {
+      queryKey: unknown;
+      queryFn: () => Promise<unknown>;
+      refetchInterval?: unknown;
+    };
+    expect(q.queryKey).toEqual(keys.system.notifyPolicyFor("tele gram"));
+    expect(q.refetchInterval).toBeUndefined();
+    await q.queryFn();
+    expect(h.apiFetch).toHaveBeenCalledWith("/notifications/policy?channel=tele%20gram");
+  });
+
+  it("saves the whole overrides, never retries, and invalidates only that channel", async () => {
+    const m = useSetChannelNotifyPolicy("telegram") as unknown as {
+      mutationFn: (p: unknown) => Promise<unknown>;
+      retry: boolean;
+      onSettled: () => void;
+    };
+    const overrides = { families: [], kinds: [{ selector: "x", deliver: false }] };
+    await m.mutationFn(overrides);
+    const [path, init] = (h.apiFetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/notifications/policy?channel=telegram");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual(overrides);
+    expect(m.retry).toBe(false);
+    const spy = vi.spyOn(client, "invalidateQueries");
+    m.onSettled();
+    expect(spy).toHaveBeenCalledWith({ queryKey: keys.system.notifyPolicyFor("telegram") });
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  // characterisation: passes before this chunk
+  it("useSetNotifyPolicy invalidates the prefix, so a per-channel query is refetched", async () => {
+    let fetched = 0;
+    await client.fetchQuery({
+      queryKey: keys.system.notifyPolicyFor("telegram"),
+      queryFn: async () => ++fetched,
+    });
+    const m = useSetNotifyPolicy() as unknown as { onSettled: () => void };
+    m.onSettled();
+    expect(
+      client.getQueryCache().find({ queryKey: keys.system.notifyPolicyFor("telegram") })?.state.isInvalidated,
+    ).toBe(true);
   });
 });

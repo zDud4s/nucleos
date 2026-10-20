@@ -31,6 +31,7 @@ import { Voice, validateVoiceSearch } from "./pages/Voice";
 import { validateBrainSearch } from "./brain/search";
 import { Waiting, validateWaitingSearch } from "./pages/Waiting";
 import { BrowserRedirect, WebTabs } from "./pages/WebTabs";
+import { validateSystemSearch } from "./pages/systemSearch";
 
 /**
  * Pages that are not the landing route load on first visit rather than at startup. `Chats` alone is
@@ -159,7 +160,9 @@ const SEARCH_VALIDATORS: Record<string, (search: Record<string, unknown>) => obj
  *
  * `/system/$view` is the same idiom again: like `/projects/$projectId/$view`, the
  * view is a path parameter and not a search param — there is exactly one of it, it
- * always has a value, and it is not a filter. No `SEARCH_VALIDATORS` entry.
+ * always has a value, and it is not a filter. No `SEARCH_VALIDATORS` entry: its one search param,
+ * `?channel=` (the notifications tab's scope), is validated by the `DETAIL_ROUTES` entry, and the
+ * validator serves nothing else.
  *
  * `/team-runs/$runId` is the first detail route whose first segment is not
  * itself a nav path — `/teams/$teamId` is a detail of `/teams`, but a team run
@@ -283,7 +286,7 @@ const DETAIL_ROUTES: {
   { path: "/web/sessions", component: BrowserRedirect },
   // Old bookmarks and feed rows still point at /browser; it now only forwards to the tab.
   { path: "/browser", component: BrowserRedirect },
-  { path: "/system/$view", component: System },
+  { path: "/system/$view", component: System, validateSearch: validateSystemSearch },
 ];
 
 export function createAppRouter(initialPath = "/") {

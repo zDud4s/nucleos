@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { validateSystemSearch } from "./systemSearch";
 import { isApiRefusal } from "../data/client";
 import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
@@ -68,6 +69,7 @@ import {
   Meter,
 } from "../ui";
 import { MachineSettings } from "./MachineSettings";
+import { ChannelsView } from "./ChannelsView";
 import { NotificationsView } from "./NotificationsView";
 import "./system.css";
 import { DAEMON_NAME } from "../copy";
@@ -75,7 +77,7 @@ import { DAEMON_NAME } from "../copy";
 /**
  * System — the machine's own state, not a project's.
  *
- * Five tabs. S1 and S2 built the health view (the daemon's own subsystem
+ * Seven tabs. S1 and S2 built the health view (the daemon's own subsystem
  * readout and the sidecars' own liveness) plus, on top of it, the project
  * brakes and the editable budget; and the whole backups view (snapshots,
  * staged restore and the PII tally). Health data is read off
@@ -97,12 +99,12 @@ import { DAEMON_NAME } from "../copy";
  *
  * The notifications tab is the newest, and belongs here for the same reason the
  * budget does: it is the machine's own behaviour, not a project's. It edits
- * which feed kinds still reach Telegram — a preference the núcleo stores and
+ * which feed kinds still reach a channel — a preference the núcleo stores and
  * the sidecar obeys, so nothing on this page decides anything by itself.
  */
 
-/** The six tabs, in the order they read. */
-const VIEWS = ["health", "limits", "backups", "tokens", "notifications", "settings"] as const;
+/** The seven tabs, in the order they read. */
+const VIEWS = ["health", "limits", "backups", "tokens", "channels", "notifications", "settings"] as const;
 export type SystemView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<SystemView, string> = {
@@ -110,6 +112,7 @@ const VIEW_LABEL: Record<SystemView, string> = {
   limits: "Limits",
   backups: "Backups",
   tokens: "Tokens",
+  channels: "Channels",
   notifications: "Notifications",
   // The slug stays `settings`; only the word changed, because "System" inside the page
   // called System named nothing.
@@ -117,7 +120,7 @@ const VIEW_LABEL: Record<SystemView, string> = {
 };
 
 /**
- * A `$view` param as one of the six.
+ * A `$view` param as one of the seven.
  *
  * Falls back to `health` rather than refusing: a route parameter is a string,
  * anybody can type one, and a typo in a path is not a missing page.
@@ -129,9 +132,13 @@ export function normaliseView(raw: string | undefined): SystemView {
     : "health";
 }
 
+export { validateSystemSearch };
+
 export function System() {
   const params = useParams({ strict: false }) as { view?: string };
   const view = normaliseView(params.view);
+  const { channel } = validateSystemSearch(useSearch({ strict: false }) as Record<string, unknown>);
+  const navigate = useNavigate();
   const health = useSystemHealth();
   const sidecars = useSidecars();
 
@@ -146,7 +153,19 @@ export function System() {
         {view === "limits" && <BudgetPanel />}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
-        {view === "notifications" && <NotificationsView />}
+        {view === "channels" && <ChannelsView />}
+        {view === "notifications" && (
+          <NotificationsView
+            channel={channel}
+            onChannelChange={(next) => {
+              void navigate({
+                to: "/system/$view",
+                params: { view: "notifications" },
+                search: (next === undefined ? {} : { channel: next }) as never,
+              });
+            }}
+          />
+        )}
         {view === "settings" && (
           <>
             <MachineSettings />

@@ -1,0 +1,5 @@
+{ "kind": "telegram", "version": "1.0.0",
+  "capabilities": { "buttons": true, "edit": true, "typing": true, "threads": true,
+                    "reply_to": true, "max_text": 4096,
+                    "media_in":  ["audio", "image", "file"],
+                    "media_out": ["image", "file", "audio"] } }
