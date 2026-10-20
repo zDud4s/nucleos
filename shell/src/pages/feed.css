@@ -99,6 +99,8 @@
 .feed-tools {
   /* One height for every control in the filter panel, declared once and read three times. */
   --feed-control-h: calc(var(--text-sm) * var(--leading-normal) + 2 * var(--space-2) + 2px);
+  /* The window switch's own vertical padding (`.ui-switch-seg`), so the search and "More" are its height. */
+  --feed-box-pad-y: 0.34rem;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -121,29 +123,22 @@
   margin-left: auto;
 }
 
-/* The same box as the window switch beside it, so the row reads as one line of controls. */
-.feed-search-input {
+/**
+ * The search is the shared `Field` (label hidden: the placeholder says it on screen). Its border,
+ * fill, placeholder and focus ring are `.ui-field`'s; only the width and the box height are the
+ * feed's — the same box as the window switch beside it, so the row reads as one line of controls.
+ */
+.feed-search-bar .ui-field input {
   width: 16rem;
   min-width: 0;
-  padding: 0.34rem var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-sm);
-}
-
-.feed-search-input::placeholder {
-  color: var(--text-muted);
-  opacity: 1;
+  padding: var(--feed-box-pad-y) var(--space-3);
 }
 
 .feed-search-more {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  padding: 0.34rem var(--space-3);
+  padding: var(--feed-box-pad-y) var(--space-3);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
   background: none;
@@ -209,7 +204,8 @@
   height: var(--feed-control-h);
   min-width: 9rem;
   padding: var(--space-2);
-  border: 1px solid var(--border);
+  /* A field's edge is `--border-field`: `--border` is a hairline between rows and vanishes round a well in light. */
+  border: 1px solid var(--border-field);
   border-radius: var(--radius-md);
   background: var(--surface-sunken);
   color: var(--text);
@@ -315,7 +311,8 @@
 }
 
 .feed-trace-frame {
-  --feed-trace-gutter: 13rem;
+  /* A share of the room the trace is given, between a floor and a cap: names grow with the track. */
+  --feed-trace-gutter: clamp(13rem, 26cqi, 22rem);
   --feed-trace-meta: 11rem;
   --feed-trace-pad: var(--space-3);
   --feed-trace-ruler: 30px;
@@ -366,7 +363,8 @@
   min-width: 0;
   overflow: hidden;
   color: var(--text-muted);
-  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -574,11 +572,16 @@
   cursor: pointer;
 }
 
+/* A rung up, and the hairline that carries it in light, where the card and its raised rung are both white. */
 .feed-trace-label:hover {
   background: var(--surface-raised);
+  box-shadow: inset 0 0 0 1px var(--border);
+  color: var(--text);
 }
 
+/* The lane's `h3` hands its display face down to the button; a group label is the app's label rank, in the body face. */
 .feed-trace-lane .feed-trace-label {
+  font-family: var(--font-body);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-wide);
@@ -599,7 +602,7 @@
 .feed-trace-lane-name {
   min-width: 0;
   overflow-wrap: anywhere;
-  line-height: var(--leading-tight, 1.25);
+  line-height: var(--leading-tight);
 }
 
 .feed-trace-lane-n {
@@ -615,6 +618,12 @@
 .feed-trace-fold .feed-trace-label {
   padding-left: var(--space-4);
   color: var(--text-muted);
+}
+
+/* The muted lane and fold labels, which the two rules above would otherwise hold at muted on hover. */
+.feed-trace-lane .feed-trace-label:hover,
+.feed-trace-fold .feed-trace-label:hover {
+  color: var(--text);
 }
 
 .feed-trace-name {
@@ -787,41 +796,58 @@
   display: grid;
   flex: none;
   place-items: center;
-  width: 34px;
-  height: 34px;
+  width: var(--hit-min);
+  height: var(--hit-min);
   padding: 0;
   border: 1px solid var(--border-strong);
   border-radius: 50%;
   background: var(--surface);
   color: var(--text);
   cursor: pointer;
+  transition:
+    background-color var(--dur-quick) var(--ease),
+    border-color var(--dur-quick) var(--ease);
 }
 
+/* A rung up, and a stronger edge with it: in light the raised rung is the card's own white. */
 .feed-trace-play:hover {
   background: var(--surface-raised);
+  border-color: var(--text-faint);
+}
+
+/* Pressed goes back down a rung, as `.ui-button:active` does. */
+.feed-trace-play:active {
+  background: var(--surface-sunken);
+  transition-duration: 0s;
 }
 
 .feed-trace-slider {
   position: relative;
   flex: 1 1 auto;
   min-width: 6rem;
-  height: 34px;
+  height: var(--hit-min);
   border-radius: var(--radius-sm);
   cursor: ew-resize;
   touch-action: none;
 }
 
+/* The track carries its own edge: a sunken rung alone is a ghost on light's white card. */
 .feed-trace-rail {
   position: absolute;
   top: 50%;
   right: 7px;
   left: 7px;
-  height: 3px;
+  height: var(--space-1);
   overflow: hidden;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   background: var(--surface-sunken);
-  box-shadow: inset 0 0 0 1px var(--border);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
   transform: translateY(-50%);
+  transition: box-shadow var(--dur-quick) var(--ease);
+}
+
+.feed-trace-slider:hover .feed-trace-rail {
+  box-shadow: inset 0 0 0 1px var(--text-faint);
 }
 
 .feed-trace-rail-fill {
@@ -995,12 +1021,13 @@
 .feed-detail-facts {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
+  /* Baseline, so a caps label and its mono value sit on one line whatever their sizes. */
+  align-items: baseline;
   gap: var(--space-2) var(--space-3);
   margin: 0;
 }
 
 .feed-detail-facts dt {
-  padding-top: 2px;
   color: var(--text-muted);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
@@ -1043,9 +1070,12 @@
   }
 }
 
-/* The list's own heading: the record, after the trace and the sequence opened from it. */
+/*
+  The list's own heading: the record, after the trace and the sequence opened from it. One rhythm
+  for every heading in the list: 32px above, at most 16px below — here 8 plus the day head's own 8.
+*/
 .feed-every {
-  margin: var(--space-6) 0 var(--space-1);
+  margin: var(--space-6) 0 var(--space-2);
   font-family: var(--font-display);
   font-size: var(--text-lg);
   font-weight: var(--weight-bold);
@@ -1080,6 +1110,7 @@
   container: feed-days / inline-size;
 }
 
+/* 24 + the head's 8 of padding: 32px above a day's name, as above "Every line". */
 .feed-day + .feed-day {
   margin-top: var(--space-5);
 }
@@ -1098,7 +1129,7 @@
   align-items: baseline;
   gap: var(--space-3);
   margin: 0;
-  padding: var(--space-3) var(--space-2) var(--space-2);
+  padding: var(--space-2);
   border-bottom: 1px solid var(--border-strong);
   background: var(--bg);
 }
@@ -1110,7 +1141,10 @@
   color: var(--text);
 }
 
+/* In the heading, so it inherits the display face and its tight tracking; a date is prose. */
 .feed-day-date {
+  font-family: var(--font-body);
+  letter-spacing: normal;
   font-size: var(--text-xs);
   font-weight: var(--weight-regular);
   color: var(--text-muted);
@@ -1232,9 +1266,11 @@
   color: var(--accent);
   font-size: var(--text-xs);
   text-decoration: none;
+  text-underline-offset: 0.2em;
 }
 
-.feed-link:hover {
+.feed-link:hover,
+.feed-link:focus-visible {
   text-decoration: underline;
 }
 
@@ -1322,13 +1358,10 @@
 }
 
 /*
-  Folded, routine is an aside between the exceptions and is set a size down — at full row weight
-  every other row of the list was a fold, and the lines that matter were lost among them.
+  The fold's time is `.feed-line-time` as it is — the same mono size as every other row, so the
+  column of times reads as one. What makes a fold an aside between the exceptions is its tighter
+  box and the muted words, not a smaller clock.
 */
-.feed-routine > .feed-line-time {
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-}
 
 .feed-routine-toggle {
   display: flex;
@@ -1451,14 +1484,14 @@
 
 .feed-mark-card {
   position: fixed;
-  z-index: 50;
+  z-index: var(--z-top);
   width: max-content;
   max-width: 320px;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface);
-  box-shadow: 0 6px 24px rgb(0 0 0 / 0.35);
+  box-shadow: var(--shadow-md);
   color: var(--text);
   font-size: var(--text-xs);
   pointer-events: none;
@@ -1482,7 +1515,7 @@
 }
 
 .feed-mark-card-kind {
-  font-weight: 600;
+  font-weight: var(--weight-semibold);
 }
 
 .feed-mark-card-at {
@@ -1490,6 +1523,7 @@
   padding-left: var(--space-2);
   color: var(--text-muted);
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
 
 .feed-mark-card-summary {
@@ -1497,7 +1531,7 @@
   margin: var(--space-1) 0 0;
   overflow: hidden;
   color: var(--text-muted);
-  line-height: 1.4;
+  line-height: var(--leading-snug);
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 5;
@@ -1507,4 +1541,5 @@
   margin-top: var(--space-1);
   color: var(--text-muted);
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
