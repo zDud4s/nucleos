@@ -450,6 +450,93 @@ pub const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500
 // need them too; re-exported so the callers here and in `http/knowledge.rs` keep their path.
 pub use nucleos_base::storage::{is_busy, retry_busy};
 
+/// Why an owner's answer to a capture request was not recorded.
+#[derive(Debug)]
+pub enum AnswerError {
+    /// No capture request exists for the job.
+    NotFound,
+    /// The answer had no text.
+    Empty,
+    /// The origin is not one a note may carry.
+    UnknownOrigin,
+    Db(sqlx::Error),
+    /// A note error that an answer cannot meet in practice, kept for the log.
+    Internal(String),
+}
+
+impl std::fmt::Display for AnswerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("no capture request for this job"),
+            Self::Empty => formatter.write_str("an answer needs some text"),
+            Self::UnknownOrigin => formatter.write_str("unknown origin"),
+            Self::Db(error) => write!(formatter, "database error: {error}"),
+            Self::Internal(detail) => write!(formatter, "internal error: {detail}"),
+        }
+    }
+}
+
+impl From<crate::owner_notes::NoteError> for AnswerError {
+    fn from(error: crate::owner_notes::NoteError) -> Self {
+        use crate::owner_notes::NoteError;
+        match error {
+            NoteError::Empty => Self::Empty,
+            NoteError::UnknownOrigin => Self::UnknownOrigin,
+            NoteError::Db(error) => Self::Db(error),
+            other @ (NoteError::UnknownState | NoteError::NotFound) => {
+                Self::Internal(format!("{other:?}"))
+            }
+        }
+    }
+}
+
+/// The owner's answer becomes a note linked to the job; it also closes the request and releases the
+/// job when the request is still open. A late answer keeps its note and releases nothing. Returns
+/// the note's id and whether the request was released.
+pub async fn answer(
+    pool: &SqlitePool,
+    job_id: i64,
+    text: &str,
+    origin: &str,
+) -> Result<(i64, bool), AnswerError> {
+    use crate::owner_notes::NoteError;
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM capture_requests WHERE job_id = ?")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AnswerError::Db)?
+        .is_some();
+    if !exists {
+        return Err(AnswerError::NotFound);
+    }
+    // A busy database is retried: the owner typed this once, and another writer holding the lock
+    // past busy_timeout is no reason to lose it.
+    retry_busy(
+        BUSY_ATTEMPTS,
+        BUSY_PAUSE,
+        |error: &NoteError| matches!(error, NoteError::Db(db) if is_busy(db)),
+        || answer_once(pool, job_id, text, origin),
+    )
+    .await
+    .map_err(AnswerError::from)
+}
+
+/// One attempt at an answer: the note, its link and the request's close commit together or not at
+/// all, so a retry after a busy database never finds half of the previous try.
+async fn answer_once(
+    pool: &SqlitePool,
+    job_id: i64,
+    text: &str,
+    origin: &str,
+) -> Result<(i64, bool), crate::owner_notes::NoteError> {
+    let mut tx = pool.begin().await?;
+    let note_id =
+        crate::owner_notes::create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
+    let released = close_answered_in(&mut tx, job_id, note_id, Utc::now()).await?;
+    tx.commit().await?;
+    Ok((note_id, released))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listing {
     Open,
@@ -958,6 +1045,58 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((state.as_str(), note), (STATE_ANSWERED, Some(31)));
+    }
+
+    #[tokio::test]
+    async fn capture_answer_creates_a_linked_note_and_closes_the_request() {
+        let pool = pool().await;
+        opened(&pool, 7).await;
+        let (note_id, released) = answer(&pool, 7, "only I knew this", "shell").await.unwrap();
+        assert!(released);
+        let (state, note): (String, Option<i64>) =
+            sqlx::query_as("SELECT state, note_id FROM capture_requests WHERE job_id = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((state.as_str(), note), (STATE_ANSWERED, Some(note_id)));
+        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_note_links")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(links, 1);
+        let (_, late) = answer(&pool, 7, "a second thought", "shell").await.unwrap();
+        assert!(!late, "a late answer keeps its note and releases nothing");
+    }
+
+    #[tokio::test]
+    async fn capture_answer_unknown_job_is_not_found() {
+        let pool = pool().await;
+        assert!(matches!(
+            answer(&pool, 99, "text", "shell").await,
+            Err(AnswerError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn capture_answer_empty_text_is_empty() {
+        let pool = pool().await;
+        opened(&pool, 7).await;
+        assert!(matches!(
+            answer(&pool, 7, "   ", "shell").await,
+            Err(AnswerError::Empty)
+        ));
+        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_OPEN);
+    }
+
+    #[tokio::test]
+    async fn capture_answer_unknown_origin_is_refused() {
+        let pool = pool().await;
+        opened(&pool, 7).await;
+        assert!(matches!(
+            answer(&pool, 7, "text", "carrier-pigeon").await,
+            Err(AnswerError::UnknownOrigin)
+        ));
+        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_OPEN);
     }
 
     #[tokio::test]

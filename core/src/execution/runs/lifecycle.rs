@@ -283,6 +283,10 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             // Only for the terminator that won. No rows means the body finished on its own and wrote
             // its own stdout and usage, read off a real `result` — those are the ones to keep.
             let won = matches!(&result, Ok(done) if done.rows_affected() == 1);
+            // After the CAS and only for the winner: a woken reader finds the new status.
+            if won {
+                nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
+            }
             if won && let Some(stream) = stream {
                 let seen = stream
                     .lock()

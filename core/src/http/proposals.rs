@@ -191,53 +191,6 @@ pub(super) async fn post_proposal_dismiss(
     }
 }
 
-/// Turns a merge decision's outcome into the answer the caller gets.
-///
-/// The conflict is a 409 with a body, not a bare status: it is the one refusal here that names
-/// something the person can go and change, and a status code cannot say which two instructions
-/// disagree.
-///
-/// **That sentence was written before the body was, and described the opposite of what the code
-/// did** — every arm returned a bare `StatusCode`, which axum renders with no body at all. Recorded
-/// rather than quietly corrected, because a comment promising a guarantee the code does not keep is
-/// the exact failure this whole handler was changed to end, and `post_proposal_approve` below was
-/// carrying its own version of it.
-pub(super) fn merge_decision_response(
-    outcome: Result<
-        crate::integrations::contacts::MergeOutcome,
-        crate::integrations::contacts::DecisionError,
-    >,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match outcome {
-        Ok(crate::integrations::contacts::MergeOutcome::Merged) => {
-            Ok(Json(serde_json::json!({ "merged": true })))
-        }
-        Ok(crate::integrations::contacts::MergeOutcome::RefusedConflictingVerdicts {
-            keep,
-            absorb,
-        }) => {
-            tracing::info!(%keep, %absorb, "refused a contact merge with conflicting verdicts");
-            Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "these two people carry standing decisions that disagree — {keep} against {absorb}; settle one of them and decide this again"
-                ),
-            ))
-        }
-        Err(crate::integrations::contacts::DecisionError::NotPending) => Err((
-            StatusCode::CONFLICT,
-            "this suggestion has already been decided".to_owned(),
-        )),
-        Err(crate::integrations::contacts::DecisionError::Db(error)) => {
-            tracing::warn!(%error, "deciding a contact merge failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the decision could not be recorded".to_owned(),
-            ))
-        }
-    }
-}
-
 /// **Every refusal here carries a sentence, and that is the whole reason this returns a tuple.**
 ///
 /// This route can answer 409 for two reasons that mean opposite things to the person who clicked:
@@ -267,68 +220,6 @@ pub(super) struct ApproveBody {
     pub(super) scope: Option<String>,
 }
 
-/// 422 when `scope` names an agent or a team the núcleo does not have. A project is not checked:
-/// a project id is whatever a run was started with, and has no table of its own to be missing from.
-pub(super) async fn refuse_unknown_owner(
-    pool: &sqlx::SqlitePool,
-    scope: &crate::knowledge::Scope,
-) -> Result<(), (StatusCode, String)> {
-    let (sql, noun, owner) = match scope {
-        crate::knowledge::Scope::Agent(owner) => {
-            ("SELECT 1 FROM agents WHERE id = ?", "agent", owner)
-        }
-        crate::knowledge::Scope::Team(owner) => ("SELECT 1 FROM teams WHERE id = ?", "team", owner),
-        _ => return Ok(()),
-    };
-    let found: Option<i64> = sqlx::query_scalar(sql)
-        .bind(owner)
-        .fetch_optional(pool)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "checking the scope an approval names failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the scope could not be checked".to_owned(),
-            )
-        })?;
-    match found {
-        Some(_) => Ok(()),
-        None => Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("there is no {noun} `{owner}` to keep this refinement"),
-        )),
-    }
-}
-
-/// What the refinement door says when deciding refuses. `Malformed` after a real move can only be
-/// the move itself (a successor stays where its predecessor lived); otherwise the proposal names
-/// no row.
-pub(super) fn refinement_refusal(
-    error: crate::knowledge::DecisionError,
-    id: i64,
-    was_rescoped: bool,
-) -> (StatusCode, String) {
-    match error {
-        crate::knowledge::DecisionError::NotFound => {
-            (StatusCode::NOT_FOUND, format!("there is no proposal {id}"))
-        }
-        crate::knowledge::DecisionError::NotPending => (
-            StatusCode::CONFLICT,
-            "this proposal has already been decided".to_owned(),
-        ),
-        crate::knowledge::DecisionError::Malformed => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            if was_rescoped {
-                "this refinement replaces an earlier one, so it can only be approved in the scope \
-                 it was declared in"
-                    .to_owned()
-            } else {
-                "this proposal does not name a refinement".to_owned()
-            },
-        ),
-    }
-}
-
 pub(super) async fn post_proposal_approve(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -356,154 +247,25 @@ pub(super) async fn post_proposal_approve(
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("there is no proposal {id}")))?;
     let kind = proposal.kind.clone();
-    if kind == "contact-merge" {
-        // Uncancellable for the same reason the resume below is: the decision commits, and a
-        // request dropped mid-flight must not leave the record disagreeing with what happened.
-        let state = state.clone();
-        let outcome = uncancellable(async move {
-            crate::integrations::contacts::approve_merge(&state.pool, id).await
-        })
+    // The four kinds that start no run (or act at once) are decided by the service function; the
+    // rest stay here until they move too. This reads the proposal once to learn the kind and
+    // `decide::approve` reads it again, so an unknown id still answers 404 from the read above.
+    if matches!(
+        kind.as_str(),
+        "contact-merge" | "refinement" | "calendar-event" | "github-action"
+    ) {
+        return crate::proposals::approve(
+            &state,
+            id,
+            crate::proposals::ApproveInput {
+                hire: edited,
+                seat,
+                scope: rescope,
+            },
+        )
         .await
-        .map_err(|status| (status, "the merge task did not finish".to_owned()))?;
-        return merge_decision_response(outcome);
-    }
-    if kind == "refinement" {
-        // Fifth kind through this door, and the third that starts no run: approving activates the
-        // refinement and decides the proposal in one transaction. Uncancellable for the reason the
-        // others give — a dropped request must not leave the proposal and the layer disagreeing
-        // about whether the agent was allowed to learn something.
-        let target = rescope
-            .as_deref()
-            .map(|raw| {
-                refinement_target(raw).ok_or_else(|| {
-                    (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "`{raw}` is not a scope a refinement can be approved into: agent:<id>, team:<id> or project:<id>"
-                        ),
-                    )
-                })
-            })
-            .transpose()?;
-        // A scope naming an agent or a team must name one that exists; and a scope equal to the
-        // declared one is the plain approval, so a refusal below can only be about the move.
-        let target = match target {
-            Some(scope) => {
-                refuse_unknown_owner(&state.pool, &scope).await?;
-                match crate::knowledge::declared_in(&state.pool, id, &scope).await {
-                    Ok(true) => None,
-                    Ok(false) => Some(scope),
-                    Err(error) => return Err(refinement_refusal(error, id, false)),
-                }
-            }
-            None => None,
-        };
-        let was_rescoped = target.is_some();
-        let state = state.clone();
-        let activated = uncancellable(async move {
-            crate::knowledge::approve_as(&state.pool, id, target.as_ref()).await
-        })
-        .await
-        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
-        return match activated {
-            Ok(refinement_id) => Ok(Json(serde_json::json!({ "refinement_id": refinement_id }))),
-            Err(error) => Err(refinement_refusal(error, id, was_rescoped)),
-        };
-    }
-    if kind == "calendar-event" {
-        // Third kind through this door, and the second that starts no run: approving writes the
-        // event and the decision in one transaction. Uncancellable for the same reason as the
-        // other two — a dropped request must not leave the proposal and the calendar disagreeing.
-        let state = state.clone();
-        let created = uncancellable(async move {
-            crate::integrations::calendar::approve_proposed_event(&state.pool, id).await
-        })
-        .await
-        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
-        return match created {
-            Ok(event_id) => Ok(Json(serde_json::json!({ "event_id": event_id }))),
-            Err(crate::integrations::calendar::DecisionError::NotFound) => {
-                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
-            }
-            Err(crate::integrations::calendar::DecisionError::NotPending) => Err((
-                StatusCode::CONFLICT,
-                "this proposal has already been decided".to_owned(),
-            )),
-            Err(crate::integrations::calendar::DecisionError::Malformed) => {
-                tracing::warn!(
-                    proposal_id = id,
-                    "a calendar proposal carried no usable event"
-                );
-                Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "this proposal carries no usable event, so there is nothing to create"
-                        .to_owned(),
-                ))
-            }
-            Err(crate::integrations::calendar::DecisionError::Db(error)) => {
-                tracing::warn!(proposal_id = id, %error, "approving a calendar proposal failed");
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "the event could not be written".to_owned(),
-                ))
-            }
-        };
-    }
-
-    if kind == "github-action" {
-        // The kind through this door that ACTS on approval, where `team-action` waits for a tick.
-        // A pillar answering synchronously has no later pass to be picked up on, so without this the
-        // button would approve nothing.
-        //
-        // Uncancellable for the reason all of its neighbours are, and here it carries more: the work
-        // between the claim and the note is a live call to GitHub, and a request dropped across it
-        // would leave a comment published and the row saying only that somebody said yes.
-        let state = state.clone();
-        let ran = uncancellable(async move {
-            crate::integrations::github::approve_proposed_operation(&state.pool, &state.github, id)
-                .await
-        })
-        .await
-        .map_err(|status| (status, "the approval task did not finish".to_owned()))?;
-        return match ran {
-            Ok(outcome) => Ok(Json(serde_json::json!({
-                "operation": outcome.kind,
-                "exit_code": outcome.exit_code,
-                "stdout": outcome.stdout,
-                "output_tail": outcome.output_tail,
-            }))),
-            Err(crate::integrations::github::DecisionError::NotFound) => {
-                Err((StatusCode::NOT_FOUND, format!("there is no proposal {id}")))
-            }
-            Err(crate::integrations::github::DecisionError::NotPending) => Err((
-                StatusCode::CONFLICT,
-                "this proposal has already been decided".to_owned(),
-            )),
-            Err(crate::integrations::github::DecisionError::Malformed) => {
-                tracing::warn!(
-                    proposal_id = id,
-                    "a github proposal carried no usable operation"
-                );
-                Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "this proposal carries no usable operation, so there is nothing to run"
-                        .to_owned(),
-                ))
-            }
-            // The proposal is already `approved` and the note beneath it says what happened. The
-            // status is the failure's own, so a missing token does not read as a broken daemon.
-            Err(crate::integrations::github::DecisionError::Failed(failure)) => Err((
-                github_failure_status(&failure),
-                format!("approved, and it did not run: {failure}"),
-            )),
-            Err(crate::integrations::github::DecisionError::Db(error)) => {
-                tracing::warn!(proposal_id = id, %error, "approving a github proposal failed");
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "the decision could not be recorded".to_owned(),
-                ))
-            }
-        };
+        .map(Json)
+        .map_err(|error| error.into_http(id));
     }
 
     if kind == "browser-wheel" {

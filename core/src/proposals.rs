@@ -3,6 +3,9 @@
 use serde::Serialize;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 
+mod decide;
+pub use decide::*;
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Proposal {
     pub id: i64,
