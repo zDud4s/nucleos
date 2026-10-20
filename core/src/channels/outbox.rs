@@ -50,3 +50,57 @@ pub async fn release_all(pool: &SqlitePool, channel: &str) -> sqlx::Result<u64> 
 pub async fn prune(_pool: &SqlitePool, _now: DateTime<Utc>) -> sqlx::Result<u64> {
     Ok(0) // P0 stub: real DELETE lands with its chunk
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn insert(pool: &SqlitePool, channel: &str, state: &str, attempts: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class, \
+             state, due_at, lease_until, attempts, created_at) \
+             VALUES (?, 'conv', 'ordered', 'send', '{}', 'turn', ?, 't', \
+             CASE WHEN ? = 'leased' THEN 'later' END, ?, 't') RETURNING id",
+        )
+        .bind(channel)
+        .bind(state)
+        .bind(state)
+        .bind(attempts)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn row(pool: &SqlitePool, id: i64) -> (String, Option<String>, i64) {
+        sqlx::query_as("SELECT state, lease_until, attempts FROM channel_outbox WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn release_all_returns_leased_rows_to_pending_without_touching_attempts() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let leased = insert(pool, "a", "leased", 2).await;
+        let pending = insert(pool, "a", "pending", 1).await;
+        let done = insert(pool, "a", "done", 3).await;
+        let other_channel = insert(pool, "b", "leased", 1).await;
+
+        assert_eq!(release_all(pool, "a").await.unwrap(), 1);
+
+        assert_eq!(row(pool, leased).await, ("pending".to_string(), None, 2));
+        assert_eq!(row(pool, pending).await, ("pending".to_string(), None, 1));
+        assert_eq!(row(pool, done).await, ("done".to_string(), None, 3));
+        let (st, lease, attempts) = row(pool, other_channel).await;
+        assert_eq!((st.as_str(), attempts), ("leased", 1));
+        assert!(lease.is_some());
+    }
+
+    #[tokio::test]
+    async fn release_all_on_an_empty_queue_releases_nothing() {
+        let state = crate::channels::testkit::state().await;
+        assert_eq!(release_all(&state.pool, "a").await.unwrap(), 0);
+    }
+}

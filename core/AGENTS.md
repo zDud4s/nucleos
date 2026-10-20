@@ -275,10 +275,10 @@ the contract, not a snapshot.
 | `channels/outbox/ack.rs` | Outbox acknowledgement handling. |
 | `channels/outbox/degrade.rs` | Outbox degradation of unsupported content. |
 | `channels/outbox/lease.rs` | Outbox lease handling: claim, renew, expiry. |
-| `channels/registry.rs` | Channel manifests, per-channel configuration and presence. |
+| `channels/registry.rs` | Channel manifests, per-channel configuration and presence: in-memory `Presence` (last hello/request, launch time, drop counters, secrets cache), `record_hello` (contract check, `channel_presence` upsert, leased outbox rows released), `capabilities`, and the `GET /channels` readout (`list`, `channel_state`, `RoutingState`). |
 | `channels/replies.rs` | Turn cycle and queue notices sent back to a channel. |
 | `channels/routing.rs` | Notifications to the primary channel. |
-| `channels/schema.rs` | Test-only: JSON schema checks of the contract. |
+| `channels/schema.rs` | Test-only: checks that migrations 0220-0227 create the channel tables, indexes and CHECKs. |
 | `channels/strings.rs` | Single table of user-visible channel text. |
 | `channels/testkit.rs` | Test-only: helpers that build a real `AppState` over a fresh pool. |
 | `channels/tokens.rs` | Button action tokens and their housekeeping. |
