@@ -120,10 +120,8 @@ func TestSendTextPartForbidsMedia(t *testing.T) {
 	wantSendErr(t, `{"id":1,"type":"send","conversation":"c","parts":[{"type":"text","text":"x","media":"m_1"}]}`, contract.CodeForbidden, "/parts/0/media")
 }
 
-func TestSendOtherTypesAreNotYetDecoded(t *testing.T) {
+func TestSendUnknownTypeIsNotDecoded(t *testing.T) {
 	for _, doc := range []string{
-		`{"id":1,"type":"edit","conversation":"c","target":1,"target_platform_refs":["1"],"parts":[{"type":"text","text":"x"}]}`,
-		`{"id":1,"type":"answer_action","conversation":"c","action_ref":"a","text":"x"}`,
 		`{"id":1,"type":"react","conversation":"c"}`,
 	} {
 		_, err := contract.ParseAction([]byte(doc))
