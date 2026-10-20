@@ -121,6 +121,12 @@ export function useChannels() {
   });
 }
 
+/** The answer of `PUT /channels/primary`: `reseeded` is true when the channel had never been primary. */
+export interface SetPrimaryAnswer {
+  primary: string | null;
+  reseeded: boolean;
+}
+
 /**
  * `PUT /channels/primary` with `{channel}` (`null` clears it). Settling
  * refreshes the readout and the notification policy, whose per-channel view
@@ -130,7 +136,7 @@ export function useSetPrimaryChannel() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (channel: string | null) =>
-      apiFetch<void>("/channels/primary", { method: "PUT", body: JSON.stringify({ channel }) }),
+      apiFetch<SetPrimaryAnswer>("/channels/primary", { method: "PUT", body: JSON.stringify({ channel }) }),
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.channels.all });

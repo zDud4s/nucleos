@@ -33,7 +33,7 @@ const SENTENCES: Record<string, string> = {
 export function PrimaryChannelControl({ channel, primary }: { channel: Channel; primary: string | null }) {
   const setPrimary = useSetPrimaryChannel();
   const isPrimary = primary === channel.id;
-  const reseeded = (setPrimary.data as { reseeded?: boolean } | undefined)?.reseeded === true;
+  const reseeded = setPrimary.data?.reseeded === true;
   const error = setPrimary.error;
 
   return (
