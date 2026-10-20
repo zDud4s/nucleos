@@ -332,3 +332,39 @@ func TestRunIngestErrorStopsTheRunnerAndIsReturned(t *testing.T) {
 		t.Fatalf("Run = %v, want the ingest error", err)
 	}
 }
+
+// runKindHello runs the kit with the given hello kind and returns the first hello the core saw.
+func runKindHello(t *testing.T, kind string) contract.Hello {
+	t.Helper()
+	g := newRunRig(t)
+	g.cfg.Kind = kind
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := g.start(ctx, g.factory(nil, nil))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if h, n := g.core.Hello(); n >= 1 {
+			cancel()
+			if err := waitRun(t, done); err != nil {
+				t.Fatalf("Run = %v", err)
+			}
+			return h
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no hello arrived")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRunKindIsSentInTheHello(t *testing.T) {
+	if h := runKindHello(t, "telegram"); h.Kind != "telegram" {
+		t.Fatalf("hello kind = %q, want telegram", h.Kind)
+	}
+}
+
+func TestRunKindEmptyKeepsAdapter(t *testing.T) {
+	if h := runKindHello(t, ""); h.Kind != "adapter" {
+		t.Fatalf("hello kind = %q, want adapter", h.Kind)
+	}
+}

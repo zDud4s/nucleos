@@ -64,7 +64,7 @@ func Run(ctx context.Context, cfg Config, f Factory) error {
 	lifeline.Watch(runGetenv, lifelineIn, cancel)
 
 	runner := &Runner{
-		Client: client, Adapter: adapter, Clock: clk, Stats: stats,
+		Client: client, Adapter: adapter, Clock: clk, Stats: stats, Kind: cfg.Kind,
 		Guard: Guard, ShutdownGrace: runShutdownGrace,
 	}
 

@@ -92,3 +92,13 @@ func TestConfigChannelIDDefaultsToTelegram(t *testing.T) {
 		t.Fatalf("channel = %q", cfg.Kit.Channel)
 	}
 }
+
+func TestConfigKindIsTelegram(t *testing.T) {
+	cfg, err := loadConfig(envOf(baseEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Kit.Kind != "telegram" {
+		t.Fatalf("kit kind = %q, want telegram", cfg.Kit.Kind)
+	}
+}

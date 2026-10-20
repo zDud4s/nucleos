@@ -15,6 +15,8 @@ type Config struct {
 	BaseURL string // core base URL, e.g. http://127.0.0.1:7777
 	Channel string // channel id used in /channels/{channel}/* routes
 	Token   string // bearer token, read from the environment by the caller
+	// Kind is the kind announced in the hello. Empty means "adapter".
+	Kind string
 	// HTTP is the transport. Nil means a client with no global Timeout:
 	// long-polls and media transfers set deadlines per request via context.
 	HTTP  *http.Client

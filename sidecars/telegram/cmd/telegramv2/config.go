@@ -17,6 +17,9 @@ const (
 
 	// defaultChannelID is the channel id used when the daemon does not set one.
 	defaultChannelID = "telegram"
+
+	// channelKind is the kind announced in the hello.
+	channelKind = "telegram"
 )
 
 // appConfig is everything the v2 entry point needs. It deliberately does not read telegram.yaml:
@@ -41,6 +44,7 @@ func loadConfig(getenv func(string) string) (appConfig, error) {
 	if kc.Channel == "" {
 		kc.Channel = defaultChannelID
 	}
+	kc.Kind = channelKind
 	offset := getenv(envOffsetPath)
 	if offset == "" {
 		// Same file as the v1 sidecar, so the switch between them keeps the cursor.
