@@ -100,16 +100,33 @@ pub fn by_id(id: &str) -> Option<&'static Manifest> {
 /// `~/.nucleos/channels/<id>.yaml`. Absent or malformed file = default, never fatal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ChannelConfig {
-    #[serde(default)]
+    // `pillars` is a private module of `config`; its glob re-export carries the `pub(crate)` fn.
+    #[serde(default, deserialize_with = "crate::config::deserialize_blank_as_none")]
     pub doctrine: Option<String>,
     /// Project id to `conversation_ref` (a thread in Telegram).
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
 }
 
-/// Reads every channel's yaml. P0 returns the empty map (the inert hub); A2 reads the files.
-pub fn load_configs(_machine_config_root: Option<&Path>) -> HashMap<&'static str, ChannelConfig> {
-    HashMap::new()
+/// Reads one channel's `<root>/<settings_file>.yaml`. Absent, unreadable or malformed = default,
+/// never fatal: a typo must cost fidelity, not stop the daemon.
+pub fn load_config(machine_config_root: &Path, manifest: &Manifest) -> ChannelConfig {
+    let path = machine_config_root.join(format!("{}.yaml", manifest.settings_file));
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Reads every channel's yaml. `None` (no machine-config root) gives the empty map, the inert hub.
+pub fn load_configs(machine_config_root: Option<&Path>) -> HashMap<&'static str, ChannelConfig> {
+    let Some(root) = machine_config_root else {
+        return HashMap::new();
+    };
+    MANIFESTS
+        .iter()
+        .map(|manifest| (manifest.id, load_config(root, manifest)))
+        .collect()
 }
 
 /// Reverse lookup: the project mapped to a conversation, if any.
@@ -652,6 +669,77 @@ mod tests {
         matches!(chars.next(), Some('a'..='z'))
             && id.len() <= 32
             && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
+    fn write_yaml(root: &Path, file: &str, text: &str) {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn load_config_missing_or_malformed_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_config(dir.path(), &TELEGRAM), ChannelConfig::default());
+
+        write_yaml(
+            dir.path(),
+            "channels/telegram.yaml",
+            "doctrine: [not a string\n",
+        );
+        assert_eq!(load_config(dir.path(), &TELEGRAM), ChannelConfig::default());
+
+        write_yaml(
+            dir.path(),
+            "channels/telegram.yaml",
+            "doctrine: be brief\nprojects:\n  nucleos: \"-100:5\"\n",
+        );
+        let config = load_config(dir.path(), &TELEGRAM);
+        assert_eq!(config.doctrine.as_deref(), Some("be brief"));
+        assert_eq!(
+            config.projects.get("nucleos").map(String::as_str),
+            Some("-100:5")
+        );
+
+        let all = load_configs(Some(dir.path()));
+        assert_eq!(all.get("telegram"), Some(&config));
+        assert_eq!(all.get("fake"), Some(&ChannelConfig::default()));
+        assert!(load_configs(None).is_empty());
+    }
+
+    #[test]
+    fn project_for_conversation_reverse_lookup() {
+        let config = ChannelConfig {
+            doctrine: None,
+            projects: BTreeMap::from([
+                ("alpha".to_string(), "-1:5".to_string()),
+                ("beta".to_string(), "-1:6".to_string()),
+            ]),
+        };
+        assert_eq!(
+            project_for_conversation(&config, "-1:6").as_deref(),
+            Some("beta")
+        );
+        assert_eq!(project_for_conversation(&config, "-1:9"), None);
+        assert_eq!(
+            project_for_conversation(&ChannelConfig::default(), "-1:5"),
+            None
+        );
+    }
+
+    #[test]
+    fn blank_doctrine_reads_as_none() {
+        for text in [
+            "doctrine: \"  \"\n",
+            "doctrine: \"\"\n",
+            "doctrine:\n",
+            "projects: {}\n",
+        ] {
+            let config: ChannelConfig = serde_yaml::from_str(text).unwrap();
+            assert_eq!(config.doctrine, None, "{text:?}");
+        }
+        let config: ChannelConfig = serde_yaml::from_str("doctrine: hi\n").unwrap();
+        assert_eq!(config.doctrine.as_deref(), Some("hi"));
     }
 
     #[test]

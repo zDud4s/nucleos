@@ -74,8 +74,7 @@ impl Origin {
 fn doctrine_for(state: &crate::state::AppState, origin: Origin) -> Option<String> {
     match origin {
         Origin::Telegram => state.telegram_doctrine.clone(),
-        // A2 reads the per-channel yaml doctrine here (R2a)
-        Origin::Channel(_) => None,
+        Origin::Channel(id) => state.channels.config(id).and_then(|config| config.doctrine),
         Origin::Shell | Origin::Voice | Origin::BrowserPanel => None,
     }
 }
@@ -1492,10 +1491,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn doctrine_for_a_channel_is_none_until_a2_reads_the_yaml() {
+    async fn a_channel_turn_without_own_instructions_gets_the_channel_doctrine() {
+        use crate::channels::registry::ChannelConfig;
         let mut state = crate::channels::testkit::state().await;
         state.telegram_doctrine = Some("be brief".to_string());
+        // No config for the channel: no doctrine, and the legacy Telegram one is not borrowed.
         assert_eq!(doctrine_for(&state, Origin::Channel("telegram")), None);
+        let configs = std::collections::HashMap::from([(
+            "telegram",
+            ChannelConfig {
+                doctrine: Some("answer in one line".to_string()),
+                ..ChannelConfig::default()
+            },
+        )]);
+        state.channels =
+            std::sync::Arc::new(crate::channels::ChannelsRuntime::with_configs(configs));
+        assert_eq!(
+            doctrine_for(&state, Origin::Channel("telegram")),
+            Some("answer in one line".to_string())
+        );
         assert_eq!(
             doctrine_for(&state, Origin::Telegram),
             Some("be brief".to_string())

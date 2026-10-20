@@ -84,6 +84,8 @@ pub const CALENDAR_FILE: &str = "calendar.yaml";
 pub const WEB_FILE: &str = "web.yaml";
 pub const BROWSER_FILE: &str = "browser.yaml";
 pub const TELEGRAM_FILE: &str = "telegram.yaml";
+/// The Telegram channel's own settings, under the `channels/` subdirectory of [`root`].
+pub const CHANNEL_TELEGRAM_FILE: &str = "channels/telegram.yaml";
 pub const GITHUB_FILE: &str = "github.yaml";
 pub const COUNCIL_FILE: &str = "council.yaml";
 pub const ROUTER_FILE: &str = "router.yaml";
@@ -138,6 +140,14 @@ fn validate_telegram(contents: &str) -> Result<(), String> {
     crate::config::parse_telegram_config(contents).map(|_| ())
 }
 
+/// The per-channel file: the same grammar `registry::load_config` reads, but strict. The loader
+/// is fail-soft; the door must be able to say no.
+fn validate_channel_config(contents: &str) -> Result<(), String> {
+    serde_yaml::from_str::<crate::channels::registry::ChannelConfig>(contents)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn validate_github(contents: &str) -> Result<(), String> {
     crate::config::parse_github_config(contents).map(|_| ())
 }
@@ -182,7 +192,7 @@ fn validate_verify(contents: &str) -> Result<(), String> {
     crate::config::parse_verify_config(contents).map(|_| ())
 }
 
-/// This machine's settings files. Eleven rows, and the count is asserted in the tests for the same
+/// This machine's settings files. Twelve rows, and the count is asserted in the tests for the same
 /// reason the project registry asserts two: a row added without reading the header above is a row
 /// that has not answered the membership rule.
 pub static SETTINGS: &[Setting] = &[
@@ -227,6 +237,13 @@ pub static SETTINGS: &[Setting] = &[
         what: "the standing instructions a Telegram turn is launched with when the chat has none of its own",
         takes_effect: "when the daemon restarts",
         validate: validate_telegram,
+    },
+    Setting {
+        path: CHANNEL_TELEGRAM_FILE,
+        area: "channels/telegram",
+        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in (the older telegram area keeps the bot token and chat id until the channel migration)",
+        takes_effect: "when the daemon restarts",
+        validate: validate_channel_config,
     },
     Setting {
         path: GITHUB_FILE,
@@ -477,7 +494,7 @@ mod tests {
     fn every_setting_can_refuse_and_says_what_it_changes() {
         assert_eq!(
             SETTINGS.len(),
-            11,
+            12,
             "see the module header before adding a row"
         );
         for setting in SETTINGS {
@@ -494,6 +511,44 @@ mod tests {
             assert!(
                 !setting.takes_effect.is_empty(),
                 "{} must say when a write starts mattering",
+                setting.path
+            );
+        }
+    }
+
+    /// The table has the twelve rows the header counts; the pin above names the guard, this one
+    /// names the count.
+    #[test]
+    fn the_settings_table_has_twelve_rows() {
+        assert_eq!(SETTINGS.len(), 12);
+    }
+
+    /// Every production channel manifest has exactly one row, keyed by its `settings_area` and
+    /// naming `<settings_file>.yaml`.
+    #[test]
+    fn machine_config_has_one_channel_area_per_manifest() {
+        for manifest in crate::channels::registry::PROD_MANIFESTS {
+            let rows: Vec<&Setting> = SETTINGS
+                .iter()
+                .filter(|setting| setting.area == manifest.settings_area)
+                .collect();
+            assert_eq!(rows.len(), 1, "{} needs exactly one row", manifest.id);
+            assert_eq!(
+                rows[0].path,
+                format!("{}.yaml", manifest.settings_file),
+                "{} row must name the manifest's file",
+                manifest.id
+            );
+        }
+    }
+
+    /// The page draws `what` for every row, so none may be empty.
+    #[test]
+    fn every_machine_setting_has_a_non_empty_what() {
+        for setting in SETTINGS {
+            assert!(
+                !setting.what.trim().is_empty(),
+                "{} must say what it changes",
                 setting.path
             );
         }
@@ -741,7 +796,8 @@ url: http://example.com:8080
         );
     }
 
-    /// Every row is a bare file name under the root, and a person is shown it as `~/.nucleos/...`.
+    /// Every row is a relative file under the root (a per-channel row sits one directory down, in
+    /// `channels/`), and a person is shown it as `~/.nucleos/...`.
     ///
     /// The absence is asserted as hard as the presence, like the council's own test: a row that
     /// reached back for `.ai/` would be a setting that exists once per checkout again.
@@ -749,8 +805,13 @@ url: http://example.com:8080
     fn every_row_is_a_file_under_the_root_and_is_shown_with_a_tilde() {
         for setting in SETTINGS {
             assert!(
-                !setting.path.contains(['/', '\\']),
-                "{} must be a file name relative to the root",
+                !setting.path.contains('\\')
+                    && !setting.path.starts_with('/')
+                    && !setting
+                        .path
+                        .split('/')
+                        .any(|part| part.is_empty() || part == ".."),
+                "{} must be a file path relative to the root",
                 setting.path
             );
             assert_eq!(

@@ -5,6 +5,8 @@ use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 
 mod decide;
 pub use decide::*;
+#[cfg(test)]
+mod wake_guard;
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Proposal {
