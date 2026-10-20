@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::RngExt;
 use sqlx::SqlitePool;
 
+use crate::channels::contract::InPart;
 use crate::channels::registry;
 use crate::state::AppState;
 
@@ -181,9 +182,276 @@ pub async fn prune(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
     Ok(result.rows_affected())
 }
 
+/// What a message becomes for the turn (§7.1 `media.rs`).
+#[derive(Debug, Default)]
+pub struct TurnInput {
+    /// Text parts, captions, transcripts and "file at <path>" lines, in order.
+    pub text: String,
+    /// Within `MAX_IMAGES` / `MAX_IMAGE_CHARS`; the excess goes as files.
+    pub images: Vec<crate::execution::runner::Attachment>,
+    /// True when any part came from a transcript: commands never fire from it.
+    pub transcribed: bool,
+    /// True when the message held anything but typed text (captures refuse it).
+    pub non_text: bool,
+    /// Parts that could not be used, answered with `strings::Text::Unsupported`.
+    pub refused: Vec<String>,
+}
+
+/// The media types an image block may claim; the same four as `send.rs`' `IMAGE_MEDIA_TYPES`,
+/// which is not visible from here. Anything else goes to the turn as a file.
+const IMAGE_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+fn push_line(text: &mut String, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(line);
+}
+
+/// A stored id and its bytes, or `None` when either is gone (a refused part, never fatal).
+async fn load(state: &AppState, channel: &str, media_id: &str) -> Option<(StoredMedia, Vec<u8>)> {
+    let stored = open(state, channel, media_id).await.ok()?;
+    let bytes = tokio::fs::read(&stored.path).await.ok()?;
+    Some((stored, bytes))
+}
+
+/// Transcribes audio through `state.voice.transcriber`. `None` = no transcriber, an unusable
+/// container, a failure or silence; the caller refuses the part.
+async fn transcribe(
+    state: &AppState,
+    stored: &StoredMedia,
+    bytes: &[u8],
+    duration_ms: Option<u64>,
+) -> Option<String> {
+    let transcriber = state.voice.transcriber.as_ref()?;
+    let extension = crate::transcribe::extension_for(Some(extension_of(&stored.mime)))?;
+    let duration = std::time::Duration::from_millis(duration_ms.unwrap_or(0));
+    let heard = transcriber
+        .transcribe(bytes, extension, duration)
+        .await
+        .ok()?;
+    let heard = heard.trim();
+    (!heard.is_empty()).then(|| heard.to_string())
+}
+
+/// Turns the parts of an inbound message into what the turn takes. No transcriber, a missing
+/// media id or an unreadable file is a refused part, not an error.
+pub async fn to_turn_input(state: &AppState, channel: &'static str, parts: &[InPart]) -> TurnInput {
+    use base64::Engine;
+
+    let mut input = TurnInput::default();
+    for part in parts {
+        match part {
+            InPart::Text { text } => push_line(&mut input.text, text),
+            InPart::Audio {
+                media, duration_ms, ..
+            } => {
+                input.non_text = true;
+                let heard = match load(state, channel, media).await {
+                    Some((stored, bytes)) => transcribe(state, &stored, &bytes, *duration_ms).await,
+                    None => None,
+                };
+                match heard {
+                    Some(text) => {
+                        input.transcribed = true;
+                        push_line(&mut input.text, &text);
+                    }
+                    None => input.refused.push("audio".to_string()),
+                }
+            }
+            InPart::Image { media, caption } => {
+                input.non_text = true;
+                let Some((stored, bytes)) = load(state, channel, media).await else {
+                    input.refused.push("image".to_string());
+                    continue;
+                };
+                if let Some(caption) = caption {
+                    push_line(&mut input.text, caption);
+                }
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let media_type = stored.mime.split(';').next().unwrap_or("").trim();
+                if input.images.len() < crate::assistant::MAX_IMAGES
+                    && data.len() <= crate::assistant::MAX_IMAGE_CHARS
+                    && IMAGE_MEDIA_TYPES.contains(&media_type)
+                {
+                    input.images.push(crate::execution::runner::Attachment {
+                        media_type: media_type.to_string(),
+                        data,
+                    });
+                } else {
+                    push_line(&mut input.text, &format!("file at {}", stored.relative));
+                }
+            }
+            InPart::File { media, caption, .. } => {
+                input.non_text = true;
+                let Some((stored, _)) = load(state, channel, media).await else {
+                    input.refused.push("file".to_string());
+                    continue;
+                };
+                if let Some(caption) = caption {
+                    push_line(&mut input.text, caption);
+                }
+                push_line(&mut input.text, &format!("file at {}", stored.relative));
+            }
+            InPart::Unsupported { label } => {
+                input.non_text = true;
+                input.refused.push(label.clone());
+            }
+        }
+    }
+    input
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod turn_input {
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::transcribe::FakeTranscriber;
+
+        async fn stored(state: &AppState, mime: &str, bytes: &[u8]) -> String {
+            store(state, "fake", mime, bytes, Utc::now()).await.unwrap()
+        }
+
+        fn with_transcriber(state: &mut AppState, text: &str) {
+            state.voice = Arc::new(crate::integrations::voice::VoiceRuntime {
+                transcriber: Some(Arc::new(FakeTranscriber::returning(text))),
+                ..Default::default()
+            });
+        }
+
+        #[tokio::test]
+        async fn typed_text_passes_through() {
+            let (state, _dir) = state_with_root().await;
+            let parts = [
+                InPart::Text { text: "one".into() },
+                InPart::Text { text: "two".into() },
+            ];
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.text, "one\ntwo");
+            assert!(!input.non_text && !input.transcribed);
+            assert!(input.images.is_empty() && input.refused.is_empty());
+        }
+
+        #[tokio::test]
+        async fn audio_is_transcribed_and_flags_transcribed() {
+            let (mut state, _dir) = state_with_root().await;
+            with_transcriber(&mut state, "  what time is it  ");
+            let media = stored(&state, "audio/ogg", b"ogg").await;
+            let parts = [InPart::Audio {
+                media,
+                mime: "audio/ogg".into(),
+                duration_ms: Some(1500),
+            }];
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.text, "what time is it");
+            assert!(input.transcribed && input.non_text);
+            assert!(input.refused.is_empty());
+        }
+
+        #[tokio::test]
+        async fn no_transcriber_refuses_the_audio_part() {
+            let (state, _dir) = state_with_root().await;
+            let media = stored(&state, "audio/ogg", b"ogg").await;
+            let parts = [InPart::Audio {
+                media,
+                mime: "audio/ogg".into(),
+                duration_ms: None,
+            }];
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.refused, vec!["audio".to_string()]);
+            assert!(input.non_text && !input.transcribed);
+            assert!(input.text.is_empty());
+        }
+
+        #[tokio::test]
+        async fn images_within_limits_become_attachments() {
+            let (state, _dir) = state_with_root().await;
+            let media = stored(&state, "image/png", b"png-bytes").await;
+            let parts = [InPart::Image {
+                media,
+                caption: Some("look".into()),
+            }];
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.text, "look");
+            assert_eq!(input.images.len(), 1);
+            assert_eq!(input.images[0].media_type, "image/png");
+            assert_eq!(input.images[0].data, "cG5nLWJ5dGVz");
+            assert!(input.non_text);
+        }
+
+        #[tokio::test]
+        async fn the_sixth_image_goes_as_a_file() {
+            let (state, _dir) = state_with_root().await;
+            let mut parts = Vec::new();
+            let mut last = String::new();
+            for _ in 0..=crate::assistant::MAX_IMAGES {
+                last = stored(&state, "image/png", b"png-bytes").await;
+                parts.push(InPart::Image {
+                    media: last.clone(),
+                    caption: None,
+                });
+            }
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.images.len(), crate::assistant::MAX_IMAGES);
+            let relative = open(&state, "fake", &last).await.unwrap().relative;
+            assert_eq!(input.text, format!("file at {relative}"));
+        }
+
+        #[tokio::test]
+        async fn a_file_becomes_a_path_line() {
+            let (state, _dir) = state_with_root().await;
+            let media = stored(&state, "application/pdf", b"pdf").await;
+            let relative = open(&state, "fake", &media).await.unwrap().relative;
+            let parts = [InPart::File {
+                media,
+                name: Some("a.pdf".into()),
+                caption: Some("the report".into()),
+            }];
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.text, format!("the report\nfile at {relative}"));
+            assert!(input.non_text && input.images.is_empty());
+        }
+
+        #[tokio::test]
+        async fn unsupported_parts_are_listed_in_refused() {
+            let (state, _dir) = state_with_root().await;
+            let parts = [
+                InPart::Unsupported {
+                    label: "sticker".into(),
+                },
+                InPart::Text { text: "hi".into() },
+            ];
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.refused, vec!["sticker".to_string()]);
+            assert_eq!(input.text, "hi");
+            assert!(input.non_text);
+        }
+
+        #[tokio::test]
+        async fn a_missing_media_id_is_refused_not_fatal() {
+            let (state, _dir) = state_with_root().await;
+            let parts = [
+                InPart::Image {
+                    media: "m_nope".into(),
+                    caption: None,
+                },
+                InPart::Text {
+                    text: "still here".into(),
+                },
+            ];
+            let input = to_turn_input(&state, "fake", &parts).await;
+            assert_eq!(input.refused, vec!["image".to_string()]);
+            assert_eq!(input.text, "still here");
+            assert!(input.images.is_empty() && input.non_text);
+        }
+    }
 
     async fn state_with_root() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

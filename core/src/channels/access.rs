@@ -7,6 +7,13 @@ use axum::routing::{delete, get, put};
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::SqlitePool;
 
+mod pairing;
+
+pub use pairing::{
+    MintedCode, PairOutcome, PairedIdentity, PairingStatus, cancel_pairing, mint_pairing_code,
+    pair, pairing_status,
+};
+
 use super::{contract, registry};
 use crate::state::AppState;
 

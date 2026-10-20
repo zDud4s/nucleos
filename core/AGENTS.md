@@ -267,7 +267,7 @@ the contract, not a snapshot.
 | `channels/commands.rs` | Chat commands: the `Intent` type and the router that maps a chat message to one. |
 | `channels/conformance.rs` | Test-only: contract conformance scenarios. |
 | `channels/contract.rs` | Channel contract types: the shapes adapters and the núcleo exchange. |
-| `channels/contract/decode.rs` | Strict decoding of the adapter contract. |
+| `channels/contract/decode.rs` | Strict two-stage decoding of the adapter contract (hello, ack, error, media, event and event_response shapes) and the valid event -> `InboundEvent` conversion. |
 | `channels/fake.rs` | Test-only: a fake adapter used by the contract scenarios. |
 | `channels/ingest.rs` | Adapter ingest: `hello` and `events`. |
 | `channels/media.rs` | Media bytes, transcription and turn input. |

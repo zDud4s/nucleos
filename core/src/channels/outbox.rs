@@ -5,6 +5,8 @@ mod ack;
 mod degrade;
 mod lease;
 
+pub use lease::lease;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
