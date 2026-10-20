@@ -173,7 +173,7 @@ describe("ChannelCard", () => {
   it("explains incompatible as a refused contract that needs an adapter update", async () => {
     await renderWithRouter(<ChannelCard channel={{ ...telegram, state: "incompatible" }} primary={null} />);
     expect(screen.getByText("incompatible")).toBeTruthy();
-    expect(screen.getByText(/contract the núcleo refused/)).toBeTruthy();
+    expect(screen.getByText(/contract the background service refused/)).toBeTruthy();
     expect(screen.getByText(/update the adapter/i)).toBeTruthy();
   });
 

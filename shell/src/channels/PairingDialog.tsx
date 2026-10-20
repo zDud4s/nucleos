@@ -139,7 +139,7 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
       {code === null && error === null && <p role="status">asking for a code…</p>}
       {error instanceof ApiRefusal && <RefusalNote refusal={error} sentences={SENTENCES} />}
       {error !== null && !(error instanceof ApiRefusal) && (
-        <ErrorNote>the {DAEMON_NAME} did not answer the request for a code</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} could not be reached for a code; check that it is running, then try again</ErrorNote>
       )}
       {code !== null && status.data?.state === "paired" && (
         <div className="pairing-done" role="status">
@@ -180,7 +180,7 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
               <Button onClick={again}>Get a new code</Button>
             </div>
           )}
-          {status.isError && <ErrorNote>the {DAEMON_NAME} did not answer the status request</ErrorNote>}
+          {status.isError && <ErrorNote>the {DAEMON_NAME} could not be reached for the pairing status; check that it is running</ErrorNote>}
           {channel.state === "offline" && (
             <p>the bot only answers when the adapter is back online; the code is valid until then</p>
           )}

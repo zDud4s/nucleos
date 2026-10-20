@@ -328,7 +328,7 @@ describe("PairingDialog", () => {
       );
       open();
       await flush();
-      expect(screen.getByText(/did not answer the status request/i)).toBeTruthy();
+      expect(screen.getByText(/could not be reached for the pairing status/i)).toBeTruthy();
       expect(screen.getByText("/pair 482913")).toBeTruthy();
     });
   });

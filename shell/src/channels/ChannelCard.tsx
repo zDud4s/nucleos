@@ -21,7 +21,7 @@ const STATE: Record<ChannelState, { label: string; sentence: string }> = {
   incompatible: {
     label: "incompatible",
     sentence:
-      "the adapter spoke a contract the núcleo refused (409 contract_version): update the adapter, then restart it",
+      "the adapter spoke a contract the background service refused (409 contract_version): update the adapter, then restart it",
   },
 };
 
