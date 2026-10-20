@@ -86,7 +86,9 @@ func ToHTML(md string) string {
 
 // Chunk splits s into pieces each no longer than limit runes, breaking preferentially at newline
 // boundaries and never inside a <pre>...</pre> block. Oversized pre blocks are closed and reopened
-// so every resulting chunk stays both balanced and under the limit.
+// so every resulting chunk stays both balanced and under the limit, and so is any other span (<b>,
+// <i>, <code>, <a href=...>) that a piece boundary lands inside: it is closed at the end of the piece
+// and reopened, with the same attributes, at the start of the next.
 func Chunk(s string, limit int) []string {
 	if s == "" {
 		return []string{""}
@@ -99,11 +101,14 @@ func Chunk(s string, limit int) []string {
 	chunks := make([]string, 0, (utf8.RuneCountInString(s)/limit)+1)
 	current := ""
 	currentLen := 0
+	// spans is what is left open at the end of current, outermost first.
+	var spans []span
 
 	flush := func() {
 		if current == "" {
 			return
 		}
+		current += closers(spans)
 		chunks = append(chunks, current)
 		current = ""
 		currentLen = 0
@@ -125,23 +130,44 @@ func Chunk(s string, limit int) []string {
 
 		remaining := token.text
 		for remaining != "" {
-			available := limit - currentLen
-			if available == 0 {
+			if current == "" && len(spans) > 0 {
+				current = reopeners(spans)
+				currentLen = utf8.RuneCountInString(current)
+			}
+
+			available := limit - currentLen - utf8.RuneCountInString(closers(spans))
+			if available <= 0 {
 				flush()
-				available = limit
+				continue
 			}
 
-			if utf8.RuneCountInString(remaining) <= available {
-				current += remaining
-				currentLen += utf8.RuneCountInString(remaining)
-				break
+			// Take as much of remaining as fits together with the closers of whatever it leaves open.
+			var prefix, rest string
+			for {
+				if utf8.RuneCountInString(remaining) <= available {
+					prefix, rest = remaining, ""
+				} else {
+					prefix, rest = splitTextAt(remaining, available)
+				}
+				after := applyTags(spans, prefix)
+				if 2*overhead(after) > limit {
+					// Reopening and closing would eat most of every piece (a long href in a tiny limit):
+					// stop balancing, and cut the way a plain run of text is cut.
+					after = nil
+				}
+				over := currentLen + utf8.RuneCountInString(prefix) + utf8.RuneCountInString(closers(after)) - limit
+				if over <= 0 || available-over <= 0 {
+					spans = after
+					break
+				}
+				available -= over
 			}
-
-			prefix, rest := splitTextAt(remaining, available)
 			current += prefix
 			currentLen += utf8.RuneCountInString(prefix)
-			flush()
 			remaining = rest
+			if remaining != "" {
+				flush()
+			}
 		}
 	}
 
@@ -150,6 +176,56 @@ func Chunk(s string, limit int) []string {
 		return []string{""}
 	}
 	return chunks
+}
+
+// span is an inline element opened in a chunk: its name and the exact text that opened it.
+type span struct {
+	name string
+	open string
+}
+
+var spanTagPattern = regexp.MustCompile(`<(/?)([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?>`)
+
+// applyTags returns the spans still open after text, given those open before it. A closing tag that does
+// not match the innermost open span is ignored, and <pre> is never tracked: tokenizePreBlocks owns it.
+func applyTags(before []span, text string) []span {
+	out := append([]span(nil), before...)
+	for _, m := range spanTagPattern.FindAllStringSubmatch(text, -1) {
+		name := strings.ToLower(m[2])
+		if name == "pre" {
+			continue
+		}
+		if m[1] == "" {
+			out = append(out, span{name: name, open: m[0]})
+		} else if len(out) > 0 && out[len(out)-1].name == name {
+			out = out[:len(out)-1]
+		}
+	}
+	return out
+}
+
+// overhead is what balancing the open spans costs in every piece: the tags that reopen them and those
+// that close them again.
+func overhead(open []span) int {
+	return utf8.RuneCountInString(reopeners(open)) + utf8.RuneCountInString(closers(open))
+}
+
+// closers closes the open spans, innermost first.
+func closers(open []span) string {
+	var b strings.Builder
+	for i := len(open) - 1; i >= 0; i-- {
+		b.WriteString("</" + open[i].name + ">")
+	}
+	return b.String()
+}
+
+// reopeners opens the spans again, outermost first, with their original attributes.
+func reopeners(open []span) string {
+	var b strings.Builder
+	for _, t := range open {
+		b.WriteString(t.open)
+	}
+	return b.String()
 }
 
 // StripTags removes HTML tags and unescapes the basic entities, for the plain-text fallback when a
