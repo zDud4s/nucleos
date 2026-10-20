@@ -329,7 +329,8 @@ func TestMediaInFullMessageMatchesFixture(t *testing.T) {
 		Chat:            telegram.Chat{ID: -100123, Type: "supergroup"},
 		MessageThreadID: 5,
 		IsTopicMessage:  true,
-		From:            &telegram.User{ID: 4242},
+		From:            &telegram.User{ID: 4242, FirstName: "Duarte"},
+		Date:            fixtureAt(t, eventFixture(t, "message-full")),
 		Text:            "Vê isto e diz-me o que achas",
 		Caption:         "legenda",
 		ReplyToMessage:  &telegram.Message{MessageID: 987},
@@ -348,10 +349,10 @@ func TestMediaInFullMessageMatchesFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := withoutSenderName(eventFixture(t, "message-full"))
-	want.At = nil
-	// A Telegram message has a single caption, shared by its media; the fixture gives each part its own,
-	// and the 4100 ms voice is 4 whole seconds on the wire.
+	want := eventFixture(t, "message-full")
+	// A Telegram message has a single caption, shared by its image and file; the fixture gives each part
+	// its own, and the 4100 ms voice is 4 whole seconds on the wire. The audio part has no caption field
+	// in the contract, so it carries none.
 	parts := append([]contract.InPart(nil), want.Message.Parts...)
 	for i := range parts {
 		switch *parts[i].Type {

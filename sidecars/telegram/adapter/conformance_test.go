@@ -2,9 +2,12 @@ package adapter
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"nucleoschannelkit/contract"
 	"nucleoschannelkit/contract/fixtures"
@@ -147,7 +150,8 @@ var conformEvents = map[string]func(t *testing.T) contract.Event{
 		msg := &telegram.Message{
 			MessageID: 12,
 			Chat:      telegram.Chat{ID: -100777, Type: "group"},
-			From:      &telegram.User{ID: 4242},
+			From:      &telegram.User{ID: 4242, FirstName: "Duarte"},
+			Date:      time.Date(2026, 10, 19, 9, 31, 0, 0, time.UTC).Unix(),
 			Photo:     []telegram.PhotoSize{{FileID: "p", Width: 10, Height: 10}},
 		}
 		ev, needsMedia, ok := Inbound(telegram.Update{UpdateID: 88125, Message: msg})
@@ -192,6 +196,24 @@ var conformEvents = map[string]func(t *testing.T) contract.Event{
 		}
 		return ev
 	},
+}
+
+// The group-image fixture spells its "at" with a +01:00 offset; the adapter emits the same instant in UTC,
+// and carries the sender's name.
+func TestConformanceGroupImageMatchesFixture(t *testing.T) {
+	got := conformEvents["events/message-group-image.json"](t)
+	want := utcAt(t, eventFixture(t, "message-group-image"))
+	// The fixture gives the image a mime that message-full's image lacks; the adapter sends none.
+	parts := append([]contract.InPart(nil), want.Message.Parts...)
+	parts[0].Mime = nil
+	m := *want.Message
+	m.Parts = parts
+	want.Message = &m
+	if !reflect.DeepEqual(got, want) {
+		gj, _ := json.MarshalIndent(got, "", " ")
+		wj, _ := json.MarshalIndent(want, "", " ")
+		t.Fatalf("event differs:\n got %s\nwant %s", gj, wj)
+	}
 }
 
 func TestConformanceInboundEventsDecodeStrict(t *testing.T) {

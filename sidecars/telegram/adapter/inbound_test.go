@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"reflect"
 	"testing"
+	"time"
 
 	"nucleoschannelkit/contract"
 	"nucleoschannelkit/contract/fixtures"
@@ -24,11 +25,22 @@ func eventFixture(t *testing.T, name string) contract.Event {
 	return ev
 }
 
-// withoutSenderName drops what a telegram.Update cannot carry: the v1 User type has no display name.
-func withoutSenderName(ev contract.Event) contract.Event {
-	s := *ev.Sender
-	s.Name = nil
-	ev.Sender = &s
+// fixtureAt is the instant of the fixture's "at" as Telegram would send it: whole unix seconds.
+func fixtureAt(t *testing.T, ev contract.Event) int64 {
+	t.Helper()
+	at, err := time.Parse(time.RFC3339, *ev.At)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return at.Unix()
+}
+
+// utcAt rewrites the fixture's "at" to RFC3339 UTC, the one form the adapter emits, whatever offset the
+// fixture spells it with.
+func utcAt(t *testing.T, ev contract.Event) contract.Event {
+	t.Helper()
+	at := time.Unix(fixtureAt(t, ev), 0).UTC().Format(time.RFC3339)
+	ev.At = &at
 	return ev
 }
 
@@ -39,6 +51,55 @@ func privateText(updateID, messageID int64, text string) telegram.Update {
 		From:      &telegram.User{ID: 4242},
 		Text:      text,
 	}}
+}
+
+func withFirstName(u telegram.Update, name string) telegram.Update {
+	from := *u.Message.From
+	from.FirstName = name
+	u.Message.From = &from
+	return u
+}
+
+func TestInboundSenderNameComposition(t *testing.T) {
+	cases := []struct {
+		first, last, user string
+		want              *string
+	}{
+		{"Duarte", "", "", str("Duarte")},
+		{"Duarte", "Ferreira", "dudas", str("Duarte Ferreira")},
+		{"", "Ferreira", "", str("Ferreira")},
+		{"", "", "dudas", str("dudas")},
+		{"  ", "", "", nil},
+		{"", "", "", nil},
+	}
+	for _, c := range cases {
+		u := privateText(1, 2, "hi")
+		u.Message.From.FirstName, u.Message.From.LastName, u.Message.From.Username = c.first, c.last, c.user
+		got, _, ok := Inbound(u)
+		if !ok {
+			t.Fatal("dropped")
+		}
+		switch {
+		case c.want == nil && got.Sender.Name != nil:
+			t.Errorf("%+v: name = %q, want none", c, *got.Sender.Name)
+		case c.want != nil && (got.Sender.Name == nil || *got.Sender.Name != *c.want):
+			t.Errorf("%+v: name = %v, want %q", c, got.Sender.Name, *c.want)
+		}
+		assertDecodes(t, got)
+	}
+}
+
+func TestInboundAtIsRFC3339UTCFromUnixDate(t *testing.T) {
+	u := privateText(1, 2, "hi")
+	u.Message.Date = time.Date(2026, 10, 19, 10, 31, 0, 0, time.FixedZone("x", 3600)).Unix()
+	got, _, _ := Inbound(u)
+	if got.At == nil || *got.At != "2026-10-19T09:31:00Z" {
+		t.Fatalf("at = %v", got.At)
+	}
+	assertDecodes(t, got)
+	if none, _, _ := Inbound(privateText(1, 2, "hi")); none.At != nil {
+		t.Fatalf("a message without a date must carry no at, got %q", *none.At)
+	}
 }
 
 func TestInboundTextPrivate(t *testing.T) {
@@ -52,11 +113,11 @@ func TestInboundTextPrivate(t *testing.T) {
 }
 
 func TestInboundTextPairPassesRaw(t *testing.T) {
-	got, _, ok := Inbound(privateText(88126, 993, "/pair 483920"))
+	got, _, ok := Inbound(withFirstName(privateText(88126, 993, "/pair 483920"), "Duarte"))
 	if !ok {
 		t.Fatal("dropped")
 	}
-	want := withoutSenderName(eventFixture(t, "message-pair"))
+	want := eventFixture(t, "message-pair")
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("event differs:\n got %+v\nwant %+v", got, want)
 	}
@@ -79,7 +140,8 @@ func TestInboundThreadWithReply(t *testing.T) {
 		Chat:            telegram.Chat{ID: -100123, Type: "supergroup"},
 		MessageThreadID: 5,
 		IsTopicMessage:  true,
-		From:            &telegram.User{ID: 4242},
+		From:            &telegram.User{ID: 4242, FirstName: "Duarte"},
+		Date:            fixtureAt(t, eventFixture(t, "message-full")),
 		Text:            "Vê isto e diz-me o que achas",
 		ReplyToMessage:  &telegram.Message{MessageID: 987},
 		Sticker:         &telegram.Sticker{FileID: "s"},
@@ -88,8 +150,7 @@ func TestInboundThreadWithReply(t *testing.T) {
 	if !ok {
 		t.Fatal("dropped")
 	}
-	want := withoutSenderName(eventFixture(t, "message-full"))
-	want.At = nil
+	want := eventFixture(t, "message-full")
 	// Media parts are attached by AttachMedia, not by Inbound.
 	var parts []contract.InPart
 	for _, p := range want.Message.Parts {

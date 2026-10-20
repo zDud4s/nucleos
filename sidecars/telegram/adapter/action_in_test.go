@@ -15,7 +15,7 @@ func callbackQuery(data string) telegram.CallbackQuery {
 	return telegram.CallbackQuery{
 		ID:   "551",
 		Data: data,
-		From: telegram.User{ID: 4242},
+		From: telegram.User{ID: 4242, FirstName: "Duarte"},
 		Message: &telegram.Message{
 			MessageID:       990,
 			Chat:            telegram.Chat{ID: -100123, Type: "supergroup"},
@@ -32,7 +32,7 @@ func TestCallbackMatchesFixture(t *testing.T) {
 	if !ok {
 		t.Fatalf("dropped: %s", reason)
 	}
-	want := withoutSenderName(eventFixture(t, "action"))
+	want := eventFixture(t, "action")
 	want.At = nil // a callback query carries no timestamp
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("event differs:\n got %+v\nwant %+v", got, want)

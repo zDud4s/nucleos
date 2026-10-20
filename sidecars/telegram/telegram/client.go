@@ -46,6 +46,8 @@ type Message struct {
 	// without it would give every reply chain in an ordinary group a key of its own, and on the day
 	// that ships every one of those conversations loses its session.
 	IsTopicMessage bool `json:"is_topic_message"`
+	// Date is when Telegram received the message, in unix seconds; 0 when absent.
+	Date int64 `json:"date"`
 	// From is who typed it, which is not the same question as which chat it arrived in: a group
 	// chat id authorises a room, and a room's membership changes without anyone reconfiguring
 	// this sidecar.
@@ -229,6 +231,11 @@ type User struct {
 	// IsBot is mandatory in the Bot API. The sidecar never calls getMe, so it does not know its own
 	// id; "a bot wrote it" is what identifies a capture request in an authorised chat.
 	IsBot bool `json:"is_bot"`
+	// The display fields are optional in the Bot API (only first_name is mandatory). The v2 adapter
+	// composes the contract's sender.name from them; v1 never reads them.
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Username  string `json:"username"`
 }
 
 type Button struct {

@@ -2,6 +2,8 @@ package adapter
 
 import (
 	"strconv"
+	"strings"
+	"time"
 
 	"nucleoschannelkit/contract"
 
@@ -49,6 +51,7 @@ func Inbound(update telegram.Update) (ev contract.Event, needsMedia bool, ok boo
 	typ := "message"
 	return contract.Event{
 		EventID:      &eventID,
+		At:           messageTime(msg),
 		Conversation: conv,
 		Sender:       sender,
 		Type:         &typ,
@@ -86,7 +89,30 @@ func conversationAndSender(msg *telegram.Message) (*contract.Conversation, *cont
 		conv = &contract.Conversation{Ref: &ref, Kind: &thread, Parent: &parent}
 	}
 	sref := strconv.FormatInt(msg.From.ID, 10)
-	return conv, &contract.Sender{Ref: &sref}, true
+	return conv, &contract.Sender{Ref: &sref, Name: senderName(msg.From)}, true
+}
+
+// senderName is the display name the contract's sender.name carries: first and last name joined by a
+// space, else whichever of them is set, else the @username, else nil (the field is optional).
+func senderName(u *telegram.User) *string {
+	name := strings.TrimSpace(strings.TrimSpace(u.FirstName) + " " + strings.TrimSpace(u.LastName))
+	if name == "" {
+		name = strings.TrimSpace(u.Username)
+	}
+	if name == "" {
+		return nil
+	}
+	return &name
+}
+
+// messageTime is the message's date as the contract spells "at" (RFC3339, UTC), or nil when Telegram
+// sent none.
+func messageTime(msg *telegram.Message) *string {
+	if msg.Date <= 0 {
+		return nil
+	}
+	at := time.Unix(msg.Date, 0).UTC().Format(time.RFC3339)
+	return &at
 }
 
 // messageText is the text of a message, or its caption when it is media with an instruction.
