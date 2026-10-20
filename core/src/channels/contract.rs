@@ -9,6 +9,9 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod decode;
+pub use decode::*;
+
 pub const CONTRACT_VERSION: &str = "1.0.0";
 
 /// The largest `retry_after_ms` an adapter may report (24 h). Shared with the adapter kit.
