@@ -890,8 +890,17 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(paired, None, "the heard /pair must not run");
-        // It went to the turn as plain words instead.
-        assert_eq!(run_count(&st.pool, "telegram:voice-chat").await, 1);
+        // A heard command is said back (`route_transcript` -> `Refused`), never run and never sent
+        // to the turn.
+        assert_eq!(run_count(&st.pool, "telegram:voice-chat").await, 0);
+        let rows = outbox_rows(&st.pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            sent_text(&rows[0].1),
+            strings::render(&Text::HeardCommand {
+                text: minted.command.clone()
+            })
+        );
     }
 
     #[tokio::test]

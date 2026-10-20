@@ -8,6 +8,9 @@ use crate::channels::bus::{Cadence, ChannelsBus};
 use crate::channels::registry;
 use crate::state::AppState;
 
+mod policy;
+pub use policy::{PolicyError, channel_overrides, passes, put_channel_policy, resolved_policy};
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Wanted {
     pub feed: bool,
@@ -41,12 +44,6 @@ pub struct RouteReport {
     pub proposals: u32,
     pub kill: bool,
     pub budget: bool,
-}
-
-#[derive(Debug)]
-pub enum PolicyError {
-    Invalid(nucleos_base::notify_policy::ValidationError),
-    Db(sqlx::Error),
 }
 
 /// The routing loop, spawned once from `main.rs` when a channel instance exists. A2.
@@ -92,36 +89,5 @@ pub async fn advance_turn_watermark(
 
 /// Whether notifications have a destination now. A2.
 pub async fn routing_state(state: &AppState) -> sqlx::Result<registry::RoutingState> {
-    todo!()
-}
-
-/// Default rows merged with this channel's overrides. A2.
-pub async fn resolved_policy(
-    pool: &SqlitePool,
-    channel: Option<&str>,
-) -> sqlx::Result<nucleos_base::notify_policy::Policy> {
-    todo!()
-}
-
-/// The channel's own override rows only. A2.
-pub async fn channel_overrides(
-    pool: &SqlitePool,
-    channel: &str,
-) -> sqlx::Result<nucleos_base::notify_policy::Policy> {
-    todo!()
-}
-
-/// Longest family prefix + exact kind rules, fail-open. A2.
-pub fn passes(policy: &nucleos_base::notify_policy::Policy, kind: &str) -> bool {
-    todo!()
-}
-
-/// Replaces every override row of `channel` in one transaction. A2.
-pub async fn put_channel_policy(
-    pool: &SqlitePool,
-    channel: &str,
-    policy: &nucleos_base::notify_policy::Policy,
-    now: DateTime<Utc>,
-) -> Result<(), PolicyError> {
     todo!()
 }

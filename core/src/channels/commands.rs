@@ -5,7 +5,8 @@
 //! as annex D says. In A1 the placeholder `route` only ever yields `Pair` and `Chat`, and
 //! `capture_target` finds nothing, so `execute` and `answer_capture` are unreachable until A2.
 
-use super::{contract, ingest, media};
+use super::strings::{self, Text};
+use super::{contract, ingest, media, outbox};
 use crate::state::AppState;
 
 /// What a message asks for. Port of `shortcuts.Intent` plus the channel-only commands.
@@ -163,14 +164,66 @@ fn has_prefix_fold(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-/// Runs a command and enqueues its answer in the same conversation. A2: until then `route` never
-/// yields an intent that reaches here, so nothing in A1 calls it.
+/// Runs a command and enqueues its answer in the same conversation, through service functions only
+/// (no HTTP). C2a covers help, budget, proposals, projects and a refused voice command; the rest
+/// arrive with C2b (mail, inbox, note) and C3 (kill, cancel, approve, reject), and C4 (cap).
 pub async fn execute(
-    _state: &AppState,
-    _at: &ingest::Inbound<'_>,
-    _intent: Intent,
+    state: &AppState,
+    at: &ingest::Inbound<'_>,
+    intent: Intent,
 ) -> sqlx::Result<()> {
-    todo!()
+    let now = chrono::Utc::now();
+    let reply = match intent {
+        Intent::Help => strings::render(&Text::Help),
+        Intent::Budget => {
+            let snapshot = crate::governance::budget::snapshot(&state.pool, now).await?;
+            strings::render(&Text::Budget(snapshot))
+        }
+        Intent::Proposals => {
+            let pending = crate::proposals::list_pending(&state.pool).await?;
+            strings::render_proposals(&pending)
+        }
+        Intent::Proj { filter } => {
+            let roster = crate::governance::autopilot::project_roster(&state.pool).await?;
+            strings::render_projects(&roster, filter.as_deref())
+        }
+        Intent::Refused(text) => strings::render(&Text::HeardCommand { text }),
+        Intent::Pair(_) => {
+            // `ingest` runs `/pair` through `access::pair` before it reaches here.
+            tracing::error!("a pairing command reached commands::execute");
+            return Ok(());
+        }
+        Intent::Mail
+        | Intent::Inbox
+        | Intent::Note(_)
+        | Intent::Kill { .. }
+        | Intent::Cancel
+        | Intent::Cap { .. }
+        | Intent::Approve(_)
+        | Intent::Reject(_)
+        | Intent::Chat(_) => todo!(),
+    };
+    say(state, &at.key, reply, now).await
+}
+
+/// Queues a plain text answer in the conversation the command came from and wakes its channel.
+async fn say(
+    state: &AppState,
+    key: &contract::ConversationKey,
+    text: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<()> {
+    let action = outbox::NewAction::Send {
+        reply_to: None,
+        parts: vec![contract::OutPart::Text { text }],
+        buttons: None,
+        silent: false,
+    };
+    let mut conn = state.pool.acquire().await?;
+    outbox::enqueue(&mut conn, key, action, outbox::Class::Command, None, now).await?;
+    drop(conn);
+    outbox::wake(state, key.channel);
+    Ok(())
 }
 
 /// Which capture request a message answers, if any. Placeholder: A1 has no capture requests on the
@@ -330,5 +383,142 @@ mod tests {
         assert_eq!(route(""), chat(""));
         assert_eq!(route("héllo wörld"), chat("héllo wörld"));
         assert_eq!(route("ß"), chat("ß"));
+    }
+
+    fn conversation() -> contract::Conversation {
+        contract::Conversation {
+            reference: "c1".to_string(),
+            kind: contract::ConversationKind::Private,
+            parent: None,
+        }
+    }
+
+    fn sender() -> contract::Sender {
+        contract::Sender {
+            reference: "u1".to_string(),
+            name: None,
+        }
+    }
+
+    /// Runs `intent` as if it came from conversation `fake:c1`.
+    async fn run(state: &AppState, intent: Intent) {
+        let (conversation, sender) = (conversation(), sender());
+        let at = ingest::Inbound {
+            channel: "fake",
+            key: contract::ConversationKey::new("fake", "c1"),
+            conversation: &conversation,
+            sender: &sender,
+            message_ref: "m1",
+        };
+        execute(state, &at, intent).await.unwrap();
+    }
+
+    /// Every queued answer as (conversation, class, text), oldest first.
+    async fn queued(state: &AppState) -> Vec<(String, String, String)> {
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT conversation, class, payload FROM channel_outbox ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        rows.into_iter()
+            .map(|(conversation, class, payload)| {
+                let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                let text = payload["parts"][0]["text"].as_str().unwrap().to_string();
+                (conversation, class, text)
+            })
+            .collect()
+    }
+
+    async fn the_one_answer(state: &AppState) -> String {
+        let mut all = queued(state).await;
+        assert_eq!(all.len(), 1, "{all:?}");
+        let (conversation, class, text) = all.remove(0);
+        assert_eq!(conversation, "c1");
+        assert_eq!(class, "command");
+        text
+    }
+
+    #[tokio::test]
+    async fn execute_help_enqueues_the_help_text() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Help).await;
+        assert_eq!(the_one_answer(&state).await, strings::render(&Text::Help));
+    }
+
+    #[tokio::test]
+    async fn execute_budget_enqueues_the_snapshot() {
+        let state = crate::channels::testkit::state().await;
+        let snapshot = crate::governance::budget::snapshot(&state.pool, chrono::Utc::now())
+            .await
+            .unwrap();
+        run(&state, Intent::Budget).await;
+        let answer = the_one_answer(&state).await;
+        assert_eq!(answer, strings::render(&Text::Budget(snapshot)));
+        assert!(answer.starts_with("Budget ("), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn execute_proposals_empty_says_none() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Proposals).await;
+        assert_eq!(the_one_answer(&state).await, "No open proposals.");
+    }
+
+    #[tokio::test]
+    async fn execute_proposals_lists_the_pending_ones() {
+        let state = crate::channels::testkit::state().await;
+        // `list_pending` is the approvals queue: only `action-approval` rows count, so a
+        // contact-merge proposal would (rightly) not be listed.
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO proposals
+             (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input, created_at, decided_at)
+             VALUES ('action-approval', 'pending', NULL, NULL, NULL, 'Bash', 'same person', NULL, ?, NULL)
+             RETURNING id",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        run(&state, Intent::Proposals).await;
+        let answer = the_one_answer(&state).await;
+        assert!(
+            answer.contains(&format!("proposal {id} (action-approval): Bash")),
+            "{answer}"
+        );
+        assert!(answer.contains("same person"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn execute_proj_filter_applies() {
+        let state = crate::channels::testkit::state().await;
+        for project in ["alpha-app", "beta-tool"] {
+            sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES (?, 'off')")
+                .bind(project)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+        run(
+            &state,
+            Intent::Proj {
+                filter: Some("ALPHA".to_string()),
+            },
+        )
+        .await;
+        let answer = the_one_answer(&state).await;
+        assert!(answer.contains("alpha-app"), "{answer}");
+        assert!(!answer.contains("beta-tool"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn execute_refused_enqueues_the_heard_command_text() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Refused("kill off".to_string())).await;
+        assert_eq!(
+            the_one_answer(&state).await,
+            strings::render(&Text::HeardCommand {
+                text: "kill off".to_string()
+            })
+        );
     }
 }
