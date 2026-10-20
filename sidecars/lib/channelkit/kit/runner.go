@@ -29,6 +29,33 @@ type Runner struct {
 	// ShutdownGrace bounds how long Run, once its context is cancelled, waits for
 	// in-flight executions and their final acks. Zero means DefaultShutdownGrace.
 	ShutdownGrace time.Duration
+
+	leaseMu sync.Mutex
+	leases  map[uint64]*Lease // renewal of every in-flight action, by action id
+}
+
+// trackLease records the lease of an in-flight action.
+func (r *Runner) trackLease(id uint64, l *Lease) {
+	r.leaseMu.Lock()
+	defer r.leaseMu.Unlock()
+	if r.leases == nil {
+		r.leases = make(map[uint64]*Lease)
+	}
+	r.leases[id] = l
+}
+
+// untrackLease forgets the lease of an action that finished.
+func (r *Runner) untrackLease(id uint64) {
+	r.leaseMu.Lock()
+	defer r.leaseMu.Unlock()
+	delete(r.leases, id)
+}
+
+// leaseOf returns the lease of an in-flight action, or nil.
+func (r *Runner) leaseOf(id uint64) *Lease {
+	r.leaseMu.Lock()
+	defer r.leaseMu.Unlock()
+	return r.leases[id]
 }
 
 // Run polls the outbox until ctx ends or the core answers with a fatal status.
@@ -113,7 +140,13 @@ func (r *Runner) dispatch(ctx, hard context.Context, wg *sync.WaitGroup, client 
 	}
 	key := strconv.FormatUint(it.ID, 10)
 	if !r.Inflight.TryAdd(key) {
-		// Redelivered while still running: the execution in flight settles it.
+		// Redelivered while still running: the execution in flight settles it. The
+		// core leased it afresh, though, and nobody renews that new lease unless the
+		// old renewal had already given up, so restart it.
+		r.Stats.RedeliveredSkipped.Add(1)
+		if l := r.leaseOf(it.ID); l != nil {
+			l.Resume()
+		}
 		return
 	}
 	wg.Add(1)

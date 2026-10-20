@@ -42,6 +42,8 @@ func (r *Runner) runAction(ctx, hard context.Context, client *Client, caps contr
 		}
 	}
 	lease := NewRenewer(client).Start(hard, id)
+	r.trackLease(id, lease)
+	defer r.untrackLease(id)
 	defer lease.Stop()
 
 	r.Stats.Executions.Add(1)
