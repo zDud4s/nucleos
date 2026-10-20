@@ -11,8 +11,15 @@ vi.mock("../data/client", async (original) => ({
 
 import { NotificationsView } from "./NotificationsView";
 import { ApiRefusal } from "../data/client";
-import type { NotifyPolicy } from "../data/feed";
+import { mergePolicy, type ChannelNotifyPolicy, type NotifyPolicy } from "../data/feed";
+import { QueryClientProvider } from "@tanstack/react-query";
+import type { ReactElement } from "react";
 import { renderWithQuery } from "../test/harness";
+
+/** Swap the rendered tree while keeping the same query client (the harness wraps it once). */
+function rerenderWith(view: ReturnType<typeof renderWithQuery>, ui: ReactElement) {
+  view.rerender(<QueryClientProvider client={view.queryClient}>{ui}</QueryClientProvider>);
+}
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -205,6 +212,331 @@ describe("the notifications view", () => {
     renderWithQuery(<NotificationsView />);
 
     expect(await screen.findByText(/nothing is known about the notification policy/i)).toBeDefined();
+  });
+
+  describe("the channel scope selector", () => {
+    const channel = (id: string, label: string, configured: boolean) => ({
+      id,
+      kind: id,
+      label,
+      health_row: id,
+      configured,
+      missing_secrets: [],
+      settings_area: id,
+      state: configured ? "online" : "not_configured",
+      since: null,
+      adapter: null,
+      capabilities: null,
+      home: null,
+      identities: { senders: 0, conversations: 0 },
+      pairing: null,
+      outbox: { pending: 0, leased: 0, failed: 0, oldest_due_at: null },
+      drops: { unknown_sender: 0, pairing_failures: 0, counted_since: "2026-10-19T00:00:00Z" },
+    });
+    const READOUT = {
+      contract_version: "1",
+      primary: "telegram",
+      routing: { state: "ok" },
+      channels: [
+        channel("telegram", "Telegram", true),
+        channel("email", "Email", true),
+        channel("matrix", "Matrix", false),
+      ],
+    };
+
+    /** `serve`, plus `GET /channels` answered by `channels` (a function, so a test can fail or stall it). */
+    function serveWithChannels(channels: () => unknown) {
+      serve({ families: [], kinds: [] }, OBSERVED);
+      const base = daemon.apiFetch.getMockImplementation()!;
+      daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+        if (path === "/channels") return channels();
+        // Channel mode (chunk 10) reads the channel's own policy; an empty one is enough here.
+        if (path.startsWith("/notifications/policy?channel=")) {
+          const empty = { families: [], kinds: [] };
+          return { channel: "telegram", primary: true, default: empty, overrides: empty, resolved: empty };
+        }
+        return base(path, init);
+      });
+    }
+
+    it("titles the panel neutrally", async () => {
+      serve({ families: [], kinds: [] }, OBSERVED);
+      renderWithQuery(<NotificationsView />);
+      expect(await screen.findByText("Notifications")).toBeDefined();
+      expect(screen.queryByText("Telegram notifications")).toBeNull();
+    });
+
+    it("draws no selector without onChannelChange", async () => {
+      serve({ families: [], kinds: [] }, OBSERVED);
+      renderWithQuery(<NotificationsView />);
+      await screen.findByText("jobs");
+      expect(screen.queryByLabelText(/channel/i)).toBeNull();
+    });
+
+    it("offers Default and the configured channels, marking the primary", async () => {
+      serveWithChannels(() => READOUT);
+      renderWithQuery(<NotificationsView onChannelChange={vi.fn()} />);
+
+      await screen.findByText("jobs");
+      await waitFor(() =>
+        expect((screen.getByLabelText(/channel/i) as HTMLSelectElement).disabled).toBe(false),
+      );
+      const select = screen.getByLabelText(/channel/i) as HTMLSelectElement;
+      const names = Array.from(select.options).map((o) => o.textContent ?? "");
+      expect(names).toHaveLength(3);
+      expect(names[0]).toBe("Default (all channels)");
+      expect(names[1]).toMatch(/Telegram/);
+      expect(names[1]).toMatch(/primary/);
+      expect(names[2]).toBe("Email");
+      expect(names.join(" ")).not.toMatch(/Matrix/);
+    });
+
+    it("reports the choice, and Default as undefined", async () => {
+      serveWithChannels(() => READOUT);
+      const onChannelChange = vi.fn();
+      renderWithQuery(<NotificationsView channel="telegram" onChannelChange={onChannelChange} />);
+
+      await screen.findByText("jobs");
+      await waitFor(() =>
+        expect((screen.getByLabelText(/channel/i) as HTMLSelectElement).disabled).toBe(false),
+      );
+      const select = screen.getByLabelText(/channel/i) as HTMLSelectElement;
+      expect(select.value).toBe("telegram");
+
+      fireEvent.change(select, { target: { value: "email" } });
+      expect(onChannelChange).toHaveBeenLastCalledWith("email");
+      fireEvent.change(select, { target: { value: "" } });
+      expect(onChannelChange).toHaveBeenLastCalledWith(undefined);
+    });
+
+    it("keeps Default working, with a quiet note, when the channel list fails", async () => {
+      serveWithChannels(() => {
+        throw new Error("the daemon did not answer");
+      });
+      renderWithQuery(<NotificationsView onChannelChange={vi.fn()} />);
+
+      expect(await screen.findByText("jobs")).toBeDefined();
+      expect(await screen.findByText(/channel list did not load/i)).toBeDefined();
+      const select = screen.getByLabelText(/channel/i) as HTMLSelectElement;
+      expect(Array.from(select.options).map((o) => o.textContent)).toEqual(["Default (all channels)"]);
+    });
+
+    it("disables the selector while the channels load", async () => {
+      serveWithChannels(() => new Promise(() => {}));
+      renderWithQuery(<NotificationsView onChannelChange={vi.fn()} />);
+
+      await screen.findByText("jobs");
+      expect((screen.getByLabelText(/channel/i) as HTMLSelectElement).disabled).toBe(true);
+    });
+  });
+
+  describe("channel mode", () => {
+    const rule = (selector: string, enabled: boolean) => ({ selector, enabled });
+    const DEFAULTS: NotifyPolicy = {
+      families: [rule("worktree_", false), rule("job_", true)],
+      kinds: [],
+    };
+    const policyFor = (
+      channel: string,
+      overrides: NotifyPolicy,
+      primary = true,
+    ): ChannelNotifyPolicy => ({
+      channel,
+      primary,
+      default: DEFAULTS,
+      overrides,
+      resolved: mergePolicy(DEFAULTS, overrides),
+    });
+
+    /** A daemon serving per-channel policies (and the default one), recording every PUT. */
+    function serveChannels(
+      byChannel: Record<string, ChannelNotifyPolicy>,
+      puts: { path: string; body: unknown }[] = [],
+    ) {
+      daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        if (path === "/notifications/kinds") return OBSERVED;
+        if (path === "/notifications/policy" && method === "GET") return { families: [], kinds: [] };
+        if (path === "/notifications/policy" && method === "PUT") {
+          puts.push({ path, body: JSON.parse(init!.body as string) });
+          return undefined;
+        }
+        const match = /^\/notifications\/policy\?channel=(.+)$/.exec(path);
+        if (match) {
+          const id = decodeURIComponent(match[1]);
+          if (method === "PUT") {
+            puts.push({ path, body: JSON.parse(init!.body as string) });
+            return undefined;
+          }
+          if (id === "ghost") throw new ApiRefusal(404, "unknown_channel", "no channel called ghost");
+          return byChannel[id];
+        }
+        if (path === "/channels") return { contract_version: "1", primary: "telegram", routing: { state: "ok" }, channels: [] };
+        throw new Error(`unexpected ${method} ${path}`);
+      });
+    }
+
+    const familyRow = async (name: string) => (await screen.findByText(name)).closest("li")!;
+
+    it("draws the overrides laid over the default, with a source mark per row", async () => {
+      serveChannels({
+        telegram: policyFor("telegram", { families: [rule("worktree_", true), rule("job_", true)], kinds: [] }),
+      });
+      renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+
+      const worktrees = await familyRow("worktrees");
+      // The override `true` beats the default `false`.
+      expect((within(worktrees).getByRole("checkbox") as HTMLInputElement).checked).toBe(true);
+      expect(within(worktrees).getByText("override")).toBeDefined();
+      // Same value as the default: pinned to it.
+      const jobs = await familyRow("jobs");
+      expect(within(jobs).getByText("pinned")).toBeDefined();
+      expect(within(jobs).getByTitle(/pinned to the default/i)).toBeDefined();
+      // No override at all: inherits.
+      const team = await familyRow("team");
+      expect(within(team).getByText("default")).toBeDefined();
+      expect(within(team).queryByRole("button", { name: /reset to default/i })).toBeNull();
+    });
+
+    it("resets an overridden row back to the default", async () => {
+      serveChannels({
+        telegram: policyFor("telegram", { families: [rule("worktree_", true)], kinds: [] }),
+      });
+      renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+
+      const worktrees = await familyRow("worktrees");
+      fireEvent.click(within(worktrees).getByRole("button", { name: /reset to default/i }));
+
+      const after = await familyRow("worktrees");
+      expect(within(after).getByText("default")).toBeDefined();
+      expect((within(after).getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+      expect(within(after).queryByRole("button", { name: /reset to default/i })).toBeNull();
+      expect(screen.queryByText(/unsaved changes/i)).not.toBeNull();
+    });
+
+    it("saves only the overrides, to the channel's URL, and only when dirty", async () => {
+      const puts: { path: string; body: unknown }[] = [];
+      serveChannels({ telegram: policyFor("telegram", { families: [], kinds: [] }) }, puts);
+      renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+
+      const save = (await screen.findByRole("button", { name: /^save$/i })) as HTMLButtonElement;
+      expect(save.disabled).toBe(true);
+
+      // Turning the (default-off) worktrees family on must store an explicit `true`.
+      const worktrees = await familyRow("worktrees");
+      fireEvent.click(within(worktrees).getByRole("checkbox"));
+      expect(save.disabled).toBe(false);
+      fireEvent.click(save);
+
+      await waitFor(() => expect(puts).toHaveLength(1));
+      expect(puts[0].path).toBe("/notifications/policy?channel=telegram");
+      expect(puts[0].body).toEqual({ families: [rule("worktree_", true)], kinds: [] });
+      expect(Object.keys(puts[0].body as object).sort()).toEqual(["families", "kinds"]);
+    });
+
+    it("notes that a channel which is not the primary is dormant", async () => {
+      serveChannels({ email: policyFor("email", { families: [], kinds: [] }, false) });
+      renderWithQuery(<NotificationsView channel="email" onChannelChange={vi.fn()} />);
+
+      expect(await screen.findByText(/dormant/i)).toBeDefined();
+      expect(screen.getByText(/when it becomes the primary/i)).toBeDefined();
+    });
+
+    it("has no dormant note on the primary channel", async () => {
+      serveChannels({ telegram: policyFor("telegram", { families: [], kinds: [] }) });
+      renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+
+      await familyRow("jobs");
+      expect(screen.queryByText(/dormant/i)).toBeNull();
+    });
+
+    it("says an empty override set inherits everything, and stops once there is one", async () => {
+      serveChannels({
+        telegram: policyFor("telegram", { families: [], kinds: [] }),
+        email: policyFor("email", { families: [rule("team_", false)], kinds: [] }),
+      });
+      const view = renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+      expect(await screen.findByText(/inherits everything from the default/i)).toBeDefined();
+
+      rerenderWith(view, <NotificationsView channel="email" onChannelChange={vi.fn()} />);
+      await waitFor(() => expect(screen.queryByText(/inherits everything/i)).toBeNull());
+    });
+
+    it("shows a refusal of the PUT", async () => {
+      serveChannels({ telegram: policyFor("telegram", { families: [], kinds: [] }) });
+      const base = daemon.apiFetch.getMockImplementation()!;
+      daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+        if (init?.method === "PUT") throw new ApiRefusal(400, "selector_too_long", "selector is too long");
+        return base(path, init);
+      });
+      renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+
+      const worktrees = await familyRow("worktrees");
+      fireEvent.click(within(worktrees).getByRole("checkbox"));
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+      expect(await screen.findByText("selector_too_long")).toBeDefined();
+    });
+
+    it("shows a refusal of the GET instead of loading forever", async () => {
+      serveChannels({});
+      renderWithQuery(<NotificationsView channel="ghost" onChannelChange={vi.fn()} />);
+
+      expect(await screen.findByText("unknown_channel")).toBeDefined();
+      expect(screen.queryByText(/reading the notification policy/i)).toBeNull();
+    });
+
+    it("re-seeds the draft when the channel changes, without mixing drafts", async () => {
+      serveChannels({
+        telegram: policyFor("telegram", { families: [], kinds: [] }),
+        email: policyFor("email", { families: [rule("team_", false)], kinds: [] }),
+      });
+      const view = renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+
+      const worktrees = await familyRow("worktrees");
+      fireEvent.click(within(worktrees).getByRole("checkbox"));
+      expect(screen.queryByText(/unsaved changes/i)).not.toBeNull();
+
+      rerenderWith(view, <NotificationsView channel="email" onChannelChange={vi.fn()} />);
+      await waitFor(() => expect(screen.queryByText(/unsaved changes/i)).toBeNull());
+      const worktreesAfter = await familyRow("worktrees");
+      expect((within(worktreesAfter).getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+      const team = await familyRow("team");
+      expect(within(team).getByText("override")).toBeDefined();
+    });
+
+    it("goes back to the old behaviour on Default, without asking for a channel", async () => {
+      serveChannels({ telegram: policyFor("telegram", { families: [], kinds: [] }) });
+      const view = renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
+      await familyRow("jobs");
+
+      daemon.apiFetch.mockClear();
+      rerenderWith(view, <NotificationsView onChannelChange={vi.fn()} />);
+      await screen.findByText("jobs");
+      expect(daemon.apiFetch.mock.calls.map((c) => c[0])).not.toContain(
+        "/notifications/policy?channel=telegram",
+      );
+    });
+
+    it("leaves Default mode unchanged when a handler is passed but no channel", async () => {
+      const puts: { path: string; body: unknown }[] = [];
+      serveChannels({}, puts);
+      renderWithQuery(<NotificationsView onChannelChange={vi.fn()} />);
+
+      const jobs = await familyRow("jobs");
+      expect(daemon.apiFetch.mock.calls.map((c) => c[0])).toContain("/notifications/policy");
+      expect(
+        daemon.apiFetch.mock.calls.some((c) => String(c[0]).includes("?channel=")),
+      ).toBe(false);
+      expect(screen.queryByText(/reset to default/i)).toBeNull();
+      expect(within(jobs).queryByText(/^(default|override|pinned)$/)).toBeNull();
+
+      fireEvent.click(within(jobs).getByRole("checkbox"));
+      fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+      await waitFor(() => expect(puts).toHaveLength(1));
+      expect(puts[0].path).toBe("/notifications/policy");
+      expect(puts[0].body).toEqual({ families: [rule("job_", false)], kinds: [] });
+    });
   });
 
   it("the desktop switch remembers its state", async () => {

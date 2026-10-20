@@ -1,7 +1,10 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED, RESOLVE_MIN_REVIEWED } from "../data/autopilot";
-import { previewPipeline, judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, NOW, OWNER_NOTES, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { previewPipeline, judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, CHANNELS, CHANNEL_IDENTITIES, CHANNEL_NOTIFY_POLICY, NOW, OWNER_NOTES, PAIRING_CODE, PAIRING_STATUS, answer, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { sidecarKeyOf } from "../data/system";
+import { mergePolicy } from "../data/feed";
+import type { MachineConfig } from "../data/machine-config";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
 import { quietGaps } from "../lib/timeline";
@@ -240,5 +243,93 @@ describe("the preview fixtures", () => {
     for (const link of NOTES_GRAPH.links.filter((row) => row.target_kind !== "note")) {
       expect(NOTES_GRAPH.targets.some((target) => target.kind === link.target_kind && target.ref === link.target_ref), link.target_ref).toBe(true);
     }
+  });
+});
+
+describe("the channel management fixtures", () => {
+  const put = (body: unknown): RequestInit => ({ method: "PUT", body: JSON.stringify(body) });
+  const CHANNEL_WHAT =
+    "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in (the older telegram area keeps the bot token and chat id until the channel migration)";
+
+  it("the readout has telegram online and homed on a thread, and discord offline", () => {
+    expect(CHANNELS.primary).toBe("telegram");
+    expect(CHANNELS.routing.state).toBe("ok");
+    const [telegram, discord] = CHANNELS.channels;
+    expect(telegram.state).toBe("online");
+    expect(telegram.home).toEqual({ conversation_ref: "-100123:5", kind: "thread", parent: "-100123", sender_ref: "4242" });
+    expect(telegram.identities).toEqual({ senders: 1, conversations: 3 });
+    expect(telegram.pairing).toBeNull();
+    expect(telegram.outbox.failed).toBe(1);
+    expect(telegram.drops.unknown_sender).toBe(3);
+    expect(discord.state).toBe("offline");
+    expect(discord.configured).toBe(true);
+    expect(discord.capabilities?.buttons).toBe(false);
+    expect(discord.capabilities?.threads).toBe(false);
+    expect(Date.parse(discord.since as string)).toBe(NOW - 2 * 3_600_000);
+    for (const channel of CHANNELS.channels) {
+      expect(channel.health_row).toBe(`${channel.id}_sidecar`);
+      expect(sidecarKeyOf(channel.health_row)).toBe(channel.id);
+    }
+  });
+
+  it("serves the readout and the pairing routes", () => {
+    expect(answer("/channels")).toBe(CHANNELS);
+    expect(answer("/channels/telegram/pairing")).toMatchObject({ state: "waiting" });
+    expect(answer("/channels/discord/pairing")).toMatchObject({ state: "paired" });
+    expect(answer("/channels/zzz/pairing")).toEqual({ state: "none" });
+    expect(PAIRING_STATUS.telegram.state).toBe("waiting");
+    expect(answer("/channels/telegram/pairing", { method: "POST" })).toEqual(PAIRING_CODE);
+    expect(PAIRING_CODE.code).toBe("482913");
+    expect(PAIRING_CODE.command).toBe("/pair 482913");
+    expect(Date.parse(PAIRING_CODE.expires_at)).toBe(NOW + 10 * 60_000);
+    expect(answer("/channels/telegram/pairing", { method: "DELETE" })).toBeUndefined();
+  });
+
+  it("serves the identities, with one home and the group covering its threads", () => {
+    const telegram = CHANNEL_IDENTITIES.telegram;
+    expect(answer("/channels/telegram/identities")).toBe(telegram);
+    const owner = telegram.identities.find((row) => row.sender_ref === "4242");
+    expect(owner?.conversations).toHaveLength(3);
+    expect(owner?.conversations.filter((row) => row.home)).toHaveLength(1);
+    expect(owner?.conversations.find((row) => row.conversation_ref === "-100123")?.covers_threads).toBe(true);
+    expect(telegram.projects).toEqual([{ project_id: "alpha", conversation_ref: "-100123:7" }]);
+    expect(CHANNEL_IDENTITIES.discord.identities).toEqual([]);
+    expect(answer("/channels/telegram/identities/4242", { method: "DELETE" })).toEqual({ removed: 1, home_cleared: false });
+    expect(answer("/channels/telegram/identities/4242/home", put({ conversation_ref: "4242" }))).toEqual({ home: "4242", previous: "-100123:5" });
+  });
+
+  it("answers the primary switch, and clearing it never reseeds", () => {
+    expect(answer("/channels/primary", put({ channel: "discord" }))).toEqual({ primary: "discord", reseeded: true });
+    expect(answer("/channels/primary", put({ channel: "telegram" }))).toEqual({ primary: "telegram", reseeded: false });
+    expect(answer("/channels/primary", put({ channel: null }))).toEqual({ primary: null, reseeded: false });
+  });
+
+  it("keeps the old policy shape and serves the per-channel one", () => {
+    const old = answer("/notifications/policy") as { families: unknown; kinds: unknown };
+    expect(Object.keys(old).sort()).toEqual(["families", "kinds"]);
+    for (const id of ["telegram", "discord"]) {
+      const p = answer(`/notifications/policy?channel=${id}`) as (typeof CHANNEL_NOTIFY_POLICY)[string];
+      expect(p).toBe(CHANNEL_NOTIFY_POLICY[id]);
+      expect(p.channel).toBe(id);
+      expect(mergePolicy(p.default, p.overrides)).toEqual(p.resolved);
+    }
+    expect(CHANNEL_NOTIFY_POLICY.telegram.default).toEqual(old);
+    expect(CHANNEL_NOTIFY_POLICY.telegram.primary).toBe(true);
+    expect(CHANNEL_NOTIFY_POLICY.discord.primary).toBe(false);
+    expect(CHANNEL_NOTIFY_POLICY.discord.overrides).toEqual({ families: [], kinds: [] });
+    expect(answer("/notifications/policy?channel=telegram", put({ families: [], kinds: [] }))).toBeUndefined();
+  });
+
+  it("aligns the older fixtures with the channels", () => {
+    expect(OWNER_NOTES.find((note) => note.id === 2)?.origin).toBe("channel:telegram");
+    const config = answer("/config/machine") as MachineConfig;
+    const area = config.settings.find((row) => row.area === "channels/telegram");
+    expect(area?.path).toBe("channels/telegram.yaml");
+    expect(area?.what).toBe(CHANNEL_WHAT);
+    expect(config.settings.some((row) => row.area === "telegram")).toBe(true);
+    const secrets = answer("/config/secrets") as { secrets: { key: string; area: string }[] };
+    expect(secrets.secrets.find((row) => row.key === "telegram-bot-token")?.area).toBe("telegram");
+    const health = answer("/health/readout") as { subsystems: { name: string; status: string; reason?: string }[] };
+    expect(health.subsystems.find((row) => row.name === "telegram_sidecar")).toEqual({ name: "telegram_sidecar", status: "ok" });
   });
 });

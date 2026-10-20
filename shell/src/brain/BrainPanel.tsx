@@ -1,10 +1,14 @@
 import { DAEMON_NAME } from "../copy";
 import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { ApiRefusal } from "../data/client";
+import type { ChannelsReadout } from "../data/channels";
+import { keys } from "../data/keys";
 import { useKnowledge, type Known } from "../data/knowledge";
 import {
   LINK_TYPES,
+  originLabel,
   TARGET_KINDS,
   TEACH_KINDS,
   useAddLink,
@@ -150,6 +154,10 @@ function NotePanel({
   const detail = useOwnerNote(id);
   const update = useUpdateNote();
   const remove = useRemoveLink();
+  // Accepted limitation: this reads the cache without subscribing or fetching (the notes panel must
+  // not request /channels). If `channels.all` loads only after this paints, the label stays the
+  // fallback ("Telegram") until another render; it does not repaint by itself.
+  const cachedChannels = useQueryClient().getQueryData<ChannelsReadout>(keys.channels.all);
 
   if (detail.isError) return <ErrorNote>the {DAEMON_NAME} is not responding — the note is not known</ErrorNote>;
   if (detail.data === undefined) return <Quiet says="Loading…" />;
@@ -163,7 +171,7 @@ function NotePanel({
       <header className="brain-panel-head">
         <p className="brain-text">{note.text}</p>
         <div className="brain-meta">
-          <span className="brain-origin">{note.origin}</span>
+          <span className="brain-origin">{originLabel(note.origin, cachedChannels?.channels)}</span>
           <span className="brain-state">{note.state}</span>
           <RelativeTime at={note.created_at} />
           <span className="brain-meta-end">

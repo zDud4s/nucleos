@@ -663,7 +663,7 @@ export const keys = {
     tokens: ["system", "tokens"] as const,
     pii: ["system", "pii"] as const,
     /**
-     * Which feed kinds still reach Telegram — `GET /notifications/policy` — and
+     * Which feed kinds still reach a messaging channel — `GET /notifications/policy` — and
      * which kinds this machine has actually written — `GET /notifications/kinds`.
      *
      * Two keys and not one, because they are two different things that happen to
@@ -673,6 +673,12 @@ export const keys = {
      * nothing.
      */
     notifyPolicy: ["system", "notify-policy"] as const,
+    /**
+     * One channel's view of the policy. Hangs under the `notifyPolicy` prefix on
+     * purpose: saving the default invalidates the prefix and refreshes every
+     * resolved view, while saving one channel invalidates only its own key.
+     */
+    notifyPolicyFor: (channel: string) => ["system", "notify-policy", channel] as const,
     notifyKinds: ["system", "notify-kinds"] as const,
     config: (area: string) => ["system", "config", area] as const,
     /**
@@ -695,5 +701,12 @@ export const keys = {
     embedding: ["system", "embedding"] as const,
     /** The credentials this machine holds, by presence only -- `GET /config/secrets`. */
     secrets: ["system", "secrets"] as const,
+  },
+
+  /** Messaging channels -- `GET /channels` and the per-channel management routes. */
+  channels: {
+    all: ["channels"] as const,
+    identities: (channel: string) => ["channels", channel, "identities"] as const,
+    pairing: (channel: string) => ["channels", channel, "pairing"] as const,
   },
 } as const;
