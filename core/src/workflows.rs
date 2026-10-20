@@ -1247,7 +1247,12 @@ mod tests {
     #[test]
     fn an_interpreter_cache_beside_a_bundles_scripts_is_not_drift() {
         let temp = tempfile::tempdir().unwrap();
-        let root = shelf(temp.path(), "harness", "1.0", &[("scripts/x.py", "print()")]);
+        let root = shelf(
+            temp.path(),
+            "harness",
+            "1.0",
+            &[("scripts/x.py", "print()")],
+        );
         let dir = root.join("harness").join("1.0");
         let before = digest_of(&file_hashes(&dir).unwrap());
 
