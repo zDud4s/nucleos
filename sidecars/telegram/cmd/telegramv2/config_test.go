@@ -29,11 +29,11 @@ func TestConfigMissingBotTokenIsAnError(t *testing.T) {
 
 func TestConfigErrorsNeverCarryTheBotToken(t *testing.T) {
 	cases := map[string]func(map[string]string){
-		"no daemon url":     func(m map[string]string) { delete(m, "NUCLEOS_DAEMON_URL") },
-		"non-loopback url":  func(m map[string]string) { m["NUCLEOS_DAEMON_URL"] = "http://example.com" },
-		"no channel token":  func(m map[string]string) { delete(m, "NUCLEOS_CHANNEL_TOKEN") },
-		"no bot token":      func(m map[string]string) { delete(m, "TELEGRAM_BOT_TOKEN") },
-		"blank bot token":   func(m map[string]string) { m["TELEGRAM_BOT_TOKEN"] = "  " },
+		"no daemon url":    func(m map[string]string) { delete(m, "NUCLEOS_DAEMON_URL") },
+		"non-loopback url": func(m map[string]string) { m["NUCLEOS_DAEMON_URL"] = "http://example.com" },
+		"no channel token": func(m map[string]string) { delete(m, "NUCLEOS_CHANNEL_TOKEN") },
+		"no bot token":     func(m map[string]string) { delete(m, "TELEGRAM_BOT_TOKEN") },
+		"blank bot token":  func(m map[string]string) { m["TELEGRAM_BOT_TOKEN"] = "  " },
 	}
 	for name, mutate := range cases {
 		env := baseEnv()
