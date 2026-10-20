@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { validateSystemSearch } from "./systemSearch";
 import { isApiRefusal } from "../data/client";
 import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
@@ -129,9 +130,13 @@ export function normaliseView(raw: string | undefined): SystemView {
     : "health";
 }
 
+export { validateSystemSearch };
+
 export function System() {
   const params = useParams({ strict: false }) as { view?: string };
   const view = normaliseView(params.view);
+  const { channel } = validateSystemSearch(useSearch({ strict: false }) as Record<string, unknown>);
+  const navigate = useNavigate();
   const health = useSystemHealth();
   const sidecars = useSidecars();
 
@@ -146,7 +151,18 @@ export function System() {
         {view === "limits" && <BudgetPanel />}
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
-        {view === "notifications" && <NotificationsView />}
+        {view === "notifications" && (
+          <NotificationsView
+            channel={channel}
+            onChannelChange={(next) => {
+              void navigate({
+                to: "/system/$view",
+                params: { view: "notifications" },
+                search: (next === undefined ? {} : { channel: next }) as never,
+              });
+            }}
+          />
+        )}
         {view === "settings" && (
           <>
             <MachineSettings />

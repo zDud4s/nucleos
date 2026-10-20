@@ -18,7 +18,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
-import { System, takenAt } from "./System";
+import { System, takenAt, validateSystemSearch } from "./System";
 import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
@@ -402,7 +402,10 @@ async function renderSystemAt(initialPath: string) {
   const rootRoute = createRootRoute({ component: () => <Outlet /> });
   const routes = [
     createRoute({ getParentRoute: () => rootRoute, path: "/system", component: System }),
-    createRoute({ getParentRoute: () => rootRoute, path: "/system/$view", component: System }),
+    createRoute({ getParentRoute: () => rootRoute, path: "/system/$view",
+      component: System,
+      validateSearch: validateSystemSearch,
+    }),
   ];
   const router = createRouter({
     routeTree: rootRoute.addChildren(routes),
@@ -1590,5 +1593,82 @@ describe("System - map-authored readings", () => {
       expect(badge.className).toContain("ui-badge-info");
       expect(badge.className).not.toContain("ui-badge-active");
     }
+  });
+});
+
+describe("System - the channel search param", () => {
+  const EMPTY = { families: [], kinds: [] };
+  const channel = (id: string, label: string) => ({ id, label, configured: true });
+
+  /** `systemFetch` plus the channel list and the per-channel policy the notifications tab reads. */
+  function serveChannels() {
+    const base = systemFetch(systemWorld());
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/channels") {
+        return {
+          contract_version: "1",
+          primary: "telegram",
+          routing: { state: "ok" },
+          channels: [channel("telegram", "Telegram"), channel("discord", "Discord")],
+        };
+      }
+      if (path === "/notifications/kinds") return [];
+      if (path === "/notifications/policy") return EMPTY;
+      if (path.startsWith("/notifications/policy?channel=")) {
+        const id = path.slice(path.indexOf("=") + 1);
+        return { channel: id, primary: id === "telegram", default: EMPTY, overrides: EMPTY, resolved: EMPTY };
+      }
+      return await base(path, init);
+    });
+  }
+
+  const requested = () => daemon.apiFetch.mock.calls.map((call) => call[0] as string);
+
+  it("reads the channel's policy when ?channel= names one", async () => {
+    serveChannels();
+    await renderSystemAt("/system/notifications?channel=telegram");
+    await waitFor(() => {
+      expect(requested()).toContain("/notifications/policy?channel=telegram");
+    });
+  });
+
+  it("choosing another channel puts it in the URL, and Default takes it out", async () => {
+    serveChannels();
+    const { router } = await renderSystemAt("/system/notifications?channel=telegram");
+    const select = await screen.findByLabelText("Channel");
+    await waitFor(() => {
+      expect(within(select).getAllByRole("option").length).toBe(3);
+    });
+
+    fireEvent.change(select, { target: { value: "discord" } });
+    await waitFor(() => {
+      expect(router.state.location.search).toEqual({ channel: "discord" });
+    });
+    await waitFor(() => {
+      expect(requested()).toContain("/notifications/policy?channel=discord");
+    });
+
+    fireEvent.change(await screen.findByLabelText("Channel"), { target: { value: "" } });
+    await waitFor(() => {
+      expect(router.state.location.search).toEqual({});
+    });
+  });
+
+  it("an empty or malformed ?channel= is the Default mode", async () => {
+    serveChannels();
+    await renderSystemAt("/system/notifications?channel=");
+    await screen.findByLabelText("Channel");
+    expect(requested().some((path) => path.startsWith("/notifications/policy?channel="))).toBe(false);
+    expect(validateSystemSearch({ channel: "" })).toEqual({});
+    expect(validateSystemSearch({ channel: "Bad Id" })).toEqual({});
+    expect(validateSystemSearch({ channel: 7 })).toEqual({});
+    expect(validateSystemSearch({ channel: "discord" })).toEqual({ channel: "discord" });
+  });
+
+  it("ignores the param on another tab", async () => {
+    serveChannels();
+    await renderSystemAt("/system/limits?channel=x");
+    await screen.findByLabelText("Window limit (USD)");
+    expect(requested().some((path) => path.startsWith("/notifications/policy"))).toBe(false);
   });
 });
