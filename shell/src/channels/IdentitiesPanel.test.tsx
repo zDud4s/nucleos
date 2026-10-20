@@ -126,7 +126,7 @@ describe("IdentitiesPanel", () => {
       identities: [
         example.identities[0]!,
         {
-          sender_ref: "777", sender_name: "Ana", role: "member",
+          sender_ref: "777", sender_name: "Ana", role: "owner",
           conversations: [
             { conversation_ref: "777", kind: "private", parent: null, home: false, covers_threads: false, created_at: "2026-10-14T09:15:40Z" },
           ],
