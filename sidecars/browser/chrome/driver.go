@@ -101,6 +101,11 @@ type Driver struct {
 	movingWithin time.Duration
 	// promptTimeout is how long a prompt put to a person waits before it is cancelled.
 	promptTimeout time.Duration
+
+	// embedded marks a driver attached to a browser that is not ours (the person's WebView2): it never
+	// creates a target, so Open is refused and the profile sweep, which needs a scratch page, is
+	// skipped. See ConnectEmbedded.
+	embedded bool
 }
 
 type session struct {
@@ -226,21 +231,35 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 		return nil, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
 	}
 
+	if err := armBrowserFence(ctx, conn, true); err != nil {
+		return nil, err
+	}
+
+	driver := newDriver(conn, policy)
+	driver.startSweep()
+	return driver, nil
+}
+
+// armBrowserFence puts the interception, optionally the browser-level auto-attach, and the download
+// denial on the browser session. Every failure is ErrFenceNotAttached.
+func armBrowserFence(ctx context.Context, conn *cdp.Conn, autoAttach bool) error {
 	if _, err := conn.Call(ctx, cdp.BrowserSession, "Fetch.enable", map[string]any{
 		"patterns":           []map[string]any{{"urlPattern": "*"}},
 		"handleAuthRequests": true,
 	}); err != nil {
-		return nil, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
+		return fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
 	}
 
-	// waitForDebuggerOnStart is what closes the TOCTOU window of spec §5.4: a new target is born
-	// paused, with an empty url, and the interception is already on before it may navigate.
-	if _, err := conn.Call(ctx, cdp.BrowserSession, "Target.setAutoAttach", map[string]any{
-		"autoAttach":             true,
-		"waitForDebuggerOnStart": true,
-		"flatten":                true,
-	}); err != nil {
-		return nil, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
+	if autoAttach {
+		// waitForDebuggerOnStart is what closes the TOCTOU window of spec §5.4: a new target is born
+		// paused, with an empty url, and the interception is already on before it may navigate.
+		if _, err := conn.Call(ctx, cdp.BrowserSession, "Target.setAutoAttach", map[string]any{
+			"autoAttach":             true,
+			"waitForDebuggerOnStart": true,
+			"flatten":                true,
+		}); err != nil {
+			return fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
+		}
 	}
 
 	// Downloads (spec §6.2, test 8). Fatal rather than best-effort, and the trade-off is deliberate:
@@ -251,9 +270,15 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	if _, err := conn.Call(ctx, cdp.BrowserSession, "Browser.setDownloadBehavior", map[string]any{
 		"behavior": "deny",
 	}); err != nil {
-		return nil, fmt.Errorf("%w: downloads not denied: %v", browser.ErrFenceNotAttached, err)
+		return fmt.Errorf("%w: downloads not denied: %v", browser.ErrFenceNotAttached, err)
 	}
+	return nil
+}
 
+// newDriver builds the Driver and subscribes it to the connection. It arms nothing: Connect and
+// ConnectEmbedded each arm the fence first and only then call it, so a Driver still cannot exist
+// without one.
+func newDriver(conn *cdp.Conn, policy fence.Policy) *Driver {
 	driver := &Driver{
 		conn:         conn,
 		policy:       policy,
@@ -282,8 +307,7 @@ func Connect(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver,
 	conn.OnEvent(driver.onScreencastFrame)
 	conn.OnEvent(driver.onFileChooser)
 	conn.OnEvent(driver.onPanelEvent)
-	driver.startSweep()
-	return driver, nil
+	return driver
 }
 
 func (d *Driver) Name() string { return "chrome" }
@@ -427,6 +451,11 @@ func (d *Driver) onDetached(event cdp.Event) {
 
 // Open creates a target, arms it while it is still paused, and only then navigates.
 func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Session, error) {
+	// An embedded driver has no target of its own to create; the check is first so that nothing, not
+	// even the sweep wait, can lead to Target.createTarget on someone else's browser.
+	if d.embedded {
+		return browser.Session{}, ErrEmbeddedOpen
+	}
 	// Before a target exists, let alone navigates. Spec §5.8 says the profile is swept "ao abrir",
 	// and the reason it is here rather than in Connect is that this is the line the requirement is
 	// actually about: nothing may render while a worker somebody else registered is still live.
@@ -438,11 +467,25 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	if err != nil {
 		return browser.Session{}, err
 	}
+	// Every way out of here that does not hand the caller a usable session takes the tab with it: an
+	// error return carries no id, so nobody else could ever close it.
+	return d.arm(ctx, targetID, cdpSession, req.URL, func(closing context.Context) {
+		_, _ = d.conn.Call(closing, cdp.BrowserSession, "Target.closeTarget", map[string]any{
+			"targetId": targetID,
+		})
+	})
+}
+
+// arm is what Open and Adopt share once a page session exists: arm the target while it is still on
+// about:blank, register it, navigate, and report where it landed.
+//
+// release is how a target that never got registered is let go of — closed for a tab we made, detached
+// for one that belongs to somebody else. Once the session is registered the ordinary Close does the
+// whole teardown.
+func (d *Driver) arm(ctx context.Context, targetID string, cdpSession cdp.SessionID, url string,
+	release func(context.Context)) (browser.Session, error) {
 	target := struct{ TargetID string }{TargetID: targetID}
 
-	// Every way out of here that does not hand the caller a usable session takes the tab with it: an
-	// error return carries no id, so nobody else could ever close it. registered is set once the
-	// session is in the driver's maps, and then the ordinary Close does the whole teardown.
 	var registered browser.SessionID
 	keep := false
 	defer func() {
@@ -455,9 +498,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 			_ = d.Close(closing, registered)
 			return
 		}
-		_, _ = d.conn.Call(closing, cdp.BrowserSession, "Target.closeTarget", map[string]any{
-			"targetId": target.TargetID,
-		})
+		release(closing)
 	}()
 
 	if _, err := d.conn.Call(ctx, cdpSession, "Page.enable", nil); err != nil {
@@ -488,7 +529,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 		target:       target.TargetID,
 		cdp:          cdpSession,
 		mode:         browser.ModeAgent,
-		requested:    req.URL,
+		requested:    url,
 		frameID:      mainFrame,
 		refs:         map[string]nodeKey{},
 		refByNode:    map[nodeKey]string{},
@@ -524,7 +565,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 	ready := d.watchPage(cdpSession, mainFrame)
 	defer ready.stop()
 
-	navigated, err := d.conn.Call(ctx, cdpSession, "Page.navigate", map[string]any{"url": req.URL})
+	navigated, err := d.conn.Call(ctx, cdpSession, "Page.navigate", map[string]any{"url": url})
 	if err != nil {
 		return browser.Session{}, fmt.Errorf("navigating: %w", err)
 	}
@@ -548,7 +589,7 @@ func (d *Driver) Open(ctx context.Context, req browser.OpenRequest) (browser.Ses
 				Refusal:      &browser.Refusal{Consequence: refused.Consequence, Detail: refused.Detail},
 			}, nil
 		}
-		return browser.Session{}, fmt.Errorf("navigating to %s: %s", req.URL, outcome.ErrorText)
+		return browser.Session{}, fmt.Errorf("navigating to %s: %s", url, outcome.ErrorText)
 	}
 
 	stillLoading := d.awaitReady(ctx, ready, entry)

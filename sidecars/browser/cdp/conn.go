@@ -89,6 +89,22 @@ type Conn struct {
 	// demonstrated by accident and spent a while misreading as "the navigation was blocked".
 	queue     []Event
 	queueCond *sync.Cond
+
+	// refuse, when set, vetoes a command before it is written. Guarded by mu.
+	refuse func(method string) bool
+}
+
+// ErrMethodRefused is what Call returns for a command the connection was told never to send.
+var ErrMethodRefused = errors.New("cdp: this connection refuses that command")
+
+// Refuse installs a veto: a command for which match returns true is never written and Call returns
+// [ErrMethodRefused]. It exists for connections to a browser that is not ours (the embedded WebView2):
+// there the sidecar acts only on one attached target, and the guard sits at the single choke point
+// every command passes, so no code path can forget it.
+func (c *Conn) Refuse(match func(method string) bool) {
+	c.mu.Lock()
+	c.refuse = match
+	c.mu.Unlock()
 }
 
 // Dial connects to a browser's WebSocket debugger url.
@@ -215,6 +231,10 @@ func (c *Conn) Call(ctx context.Context, session SessionID, method string, param
 	waiter := make(chan *message, 1)
 
 	c.mu.Lock()
+	if c.refuse != nil && c.refuse(method) {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrMethodRefused, method)
+	}
 	if c.closed {
 		c.mu.Unlock()
 		return nil, c.closeReason()

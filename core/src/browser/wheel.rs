@@ -1139,6 +1139,8 @@ mod tests {
                 client: BrowserClient::new(&address.to_string(), "tok".into()),
                 modes: Default::default(),
                 seats: Default::default(),
+                embedded: Default::default(),
+                embedded_forced: Default::default(),
             }),
             seen,
         )
@@ -2035,6 +2037,8 @@ mod tests {
             client: BrowserClient::new(&address.to_string(), "tok".into()),
             modes: Default::default(),
             seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
         })
     }
 
@@ -2069,6 +2073,8 @@ mod tests {
             client: BrowserClient::new(&address.to_string(), "tok".into()),
             modes: Default::default(),
             seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
         })
     }
 

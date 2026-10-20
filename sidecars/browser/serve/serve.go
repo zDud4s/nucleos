@@ -67,6 +67,7 @@ func Serve(cfg config.Config, driver browser.Driver) error {
 
 	personRoutes(mux, cfg.DaemonToken, driver)
 	panelRoutes(mux, cfg.DaemonToken, driver)
+	embeddedRoutes(mux, cfg.DaemonToken, driver)
 
 	server := &http.Server{
 		Addr:              cfg.Addr,

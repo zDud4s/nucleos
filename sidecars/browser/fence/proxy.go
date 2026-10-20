@@ -61,6 +61,8 @@ type Proxy struct {
 	// person is the person's switch: while on, the proxy forwards what Decide/DecideTunnel would
 	// refuse. The Dialer stays, so a loopback or private destination is still vetted.
 	person atomic.Bool
+	// embedded marks the proxy of an embedded WebView2 environment. See NewEmbeddedProxy.
+	embedded bool
 
 	mu       sync.Mutex
 	refusals []ProxyRefusal
@@ -83,7 +85,9 @@ const proxyRefusalCap = 256
 // It refuses to exist without a valid policy for the same reason chrome.Connect refuses to return a
 // Driver without an attached fence: a proxy running with a default policy is indistinguishable, from
 // every call site, from one running with the right one.
-func NewProxy(policy Policy) (*Proxy, error) {
+func NewProxy(policy Policy) (*Proxy, error) { return newProxy(policy, false) }
+
+func newProxy(policy Policy, embedded bool) (*Proxy, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
@@ -94,6 +98,7 @@ func NewProxy(policy Policy) (*Proxy, error) {
 	dialer := &Dialer{Timeout: 10 * time.Second}
 	proxy := &Proxy{
 		policy:   policy,
+		embedded: embedded,
 		listener: listener,
 		dialer:   dialer,
 		// NewTransport sets Proxy to nil explicitly: a transport that honoured the environment's
@@ -150,6 +155,9 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		p.tunnel(w, r)
 		return
 	}
+	if p.refuseAmbient(w, r.URL.Hostname()) {
+		return
+	}
 
 	// ResourceType is left empty on purpose, and it is READ as a signal rather than merely absent.
 	// This layer sees bytes, not Chrome's classification, so it cannot tell a document from a
@@ -176,6 +184,9 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 
 // tunnel answers CONNECT. See [DecideTunnel] for why the rule is as thin as it is.
 func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
+	if p.refuseAmbient(w, r.Host) {
+		return
+	}
 	if !p.person.Load() {
 		if verdict := DecideTunnel(p.policy, r.Host); !verdict.Allow {
 			p.refuse(w, r.Host, verdict)

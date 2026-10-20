@@ -794,6 +794,8 @@ async fn main() {
             ),
             modes: Default::default(),
             seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
         }),
         web: Arc::new(integrations::web::WebRuntime {
             enabled: web_config.enabled,

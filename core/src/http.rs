@@ -24451,6 +24451,8 @@ mod tests {
             client: crate::browser_client::BrowserClient::new("127.0.0.1:9", "tok".into()),
             modes: Default::default(),
             seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
         });
         let id = sqlx::query(
             "INSERT INTO browser_sessions \

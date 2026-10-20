@@ -162,6 +162,13 @@ pub struct Session {
     pub status: i64,
 }
 
+/// The sidecar's answer to `/embedded/prepare`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct EmbeddedPrepared {
+    /// `host:port` of the project's fence proxy on loopback.
+    pub proxy_addr: String,
+}
+
 /// One thing on the page the agent may refer to.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Element {
@@ -759,6 +766,58 @@ impl BrowserClient {
         Err(self.read_error(status, response).await)
     }
 
+    /// Asks the sidecar for the fence proxy of an embedded project (one per project, idempotent).
+    /// The agent's browser environment is built with `--proxy-server=<proxy_addr>`.
+    pub async fn embedded_prepare(
+        &self,
+        project: &str,
+        placement: &Placement,
+    ) -> Result<EmbeddedPrepared, BrowserError> {
+        self.call(
+            "/embedded/prepare",
+            &serde_json::json!({ "project": project, "placement": placement }),
+        )
+        .await
+    }
+
+    /// Attaches to the agent tab the shell opened at `about:blank#<nonce>` in the embedded browser
+    /// reachable at `cdp_http`, then navigates it to `url`. The reply is the same wire type as `/open`.
+    pub async fn embedded_attach(
+        &self,
+        project: &str,
+        cdp_http: &str,
+        nonce: &str,
+        url: &str,
+        placement: &Placement,
+    ) -> Result<Session, BrowserError> {
+        self.call(
+            "/embedded/attach",
+            &serde_json::json!({
+                "project": project,
+                "cdp_http": cdp_http,
+                "nonce": nonce,
+                "url": url,
+                "placement": placement,
+            }),
+        )
+        .await
+    }
+
+    /// Drops the project's fence proxy and CDP connection (204).
+    pub async fn embedded_forget(&self, project: &str) -> Result<(), BrowserError> {
+        let response = self
+            .post(
+                "/embedded/forget",
+                &serde_json::json!({ "project": project }),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(self.read_error(status, response).await)
+    }
+
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1180,6 +1239,98 @@ mod tests {
             calls[1]
         );
         assert!(calls[1]["body"].get("visible").is_none());
+    }
+
+    /// The three embedded verbs, over a socket: routes, bearer, body field names, and the reply
+    /// types (`Session` for attach, a bare 204 for forget).
+    #[tokio::test]
+    async fn the_embedded_verbs_reach_the_sidecar_the_way_it_reads_them() {
+        use axum::extract::Path;
+        use axum::response::IntoResponse as _;
+        use axum::routing::post;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/embedded/{verb}",
+            post(
+                move |Path(verb): Path<String>,
+                      headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let authorization = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        recorder.lock().unwrap().push(serde_json::json!({
+                            "verb": verb,
+                            "authorization": authorization,
+                            "body": body,
+                        }));
+                        match verb.as_str() {
+                            "prepare" => {
+                                axum::Json(serde_json::json!({"proxy_addr": "127.0.0.1:9911"}))
+                                    .into_response()
+                            }
+                            "attach" => axum::Json(serde_json::json!({
+                                "id": "s9", "mode": "agent",
+                                "requested_url": "https://jira.example.org/",
+                                "final_url": "https://jira.example.org/browse",
+                            }))
+                            .into_response(),
+                            _ => axum::http::StatusCode::NO_CONTENT.into_response(),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = BrowserClient::new(&address, "tok".into());
+        let placement = Placement::project("acme", vec!["https://jira.example.org".into()]);
+
+        let prepared = client
+            .embedded_prepare("acme", &placement)
+            .await
+            .expect("prepare");
+        assert_eq!(prepared.proxy_addr, "127.0.0.1:9911");
+
+        let session = client
+            .embedded_attach(
+                "acme",
+                "http://127.0.0.1:9333",
+                "n0nce",
+                "https://jira.example.org/",
+                &placement,
+            )
+            .await
+            .expect("attach");
+        assert_eq!(session.id, "s9");
+        assert_eq!(session.final_url, "https://jira.example.org/browse");
+
+        client.embedded_forget("acme").await.expect("forget");
+
+        let calls = seen.lock().unwrap();
+        let verbs = calls
+            .iter()
+            .map(|call| call["verb"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(verbs, vec!["prepare", "attach", "forget"]);
+        for call in calls.iter() {
+            assert_eq!(call["authorization"], "Bearer tok", "{call}");
+            assert_eq!(call["body"]["project"], "acme", "{call}");
+        }
+        assert_eq!(calls[0]["body"]["placement"]["profile"]["id"], "acme");
+        assert_eq!(calls[1]["body"]["cdp_http"], "http://127.0.0.1:9333");
+        assert_eq!(calls[1]["body"]["nonce"], "n0nce");
+        assert_eq!(calls[1]["body"]["url"], "https://jira.example.org/");
+        assert_eq!(calls[1]["body"]["placement"]["profile"]["kind"], "project");
     }
 
     /// The other half of the round trip: a sidecar that is not there. A caller has to be able to
