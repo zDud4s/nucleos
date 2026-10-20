@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use super::policy::{passes, resolved_policy};
 use crate::channels::outbox::{self, Class, NewAction, Subject};
 use crate::channels::strings::{self, Text};
-use crate::channels::{access, contract, registry};
+use crate::channels::{access, contract, registry, tokens};
 use crate::state::AppState;
 
 /// Rows read per query; a longer backlog is walked in further batches of the same pass.
@@ -173,6 +173,126 @@ pub(super) async fn announce_feed(
     Ok(announced)
 }
 
+const APPROVE_LABEL: &str = "\u{2705} Approve";
+const REJECT_LABEL: &str = "\u{274C} Reject";
+
+/// Pending proposals past `proposal_cursor`, oldest first, each with whether it carries buttons:
+/// an approval is decided from the chat, a barrier refusal is only news. `hi` bounds the read so
+/// the cursor can move to it without skipping a row that landed after the lists were read.
+async fn new_proposals(
+    pool: &SqlitePool,
+    cursor: i64,
+    hi: i64,
+) -> sqlx::Result<Vec<(crate::proposals::Proposal, bool)>> {
+    let mut rows: Vec<(crate::proposals::Proposal, bool)> = Vec::new();
+    let approvals = crate::proposals::list_pending(pool).await?;
+    let refused = crate::proposals::list_refused_actions(pool).await?;
+    rows.extend(approvals.into_iter().map(|p| (p, true)));
+    rows.extend(refused.into_iter().map(|p| (p, false)));
+    rows.retain(|(p, _)| p.id > cursor && p.id <= hi);
+    rows.sort_by_key(|(p, _)| p.id);
+    Ok(rows)
+}
+
+/// Announces pending proposals past the primary's cursor and moves the cursor, in one transaction:
+/// the tokens of the buttons are issued beside the `enqueue` that shows them. Without a
+/// destination the cursor still moves, so nothing bursts out once one resolves.
+pub(super) async fn announce_proposals(
+    state: &AppState,
+    now: DateTime<Utc>,
+    primary: &'static str,
+    destination_ok: bool,
+) -> sqlx::Result<u32> {
+    let pool = &state.pool;
+    let hi: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM proposals")
+        .fetch_one(pool)
+        .await?;
+    let cursor: i64 =
+        sqlx::query_scalar("SELECT proposal_cursor FROM channel_routing_state WHERE channel = ?")
+            .bind(primary)
+            .fetch_one(pool)
+            .await?;
+    if hi <= cursor {
+        return Ok(0);
+    }
+    let home = if destination_ok {
+        access::home_conversation(pool, primary).await?
+    } else {
+        None
+    };
+    let rows = match home {
+        Some(_) => new_proposals(pool, cursor, hi).await?,
+        None => Vec::new(),
+    };
+
+    let mut tx = pool.begin().await?;
+    let mut announced = 0u32;
+    if let Some(home) = home {
+        let key = contract::ConversationKey::new(primary, home);
+        for (proposal, approvable) in &rows {
+            let text = strings::render_proposals(std::slice::from_ref(proposal));
+            let (buttons, class, subject) = if *approvable {
+                let approve = tokens::issue(
+                    &mut tx,
+                    &key,
+                    tokens::TokenAction::Approve,
+                    proposal.id,
+                    now,
+                )
+                .await?;
+                let reject =
+                    tokens::issue(&mut tx, &key, tokens::TokenAction::Reject, proposal.id, now)
+                        .await?;
+                let row = vec![
+                    contract::Button {
+                        label: APPROVE_LABEL.to_owned(),
+                        token: approve,
+                    },
+                    contract::Button {
+                        label: REJECT_LABEL.to_owned(),
+                        token: reject,
+                    },
+                ];
+                (
+                    Some(vec![row]),
+                    Class::Approval,
+                    Some(Subject::Proposal(proposal.id)),
+                )
+            } else {
+                (None, Class::Notification, None)
+            };
+            outbox::enqueue(
+                &mut tx,
+                &key,
+                NewAction::Send {
+                    reply_to: None,
+                    parts: vec![contract::OutPart::Text { text }],
+                    buttons,
+                    silent: false,
+                },
+                class,
+                subject,
+                now,
+            )
+            .await?;
+            announced += 1;
+        }
+    }
+    sqlx::query(
+        "UPDATE channel_routing_state SET proposal_cursor = MAX(proposal_cursor, ?) \
+         WHERE channel = ?",
+    )
+    .bind(hi)
+    .bind(primary)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if announced > 0 {
+        outbox::wake(state, primary);
+    }
+    Ok(announced)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -297,6 +417,147 @@ mod tests {
         .fetch_one(&state.pool)
         .await
         .unwrap()
+    }
+
+    fn proposals_only() -> Wanted {
+        Wanted {
+            proposals: true,
+            ..Wanted::default()
+        }
+    }
+
+    async fn proposal_cursor(state: &AppState) -> i64 {
+        sqlx::query_scalar(
+            "SELECT proposal_cursor FROM channel_routing_state WHERE channel = 'telegram'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn route_proposal_enqueues_buttons_with_tokens_in_one_tx() {
+        let state = ready(false, &[], true).await;
+        let id = crate::proposals::create_action_approval(
+            &state.pool,
+            1,
+            None,
+            None,
+            "Bash",
+            "needs a shell",
+            None,
+        )
+        .await
+        .unwrap();
+        let report = routing::route_once(&state, now(), proposals_only())
+            .await
+            .unwrap();
+        assert_eq!(report.proposals, 1);
+        assert_eq!(proposal_cursor(&state).await, id);
+
+        let (conversation, payload, class, subject): (String, String, String, Option<String>) =
+            sqlx::query_as("SELECT conversation, payload, class, subject FROM channel_outbox")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(conversation, HOME);
+        assert_eq!(class, "approval");
+        assert_eq!(subject, Some(format!("proposal:{id}")));
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            payload["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Bash")
+        );
+        let row = payload["buttons"][0].as_array().unwrap();
+        assert_eq!(row.len(), 2);
+        let approve = row[0]["token"].as_str().unwrap();
+        let reject = row[1]["token"].as_str().unwrap();
+
+        let tokens: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT token, action, conversation, proposal_id FROM channel_action_tokens \
+             ORDER BY action",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(
+            tokens[0],
+            (approve.to_owned(), "approve".into(), HOME.into(), id)
+        );
+        assert_eq!(
+            tokens[1],
+            (reject.to_owned(), "reject".into(), HOME.into(), id)
+        );
+
+        // Nothing new: no second announcement.
+        let again = routing::route_once(&state, now(), proposals_only())
+            .await
+            .unwrap();
+        assert_eq!(again.proposals, 0);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_outbox")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn route_refused_action_has_no_buttons() {
+        let state = ready(false, &[], true).await;
+        let id = crate::proposals::create_refused_action(
+            &state.pool,
+            1,
+            None,
+            "Bash",
+            "barrier said no",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let report = routing::route_once(&state, now(), proposals_only())
+            .await
+            .unwrap();
+        assert_eq!(report.proposals, 1);
+        assert_eq!(proposal_cursor(&state).await, id);
+        let (payload, class): (String, String) =
+            sqlx::query_as("SELECT payload, class FROM channel_outbox")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(payload["buttons"].is_null());
+        assert_eq!(class, "notification");
+        let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_action_tokens")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn route_proposal_without_destination_advances_the_cursor_and_sends_nothing() {
+        let state = ready(false, &[], false).await;
+        let id = crate::proposals::create_action_approval(
+            &state.pool,
+            1,
+            None,
+            None,
+            "Bash",
+            "why",
+            None,
+        )
+        .await
+        .unwrap();
+        let report = routing::route_once(&state, now(), proposals_only())
+            .await
+            .unwrap();
+        assert_eq!(report.proposals, 0);
+        assert!(sent(&state).await.is_empty());
+        assert_eq!(proposal_cursor(&state).await, id);
     }
 
     #[tokio::test]

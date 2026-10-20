@@ -59,8 +59,8 @@ pub async fn run_routing_loop(_state: AppState, _bus: ChannelsBus, _cadence: Cad
 }
 
 /// One pass over what `wanted` names. A channel with no `channel_routing_state` row yet only
-/// seeds (Anexo B, B.6.4). Only the feed half exists so far (H3a); proposals, kill and budget
-/// arrive with H3b and H4.
+/// seeds (Anexo B, B.6.4). Feed (H3a) and proposals (H3b) exist so far; kill and budget arrive
+/// with H4.
 pub async fn route_once(
     state: &AppState,
     now: DateTime<Utc>,
@@ -84,6 +84,10 @@ pub async fn route_once(
     let destination_ok = routing_state(state).await? == registry::RoutingState::Ok;
     if wanted.feed {
         report.feed = announce::announce_feed(state, now, primary, destination_ok).await?;
+    }
+    if wanted.proposals {
+        report.proposals =
+            announce::announce_proposals(state, now, primary, destination_ok).await?;
     }
     Ok(report)
 }

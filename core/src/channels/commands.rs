@@ -225,7 +225,12 @@ pub async fn execute(
             let decided = crate::proposals::reject(state, id).await;
             decision_reply(decided, Text::Rejected { id })
         }
-        Intent::Cap { .. } | Intent::Chat(_) => todo!(),
+        Intent::Cap { job, text } => run_capture(at, state, job, &text).await,
+        Intent::Chat(_) => {
+            // A plain message goes to the turn in `ingest`, never through `execute`.
+            tracing::error!("a plain message reached commands::execute");
+            return Ok(());
+        }
     };
     say(state, &at.key, reply, now).await
 }
@@ -309,25 +314,77 @@ async fn say(
     Ok(())
 }
 
-/// Which capture request a message answers, if any. Placeholder: A1 has no capture requests on the
-/// outbox yet, so nothing is ever a capture answer; A2 replaces the body.
-pub async fn capture_target(
-    _state: &AppState,
-    _at: &ingest::Inbound<'_>,
-    _message: &contract::InMessage,
-) -> sqlx::Result<Option<i64>> {
-    Ok(None)
+/// The message's text when every part is typed text; `None` as soon as one part is not.
+fn typed_text(message: &contract::InMessage) -> Option<String> {
+    let mut lines = Vec::new();
+    for part in &message.parts {
+        match part {
+            contract::InPart::Text { text } => lines.push(text.as_str()),
+            _ => return None,
+        }
+    }
+    Some(lines.join("\n"))
 }
 
-/// Answers a capture with typed text only. A2: reachable only through a `Some` from
-/// `capture_target`, which A1 never returns.
+/// Which capture request a message answers, if any: a reply to a capture request this very
+/// conversation was sent, else the typed `/cap <N> <text>` form. The "open captures" hint of the
+/// Telegram v1 is left out on purpose (Q14).
+pub async fn capture_target(
+    state: &AppState,
+    at: &ingest::Inbound<'_>,
+    message: &contract::InMessage,
+) -> sqlx::Result<Option<i64>> {
+    if let Some(reply_to) = message.reply_to.as_deref() {
+        let sent = outbox::find_by_platform_ref(&state.pool, &at.key, reply_to).await?;
+        if let Some(outbox::Subject::Capture(job)) = sent.and_then(|sent| sent.subject) {
+            return Ok(Some(job));
+        }
+    }
+    Ok(match typed_text(message).map(|text| route(&text)) {
+        Some(Intent::Cap { job, .. }) => Some(job),
+        _ => None,
+    })
+}
+
+/// Files `text` as the answer to capture request `job`, with this channel as the note's origin, and
+/// says what happened.
+async fn run_capture(at: &ingest::Inbound<'_>, state: &AppState, job: i64, text: &str) -> String {
+    let origin = crate::assistant::Origin::Channel(at.channel).as_wire();
+    match crate::capture::answer(&state.pool, job, text, origin).await {
+        Ok(_) => strings::render(&Text::CaptureAnswered { job }),
+        Err(error) => {
+            tracing::warn!(channel = at.channel, job, %error, "a capture answer was not recorded");
+            strings::render(&Text::NotSent {
+                refusal: format!("capture request #{job} could not take the answer ({error})"),
+            })
+        }
+    }
+}
+
+/// Answers a capture with typed text only: voice, images and files are refused. In the `/cap <N>
+/// <text>` form the answer is the text after the job number.
 pub async fn answer_capture(
-    _state: &AppState,
-    _at: &ingest::Inbound<'_>,
-    _job: i64,
-    _input: &media::TurnInput,
+    state: &AppState,
+    at: &ingest::Inbound<'_>,
+    job: i64,
+    input: &media::TurnInput,
 ) -> sqlx::Result<()> {
-    todo!()
+    let now = chrono::Utc::now();
+    if input.non_text || input.transcribed || input.text.trim().is_empty() {
+        return say(
+            state,
+            &at.key,
+            strings::render(&Text::CaptureNeedsText),
+            now,
+        )
+        .await;
+    }
+    let text = match route(&input.text) {
+        Intent::Cap { job: named, text } if named == job => text,
+        _ => input.text.clone(),
+    };
+    let reply = run_capture(at, state, job, &text).await;
+    say(state, &at.key, reply, now).await
 }
 
 #[cfg(test)]
@@ -760,5 +817,189 @@ mod tests {
         run(&state, Intent::Reject(id)).await;
         let last = queued(&state).await.pop().unwrap().2;
         assert_eq!(last, "That one was already handled.");
+    }
+
+    fn inbound<'a>(
+        conversation: &'a contract::Conversation,
+        sender: &'a contract::Sender,
+    ) -> ingest::Inbound<'a> {
+        ingest::Inbound {
+            channel: "fake",
+            key: contract::ConversationKey::new("fake", "c1"),
+            conversation,
+            sender,
+            message_ref: "m1",
+        }
+    }
+
+    fn message(reply_to: Option<&str>, parts: serde_json::Value) -> contract::InMessage {
+        serde_json::from_value(serde_json::json!({
+            "ref": "m1", "reply_to": reply_to, "parts": parts
+        }))
+        .unwrap()
+    }
+
+    fn text_message(reply_to: Option<&str>, text: &str) -> contract::InMessage {
+        message(
+            reply_to,
+            serde_json::json!([{"type": "text", "text": text}]),
+        )
+    }
+
+    async fn open_request(state: &AppState, job: i64) {
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, \
+             deadline, created_at) VALUES (?, 'p', '[]', 'what happened?', 'open', \
+             '2099-01-01T00:00:00Z', '2026-10-20T00:00:00Z')",
+        )
+        .bind(job)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A delivered outbox row of `conversation` that carries platform ref `platform_ref`.
+    async fn delivered(state: &AppState, conversation: &str, platform_ref: &str, subject: &str) {
+        sqlx::query(
+            "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class, \
+             subject, state, due_at, platform_refs, attempts, created_at, settled_at) \
+             VALUES ('fake', ?, 'ordered', 'send', '{}', 'turn', ?, 'done', 't', ?, 0, 't', 's')",
+        )
+        .bind(conversation)
+        .bind(subject)
+        .bind(format!("[\"{platform_ref}\"]"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_target_by_reply_to_matches_outbox_subject() {
+        let state = crate::channels::testkit::state().await;
+        delivered(&state, "c1", "p9", "capture:7").await;
+        delivered(&state, "c1", "p8", "proposal:3").await;
+        delivered(&state, "other", "p7", "capture:5").await;
+        let (c, s) = (conversation(), sender());
+        let at = inbound(&c, &s);
+        let target = |reply_to: &'static str| {
+            let message = text_message(Some(reply_to), "an answer");
+            let (state, at) = (&state, &at);
+            async move { capture_target(state, at, &message).await.unwrap() }
+        };
+        assert_eq!(target("p9").await, Some(7));
+        // A reply to a proposal, to another conversation's capture, or to nothing known.
+        assert_eq!(target("p8").await, None);
+        assert_eq!(target("p7").await, None);
+        assert_eq!(target("nope").await, None);
+        let plain = text_message(None, "an answer");
+        assert_eq!(capture_target(&state, &at, &plain).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn capture_target_by_cap_form() {
+        let state = crate::channels::testkit::state().await;
+        let (c, s) = (conversation(), sender());
+        let at = inbound(&c, &s);
+        let found = capture_target(&state, &at, &text_message(None, "/cap 12 it was me"))
+            .await
+            .unwrap();
+        assert_eq!(found, Some(12));
+        // Malformed forms are not a capture answer.
+        for text in ["/cap", "/cap 12", "/cap x y", "cap 12 hi"] {
+            let found = capture_target(&state, &at, &text_message(None, text))
+                .await
+                .unwrap();
+            assert_eq!(found, None, "{text}");
+        }
+        // The form is typed text only.
+        let mixed = message(
+            None,
+            serde_json::json!([
+                {"type": "text", "text": "/cap 12 hi"},
+                {"type": "image", "media": "m_1"}
+            ]),
+        );
+        assert_eq!(capture_target(&state, &at, &mixed).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn answer_capture_refuses_non_text() {
+        let state = crate::channels::testkit::state().await;
+        open_request(&state, 7).await;
+        let (c, s) = (conversation(), sender());
+        let at = inbound(&c, &s);
+        for input in [
+            media::TurnInput {
+                text: "a caption".to_string(),
+                non_text: true,
+                ..Default::default()
+            },
+            media::TurnInput {
+                text: "a transcript".to_string(),
+                transcribed: true,
+                non_text: true,
+                ..Default::default()
+            },
+            media::TurnInput::default(),
+        ] {
+            answer_capture(&state, &at, 7, &input).await.unwrap();
+        }
+        let answers: Vec<String> = queued(&state).await.into_iter().map(|a| a.2).collect();
+        let needs = strings::render(&Text::CaptureNeedsText);
+        assert_eq!(answers, vec![needs.clone(), needs.clone(), needs]);
+        let state_of: String =
+            sqlx::query_scalar("SELECT state FROM capture_requests WHERE job_id = 7")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(state_of, "open", "a refused answer leaves the request open");
+    }
+
+    #[tokio::test]
+    async fn answer_capture_writes_note_with_channel_origin() {
+        let state = crate::channels::testkit::state().await;
+        open_request(&state, 7).await;
+        open_request(&state, 8).await;
+        let (c, s) = (conversation(), sender());
+        let at = inbound(&c, &s);
+        // A reply: the whole text is the answer.
+        let reply = media::TurnInput {
+            text: "only I knew this".to_string(),
+            ..Default::default()
+        };
+        answer_capture(&state, &at, 7, &reply).await.unwrap();
+        // The `/cap` form: the answer is what follows the job number.
+        let typed = media::TurnInput {
+            text: "/cap 8 the second one".to_string(),
+            ..Default::default()
+        };
+        answer_capture(&state, &at, 8, &typed).await.unwrap();
+
+        let answers: Vec<String> = queued(&state).await.into_iter().map(|a| a.2).collect();
+        assert_eq!(
+            answers,
+            vec![
+                strings::render(&Text::CaptureAnswered { job: 7 }),
+                strings::render(&Text::CaptureAnswered { job: 8 }),
+            ]
+        );
+        let notes: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT r.job_id, n.note_text, n.origin FROM capture_requests r \
+             JOIN owner_notes n ON n.id = r.note_id WHERE r.state = 'answered' ORDER BY r.job_id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            notes,
+            vec![
+                (
+                    7,
+                    "only I knew this".to_string(),
+                    "channel:fake".to_string()
+                ),
+                (8, "the second one".to_string(), "channel:fake".to_string()),
+            ]
+        );
     }
 }
