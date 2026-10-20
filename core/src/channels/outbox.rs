@@ -1,5 +1,5 @@
-//! The outbound queue with leases (flow F, Anexo D D.10). P0-2b: the adapter routes answer 501,
-//! `release_all` is real, the rest lands with OL-a/OL-b/RB.
+//! The outbound queue with leases (flow F, Anexo D D.10) and the adapter routes that read and
+//! acknowledge it (RB).
 
 mod ack;
 mod degrade;
@@ -11,14 +11,19 @@ pub use lease::lease;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
 use tokio::sync::Notify;
 
+use super::ingest::{contract_error, own_channel};
 use super::{contract, registry};
+use crate::auth::Scope;
 use crate::state::AppState;
 
 /// A notification not delivered within this long fails with reason `expired` (section 7.4).
@@ -344,20 +349,131 @@ pub async fn counts(pool: &SqlitePool, channel: &str) -> sqlx::Result<registry::
     Ok(counts)
 }
 
+/// The longest an adapter may park one poll (section 6.1).
+const MAX_WAIT_SECS: u64 = 30;
+
 /// Routes of D.10.2, literal paths (no `nest`) so `map::seam` can read them.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/channels/{channel}/outbox", get(not_implemented))
-        .route("/channels/{channel}/outbox/{id}/ack", post(not_implemented))
-        .route(
-            "/channels/{channel}/outbox/{id}/renew",
-            post(not_implemented),
-        )
+        .route("/channels/{channel}/outbox", get(get_outbox))
+        .route("/channels/{channel}/outbox/{id}/ack", post(post_ack))
+        .route("/channels/{channel}/outbox/{id}/renew", post(post_renew))
 }
 
-/// Placeholder handler: the real one replaces it in the chunk that owns the route.
-async fn not_implemented() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+/// The 4xx/5xx bodies that carry only a name (`not_leased`, `not_found`): `{error[, detail]}`.
+fn named_error(status: StatusCode, error: &str, detail: Option<&str>) -> Response {
+    let body = contract::ErrorResponse {
+        error: error.to_string(),
+        at: None,
+        detail: detail.map(str::to_string),
+        contract_version: None,
+    };
+    (status, Json(body)).into_response()
+}
+
+fn not_found() -> Response {
+    named_error(StatusCode::NOT_FOUND, "not_found", Some("no such action"))
+}
+
+fn database_failure(error: &sqlx::Error, channel: &str, what: &str) -> Response {
+    tracing::warn!(%error, channel, "outbox {what} failed");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PollQuery {
+    /// Seconds to park when nothing is due; absent = 0, above 30 = 30. A value that is not an
+    /// unsigned integer is refused by the `Query` extractor with its default 400.
+    #[serde(default)]
+    wait: Option<u64>,
+}
+
+/// `GET /channels/{channel}/outbox?wait=` (section 6.1).
+async fn get_outbox(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Path(named): Path<String>,
+    Query(query): Query<PollQuery>,
+) -> Response {
+    let channel = match own_channel(&scope, &named) {
+        Ok(channel) => channel,
+        Err(refusal) => return refusal,
+    };
+    let wait = std::time::Duration::from_secs(query.wait.unwrap_or(0).min(MAX_WAIT_SECS));
+    match lease(&state, channel, wait, Utc::now()).await {
+        Ok(poll) => Json(poll).into_response(),
+        Err(error) => database_failure(&error, channel, "poll"),
+    }
+}
+
+/// The strictly decoded wire ack as the domain type `outbox::ack` takes. `None` only for a body
+/// that carries neither `ok` nor `failed`, which `AckShape` has already refused.
+fn ack_of(body: contract::AckBody) -> Option<contract::Ack> {
+    match (body.ok, body.failed) {
+        (Some(ok), None) => Some(contract::Ack::Ok {
+            ok,
+            platform_refs: body.platform_refs,
+        }),
+        (None, Some(failed)) => Some(contract::Ack::Failed {
+            failed: contract::Failure {
+                retryable: failed.retryable,
+                retry_after_ms: failed.retry_after_ms,
+                reason: failed.reason,
+            },
+        }),
+        _ => None,
+    }
+}
+
+// A non-numeric `{id}` never reaches the handlers below: the `Path<(String, i64)>` extractor
+// refuses it with axum's default 400 (and an id that parses but does not exist is a 404).
+
+/// `POST /channels/{channel}/outbox/{id}/ack` (section 6.2). An `ok` without `platform_refs` is a
+/// success like any other (owner decision Q5): the row is `done`, nothing is retried.
+async fn post_ack(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Path((named, id)): Path<(String, i64)>,
+    body: Bytes,
+) -> Response {
+    let channel = match own_channel(&scope, &named) {
+        Ok(channel) => channel,
+        Err(refusal) => return refusal,
+    };
+    let decoded = match contract::decode::<contract::AckShape>(&body) {
+        Ok(decoded) => decoded,
+        Err(error) => return contract_error(error),
+    };
+    let Some(verdict) = ack_of(decoded) else {
+        return contract_error(contract::ContractError::new(contract::ErrorCode::OneOf, ""));
+    };
+    match ack(&state, channel, id, verdict, Utc::now()).await {
+        Ok(Some(outcome)) => Json(outcome).into_response(),
+        Ok(None) => not_found(),
+        Err(error) => database_failure(&error, channel, "ack"),
+    }
+}
+
+/// `POST /channels/{channel}/outbox/{id}/renew` (section 6.1). The body, if any, is ignored.
+async fn post_renew(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Path((named, id)): Path<(String, i64)>,
+) -> Response {
+    let channel = match own_channel(&scope, &named) {
+        Ok(channel) => channel,
+        Err(refusal) => return refusal,
+    };
+    match renew(&state.pool, channel, id, Utc::now()).await {
+        Ok(renewed) => Json(contract::RenewAnswer {
+            // Second precision, like the stored value and the contract's `date-time`.
+            lease_until: stamp(renewed.lease_until),
+        })
+        .into_response(),
+        Err(RenewError::NotLeased) => named_error(StatusCode::CONFLICT, "not_leased", None),
+        Err(RenewError::NotFound) => not_found(),
+        Err(RenewError::Db(error)) => database_failure(&error, channel, "renew"),
+    }
 }
 
 /// Per-channel long-poll wakers and the ephemeral set (`typing`, memory only).
@@ -925,5 +1041,308 @@ mod tests {
         wake(&state, "fake");
         let woke = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
         assert!(woke.is_ok());
+    }
+
+    // ---- the routes (RB) ------------------------------------------------------------------
+
+    /// The channel routes behind the real token middleware.
+    fn app(st: &AppState) -> Router {
+        crate::channels::routes()
+            .layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                crate::auth::require_token,
+            ))
+            .with_state(st.clone())
+    }
+
+    async fn fake_key(st: &AppState) -> String {
+        crate::auth::mint_service_token(&st.pool, crate::auth::Service::Channel("fake"))
+            .await
+            .unwrap()
+    }
+
+    async fn call(
+        st: &AppState,
+        key: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Authorization", format!("Bearer {key}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = app(st).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Queues a plain `send` for `channel` and returns its id.
+    async fn queue(st: &AppState, channel: &'static str, conversation: &str) -> i64 {
+        let mut conn = st.pool.acquire().await.unwrap();
+        enqueue(
+            &mut conn,
+            &contract::ConversationKey::new(channel, conversation),
+            plain_send(),
+            Class::Turn,
+            None,
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Queues a `send` for `fake` and leases it through the route, as an adapter would.
+    async fn leased(st: &AppState, key: &str) -> i64 {
+        let id = queue(st, "fake", "c1").await;
+        let (status, body) = call(st, key, "GET", "/channels/fake/outbox", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["actions"][0]["id"], id);
+        id
+    }
+
+    async fn state_of(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
+        sqlx::query_as("SELECT state, platform_refs FROM channel_outbox WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn route_get_outbox_returns_actions_and_ephemeral_shapes_validating_against_the_contract()
+    {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        registry::record_hello(&st, "fake", &hello(true), Utc::now())
+            .await
+            .unwrap();
+        let id = queue(&st, "fake", "c1").await;
+        typing(&st, &key("c2"));
+
+        let (status, body) = call(&st, &token, "GET", "/channels/fake/outbox?wait=0", "").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let bytes = serde_json::to_vec(&body).unwrap();
+        contract::decode::<contract::OutboxResponseShape>(&bytes).expect("outbox_response shape");
+        assert_eq!(body["actions"].as_array().unwrap().len(), 1);
+        assert_eq!(body["actions"][0]["id"], id);
+        assert_eq!(body["actions"][0]["type"], "send");
+        assert_eq!(
+            body["ephemeral"],
+            serde_json::json!([{"type": "typing", "conversation": "c2"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn route_an_empty_poll_with_wait_zero_returns_at_once() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        for path in ["/channels/fake/outbox", "/channels/fake/outbox?wait=0"] {
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                call(&st, &token, "GET", path, ""),
+            )
+            .await
+            .expect("an empty poll with wait 0 must not park");
+            assert_eq!(reply.0, StatusCode::OK);
+            assert_eq!(reply.1, serde_json::json!({"actions": [], "ephemeral": []}));
+        }
+    }
+
+    #[tokio::test]
+    async fn route_a_wait_that_is_not_a_number_is_refused_by_the_extractor() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let (status, _) = call(&st, &token, "GET", "/channels/fake/outbox?wait=soon", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_ack_ok_returns_state_done() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await;
+
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{id}/ack"),
+            r#"{"ok":true,"platform_refs":["p1"]}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"state": "done"}));
+        let bytes = serde_json::to_vec(&body).unwrap();
+        contract::decode::<contract::AckResponseShape>(&bytes).expect("ack_response shape");
+        assert_eq!(
+            state_of(&st.pool, id).await,
+            ("done".to_string(), Some(r#"["p1"]"#.to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn route_ack_ok_without_platform_refs_is_done() {
+        // Q5: a `send` acknowledged `ok` with no refs is a success; nothing is retried.
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await;
+
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{id}/ack"),
+            r#"{"ok":true}"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"state": "done"}));
+        assert_eq!(
+            state_of(&st.pool, id).await,
+            ("done".to_string(), Some("[]".to_string()))
+        );
+        let (_, polled) = call(&st, &token, "GET", "/channels/fake/outbox", "").await;
+        assert_eq!(polled["actions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn route_a_bad_ack_is_a_400_with_the_pointer() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await;
+        let path = format!("/channels/fake/outbox/{id}/ack");
+
+        let (status, body) = call(&st, &token, "POST", &path, r#"{"ok":false}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, serde_json::json!({"error": "value", "at": "/ok"}));
+
+        let (status, body) = call(&st, &token, "POST", &path, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, serde_json::json!({"error": "decode"}));
+
+        // Nothing was settled by the refused bodies.
+        assert_eq!(state_of(&st.pool, id).await.0, "leased");
+    }
+
+    #[tokio::test]
+    async fn route_a_retryable_failure_puts_the_row_back_to_pending() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await;
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{id}/ack"),
+            r#"{"failed":{"retryable":true,"reason":"network"}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"state": "pending"}));
+    }
+
+    #[tokio::test]
+    async fn route_renew_extends_a_leased_row() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await;
+
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{id}/renew"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let bytes = serde_json::to_vec(&body).unwrap();
+        contract::decode::<contract::RenewResponseShape>(&bytes).expect("renew_response shape");
+    }
+
+    #[tokio::test]
+    async fn route_renew_after_done_is_409_not_leased() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await;
+        let ack_path = format!("/channels/fake/outbox/{id}/ack");
+        call(&st, &token, "POST", &ack_path, r#"{"ok":true}"#).await;
+
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{id}/renew"),
+            "",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({"error": "not_leased"}));
+    }
+
+    #[tokio::test]
+    async fn route_ack_of_another_channels_row_is_404() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let foreign = queue(&st, "telegram", "c1").await;
+
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{foreign}/ack"),
+            r#"{"ok":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+
+        let (status, _) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{foreign}/renew"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(state_of(&st.pool, foreign).await.0, "pending");
+    }
+
+    #[tokio::test]
+    async fn route_a_non_numeric_id_is_refused_by_the_extractor() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let (status, _) = call(&st, &token, "POST", "/channels/fake/outbox/abc/ack", "{}").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn route_the_control_key_is_refused_on_every_outbox_route() {
+        let st = crate::channels::testkit::state().await;
+        for (method, path) in [
+            ("GET", "/channels/fake/outbox"),
+            ("POST", "/channels/fake/outbox/1/ack"),
+            ("POST", "/channels/fake/outbox/1/renew"),
+        ] {
+            let (status, _) = call(&st, "test-token", method, path, "").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        }
     }
 }

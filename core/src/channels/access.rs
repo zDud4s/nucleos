@@ -1,9 +1,13 @@
-//! Access policy, pairing, primary channel and management routes (flow C). P0 skeleton: the
-//! routes answer 501.
+//! Access policy, pairing, primary channel and management routes (flow C). The management routes
+//! of Anexo E (pairing, identities, home, primary) are real; `GET /channels` stays a 501 stub
+//! until A2 (`registry::list`).
 
-use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, put};
+use axum::{Json, Router};
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::SqlitePool;
 
@@ -152,31 +156,257 @@ pub async fn primary(pool: &SqlitePool) -> sqlx::Result<Option<&'static str>> {
         .map(|manifest| manifest.id))
 }
 
-/// Routes of D.7 and E, literal paths (no `nest`) so `map::seam` can read them.
+/// Routes of D.7 and E, literal paths (no `nest`) so `map::seam` can read them. All of them are
+/// Control-only: `auth.rs` answers a channel key with a bare 403 before any handler here runs.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/channels", get(not_implemented))
-        .route("/channels/primary", put(not_implemented))
+        .route("/channels/primary", put(put_primary))
         .route(
             "/channels/{channel}/pairing",
-            get(not_implemented)
-                .post(not_implemented)
-                .delete(not_implemented),
+            get(get_pairing).post(post_pairing).delete(delete_pairing),
         )
-        .route("/channels/{channel}/identities", get(not_implemented))
+        .route("/channels/{channel}/identities", get(get_identities))
         .route(
             "/channels/{channel}/identities/{sender_ref}",
-            delete(not_implemented),
+            delete(delete_identity),
         )
         .route(
             "/channels/{channel}/identities/{sender_ref}/home",
-            put(not_implemented),
+            put(put_home),
         )
 }
 
-/// Placeholder handler: the real one replaces it in the chunk that owns the route.
+/// Placeholder handler for `GET /channels` (A2: `registry::list`).
 async fn not_implemented() -> StatusCode {
     StatusCode::NOT_IMPLEMENTED
+}
+
+/// The body of every named refusal of Anexo E (E.1): `{"refusal": wire, "detail": english}`. It is
+/// not `door::refusal`, which carries no `detail`.
+fn refuse(refusal: contract::ManagementRefusal, detail: &str) -> Response {
+    (
+        refusal.status(),
+        Json(serde_json::json!({ "refusal": refusal.wire(), "detail": detail })),
+    )
+        .into_response()
+}
+
+fn database_failure(error: &sqlx::Error, what: &str) -> Response {
+    tracing::warn!(%error, "channel management {what} failed");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// E.1 common checks, in order: `400 malformed_channel`, then `404 unknown_channel`.
+fn resolve_channel(channel: &str) -> Result<&'static registry::Manifest, Response> {
+    if !contract::valid_channel_id(channel) {
+        return Err(refuse(
+            contract::ManagementRefusal::MalformedChannel,
+            "the channel id must match [a-z][a-z0-9-]{0,31}",
+        ));
+    }
+    registry::by_id(channel).ok_or_else(|| {
+        refuse(
+            contract::ManagementRefusal::UnknownChannel,
+            "no channel of that kind is compiled into this build",
+        )
+    })
+}
+
+/// E.1: a ref is 1 to 128 bytes, else `400 malformed_ref`.
+fn check_ref(reference: &str, what: &str) -> Result<(), Response> {
+    if contract::valid_ref(reference) {
+        return Ok(());
+    }
+    Err(refuse(
+        contract::ManagementRefusal::MalformedRef,
+        &format!("{what} must be between 1 and 128 bytes"),
+    ))
+}
+
+/// A body that is not the JSON the route takes: the plain 400 of the extractors it replaces, with
+/// no refusal name (E.1: unnamed refusals carry the status only).
+fn bad_body() -> Response {
+    StatusCode::BAD_REQUEST.into_response()
+}
+
+/// `POST /channels/{channel}/pairing` (E.4): mints a code, 201.
+///
+/// TODO(A2): the `409 channel_not_configured` of E.4 is NOT checked here. The only predicate over
+/// the required secrets is `Presence::secrets_status`, private to `registry.rs`, and its cache is
+/// filled by the launcher (`launch_all`, A2): in A1 every real channel would read as not configured
+/// and the route could never mint. A2 adds a public predicate and the check goes right after
+/// `resolve_channel`.
+async fn post_pairing(State(state): State<AppState>, Path(channel): Path<String>) -> Response {
+    let manifest = match resolve_channel(&channel) {
+        Ok(manifest) => manifest,
+        Err(refusal) => return refusal,
+    };
+    match mint_pairing_code(&state.pool, manifest.id, Utc::now()).await {
+        Ok(minted) => (StatusCode::CREATED, Json(minted)).into_response(),
+        Err(error) => database_failure(&error, "pairing mint"),
+    }
+}
+
+/// `GET /channels/{channel}/pairing` (E.4): the state of the most recent code.
+async fn get_pairing(State(state): State<AppState>, Path(channel): Path<String>) -> Response {
+    let manifest = match resolve_channel(&channel) {
+        Ok(manifest) => manifest,
+        Err(refusal) => return refusal,
+    };
+    match pairing_status(&state.pool, manifest.id, Utc::now()).await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => database_failure(&error, "pairing status"),
+    }
+}
+
+/// `DELETE /channels/{channel}/pairing` (E.4): 204, also when there is no live code.
+async fn delete_pairing(State(state): State<AppState>, Path(channel): Path<String>) -> Response {
+    let manifest = match resolve_channel(&channel) {
+        Ok(manifest) => manifest,
+        Err(refusal) => return refusal,
+    };
+    match cancel_pairing(&state.pool, manifest.id, Utc::now()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => database_failure(&error, "pairing cancel"),
+    }
+}
+
+/// `GET /channels/{channel}/identities` (E.5).
+async fn get_identities(State(state): State<AppState>, Path(channel): Path<String>) -> Response {
+    let manifest = match resolve_channel(&channel) {
+        Ok(manifest) => manifest,
+        Err(refusal) => return refusal,
+    };
+    match identities(&state, manifest.id).await {
+        Ok(readout) => Json(readout).into_response(),
+        Err(error) => database_failure(&error, "identities"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ForgetQuery {
+    /// Percent-decoded by the extractor; present means "only this conversation".
+    conversation: Option<String>,
+}
+
+/// `DELETE /channels/{channel}/identities/{sender_ref}[?conversation=<ref>]` (E.5).
+async fn delete_identity(
+    State(state): State<AppState>,
+    Path((channel, sender_ref)): Path<(String, String)>,
+    Query(query): Query<ForgetQuery>,
+) -> Response {
+    let manifest = match resolve_channel(&channel) {
+        Ok(manifest) => manifest,
+        Err(refusal) => return refusal,
+    };
+    if let Err(refusal) = check_ref(&sender_ref, "sender_ref") {
+        return refusal;
+    }
+    if let Some(conversation) = &query.conversation
+        && let Err(refusal) = check_ref(conversation, "conversation")
+    {
+        return refusal;
+    }
+    match forget(
+        &state,
+        manifest.id,
+        &sender_ref,
+        query.conversation.as_deref(),
+    )
+    .await
+    {
+        Ok(forgotten) => Json(forgotten).into_response(),
+        Err(ForgetError::UnknownIdentity) => refuse(
+            contract::ManagementRefusal::UnknownIdentity,
+            "that sender has no identity on this channel",
+        ),
+        Err(ForgetError::UnknownConversation) => refuse(
+            contract::ManagementRefusal::UnknownConversation,
+            "that conversation is not one of this sender's on this channel",
+        ),
+        Err(ForgetError::Db(error)) => database_failure(&error, "identity forget"),
+    }
+}
+
+/// `PUT /channels/{channel}/identities/{sender_ref}/home {"conversation_ref": ...}` (E.5).
+async fn put_home(
+    State(state): State<AppState>,
+    Path((channel, sender_ref)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let manifest = match resolve_channel(&channel) {
+        Ok(manifest) => manifest,
+        Err(refusal) => return refusal,
+    };
+    if let Err(refusal) = check_ref(&sender_ref, "sender_ref") {
+        return refusal;
+    }
+    let conversation_ref = match serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("conversation_ref"))
+        .and_then(|value| value.as_str())
+    {
+        Some(reference) => reference.to_string(),
+        None => return bad_body(),
+    };
+    if let Err(refusal) = check_ref(&conversation_ref, "conversation_ref") {
+        return refusal;
+    }
+    match set_home(&state.pool, manifest.id, &sender_ref, &conversation_ref).await {
+        Ok(set) => Json(set).into_response(),
+        Err(SetHomeError::UnknownIdentity) => refuse(
+            contract::ManagementRefusal::UnknownIdentity,
+            "that sender has no identity on this channel",
+        ),
+        Err(SetHomeError::UnknownConversation) => refuse(
+            contract::ManagementRefusal::UnknownConversation,
+            "that conversation is not one of this sender's on this channel",
+        ),
+        Err(SetHomeError::Db(error)) => database_failure(&error, "home change"),
+    }
+}
+
+/// `PUT /channels/primary {"channel": "<id>" | null}` (E.3). The `channel` key is required, so an
+/// empty object cannot clear the primary by accident.
+async fn put_primary(State(state): State<AppState>, body: Bytes) -> Response {
+    let value = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let requested: Option<String> = match value
+        .as_ref()
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get("channel"))
+    {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(id)) => Some(id.clone()),
+        _ => return bad_body(),
+    };
+    if let Some(id) = &requested {
+        // The unknown-channel refusal comes from `set_primary` (same 404), after the grammar.
+        if !contract::valid_channel_id(id) {
+            return refuse(
+                contract::ManagementRefusal::MalformedChannel,
+                "the channel id must match [a-z][a-z0-9-]{0,31}",
+            );
+        }
+    }
+    match set_primary(&state, requested.as_deref()).await {
+        Ok(set) => Json(set).into_response(),
+        Err(PrimaryError::UnknownChannel) => refuse(
+            contract::ManagementRefusal::UnknownChannel,
+            "no channel of that kind is compiled into this build",
+        ),
+        Err(PrimaryError::ChannelNotConfigured) => refuse(
+            contract::ManagementRefusal::ChannelNotConfigured,
+            "the channel is not configured, so it cannot become the primary yet",
+        ),
+        Err(PrimaryError::NoHomeConversation) => refuse(
+            contract::ManagementRefusal::NoHomeConversation,
+            "the channel has no home conversation, so notifications would have no destination",
+        ),
+        Err(PrimaryError::Db(error)) => database_failure(&error, "primary change"),
+    }
 }
 
 /// Housekeeping hook called hourly by `run_housekeeping`.
@@ -382,5 +612,442 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(left, vec!["recent".to_string(), "future".to_string()]);
+    }
+
+    // ---- the management routes (RC) --------------------------------------------------------
+
+    const CONTROL_KEY: &str = "test-token";
+
+    /// The channel routes behind the real token middleware.
+    fn app(st: &AppState) -> Router {
+        crate::channels::routes()
+            .layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                crate::auth::require_token,
+            ))
+            .with_state(st.clone())
+    }
+
+    async fn call(
+        st: &AppState,
+        key: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Authorization", format!("Bearer {key}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = app(st).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Calls as the control key and asserts a named refusal of Anexo E (status, wire name and a
+    /// non-empty English `detail`).
+    async fn refused(
+        st: &AppState,
+        method: &str,
+        path: &str,
+        body: &str,
+        refusal: contract::ManagementRefusal,
+    ) {
+        let (status, json) = call(st, CONTROL_KEY, method, path, body).await;
+        assert_eq!(status, refusal.status(), "{method} {path}");
+        assert_eq!(json["refusal"], refusal.wire(), "{method} {path}");
+        assert!(
+            json["detail"].as_str().is_some_and(|d| !d.is_empty()),
+            "{method} {path}: {json}"
+        );
+    }
+
+    async fn seed_fake(
+        pool: &SqlitePool,
+        sender: &str,
+        conversation: &str,
+        kind: &str,
+        parent: Option<&str>,
+        home: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO channel_identities (channel, sender_ref, conversation_ref, \
+             conversation_kind, parent, home, created_at) VALUES ('fake', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(sender)
+        .bind(conversation)
+        .bind(kind)
+        .bind(parent)
+        .bind(home as i64)
+        .bind(NOW)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_malformed_channel_is_400_before_anything_else() {
+        use contract::ManagementRefusal::MalformedChannel;
+        let st = state().await;
+        refused(
+            &st,
+            "POST",
+            "/channels/Bad_Id/pairing",
+            "",
+            MalformedChannel,
+        )
+        .await;
+        refused(
+            &st,
+            "GET",
+            "/channels/Bad_Id/identities",
+            "",
+            MalformedChannel,
+        )
+        .await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/primary",
+            r#"{"channel":"BAD"}"#,
+            MalformedChannel,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_unknown_channel_is_404() {
+        use contract::ManagementRefusal::UnknownChannel;
+        let st = state().await;
+        refused(&st, "GET", "/channels/nope/pairing", "", UnknownChannel).await;
+        refused(&st, "DELETE", "/channels/nope/pairing", "", UnknownChannel).await;
+        refused(&st, "GET", "/channels/nope/identities", "", UnknownChannel).await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/primary",
+            r#"{"channel":"nope"}"#,
+            UnknownChannel,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_refs_of_129_bytes_or_empty_are_malformed_ref() {
+        use contract::ManagementRefusal::MalformedRef;
+        let st = state().await;
+        seed_fake(&st.pool, "u1", "c1", "private", None, true).await;
+        let long = "a".repeat(129);
+        refused(
+            &st,
+            "DELETE",
+            &format!("/channels/fake/identities/{long}"),
+            "",
+            MalformedRef,
+        )
+        .await;
+        refused(
+            &st,
+            "DELETE",
+            "/channels/fake/identities/u1?conversation=",
+            "",
+            MalformedRef,
+        )
+        .await;
+        refused(
+            &st,
+            "DELETE",
+            &format!("/channels/fake/identities/u1?conversation={long}"),
+            "",
+            MalformedRef,
+        )
+        .await;
+        refused(
+            &st,
+            "PUT",
+            &format!("/channels/fake/identities/{long}/home"),
+            r#"{"conversation_ref":"c1"}"#,
+            MalformedRef,
+        )
+        .await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/fake/identities/u1/home",
+            &format!(r#"{{"conversation_ref":"{long}"}}"#),
+            MalformedRef,
+        )
+        .await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/fake/identities/u1/home",
+            r#"{"conversation_ref":""}"#,
+            MalformedRef,
+        )
+        .await;
+        // The 128-byte edge is accepted by the grammar (and then simply unknown).
+        let edge = "a".repeat(128);
+        refused(
+            &st,
+            "DELETE",
+            &format!("/channels/fake/identities/{edge}"),
+            "",
+            contract::ManagementRefusal::UnknownIdentity,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_channel_not_configured_is_409_on_primary() {
+        let st = state().await;
+        seed_fake(&st.pool, "u1", "c1", "private", None, true).await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/primary",
+            r#"{"channel":"fake"}"#,
+            contract::ManagementRefusal::ChannelNotConfigured,
+        )
+        .await;
+        // A1: the stored primary did not change.
+        assert_eq!(primary(&st.pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn route_no_home_conversation_is_409_on_primary() {
+        let st = state().await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/primary",
+            r#"{"channel":"fake"}"#,
+            contract::ManagementRefusal::NoHomeConversation,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_unknown_identity_is_404_on_forget_and_home() {
+        use contract::ManagementRefusal::UnknownIdentity;
+        let st = state().await;
+        refused(
+            &st,
+            "DELETE",
+            "/channels/fake/identities/ghost",
+            "",
+            UnknownIdentity,
+        )
+        .await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/fake/identities/ghost/home",
+            r#"{"conversation_ref":"c1"}"#,
+            UnknownIdentity,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_unknown_conversation_is_404_on_forget_and_home() {
+        use contract::ManagementRefusal::UnknownConversation;
+        let st = state().await;
+        seed_fake(&st.pool, "u1", "c1", "private", None, true).await;
+        refused(
+            &st,
+            "DELETE",
+            "/channels/fake/identities/u1?conversation=zz",
+            "",
+            UnknownConversation,
+        )
+        .await;
+        refused(
+            &st,
+            "PUT",
+            "/channels/fake/identities/u1/home",
+            r#"{"conversation_ref":"zz"}"#,
+            UnknownConversation,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_primary_null_clears_and_the_current_one_is_a_noop() {
+        let st = state().await;
+        sqlx::query("UPDATE channels_global SET primary_channel = 'fake' WHERE id = 1")
+            .execute(&st.pool)
+            .await
+            .unwrap();
+        let (status, body) = call(
+            &st,
+            CONTROL_KEY,
+            "PUT",
+            "/channels/primary",
+            r#"{"channel":"fake"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"primary":"fake","reseeded":false}));
+        let (status, body) = call(
+            &st,
+            CONTROL_KEY,
+            "PUT",
+            "/channels/primary",
+            r#"{"channel":null}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"primary":null,"reseeded":false}));
+        assert_eq!(primary(&st.pool).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn route_primary_needs_the_channel_key() {
+        let st = state().await;
+        for body in ["", "{}", r#"{"channel":7}"#, "not json"] {
+            let (status, _) = call(&st, CONTROL_KEY, "PUT", "/channels/primary", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body {body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_pairing_mints_reads_and_cancels() {
+        let st = state().await;
+        let (status, body) = call(&st, CONTROL_KEY, "GET", "/channels/fake/pairing", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "none");
+
+        let (status, body) = call(&st, CONTROL_KEY, "POST", "/channels/fake/pairing", "").await;
+        assert_eq!(status, StatusCode::CREATED);
+        let code = body["code"].as_str().unwrap().to_string();
+        assert_eq!(code.len(), 6);
+        assert!(code.bytes().all(|c| c.is_ascii_digit()));
+        assert_eq!(body["command"], format!("/pair {code}"));
+        assert_eq!(body["attempts_left"], MAX_PAIR_ATTEMPTS);
+        assert!(body["expires_at"].is_string());
+
+        let (status, body) = call(&st, CONTROL_KEY, "GET", "/channels/fake/pairing", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "waiting");
+        assert!(body.get("code").is_none(), "the code never comes back");
+
+        for _ in 0..2 {
+            let (status, _) = call(&st, CONTROL_KEY, "DELETE", "/channels/fake/pairing", "").await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let (_, body) = call(&st, CONTROL_KEY, "GET", "/channels/fake/pairing", "").await;
+        assert_eq!(body["state"], "none");
+    }
+
+    #[tokio::test]
+    async fn route_identities_list_groups_by_sender() {
+        let st = state().await;
+        seed_fake(&st.pool, "u1", "g1", "group", None, false).await;
+        seed_fake(&st.pool, "u1", "g1:5", "thread", Some("g1"), true).await;
+        let (status, body) = call(&st, CONTROL_KEY, "GET", "/channels/fake/identities", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"], "fake");
+        assert_eq!(body["home"], "g1:5");
+        let senders = body["identities"].as_array().unwrap();
+        assert_eq!(senders.len(), 1);
+        assert_eq!(senders[0]["sender_ref"], "u1");
+        assert_eq!(senders[0]["conversations"].as_array().unwrap().len(), 2);
+        assert_eq!(body["projects"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn route_forget_decodes_percent_encoded_refs() {
+        let st = state().await;
+        seed_fake(&st.pool, "a:b", "-100", "group", None, false).await;
+        seed_fake(&st.pool, "a:b", "-100:5", "thread", Some("-100"), true).await;
+        let (status, body) = call(
+            &st,
+            CONTROL_KEY,
+            "DELETE",
+            "/channels/fake/identities/a%3Ab?conversation=-100%3A5",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"removed":1,"home_cleared":true}));
+        let (status, body) = call(
+            &st,
+            CONTROL_KEY,
+            "DELETE",
+            "/channels/fake/identities/a%3Ab",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"removed":1,"home_cleared":false}));
+    }
+
+    #[tokio::test]
+    async fn route_home_moves_and_is_idempotent() {
+        let st = state().await;
+        seed_fake(&st.pool, "u1", "c1", "private", None, true).await;
+        seed_fake(&st.pool, "u1", "c2", "private", None, false).await;
+        let (status, body) = call(
+            &st,
+            CONTROL_KEY,
+            "PUT",
+            "/channels/fake/identities/u1/home",
+            r#"{"conversation_ref":"c2"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"home":"c2","previous":"c1"}));
+        let (_, body) = call(
+            &st,
+            CONTROL_KEY,
+            "PUT",
+            "/channels/fake/identities/u1/home",
+            r#"{"conversation_ref":"c2"}"#,
+        )
+        .await;
+        assert_eq!(body, serde_json::json!({"home":"c2","previous":"c2"}));
+        let (status, _) = call(
+            &st,
+            CONTROL_KEY,
+            "PUT",
+            "/channels/fake/identities/u1/home",
+            "not json",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Regression for P0-9: a channel key never reaches a management handler, not even its own
+    /// channel's.
+    #[tokio::test]
+    async fn route_a_channel_key_is_403_on_management() {
+        let st = state().await;
+        let key = crate::auth::mint_service_token(&st.pool, crate::auth::Service::Channel("fake"))
+            .await
+            .unwrap();
+        for (method, path, body) in [
+            ("POST", "/channels/fake/pairing", ""),
+            ("GET", "/channels/fake/identities", ""),
+            ("PUT", "/channels/primary", r#"{"channel":null}"#),
+        ] {
+            let (status, _) = call(&st, &key, method, path, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        let minted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_pairing_codes")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        assert_eq!(minted, 0);
     }
 }

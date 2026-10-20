@@ -1,28 +1,164 @@
-//! Media bytes, transcription and turn input (flow B). P0 skeleton: the routes answer 501.
+//! Media bytes, transcription and turn input (flow B). The two routes at the top only decode,
+//! authorise and answer; `store` and `open` are the logic.
 
 use std::path::PathBuf;
 
+use axum::Json;
 use axum::Router;
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Extension, Path, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::{DateTime, Duration, Utc};
 use rand::RngExt;
 use sqlx::SqlitePool;
 
-use crate::channels::contract::InPart;
+use super::ingest::own_channel;
+use crate::auth::Scope;
+use crate::channels::contract::{ErrorResponse, InPart, MediaCreated};
 use crate::channels::registry;
 use crate::state::AppState;
 
 /// Routes of D.9, literal paths (no `nest`) so `map::seam` can read them.
 pub fn routes() -> Router<AppState> {
+    // The layer lifts axum's 2 MB default to the largest manifest limit. The handler reads the body
+    // by hand and enforces the channel's OWN limit, so the 413 carries the JSON body of T9 (R14)
+    // instead of the layer's bare one.
+    let ceiling = registry::all()
+        .iter()
+        .map(|m| m.max_media_bytes)
+        .max()
+        .unwrap_or(0);
     Router::new()
-        .route("/channels/{channel}/media", post(not_implemented))
-        .route("/channels/{channel}/media/{media_id}", get(not_implemented))
+        .route(
+            "/channels/{channel}/media",
+            post(post_media).layer(DefaultBodyLimit::max(ceiling)),
+        )
+        .route("/channels/{channel}/media/{media_id}", get(get_media))
 }
 
-/// Placeholder handler: the real one replaces it in the chunk that owns the route.
-async fn not_implemented() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+/// One half of a mime type, `^[a-z0-9][a-z0-9.+-]*$` (T7).
+fn mime_half(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b[1..].iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(*c, b'.' | b'+' | b'-')
+        })
+}
+
+/// `type/subtype`, no parameters (`; codecs=opus` is refused), the same grammar as an event part.
+fn valid_mime(s: &str) -> bool {
+    s.split_once('/')
+        .is_some_and(|(kind, subtype)| mime_half(kind) && mime_half(subtype))
+}
+
+fn refusal(status: StatusCode, error: &str, detail: Option<String>) -> Response {
+    let body = ErrorResponse {
+        error: error.to_string(),
+        at: None,
+        detail,
+        contract_version: None,
+    };
+    (status, Json(body)).into_response()
+}
+
+fn too_large(limit: usize) -> Response {
+    refusal(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "media_too_large",
+        Some(format!("limit is {limit} bytes")),
+    )
+}
+
+/// `POST /channels/{channel}/media` (section 5.2): raw bytes, `Content-Type` is the mime.
+async fn post_media(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Path(named): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let channel = match own_channel(&scope, &named) {
+        Ok(channel) => channel,
+        Err(refusal) => return refusal,
+    };
+    let Some(manifest) = registry::by_id(channel) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mime = match headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(mime) if valid_mime(mime) => mime.to_string(),
+        _ => {
+            return refusal(
+                StatusCode::BAD_REQUEST,
+                "grammar",
+                Some("Content-Type must be a bare mime type".to_string()),
+            );
+        }
+    };
+    // One byte over the limit is enough to know; a read error (the peer went away) answers the
+    // same, to nobody.
+    let limit = manifest.max_media_bytes;
+    let bytes = match axum::body::to_bytes(body, limit.saturating_add(1)).await {
+        Ok(bytes) => bytes,
+        Err(_) => return too_large(limit),
+    };
+    match store(&state, channel, &mime, &bytes, Utc::now()).await {
+        Ok(media_id) => Json(MediaCreated { media_id }).into_response(),
+        Err(MediaError::TooLarge) => too_large(limit),
+        Err(MediaError::NoFilesRoot) => refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_files_root",
+            Some("the files folder is not available".to_string()),
+        ),
+        Err(error) => {
+            tracing::warn!(?error, channel, "media could not be stored");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `GET /channels/{channel}/media/{media_id}`: the bytes with the stored `Content-Type`. Unknown
+/// ids and another channel's ids are the same 404.
+async fn get_media(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Path((named, media_id)): Path<(String, String)>,
+) -> Response {
+    let channel = match own_channel(&scope, &named) {
+        Ok(channel) => channel,
+        Err(refusal) => return refusal,
+    };
+    let stored = match open(&state, channel, &media_id).await {
+        Ok(stored) => stored,
+        Err(MediaError::UnknownMedia | MediaError::WrongChannel) => {
+            return refusal(StatusCode::NOT_FOUND, "unknown_media", None);
+        }
+        Err(MediaError::NoFilesRoot) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(error) => {
+            tracing::warn!(?error, channel, "media could not be opened");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let bytes = match tokio::fs::read(&stored.path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return refusal(StatusCode::NOT_FOUND, "unknown_media", None);
+        }
+        Err(error) => {
+            tracing::warn!(%error, channel, "media file could not be read");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let content_type = HeaderValue::from_str(&stored.mime)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
 }
 
 /// The folder under `files_root` where channel media lands, like `CHAT_IMAGES` does for pasted
@@ -601,5 +737,157 @@ mod tests {
         assert!(open(&state, "fake", &fresh).await.is_ok());
         // The file follows the files-folder rules: pruning the row does not delete it.
         assert!(old_file.exists());
+    }
+
+    // ---- the routes (RA) ------------------------------------------------------------------
+
+    async fn route_key(state: &AppState, channel: &'static str) -> String {
+        crate::auth::mint_service_token(&state.pool, crate::auth::Service::Channel(channel))
+            .await
+            .unwrap()
+    }
+
+    /// One request through the real token middleware and the channel routes.
+    async fn call(
+        state: &AppState,
+        key: &str,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        use tower::ServiceExt;
+        let app = crate::channels::routes()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::require_token,
+            ))
+            .with_state(state.clone());
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Authorization", format!("Bearer {key}"));
+        if let Some(content_type) = content_type {
+            request = request.header("Content-Type", content_type);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn route_media_of_one_byte_answers_an_id_and_serves_it_back() {
+        let (state, _dir) = state_with_root().await;
+        let key = route_key(&state, "fake").await;
+        let (status, _, body) = call(
+            &state,
+            &key,
+            "POST",
+            "/channels/fake/media",
+            Some("image/png"),
+            vec![7],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = answer["media_id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("m_"), "{id}");
+
+        let (status, headers, bytes) = call(
+            &state,
+            &key,
+            "GET",
+            &format!("/channels/fake/media/{id}"),
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("content-type").unwrap(), "image/png");
+        assert_eq!(bytes, vec![7]);
+    }
+
+    #[tokio::test]
+    async fn route_media_above_the_manifest_limit_is_413_with_the_contract_body() {
+        let (state, _dir) = state_with_root().await;
+        let key = route_key(&state, "fake").await;
+        let limit = registry::by_id("fake").unwrap().max_media_bytes;
+        let (status, _, body) = call(
+            &state,
+            &key,
+            "POST",
+            "/channels/fake/media",
+            Some("application/pdf"),
+            vec![0; limit + 1],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({
+                "error": "media_too_large",
+                "detail": format!("limit is {limit} bytes")
+            })
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_media")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn route_media_with_a_mime_parameter_is_a_400() {
+        let (state, _dir) = state_with_root().await;
+        let key = route_key(&state, "fake").await;
+        let (status, _, body) = call(
+            &state,
+            &key,
+            "POST",
+            "/channels/fake/media",
+            Some("audio/ogg; codecs=opus"),
+            vec![1],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["error"], "grammar");
+    }
+
+    #[tokio::test]
+    async fn route_media_of_another_channel_is_404() {
+        let (state, _dir) = state_with_root().await;
+        let theirs = store(&state, "telegram", "text/plain", b"x", Utc::now())
+            .await
+            .unwrap();
+        let key = route_key(&state, "fake").await;
+        let (status, _, _) = call(
+            &state,
+            &key,
+            "GET",
+            &format!("/channels/fake/media/{theirs}"),
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = call(
+            &state,
+            &key,
+            "GET",
+            "/channels/fake/media/m_unknown",
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

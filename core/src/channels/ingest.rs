@@ -1,22 +1,29 @@
-//! Adapter ingest: `hello` and `events` (flow A, Anexo D D.6). The routes still answer 501 (RA owns
-//! them); `ingest_event` is the whole of `/events` minus the HTTP.
+//! Adapter ingest: `hello` and `events` (flow A, Anexo D D.6). `ingest_event` is the whole of
+//! `/events` minus the HTTP; the handlers below only decode, authorise and answer.
 
+use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{post, put};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::SqlitePool;
 
 use super::commands::{self, Intent};
 use super::contract::{
-    self, ConversationKey, EventBody, InAction, InMessage, InPart, InboundEvent, IngestReply,
-    OutPart,
+    self, AdapterHello, Capabilities, ContractError, ConversationKey, ErrorCode, ErrorResponse,
+    EventBody, Hello, HelloShape, InAction, InMessage, InPart, InboundEvent, IngestReply, OutPart,
+    decode, decode_event,
 };
 use super::outbox::{self, Class, NewAction};
+use super::registry::{self, HelloError};
 use super::strings::{self, Text};
 use super::tokens::{self, Redeemed, TokenAction};
 use super::{access, media, replies};
 use crate::assistant::{Origin, Sent};
+use crate::auth::{Scope, Service};
 use crate::state::AppState;
 
 /// Retention of `channel_events`: far above the redelivery window of any platform (section 5.3).
@@ -29,13 +36,106 @@ const REPROCESS_AFTER: Duration = Duration::seconds(60);
 /// Routes of D.6, literal paths (no `nest`) so `map::seam` can read them.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/channels/{channel}/hello", put(not_implemented))
-        .route("/channels/{channel}/events", post(not_implemented))
+        .route("/channels/{channel}/hello", put(put_hello))
+        .route("/channels/{channel}/events", post(post_event))
 }
 
-/// Placeholder handler: the real one replaces it in the chunk that owns the route.
-async fn not_implemented() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+/// The channel a request speaks for, taken from the authenticated scope and never from the body
+/// (section 7.3). Only a channel's own key is admitted: the control key has no channel to speak for
+/// and gets a bare 403, and a key on another channel's path (which `require_token` already refuses)
+/// gets the `channel_mismatch` body.
+pub(super) fn own_channel(scope: &Scope, named: &str) -> Result<&'static str, Response> {
+    match scope {
+        Scope::Service(Service::Channel(id)) if *id == named => Ok(*id),
+        Scope::Service(Service::Channel(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "channel_mismatch" })),
+        )
+            .into_response()),
+        _ => Err(StatusCode::FORBIDDEN.into_response()),
+    }
+}
+
+/// The 400 of T9: `{error, at}` from a failed decode.
+pub(super) fn contract_error(error: ContractError) -> Response {
+    (StatusCode::BAD_REQUEST, Json(ErrorResponse::from(error))).into_response()
+}
+
+/// What `record_hello` takes, from the strictly decoded wire form of the same document.
+fn hello_of(adapter: &AdapterHello) -> Hello {
+    let caps = &adapter.capabilities;
+    Hello {
+        kind: adapter.kind.clone(),
+        version: adapter.version.clone(),
+        capabilities: Capabilities {
+            buttons: caps.buttons,
+            edit: caps.edit,
+            typing: caps.typing,
+            threads: caps.threads,
+            reply_to: caps.reply_to,
+            // `HelloShape` already bounded it to 1..=1_000_000.
+            max_text: u32::try_from(caps.max_text).unwrap_or(u32::MAX),
+            media_in: caps.media_in.clone(),
+            media_out: caps.media_out.clone(),
+        },
+    }
+}
+
+/// `PUT /channels/{channel}/hello` (section 5.1).
+async fn put_hello(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Path(named): Path<String>,
+    body: Bytes,
+) -> Response {
+    let channel = match own_channel(&scope, &named) {
+        Ok(channel) => channel,
+        Err(refusal) => return refusal,
+    };
+    let adapter = match decode::<HelloShape>(&body) {
+        Ok(adapter) => adapter,
+        Err(error) => return contract_error(error),
+    };
+    match registry::record_hello(&state, channel, &hello_of(&adapter), Utc::now()).await {
+        Ok(reply) => Json(reply).into_response(),
+        Err(HelloError::Incompatible { .. }) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::contract_version(&adapter)),
+        )
+            .into_response(),
+        Err(HelloError::KindMismatch) => {
+            contract_error(ContractError::new(ErrorCode::Value, "/kind"))
+        }
+        Err(HelloError::Db(error)) => {
+            tracing::warn!(%error, channel, "hello could not be recorded");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `POST /channels/{channel}/events` (section 5.3). The ingest runs to the end even when the
+/// adapter drops the connection: a half-run command is worse than a duplicate answer.
+async fn post_event(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Path(named): Path<String>,
+    body: Bytes,
+) -> Response {
+    let channel = match own_channel(&scope, &named) {
+        Ok(channel) => channel,
+        Err(refusal) => return refusal,
+    };
+    let event = match decode_event(&body) {
+        Ok(event) => event,
+        Err(error) => return contract_error(error),
+    };
+    let now = Utc::now();
+    match crate::door::uncancellable(async move { ingest_event(&state, channel, event, now).await })
+        .await
+    {
+        Ok(reply) => reply.into_response(),
+        Err(status) => status.into_response(),
+    }
 }
 
 /// Everything ingest knows about one inbound message once it is admitted, handed to commands.
@@ -845,5 +945,178 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(left, vec!["ev-recent".to_string()]);
+    }
+
+    // ---- the routes (RA) ------------------------------------------------------------------
+
+    const HELLO: &str = r#"{"kind":"fake","version":"1.0.0","capabilities":{"max_text":4096}}"#;
+
+    /// `/pair <garbage>` from a stranger: understood, silent, and needs no turn runner.
+    fn pair_event(id: &str) -> String {
+        format!(
+            r#"{{"event_id":"{id}","conversation":{{"ref":"c1","kind":"private"}},"sender":{{"ref":"stranger"}},"type":"message","message":{{"ref":"1","parts":[{{"type":"text","text":"/pair nope"}}]}}}}"#
+        )
+    }
+
+    /// The channel routes behind the real token middleware.
+    fn app(st: &AppState) -> Router {
+        crate::channels::routes()
+            .layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                crate::auth::require_token,
+            ))
+            .with_state(st.clone())
+    }
+
+    async fn fake_key(st: &AppState) -> String {
+        crate::auth::mint_service_token(&st.pool, Service::Channel("fake"))
+            .await
+            .unwrap()
+    }
+
+    async fn call(
+        st: &AppState,
+        key: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Authorization", format!("Bearer {key}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = app(st).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn route_hello_answers_the_contract_version() {
+        let st = state().await;
+        let key = fake_key(&st).await;
+        let (status, body) = call(&st, &key, "PUT", "/channels/fake/hello", HELLO).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"contract_version": "1.0.0"}));
+    }
+
+    #[tokio::test]
+    async fn route_hello_of_a_future_major_is_409_with_the_contract_version_body() {
+        let st = state().await;
+        let key = fake_key(&st).await;
+        let hello = HELLO.replace("1.0.0", "2.0.0");
+        let (status, body) = call(&st, &key, "PUT", "/channels/fake/hello", &hello).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "contract_version",
+                "contract_version": "1.0.0",
+                "detail": "adapter speaks 2.0.0"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn route_hello_with_another_channels_kind_is_400() {
+        let st = state().await;
+        let key = fake_key(&st).await;
+        let hello = HELLO.replace(r#""kind":"fake""#, r#""kind":"telegram""#);
+        let (status, body) = call(&st, &key, "PUT", "/channels/fake/hello", &hello).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "value");
+        assert_eq!(body["at"], "/kind");
+    }
+
+    #[tokio::test]
+    async fn route_event_that_breaks_the_contract_is_400_with_the_pointer() {
+        let st = state().await;
+        let key = fake_key(&st).await;
+        let thread_without_parent = r#"{"event_id":"e1","conversation":{"ref":"t1","kind":"thread"},"sender":{"ref":"u1"},"type":"message","message":{"ref":"1","parts":[{"type":"text","text":"hi"}]}}"#;
+        let (status, body) = call(
+            &st,
+            &key,
+            "POST",
+            "/channels/fake/events",
+            thread_without_parent,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "required_if", "at": "/conversation/parent"})
+        );
+    }
+
+    #[tokio::test]
+    async fn route_event_is_accepted_then_duplicate_and_a_stranger_is_dropped() {
+        let st = state().await;
+        let key = fake_key(&st).await;
+        let (status, body) = call(
+            &st,
+            &key,
+            "POST",
+            "/channels/fake/events",
+            &pair_event("r-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body, serde_json::json!({"accepted": true}));
+
+        let (status, body) = call(
+            &st,
+            &key,
+            "POST",
+            "/channels/fake/events",
+            &pair_event("r-1"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"duplicate": true}));
+
+        let plain = pair_event("r-2").replace("/pair nope", "hello there");
+        let (status, body) = call(&st, &key, "POST", "/channels/fake/events", &plain).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body, serde_json::json!({"dropped": true}));
+    }
+
+    #[tokio::test]
+    async fn route_event_is_processed_even_when_the_client_goes_away() {
+        use tower::ServiceExt;
+        let st = state().await;
+        // No token middleware: nothing to await before the handler hands the work to `uncancellable`.
+        let router = crate::channels::routes()
+            .layer(Extension(Scope::Service(Service::Channel("fake"))))
+            .with_state(st.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/channels/fake/events")
+            .body(axum::body::Body::from(pair_event("r-gone")))
+            .unwrap();
+        // One poll starts the handler, then the future (the "client") is dropped.
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, router.oneshot(request)).await;
+        let mut outcome = String::new();
+        for _ in 0..200 {
+            outcome = sqlx::query_scalar("SELECT outcome FROM channel_events WHERE event_id = ?")
+                .bind("r-gone")
+                .fetch_optional(&st.pool)
+                .await
+                .unwrap()
+                .unwrap_or_default();
+            if outcome == "accepted" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(outcome, "accepted");
     }
 }
