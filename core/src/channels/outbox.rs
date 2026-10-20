@@ -5,6 +5,7 @@ mod ack;
 mod degrade;
 mod lease;
 
+pub use ack::{AckOutcome, ActionState, RenewError, Renewed, ack, renew};
 pub use lease::lease;
 
 use std::collections::{HashMap, HashSet};

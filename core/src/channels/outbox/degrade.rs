@@ -5,6 +5,7 @@ use sqlx::SqliteConnection;
 
 use super::Subject;
 use crate::channels::contract::{Button, Capabilities, MediaKind, OutAction, OutPart};
+use crate::channels::media::display_name;
 use crate::channels::strings::{self, Text};
 
 type Buttons = Option<Vec<Vec<Button>>>;
@@ -69,16 +70,6 @@ async fn substitute_conversation(
     Ok(conversation)
 }
 
-/// `media::display_name` over a connection (that one takes a pool): the stored name, else the mime.
-async fn display_name(conn: &mut SqliteConnection, media_id: &str) -> sqlx::Result<Option<String>> {
-    let row: Option<(Option<String>, String)> =
-        sqlx::query_as("SELECT name, mime FROM channel_media WHERE id = ?")
-            .bind(media_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-    Ok(row.map(|(name, mime)| name.filter(|n| !n.is_empty()).unwrap_or(mime)))
-}
-
 fn text_part(text: Text) -> OutPart {
     OutPart::Text {
         text: strings::render(&text),
@@ -115,7 +106,7 @@ async fn degrade_media(
         }
         let name = match label {
             Some(name) => name,
-            None => display_name(conn, &media).await?.unwrap_or(media),
+            None => display_name(&mut *conn, &media).await?.unwrap_or(media),
         };
         out.push(text_part(Text::MediaUnavailable { name }));
         if let Some(caption) = caption.filter(|c| !c.is_empty()) {

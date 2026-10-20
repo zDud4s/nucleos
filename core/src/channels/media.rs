@@ -161,12 +161,16 @@ pub async fn open(
     })
 }
 
-/// For `outbox` degradation: the stored name, or the mime when the row has none.
-pub async fn display_name(pool: &SqlitePool, media_id: &str) -> sqlx::Result<Option<String>> {
+/// For `outbox` degradation: the stored name, or the mime when the row has none. Generic over the
+/// executor so it runs on a pool or on a connection inside a transaction.
+pub async fn display_name<'e, E>(executor: E, media_id: &str) -> sqlx::Result<Option<String>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let row: Option<(Option<String>, String)> =
         sqlx::query_as("SELECT name, mime FROM channel_media WHERE id = ?")
             .bind(media_id)
-            .fetch_optional(pool)
+            .fetch_optional(executor)
             .await?;
     Ok(row.map(|(name, mime)| name.filter(|n| !n.is_empty()).unwrap_or(mime)))
 }

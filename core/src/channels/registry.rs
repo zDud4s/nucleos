@@ -467,66 +467,43 @@ pub struct ChannelsReadout {
     pub channels: Vec<ChannelStatus>,
 }
 
-fn parse_time(text: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
-}
-
 async fn home_of(pool: &SqlitePool, channel: &str) -> sqlx::Result<Option<HomeReadout>> {
-    let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT conversation_ref, conversation_kind, parent, sender_ref \
-         FROM channel_identities WHERE channel = ? AND home = 1",
-    )
-    .bind(channel)
-    .fetch_optional(pool)
-    .await?;
-    Ok(
-        row.and_then(|(conversation_ref, kind, parent, sender_ref)| {
-            Some(HomeReadout {
-                conversation_ref,
-                kind: serde_json::from_value(serde_json::Value::String(kind)).ok()?,
-                parent,
-                sender_ref,
-            })
-        }),
-    )
+    Ok(super::access::home_identity(pool, channel)
+        .await?
+        .map(|home| HomeReadout {
+            conversation_ref: home.conversation_ref,
+            kind: home.conversation_kind,
+            parent: home.parent,
+            sender_ref: home.sender_ref,
+        }))
 }
 
 async fn identity_counts(pool: &SqlitePool, channel: &str) -> sqlx::Result<IdentityCounts> {
-    let (senders, conversations): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(DISTINCT sender_ref), COUNT(DISTINCT conversation_ref) \
-         FROM channel_identities WHERE channel = ?",
-    )
-    .bind(channel)
-    .fetch_one(pool)
-    .await?;
+    let (senders, conversations) = super::access::identity_counts(pool, channel).await?;
     Ok(IdentityCounts {
-        senders: senders as u32,
-        conversations: conversations as u32,
+        senders,
+        conversations,
     })
 }
 
+/// The active code's deadline, from the pairing status (the one place that reads the table).
 async fn pairing_of(
     pool: &SqlitePool,
     channel: &str,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<PairingReadout>> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT expires_at, attempts FROM channel_pairing_codes WHERE channel = ? \
-         AND superseded_at IS NULL AND cancelled_at IS NULL AND paired_at IS NULL \
-         AND expires_at > ?",
+    Ok(
+        match super::access::pairing_status(pool, channel, now).await? {
+            super::access::PairingStatus::Waiting {
+                expires_at,
+                attempts_left,
+            } => Some(PairingReadout {
+                expires_at,
+                attempts_left,
+            }),
+            _ => None,
+        },
     )
-    .bind(channel)
-    .bind(stamp(now))
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|(expires_at, attempts)| {
-        Some(PairingReadout {
-            expires_at: parse_time(&expires_at)?,
-            attempts_left: super::access::MAX_PAIR_ATTEMPTS.saturating_sub(attempts.max(0) as u32),
-        })
-    }))
 }
 
 /// `GET /channels`: one status per compiled manifest. Presence, cache and drops come from memory;
