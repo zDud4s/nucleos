@@ -1,8 +1,11 @@
 //! Turn cycle and queue notices (flow G, Anexo D D.11). P0 skeleton: A2 owns the `todo!()` bodies.
 #![allow(dead_code, unused_variables)] // P0 skeleton: A2 removes this with the real body
 
+use std::time::Duration;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
+use tokio::time::Instant;
 
 use crate::channels::bus::{Cadence, ChannelsBus};
 use crate::channels::outbox::{self, Class, NewAction, Subject};
@@ -12,9 +15,56 @@ use crate::channels::{contract, registry};
 use crate::state::AppState;
 
 /// The ping deadlines, in memory: `(created_at + ping_after, run_id)` of every open channel turn
-/// without `pinged_at`, ordered.
+/// without `pinged_at`, ordered. Rebuilt from the database on every `open_pass`, so a restart or a
+/// missed signal loses nothing.
 #[derive(Default)]
-pub struct Pings(std::collections::BTreeMap<(tokio::time::Instant, i64), ()>);
+pub struct Pings(std::collections::BTreeMap<(Instant, i64), ()>);
+
+/// `runs.created_at` as stored: RFC 3339, or SQLite's `YYYY-MM-DD HH:MM:SS`.
+fn parse_stored(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|at| at.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|naive| naive.and_utc())
+        })
+}
+
+impl Pings {
+    /// Replaces every deadline with the ones of the unpinged `running` turns. A turn already past its
+    /// deadline (or with an unreadable `created_at`) is due immediately.
+    fn rebuild(&mut self, running: &[RunningTurn], now: DateTime<Utc>, ping_after: Duration) {
+        self.0.clear();
+        let base = Instant::now();
+        for turn in running.iter().filter(|turn| !turn.pinged) {
+            let elapsed = parse_stored(&turn.created_at)
+                .and_then(|created| (now - created).to_std().ok())
+                .unwrap_or(ping_after);
+            let remaining = ping_after.saturating_sub(elapsed);
+            self.0.insert((base + remaining, turn.run_id), ());
+        }
+    }
+
+    /// The earliest deadline, if any.
+    pub fn first(&self) -> Option<Instant> {
+        self.0.keys().next().map(|(at, _)| *at)
+    }
+
+    /// Removes and returns the runs whose deadline is at or before `at`, earliest first.
+    fn pop_due(&mut self, at: Instant) -> Vec<i64> {
+        let mut due = Vec::new();
+        while let Some(((deadline, run_id), ())) = self.0.pop_first() {
+            if deadline > at {
+                self.0.insert((deadline, run_id), ());
+                break;
+            }
+            due.push(run_id);
+        }
+        due
+    }
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -266,34 +316,203 @@ async fn discover_channel(
     Ok(report)
 }
 
-/// Answers terminal turns and refreshes ping deadlines. A2.
-pub async fn open_pass(
+/// A channel turn that is acknowledged, still running and not answered: what `open_pass` hands back
+/// so the ping deadlines can be rebuilt from it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RunningTurn {
+    pub run_id: i64,
+    pub channel: &'static str,
+    /// `runs.created_at`, as stored.
+    pub created_at: String,
+    /// Whether the "still working" ping already went out.
+    pub pinged: bool,
+}
+
+/// The outcome of one `open_pass`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OpenPass {
+    pub report: SweepReport,
+    pub running: Vec<RunningTurn>,
+}
+
+/// `(run_id, channel, conversation, status, stdout, created_at, pinged_at)` of an open turn.
+type OpenRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+const OPEN_TURNS: &str = "SELECT t.run_id, t.channel, t.conversation, r.status, r.stdout, \
+     r.created_at, t.pinged_at \
+     FROM channel_turn_replies t JOIN runs r ON r.id = t.run_id \
+     WHERE t.replied_at IS NULL";
+
+fn key_of(channel: &str, conversation: &str) -> Option<contract::ConversationKey> {
+    registry::by_id(channel).map(|m| contract::ConversationKey::new(m.id, conversation))
+}
+
+/// The final reply, once: the compare-and-set on `replied_at` and the enqueue share a transaction,
+/// so the send exists if and only if this call won the race. `true` when it did.
+async fn reply_once(
     state: &AppState,
+    key: &contract::ConversationKey,
+    run_id: i64,
+    text: String,
     now: DateTime<Utc>,
-    cadence: &Cadence,
-    pings: &mut Pings,
-) -> sqlx::Result<SweepReport> {
-    todo!()
+) -> sqlx::Result<bool> {
+    let mut tx = state.pool.begin().await?;
+    let won = sqlx::query(
+        "UPDATE channel_turn_replies SET replied_at = ? WHERE run_id = ? AND replied_at IS NULL",
+    )
+    .bind(stamp(now))
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if won {
+        enqueue_text(&mut tx, key, run_id, text, now).await?;
+    }
+    tx.commit().await?;
+    if won {
+        outbox::wake(state, key.channel);
+    }
+    Ok(won)
 }
 
-/// A ping that fired. A2.
+/// Answers every acknowledged turn that finished and returns the ones still running. An interrupted
+/// turn (the daemon died under it) is terminal too, so it is answered here with its status sentence.
+/// Emits `send` only, never `edit` (Q8).
+pub async fn open_pass(state: &AppState, now: DateTime<Utc>) -> sqlx::Result<OpenPass> {
+    let rows: Vec<OpenRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{OPEN_TURNS} ORDER BY t.run_id"
+    )))
+    .fetch_all(&state.pool)
+    .await?;
+    let mut out = OpenPass::default();
+    for (run_id, channel, conversation, status, stdout, created_at, pinged_at) in rows {
+        let Some(key) = key_of(&channel, &conversation) else {
+            continue;
+        };
+        if is_running(&status) {
+            out.running.push(RunningTurn {
+                run_id,
+                channel: key.channel,
+                created_at,
+                pinged: pinged_at.is_some(),
+            });
+            continue;
+        }
+        let text = final_text(run_id, &status, stdout.as_deref());
+        if reply_once(state, &key, run_id, text, now).await? {
+            out.report.replied += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Answers `run_id` now if it is finished and not yet answered, by the same compare-and-set as
+/// `open_pass`, so calling both is safe. Used to put the final reply ahead of a pause notice. Never
+/// fails the caller: an error is logged and the sweep answers the turn later.
+pub(crate) async fn reply_now(state: &AppState, run_id: i64) {
+    let row: sqlx::Result<Option<OpenRow>> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{OPEN_TURNS} AND t.run_id = ?"
+    )))
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await;
+    let (_, channel, conversation, status, stdout, _, _) = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, run_id, "channels: could not read the turn to answer");
+            return;
+        }
+    };
+    let Some(key) = key_of(&channel, &conversation).filter(|_| !is_running(&status)) else {
+        return;
+    };
+    let text = final_text(run_id, &status, stdout.as_deref());
+    if let Err(error) = reply_once(state, &key, run_id, text, Utc::now()).await {
+        tracing::warn!(%error, run_id, "channels: could not answer the turn");
+    }
+}
+
+/// Sends the "still working" ping of `run_id`, once. The compare-and-set on `pinged_at` only wins
+/// while the turn is unanswered and its run is still `running`, and the enqueue shares its
+/// transaction. `true` when this call sent the ping.
 pub async fn fire_ping(state: &AppState, run_id: i64, now: DateTime<Utc>) -> sqlx::Result<bool> {
-    todo!()
+    let mut tx = state.pool.begin().await?;
+    let won: Option<(String, String)> = sqlx::query_as(
+        "UPDATE channel_turn_replies SET pinged_at = ? \
+         WHERE run_id = ? AND pinged_at IS NULL AND replied_at IS NULL \
+         AND EXISTS (SELECT 1 FROM runs r \
+                     WHERE r.id = channel_turn_replies.run_id AND r.status = 'running') \
+         RETURNING channel, conversation",
+    )
+    .bind(stamp(now))
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((channel, conversation)) = won else {
+        return Ok(false);
+    };
+    // A channel that left the registry: dropping `tx` rolls the mark back.
+    let Some(key) = key_of(&channel, &conversation) else {
+        return Ok(false);
+    };
+    enqueue_text(
+        &mut tx,
+        &key,
+        run_id,
+        strings::render(&Text::StillWorking),
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    outbox::wake(state, key.channel);
+    Ok(true)
 }
 
-/// `discover` + `open_pass`. A2.
+/// One full pass: `discover` the unregistered turns, answer the finished ones, rebuild the ping
+/// deadlines from the turns still running and fire the pings already due.
 pub async fn sweep_once(
     state: &AppState,
     now: DateTime<Utc>,
     cadence: &Cadence,
     pings: &mut Pings,
 ) -> sqlx::Result<SweepReport> {
-    todo!()
+    let mut report = discover(state, now).await?;
+    let pass = open_pass(state, now).await?;
+    report.add(pass.report);
+    pings.rebuild(&pass.running, now, cadence.ping_after);
+    for run_id in pings.pop_due(Instant::now()) {
+        if fire_ping(state, run_id, now).await? {
+            report.pinged += 1;
+        }
+    }
+    Ok(report)
 }
 
-/// `channel_turn_replies` rows more than 7 days past `replied_at`.
-pub async fn prune(_pool: &SqlitePool, _now: DateTime<Utc>) -> sqlx::Result<u64> {
-    Ok(0) // P0 stub: real DELETE lands with its chunk
+/// How long an answered turn keeps its `channel_turn_replies` row.
+const REPLIED_TTL_DAYS: i64 = 7;
+
+/// Deletes the rows answered more than 7 days before `now`; unanswered rows stay whatever their
+/// age. Returns how many were removed.
+pub async fn prune(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
+    let cutoff = stamp(now - chrono::Duration::days(REPLIED_TTL_DAYS));
+    let removed = sqlx::query(
+        "DELETE FROM channel_turn_replies WHERE replied_at IS NOT NULL AND replied_at < ?",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(removed)
 }
 
 /// Posts a system notice and mirrors `queue` notices to the channel. A2.
@@ -608,5 +827,267 @@ mod tests {
 
         assert_eq!(reply_rows(&state.pool).await.len(), 1);
         assert_eq!(outbox_rows(&state.pool).await.len(), 1);
+    }
+
+    /// An acknowledged turn whose run then moved to `status`.
+    async fn acked_run(state: &AppState, status: &str, stdout: Option<&str>) -> i64 {
+        let run = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(state, run, "telegram:77").await;
+        sqlx::query("UPDATE runs SET status = ?, stdout = ? WHERE id = ?")
+            .bind(status)
+            .bind(stdout)
+            .bind(run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run
+    }
+
+    #[tokio::test]
+    async fn open_pass_terminal_run_replies_exactly_once() {
+        let state = live_state().await;
+        let run = acked_run(&state, "completed", Some("All done.")).await;
+
+        let first = open_pass(&state, now()).await.unwrap();
+        let second = open_pass(&state, now()).await.unwrap();
+
+        assert_eq!(first.report.replied, 1);
+        assert!(first.running.is_empty());
+        assert_eq!(second, OpenPass::default());
+        let rows = reply_rows(&state.pool).await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.is_some() && rows[0].2.is_some());
+        let sent = outbox_rows(&state.pool).await;
+        assert_eq!(sent.len(), 2, "the working ack and one final reply");
+        assert_eq!(sent[1].2, Some(format!("run:{run}")));
+        assert_eq!(sent[1].3, "All done.");
+    }
+
+    #[tokio::test]
+    async fn open_pass_failed_run_replies_with_turn_ended() {
+        let state = live_state().await;
+        let mut expected = Vec::new();
+        for status in ["failed", "timeout", "cancelled", "interrupted"] {
+            let run = acked_run(&state, status, Some("partial output")).await;
+            expected.push(strings::render(&Text::TurnEnded {
+                turn: run,
+                status: status.to_owned(),
+            }));
+        }
+
+        let pass = open_pass(&state, now()).await.unwrap();
+
+        assert_eq!(pass.report.replied, 4);
+        let sent = outbox_rows(&state.pool).await;
+        let replies: Vec<&str> = sent.iter().map(|row| row.3.as_str()).collect();
+        for text in &expected {
+            assert!(replies.contains(&text.as_str()), "missing: {text}");
+        }
+        assert!(!sent.iter().any(|row| row.3 == "partial output"));
+    }
+
+    #[tokio::test]
+    async fn open_pass_running_run_is_returned_not_answered() {
+        let state = live_state().await;
+        let run = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(&state, run, "telegram:77").await;
+
+        let pass = open_pass(&state, now()).await.unwrap();
+
+        assert_eq!(pass.report, SweepReport::default());
+        assert_eq!(pass.running.len(), 1);
+        assert_eq!(pass.running[0].run_id, run);
+        assert_eq!(pass.running[0].channel, "telegram");
+        assert!(!pass.running[0].pinged);
+        let rows = reply_rows(&state.pool).await;
+        assert!(rows[0].2.is_none());
+        assert_eq!(
+            outbox_rows(&state.pool).await.len(),
+            1,
+            "only the working ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_now_is_idempotent_with_open_pass() {
+        let state = live_state().await;
+        let run = acked_run(&state, "completed", Some("All done.")).await;
+
+        reply_now(&state, run).await;
+        reply_now(&state, run).await;
+        let pass = open_pass(&state, now()).await.unwrap();
+
+        assert_eq!(pass.report.replied, 0);
+        let sent = outbox_rows(&state.pool).await;
+        assert_eq!(sent.len(), 2, "the working ack and one final reply");
+        assert_eq!(sent[1].3, "All done.");
+
+        // And the other way round: the loop answers first, `reply_now` finds nothing to do.
+        let other = acked_run(&state, "completed", Some("Again.")).await;
+        assert_eq!(open_pass(&state, now()).await.unwrap().report.replied, 1);
+        reply_now(&state, other).await;
+        assert_eq!(outbox_rows(&state.pool).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn open_pass_running_run_refreshes_the_ping_deadline() {
+        let state = live_state().await;
+        let ping_after = Duration::from_secs(600);
+        // Created 4 minutes before `now()`: 6 minutes left of the 10.
+        let fresh = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        sqlx::query("UPDATE runs SET created_at = ? WHERE id = ?")
+            .bind(stamp(now() - chrono::Duration::minutes(4)))
+            .bind(fresh)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        turn_started(&state, fresh, "telegram:77").await;
+        // Created long ago: already due.
+        let old = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(&state, old, "telegram:77").await;
+        // Already pinged: no deadline.
+        let pinged = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(&state, pinged, "telegram:77").await;
+        assert!(fire_ping(&state, pinged, now()).await.unwrap());
+
+        let mut pings = Pings::default();
+        for _ in 0..2 {
+            let pass = open_pass(&state, now()).await.unwrap();
+            pings.rebuild(&pass.running, now(), ping_after);
+        }
+
+        assert_eq!(
+            pings.0.len(),
+            2,
+            "rebuilt, not accumulated; the pinged turn is out"
+        );
+        let first = pings.first().unwrap();
+        assert!(first <= Instant::now(), "the old turn is due at once");
+        let keys: Vec<i64> = pings.0.keys().map(|(_, run)| *run).collect();
+        assert_eq!(keys, vec![old, fresh]);
+        let (late, _) = pings.0.keys().next_back().unwrap();
+        let left = late.saturating_duration_since(Instant::now());
+        assert!(
+            left > Duration::from_secs(350) && left <= Duration::from_secs(360),
+            "{left:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_ping_only_if_still_running_and_not_pinged() {
+        let state = live_state().await;
+        let run = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(&state, run, "telegram:77").await;
+
+        assert!(fire_ping(&state, run, now()).await.unwrap());
+        assert!(!fire_ping(&state, run, now()).await.unwrap(), "not twice");
+        let sent = outbox_rows(&state.pool).await;
+        assert_eq!(sent.len(), 2, "the working ack and one ping");
+        assert_eq!(sent[1].2, Some(format!("run:{run}")));
+        assert_eq!(sent[1].3, strings::render(&Text::StillWorking));
+
+        // The run finished meanwhile: no ping, and the mark stays unset.
+        let done = acked_run(&state, "completed", Some("Done.")).await;
+        assert!(!fire_ping(&state, done, now()).await.unwrap());
+        let pinged_at: Option<String> =
+            sqlx::query_scalar("SELECT pinged_at FROM channel_turn_replies WHERE run_id = ?")
+                .bind(done)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(pinged_at.is_none());
+
+        // Answered already, even though the run still says running: no ping either.
+        let answered = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(&state, answered, "telegram:77").await;
+        sqlx::query("UPDATE channel_turn_replies SET replied_at = ? WHERE run_id = ?")
+            .bind(stamp(now()))
+            .bind(answered)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(!fire_ping(&state, answered, now()).await.unwrap());
+        // No row at all.
+        assert!(!fire_ping(&state, 9999, now()).await.unwrap());
+        // Run's ack and ping, plus one ack each for `done` and `answered`.
+        assert_eq!(outbox_rows(&state.pool).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn sweep_once_answers_an_interrupted_turn() {
+        let state = live_state().await;
+        let run = acked_run(&state, "interrupted", None).await;
+        let mut pings = Pings::default();
+
+        let report = sweep_once(&state, now(), &Cadence::default(), &mut pings)
+            .await
+            .unwrap();
+
+        assert_eq!(report.replied, 1);
+        assert!(pings.first().is_none());
+        let sent = outbox_rows(&state.pool).await;
+        assert_eq!(sent.len(), 2, "the working ack and the reply");
+        assert_eq!(
+            sent[1].3,
+            strings::render(&Text::TurnEnded {
+                turn: run,
+                status: "interrupted".to_owned(),
+            })
+        );
+        let again = sweep_once(&state, now(), &Cadence::default(), &mut pings)
+            .await
+            .unwrap();
+        assert_eq!(again, SweepReport::default());
+    }
+
+    /// A row answered at `replied_at` (or never, for `None`), for a fresh run.
+    async fn reply_row_at(state: &AppState, replied_at: Option<DateTime<Utc>>) -> i64 {
+        let run = insert_run(&state.pool, "telegram:77", "completed", None, None).await;
+        sqlx::query(
+            "INSERT INTO channel_turn_replies \
+             (run_id, channel, conversation, acked_at, replied_at) VALUES (?, 'telegram', '77', ?, ?)",
+        )
+        .bind(run)
+        .bind(stamp(now()))
+        .bind(replied_at.map(stamp))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        run
+    }
+
+    #[tokio::test]
+    async fn prune_removes_replied_older_than_7_days() {
+        let state = live_state().await;
+        let old = reply_row_at(&state, Some(now() - chrono::Duration::days(8))).await;
+        let older = reply_row_at(&state, Some(now() - chrono::Duration::days(30))).await;
+        let kept = reply_row_at(&state, Some(now() - chrono::Duration::days(6))).await;
+
+        assert_eq!(prune(&state.pool, now()).await.unwrap(), 2);
+
+        let left: Vec<i64> = reply_rows(&state.pool).await.iter().map(|r| r.0).collect();
+        assert_eq!(left, vec![kept]);
+        assert!(!left.contains(&old) && !left.contains(&older));
+        assert_eq!(prune(&state.pool, now()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_unreplied_and_recent_rows() {
+        let state = live_state().await;
+        // Unanswered, however old its ack.
+        let open = reply_row_at(&state, None).await;
+        sqlx::query("UPDATE channel_turn_replies SET acked_at = ? WHERE run_id = ?")
+            .bind(stamp(now() - chrono::Duration::days(60)))
+            .bind(open)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let recent = reply_row_at(&state, Some(now() - chrono::Duration::hours(1))).await;
+        let edge = reply_row_at(&state, Some(now() - chrono::Duration::days(7))).await;
+
+        assert_eq!(prune(&state.pool, now()).await.unwrap(), 0);
+
+        let left: Vec<i64> = reply_rows(&state.pool).await.iter().map(|r| r.0).collect();
+        assert_eq!(left, vec![open, recent, edge]);
     }
 }
