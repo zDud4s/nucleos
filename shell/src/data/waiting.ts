@@ -135,9 +135,9 @@ export { useProposals as useActionApprovals } from "./system";
 /**
  * §7 — the exclusion requests, from the fleet's slice.
  *
- * Re-exported for the reason above: the Fleet page draws these as edges on its
- * canvas and this page decides them, and one query key is what keeps an approval
- * here from leaving a phantom edge there.
+ * Re-exported for the reason above: the Autopilot page lists the rules these
+ * become and this page decides them; one query key is what keeps an approval
+ * here from leaving a stale list there.
  */
 export { useExclusionRequests } from "./fleet";
 

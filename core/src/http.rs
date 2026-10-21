@@ -129,6 +129,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(email::routes())
         .merge(files::routes())
         .merge(fleet::routes())
+        .merge(crate::fleet::route::routes())
         .merge(git_ops::routes())
         .merge(hooks::routes())
         .merge(judging::routes())
@@ -352,6 +353,7 @@ mod tests {
                 run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
+                fleet: Default::default(),
                 files_root: None,
                 files_trash: None,
                 workflow_library: None,
@@ -1459,6 +1461,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            fleet: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -18816,6 +18819,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            fleet: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -26009,6 +26013,7 @@ mod triage_barrier_tests {
             calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_tails: Default::default(),
+            fleet: Default::default(),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }

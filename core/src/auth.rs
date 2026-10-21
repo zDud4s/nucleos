@@ -1288,6 +1288,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            fleet: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -1343,6 +1344,14 @@ mod tests {
             .route("/assistant/ide-sessions", get(|| async {}))
             .route("/runs/awaiting-approval", get(|| async {}))
             .route("/proposals", get(|| async {}))
+            // Stand-ins for the live fleet tree: these tests are about who may reach a path, and
+            // the path is what `permits` matches on.
+            .route("/fleet/live", get(|| async {}))
+            .route("/fleet/nodes/{id}/transcript", get(|| async {}))
+            .route(
+                "/fleet/pins/{root_id}",
+                post(|| async {}).delete(|| async {}),
+            )
             // A stand-in for the real gate route: these tests are about who may reach it, and the
             // path is what `permits` matches on.
             .route(HOOK_ROUTE, post(|| async { "decided" }))
@@ -3411,6 +3420,92 @@ mod tests {
             assert!(
                 permits(&scope, &Method::GET, "/browser/sessions/7/live"),
                 "{scope:?} is the owner and may watch"
+            );
+        }
+    }
+
+    /// The fleet tree streams the commands and file text of every local agent session, so it is the
+    /// owner's to read and nobody else's. Safe today by being in no table; this is what says no to
+    /// filing any of the three beside the other `/fleet/...` reads (`/fleet/exclusions` IS listed,
+    /// for the read-only key, because it only describes the shape of the fleet).
+    #[test]
+    fn the_fleet_stream_transcripts_and_pins_are_in_no_scope_table() {
+        const ROUTES: [(Method, &str); 4] = [
+            (Method::GET, "/fleet/live"),
+            (Method::GET, "/fleet/nodes/{id}/transcript"),
+            (Method::POST, "/fleet/pins/{root_id}"),
+            (Method::DELETE, "/fleet/pins/{root_id}"),
+        ];
+        for (method, route) in &ROUTES {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, method, route)
+                    && !route_is_listed(RUN_CREATING_ROUTES, method, route)
+                    && !route_is_listed(TEAM_ROUTES, method, route)
+                    && !route_is_listed(EMAIL_ROUTES, method, route)
+                    && !route_is_listed(COUNCIL_ROUTES, method, route)
+                    && !route_is_listed(CHANNEL_ROUTES, method, route),
+                "{method} {route} must stay out of every scope table"
+            );
+        }
+
+        let concrete = [
+            (Method::GET, "/fleet/live"),
+            (Method::GET, "/fleet/nodes/claude-code%3Aabc/transcript"),
+            (Method::POST, "/fleet/pins/claude-code%3Aabc"),
+            (Method::DELETE, "/fleet/pins/claude-code%3Aabc"),
+        ];
+        for scope in [
+            Scope::Run(7),
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::TeamRun("team-1".to_owned()),
+        ] {
+            for (method, path) in &concrete {
+                assert!(
+                    !permits(&scope, method, path),
+                    "{scope:?} must not reach {method} {path}"
+                );
+            }
+        }
+        for scope in [Scope::Control, Scope::ApiToken(ApiTokenLevel::Admin)] {
+            for (method, path) in &concrete {
+                assert!(
+                    permits(&scope, method, path),
+                    "{scope:?} is the owner: {method} {path}"
+                );
+            }
+        }
+    }
+
+    /// The same, through the real middleware: a read-only key is refused with 403 and the owner is
+    /// not.
+    #[tokio::test]
+    async fn the_fleet_routes_refuse_a_read_only_key_over_http() {
+        let state = test_state("control-token").await;
+        let reader = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let admin = stored_api_token(&state, "boss", ApiTokenLevel::Admin).await;
+        let app = protected_router(state);
+
+        for (method, uri) in [
+            ("GET", "/fleet/live"),
+            ("GET", "/fleet/nodes/claude-code%3Aabc/transcript"),
+            ("POST", "/fleet/pins/claude-code%3Aabc"),
+            ("DELETE", "/fleet/pins/claude-code%3Aabc"),
+        ] {
+            assert_eq!(
+                status_of(&app, method, uri, &reader).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+            assert_eq!(
+                status_of(&app, method, uri, "control-token").await,
+                StatusCode::OK,
+                "{method} {uri}"
+            );
+            assert_eq!(
+                status_of(&app, method, uri, &admin).await,
+                StatusCode::OK,
+                "{method} {uri}"
             );
         }
     }

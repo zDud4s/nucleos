@@ -2124,6 +2124,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            fleet: Default::default(),
             files_root: None,
             files_trash: None,
             email: Arc::new(crate::state::EmailRuntime::default()),

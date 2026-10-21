@@ -32,6 +32,13 @@ chrono-tz = "0.10.4"
 iana-time-zone = "0.1.65"
 croner = "3.0.1"
 directories = "6.0.0"
+# `fleet/watch.rs` only: the OS file watcher (ReadDirectoryChangesW on Windows, inotify, kqueue)
+# that tells the live fleet tree a transcript grew, so a line reaches the screen in ~100 ms and
+# not at the next 5 s poll. NOT already in the lock file: it adds `notify` and `notify-types`
+# plus a few small crates that differ per platform (`walkdir`, `bitflags`, `inotify` on Linux,
+# `fsevent-sys` on macOS); `mio` and `windows-sys` are already here through tokio. The lock-file
+# diff of the commit is the exact list.
+notify = "8"
 keyring = { version = "4.1.5", features = ["windows-native-keyring-store"] }
 # Sizes the heavy-command admission budget (CPU count).
 num_cpus = "1"

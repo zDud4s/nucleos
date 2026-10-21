@@ -1236,6 +1236,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             run_tails: Default::default(),
+            fleet: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
