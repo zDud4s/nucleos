@@ -53,6 +53,8 @@ Filled packets flow via stdin/temp files (see `dispatch.md`); never Edit/Write `
 | `loops/` | Spec-session checklists (see below), one file per session. | Working state of a session, not a deliverable. |
 | `nodes/` | Handoff files of node trees, one directory per root (`nodes/<root_id>/<node_id>.md`). | Written by nodes at close; the daemon holds the tree itself. |
 | `prompts/` | The archived prompt of each dispatched phase (see `prompt-contract.yaml`). | Evidence of what a phase was sent. |
+| `pipelines/` | Saved agent-pipeline YAML definitions, structure-only DAGs, authored by `orchestrate-agents`. | A definition, not a run: it holds no outputs. |
+| `agent-runs/` | Filled run records persisted by `run-pipeline`. | The result of one run; `pipelines/` is what it ran. |
 
 Metrics, rework, intent and event rows are not files you write: the controller records them with the MCP tool `mcp__nucleos__record` (`{kind: metric|rework|intent|event, task_id, phase?, caught_by?, payload}`), and the daemon owns the ledgers.
 

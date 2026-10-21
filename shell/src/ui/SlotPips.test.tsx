@@ -12,7 +12,7 @@ function suffix(element: Element, prefix: string): string {
   return [...element.classList].find((name) => name.startsWith(prefix))!.slice(prefix.length);
 }
 
-const implementing: StateBadgeProps = { domain: "job", state: "implementing" };
+const implementing: StateBadgeProps = { domain: "job", state: "running" };
 
 describe("SlotPips", () => {
   it("draws one pip per slot of the limit: lit for each held, hollow for each free", () => {
@@ -54,7 +54,7 @@ describe("SlotPips", () => {
     const { container } = render(<SlotPips held={[implementing, implementing, implementing]} limit={20} />);
     expect(tones(container)).toEqual(["active", "active", "active"]);
     expect(screen.getByText("3/20").className).toBe("ui-pips-count");
-    expect(screen.getByText("3 of 20 slots held (implementing, implementing, implementing), room for 17")).toBeDefined();
+    expect(screen.getByText("3 of 20 slots held (running, running, running), room for 17")).toBeDefined();
 
     // Eight is still every pip, and no count: the row says it by itself.
     const eight = render(<SlotPips held={[]} limit={8} />).container;
@@ -65,14 +65,14 @@ describe("SlotPips", () => {
   it("hides the drawing from assistive tech and says it in a sentence instead", () => {
     const { container } = render(<SlotPips held={[implementing]} limit={3} />);
     expect(container.querySelector(".ui-pips-row")?.getAttribute("aria-hidden")).toBe("true");
-    const said = screen.getByText("1 of 3 slots held (implementing), room for 2");
+    const said = screen.getByText("1 of 3 slots held (running), room for 2");
     expect(said.className).toBe("sr-only");
     expect(said.closest("[aria-hidden]")).toBeNull();
   });
 
   it("says nothing about room when there is none, and draws what is held under a lowered ceiling", () => {
     const full = render(<SlotPips held={[implementing, { domain: "run", state: "running" }]} limit={2} />);
-    expect(within(full.container)).toBe("2 of 2 slots held (implementing, running)");
+    expect(within(full.container)).toBe("2 of 2 slots held (running, running)");
 
     // A ceiling lowered below what is held: every held slot is still a lamp, and none is free.
     const over = render(<SlotPips held={[implementing, implementing, implementing]} limit={2} />);

@@ -6,7 +6,7 @@
 //! domain in `voice.rs` stay ignorant of processes, deadlines and temp files, and what lets a resident
 //! `whisper-server` arrive later as a second `impl` rather than as a rewrite.
 //!
-//! The contract is the one `sidecars/telegram/transcribe/transcribe.go` already established: the
+//! The contract is the one the retired v1 Telegram sidecar's transcriber established: the
 //! command is whitespace-split into program + args, the audio path is appended last, and the
 //! transcript is read from stdout. Simple splitting is sufficient because the string is local and
 //! operator-supplied; it is not a shell.
@@ -21,8 +21,8 @@ use tokio::process::Command;
 
 /// Floor for any transcription, however short the audio.
 ///
-/// This is the value the Telegram sidecar uses as its *entire* deadline, and its comment explains why
-/// it is enough there: "a voice note is seconds of audio". It survives here only as the floor, because
+/// This is the value the retired v1 Telegram sidecar used as its *entire* deadline, and its comment
+/// explained why it was enough there: "a voice note is seconds of audio". It survives here only as the floor, because
 /// process startup and model loading are paid whether the clip is two seconds or none.
 const MIN_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -136,7 +136,7 @@ fn append_capped(body: &mut Vec<u8>, chunk: &[u8]) -> std::io::Result<()> {
 ///
 /// The núcleo hands a PATH to a program it did not write, so the extension is how that program is told
 /// what the bytes are: whisper reads a `.wav` as PCM and rejects Opus wearing that name. The shell sends
-/// WAV, but the Telegram sidecar downloads `.ogg` from Telegram — and the point of one pipeline is that
+/// WAV, but the Telegram channel adapter downloads `.ogg` from Telegram — and the point of one pipeline is that
 /// it does not need a second transcriber, so it has to be able to say which container it is sending.
 ///
 /// Returns a `&'static str` instead of echoing the request, and that is the whole security property:
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn the_containers_a_real_caller_sends_are_accepted_however_they_are_written() {
-        // `.ogg` is what the Telegram sidecar downloads; the leading dot and the case are the two
+        // `.ogg` is what the Telegram channel adapter downloads; the leading dot and the case are the two
         // ways someone writes it by hand.
         assert_eq!(extension_for(Some("ogg")), Some("ogg"));
         assert_eq!(extension_for(Some(".ogg")), Some("ogg"));

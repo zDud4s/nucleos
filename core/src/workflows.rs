@@ -60,11 +60,16 @@
 //! reported separately as `update_available`, because "somebody published 1.1" and "the 1.0 you
 //! pinned is not the 1.0 you have" are opposite facts that would send a person to opposite places.
 
+pub mod condition;
 pub mod consent;
+pub mod effective;
+pub mod facts;
 pub mod graph;
 pub mod hooks;
 pub mod materialize;
 pub mod package;
+pub mod timeout;
+pub mod walk;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

@@ -845,7 +845,7 @@ pub async fn state_with_note(
 ) -> sqlx::Result<String> {
     let task: String = sqlx::query_scalar(
         "SELECT COALESCE(
-                    (SELECT description FROM job_items WHERE job_items.id = runs.item_id),
+                    (SELECT description FROM job_nodes WHERE job_nodes.id = runs.item_id),
                     runs.prompt)
          FROM runs WHERE id = ?",
     )
@@ -1803,14 +1803,14 @@ mod tests {
         let pool = pool().await;
         let job_id = sqlx::query(
             "INSERT INTO jobs (project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES ('p', 'C:/work/repo', 'advance the backlog', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+             VALUES ('p', 'C:/work/repo', 'advance the backlog', 'running', 5, 1, 1, '2026-09-27T00:00:00Z')",
         )
         .execute(&pool)
         .await
         .unwrap()
         .last_insert_rowid();
         let item_id = sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status) VALUES (?, 1, 'Rename the flag', 'running')",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status) VALUES (?, 'implement', 1, 'Rename the flag', 'running')",
         )
         .bind(job_id)
         .execute(&pool)

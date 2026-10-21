@@ -201,7 +201,7 @@ function literals(source: string, declaration: RegExp, constants = new Map<strin
 describe("state-map completeness", () => {
   it("every job and team-run literal in the Rust source has a reading", () => {
     const constants = statusConstants(jobRs);
-    const jobLive = literals(jobRs, /pub const LIVE_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/);
+    const jobLive = literals(jobRs, /pub const LIVE_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/, constants);
     const jobTerminal = literals(jobRs, /pub const TERMINAL_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/, constants);
     const teamLive = literals(teamRs, /pub const LIVE_STATES: &\[&str\] = &\[([^\]]*)\];/);
     const teamTerminal = literals(teamRs, /pub const TERMINAL_STATES: &\[&str\] = &\[([^\]]*)\];/);

@@ -878,9 +878,9 @@ mod tests {
                 name: name.to_owned(),
                 speciality: "writes things".to_owned(),
                 prompt: "write".to_owned(),
-                engine: "claude".into(),
+                engine: Some("claude".into()),
                 model: None,
-                tool_policy: "mcp_only".into(),
+                capabilities: vec!["mcp.nucleos".into()],
             },
         )
         .await

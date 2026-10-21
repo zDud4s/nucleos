@@ -35,6 +35,7 @@ function agent(overrides: Partial<Agent> = {}): Agent {
     prompt: "You write short, punchy copy.",
     engine: "claude",
     model: null,
+    capabilities: ["mcp.nucleos"],
     tool_policy: "mcp_only",
     created_at: "2026-08-01T09:00:00Z",
     updated_at: "2026-08-01T09:00:00Z",
@@ -91,7 +92,8 @@ function agentsFetch(
         prompt: String(body.prompt),
         engine: String(body.engine),
         model: (body.model as string | null) ?? null,
-        tool_policy: String(body.tool_policy),
+        capabilities: body.capabilities as string[],
+        tool_policy: "none",
         created_at: "2026-08-18T09:00:00Z",
         updated_at: "2026-08-18T09:00:00Z",
       };
@@ -112,7 +114,7 @@ function agentsFetch(
       row.prompt = String(body.prompt);
       row.engine = String(body.engine);
       row.model = (body.model as string | null) ?? null;
-      row.tool_policy = String(body.tool_policy);
+      row.capabilities = body.capabilities as string[];
       return row;
     }
     if (idMatch !== null && init?.method === "DELETE") {
@@ -283,7 +285,7 @@ describe("Agents - what an agent can do", () => {
     daemon.apiFetch.mockImplementation(
       agentsFetch([
         agent({ id: "armed", name: "armed", tool_policy: "mcp_only" }),
-        agent({ id: "bare", name: "bare", tool_policy: "none" }),
+        agent({ id: "bare", name: "bare", capabilities: [], tool_policy: "none" }),
       ]),
     );
     renderWithQuery(<Agents />);
@@ -398,18 +400,17 @@ describe("Agents - how much of an agent is spoken for", () => {
 /* --------------------------------------------------------------- create -- */
 
 describe("Agents - the policy control and the local-engine model requirement", () => {
-  it("offers mcp_only and none and never unrestricted", async () => {
+  it("offers every known capability as a checkbox and sends the ticked ones", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([]));
     renderWithQuery(<Agents />);
 
     const panel = await openCreate();
-    const policySelect = within(panel).getByLabelText("Tool policy");
-    const optionLabels = within(policySelect as HTMLSelectElement)
-      .getAllByRole("option")
-      .map((option) => option.textContent);
+    const group = within(panel).getByRole("group", { name: "Capabilities" });
+    const labels = within(group)
+      .getAllByRole("checkbox")
+      .map((box) => box.parentElement?.textContent);
 
-    expect(optionLabels).toEqual(["mcp_only", "none"]);
-    expect(optionLabels).not.toContain("unrestricted");
+    expect(labels).toEqual(["fs.read", "fs.write", "shell", "web", "memory.read", "mcp.nucleos"]);
   });
 
   it("refuses submit when engine is local and no model is named", async () => {
@@ -482,7 +483,7 @@ describe("Agents - editing a row", () => {
           prompt: "You write short, punchy copy.",
           engine: "claude",
           model: null,
-          tool_policy: "mcp_only",
+          capabilities: ["mcp.nucleos"],
         }),
       }),
     );

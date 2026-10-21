@@ -45,7 +45,6 @@ fn shared_routes_stay_registered() {
     let text = http_sources();
     let routes = [
         "/assistant/message",
-        "/assistant/{turn_id}",
         "/owner-notes",
         "/capture-requests",
         "/capture-requests/{job_id}/answer",

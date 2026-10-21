@@ -12,6 +12,10 @@ pub(crate) mod fake;
 pub mod ingest;
 pub mod media;
 pub mod outbox;
+#[cfg(test)]
+mod port_tests_commands;
+#[cfg(test)]
+mod port_tests_flow;
 pub mod registry;
 pub mod replies;
 pub mod routing;

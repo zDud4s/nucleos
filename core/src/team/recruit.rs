@@ -168,11 +168,21 @@ pub async fn propose_teammate(
             .flatten(),
         None => None,
     };
-    let engine = request
-        .engine
-        .clone()
-        .or_else(|| director.as_ref().map(|agent| agent.engine.clone()))
-        .unwrap_or_else(|| "claude".to_owned());
+    // A director with no engine of its own (a package agent) hands on "the router decides".
+    let engine = match request.engine.clone() {
+        Some(engine) => Some(engine),
+        None => match director.as_ref() {
+            Some(agent) => agent.engine.clone(),
+            None => Some("claude".to_owned()),
+        },
+    };
+    let policy = request.tool_policy.as_deref().unwrap_or("mcp_only");
+    let capabilities = capabilities_for_policy(policy).ok_or_else(|| {
+        RecruitError::Invalid(
+            "tool_policy must be mcp_only or none; unrestricted is for classifier-governed runs"
+                .to_owned(),
+        )
+    })?;
     let mut proposed = crate::agent::AgentRequest {
         name: request.name.trim().to_owned(),
         speciality: request.speciality.trim().to_owned(),
@@ -182,10 +192,7 @@ pub async fn propose_teammate(
             .model
             .clone()
             .or_else(|| director.as_ref().and_then(|agent| agent.model.clone())),
-        tool_policy: request
-            .tool_policy
-            .clone()
-            .unwrap_or_else(|| "mcp_only".to_owned()),
+        capabilities,
     };
     // Validated here AND at approval, and the two are not redundant. Here it is a sentence the
     // director can act on while it still holds the turn; there it is the last word, over whatever
@@ -208,7 +215,7 @@ pub async fn propose_teammate(
     if request.model.is_none()
         && let Some(advised) = crate::models::seat_advice::recruit_default(
             state.runner.router(),
-            &proposed.engine,
+            proposed.engine.as_deref().unwrap_or("claude"),
             &request.speciality,
             &request.why,
             &request.prompt,
@@ -228,7 +235,9 @@ pub async fn propose_teammate(
         "prompt": proposed.prompt,
         "engine": proposed.engine,
         "model": proposed.model,
-        "tool_policy": proposed.tool_policy,
+        "capabilities": proposed.capabilities,
+        // The director's own vocabulary, kept beside the stored one for whoever reads the payload.
+        "tool_policy": policy,
     });
     let proposal_id = crate::proposals::create_agent_recruit(
         &state.pool,
@@ -247,6 +256,16 @@ pub async fn propose_teammate(
              with who you have, and say in the delivery what was missing."
         ),
     })
+}
+
+/// PURE: a director's `tool_policy` word as the capabilities a `user` agent stores; `None` for
+/// anything but the two policies a recruit may have (`unrestricted` is never recruited).
+fn capabilities_for_policy(policy: &str) -> Option<Vec<String>> {
+    match policy {
+        "mcp_only" => Some(vec!["mcp.nucleos".to_owned()]),
+        "none" => Some(Vec::new()),
+        _ => None,
+    }
 }
 
 /// Why a recruitment could not be completed once somebody said yes.
@@ -303,7 +322,18 @@ pub async fn approve_recruit(
 
     let request = match edited {
         Some(edited) => edited,
-        None => serde_json::from_value(payload.clone()).map_err(|_| HireError::Malformed)?,
+        None => {
+            let mut stored: crate::agent::AgentRequest =
+                serde_json::from_value(payload.clone()).map_err(|_| HireError::Malformed)?;
+            // A proposal filed before the catalogue stored capabilities carries only `tool_policy`.
+            if payload.get("capabilities").is_none()
+                && let Some(policy) = payload.get("tool_policy").and_then(|value| value.as_str())
+            {
+                stored.capabilities =
+                    capabilities_for_policy(policy).ok_or(HireError::Malformed)?;
+            }
+            stored
+        }
     };
     crate::agent::validate_request(&request).map_err(|why| HireError::Refused(why.to_owned()))?;
 
@@ -337,9 +367,9 @@ pub async fn approve_recruit(
         return Err(HireError::NotPending);
     }
     let written = sqlx::query(
-        "INSERT INTO agents (id, name, speciality, prompt, engine, model, tool_policy,
-                             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agents (id, name, speciality, prompt, engine, model, capabilities,
+                             source, package_ref, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'user', NULL, ?, ?)",
     )
     .bind(&id)
     .bind(&request.name)
@@ -347,7 +377,7 @@ pub async fn approve_recruit(
     .bind(&request.prompt)
     .bind(&request.engine)
     .bind(&request.model)
-    .bind(&request.tool_policy)
+    .bind(serde_json::to_string(&request.capabilities).unwrap_or_else(|_| "[]".to_owned()))
     .bind(&now)
     .bind(&now)
     .execute(&mut *transaction)

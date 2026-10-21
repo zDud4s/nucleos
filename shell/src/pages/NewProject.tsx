@@ -19,7 +19,13 @@ import { useDeclareProjectCommand } from "../data/project-commands";
 import { useSetWipLimit } from "../data/projects";
 import { useSetProjectMode } from "../data/autopilot";
 import { useKillSwitch, useProjects } from "../data/system";
-import { useInstallWorkflow, useWorkflowLibrary } from "../data/workflows";
+import {
+  consentFromRefusal,
+  useInstallWorkflow,
+  useWorkflowLibrary,
+  type WorkflowConsent,
+} from "../data/workflows";
+import { ConsentListing } from "../project/WorkflowConsent";
 import { MODE_MEANING, MODE_REFUSAL_PROSE } from "../lib/mode";
 import { Roster } from "./Roster";
 import "./new-project.css";
@@ -372,6 +378,35 @@ function Found({
   const adopt = useAdoptWorkflow();
   const install = useInstallWorkflow();
 
+  /**
+   * The commands the daemon wants agreed to before it records a workflow, while a write is in
+   * flight. `resolve` settles the promise `withConsent` is awaiting.
+   */
+  const [consentAsk, setConsentAsk] = useState<{
+    consent: WorkflowConsent;
+    resolve: (agreed: boolean) => void;
+  } | null>(null);
+
+  /**
+   * Run a workflow write; if the daemon answers `consent_required`, show its commands and, once the
+   * person agrees, send the same write again with the digest of exactly that listing. Declining
+   * rethrows the refusal, so the receipt stops at this write like any other refusal.
+   */
+  async function withConsent<T>(call: (consentDigest?: string) => Promise<T>): Promise<T> {
+    try {
+      return await call();
+    } catch (error) {
+      const refused = consentFromRefusal(error);
+      if (refused === null) throw error;
+      const agreed = await new Promise<boolean>((resolve) =>
+        setConsentAsk({ consent: refused.consent, resolve }),
+      );
+      setConsentAsk(null);
+      if (!agreed) throw error;
+      return call(refused.digest);
+    }
+  }
+
   const idHelpId = useId();
   const reasonId = useId();
   const ceilingLabelId = useId();
@@ -495,7 +530,10 @@ function Found({
                 adopting <span className="font-mono">{adopting}</span>
               </>
             ),
-            run: () => adopt.mutateAsync({ projectId, name: "harness", path: adopting }),
+            run: () =>
+              withConsent((consentDigest) =>
+                adopt.mutateAsync({ projectId, name: "harness", path: adopting, consentDigest }),
+              ),
           },
         ]
       : installing !== null
@@ -516,7 +554,9 @@ function Found({
               ),
               run: () => {
                 const [name, version] = installing.split("@");
-                return install.mutateAsync({ projectId, name, version });
+                return withConsent((consentDigest) =>
+                  install.mutateAsync({ projectId, name, version, consentDigest }),
+                );
               },
             },
           ]
@@ -606,6 +646,26 @@ function Found({
   const shown = ran?.plan ?? plan;
 
   return (
+    <>
+    {/* Outside the fieldset: it is disabled while a write is in flight, and this is what that
+        write is waiting on. */}
+    {consentAsk === null ? null : (
+      <div
+        role="group"
+        aria-label="Commands to agree to"
+        className="ui-well ui-well-reading flex max-w-prose flex-col gap-3"
+      >
+        <ConsentListing consent={consentAsk.consent} />
+        <div className="flex flex-wrap items-center gap-3">
+          <Button variant="primary" onClick={() => consentAsk.resolve(true)}>
+            agree and record the workflow
+          </Button>
+          <Button variant="quiet" onClick={() => consentAsk.resolve(false)}>
+            cancel
+          </Button>
+        </div>
+      </div>
+    )}
     <fieldset disabled={locked} className="m-0 flex min-w-0 flex-col gap-5 border-0 p-0">
       <legend className="sr-only">Project setup</legend>
       <Step n={2} label="What is already there" headingRef={foundHeading}>
@@ -879,6 +939,7 @@ function Found({
         )}
       </Step>
     </fieldset>
+    </>
   );
 }
 
@@ -930,7 +991,16 @@ function WriteRefused({ stage, error }: { stage: Planned | undefined; error: unk
   return (
     <RefusalNote
       refusal={error}
-      sentences={stage?.stage === "register" ? MODE_REFUSAL_PROSE : undefined}
+      sentences={
+        stage?.stage === "register"
+          ? MODE_REFUSAL_PROSE
+          : stage?.stage === "workflow"
+            ? {
+                consent_required:
+                  "the commands this workflow runs were not agreed to, so it was not recorded.",
+              }
+            : undefined
+      }
     />
   );
 }

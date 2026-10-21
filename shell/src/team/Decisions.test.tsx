@@ -118,7 +118,7 @@ function recruit(teamId: string, overrides: Partial<Proposal> = {}): Proposal {
       prompt: "you read VAT returns",
       engine: "claude",
       model: null,
-      tool_policy: "read_only",
+      capabilities: ["fs.read", "teleport"],
       team_id: teamId,
       team_run_id: "run-1",
       slug: "tax-analyst",
@@ -228,11 +228,11 @@ describe("Decisions - recruitment", () => {
     await renderDecisions(teamView(), [], { recruits: [recruit("financas")] });
 
     const panel = await panelFor("Specialists it asked for");
-    const policy = (await within(panel).findByLabelText("Tool policy")) as HTMLSelectElement;
-    // `read_only` is the value a director proposes and the daemon refuses.
-    expect(policy.value).toBe("read_only");
-    expect(within(policy).getByRole("option", { name: "read_only (not accepted)" })).toBeDefined();
-    expect(within(policy).getByRole("option", { name: "mcp_only" })).toBeDefined();
+    const group = await within(panel).findByRole("group", { name: "Capabilities" });
+    // `teleport` is a capability a director proposes and the daemon refuses; it stays listed, ticked.
+    expect((within(group).getByLabelText("teleport") as HTMLInputElement).checked).toBe(true);
+    expect((within(group).getByLabelText("fs.read") as HTMLInputElement).checked).toBe(true);
+    expect((within(group).getByLabelText("shell") as HTMLInputElement).checked).toBe(false);
   });
 
   it("says so when the requested specialists cannot be loaded", async () => {

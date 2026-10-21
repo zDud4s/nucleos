@@ -36,6 +36,9 @@ use crate::execution::runner::{
 use crate::router_client::{RouteAdvice, RouteRequest, RouterClient};
 use crate::speed::Speed;
 
+mod item_context;
+pub use item_context::{ItemContext, ItemRef, failed_label, item_context};
+
 /// Where the router listens unless `router.yaml` says otherwise.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:18733";
 /// The ceiling on one route call. A run waits at most this long before launching without advice.
@@ -322,6 +325,17 @@ impl Router {
         self
     }
 
+    /// Whether `model` (by id) takes `effort`: a level the models file does not list for it is refused,
+    /// a model the file does not list is not second-guessed.
+    pub fn takes_effort(&self, model: &str, effort: &str) -> bool {
+        EFFORT_ORDER.contains(&effort)
+            && self
+                .model_efforts
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(model))
+                .is_none_or(|(_, efforts)| efforts.iter().any(|level| level == effort))
+    }
+
     /// Whether the advised effort can be handed to the CLI as it comes. It goes to `--effort` /
     /// `model_reasoning_effort=` unchecked by anything after this, so a level this daemon cannot
     /// rank, or one the models file says the advised model (by id or tier) does not take, would
@@ -604,24 +618,6 @@ pub fn choose(
     }
 }
 
-/// The item a run works on, as the route request needs it.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ItemContext {
-    pub files: Vec<String>,
-    /// `gate_attempts + 1`: which attempt at the item this run is.
-    pub attempt: Option<u32>,
-    pub gate_output: Option<String>,
-    /// `model[@effort]` of every attempt that already failed the item.
-    pub failed: Vec<String>,
-}
-
-/// How a run names its item: a team item by its id, a sequential job's by its place in the queue.
-#[derive(Debug, Clone, Copy)]
-pub enum ItemRef {
-    Id(i64),
-    Ordinal { job_id: i64, ordinal: i64 },
-}
-
 /// What a run tells the router about itself.
 #[derive(Debug, Clone)]
 pub struct RouteQuery {
@@ -632,90 +628,47 @@ pub struct RouteQuery {
     /// longer be found from the item.
     pub item: Option<ItemContext>,
     pub resume: bool,
+    /// `Some` narrows the runners the router may choose from to these kinds (eligible ∩ this −
+    /// braked). A node launcher's `restrict_runners`.
+    pub restrict_runners: Option<Vec<RunnerKind>>,
+    /// `Some` bypasses the router: this runner, this model, this effort.
+    pub pin: Option<EnginePinRoute>,
+    /// The run's answer will be validated by the driver, which reports to the router afterwards;
+    /// `outcome_at_run_end` stays silent for it.
+    pub judged_later: bool,
+    /// The effort a node asked for with no engine pin: the router still picks runner and model, but
+    /// the launch runs at this effort (checked against the model it lands on).
+    pub effort: Option<String>,
 }
 
-/// `model[@effort]`, as the router's `failed` matches it.
-pub fn failed_label(model: &str, effort: Option<&str>) -> String {
-    match effort {
-        Some(effort) if !effort.is_empty() => format!("{model}@{effort}"),
-        _ => model.to_owned(),
-    }
-}
-
-/// The item's files, attempt, last gate output, and every model that already failed it.
-///
-/// `failed` is a chain: the previous run recorded, in `route_failed`, what had failed before it,
-/// so the whole history is that list plus the previous run's own model when its gate failed. A
-/// previous run launched with routing off recorded no model and adds nothing — nothing is guessed.
-/// Every read is best-effort: a missing row is an item with no history, never a failed run.
-pub async fn item_context(pool: &SqlitePool, item: ItemRef, current_run: i64) -> ItemContext {
-    type Row = (
-        Option<String>,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-    );
-    let row: Option<Row> = match item {
-        ItemRef::Id(id) => sqlx::query_as(
-            "SELECT files, gate_attempts, gate_output, gate_status, run_id FROM job_items WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await,
-        ItemRef::Ordinal { job_id, ordinal } => sqlx::query_as(
-            "SELECT files, gate_attempts, gate_output, gate_status, run_id
-               FROM job_items WHERE job_id = ? AND ordinal = ?",
-        )
-        .bind(job_id)
-        .bind(ordinal)
-        .fetch_optional(pool)
-        .await,
-    }
-    .unwrap_or_else(|error| {
-        tracing::warn!(%error, "could not read a routed run's item");
-        None
-    });
-    let Some((files, gate_attempts, gate_output, gate_status, previous)) = row else {
-        return ItemContext::default();
-    };
-    let mut failed: Vec<String> = Vec::new();
-    if gate_status.as_deref() == Some("failed")
-        && let Some(previous) = previous.filter(|previous| *previous != current_run)
-    {
-        let prior: Option<(Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as("SELECT model, effort, route_failed FROM runs WHERE id = ?")
-                .bind(previous)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or_default();
-        if let Some((model, effort, route_failed)) = prior {
-            for label in route_failed
-                .as_deref()
-                .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
-                .unwrap_or_default()
-            {
-                if !failed.contains(&label) {
-                    failed.push(label);
-                }
-            }
-            if let Some(model) = model.filter(|model| !model.is_empty()) {
-                let label = failed_label(&model, effort.as_deref());
-                if !failed.contains(&label) {
-                    failed.push(label);
-                }
-            }
+impl RouteQuery {
+    /// A query that restricts, pins and defers nothing: how every run but a launcher-shaped node
+    /// is routed.
+    pub fn plain(
+        task: String,
+        stage: Option<String>,
+        item: Option<ItemContext>,
+        resume: bool,
+    ) -> Self {
+        Self {
+            task,
+            stage,
+            item,
+            resume,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
         }
     }
-    ItemContext {
-        files: files
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
-            .unwrap_or_default(),
-        attempt: u32::try_from(gate_attempts + 1).ok(),
-        gate_output,
-        failed,
-    }
+}
+
+/// A fixed engine and model, from a node launcher's pin (`dispatch::EnginePin` is this type).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnginePinRoute {
+    pub runner: RunnerKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// The runners the quota brake is holding right now, by the stored readings only.
@@ -723,7 +676,7 @@ pub async fn item_context(pool: &SqlitePool, item: ItemRef, current_run: i64) ->
 /// Side-effect free on purpose: `quota::quota_permits_new_run` announces a blind brake and clears
 /// markers, which is the scheduler's job, and a live sidecar call could cost the run 25 seconds.
 /// Fails open like the brake itself — an unreadable policy or reading holds nothing.
-async fn braked_runners(pool: &SqlitePool) -> Vec<RunnerKind> {
+pub async fn braked_runners(pool: &SqlitePool) -> Vec<RunnerKind> {
     let Ok(policy) = crate::quota::load_brake_policy(pool).await else {
         return Vec::new();
     };
@@ -752,6 +705,9 @@ pub struct Resolved {
     pub effort: Option<String>,
     pub decision_id: Option<String>,
     pub router: Option<Arc<Router>>,
+    /// Why the launch cannot happen at all (a pin to an engine this daemon does not hold). `spawn_run`
+    /// fails the run with this sentence before any CLI starts.
+    pub refused: Option<String>,
 }
 
 /// Asks the router about one run, records the choice beside the advice, and says what to launch.
@@ -771,15 +727,34 @@ pub async fn resolve(
     shape: RunShape,
     speed: Speed,
 ) -> Resolved {
+    let pin = route.as_ref().and_then(|query| query.pin.clone());
+    // A node's own effort (no pin) beats the configured one on every path that does not route.
+    let hint = route
+        .as_ref()
+        .and_then(|query| query.effort.clone())
+        .filter(|effort| EFFORT_ORDER.contains(&effort.as_str()));
+    let effort = hint.clone().or(effort);
     let (Some(router), Some(query)) = (runner.router(), route) else {
+        // No router to hold the pin's runner against, so only its model and effort are applied to
+        // the runner the run already has. A pin is never silently dropped.
+        let (model, effort) = match pin {
+            Some(pin) => (pin.model, pin.effort),
+            None => (model, effort),
+        };
         return Resolved {
             runner,
             model,
             effort,
             decision_id: None,
             router: None,
+            refused: None,
         };
     };
+    // A pin bypasses the router entirely, whatever mode the runs surface is in: no HTTP, no
+    // decision id, and `route_mode` and the `advised_*` columns stay NULL.
+    if let Some(pin) = pin {
+        return resolve_pin(pool, run_id, runner, router, pin).await;
+    }
     let mode = router.runs_mode();
     if mode == Mode::Off {
         return Resolved {
@@ -788,6 +763,7 @@ pub async fn resolve(
             effort,
             decision_id: None,
             router: None,
+            refused: None,
         };
     }
 
@@ -804,11 +780,24 @@ pub async fn resolve(
         mode
     };
     let braked = braked_runners(pool).await;
-    let runners: Vec<RunnerKind> = router
-        .eligible(shape)
-        .into_iter()
-        .filter(|kind| !braked.contains(kind))
-        .collect();
+    // The restriction is applied to the eligible set BEFORE the quota brake is subtracted.
+    let runners = narrowed_runners(
+        router.eligible(shape),
+        query.restrict_runners.as_deref(),
+        &braked,
+    );
+    if query
+        .restrict_runners
+        .as_ref()
+        .is_some_and(|only| !only.is_empty())
+        && runners.is_empty()
+    {
+        tracing::warn!(
+            run_id,
+            restrict = ?query.restrict_runners,
+            "a node's engine restriction leaves no runner the router can use; not routing"
+        );
+    }
     let request = router.build_request(&query, &runners);
     // Never asked with no runners: an empty list is "any runner" to the router.
     let advice = if runners.is_empty() {
@@ -838,12 +827,26 @@ pub async fn resolve(
         model: model.clone(),
         effort: effort.clone(),
     };
-    let choice = choose(
+    let mut choice = choose(
         mode,
         configured,
         advice.as_ref().map(|(advice, kind)| (advice, *kind)),
         effort_ceiling(speed),
     );
+    // The node asked for an effort and pinned no engine: the router still chose runner and model, and
+    // the effort holds when the model it landed on takes it.
+    if let Some(hint) = hint.as_deref()
+        && !shape.resume
+    {
+        let landed = router.available(choice.kind).unwrap_or(&router.primary);
+        let name = choice
+            .model
+            .as_deref()
+            .unwrap_or(landed.default_model.as_str());
+        if router.takes_effort(name, hint) {
+            choice.effort = Some(hint.to_owned());
+        }
+    }
     let launched = router.available(choice.kind).unwrap_or(&router.primary);
     let effective_model = choice
         .model
@@ -886,6 +889,72 @@ pub async fn resolve(
         effort: choice.effort,
         decision_id: advised.map(|advice| advice.decision_id.clone()),
         router: Some(router),
+        refused: None,
+    }
+}
+
+/// `eligible ∩ restrict − braked`, in `eligible`'s order. `restrict` of `None` restricts nothing.
+pub fn narrowed_runners(
+    eligible: Vec<RunnerKind>,
+    restrict: Option<&[RunnerKind]>,
+    braked: &[RunnerKind],
+) -> Vec<RunnerKind> {
+    eligible
+        .into_iter()
+        .filter(|kind| restrict.is_none_or(|only| only.contains(kind)))
+        .filter(|kind| !braked.contains(kind))
+        .collect()
+}
+
+/// A pinned launch: the runner the pin names (the wrapper `runner` when it is the primary), its
+/// model and effort, written in one UPDATE. A runner the router does not hold is refused.
+async fn resolve_pin(
+    pool: &SqlitePool,
+    run_id: i64,
+    runner: Arc<dyn CommandRunner>,
+    router: Arc<Router>,
+    pin: EnginePinRoute,
+) -> Resolved {
+    let Some(available) = router.available(pin.runner) else {
+        return Resolved {
+            runner,
+            model: pin.model,
+            effort: pin.effort,
+            decision_id: None,
+            router: None,
+            refused: Some(format!(
+                "this node is pinned to the {} engine, which this daemon cannot launch",
+                pin.runner.as_str()
+            )),
+        };
+    };
+    let effective_model = pin
+        .model
+        .clone()
+        .unwrap_or_else(|| available.default_model.clone());
+    if let Err(error) =
+        sqlx::query("UPDATE runs SET model = ?, effort = ?, runner = ? WHERE id = ?")
+            .bind(&effective_model)
+            .bind(&pin.effort)
+            .bind(pin.runner.as_str())
+            .bind(run_id)
+            .execute(pool)
+            .await
+    {
+        tracing::warn!(run_id, %error, "could not record a pinned run's engine");
+    }
+    let chosen_runner = if pin.runner == router.primary.kind {
+        runner
+    } else {
+        Arc::clone(&available.runner)
+    };
+    Resolved {
+        runner: chosen_runner,
+        model: pin.model,
+        effort: pin.effort,
+        decision_id: None,
+        router: Some(router),
+        refused: None,
     }
 }
 
@@ -1272,6 +1341,10 @@ mod tests {
             stage: Some("implement".into()),
             item: None,
             resume: false,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
         }
     }
 
@@ -1506,6 +1579,10 @@ mod tests {
                     failed: vec!["claude-opus-5@high".into()],
                 }),
                 resume: false,
+                restrict_runners: None,
+                pin: None,
+                judged_later: false,
+                effort: None,
             },
             &router.eligible(shape()),
         );
@@ -1542,7 +1619,7 @@ mod tests {
         let pool = pool().await;
         let job_id = sqlx::query(
             "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
-             VALUES ('p', 'C:/p', 'implementing', 3, '2026-09-30T00:00:00Z')",
+             VALUES ('p', 'C:/p', 'running', 3, '2026-09-30T00:00:00Z')",
         )
         .execute(&pool)
         .await
@@ -1564,9 +1641,9 @@ mod tests {
         .await
         .unwrap();
         let item_id = sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, files, gate_attempts,
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, files, gate_attempts,
                                     gate_output, gate_status, run_id)
-             VALUES (?, 0, 'an item', 'gate_failed', '[\"a.rs\"]', 2, 'boom', 'failed', ?)",
+             VALUES (?, 'implement', 0, 'an item', 'gate_failed', '[\"a.rs\"]', 2, 'boom', 'failed', ?)",
         )
         .bind(job_id)
         .bind(second)
@@ -2124,6 +2201,293 @@ mod tests {
         assert_eq!(failed_label("m", Some("high")), "m@high");
         assert_eq!(failed_label("m", None), "m");
     }
+
+    // --- node launches: restriction, pin, validation deferred (M4 C2) ---
+
+    #[test]
+    fn a_restriction_intersects_the_eligible_runners() {
+        use RunnerKind::{Claude, Codex};
+        let both = vec![Claude, Codex];
+        assert_eq!(narrowed_runners(both.clone(), None, &[]), both);
+        assert_eq!(
+            narrowed_runners(both.clone(), Some(&[Codex]), &[]),
+            vec![Codex]
+        );
+        // Order is eligible's, not the restriction's.
+        assert_eq!(
+            narrowed_runners(both.clone(), Some(&[Codex, Claude]), &[]),
+            both
+        );
+        assert_eq!(
+            narrowed_runners(both, Some(&[]), &[]),
+            Vec::<RunnerKind>::new()
+        );
+    }
+
+    #[test]
+    fn a_restriction_is_applied_before_the_quota_brake_subtracts() {
+        use RunnerKind::{Claude, Codex};
+        let both = vec![Claude, Codex];
+        assert_eq!(
+            narrowed_runners(both.clone(), Some(&[Claude, Codex]), &[Claude]),
+            vec![Codex]
+        );
+        assert_eq!(
+            narrowed_runners(both, Some(&[Claude]), &[Claude]),
+            Vec::<RunnerKind>::new(),
+            "a braked runner stays braked even when it is the only one the node allows"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restriction_narrows_what_the_router_is_asked() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_r", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                restrict_runners: Some(vec![RunnerKind::Codex]),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["codex"]));
+        assert_eq!(sent["models"], serde_json::json!(["gpt-*"]));
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert!(resolved.refused.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pin_skips_the_router_and_records_runner_model_and_effort_without_a_decision_id() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_never", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Codex,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: Some("low".into()),
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        assert!(
+            received.try_recv().is_err(),
+            "a pinned launch must not call the router"
+        );
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(resolved.effort.as_deref(), Some("low"));
+        assert!(resolved.decision_id.is_none());
+        assert!(resolved.refused.is_none());
+        assert_eq!(
+            route_row(&pool, run_id).await,
+            (
+                Some("gpt-5.6-terra".into()),
+                Some("low".into()),
+                Some("codex".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        );
+
+        // A pin to the primary keeps the wrapper the run already held, and a pin with no model
+        // records the engine's own default.
+        let run_two = seed_run(&pool).await;
+        let resolved = resolve(
+            &pool,
+            run_two,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Claude,
+                    model: None,
+                    effort: None,
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert!(resolved.model.is_none());
+        let row = route_row(&pool, run_two).await;
+        assert_eq!(row.0.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(row.2.as_deref(), Some("claude"));
+        assert!(row.3.is_none() && row.4.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_a_runner_the_router_does_not_hold_is_refused() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let inner: Arc<dyn CommandRunner> = Arc::new(Probe);
+        // No alternates: only the primary is held.
+        let router = Arc::new(Router::new(
+            config(Mode::Apply, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::clone(&inner), &["claude-*"]),
+            Vec::new(),
+        ));
+        let runner: Arc<dyn CommandRunner> = Arc::new(RoutedRunner { inner, router });
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            runner,
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Codex,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: None,
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        let why = resolved.refused.expect("the launch is refused");
+        assert!(why.contains("codex"), "{why}");
+        let row = route_row(&pool, run_id).await;
+        assert!(row.0.is_none() && row.2.is_none(), "nothing was recorded");
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_pin_or_restriction_launches_exactly_as_before() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_1", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high"}),
+        )
+        .await;
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(query()),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude", "codex"]));
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolved.effort.as_deref(), Some("medium"));
+        assert_eq!(resolved.decision_id.as_deref(), Some("rt_1"));
+        assert!(resolved.refused.is_none());
+        let row = route_row(&pool, run_id).await;
+        assert_eq!(row.3.as_deref(), Some("shadow"));
+        assert_eq!(row.4.as_deref(), Some("rt_1"));
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_nodes_effort_survives_the_router_choosing_the_engine() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, _received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_1", "runner": "claude",
+                               "model": "claude-opus-5", "effort": "high"}),
+        )
+        .await;
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(RouteQuery {
+                effort: Some("low".into()),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+
+        assert_eq!(resolved.effort.as_deref(), Some("low"));
+        assert_eq!(resolved.decision_id.as_deref(), Some("rt_1"));
+        // An effort this daemon cannot launch is ignored rather than handed to the CLI.
+        let resolved = resolve(
+            &pool,
+            run_id,
+            runner,
+            Some("claude-sonnet-5".into()),
+            Some("medium".into()),
+            Some(RouteQuery {
+                effort: Some("bogus".into()),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+        assert_eq!(resolved.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn a_run_awaiting_validation_reports_nothing_at_run_end() {
+        let node = |judged_later: bool| RouteQuery {
+            stage: Some("review".into()),
+            item: None,
+            judged_later,
+            ..query()
+        };
+        assert!(!judged_by_a_job_gate(&node(false)));
+        assert!(judged_by_a_job_gate(&node(true)));
+    }
 }
 
 // ---- outcomes (P2) ----
@@ -2162,7 +2526,7 @@ pub fn outcome_of_run_end(stdout: &str) -> Option<Outcome> {
 /// implement node (which names an item, or is an `implement` resumed without one). That gate
 /// reports through `report_item_gate`, so the run itself must not also say `pass` or `fail`.
 pub fn judged_by_a_job_gate(query: &RouteQuery) -> bool {
-    query.item.is_some() || query.stage.as_deref() == Some("implement")
+    query.item.is_some() || query.stage.as_deref() == Some("implement") || query.judged_later
 }
 
 /// What the router hears when a run has ended, or `None` for nothing to report.
@@ -2226,7 +2590,7 @@ pub async fn report_item_gate(
     outcome: &crate::gate::GateOutcome,
 ) {
     let decision: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT r.route_decision_id FROM job_items i JOIN runs r ON r.id = i.run_id
+        "SELECT r.route_decision_id FROM job_nodes i JOIN runs r ON r.id = i.run_id
           WHERE i.job_id = ? AND i.ordinal = ?",
     )
     .bind(job_id)
@@ -2399,6 +2763,7 @@ mod outcome_tests {
 
     /// Only a job's item work is gated by the job: a query with an item, or an `implement` node
     /// resumed without one. A plan, a review and an ad-hoc run are not.
+
     #[test]
     fn only_item_work_is_judged_by_a_job_gate() {
         let query = |stage: Option<&str>, item: bool| RouteQuery {
@@ -2411,6 +2776,10 @@ mod outcome_tests {
                 failed: Vec::new(),
             }),
             resume: false,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
         };
         assert!(judged_by_a_job_gate(&query(Some("implement"), true)));
         assert!(judged_by_a_job_gate(&query(Some("implement"), false)));
@@ -2437,7 +2806,7 @@ mod outcome_tests {
     async fn seed_item(pool: &SqlitePool, decision: Option<&str>) -> i64 {
         let job_id = sqlx::query(
             "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
-             VALUES ('p', 'C:/p', 'implementing', 3, '2026-09-30T00:00:00Z')",
+             VALUES ('p', 'C:/p', 'running', 3, '2026-09-30T00:00:00Z')",
         )
         .execute(pool)
         .await
@@ -2453,8 +2822,8 @@ mod outcome_tests {
         .unwrap()
         .last_insert_rowid();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
-             VALUES (?, 0, 'an item', 'gating', ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, run_id)
+             VALUES (?, 'implement', 0, 'an item', 'gating', ?)",
         )
         .bind(job_id)
         .bind(run_id)

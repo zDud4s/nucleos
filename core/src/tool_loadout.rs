@@ -503,8 +503,8 @@ mod tests {
     async fn agent(pool: &sqlx::SqlitePool, id: &str) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
-                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
-             VALUES (?, ?, 'plans', 'p', 'claude', NULL, 'mcp_only',
+                 (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
+             VALUES (?, ?, 'plans', 'p', 'claude', NULL, '[\"mcp.nucleos\"]',
                      '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
         .bind(id)
@@ -534,7 +534,7 @@ mod tests {
     async fn node_run(pool: &sqlx::SqlitePool) -> i64 {
         let job = sqlx::query(
             "INSERT INTO jobs (project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES ('p', 'C:/work/repo', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+             VALUES ('p', 'C:/work/repo', 'x', 'running', 5, 1, 1, '2026-09-27T00:00:00Z')",
         )
         .execute(pool)
         .await

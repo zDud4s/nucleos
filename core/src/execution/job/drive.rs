@@ -75,7 +75,7 @@ pub(super) enum NoRoom {
 
 /// Whether a job can move again in the same pass.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Step {
+pub(super) enum Pass {
     /// A move was made that costs no run; the next one can follow immediately.
     Continued,
     /// Nothing more happens until a node lands, a brake lifts, or somebody looks at it.
@@ -259,57 +259,85 @@ pub(super) async fn council_before_review(
     BeforeReview::Go { council_file: true }
 }
 
+/// C6: the workflow walker answers beside the legacy decision on every pass, and a disagreement is
+/// said, never acted on. Only the legacy road (`WALKER_DRIVES == false`) runs it: once the walker
+/// is the authority there is nothing left to compare it with.
+const WALKER_SHADOW: bool = true;
+
+/// Asks `engine::decide` what the walker would do and compares it with the legacy `Next`. Changes
+/// nothing: a walker that cannot answer is logged, a disagreement is said once per (job, round,
+/// pair of answers). `Stuck` has no legacy word and is always a disagreement.
+pub(super) async fn shadow_differential(state: &AppState, job: &JobRow, round: i64, legacy: &Next) {
+    let (step, graph) = match engine::decide(state, job).await {
+        Ok((step, _facts, graph)) => (step, graph),
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "the workflow walker could not answer");
+            return;
+        }
+    };
+    let walker = bridge::step_as_next(&step, &graph.graph);
+    if walker.as_ref() == Some(legacy) {
+        return;
+    }
+    tracing::warn!(
+        job_id = job.id,
+        ?step,
+        ?legacy,
+        "the workflow walker diverged from the driver"
+    );
+    say_once(
+        &state.pool,
+        job,
+        "job_walker_diverged",
+        &format!(
+            "job {} round {}: the workflow walker answered {step:?} where the driver answered {legacy:?}",
+            job.id,
+            round + 1
+        ),
+    )
+    .await;
+}
+
+/// C7: the workflow walker is the authority. `engine::decide` answers what a job does next, for
+/// every job (a NULL snapshot is the embedded autopilot). Flipping this to `false` restores the
+/// legacy `next_step` driver, which stays intact beside it as the C6 oracle for one release; the
+/// shadow differential then runs again.
+const WALKER_DRIVES: bool = true;
+
 /// Performs one move for a job.
-pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Step {
+pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) -> Pass {
+    advance_with(state, job, now, WALKER_DRIVES).await
+}
+
+/// [`advance`] with the authority chosen by the caller, so a test can run both drivers on one state.
+pub(super) async fn advance_with(
+    state: &AppState,
+    job: &JobRow,
+    now: DateTime<Utc>,
+    walker_drives: bool,
+) -> Pass {
     let pool = &state.pool;
     let view = match load_view(pool, job.id).await {
         Ok(view) => view,
         Err(error) => {
             tracing::warn!(job_id = job.id, %error, "could not read a job");
-            return Step::Stopped;
+            return Pass::Stopped;
         }
     };
+    if walker_drives {
+        return advance_by_walker(state, job, now, &view).await;
+    }
 
     let next = next_step(&view);
+    if WALKER_SHADOW {
+        shadow_differential(state, job, view.rounds.round, &next).await;
+    }
     if matches!(next, Next::Wait) {
-        return Step::Stopped;
+        return Pass::Stopped;
     }
-    // Said here, ahead of both roads a closing round can take — the ending just below and the
-    // replan past the brakes — because the skip is the reason for either, and a reader who finds a
-    // round with no review in the feed should find why beside it.
-    if the_skip_decided(&view) {
-        say_once(
-            pool,
-            job,
-            "job_review_skipped",
-            &format!(
-                "job {} round {}: no item of the round passed, so there was nothing on the branch \
-                 for a review to judge and none was run",
-                job.id,
-                view.rounds.round + 1
-            ),
-        )
-        .await;
-    }
+    say_the_skip(pool, job, &view).await;
     if let Next::Finish(outcome) = &next {
-        let outcome = *outcome;
-        if let Err(error) = finish(pool, job.id, outcome).await {
-            tracing::warn!(job_id = job.id, %error, "could not finish a job");
-            return Step::Stopped;
-        }
-        say(
-            pool,
-            job,
-            "job_finished",
-            &format!(
-                "job {} finished `{}` after {} item(s)",
-                job.id,
-                outcome.as_status(),
-                view.items.len()
-            ),
-        )
-        .await;
-        return Step::Stopped;
+        return finish_the_job(pool, job, *outcome, view.items.len()).await;
     }
     // The gate is a subprocess, not a run: it starts no CLI, consumes no quota and answers to no
     // brake. Refusing to measure an item because the owner sat down would leave the tree holding
@@ -333,44 +361,393 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
     // subprocess and no run. Parking a job rather than writing it would leave the item reading
     // `pending` — work a person is told is still coming — for as long as the brake holds.
     if let Next::Orphan { ordinal } = &next {
-        let ordinal = *ordinal;
-        let marked = sqlx::query(
-            "UPDATE job_items SET status = 'orphaned'
-             WHERE job_id = ? AND ordinal = ? AND status = 'pending'",
-        )
-        .bind(job.id)
-        .bind(ordinal as i64)
-        .execute(pool)
-        .await;
-        return match marked {
-            // The compare-and-swap matters for the same reason `spawn_node`'s does: two passes
-            // reaching this at once must not both act, and an item that stopped being `pending` in
-            // between is one somebody else has already decided about.
-            Ok(result) if result.rows_affected() == 1 => {
-                say(
-                    pool,
-                    job,
-                    "job_item_orphaned",
-                    &format!(
-                        "job {} at item {}: something it depends on will not land, so it was put                          down without being attempted",
-                        job.id,
-                        ordinal + 1
-                    ),
-                )
-                .await;
-                Step::Continued
-            }
-            Ok(_) => Step::Continued,
-            Err(error) => {
-                tracing::warn!(job_id = job.id, ordinal, %error, "could not put down an orphaned item");
-                Step::Stopped
-            }
-        };
+        return orphan_item(pool, job, *ordinal).await;
     }
 
+    if let Some(pass) = hold_for_brakes(state, job, &view, now).await {
+        return pass;
+    }
+    let worktree = match resolve_worktree(state, job, now).await {
+        Ok(worktree) => worktree,
+        Err(pass) => return pass,
+    };
+    let artifacts = artifacts_for(&worktree.0);
+
+    match next {
+        Next::SpawnSpec => spawn_autopilot_node(state, job, &view, "spec", worktree, false).await,
+        Next::SpawnPlan => spawn_autopilot_node(state, job, &view, "plan", worktree, false).await,
+        Next::SpawnImplement(ordinals) => {
+            spawn_items(state, job, &view, &artifacts, worktree, ordinals).await
+        }
+        Next::SpawnReview => {
+            // In front of the node rather than inside `next_step`, which stays pure: this reads
+            // the database, starts a council and writes a file, and none of those belong in a
+            // function whose whole value is that it can be tested with a struct literal.
+            match engine::before_review(state, job, &view, &artifacts).await {
+                Ok(council_file) => {
+                    spawn_autopilot_node(state, job, &view, "review", worktree, council_file).await
+                }
+                Err(pass) => pass,
+            }
+        }
+        Next::SpawnReplan => {
+            spawn_autopilot_node(state, job, &view, "replan", worktree, false).await
+        }
+        // All five are answered above, before the brakes and before the worktree is resolved.
+        // Reaching one here means the dispatch above stopped covering something it used to.
+        Next::Wait
+        | Next::Finish(_)
+        | Next::RunGate { .. }
+        | Next::MergeItem { .. }
+        | Next::SettleRevert { .. }
+        | Next::Orphan { .. } => Pass::Stopped,
+    }
+}
+
+/// The walker's pass: `engine::decide` names the step, `action_of` turns it into what the driver
+/// does. Waiting, finishing, fan-boundary work, command nodes and a stuck graph cost no run and go
+/// BEFORE the brakes; starting an agent node, a fan instance or a replan goes after them.
+async fn advance_by_walker(
+    state: &AppState,
+    job: &JobRow,
+    now: DateTime<Utc>,
+    view: &JobView,
+) -> Pass {
+    let pool = &state.pool;
+    // A job with no worktree on record has no facts to read and so no walk to take: all it can do
+    // is start its first node, which is a run, so the brakes answer first exactly as they do on
+    // the legacy road (where they stand ahead of `resolve_worktree`). Without this a braked job
+    // that is still being provisioned would sit `running` instead of parking or stopping.
+    if matches!(job_worktree(pool, job.id).await, Ok(None))
+        && let Some(pass) = hold_for_brakes(state, job, view, now).await
+    {
+        return pass;
+    }
+    // The facts the walker reads live in the worktree, so it is resolved before the decision.
+    let worktree = match resolve_worktree(state, job, now).await {
+        Ok(worktree) => worktree,
+        Err(pass) => return pass,
+    };
+    let (step, facts, graph) = match engine::decide(state, job).await {
+        Ok(answer) => answer,
+        Err(error @ engine::DecideError::Emission(_)) => {
+            // A finished node's file will read the same on every tick, so waiting would only hold
+            // the job's slot until its lifetime ceiling: it ends, with the file named in the feed.
+            tracing::warn!(job_id = job.id, %error, "a node's emission is unusable; stopping the job");
+            let _ = finish(pool, job.id, Outcome::Stopped).await;
+            say(
+                pool,
+                job,
+                "job_graph_unreadable",
+                &format!(
+                    "job {} stopped: it cannot read what its workflow needs: {error}",
+                    job.id
+                ),
+            )
+            .await;
+            return Pass::Stopped;
+        }
+        Err(error) => {
+            // Not a guess at "nothing published": the job waits, and the feed says why once.
+            tracing::warn!(job_id = job.id, %error, "the workflow walker could not answer");
+            say_once(
+                pool,
+                job,
+                "job_graph_unreadable",
+                &format!(
+                    "job {} cannot read what its workflow needs: {error}",
+                    job.id
+                ),
+            )
+            .await;
+            return Pass::Stopped;
+        }
+    };
+    let action = engine::action_of(&step, &graph.graph);
+    if matches!(action, engine::Action::Wait) {
+        return Pass::Stopped;
+    }
+    // Said ahead of both roads a closing round can take — the ending and the replan past the
+    // brakes — because the skip is the reason for either.
+    say_the_skip(pool, job, view).await;
+
+    let past_the_brakes = matches!(
+        action,
+        engine::Action::DispatchAgent { .. }
+            | engine::Action::FanOut { .. }
+            | engine::Action::Replan { .. }
+    );
+    if past_the_brakes && let Some(pass) = hold_for_brakes(state, job, view, now).await {
+        return pass;
+    }
+
+    match action {
+        engine::Action::Wait => Pass::Stopped,
+        engine::Action::Finish(outcome) => {
+            finish_the_job(pool, job, outcome, view.items.len()).await
+        }
+        engine::Action::GateErrored { .. } => {
+            finish_the_job(pool, job, Outcome::GateErrored, view.items.len()).await
+        }
+        engine::Action::Stuck { node, key } => {
+            let reason = if key == "kind" {
+                format!(
+                    "job {} stopped at node {node}: it is not something a job can run",
+                    job.id
+                )
+            } else {
+                // `key` is `<emitting node>.<name>`: whether that node wrote a file at all is the
+                // difference between a node that did nothing and one that left a key out.
+                let emitter = key.split('.').next().unwrap_or_default();
+                let cause = if facts.has_emitted(emitter) {
+                    format!("{emitter} wrote a file without it")
+                } else {
+                    format!("{emitter} wrote no file")
+                };
+                format!(
+                    "job {} stopped at node {node}: nobody published `{key}` ({cause})",
+                    job.id
+                )
+            };
+            let _ = finish(pool, job.id, Outcome::Stopped).await;
+            say(pool, job, "job_graph_stuck", &reason).await;
+            Pass::Stopped
+        }
+        engine::Action::FanBoundary(op) => match op {
+            engine::FanOp::MergeItem { item, .. } => merge_item(state, job, item).await,
+            engine::FanOp::SettleRevert {
+                item: Some(item), ..
+            } => settle_revert(state, job, item, None).await,
+            engine::FanOp::SettleRevert {
+                node_id,
+                item: None,
+            } => {
+                // No state the loader writes reads as `RevertOwed`, so this is not reachable today.
+                tracing::warn!(
+                    job_id = job.id,
+                    node_id,
+                    "a singleton revert is owed and nothing settles it"
+                );
+                Pass::Stopped
+            }
+            engine::FanOp::Orphan { item, .. } => orphan_item(pool, job, item).await,
+        },
+        engine::Action::DispatchCommand {
+            ordinal: Some(ordinal),
+            ..
+        } => gate_item(state, job, ordinal, view.items.len()).await,
+        engine::Action::DispatchCommand {
+            node_id,
+            ordinal: None,
+        } => run_singleton_command(state, job, &graph, &node_id, &worktree.0).await,
+        engine::Action::DispatchAgent { node_id, .. } => {
+            engine::dispatch_agent_node(
+                state,
+                job,
+                engine::AgentTarget {
+                    view,
+                    facts: &facts,
+                    graph: &graph,
+                    node_id: &node_id,
+                    replan: false,
+                },
+                worktree,
+            )
+            .await
+        }
+        // A return edge into any node but the autopilot's `plan` is a plain loop: open the next
+        // round and let the walker walk back to that node, which then runs with its own protocol
+        // and its own emission cleared. Only `plan` has replan semantics (the replan prompt,
+        // `runs.stage = "replan"`, the plan.json queue and its ingestion).
+        engine::Action::Replan { node_id } if node_id != "plan" => {
+            open_a_plain_round(pool, job).await
+        }
+        engine::Action::Replan { node_id } => {
+            engine::dispatch_agent_node(
+                state,
+                job,
+                engine::AgentTarget {
+                    view,
+                    facts: &facts,
+                    graph: &graph,
+                    node_id: &node_id,
+                    replan: true,
+                },
+                worktree,
+            )
+            .await
+        }
+        engine::Action::FanOut { items, .. } => {
+            let artifacts = artifacts_for(&worktree.0);
+            spawn_items(state, job, view, &artifacts, worktree, items).await
+        }
+    }
+}
+
+/// A singleton command node: runs it, and lets the row it wrote carry the verdict to the next pass
+/// (the walker reads `passed`, `failed` and `gate_errored` off it and follows the edges itself). A
+/// failure with no verdict edge is the only one worth a line of its own here.
+async fn run_singleton_command(
+    state: &AppState,
+    job: &JobRow,
+    graph: &crate::workflows::effective::EffectiveGraph,
+    node_id: &str,
+    worktree: &Path,
+) -> Pass {
+    let Some(node) = graph.graph.nodes.iter().find(|node| node.id == node_id) else {
+        tracing::warn!(
+            job_id = job.id,
+            node_id,
+            "asked to run a command node the graph lacks"
+        );
+        return Pass::Stopped;
+    };
+    let instance = command_node::InstanceRef {
+        round: job.round,
+        ordinal: None,
+    };
+    let result = command_node::run_command_node(state, job, node, &instance, worktree).await;
+    let gate = crate::workflows::graph::is_gate(&graph.graph.edges, node_id);
+    match command_node::follow_for(&result, gate) {
+        command_node::CommandFollow::Parked => Pass::Stopped,
+        command_node::CommandFollow::JobFails(detail) => {
+            say(
+                &state.pool,
+                job,
+                "job_node_failed",
+                &format!("job {} node {node_id} failed: {detail}", job.id),
+            )
+            .await;
+            Pass::Continued
+        }
+        command_node::CommandFollow::Pass
+        | command_node::CommandFollow::Fail
+        | command_node::CommandFollow::GateErrored => Pass::Continued,
+    }
+}
+
+/// Said ahead of both roads a closing round can take — the ending and the replan past the brakes —
+/// because the skip is the reason for either, and a reader who finds a round with no review in the
+/// feed should find why beside it.
+async fn say_the_skip(pool: &SqlitePool, job: &JobRow, view: &JobView) {
+    if the_skip_decided(view) {
+        say_once(
+            pool,
+            job,
+            "job_review_skipped",
+            &format!(
+                "job {} round {}: no item of the round passed, so there was nothing on the branch \
+                 for a review to judge and none was run",
+                job.id,
+                view.rounds.round + 1
+            ),
+        )
+        .await;
+    }
+}
+
+/// Opens the next round of a job whose workflow loops back to a node that is not the planner. The
+/// round column is the only thing a plain loop changes: every round-scoped node reads as not
+/// entered in the new round, so the walker visits the loop's nodes again. Compare-and-set on the
+/// round the pass started with, so a pass racing a second one opens one round, not two.
+async fn open_a_plain_round(pool: &SqlitePool, job: &JobRow) -> Pass {
+    let opened = sqlx::query("UPDATE jobs SET round = round + 1 WHERE id = ? AND round = ?")
+        .bind(job.id)
+        .bind(job.round)
+        .execute(pool)
+        .await;
+    match opened {
+        Ok(done) if done.rows_affected() == 1 => {
+            say(
+                pool,
+                job,
+                "job_replanned",
+                &format!(
+                    "job {} opened round {}: its workflow loops back to an earlier node",
+                    job.id,
+                    job.round + 2
+                ),
+            )
+            .await;
+            Pass::Continued
+        }
+        Ok(_) => Pass::Stopped,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, %error, "could not open the next round");
+            Pass::Stopped
+        }
+    }
+}
+
+/// Retires the job with `outcome` and says so.
+async fn finish_the_job(pool: &SqlitePool, job: &JobRow, outcome: Outcome, items: usize) -> Pass {
+    if let Err(error) = finish(pool, job.id, outcome).await {
+        tracing::warn!(job_id = job.id, %error, "could not finish a job");
+        return Pass::Stopped;
+    }
+    say(
+        pool,
+        job,
+        "job_finished",
+        &format!(
+            "job {} finished `{}` after {} item(s)",
+            job.id,
+            outcome.as_status(),
+            items
+        ),
+    )
+    .await;
+    Pass::Stopped
+}
+
+/// Puts down a pending item whose dependency will not land.
+async fn orphan_item(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Pass {
+    let marked = sqlx::query(
+        "UPDATE job_nodes SET status = 'orphaned'
+         WHERE job_id = ? AND ordinal = ? AND status = 'pending'",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .execute(pool)
+    .await;
+    match marked {
+        // The compare-and-swap matters for the same reason `spawn_node`'s does: two passes
+        // reaching this at once must not both act, and an item that stopped being `pending` in
+        // between is one somebody else has already decided about.
+        Ok(result) if result.rows_affected() == 1 => {
+            say(
+                pool,
+                job,
+                "job_item_orphaned",
+                &format!(
+                    "job {} at item {}: something it depends on will not land, so it was put down without being attempted",
+                    job.id,
+                    ordinal + 1
+                ),
+            )
+            .await;
+            Pass::Continued
+        }
+        Ok(_) => Pass::Continued,
+        Err(error) => {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not put down an orphaned item");
+            Pass::Stopped
+        }
+    }
+}
+
+/// The brakes, for anything about to START a run. `None` is go; `Some` is the pass that parked or
+/// stopped the job.
+async fn hold_for_brakes(
+    state: &AppState,
+    job: &JobRow,
+    view: &JobView,
+    now: DateTime<Utc>,
+) -> Option<Pass> {
+    let pool = &state.pool;
     match brakes(state, job, now).await {
-        Brake::Go => {}
-        Brake::Park { reason, detail } => return park(state, job, reason, &detail).await,
+        Brake::Go => None,
+        Brake::Park { reason, detail } => Some(park(state, job, reason, &detail).await),
         Brake::Stop { detail } => {
             // A batch can still have nodes in flight here; a retired job is never driven again,
             // so nothing else would stop them.
@@ -397,170 +774,127 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
                 ),
             )
             .await;
-            return Step::Stopped;
+            Some(Pass::Stopped)
         }
     }
+}
 
-    // Three answers, and only one of them is a broken job. `start` inserts the row live BEFORE it
-    // runs `git worktree add` (the tree is keyed on the job's id, so it cannot come first), and a
-    // tick landing in that window used to fail a job that was still being born. A read that errored
-    // is a database hiccup rather than a fact about the job: this pass is skipped, never the job.
-    let worktree = match job_worktree(pool, job.id).await {
-        Ok(Some(worktree)) => Some(worktree),
+/// The job's worktree, or the pass that ends this one without it.
+///
+/// Three answers, and only one of them is a broken job. `start` inserts the row live BEFORE it
+/// runs `git worktree add` (the tree is keyed on the job's id, so it cannot come first), and a
+/// tick landing in that window used to fail a job that was still being born. A read that errored
+/// is a database hiccup rather than a fact about the job: this pass is skipped, never the job.
+async fn resolve_worktree(
+    state: &AppState,
+    job: &JobRow,
+    now: DateTime<Utc>,
+) -> Result<(PathBuf, String), Pass> {
+    let pool = &state.pool;
+    match job_worktree(pool, job.id).await {
+        Ok(Some(worktree)) => Ok(worktree),
         Err(error) => {
             tracing::warn!(
                 job_id = job.id,
                 %error,
                 "could not read a job's worktree; skipping this pass"
             );
-            return Step::Stopped;
+            Err(Pass::Stopped)
         }
-        Ok(None) if still_provisioning(&job.created_at, now) => return Step::Stopped,
-        Ok(None) => None,
+        Ok(None) if still_provisioning(&job.created_at, now) => Err(Pass::Stopped),
+        Ok(None) => {
+            let _ = finish(pool, job.id, Outcome::Failed).await;
+            say(
+                pool,
+                job,
+                "job_failed",
+                &format!(
+                    "job {} has no worktree on record to run its nodes in",
+                    job.id
+                ),
+            )
+            .await;
+            Err(Pass::Stopped)
+        }
+    }
+}
+
+/// Starts one of the autopilot's own nodes (`spec`, `plan`, `review`, `replan`) with its
+/// hard-coded prompt and no launcher: the legacy road.
+async fn spawn_autopilot_node(
+    state: &AppState,
+    job: &JobRow,
+    view: &JobView,
+    stage: &str,
+    worktree: (PathBuf, String),
+    council_file: bool,
+) -> Pass {
+    let Some(prompt) =
+        engine::autopilot_protocol(state, job, view, stage, &worktree.0, council_file).await
+    else {
+        return Pass::Stopped;
     };
-    let Some(worktree) = worktree else {
-        let _ = finish(pool, job.id, Outcome::Failed).await;
-        say(
-            pool,
+    spawn_node(
+        state,
+        job,
+        NodeSpec {
+            node_id: stage,
+            claim: None,
+            launch: super::dispatch::NodeLaunch::plain(prompt),
+        },
+        worktree,
+        NoRoom::Park,
+    )
+    .await
+}
+
+/// One node per ordinal, in order, under the ONE brake reading this pass took. A brake is a
+/// statement about the JOB — its budget, the owner's attention, the window — so re-reading it
+/// between two items of one batch would let the second half be refused under a rule the first half
+/// was allowed under, for the same job at the same moment.
+async fn spawn_items(
+    state: &AppState,
+    job: &JobRow,
+    view: &JobView,
+    artifacts: &str,
+    worktree: (PathBuf, String),
+    ordinals: Vec<usize>,
+) -> Pass {
+    let pool = &state.pool;
+    let mut step = Pass::Stopped;
+    for (position, ordinal) in ordinals.into_iter().enumerate() {
+        // Re-read between items for the reason `drive` re-reads between passes: the item
+        // before this one may have parked the job for want of a slot, or ended it because
+        // its run could not be created at all, and the next item must not be started on top
+        // of either. `is_paused` as well as the live list, because `waiting` IS live — a
+        // parked job is one that will come back, not one that is over.
+        if position > 0 {
+            let Ok(current) = load_job(pool, job.id).await else {
+                break;
+            };
+            if !LIVE_STATUSES.contains(&current.status.as_str()) || is_paused(&current.status) {
+                break;
+            }
+        }
+        step = start_item(
+            state,
             job,
-            "job_failed",
-            &format!(
-                "job {} has no worktree on record to run its nodes in",
-                job.id
-            ),
+            view,
+            artifacts,
+            worktree.clone(),
+            ordinal,
+            // The first item parks the job when the project has no room, and the ones after
+            // it do not. With something already started the job is not blocked; it is at the
+            // project's ceiling, and `waiting` would be a status the next tick has to undo.
+            if position == 0 {
+                NoRoom::Park
+            } else {
+                NoRoom::ShrinkTheBatch
+            },
         )
         .await;
-        return Step::Stopped;
-    };
-    let artifacts = artifacts_for(&worktree.0);
-
-    match next {
-        Next::SpawnSpec => {
-            let task = job.prompt.clone().unwrap_or_default();
-            let prompt = spec_prompt(&task, &artifacts);
-            spawn_node(state, job, "spec", prompt, None, worktree, NoRoom::Park).await
-        }
-        Next::SpawnPlan => {
-            let task = job.prompt.clone().unwrap_or_default();
-            let prompt = plan_prompt(
-                &task,
-                job.max_items.max(0) as usize,
-                &artifacts,
-                graph_rules(pool, job).await.as_ref(),
-                spec_is_written(&worktree.0).await,
-            );
-            spawn_node(state, job, "plan", prompt, None, worktree, NoRoom::Park).await
-        }
-        Next::SpawnImplement(ordinals) => {
-            // One node per ordinal, in order, under the ONE brake reading this pass took. A brake is
-            // a statement about the JOB — its budget, the owner's attention, the window — so
-            // re-reading it between two items of one batch would let the second half be refused
-            // under a rule the first half was allowed under, for the same job at the same moment.
-            let mut step = Step::Stopped;
-            for (position, ordinal) in ordinals.into_iter().enumerate() {
-                // Re-read between items for the reason `drive` re-reads between passes: the item
-                // before this one may have parked the job for want of a slot, or ended it because
-                // its run could not be created at all, and the next item must not be started on top
-                // of either. `is_paused` as well as the live list, because `waiting` IS live — a
-                // parked job is one that will come back, not one that is over.
-                if position > 0 {
-                    let Ok(current) = load_job(pool, job.id).await else {
-                        break;
-                    };
-                    if !LIVE_STATUSES.contains(&current.status.as_str())
-                        || is_paused(&current.status)
-                    {
-                        break;
-                    }
-                }
-                step = start_item(
-                    state,
-                    job,
-                    &view,
-                    &artifacts,
-                    worktree.clone(),
-                    ordinal,
-                    // The first item parks the job when the project has no room, and the ones after
-                    // it do not. With something already started the job is not blocked; it is at the
-                    // project's ceiling, and `waiting` would be a status the next tick has to undo.
-                    if position == 0 {
-                        NoRoom::Park
-                    } else {
-                        NoRoom::ShrinkTheBatch
-                    },
-                )
-                .await;
-            }
-            step
-        }
-        Next::SpawnReview => {
-            // In front of the node rather than inside `next_step`, which stays pure: this reads
-            // the database, starts a council and writes a file, and none of those belong in a
-            // function whose whole value is that it can be tested with a struct literal.
-            match council_before_review(state, job, &artifacts).await {
-                BeforeReview::Go { council_file } => {
-                    // Here, where the node actually starts, and once: a review parked behind a
-                    // council comes back through this arm on every tick, and the row belongs to
-                    // the retry rather than to each tick spent waiting for it.
-                    if view.review == ReviewState::Retry {
-                        say_once(
-                            pool,
-                            job,
-                            "job_review_retried",
-                            &format!(
-                                "job {} round {}: its review ended on a transient API error before \
-                                 it could judge anything, so it is run once more",
-                                job.id,
-                                view.rounds.round + 1
-                            ),
-                        )
-                        .await;
-                    }
-                    let task = job.prompt.clone().unwrap_or_default();
-                    let prompt = review_prompt(
-                        &task,
-                        job.head_sha.as_deref(),
-                        &artifacts,
-                        spec_is_written(&worktree.0).await,
-                        council_file,
-                    );
-                    spawn_node(state, job, "review", prompt, None, worktree, NoRoom::Park).await
-                }
-                BeforeReview::Deliberating => {
-                    park(
-                        state,
-                        job,
-                        WAIT_COUNCIL,
-                        "a council is deliberating on this job before its review",
-                    )
-                    .await
-                }
-            }
-        }
-        Next::SpawnReplan => {
-            // Archived BEFORE the node starts, because the node is about to overwrite `plan.json`
-            // with its own answer. The round's plan has to be put aside while it still exists.
-            let archives = archive_plans(&worktree.0, view.rounds.round).await;
-            let task = job.prompt.clone().unwrap_or_default();
-            let prompt = replan_prompt(
-                &task,
-                view.rounds.round,
-                &archives,
-                &artifacts,
-                graph_rules(pool, job).await.as_ref(),
-                &unfinished_items(pool, job.id).await,
-            );
-            spawn_node(state, job, "replan", prompt, None, worktree, NoRoom::Park).await
-        }
-        // All five are answered above, before the brakes and before the worktree is resolved.
-        // Reaching one here means the dispatch above stopped covering something it used to.
-        Next::Wait
-        | Next::Finish(_)
-        | Next::RunGate { .. }
-        | Next::MergeItem { .. }
-        | Next::SettleRevert { .. }
-        | Next::Orphan { .. } => Step::Stopped,
     }
+    step
 }
 
 /// The items a replan needs told about: the ones that broke, worst-known-first by ordinal.
@@ -577,8 +911,8 @@ pub(super) async fn advance(state: &AppState, job: &JobRow, now: DateTime<Utc>) 
 /// list rather than refusing: the round it is about to open is worth more than the paragraph.
 pub(super) async fn unfinished_items(pool: &SqlitePool, job_id: i64) -> Vec<Unfinished> {
     sqlx::query_as::<_, (i64, String, Option<String>)>(
-        "SELECT ordinal, description, gate_output FROM job_items
-         WHERE job_id = ? AND status IN ('gate_failed', 'failed')
+        "SELECT ordinal, description, gate_output FROM job_nodes
+         WHERE job_id = ? AND ordinal IS NOT NULL AND status IN ('gate_failed', 'failed')
          ORDER BY ordinal",
     )
     .bind(job_id)
@@ -606,7 +940,7 @@ pub(super) async fn start_item(
     worktree: (PathBuf, String),
     ordinal: usize,
     no_room: NoRoom,
-) -> Step {
+) -> Pass {
     let pool = &state.pool;
     // What the claim below has to find. Taken from the verdict this pass already reached —
     // `next_step` named this ordinal precisely because `item_state_from` called it `Pending`
@@ -623,10 +957,10 @@ pub(super) async fn start_item(
             ordinal,
             "asked to implement an item that is not startable"
         );
-        return Step::Stopped;
+        return Pass::Stopped;
     };
     let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
-        "SELECT description, files, gate_output, agent_id FROM job_items
+        "SELECT description, files, gate_output, agent_id FROM job_nodes
              WHERE job_id = ? AND ordinal = ?",
     )
     .bind(job.id)
@@ -640,7 +974,7 @@ pub(super) async fn start_item(
     // exactly as it was, not a fallback.
     let Some((description, files, gate_output, agent_id)) = row else {
         tracing::warn!(job_id = job.id, ordinal, "a job item lost its description");
-        return Step::Stopped;
+        return Pass::Stopped;
     };
     // A hint that will not parse is no hint. It is an optimisation for where to start
     // reading, and refusing to run the item over it would fail the work for the sake of the
@@ -661,9 +995,11 @@ pub(super) async fn start_item(
     spawn_node(
         state,
         job,
-        "implement",
-        prompt,
-        Some(ItemClaim { ordinal, held }),
+        NodeSpec {
+            node_id: "implement",
+            claim: Some(ItemClaim { ordinal, held }),
+            launch: super::dispatch::NodeLaunch::plain(prompt),
+        },
         worktree,
         no_room,
     )
@@ -676,7 +1012,14 @@ pub(super) async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
 
     // Bookkeeping about work that already happened, before any decision and before any brake.
     match reconcile_nodes(state, &job).await {
-        Ok(Reconciled::KeepGoing) => {}
+        Ok(Reconciled::KeepGoing) => {
+            // The bundle's own agent nodes land beside the autopilot's, on both roads: `drive` is
+            // what `advance` runs under.
+            if let Err(error) = landing::land_nodes(state, &job).await {
+                tracing::warn!(job_id = job.id, %error, "could not land a job's agent nodes");
+                return;
+            }
+        }
         // Already retired, and with a line in the feed saying why. Carrying on would drive a job
         // that has ended — and, in the one case that returns this, would advance the queue onto a
         // tree that could not be put back.
@@ -750,7 +1093,7 @@ pub(super) async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
             status: job.status.clone(),
             ..current
         };
-        if advance(state, &current, now).await == Step::Stopped {
+        if advance(state, &current, now).await == Pass::Stopped {
             return;
         }
     }
