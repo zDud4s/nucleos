@@ -236,13 +236,12 @@ pub(super) async fn stop_turn_within(
     // The final reply goes out first and the pause notice after it, so the outbox reads in the order
     // the person should. `reply_now` is the same compare-and-set the replies loop uses, so it does
     // not answer twice. `NotRunning` stopped nothing and announces nothing.
-    if matches!(outcome, Stopped::Interrupted | Stopped::Killed) {
-        if let Some(chat) = stopped_chat(state, turn_id).await {
-            crate::channels::replies::reply_now(state, turn_id).await;
-            if let Err(error) = crate::channels::replies::announce_queue_paused(state, &chat).await
-            {
-                tracing::warn!(%error, chat, "could not announce the paused queue");
-            }
+    if matches!(outcome, Stopped::Interrupted | Stopped::Killed)
+        && let Some(chat) = stopped_chat(state, turn_id).await
+    {
+        crate::channels::replies::reply_now(state, turn_id).await;
+        if let Err(error) = crate::channels::replies::announce_queue_paused(state, &chat).await {
+            tracing::warn!(%error, chat, "could not announce the paused queue");
         }
     }
     outcome

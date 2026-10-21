@@ -200,6 +200,8 @@ fn database_failure(error: &sqlx::Error, what: &str) -> Response {
 }
 
 /// E.1 common checks, in order: `400 malformed_channel`, then `404 unknown_channel`.
+// The refusal is a ready-made HTTP response the caller returns as is; boxing it would only add noise.
+#[allow(clippy::result_large_err)]
 fn resolve_channel(channel: &str) -> Result<&'static registry::Manifest, Response> {
     if !contract::valid_channel_id(channel) {
         return Err(refuse(
@@ -216,6 +218,8 @@ fn resolve_channel(channel: &str) -> Result<&'static registry::Manifest, Respons
 }
 
 /// E.1: a ref is 1 to 128 bytes, else `400 malformed_ref`.
+// The refusal is a ready-made HTTP response the caller returns as is; boxing it would only add noise.
+#[allow(clippy::result_large_err)]
 fn check_ref(reference: &str, what: &str) -> Result<(), Response> {
     if contract::valid_ref(reference) {
         return Ok(());

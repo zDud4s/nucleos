@@ -45,6 +45,8 @@ pub fn routes() -> Router<AppState> {
 /// (section 7.3). Only a channel's own key is admitted: the control key has no channel to speak for
 /// and gets a bare 403, and a key on another channel's path (which `require_token` already refuses)
 /// gets the `channel_mismatch` body.
+// The refusal is a ready-made HTTP response the caller returns as is; boxing it would only add noise.
+#[allow(clippy::result_large_err)]
 pub(super) fn own_channel(scope: &Scope, named: &str) -> Result<&'static str, Response> {
     match scope {
         Scope::Service(Service::Channel(id)) if *id == named => Ok(*id),

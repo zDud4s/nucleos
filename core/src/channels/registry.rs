@@ -427,11 +427,13 @@ fn apply_liveness(
     now: DateTime<Utc>,
 ) -> (ChannelState, Option<DateTime<Utc>>) {
     use crate::sidecar::Liveness;
-    let dead = match (state, liveness) {
-        (ChannelState::Online, Some(Liveness::Restarting | Liveness::FailedToSpawn(_))) => true,
-        (ChannelState::Starting, Some(Liveness::FailedToSpawn(_))) => true,
-        _ => false,
-    };
+    let dead = matches!(
+        (state, liveness),
+        (
+            ChannelState::Online,
+            Some(Liveness::Restarting | Liveness::FailedToSpawn(_))
+        ) | (ChannelState::Starting, Some(Liveness::FailedToSpawn(_)))
+    );
     if dead {
         (ChannelState::Offline, Some(now))
     } else {
