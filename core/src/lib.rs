@@ -47,6 +47,7 @@ pub mod door;
 pub mod embed;
 pub mod execution;
 pub use nucleos_base::feed;
+pub mod fleet;
 pub mod files;
 pub use nucleos_base::gate;
 pub mod governance;
