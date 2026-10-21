@@ -163,7 +163,7 @@ func (u e2eUploader) Upload(ctx context.Context, mime string, r io.Reader) (stri
 	return u.c.UploadMedia(ctx, mime, r)
 }
 
-// e2eRig wires the kit, the fake core and a fake Bot API the way cmd/telegramv2/main.go does, on one
+// e2eRig wires the kit, the fake core and a fake Bot API the way main.go does, on one
 // shared clock.Fake.
 type e2eRig struct {
 	t      *testing.T

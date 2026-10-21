@@ -10,7 +10,7 @@ use super::*;
 pub struct JobNode {
     pub job_id: i64,
     /// `plan` | `implement` | `review`. Never `gate`: the gate is a subprocess, not a run.
-    pub stage: &'static str,
+    pub stage: String,
     pub worktree_path: String,
     pub branch: String,
     /// The queue position of the item this node implements, or `None` for a node with no item (plan,
@@ -19,6 +19,20 @@ pub struct JobNode {
     /// The tools and directories this node was resolved to by `job.rs`, recorded in `run_loadout`
     /// here before the CLI starts. `None` launches with the box's fixed tools and no row.
     pub loadout: Option<crate::loadout::RunTools>,
+    /// What the node's launcher asked of the router (M4 C2). `Default` is "route as before".
+    pub launch: NodeLaunchRoute,
+}
+
+/// The engine-side half of a node launch, as `create_run_with` copies it into the router query:
+/// a restriction of the runners the router may choose from, a pin that bypasses it, and whether the
+/// run's answer will be validated later (which keeps the router's outcome report for after that).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeLaunchRoute {
+    pub restrict_runners: Option<Vec<crate::models::route_advice::RunnerKind>>,
+    pub pin: Option<crate::models::route_advice::EnginePinRoute>,
+    pub judged_later: bool,
+    /// The node's own effort when it is not pinned; see `RouteQuery::effort`.
+    pub effort: Option<String>,
 }
 
 /// A conflict the daemon is about to hand an agent: which escalated request it came from, and the
@@ -186,7 +200,7 @@ pub struct JobItem {
     pub job_id: i64,
     pub item_id: i64,
     /// `plan` | `implement` | `review`, as [`JobNode::stage`].
-    pub stage: &'static str,
+    pub stage: String,
     /// Where this item's tree is born: the tip of the job's branch as the last gate left it.
     ///
     /// Named and not `Option`, because there is no honest default. `None` would mean the project
@@ -677,7 +691,7 @@ pub(super) async fn create_run_with(
                 sqlx::query("UPDATE runs SET cwd = ?, job_id = ?, stage = ? WHERE id = ?")
                     .bind(&worktree_path)
                     .bind(node.job_id)
-                    .bind(node.stage)
+                    .bind(node.stage.as_str())
             }
             // The same write, plus the item. `item_id` lands here rather than in the INSERT for the
             // reason the node's identity does: until the tree exists there is nothing for the row to
@@ -688,7 +702,7 @@ pub(super) async fn create_run_with(
             )
             .bind(&worktree_path)
             .bind(item.job_id)
-            .bind(item.stage)
+            .bind(item.stage.as_str())
             .bind(item.item_id),
             (None, None) => {
                 sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?").bind(&worktree_path)
@@ -860,7 +874,7 @@ pub(super) async fn create_run_with(
     }
     // Which configured role this run's model and effort come from: a job node's stage, or the
     // resolver's own stage name for a conflict resolution. Asked of the runner at spawn below.
-    let model_stage = node.as_ref().map(|node| node.stage).or(resolution
+    let model_stage = node.map(|node| node.stage.as_str()).or(resolution
         .as_ref()
         .map(|_| crate::execution::runner::RESOLVE_STAGE));
     // What the llm-router is told. Never for triage: mail text must not leave the machine. The
@@ -891,12 +905,16 @@ pub(super) async fn create_run_with(
             // A resolution names its own stage, so the router knows a merge conflict from an
             // ad-hoc run and can choose its model and effort like any job stage's.
             stage: node
-                .map(|node| node.stage)
-                .or(item.map(|item| item.stage))
+                .map(|node| node.stage.as_str())
+                .or(item.map(|item| item.stage.as_str()))
                 .or(resolution.map(|_| crate::execution::runner::RESOLVE_STAGE))
                 .map(str::to_owned),
             item: item_context,
             resume: false,
+            restrict_runners: node.and_then(|node| node.launch.restrict_runners.clone()),
+            pin: node.and_then(|node| node.launch.pin.clone()),
+            judged_later: node.is_some_and(|node| node.launch.judged_later),
+            effort: node.and_then(|node| node.launch.effort.clone()),
         })
     };
     // Folded HERE, where both facts are in hand, rather than in `cli_args` where they used to be
@@ -988,4 +1006,91 @@ pub(super) async fn create_run_with(
     );
 
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::runs::tests::{
+        WorktreeRootEnv, init_contained_repo, space_free_tempdir, test_state_with_runner,
+    };
+
+    /// A node's stage is whatever the workflow graph's node id is, not one of three literals: the
+    /// run row records it verbatim.
+    // The env lock is held across awaits on purpose: it serialises tests that set process-wide
+    // env vars.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_node_run_records_any_stage_string() {
+        let _env_lock = crate::execution::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-create-stage-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-create-stage-");
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+
+        let job_id = crate::execution::job::insert_job(
+            &state.pool,
+            &crate::execution::job::NewJob {
+                project_id: "proj",
+                project_root: &project_root,
+                rule_name: Some("nightly"),
+                prompt: "triage the backlog",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+                graph: None,
+            },
+        )
+        .await
+        .expect("start a job");
+        let owner = crate::execution::worktree::Owner::Job(job_id);
+        let info = crate::execution::worktree::create(&repo, owner)
+            .await
+            .expect("the job provisions its worktree once");
+        crate::execution::worktree::record(
+            &state.pool,
+            owner,
+            "proj",
+            &project_root,
+            &info.path.to_string_lossy(),
+            &info.branch,
+            info.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the job worktree");
+
+        let run_id = create_job_node_run(
+            &state,
+            "sort the inbox".into(),
+            "proj".into(),
+            project_root.clone(),
+            JobNode {
+                job_id,
+                stage: "triage".into(),
+                worktree_path: info.path.to_string_lossy().into_owned(),
+                branch: info.branch.clone(),
+                item_ordinal: None,
+                loadout: None,
+                launch: Default::default(),
+            },
+        )
+        .await
+        .expect("a node with any stage string starts");
+
+        let (stage, node_job_id): (String, i64) =
+            sqlx::query_as("SELECT stage, job_id FROM runs WHERE id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stage, "triage");
+        assert_eq!(node_job_id, job_id);
+    }
 }

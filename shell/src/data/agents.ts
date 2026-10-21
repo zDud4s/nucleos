@@ -30,8 +30,39 @@ import { keys } from "./keys";
 /** What an agent may declare for `engine`. `unrestricted` policy is refused for every engine — see below. */
 export type AgentEngine = "claude" | "codex" | "local";
 
-/** What an agent may declare for `tool_policy`. `unrestricted` is refused by the daemon and never offered. */
-export type AgentToolPolicy = "mcp_only" | "none";
+/** The closed capability vocabulary an agent may hold (`nucleos_base::agent::Capability`). */
+export const AGENT_CAPABILITIES = [
+  "fs.read",
+  "fs.write",
+  "shell",
+  "web",
+  "memory.read",
+  "mcp.nucleos",
+] as const;
+
+export type AgentCapability = (typeof AGENT_CAPABILITIES)[number];
+
+/** PURE: the capability ids in a proposed payload value; anything that is not a string list reads as none. */
+export function capabilitiesOf(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/**
+ * PURE: the capabilities of a proposed payload. A proposal filed before migration 0228 carries only
+ * `tool_policy`; this mirrors the daemon's `capabilities_for_policy` (`core/src/team/recruit.rs`).
+ */
+export function proposedCapabilities(payload: Record<string, unknown>): string[] {
+  if (payload.capabilities === undefined && typeof payload.tool_policy === "string") {
+    return payload.tool_policy === "mcp_only" ? ["mcp.nucleos"] : [];
+  }
+  return capabilitiesOf(payload.capabilities);
+}
+
+/** PURE: whether two capability lists hold the same ids, whatever the order. */
+export function sameCapabilities(a: string[], b: string[]): boolean {
+  const key = (list: string[]) => JSON.stringify([...new Set(list)].sort());
+  return key(a) === key(b);
+}
 
 /** One row of the catalogue — `agent::Agent`. */
 export interface Agent {
@@ -43,6 +74,9 @@ export interface Agent {
   engine: string;
   /** `null` reads as the engine's default, never as a blank. */
   model: string | null;
+  /** Capability ids the agent holds. */
+  capabilities: string[];
+  /** Derived by the daemon from `capabilities` (`none` | `mcp_only` | `unrestricted`); read-only. */
   tool_policy: string;
   created_at: string;
   updated_at: string;
@@ -55,7 +89,7 @@ export interface AgentRequest {
   prompt: string;
   engine: string;
   model: string | null;
-  tool_policy: string;
+  capabilities: string[];
 }
 
 /* -------------------------------------------------------------- readings -- */
@@ -123,9 +157,9 @@ export function canTakeASeat(agent: Agent): boolean {
   return agent.model !== null;
 }
 
-/** PURE: whether this agent has any tools at all — the whole of what `tool_policy` decides. */
+/** PURE: whether this agent holds any capability at all. */
 export function hasTools(agent: Agent): boolean {
-  return agent.tool_policy === "mcp_only";
+  return agent.capabilities.length > 0;
 }
 
 /**

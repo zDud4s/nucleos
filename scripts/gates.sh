@@ -367,6 +367,15 @@ if [ "$target" = sidecars ] || [ "$target" = all ]; then
     # and a notifier goroutine sharing state with them.
     run "sidecars/$name: test"  "$dir" go test -race ./...
   done
+  # Shared Go libraries the sidecars depend on (sidecars/lib/*), gated the same way.
+  for gomod in "$repo_root"/sidecars/lib/*/go.mod; do
+    [ -e "$gomod" ] || continue
+    dir="$(dirname "$gomod")"
+    name="lib/$(basename "$dir")"
+    run "sidecars/$name: gofmt" "$dir" gofmt_gate
+    run "sidecars/$name: vet"   "$dir" go vet ./...
+    run "sidecars/$name: test"  "$dir" go test -race ./...
+  done
 fi
 
 if [ "$target" = shell ] || [ "$target" = all ]; then

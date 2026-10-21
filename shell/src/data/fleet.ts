@@ -119,17 +119,29 @@ export interface Concurrency {
   projects: ProjectConcurrency[];
 }
 
+export interface JobNode {
+  node_id: string;
+  ordinal: number | null;
+  of: number | null;
+}
+
 export interface Job {
   id: number;
   project_id: string;
   rule_name: string | null;
   /**
-   * `planning` | `implementing` | `gating` | `reviewing` | `waiting` |
-   * `awaiting_approval`, then one of the endings: `completed`, `failed`,
+   * `running` | `waiting` | `awaiting_approval`, then one of the endings: `completed`, `failed`,
    * `gate_failed`, `gate_errored`, `expired`, `stopped`, `cancelled`,
    * `interrupted`.
    */
   status: string;
+  /**
+   * What a `running` job is doing now: the workflow node it is on, and which of
+   * the node's items when it fans out. Null when it is not running a node.
+   */
+  node: JobNode | null;
+  /** The workflow bundle the job runs, or null for a job not started from one. */
+  bundle: string | null;
   /**
    * Why a `waiting` job waits. Budget, slot contention and an exclusion ask
    * three different things of a reader, so `waiting` alone leaves them guessing
@@ -278,10 +290,7 @@ export interface RunSearchResult {
  * button exists to resolve, so it is worth keeping honest.
  */
 const JOB_LIVE_STATUSES = [
-  "planning",
-  "implementing",
-  "gating",
-  "reviewing",
+  "running",
   "awaiting_approval",
   "waiting",
 ];

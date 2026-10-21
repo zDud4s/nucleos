@@ -1666,7 +1666,7 @@ mod tests {
     #[tokio::test]
     async fn a_finding_with_no_evidence_is_refused_at_the_door() {
         let pool = test_pool().await;
-        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        let (_, run_id) = seed_job_run(&pool, "running").await;
         for (body, expected) in [
             (
                 serde_json::json!({"fact": "the build needs the GNU host"}),
@@ -1699,7 +1699,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversize_evidence_is_refused_at_the_door() {
         let pool = test_pool().await;
-        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        let (_, run_id) = seed_job_run(&pool, "running").await;
         let evidence = serde_json::Value::Array(
             (1..=200)
                 .map(|id| serde_json::json!({"t": "run", "id": id}))
@@ -1735,7 +1735,7 @@ mod tests {
     #[tokio::test]
     async fn an_evidence_of_nothing_but_unknown_tags_is_no_evidence() {
         let pool = test_pool().await;
-        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        let (_, run_id) = seed_job_run(&pool, "running").await;
         for evidence in [
             serde_json::json!([{"t": "vibes", "id": 1}]),
             serde_json::json!([{"t": "run"}]),
@@ -1771,7 +1771,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_can_never_write_the_measurement_column() {
         let pool = test_pool().await;
-        let (job_id, run_id) = seed_job_run(&pool, "implementing").await;
+        let (job_id, run_id) = seed_job_run(&pool, "running").await;
         let (status, _) = finding_at_door(
             &pool,
             crate::auth::Scope::Run(run_id),
@@ -1870,7 +1870,7 @@ mod tests {
             assert_eq!(answer, axum::http::StatusCode::CONFLICT, "{status}");
         }
 
-        let (_, run_id) = seed_job_run(&pool, "implementing").await;
+        let (_, run_id) = seed_job_run(&pool, "running").await;
         for fact in ["".to_owned(), "x".repeat(601)] {
             let (status, _) = finding_at_door(
                 &pool,
@@ -1980,7 +1980,7 @@ mod tests {
         let job_id: i64 = sqlx::query_scalar(
             "INSERT INTO jobs
                (project_id, project_root, status, max_items, gate_retries, created_at)
-             VALUES ('nucleos', 'C:/tmp', 'implementing', 1, 0, '2026-09-20T00:00:00Z')
+             VALUES ('nucleos', 'C:/tmp', 'running', 1, 0, '2026-09-20T00:00:00Z')
              RETURNING id",
         )
         .fetch_one(&pool)

@@ -659,7 +659,9 @@ export const JOB: Job = {
   id: 24,
   project_id: "alpha",
   rule_name: "nightly reconciliation",
-  status: "implementing",
+  status: "running",
+  node: { node_id: "implement", ordinal: 1, of: 5 },
+  bundle: "autopilot",
   wait_reason: null,
   max_items: 8,
   created_at: ago(DAY / 12),
@@ -867,7 +869,7 @@ export const RECRUITS = [
       prompt: "You read Portuguese VAT returns. You never file anything; you explain what you found.",
       engine: "claude",
       model: null,
-      tool_policy: "read_only",
+      capabilities: ["fs.read"],
       team_id: "financas",
       team_run_id: "run-live-1",
       slug: "tax-analyst",
@@ -1104,6 +1106,7 @@ function agent(overrides: Partial<Agent>): Agent {
     prompt: "",
     engine: "claude",
     model: null,
+    capabilities: ["mcp.nucleos"],
     tool_policy: "mcp_only",
     created_at: ago(90 * DAY),
     updated_at: ago(30 * DAY),
@@ -1145,6 +1148,7 @@ export const AGENTS: Agent[] = [
     speciality: "Reads what the others wrote and refuses it when it is not ready.",
     prompt: "You review. Be specific about what is wrong and where.",
     model: "claude-sonnet-5",
+    capabilities: [],
     tool_policy: "none",
     updated_at: ago(6 * DAY),
   }),
@@ -1193,7 +1197,8 @@ export const AGENTS: Agent[] = [
     speciality: "Keeps the machines patched and the backups restorable, and proves the second one.",
     prompt: "You operate. Change one thing at a time and write down what you changed.",
     model: "claude-sonnet-5",
-    tool_policy: "read_only",
+    capabilities: ["fs.read", "shell"],
+    tool_policy: "unrestricted",
     updated_at: ago(30 * DAY),
   }),
   /* Nobody employs this one, and nothing else in the app would ever say so. */
@@ -2943,7 +2948,7 @@ const STORAGE: StorageReport = {
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
 const CHANNEL_TELEGRAM_WHAT =
-  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in (the older telegram area keeps the bot token and chat id until the channel migration)";
+  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too";
 
 const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["email", "Which mailbox the e-mail pillar reads, and how often.", "host: imap.example.com\nusername: me@example.com\nmailbox: INBOX\npoll_interval_secs: 120\n"],
@@ -2978,7 +2983,7 @@ const MACHINE_CONFIG: MachineConfig = {
 
 const MACHINE_SECRETS: MachineSecret[] = [
   { key: "email-password", area: "email", what: "the IMAP password", present: true },
-  { key: "telegram-bot-token", area: "telegram", what: "the bot's token", present: false },
+  { key: "telegram-token", area: "channels/telegram", what: "the bot's token", present: false },
   { key: "github-token", area: "github", what: "the token gh is handed", present: false },
   { key: "web-search-api-key", area: "web", what: "the search provider's key", present: true },
 ];

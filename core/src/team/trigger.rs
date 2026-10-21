@@ -973,9 +973,9 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT OR IGNORE INTO agents (id, name, speciality, prompt, engine, model,
-                                           tool_policy, created_at, updated_at)
+                                           capabilities, created_at, updated_at)
              VALUES (?, ?, 'does a thing', 'You do a thing.', 'claude', 'claude-opus-5',
-                     'mcp_only', ?, ?)",
+                     '[\"mcp.nucleos\"]', ?, ?)",
         )
         .bind(id)
         .bind(id)

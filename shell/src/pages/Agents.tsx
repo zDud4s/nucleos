@@ -3,7 +3,6 @@ import { isApiRefusal } from "../data/client";
 import {
   canTakeASeat,
   employmentOf,
-  hasTools,
   renamed,
   unemployed,
   useAgents,
@@ -13,7 +12,7 @@ import {
   type Agent,
   type AgentEngine,
   type AgentRequest,
-  type AgentToolPolicy,
+  AGENT_CAPABILITIES,
   type Employer,
   type Employment,
 } from "../data/agents";
@@ -506,7 +505,7 @@ type ToolsReading = "tools" | "none" | "unmapped";
  * cannot see.
  */
 function toolsOf(agent: Agent): ToolsReading {
-  if (hasTools(agent)) return "tools";
+  if (agent.tool_policy === "mcp_only" || agent.tool_policy === "unrestricted") return "tools";
   return agent.tool_policy === "none" ? "none" : "unmapped";
 }
 
@@ -606,7 +605,7 @@ interface AgentDraft {
   prompt: string;
   engine: AgentEngine;
   model: string;
-  tool_policy: AgentToolPolicy;
+  capabilities: string[];
 }
 
 const EMPTY_DRAFT: AgentDraft = {
@@ -615,7 +614,7 @@ const EMPTY_DRAFT: AgentDraft = {
   prompt: "",
   engine: "claude",
   model: "",
-  tool_policy: "mcp_only",
+  capabilities: ["mcp.nucleos"],
 };
 
 function draftFromAgent(agent: Agent): AgentDraft {
@@ -625,16 +624,12 @@ function draftFromAgent(agent: Agent): AgentDraft {
     prompt: agent.prompt,
     engine: isAgentEngine(agent.engine) ? agent.engine : "claude",
     model: agent.model ?? "",
-    tool_policy: isAgentToolPolicy(agent.tool_policy) ? agent.tool_policy : "mcp_only",
+    capabilities: [...agent.capabilities],
   };
 }
 
 function isAgentEngine(value: string): value is AgentEngine {
   return value === "claude" || value === "codex" || value === "local";
-}
-
-function isAgentToolPolicy(value: string): value is AgentToolPolicy {
-  return value === "mcp_only" || value === "none";
 }
 
 /** A `local` engine must name a model — refused client-side before the round trip, per `agent::validate`. */
@@ -654,7 +649,7 @@ function requestFromDraft(draft: AgentDraft): AgentRequest {
     prompt: draft.prompt.trim(),
     engine: draft.engine,
     model: draft.model.trim() === "" ? null : draft.model.trim(),
-    tool_policy: draft.tool_policy,
+    capabilities: draft.capabilities,
   };
 }
 
@@ -723,16 +718,25 @@ function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: 
         </small>
       </div>
 
-      <label className="agents-field">
-        <span>Tool policy</span>
-        <select
-          value={draft.tool_policy}
-          onChange={(event) => onChange({ tool_policy: event.target.value as AgentToolPolicy })}
-        >
-          <option value="mcp_only">mcp_only</option>
-          <option value="none">none</option>
-        </select>
-      </label>
+      <fieldset className="agents-field agents-field-wide">
+        <legend>Capabilities</legend>
+        {AGENT_CAPABILITIES.map((capability) => (
+          <label key={capability} style={{ display: "inline-flex", gap: 4, marginRight: 12 }}>
+            <input
+              type="checkbox"
+              checked={draft.capabilities.includes(capability)}
+              onChange={(event) =>
+                onChange({
+                  capabilities: event.target.checked
+                    ? [...draft.capabilities, capability]
+                    : draft.capabilities.filter((held) => held !== capability),
+                })
+              }
+            />
+            <span>{capability}</span>
+          </label>
+        ))}
+      </fieldset>
     </>
   );
 }

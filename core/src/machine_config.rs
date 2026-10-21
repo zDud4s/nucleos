@@ -241,7 +241,7 @@ pub static SETTINGS: &[Setting] = &[
     Setting {
         path: CHANNEL_TELEGRAM_FILE,
         area: "channels/telegram",
-        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in (the older telegram area keeps the bot token and chat id until the channel migration)",
+        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too",
         takes_effect: "when the daemon restarts",
         validate: validate_channel_config,
     },
@@ -442,7 +442,7 @@ pub static SECRETS: &[Secret] = &[
     },
     Secret {
         key: "telegram-token",
-        area: "telegram",
+        area: "channels/telegram",
         what: "the bot token; without it the Telegram sidecar does not start",
     },
     Secret {
@@ -552,6 +552,13 @@ mod tests {
                 setting.path
             );
         }
+    }
+
+    /// The bot token is listed under the channel's own area, beside the rest of its settings.
+    #[test]
+    fn the_telegram_token_secret_is_listed_under_the_channels_telegram_area() {
+        let secret = secret_for("telegram-token").expect("telegram-token is a listed secret");
+        assert_eq!(secret.area, "channels/telegram");
     }
 
     /// The daemon's own token is absent, and every other row says what it is for.

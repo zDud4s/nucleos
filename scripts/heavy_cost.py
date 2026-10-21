@@ -305,6 +305,143 @@ def rebuild_costs(directory: Path, max_age_s: float = 600.0, tail_bytes: int = 4
         return
 
 
+# ----------------------------------------------------------------------------- light lane
+#
+# A class that has proven small (a few hundred MB, seconds of CPU) may start while the token
+# budget is full. It uses its own model, `light.json`, so `costs.json` keeps its format: an old
+# broker reads the same state dir and simply ignores the file.
+
+LIGHT_VERSION = 1
+LIGHT_MEM_MB = 1536   # p90 peak memory
+LIGHT_RUN_S = 180     # p90 run time
+LIGHT_CORES = 3       # p90 of the per-run average cores
+LIGHT_MIN_N = 5       # runs needed before a class is trusted
+LIGHT_MAX_DEFAULT = 2
+LIGHT_MARGIN_MB_DEFAULT = 1024
+
+
+def light_enabled() -> bool:
+    return os.environ.get("NUCLEOS_HEAVY_LIGHT", "").strip() != "0"
+
+
+def light_max() -> int:
+    """Light runs allowed at once (NUCLEOS_HEAVY_LIGHT_MAX); an unreadable value is the default."""
+    try:
+        return max(0, int(os.environ.get("NUCLEOS_HEAVY_LIGHT_MAX", "").strip()))
+    except ValueError:
+        return LIGHT_MAX_DEFAULT
+
+
+def light_margin_mb() -> int:
+    """Memory that must stay available on top of a light run's own p90."""
+    return int(_env_pos("NUCLEOS_HEAVY_LIGHT_MARGIN_MB", LIGHT_MARGIN_MB_DEFAULT))
+
+
+def _is_light(n, mem, run, cores, min_n: int = LIGHT_MIN_N) -> bool:
+    return (_num(n) and _num(mem) and _num(run) and _num(cores)
+            and n >= min_n and mem <= LIGHT_MEM_MB and run <= LIGHT_RUN_S
+            and cores <= LIGHT_CORES)
+
+
+def build_light(rows: list[dict], now: float | None = None, n: int = 20,
+                min_n: int = LIGHT_MIN_N, days: float = 30.0) -> dict:
+    """Per class, over its last `n` complete rows of any duration: p90 memory, run time and
+    average cores, and whether they are small enough to run beside a full budget."""
+    now = time.time() if now is None else now
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        if not isinstance(r, dict) or not isinstance(r.get("cls"), str):
+            continue
+        if not (_num(r.get("peak_mem_mb")) and _num(r.get("cores_avg"))
+                and _num(r.get("run_s"))):
+            continue
+        t = _ts_epoch(r.get("ts"))
+        if t is None or now - t > days * 86400:
+            continue
+        groups.setdefault(r["cls"], []).append(r)
+    classes: dict[str, dict] = {}
+    for cls, grp in groups.items():
+        grp = grp[-n:]
+        mem = _p90([r["peak_mem_mb"] for r in grp])
+        run = _p90([r["run_s"] for r in grp])
+        cores = _p90([r["cores_avg"] for r in grp])
+        classes[cls] = {"n": len(grp), "mem_mb": mem, "run_s": run, "cores": cores,
+                        "light": _is_light(len(grp), mem, run, cores, min_n)}
+    return {"v": LIGHT_VERSION, "built": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "classes": classes}
+
+
+def load_light(directory: Path) -> dict:
+    try:
+        data = json.loads((Path(directory) / "light.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def rebuild_light(directory: Path, max_age_s: float = 600.0, tail_bytes: int = 4_000_000) -> None:
+    """Rewrite light.json from the log's tail, at most every `max_age_s`. Never raises, and
+    never touches costs.json."""
+    try:
+        d = Path(directory)
+        target = d / "light.json"
+        try:
+            if time.time() - target.stat().st_mtime < max_age_s:
+                return
+        except OSError:
+            pass
+        log = d / "log.jsonl"
+        if not log.exists():
+            return
+        with open(log, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            seeked = size > tail_bytes
+            fh.seek(max(0, size - tail_bytes))
+            raw = fh.read()
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        if seeked and lines:
+            lines = lines[1:]
+        rows = []
+        for line in lines:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+        tmp = d / "light.json.tmp"
+        tmp.write_text(json.dumps(build_light(rows)), encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception:
+        return
+
+
+def light_entry(light: dict, cls: str) -> dict | None:
+    """The class's entry when its own numbers say light. The stored flag is not trusted: a
+    hand-edited or older file must not admit a class the thresholds would refuse."""
+    try:
+        e = ((light or {}).get("classes") or {}).get(cls)
+        if isinstance(e, dict) and _is_light(
+                e.get("n"), e.get("mem_mb"), e.get("run_s"), e.get("cores")):
+            return e
+    except Exception:
+        pass
+    return None
+
+
+def light_fits(entry: dict, p: dict, margin: float | None = None) -> tuple[bool, dict]:
+    """Room for one light run now: its memory plus a margin is available, and the CPUs
+    already busy leave it its cores with one to spare."""
+    margin = light_margin_mb() if margin is None else margin
+    avail = float(p.get("avail_mb") or 0)
+    busy = p.get("busy_cores")
+    need_mem = float(entry["mem_mb"]) + margin
+    ok = avail >= need_mem
+    if ok and _num(busy):
+        ok = busy + float(entry["cores"]) <= float(p.get("logical") or 1) - 1
+    return ok, {
+        "avail_mb": round(avail, 1), "need_mem_mb": round(need_mem, 1),
+        "busy_cores": round(busy, 1) if _num(busy) else None, "cores": entry.get("cores"),
+    }
+
+
 def predict(costs: dict, cls: str, weight: int = 1) -> tuple[float, float]:
     try:
         e = (costs or {}).get("classes", {}).get(cls)

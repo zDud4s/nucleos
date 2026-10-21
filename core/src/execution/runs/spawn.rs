@@ -446,6 +446,7 @@ pub(super) fn spawn_run(
     // Whether a gate will judge this run's work: its own (`gate_config`) or the job's, run after it
     // ends. Read before `resolve` takes the query. A run neither judges — a plan, a review, an
     // ad-hoc run — reports on its own exit instead (`route_advice::outcome_at_run_end`).
+    // (`judged_by_a_job_gate` also covers a node whose answer a validator will check: C2 `judged_later`.)
     let judged_by_a_gate = !matches!(gate_config, GateConfig::NotConfigured)
         || route
             .as_ref()
@@ -477,6 +478,32 @@ pub(super) fn spawn_run(
         // What an outcome is reported against once the run has ended: both `Some` only for a run
         // the router actually advised, so a fallback or an unrouted run reports nothing.
         let route_decision = resolved.decision_id.zip(resolved.router);
+        // A launch the router plumbing cannot honour (a pin to an engine this daemon does not hold)
+        // ends the run here, before any CLI exists: the sentence goes in `stderr`, the node above it
+        // lands `failed`, and nothing is retried because nothing ran.
+        if let Some(reason) = resolved.refused {
+            let failed = sqlx::query(
+                "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?, attempt = 1 WHERE id = ? AND status = 'running'",
+            )
+            .bind(&reason)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await;
+            warn_on_terminal_write_err(&failed, id, "failed");
+            if matches!(&failed, Ok(result) if result.rows_affected() == 1) {
+                let _ = crate::feed::append(
+                    &pool,
+                    feed_project_id.as_deref(),
+                    "run_failed_final",
+                    &format!("run {id} could not start: {reason}"),
+                    Some(id),
+                    Some(&crate::feed::run_subject(&pool, id).await),
+                )
+                .await;
+            }
+            return;
+        }
         let mut attempt: u32 = 1;
         loop {
             // A fresh session channel per attempt: persist session_id the instant the runner parses it

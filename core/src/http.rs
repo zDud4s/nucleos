@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn the_live_parameter_reaches_past_the_window_and_its_absence_changes_nothing() {
         let (state, db) = file_test_state().await;
-        let old_live = seed_job_row(&state.pool, "project-a", "implementing").await;
+        let old_live = seed_job_row(&state.pool, "project-a", "running").await;
         for _ in 0..25 {
             seed_job_row(&state.pool, "project-b", "completed").await;
         }
@@ -1313,9 +1313,9 @@ mod tests {
     async fn seed_pressure_team(pool: &sqlx::SqlitePool, with_a_job: bool) {
         for agent in ["director", "Nucleo"] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, 'a speciality', 'a prompt', 'claude', 'unrestricted',
+                 VALUES (?, ?, 'a speciality', 'a prompt', 'claude', '[\"shell\"]',
                          '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
             )
             .bind(agent)
@@ -1655,7 +1655,7 @@ mod tests {
     async fn add_job(pool: &sqlx::SqlitePool, project_id: &str) -> i64 {
         sqlx::query(
             "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
-             VALUES (?, ?, 'implementing', 5, '2026-08-15T00:00:00Z')",
+             VALUES (?, ?, 'running', 5, '2026-08-15T00:00:00Z')",
         )
         .bind(project_id)
         .bind(format!("C:/projects/{project_id}"))
@@ -2921,7 +2921,7 @@ mod tests {
         let state = test_state().await;
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES (9, 'proj', 'C:/x', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+             VALUES (9, 'proj', 'C:/x', 'x', 'running', 5, 1, 1, '2026-09-27T00:00:00Z')",
         )
         .execute(&state.pool)
         .await
@@ -3965,7 +3965,7 @@ mod tests {
 
     /// Points `state` at a temporary directory standing in for `~/.nucleos`, so project state can be
     /// written and read without a real home. The directory lives as long as the returned guard.
-    fn with_project_home(state: &mut AppState) -> tempfile::TempDir {
+    pub(super) fn with_project_home(state: &mut AppState) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         state.machine_config_root = Some(home.path().to_path_buf());
         home
@@ -3974,7 +3974,11 @@ mod tests {
     /// Registers a project with a root on disk and, when `state` has a stand-in home, writes its
     /// rules where the daemon reads them: `<home>/projects/<id>/autopilot.yaml`. Without one the
     /// project simply has no rules, which is all most callers here need.
-    async fn project_with_rules(state: &AppState, id: &str, yaml: &str) -> tempfile::TempDir {
+    pub(super) async fn project_with_rules(
+        state: &AppState,
+        id: &str,
+        yaml: &str,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         if let Some(home) = state.machine_config_root.as_deref() {
             crate::project::state::write_for_test(
@@ -8352,7 +8356,9 @@ mod tests {
     /// The library goes through `AppState` rather than through the machine's home directory, which
     /// is what makes any of this testable without touching the person running the suite. See the
     /// field's own comment in `state.rs`.
-    fn library_with(bundles: &[(&str, &str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+    pub(super) fn library_with(
+        bundles: &[(&str, &str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         for (name, version, manifest) in bundles {
             let at = dir.path().join(name).join(version);
@@ -8396,7 +8402,45 @@ mod tests {
         );
     }
 
-    async fn workflow_call(
+    /// Installs `name@version` into project `alpha` the way the shell will: read the consent
+    /// listing, then send back its digest. Asserts the install succeeded.
+    pub(super) async fn install_consenting(state: &AppState, name: &str, version: &str) {
+        let (status, listing) = workflow_call(
+            state.clone(),
+            "GET",
+            &format!("/projects/alpha/workflows/{name}/consent?version={version}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        // `GET .../consent` carries no digest (the refusal does), so ask for it by installing
+        // without one first when the listing says a command needs agreeing to.
+        let needs = listing["commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|c| c["change"] != "unchanged"));
+        let mut request = serde_json::json!({ "name": name, "version": version });
+        if needs {
+            let (status, refused) = workflow_call(
+                state.clone(),
+                "POST",
+                "/projects/alpha/workflows",
+                Some(request.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+            request["consent_digest"] = refused["digest"].clone();
+        }
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(request),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    }
+
+    pub(super) async fn workflow_call(
         state: AppState,
         method: &str,
         uri: &str,
@@ -9810,13 +9854,7 @@ mod tests {
         let _home = with_project_home(&mut state);
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
-        workflow_call(
-            state.clone(),
-            "POST",
-            "/projects/alpha/workflows",
-            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
-        )
-        .await;
+        install_consenting(&state, "harness", "1.0").await;
 
         let (status, graph) = workflow_call(
             state.clone(),
@@ -9869,13 +9907,7 @@ mod tests {
         let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
-        workflow_call(
-            state.clone(),
-            "POST",
-            "/projects/alpha/workflows",
-            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
-        )
-        .await;
+        install_consenting(&state, "harness", "1.0").await;
 
         // Through the route that writes it, rather than by editing the file in the test: the
         // shape of the pins file is `render_pins`'s business, and a test that hand-indented it
@@ -10023,13 +10055,7 @@ mod tests {
         assert_eq!(first["commands"][0]["command"], "cargo test");
         assert_eq!(first["commands"][0]["change"], "new");
 
-        workflow_call(
-            state.clone(),
-            "POST",
-            "/projects/alpha/workflows",
-            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
-        )
-        .await;
+        install_consenting(&state, "harness", "1.0").await;
 
         let (status, update) = workflow_call(
             state.clone(),
@@ -17168,6 +17194,99 @@ mod tests {
         assert_eq!(relays, 0, "a refused relay must leave no row behind");
     }
 
+    /// Shared by the two channel-origin relay tests: a relay POST from a run whose `origin` column
+    /// holds `origin`, answered with the refusal slug.
+    async fn relay_refusal_for_run_origin(origin: Option<&str>, via_send_message: bool) -> String {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id: i64 = if via_send_message {
+            crate::assistant::send_message(
+                &state,
+                &from_chat_id,
+                "ola",
+                crate::assistant::Origin::Channel("telegram"),
+            )
+            .await
+            .unwrap()
+        } else {
+            sqlx::query_scalar(
+                "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+                 VALUES ('ola', 'running', 'assistant', ?, ?, ?) RETURNING id",
+            )
+            .bind(&from_chat_id)
+            .bind(origin)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+        };
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{to_chat_id}/relay"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(
+                        crate::daemon_client::RUN_ID_HEADER,
+                        sending_run_id.to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "text": "onward" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let relays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(relays, 0, "a refused relay must leave no row behind");
+        json_body(response).await["refusal"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A turn that arrived through a channel sidecar may not relay: it is remote like Telegram, so
+    /// the gate answers with the remote-origin refusal and not `unknown_origin`.
+    #[tokio::test]
+    async fn a_relay_asked_for_by_a_channel_turn_is_refused_as_remote_origin() {
+        assert_eq!(
+            relay_refusal_for_run_origin(None, true).await,
+            "telegram_origin"
+        );
+    }
+
+    /// A run row written with the migrated spelling `channel:telegram` (what the v2 sidecar
+    /// records) reads back as a channel origin and cannot forward.
+    #[tokio::test]
+    async fn a_run_with_the_migrated_channel_telegram_origin_cannot_forward() {
+        assert_eq!(
+            relay_refusal_for_run_origin(Some("channel:telegram"), false).await,
+            "telegram_origin"
+        );
+        // An unregistered channel id stays unknown and is refused as such.
+        assert_eq!(
+            relay_refusal_for_run_origin(Some("channel:nope"), false).await,
+            "unknown_origin"
+        );
+    }
+
     /// A sending turn whose origin nobody recorded is refused, not assumed to be the permissive
     /// answer.
     ///
@@ -19396,7 +19515,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(status, "planning", "a job's first act is to plan");
+        assert_eq!(status, "running", "a job's first act is to plan");
         assert_eq!(rule_name, None, "no rule asked for this one; a person did");
 
         // Read through `owner_kind`/`owner_id` because that is how the row is written — and it is
@@ -19416,9 +19535,9 @@ mod tests {
     async fn team_in(pool: &sqlx::SqlitePool, team_id: &str) {
         let now = "2026-08-20T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -19550,6 +19669,37 @@ mod tests {
             .unwrap();
         let said = String::from_utf8_lossy(&body);
         assert!(said.contains("a-team-nobody-made"), "{said}");
+        assert_eq!(job_count(&pool).await, 0, "nothing was created to retire");
+    }
+
+    /// A caller may name the workflow, but only one the project pins: the name selects a pin and
+    /// never a path, so an unpinned name is the `NoGraph` refusal and not the embedded autopilot.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_asking_for_a_workflow_the_project_does_not_pin_is_refused_and_leaves_no_row() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-nowf422-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request_with(serde_json::json!({
+                "project_id": "p",
+                "prompt": "build the thing",
+                "workflow": "a-workflow-nobody-pinned",
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let said = String::from_utf8_lossy(&body);
+        assert!(said.contains("a-workflow-nobody-pinned"), "{said}");
         assert_eq!(job_count(&pool).await, 0, "nothing was created to retire");
     }
 
@@ -23322,9 +23472,9 @@ mod tests {
     async fn agent_in(pool: &sqlx::SqlitePool, agent_id: &str) {
         let now = "2026-10-09T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES (?, ?, 'remembering', 'recall', 'claude', 'inherit', ?, ?)",
+             VALUES (?, ?, 'remembering', 'recall', 'claude', '[]', ?, ?)",
         )
         .bind(agent_id)
         .bind(format!("Agent {agent_id}"))
@@ -24217,7 +24367,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, created_at)
-             VALUES (5, 'proj', 'C:/x', 'x', 'implementing', 5, '2026-09-27T00:00:00Z')",
+             VALUES (5, 'proj', 'C:/x', 'x', 'running', 5, '2026-09-27T00:00:00Z')",
         )
         .execute(&state.pool)
         .await
@@ -24233,7 +24383,7 @@ mod tests {
         let long = "a".repeat(80);
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, created_at)
-             VALUES (5, 'proj', 'C:/x', ?, 'implementing', 5, '2026-09-27T00:00:00Z')",
+             VALUES (5, 'proj', 'C:/x', ?, 'running', 5, '2026-09-27T00:00:00Z')",
         )
         .bind(format!("{long}\nsecond line"))
         .execute(&state.pool)
@@ -24959,8 +25109,8 @@ mod tests {
     async fn loadout_seed_agent_and_team(pool: &sqlx::SqlitePool) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
-                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
-             VALUES ('scout', 'Scout', 'reads', 'p', 'claude', NULL, 'mcp_only',
+                 (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
+             VALUES ('scout', 'Scout', 'reads', 'p', 'claude', NULL, '[\"mcp.nucleos\"]',
                      '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')",
         )
         .execute(pool)

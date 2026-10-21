@@ -14,6 +14,8 @@ import {
   standingTone,
   useEjectWorkflow,
   useForgetWorkflow,
+  consentFromRefusal,
+  sameCommands,
   useInstallWorkflow,
   useProjectWorkflows,
   useUpdateWorkflow,
@@ -21,6 +23,7 @@ import {
   useWorkflowLibrary,
   type Bundle,
   type Installed,
+  type WorkflowConsent,
 } from "../data/workflows";
 import { openInVscode } from "../lib/vscode";
 import {
@@ -290,6 +293,7 @@ function InstalledRow({
 }) {
   const eject = useEjectWorkflow();
   const update = useUpdateWorkflow();
+  const queryClient = useQueryClient();
   const forget = useForgetWorkflow();
   const library = useWorkflowLibrary();
   const ejectId = useId();
@@ -461,9 +465,13 @@ function InstalledRow({
           sentences={REFUSALS}
           onCancel={() => setReview(null)}
           onConfirm={() =>
-            update.mutate(
+            mutateWithConsent(
+              update,
               { projectId, name: row.name, version: review.version },
-              { onSuccess: () => setReview(null) },
+              queryClient.getQueryData<WorkflowConsent>(
+                keys.projects.workflowConsent(projectId, row.name, review.version),
+              ),
+              () => setReview(null),
             )
           }
         />
@@ -527,8 +535,39 @@ const REFUSALS: Record<string, string> = {
   already_ejected: "this project already has its own copy — the diff is the thing to look at.",
   bad_name: "that is not a usable workflow name.",
   invalid_graph: "this version's graph does not parse, so its commands cannot be listed.",
+  consent_required:
+    "the commands changed since they were listed, so nothing was agreed to — open the step again and read them.",
   internal: `the ${DAEMON_NAME} hit an error of its own.`,
 };
+
+/**
+ * Run a pin change the person agreed to on the consent panel.
+ *
+ * The daemon recomputes the command listing at POST time and answers `422 consent_required` with
+ * the digest it would accept. The panel's listing is what the person read, so the digest is sent
+ * back only when the daemon's listing carries exactly the commands that were on screen; anything
+ * else stays a refusal, because a digest for text nobody read is not consent.
+ */
+function mutateWithConsent<V extends { consentDigest?: string }>(
+  mutation: {
+    mutate: (
+      variables: V,
+      options?: { onSuccess?: () => void; onError?: (error: unknown) => void },
+    ) => void;
+  },
+  variables: V,
+  shown: WorkflowConsent | undefined,
+  onSuccess: () => void,
+): void {
+  mutation.mutate(variables, {
+    onSuccess,
+    onError: (error) => {
+      const refused = consentFromRefusal(error);
+      if (refused === null || shown === undefined || !sameCommands(shown, refused.consent)) return;
+      mutation.mutate({ ...variables, consentDigest: refused.digest }, { onSuccess });
+    },
+  });
+}
 
 /**
  * §6.3's guard, inline and never a modal.
@@ -675,6 +714,7 @@ function Library({
 }) {
   const library = useWorkflowLibrary();
   const install = useInstallWorkflow();
+  const queryClient = useQueryClient();
   // The bundle whose commands are on screen, waiting to be agreed to. One at a time.
   const [reviewing, setReviewing] = useState<Bundle | null>(null);
 
@@ -741,9 +781,13 @@ function Library({
           sentences={REFUSALS}
           onCancel={() => setReviewing(null)}
           onConfirm={() =>
-            install.mutate(
+            mutateWithConsent(
+              install,
               { projectId, name: reviewing.name, version: reviewing.version },
-              { onSuccess: () => setReviewing(null) },
+              queryClient.getQueryData<WorkflowConsent>(
+                keys.projects.workflowConsent(projectId, reviewing.name, reviewing.version),
+              ),
+              () => setReviewing(null),
             )
           }
         />

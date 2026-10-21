@@ -396,9 +396,9 @@ mod tests {
         let now = "2026-08-19T00:00:00+00:00";
         for id in ["a", "b"] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, 'tests', 'work', 'claude', 'inherit', ?, ?)",
+                 VALUES (?, ?, 'tests', 'work', 'claude', '[]', ?, ?)",
             )
             .bind(id)
             .bind(format!("Agent {id}"))
@@ -1285,5 +1285,31 @@ mod tests {
         for other in ["gate", "", "PLAN", "plan "] {
             assert_eq!(node_kind(other), None, "{other:?} is not a briefed node");
         }
+    }
+
+    /// A stage that is no briefed node kind (a workflow node id like `triage`) resolves exactly as
+    /// a run with no node at all: the default of each, nothing added and nothing lost.
+    #[tokio::test]
+    async fn an_unknown_stage_is_not_a_briefed_node_kind_and_still_resolves() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_all(&pool).await;
+        let files: Vec<String> = Vec::new();
+
+        assert_eq!(node_kind("triage"), None);
+
+        let unbriefed = resolve(
+            &pool,
+            &input(Some("a"), Some("x"), Some("p"), Some(7), &files),
+        )
+        .await;
+        let mut from_stage = input(Some("a"), Some("x"), Some("p"), Some(7), &files);
+        from_stage.node = node_kind("triage");
+        let resolved = resolve(&pool, &from_stage).await;
+
+        assert!(
+            !resolved.block.is_empty(),
+            "the linked rows still render a block"
+        );
+        assert_eq!(resolved.block, unbriefed.block);
     }
 }

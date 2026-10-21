@@ -33,7 +33,6 @@ const SUBSYSTEM_TIMEOUT: Duration = Duration::from_millis(500);
 const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(1);
 const LOW_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DAEMON_TOKEN_KEY: &str = "daemon-token";
-const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
 /// How long an exec verdict is trusted before a refresh is kicked off behind the readout.
 const EXEC_CACHE_TTL: Duration = Duration::from_secs(60);
 /// A generous ceiling for the background exec. Nobody waits on it, so it can afford to be patient
@@ -248,7 +247,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         credentials,
         disk,
         echo,
-        telegram,
+        channels,
         email,
         web,
         browser,
@@ -271,7 +270,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             "echo_sidecar",
             sidecar_probe("echo_sidecar", crate::sidecar::ECHO, true),
         ),
-        run_subsystem("telegram_sidecar", telegram_sidecar_probe()),
+        channel_rows(&state),
         run_subsystem(
             "email_sidecar",
             sidecar_probe("email_sidecar", crate::sidecar::EMAIL, email_enabled),
@@ -313,13 +312,10 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             machine_config_probe(state.machine_config_root.clone()),
         ),
     );
-    let subsystems = vec![
-        pool,
-        cli,
-        credentials,
-        disk,
-        echo,
-        telegram,
+    // The channel rows sit where the old hand-written telegram row sat: after `echo_sidecar`.
+    let mut subsystems = vec![pool, cli, credentials, disk, echo];
+    subsystems.extend(channels);
+    subsystems.extend([
         email,
         web,
         browser,
@@ -333,7 +329,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         distiller,
         embeddings,
         machine_config,
-    ];
+    ]);
 
     HealthReadout {
         status: aggregate_state(&subsystems),
@@ -931,31 +927,21 @@ async fn disk_probe() -> SubsystemReadout {
     readout
 }
 
-async fn telegram_sidecar_probe() -> SubsystemReadout {
-    let configured = run_probe("telegram_sidecar", async {
-        // Whether a token is configured is cached; the sidecar's liveness below stays live.
-        tokio::task::spawn_blocking(|| {
-            cached_lookup(&TELEGRAM_TOKEN_LOOKUP, LOOKUP_CACHE_TTL, || {
-                crate::secrets::load_secret(TELEGRAM_TOKEN_KEY)
-                    .map_err(classify_error)
-                    .map(|secret| {
-                        if secret.is_some() {
-                            HealthState::Ok
-                        } else {
-                            HealthState::Disabled
-                        }
-                    })
-            })
-        })
-        .await
-        .map_err(classify_error)?
-    })
-    .await;
-
-    if configured.status == HealthState::Disabled || configured.status == HealthState::Down {
-        return configured;
+/// The channel adapters' rows, generated from the registry manifests (one per channel, named by the
+/// manifest's `health_name`), under the same per-subsystem budget as every other row.
+async fn channel_rows(state: &AppState) -> Vec<SubsystemReadout> {
+    match tokio::time::timeout(
+        SUBSYSTEM_TIMEOUT,
+        crate::channels::registry::health_rows(state),
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => crate::channels::registry::MANIFESTS
+            .iter()
+            .map(|m| SubsystemReadout::down(m.health_name, FailureCategory::Timeout))
+            .collect(),
     }
-    sidecar_probe("telegram_sidecar", crate::sidecar::TELEGRAM, true).await
 }
 
 /// PURE: what the supervisor's last observation of a sidecar means for its row.
@@ -1086,7 +1072,6 @@ static CLI_BINARY_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
 static HOOK_INTERPRETER_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
 static ROUTER_TEXT_LOOKUP: LookupSlot<Option<String>> = Mutex::new(None);
 static DAEMON_TOKEN_LOOKUP: LookupSlot<ExecVerdict> = Mutex::new(None);
-static TELEGRAM_TOKEN_LOOKUP: LookupSlot<ExecVerdict> = Mutex::new(None);
 
 /// Keyed by the program itself, not by the row: the verdict is a fact about a specific binary, so
 /// re-pointing `stt_command` at a different transcriber must not inherit the old one's answer.
@@ -1615,6 +1600,56 @@ url: http://127.0.0.1:{port}
             ]),
             HealthState::Degraded
         );
+    }
+
+    async fn telegram_rows(state: crate::state::AppState) -> Vec<SubsystemReadout> {
+        collect_readout(state)
+            .await
+            .subsystems
+            .into_iter()
+            .filter(|row| row.name == "telegram_sidecar")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_health_report_has_exactly_one_telegram_sidecar_row() {
+        let state = crate::channels::testkit::state().await;
+        assert_eq!(telegram_rows(state).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_telegram_sidecar_row_comes_from_the_registry_manifest() {
+        let state = crate::channels::testkit::state().await;
+        state
+            .channels
+            .presence
+            .set_secrets_present("telegram", Vec::new());
+        let expected = crate::channels::registry::health_rows(&state)
+            .await
+            .into_iter()
+            .find(|row| row.name == "telegram_sidecar")
+            .unwrap();
+        let rows = telegram_rows(state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, expected.status);
+        assert_eq!(rows[0].reason, expected.reason);
+        // Configured but never launched or seen: not the `ok` a bare binary on disk used to give.
+        assert_ne!(rows[0].status, HealthState::Ok);
+    }
+
+    #[tokio::test]
+    async fn the_telegram_sidecar_row_is_down_without_the_token() {
+        // No token means no adapter to run: the row is not `ok`. It is `disabled`/`not_configured`
+        // (a state, not a fault), exactly what the retired probe said for a missing token.
+        let state = crate::channels::testkit::state().await;
+        state
+            .channels
+            .presence
+            .set_secrets_present("telegram", vec!["telegram-token"]);
+        let rows = telegram_rows(state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, HealthState::Disabled);
+        assert_eq!(rows[0].reason, Some(FailureCategory::NotConfigured));
     }
 
     #[tokio::test]

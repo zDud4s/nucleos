@@ -101,7 +101,7 @@ pub enum Owner {
     Job(i64),
     /// One item of a job, working in a tree of its own rather than in the job's.
     ///
-    /// Keyed on `job_items.id` and never on the run — `spawn_node` rewrites `job_items.run_id` on
+    /// Keyed on `job_nodes.id` and never on the run — `spawn_node` rewrites `job_nodes.run_id` on
     /// every start, so a tree named after a run is renamed by the first retry and the retry then
     /// cannot find the tree it was meant to continue in. The item's id is written once and is the
     /// same name for the life of the item, which is what lets a retry, a resolution and a resume
@@ -1268,7 +1268,7 @@ pub async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
 /// worktree is `target/`. Throwing away a whole build per skipped item is a cost nobody would
 /// connect back to the commit that introduced it.
 ///
-/// `sha` NEVER comes from a request. Every caller passes `job_items.checkpoint_sha` or
+/// `sha` NEVER comes from a request. Every caller passes `job_nodes.checkpoint_sha` or
 /// `jobs.head_sha`, both written by this daemon. A `reset --hard` taking a caller-supplied ref is an
 /// arbitrary-write primitive pointed at the user's own repository.
 /// Brings `branch` into whatever this checkout stands on. `Ok(false)` means it conflicts.

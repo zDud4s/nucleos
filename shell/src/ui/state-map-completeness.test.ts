@@ -46,7 +46,8 @@ function moduleSource(path: string): string {
 }
 
 function cutAtTestModule(source: string): number {
-  const at = source.search(/^#\[cfg\(test\)\]\r?\nmod /m);
+  // An inline module only: `#[cfg(test)] mod x;` declares a file and leaves the code after it in scope.
+  const at = source.search(/^#\[cfg\(test\)\]\r?\nmod \w+ \{/m);
   return at === -1 ? source.length : at;
 }
 
@@ -94,6 +95,16 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   "execution/runs/spawn.rs": { kind: ["shadow_run_completed", "worktree_run_completed"] },
   // `announce_once` binds `crate::execution::land::RESOLUTION_FAILED_KIND` to a local first.
   "resolver.rs": { kind: ["land_resolution_failed"] },
+  // The channels' own `say` queues a chat reply in `channel_outbox`; it is no feed writer, so it names no kind.
+  "channels/commands.rs": { reply: [], "strings::render(&Text::CaptureNeedsText)": [] },
+  "channels/ingest.rs": {
+    "Text::PairInvalid": [],
+    "Text::Unsupported{label:label.clone(),}": [],
+    "Text::Queued{position}": [],
+    "Text::NotSent{refusal}": [],
+  },
+  // The fake channel's `feed_row` stimulus writes whatever kind the test script supplies.
+  "channels/fake.rs": { 'text_of(stimulus,"kind")?': [] },
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
 };
 
@@ -190,7 +201,7 @@ function literals(source: string, declaration: RegExp, constants = new Map<strin
 describe("state-map completeness", () => {
   it("every job and team-run literal in the Rust source has a reading", () => {
     const constants = statusConstants(jobRs);
-    const jobLive = literals(jobRs, /pub const LIVE_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/);
+    const jobLive = literals(jobRs, /pub const LIVE_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/, constants);
     const jobTerminal = literals(jobRs, /pub const TERMINAL_STATUSES: \[&str; \d+\] = \[([^\]]*)\];/, constants);
     const teamLive = literals(teamRs, /pub const LIVE_STATES: &\[&str\] = &\[([^\]]*)\];/);
     const teamTerminal = literals(teamRs, /pub const TERMINAL_STATES: &\[&str\] = &\[([^\]]*)\];/);
