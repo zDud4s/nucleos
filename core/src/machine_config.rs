@@ -229,7 +229,7 @@ pub static SETTINGS: &[Setting] = &[
     Setting {
         path: CHANNEL_TELEGRAM_FILE,
         area: "channels/telegram",
-        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too",
+        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in, and `stream_edits` (a live progress preview made by editing the acknowledgement; on by default, `false` turns it off); the bot token is stored here too",
         takes_effect: "when the daemon restarts",
         validate: validate_channel_config,
     },
@@ -471,6 +471,27 @@ pub fn secret_for(key: &str) -> Option<&'static Secret> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Telegram row names `stream_edits`, so the settings page tells the owner it exists.
+    #[test]
+    fn settings_row_channels_telegram_mentions_stream_edits() {
+        let setting = setting_for(CHANNEL_TELEGRAM_FILE).expect("the telegram row exists");
+        assert!(setting.what.contains("stream_edits"), "{}", setting.what);
+    }
+
+    /// The door accepts `stream_edits: false`, refuses a non-bool, and absent means on.
+    #[test]
+    fn channel_config_stream_edits_defaults_to_true_and_parses_false() {
+        let setting = setting_for(CHANNEL_TELEGRAM_FILE).expect("the telegram row exists");
+        assert!((setting.validate)("stream_edits: false\n").is_ok());
+        assert!((setting.validate)("stream_edits: maybe\n").is_err());
+        let off: crate::channels::registry::ChannelConfig =
+            serde_yaml::from_str("stream_edits: false\n").unwrap();
+        assert!(!off.stream_edits());
+        let unset: crate::channels::registry::ChannelConfig =
+            serde_yaml::from_str("doctrine: x\n").unwrap();
+        assert!(unset.stream_edits());
+    }
 
     /// The membership rule, asserted rather than trusted: every row can say no, and says both of
     /// the sentences the page needs.

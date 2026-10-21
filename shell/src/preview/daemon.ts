@@ -2943,7 +2943,7 @@ const STORAGE: StorageReport = {
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
 const CHANNEL_TELEGRAM_WHAT =
-  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too";
+  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in, and `stream_edits` (a live progress preview made by editing the acknowledgement; on by default, `false` turns it off); the bot token is stored here too";
 
 const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["email", "Which mailbox the e-mail pillar reads, and how often.", "host: imap.example.com\nusername: me@example.com\nmailbox: INBOX\npoll_interval_secs: 120\n"],
