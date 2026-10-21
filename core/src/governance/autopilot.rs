@@ -1229,6 +1229,7 @@ pub async fn set_kill_switch(pool: &SqlitePool, engaged: bool) -> sqlx::Result<(
         .bind(engaged)
         .execute(pool)
         .await?;
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Kill);
     Ok(())
 }
 
@@ -3202,6 +3203,17 @@ pub mod tests {
         assert!(kill_switch_engaged(&pool).await.unwrap());
         set_kill_switch(&pool, false).await.unwrap();
         assert!(!kill_switch_engaged(&pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn wake_signal_set_kill_switch_bumps_kill() {
+        let pool = test_pool().await;
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Kill);
+        let before = *rx.borrow();
+
+        set_kill_switch(&pool, true).await.unwrap();
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 
     #[tokio::test]

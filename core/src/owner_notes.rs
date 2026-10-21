@@ -14,6 +14,16 @@ use sqlx::SqlitePool;
 
 /// Where a note was written from. Checked before the insert.
 pub const ORIGINS: [&str; 2] = ["shell", "telegram"];
+
+/// Whether a note may carry this origin: the shell, the v1 `telegram`, or `channel:<id>` for a
+/// channel whose manifest is compiled in.
+pub fn origin_allowed(origin: &str) -> bool {
+    origin == "shell"
+        || origin == "telegram"
+        || origin
+            .strip_prefix("channel:")
+            .is_some_and(|id| crate::channels::registry::by_id(id).is_some())
+}
 /// The two states a note can be in. Archiving hides a note; nothing is ever deleted.
 pub const STATES: [&str; 2] = ["active", "archived"];
 
@@ -90,6 +100,20 @@ pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, 
     Ok(id)
 }
 
+// Lives here, not in `capture.rs`, so that `capture.rs` names the notes module in exactly one place.
+impl From<NoteError> for crate::capture::AnswerError {
+    fn from(error: NoteError) -> Self {
+        match error {
+            NoteError::Empty => Self::Empty,
+            NoteError::UnknownOrigin => Self::UnknownOrigin,
+            NoteError::Db(error) => Self::Db(error),
+            other @ (NoteError::UnknownState | NoteError::NotFound) => {
+                Self::Internal(format!("{other:?}"))
+            }
+        }
+    }
+}
+
 /// Files a note already linked to a job (`relates job:<id>`), on the caller's connection so the
 /// caller's transaction decides whether it stands. The job is not looked up: the caller holds the
 /// request that names it.
@@ -126,7 +150,7 @@ async fn insert_note_in(
     if text.is_empty() {
         return Err(NoteError::Empty);
     }
-    if !ORIGINS.contains(&origin) {
+    if !origin_allowed(origin) {
         return Err(NoteError::UnknownOrigin);
     }
     let at = now();
@@ -543,6 +567,8 @@ pub async fn teach(
     let taught = format!("knowledge:{knowledge_id} proposal:{proposal_id}");
     record_raw(&mut tx, note_id, "taught", Some(&taught), &at).await?;
     tx.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok((knowledge_id, proposal_id, link_id))
 }
 
@@ -1189,10 +1215,29 @@ mod tests {
     /// and `//` comment lines are skipped.
     fn distill_mentions_are_sanctioned(source: &str) -> bool {
         let needle = ["owner", "note"].join("_");
-        let call = format!("{needle}s::active_note_texts_for_project");
-        let mut calls = 0;
-        // Cut at the test module itself, not at any `#[cfg(test)]`: a test-only helper above it
-        // would otherwise hide the production code that follows from the sweep.
+        one_call_is_sanctioned(source, &format!("{needle}s::active_note_texts_for_project"))
+    }
+
+    /// `capture.rs` may name the notes module in exactly one place: the call that files the owner's
+    /// answer as a note. A channel capture answer is the owner writing a note; `capture.rs` only
+    /// forwards it and never reads notes back.
+    fn capture_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        one_call_is_sanctioned(source, &format!("{needle}s::create_linked_to_job_in"))
+    }
+
+    /// `channels/commands.rs` may name the notes module in exactly one place: the call `/note` uses
+    /// to file the text. `/note` is the owner writing a note from a channel; `commands.rs` only
+    /// forwards it and never reads notes back.
+    fn commands_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        one_call_is_sanctioned(source, &format!("{needle}s::create("))
+    }
+
+    /// `source` up to its test module. Cut at the test module itself, not at any `#[cfg(test)]`:
+    /// a test-only helper above it would otherwise hide the production code that follows from
+    /// the sweep.
+    fn production_code(source: &str) -> String {
         let lines: Vec<&str> = source.lines().collect();
         let end = lines
             .windows(2)
@@ -1200,11 +1245,20 @@ mod tests {
                 w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
             })
             .unwrap_or(lines.len());
-        for line in &lines[..end] {
+        lines[..end].join("\n")
+    }
+
+    /// True when the production code of `source` names the notes module only inside `call`, and
+    /// exactly once.
+    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        let mut calls = 0;
+        let production = production_code(source);
+        for line in production.lines() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            let here = line.matches(call.as_str()).count();
+            let here = line.matches(call).count();
             if line.matches(needle.as_str()).count() != here {
                 return false;
             }
@@ -1236,7 +1290,64 @@ mod tests {
     }
 
     #[test]
-    fn no_core_module_but_four_mentions_owner_notes() {
+    fn the_capture_rule_holds_one_call_and_nothing_else() {
+        let needle = ["owner", "note"].join("_");
+        let call =
+            format!("let id = crate::{needle}s::create_linked_to_job_in(&mut tx, t, o, j).await?;");
+        assert!(capture_mentions_are_sanctioned(&call));
+        assert!(!capture_mentions_are_sanctioned(&format!("{call}\n{call}")));
+        assert!(!capture_mentions_are_sanctioned(&format!(
+            "use crate::{needle}s;\n{call}"
+        )));
+        assert!(!capture_mentions_are_sanctioned(&format!(
+            "{call}\nlet n = crate::{needle}s::get(&pool, 1).await;"
+        )));
+        assert!(!capture_mentions_are_sanctioned("fn nothing() {}"));
+        assert!(capture_mentions_are_sanctioned(&format!(
+            "{call}\n// mentions {needle}s"
+        )));
+    }
+
+    #[test]
+    fn the_commands_rule_holds_one_call_and_nothing_else() {
+        let needle = ["owner", "note"].join("_");
+        let call = format!("match crate::{needle}s::create(&state.pool, text, origin).await {{}}");
+        assert!(commands_mentions_are_sanctioned(&call));
+        assert!(!commands_mentions_are_sanctioned(&format!(
+            "{call}\n{call}"
+        )));
+        assert!(!commands_mentions_are_sanctioned(&format!(
+            "use crate::{needle}s;\n{call}"
+        )));
+        assert!(!commands_mentions_are_sanctioned(&format!(
+            "{call}\nlet n = crate::{needle}s::get(&pool, 1).await;"
+        )));
+        assert!(!commands_mentions_are_sanctioned("fn nothing() {}"));
+        assert!(commands_mentions_are_sanctioned(&format!(
+            "{call}\n// mentions {needle}s"
+        )));
+        assert!(commands_mentions_are_sanctioned(&format!(
+            "{call}\n#[cfg(test)]\nmod tests {{\nSELECT 1 FROM {needle}s;\n}}"
+        )));
+    }
+
+    #[test]
+    fn the_generic_sweep_ignores_test_modules_but_not_production_code() {
+        let needle = ["owner", "note"].join("_");
+        let only_in_tests =
+            format!("fn run() {{}}\n#[cfg(test)]\nmod tests {{\nJOIN {needle}s;\n}}");
+        assert!(!production_code(&only_in_tests).contains(&needle));
+        let in_production = format!("use crate::{needle}s;\n#[cfg(test)]\nmod tests {{\n}}");
+        assert!(production_code(&in_production).contains(&needle));
+        // A test-only helper above production code does not end the sweep.
+        let helper_first = format!("#[cfg(test)]\nfn helper() {{}}\nuse crate::{needle}s;");
+        assert!(production_code(&helper_first).contains(&needle));
+    }
+
+    /// The guard below scans production code only: a test module may read the notes table to
+    /// assert behaviour (D4 is about production reach, not about what a test inspects).
+    #[test]
+    fn no_core_module_but_six_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1251,6 +1362,11 @@ mod tests {
         // `distill.rs` is the one sanctioned exception, and only for its single call to
         // `active_note_texts_for_project`: D4 of `.ai/specs/2026-10-05-destilador-design.md` lets the
         // distiller's dossier read the notes linked to a project, as context only.
+        // `capture.rs` is the other: one call, `create_linked_to_job_in`. A channel capture answer is
+        // the owner writing a note; `capture.rs` only forwards it and never reads notes back.
+        // `channels/commands.rs` is the third: one call, `create(`, for `/note`. That command is the
+        // owner writing a note from a channel; `commands.rs` only forwards it and never reads notes
+        // back (plan A2 C2b).
         // `lib.rs` only declares the module (`pub mod owner_notes;`) since the core lib/bin split.
         let allowed = ["owner_notes.rs", "http.rs", "main.rs", "lib.rs"];
         let needle = ["owner", "note"].join("_");
@@ -1277,11 +1393,31 @@ mod tests {
                 );
                 continue;
             }
+            if crate::source_scan::is_top_level(&path) && name == "capture.rs" {
+                assert!(
+                    capture_mentions_are_sanctioned(&source),
+                    "capture.rs may name the notes only in its one call to \
+                     create_linked_to_job_in (the owner's answer is a note being written)"
+                );
+                continue;
+            }
+            if name == "commands.rs"
+                && crate::source_scan::module_path(&path).starts_with("channels/")
+            {
+                assert!(
+                    commands_mentions_are_sanctioned(&source),
+                    "channels/commands.rs may name the notes only in its one call to create \
+                     (`/note` is the owner writing a note; it never reads notes back)"
+                );
+                continue;
+            }
             assert!(
-                !source.contains(&needle),
-                "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
-                 http.rs and main.rs (spec D4), and from distill.rs through one call, only, so \
-                 that nothing in the agent's memory can read them",
+                !production_code(&source).contains(&needle),
+                "{} mentions `{needle}` in production code (test modules are not scanned): the \
+                 owner's notes are reachable from owner_notes.rs, \
+                 http.rs and main.rs (spec D4), from distill.rs through one read call, and from \
+                 capture.rs and channels/commands.rs through one write call each, only, so that \
+                 nothing in the agent's memory can read them",
                 path.display()
             );
         }
@@ -1353,6 +1489,64 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn note_origin_accepts_channel_id_of_a_compiled_manifest() {
+        assert!(origin_allowed("channel:telegram"));
+        assert!(origin_allowed("shell"));
+        assert!(origin_allowed("telegram"));
+    }
+
+    #[test]
+    fn note_origin_rejects_unknown_channel_and_empty_id() {
+        assert!(!origin_allowed("channel:nonexistent"));
+        assert!(!origin_allowed("channel:"));
+        assert!(!origin_allowed("channel"));
+        assert!(!origin_allowed(""));
+    }
+
+    #[tokio::test]
+    async fn capture_answer_accepts_a_channel_origin() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO capture_requests
+                 (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (7, 'web', '[]', 'why?', 'open', '2099-01-01T00:00:00', '2026-10-07T10:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (note_id, released) = crate::capture::answer(&pool, 7, "x", "channel:telegram")
+            .await
+            .unwrap();
+        assert!(released);
+        let note = get(&pool, note_id).await.unwrap();
+        assert_eq!(note.origin, "channel:telegram");
+        let (state, linked): (String, Option<i64>) =
+            sqlx::query_as("SELECT state, note_id FROM capture_requests WHERE job_id = 7")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!((state.as_str(), linked), ("answered", Some(note_id)));
+        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owner_note_links")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(links, 1);
+    }
+
+    #[tokio::test]
+    async fn wake_signal_owner_note_teach_bumps_proposals() {
+        let pool = test_pool().await;
+        let id = create(&pool, "a lesson to teach", "shell").await.unwrap();
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow_and_update();
+        teach(&pool, id, crate::knowledge::Kind::Memory, None, None)
+            .await
+            .unwrap();
+        // Other tests of this binary share the global bus: assert a lower bound only.
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 
     #[tokio::test]

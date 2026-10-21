@@ -486,7 +486,7 @@ pub struct TelegramConfig {
 /// A blank or whitespace-only string reads as `None`, mirroring `chats.rs`'s
 /// `instructions.filter(|text| !text.trim().is_empty())` for the same reason: a doctrine of empty
 /// spaces would spend an argv slot saying nothing.
-pub(super) fn deserialize_blank_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub(crate) fn deserialize_blank_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

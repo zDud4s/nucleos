@@ -207,25 +207,10 @@ pub(super) async fn post_email_incoming(
 pub(super) async fn post_email_triage(
     State(state): State<AppState>,
 ) -> Result<Json<crate::governance::triage::TriageOutcome>, StatusCode> {
-    if !state.email.armed.load(std::sync::atomic::Ordering::Relaxed) {
-        // Not an error the caller can fix by retrying: the pillar is off, or its barrier failed
-        // verification at startup and it is deliberately staying off.
-        return Ok(Json(crate::governance::triage::TriageOutcome {
-            queued: 0,
-            run_id: None,
-            reason: Some("the email pillar is not armed".to_string()),
-        }));
-    }
-
-    // Launching writes a claim across the batch's rows; a client that disconnects must not leave
-    // that half-written.
-    let state = state.clone();
-    uncancellable(async move {
-        let mut loop_state = crate::governance::triage::LoopState::default();
-        crate::governance::triage::triage_now(&state, &mut loop_state, chrono::Utc::now()).await
-    })
-    .await
-    .map(Json)
+    crate::governance::triage::triage_on_request(&state, chrono::Utc::now())
+        .await
+        .map(Json)
+        .map_err(|crate::governance::triage::TriageError(status)| status)
 }
 
 /// How many correspondents the roster returns. Enough to find anyone; short enough to draw.

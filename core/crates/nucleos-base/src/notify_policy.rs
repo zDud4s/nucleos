@@ -3,10 +3,12 @@
 //! wanted at all", `notify.rs` answers "is now a good moment", and a row can be held by one and
 //! silenced by the other without either knowing about the second.
 //!
-//! This module GUARDS, VALIDATES and OBSERVES. It does not resolve the policy against a feed row
-//! — that is the sidecar's job (spec §4, §6), on purpose: the núcleo stores a preference, the
-//! sidecar is the one place that decides whether to forward a Telegram message, and keeping the
-//! resolution there means a filter bug in one channel cannot silence the feed the shell reads.
+//! This module GUARDS, VALIDATES and OBSERVES the machine-wide rows. It does not resolve the
+//! policy against a feed row. The núcleo resolves it for the channel hub (`channels::routing`
+//! merges these rows with a channel's own overrides and decides what is announced), and the
+//! Telegram v1 sidecar still resolves it for itself (spec §4, §6). Either way the decision is made
+//! where the message is sent, never here, so a filter bug in one channel cannot silence the feed
+//! the shell reads.
 
 use std::collections::HashSet;
 
