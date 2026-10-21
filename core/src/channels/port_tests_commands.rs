@@ -83,7 +83,8 @@ async fn answers(state: &AppState) -> Vec<String> {
 }
 
 async fn count(state: &AppState, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+    // Test-only: `table` is always a literal table name from this file.
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(&state.pool)
         .await
         .unwrap()
