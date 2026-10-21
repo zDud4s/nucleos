@@ -36,6 +36,13 @@ const (
 	embeddedBodyLimit = 1 << 20
 )
 
+// findTargetWithin and findTargetEvery bound how long findTarget waits for the tab to be listed.
+// Variables so a test can shorten them.
+var (
+	findTargetWithin = 2 * time.Second
+	findTargetEvery  = 75 * time.Millisecond
+)
+
 // defaultEmbeddedHTTP never follows a redirect and never uses the environment's proxy: the endpoint is
 // loopback and must answer there.
 var defaultEmbeddedHTTP = &http.Client{
@@ -231,6 +238,42 @@ func (p *Pool) ForgetEmbedded(_ context.Context, name string) error {
 	return nil
 }
 
+// embeddedDriver resolves an outer session id to the chrome driver of its embedded entry and the
+// driver's own session id. A session that is not an embedded one is ErrNoSuchSession.
+func (p *Pool) embeddedDriver(id browser.SessionID) (*chrome.Driver, browser.SessionID, error) {
+	session, err := p.lookup(id)
+	if err != nil {
+		return nil, "", err
+	}
+	if !session.holder.embedded {
+		return nil, "", browser.ErrNoSuchSession
+	}
+	instance, ok := session.holder.driver.(embeddedInstance)
+	if !ok {
+		return nil, "", browser.ErrNoSuchSession
+	}
+	return instance.Driver, session.inner, nil
+}
+
+// DetachEmbedded detaches the CDP target session of an adopted tab. The session stays registered and
+// the browser-session fence stays armed.
+func (p *Pool) DetachEmbedded(ctx context.Context, id browser.SessionID) error {
+	driver, inner, err := p.embeddedDriver(id)
+	if err != nil {
+		return err
+	}
+	return driver.DetachEmbedded(ctx, inner)
+}
+
+// ReattachEmbedded attaches again to the tab of a detached session.
+func (p *Pool) ReattachEmbedded(ctx context.Context, id browser.SessionID) (browser.Returned, error) {
+	driver, inner, err := p.embeddedDriver(id)
+	if err != nil {
+		return browser.Returned{}, err
+	}
+	return driver.ReattachEmbedded(ctx, inner)
+}
+
 // dropEmbeddedSessions forgets every session of an embedded entry and ends its viewers.
 func (p *Pool) dropEmbeddedSessions(holder *entry) {
 	if holder == nil {
@@ -305,6 +348,7 @@ func (p *Pool) embeddedConnection(ctx context.Context, project *embeddedProject,
 		sessions: map[browser.SessionID]struct{}{},
 	}
 	close(holder.ready)
+	driver.OnEmbeddedGone(func(inner browser.SessionID) { p.embeddedTabGone(holder, inner) })
 
 	project.mu.Lock()
 	if project.dead {
@@ -320,6 +364,30 @@ func (p *Pool) embeddedConnection(ctx context.Context, project *embeddedProject,
 	return driver, holder, nil
 }
 
+// embeddedTabGone is called when the person closed the tab of an adopted session. It closes the session
+// through the normal path, so its pool slot, viewers and driver bookkeeping are released; without it an
+// embedded session lives until the project is forgotten and the pool fills up (max_sessions).
+func (p *Pool) embeddedTabGone(holder *entry, inner browser.SessionID) {
+	p.mu.Lock()
+	var outer browser.SessionID
+	for id := range holder.sessions {
+		if p.sessions[id].inner == inner {
+			outer = id
+			break
+		}
+	}
+	p.mu.Unlock()
+	if outer == "" {
+		return
+	}
+	// Off the connection's event goroutine: Close makes CDP calls whose replies it delivers.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), embeddedHTTPTimeout)
+		defer cancel()
+		_ = p.Close(ctx, outer)
+	}()
+}
+
 func connDone(conn *cdp.Conn) bool {
 	select {
 	case <-conn.Done():
@@ -331,21 +399,32 @@ func connDone(conn *cdp.Conn) bool {
 
 // findTarget returns the id of the page whose url is about:blank#<nonce>.
 func (p *Pool) findTarget(ctx context.Context, base, nonce string) (string, error) {
-	var targets []struct {
-		ID   string `json:"id"`
-		Type string `json:"type"`
-		URL  string `json:"url"`
-	}
-	if err := p.getJSON(ctx, base+"/json/list", &targets); err != nil {
-		return "", err
-	}
 	want := "about:blank#" + nonce
-	for _, target := range targets {
-		if target.Type == "page" && target.URL == want && target.ID != "" {
-			return target.ID, nil
+	deadline := time.Now().Add(findTargetWithin)
+	for {
+		var targets []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		}
+		if err := p.getJSON(ctx, base+"/json/list", &targets); err != nil {
+			return "", err
+		}
+		for _, target := range targets {
+			if target.Type == "page" && target.URL == want && target.ID != "" {
+				return target.ID, nil
+			}
+		}
+		// The shell's ack can beat WebView2 listing the new tab: ask again for a short while.
+		if !time.Now().Add(findTargetEvery).Before(deadline) {
+			return "", browser.ErrNoSuchTarget
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(findTargetEvery):
 		}
 	}
-	return "", browser.ErrNoSuchTarget
 }
 
 // getJSON GETs a DevTools HTTP endpoint with a bounded body.

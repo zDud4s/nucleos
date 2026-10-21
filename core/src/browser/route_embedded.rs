@@ -53,6 +53,7 @@ pub(super) async fn try_open(
     );
     if matches!(after.outcome, Outcome::Open(Profile::Ephemeral)) {
         runtime.embedded.queue_close(&session.id);
+        close_attached_target(runtime, &session.id).await;
         return None;
     }
     match finish_session(pool, row_id, placement, &session).await {
@@ -60,9 +61,25 @@ pub(super) async fn try_open(
         Err(error) => {
             tracing::warn!(%error, "could not record an embedded browser session");
             runtime.embedded.queue_close(&session.id);
+            close_attached_target(runtime, &session.id).await;
             None
         }
     }
+}
+
+/// Best effort: drop the sidecar's attached target for a session the núcleo gave up on, so it does
+/// not linger after the shell tab is closed.
+async fn close_attached_target(runtime: &BrowserRuntime, sidecar_id: &str) {
+    if let Err(error) = runtime.client.close(sidecar_id).await {
+        tracing::warn!(%error, "could not close the sidecar target of a discarded embedded session");
+    }
+}
+
+/// Ask the shell to bring an embedded session's tab to the front instead of handing the wheel
+/// over. `false` when the session is not embedded (or the shell has no live registration), and the
+/// caller goes through the ordinary wheel request.
+pub(super) fn queue_focus(runtime: &BrowserRuntime, sidecar_id: &str) -> bool {
+    runtime.embedded.is_embedded(sidecar_id) && runtime.embedded.queue_focus(sidecar_id)
 }
 
 /// Close an embedded session: queue the `close` request for the shell. `false` when the session is

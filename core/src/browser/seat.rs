@@ -134,6 +134,9 @@ pub enum SeatError {
     SeatUnavailable,
     NotPerson,
     BadNonce,
+    /// The session is a tab embedded in the shell: the person already shares it there, so the
+    /// seat, input and window routes do not apply.
+    Embedded,
     Begin(crate::browser_client::BrowserError),
     Db(sqlx::Error),
 }
@@ -158,6 +161,7 @@ pub fn seat_error(error: SeatError) -> axum::response::Response {
         SeatError::SeatUnavailable => (StatusCode::CONFLICT, "seat_unavailable", String::new()),
         SeatError::NotPerson => (StatusCode::CONFLICT, "not_person", String::new()),
         SeatError::BadNonce => (StatusCode::FORBIDDEN, "bad_nonce", String::new()),
+        SeatError::Embedded => (StatusCode::CONFLICT, "embedded_session", String::new()),
         SeatError::Begin(error) => (StatusCode::BAD_GATEWAY, "begin_failed", error.to_string()),
         SeatError::Db(error) => (StatusCode::INTERNAL_SERVER_ERROR, "db", error.to_string()),
     };
@@ -166,6 +170,15 @@ pub fn seat_error(error: SeatError) -> axum::response::Response {
         axum::Json(serde_json::json!({ "error": code, "detail": detail })),
     )
         .into_response()
+}
+
+/// Refuses a session that is an embedded shell tab (`SeatError::Embedded`). Embedded sessions have
+/// no sidecar-side person stretch, so every person-seat route calls this once the row is known.
+pub fn refuse_embedded(state: &crate::state::AppState, sidecar_id: &str) -> Result<(), SeatError> {
+    if state.browser.embedded.is_embedded(sidecar_id) {
+        return Err(SeatError::Embedded);
+    }
+    Ok(())
 }
 
 /// The person takes the wheel in the shell. The row moves first (so a second caller finds it
@@ -192,6 +205,7 @@ pub async fn take(
     let row = browser::live_session(state, id)
         .await
         .ok_or(SeatError::Gone)?;
+    refuse_embedded(state, &row.sidecar_id)?;
     // A shell seat that is already the person's: hand out a fresh nonce, touching nothing else.
     // The nonce lives only in memory, so a daemon restart, a shell reload, or an approval from a
     // caller that discards it (Telegram approves with no body) would otherwise leave a shell seat
@@ -291,6 +305,7 @@ async fn guard_seat(
     let row = browser::live_session(state, id)
         .await
         .ok_or(SeatError::Gone)?;
+    refuse_embedded(state, &row.sidecar_id)?;
     if row.mode != mode::HUMAN || row.seat.as_deref() != Some("shell") {
         return Err(SeatError::NotPerson);
     }
@@ -358,6 +373,41 @@ pub async fn post_answer(
         Ok(answer) => relayed(answer),
         Err(error) => crate::browser::browser_error(error),
     }
+}
+
+/// Test helper: register `sidecar_id` as an embedded session through the registry's real open
+/// path (a live registration, the shell's ack, an injected attach), so `is_embedded` is true.
+#[cfg(test)]
+pub(crate) async fn embed_for_test(runtime: &crate::browser::BrowserRuntime, sidecar_id: &str) {
+    let registry = runtime.embedded.clone();
+    registry.register("acme", "http://127.0.0.1:7");
+    let opener = registry.clone();
+    let id = sidecar_id.to_string();
+    let open = tokio::spawn(async move {
+        opener
+            .open_with("acme", "https://x.test/", move |_, _, _| async move {
+                Ok(crate::browser_client::Session {
+                    id,
+                    mode: "agent".to_string(),
+                    requested_url: "https://x.test/".to_string(),
+                    final_url: "https://x.test/".to_string(),
+                    title: String::new(),
+                    refusal: None,
+                    still_loading: false,
+                    status: 200,
+                })
+            })
+            .await
+    });
+    let request = loop {
+        if let Some(request) = registry.poll().pop() {
+            break request;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+    registry.ack(&request.request_id, "n0nce").await;
+    assert!(open.await.unwrap().is_some(), "the embedded open failed");
+    assert!(registry.is_embedded(sidecar_id));
 }
 
 #[cfg(test)]
@@ -826,6 +876,66 @@ mod tests {
             .await
             .expect("body");
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// An embedded tab is already shared with the person in the shell: take, input and answer refuse
+    /// it with `embedded_session`, move nothing and never reach the sidecar, while an ordinary
+    /// session beside it still takes and drives.
+    #[tokio::test]
+    async fn embedded_sessions_are_refused_by_take_input_and_answer() {
+        let (_db, state, seen) = seated(false).await;
+        present(&state).await;
+        let embedded = row(&state, "project", "acme", "e1").await;
+        let normal = row(&state, "project", "beta", "s1").await;
+        embed_for_test(&state.browser, "e1").await;
+        // Even a nonce the seat did issue does not open the input route to an embedded session.
+        let nonce = state.browser.seats.issue(embedded);
+        let events = serde_json::json!([{"t": "click", "x": 1, "y": 2}]);
+
+        let taken = post_take(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::Scope::Control),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(embedded),
+        )
+        .await;
+        let (status, body) = body_json(taken).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (409, Some("embedded_session"))
+        );
+        let (status, body) =
+            body_json(call_input(&state, embedded, &nonce, events.clone()).await).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (409, Some("embedded_session"))
+        );
+        let (status, body) =
+            body_json(call_answer(&state, embedded, &nonce, "p", serde_json::json!(true)).await)
+                .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (409, Some("embedded_session"))
+        );
+        assert_eq!(mode_of(&state, embedded).await, mode::AGENT);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+
+        let taken = post_take(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::Scope::Control),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(normal),
+        )
+        .await;
+        let (status, body) = body_json(taken).await;
+        assert_eq!(status, 200, "{body}");
+        let nonce = body["seat_nonce"].as_str().expect("nonce").to_string();
+        let (status, _) = body_json(call_input(&state, normal, &nonce, events).await).await;
+        assert_eq!(status, 202);
     }
 
     /// Input needs the seat's nonce: a wrong or missing one is refused with `bad_nonce`, and so is

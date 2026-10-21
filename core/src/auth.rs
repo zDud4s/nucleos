@@ -1417,6 +1417,7 @@ mod tests {
             .route("/browser/embedded/requests", get(|| async {}))
             .route("/browser/embedded/requests/{id}/ack", post(|| async {}))
             .route("/browser/embedded/sessions/{id}/closed", post(|| async {}))
+            .route("/browser/embedded/sessions/{id}/owner", post(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -2581,6 +2582,7 @@ mod tests {
             ("GET", "/browser/embedded/requests"),
             ("POST", "/browser/embedded/requests/er-1/ack"),
             ("POST", "/browser/embedded/sessions/s1/closed"),
+            ("POST", "/browser/embedded/sessions/s1/owner"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,
@@ -4363,6 +4365,7 @@ mod tests {
             .route("/browser/embedded/requests", get(|| async {}))
             .route("/browser/embedded/requests/{id}/ack", post(|| async {}))
             .route("/browser/embedded/sessions/{id}/closed", post(|| async {}))
+            .route("/browser/embedded/sessions/{id}/owner", post(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -4536,6 +4539,7 @@ mod tests {
             "/browser/embedded/register",
             "/browser/embedded/requests/er-1/ack",
             "/browser/embedded/sessions/s1/closed",
+            "/browser/embedded/sessions/s1/owner",
         ] {
             assert_eq!(
                 post_body_status(&app, route, &key, "{}").await.0,

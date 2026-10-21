@@ -965,6 +965,11 @@ pub async fn post_window_seat(
     if !crate::attention::owner_is_present(&state.pool, chrono::Utc::now()).await {
         return seat_error(SeatError::OwnerAbsent);
     }
+    if let Ok(row) = live(&state.pool, id).await
+        && let Err(error) = crate::browser::seat::refuse_embedded(&state, &row.sidecar_id)
+    {
+        return seat_error(error);
+    }
     match to_window(&state, id).await {
         Ok(row) => axum::Json(serde_json::json!({ "session": row })).into_response(),
         Err(WheelError::WrongState(_)) => seat_error(SeatError::NotPerson),
@@ -977,6 +982,18 @@ pub async fn post_handoff(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HandoffBody>,
 ) -> axum::response::Response {
+    // An embedded agent session already sits in the shell: the owner is asked to look at the tab,
+    // not to take the wheel, so no proposal is made and the mode stays as it is.
+    match live(&state.pool, body.session_id).await {
+        Ok(row)
+            if row.mode == mode::AGENT
+                && super::route_embedded::queue_focus(&state.browser, &row.sidecar_id) =>
+        {
+            return axum::Json(serde_json::json!({ "focus": "queued" })).into_response();
+        }
+        Ok(_) => {}
+        Err(error) => return wheel_error(error),
+    }
     match request(&state, body.session_id, &body.reason).await {
         Ok(proposal) => axum::Json(serde_json::json!({ "proposal_id": proposal })).into_response(),
         Err(error) => wheel_error(error),
@@ -988,6 +1005,11 @@ pub async fn post_return(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<WheelBody>,
 ) -> axum::response::Response {
+    if let Ok(row) = live(&state.pool, body.session_id).await
+        && let Err(error) = crate::browser::seat::refuse_embedded(&state, &row.sidecar_id)
+    {
+        return crate::browser::seat::seat_error(error);
+    }
     match give_back(&state, body.session_id, body.to.as_deref()).await {
         Ok(chain) => axum::Json(serde_json::json!({ "chain": chain })).into_response(),
         Err(error) => wheel_error(error),
@@ -1857,6 +1879,89 @@ mod tests {
 
     fn volante_saw(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, verb: &str) -> bool {
         seen.lock().unwrap().iter().any(|seen| seen == verb)
+    }
+
+    async fn error_code(response: axum::response::Response) -> (u16, String) {
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (
+            status,
+            body["error"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// An embedded tab has no person stretch to end and no real window to open: the window and
+    /// return routes refuse it with `embedded_session`, touching neither the row nor the sidecar,
+    /// while an ordinary session still goes through both.
+    #[tokio::test]
+    async fn embedded_sessions_are_refused_by_the_window_and_return_routes() {
+        let (db, state, seen) = wheeled(vec![], false).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let id = volante_row(&state, "project", mode::HUMAN, Some("shell")).await;
+        crate::browser::seat::embed_for_test(&state.browser, "s1").await;
+
+        let window = post_window_seat(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::Scope::Control),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(id),
+        )
+        .await;
+        assert_eq!(error_code(window).await, (409, "embedded_session".into()));
+        let returned = post_return(
+            axum::extract::State(state.clone()),
+            axum::Json(WheelBody {
+                session_id: id,
+                to: None,
+            }),
+        )
+        .await;
+        assert_eq!(error_code(returned).await, (409, "embedded_session".into()));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        let row = browser::session_row(&state.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.closed_at.is_none());
+        assert_eq!(row.seat.as_deref(), Some("shell"));
+
+        // A normal session (another sidecar id) is not refused by either route.
+        sqlx::query("UPDATE browser_sessions SET sidecar_id = 'h9' WHERE id = ?")
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let window = post_window_seat(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::Scope::Control),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(id),
+        )
+        .await;
+        assert_eq!(window.status(), axum::http::StatusCode::OK);
+        let returned = post_return(
+            axum::extract::State(state.clone()),
+            axum::Json(WheelBody {
+                session_id: id,
+                to: None,
+            }),
+        )
+        .await;
+        assert_eq!(returned.status(), axum::http::StatusCode::OK);
+        db.close().await;
     }
 
     /// Spec 4.1: a lone project-profile session is offered the shell seat, and with no explicit

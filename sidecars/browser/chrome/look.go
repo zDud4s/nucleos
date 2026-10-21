@@ -121,7 +121,7 @@ const eraseScript = `(function() {
 func (d *Driver) Look(ctx context.Context, id browser.SessionID) (browser.LookResult, error) {
 	d.gate.RLock()
 	defer d.gate.RUnlock()
-	entry, err := d.lookup(id)
+	entry, err := d.lookupAttached(id)
 	if err != nil {
 		return browser.LookResult{}, err
 	}

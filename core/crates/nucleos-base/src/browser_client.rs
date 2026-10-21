@@ -818,6 +818,38 @@ impl BrowserClient {
         Err(self.read_error(status, response).await)
     }
 
+    /// Detaches an embedded session from its host window without closing it (204).
+    pub async fn embedded_detach(&self, session_id: &str) -> Result<(), BrowserError> {
+        let response = self
+            .post(
+                "/embedded/detach",
+                &serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(self.read_error(status, response).await)
+    }
+
+    /// Reattaches a previously detached embedded session to its host window. Answers the sites
+    /// visited while detached (empty when it was not detached).
+    pub async fn embedded_reattach(&self, session_id: &str) -> Result<Vec<String>, BrowserError> {
+        #[derive(serde::Deserialize)]
+        struct Reattached {
+            #[serde(default)]
+            chain: Vec<String>,
+        }
+        let reattached: Reattached = self
+            .call(
+                "/embedded/reattach",
+                &serde_json::json!({ "session_id": session_id }),
+            )
+            .await?;
+        Ok(reattached.chain)
+    }
+
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -1331,6 +1363,68 @@ mod tests {
         assert_eq!(calls[1]["body"]["nonce"], "n0nce");
         assert_eq!(calls[1]["body"]["url"], "https://jira.example.org/");
         assert_eq!(calls[1]["body"]["placement"]["profile"]["kind"], "project");
+    }
+
+    /// Detach and reattach post the session id to their own routes; detach accepts a bare 204 and
+    /// reattach answers the chain of sites visited while detached.
+    #[tokio::test]
+    async fn embedded_detach_and_reattach_return_the_chain() {
+        use axum::extract::Path;
+        use axum::response::IntoResponse as _;
+        use axum::routing::post;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new().route(
+            "/embedded/{verb}",
+            post(
+                move |Path(verb): Path<String>,
+                      headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let authorization = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        recorder.lock().unwrap().push(serde_json::json!({
+                            "verb": verb,
+                            "authorization": authorization,
+                            "body": body,
+                        }));
+                        if verb == "reattach" {
+                            return axum::Json(serde_json::json!({
+                                "chain": ["https://a.example/", "https://b.example/"]
+                            }))
+                            .into_response();
+                        }
+                        axum::http::StatusCode::NO_CONTENT.into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = BrowserClient::new(&address, "tok".into());
+        client.embedded_detach("s9").await.expect("detach");
+        let chain = client.embedded_reattach("s9").await.expect("reattach");
+        assert_eq!(chain, vec!["https://a.example/", "https://b.example/"]);
+
+        let calls = seen.lock().unwrap();
+        let verbs = calls
+            .iter()
+            .map(|call| call["verb"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(verbs, vec!["detach", "reattach"]);
+        for call in calls.iter() {
+            assert_eq!(call["authorization"], "Bearer tok", "{call}");
+            assert_eq!(call["body"]["session_id"], "s9", "{call}");
+        }
     }
 
     /// The other half of the round trip: a sidecar that is not there. A caller has to be able to

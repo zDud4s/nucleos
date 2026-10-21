@@ -139,6 +139,9 @@ pub async fn post_snapshot(
     if row.mode != mode::AGENT {
         return not_the_agents(&row, "what is on its screen is theirs");
     }
+    if let Some(refusal) = owner_has_control(&state, &row, "what is on its screen is theirs") {
+        return refusal;
+    }
     match state
         .browser
         .client
@@ -204,6 +207,28 @@ pub(super) fn not_the_agents(row: &SessionRow, what: &str) -> axum::response::Re
     .into_response()
 }
 
+/// The refusal an agent gets while the owner holds an embedded session by hand (the shell's own
+/// flag, not the wheel mode). `None` when the session is not embedded or the owner has let go.
+pub(super) fn owner_has_control(
+    state: &AppState,
+    row: &SessionRow,
+    what: &str,
+) -> Option<axum::response::Response> {
+    if !state.browser.embedded.is_human(&row.sidecar_id) {
+        return None;
+    }
+    Some(
+        axum::Json(serde_json::json!({
+            "outcome": "refused",
+            "refusal": {
+                "consequence": "owner_has_control",
+                "detail": format!("the owner is using this session by hand, so {what}"),
+            },
+        }))
+        .into_response(),
+    )
+}
+
 /// `POST /browser/act`.
 ///
 /// A refusal by the fence comes back as 200 carrying `outcome: "refused"`, all the way from the
@@ -224,6 +249,9 @@ pub async fn post_act(
     // A refusal and not an error, in the shape the agent already knows how to read (§6.2).
     if row.mode != mode::AGENT {
         return not_the_agents(&row, "it is not the agent's to act on");
+    }
+    if let Some(refusal) = owner_has_control(&state, &row, "it is not the agent's to act on") {
+        return refusal;
     }
     match state
         .browser
@@ -320,6 +348,9 @@ pub async fn post_look(
     if row.mode != mode::AGENT {
         return not_the_agents(&row, "what is on its screen is theirs");
     }
+    if let Some(refusal) = owner_has_control(&state, &row, "what is on its screen is theirs") {
+        return refusal;
+    }
     match state.browser.client.look(&row.sidecar_id).await {
         Ok(result) => axum::Json(result).into_response(),
         Err(error) => browser_error(error),
@@ -351,6 +382,9 @@ pub async fn post_screenshot(
     // login form, with a password half-typed into it."
     if row.mode != mode::AGENT {
         return not_the_agents(&row, "what is on its screen is theirs");
+    }
+    if let Some(refusal) = owner_has_control(&state, &row, "what is on its screen is theirs") {
+        return refusal;
     }
     match state.browser.client.screenshot(&row.sidecar_id).await {
         Ok(image) => ([(axum::http::header::CONTENT_TYPE, "image/png")], image).into_response(),

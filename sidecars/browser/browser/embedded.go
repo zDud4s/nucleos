@@ -40,6 +40,17 @@ type Embedded interface {
 	AttachEmbedded(ctx context.Context, req AttachRequest) (Session, error)
 	// ForgetEmbedded drops everything held for a project. An unknown project is not an error.
 	ForgetEmbedded(ctx context.Context, project string) error
+	// DetachEmbedded detaches the CDP target session of one adopted tab (Target.detachFromTarget).
+	// The browser-session Fetch interception and the CSP fence stay armed.
+	DetachEmbedded(ctx context.Context, id SessionID) error
+	// ReattachEmbedded attaches again to the stored target of a detached session and re-wires it. It returns
+	// the main-frame documents the tab requested while detached (empty if it was not detached).
+	ReattachEmbedded(ctx context.Context, id SessionID) (Returned, error)
+}
+
+// EmbeddedSessionRequest names the embedded session a detach or reattach applies to.
+type EmbeddedSessionRequest struct {
+	SessionID SessionID `json:"session_id"`
 }
 
 var (
@@ -99,4 +110,34 @@ func (f *Fake) ForgetEmbedded(_ context.Context, project string) error {
 	defer f.mu.Unlock()
 	f.EmbeddedForgotten = append(f.EmbeddedForgotten, project)
 	return f.EmbeddedErr
+}
+
+// DetachEmbedded on the Fake records the session id.
+func (f *Fake) DetachEmbedded(_ context.Context, id SessionID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.EmbeddedDetached = append(f.EmbeddedDetached, id)
+	return f.embeddedSessionErr(id)
+}
+
+// ReattachEmbedded on the Fake records the session id.
+func (f *Fake) ReattachEmbedded(_ context.Context, id SessionID) (Returned, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.EmbeddedReattached = append(f.EmbeddedReattached, id)
+	if err := f.embeddedSessionErr(id); err != nil {
+		return Returned{}, err
+	}
+	return Returned{Chain: append([]string{}, f.EmbeddedChain...)}, nil
+}
+
+// embeddedSessionErr is EmbeddedErr, else ErrNoSuchSession for an unknown id. Called with f.mu held.
+func (f *Fake) embeddedSessionErr(id SessionID) error {
+	if f.EmbeddedErr != nil {
+		return f.EmbeddedErr
+	}
+	if _, ok := f.sessions[id]; !ok {
+		return ErrNoSuchSession
+	}
+	return nil
 }
