@@ -954,6 +954,22 @@
   border-top: 1px solid var(--border);
 }
 
+/* The pairing question lays its two selects and its button on one row. */
+.ap-pair {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.ap-pair .ui-field {
+  flex: 1 1 10rem;
+}
+
+.ap-pair .ui-field select {
+  width: 100%;
+  min-width: 0;
+}
+
 .ap-field-label {
   font-family: var(--font-body);
   font-size: var(--text-xs);

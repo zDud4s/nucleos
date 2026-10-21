@@ -21,7 +21,6 @@ const ALLOWED = new Map<string, { reason: string; only?: string }>([
   ["autopilot.css:.ap-link", { reason: "a Link" }],
   ["chats.css:.chats-rich-link", { reason: "a button that opens a URL through the OS" }],
   ["feed.css:.feed-link", { reason: "a run link, and the page a line's question is answered on" }],
-  ["fleet.css:.fleet-card-link", { reason: "a fleet card link" }],
   ["projects.css:.pj-match-path", { reason: "a project path link" }],
   ["waiting.css:.waiting-row-link", { reason: "a waiting row link" }],
   [
