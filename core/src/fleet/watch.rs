@@ -111,7 +111,8 @@ mod tests {
         let write = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any)))
             .add_path(PathBuf::from("/s/a.jsonl"));
         assert_eq!(reported(Ok(write)), vec![PathBuf::from("/s/a.jsonl")]);
-        let read = Event::new(EventKind::Access(AccessKind::Any)).add_path(PathBuf::from("/s/a.jsonl"));
+        let read =
+            Event::new(EventKind::Access(AccessKind::Any)).add_path(PathBuf::from("/s/a.jsonl"));
         assert!(reported(Ok(read)).is_empty());
     }
 

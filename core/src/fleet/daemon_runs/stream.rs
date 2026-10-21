@@ -19,7 +19,14 @@ pub struct Parsed {
     pub usage: Option<Usage>,
 }
 
-const INPUT_KEYS: [&str; 6] = ["file_path", "command", "pattern", "path", "url", "description"];
+const INPUT_KEYS: [&str; 6] = [
+    "file_path",
+    "command",
+    "pattern",
+    "path",
+    "url",
+    "description",
+];
 
 /// Terminal lines for complete stdout lines. Reasoning never becomes a line; a tool result is one
 /// summary line (`N lines`); a non-JSON line is plain text.
@@ -260,7 +267,10 @@ mod tests {
         ]));
         assert_eq!(
             parsed.usage,
-            Some(Usage { context_tokens: Some(315), cost_usd: None })
+            Some(Usage {
+                context_tokens: Some(315),
+                cost_usd: None
+            })
         );
     }
 
@@ -279,7 +289,13 @@ mod tests {
 
     #[test]
     fn every_other_end_is_an_error_line_with_the_status() {
-        for status in ["failed", "timed_out", "cancelled", "interrupted", "superseded"] {
+        for status in [
+            "failed",
+            "timed_out",
+            "cancelled",
+            "interrupted",
+            "superseded",
+        ] {
             assert_eq!(
                 final_line(status, r#"{"type":"result","result":"nope"}"#),
                 TermLine::new(TermKind::Error, status),
@@ -306,7 +322,10 @@ mod tests {
         let (lines, offset) = tail_lines(&tails, 5, offset).unwrap();
         assert_eq!(lines, ["three", "four"]);
         assert_eq!(offset, Offset(19));
-        assert_eq!(tail_lines(&tails, 5, offset).unwrap().0, Vec::<String>::new());
+        assert_eq!(
+            tail_lines(&tails, 5, offset).unwrap().0,
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -341,7 +360,11 @@ mod tests {
         let (tails, _) = tails_with(5, &text);
         let (lines, offset) = tail_lines(&tails, 5, Offset::TAIL).unwrap();
         assert_eq!(offset, Offset(text.len() as u64));
-        assert!(lines.iter().all(|l| l.len() == 10 && l.starts_with("line-")));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.len() == 10 && l.starts_with("line-"))
+        );
         assert_eq!(lines.last().unwrap(), "line-19999");
         assert!(lines.len() < 20_000);
     }

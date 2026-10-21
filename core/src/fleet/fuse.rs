@@ -294,35 +294,60 @@ mod tests {
             .nodes
             .iter()
             .find(|n| n.node.id == id)
-            .unwrap_or_else(|| panic!("no node {id} in {:?}", fused.nodes.iter().map(|n| &n.node.id).collect::<Vec<_>>()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no node {id} in {:?}",
+                    fused.nodes.iter().map(|n| &n.node.id).collect::<Vec<_>>()
+                )
+            })
     }
 
     #[test]
     fn equal_keys_merge_into_one_node_with_run_id_stop_and_cost_from_the_daemon() {
         let mut native = sighting("claude-code", "s1");
         native.model = Some("opus".into());
-        native.usage = Some(Usage { context_tokens: Some(900), cost_usd: None });
+        native.usage = Some(Usage {
+            context_tokens: Some(900),
+            cost_usd: None,
+        });
         let mut daemon = sighting("claude-code", "s1");
         daemon.run_id = Some(7);
         daemon.can_stop = true;
         daemon.model = Some("ignored".into());
-        daemon.usage = Some(Usage { context_tokens: Some(1), cost_usd: Some(0.5) });
+        daemon.usage = Some(Usage {
+            context_tokens: Some(1),
+            cost_usd: Some(0.5),
+        });
 
         let fused = run(
-            vec![("claude_code", vec![native]), (DAEMON_RUNS_SOURCE, vec![daemon])],
+            vec![
+                ("claude_code", vec![native]),
+                (DAEMON_RUNS_SOURCE, vec![daemon]),
+            ],
             vec![],
         );
 
         assert_eq!(fused.nodes.len(), 1);
         let n = node(&fused, "claude-code:s1");
-        assert_eq!(n.node.model.as_deref(), Some("opus"), "fields come from the native sighting");
+        assert_eq!(
+            n.node.model.as_deref(),
+            Some("opus"),
+            "fields come from the native sighting"
+        );
         assert_eq!(n.node.run_id, Some(7));
         assert!(n.node.capabilities.stop);
         assert!(n.node.capabilities.open_run);
-        assert_eq!(n.lines_source, Some(0), "lines come from the harness adapter, not the daemon");
+        assert_eq!(
+            n.lines_source,
+            Some(0),
+            "lines come from the harness adapter, not the daemon"
+        );
         assert_eq!(
             n.usage,
-            Some(Usage { context_tokens: Some(900), cost_usd: Some(0.5) })
+            Some(Usage {
+                context_tokens: Some(900),
+                cost_usd: Some(0.5)
+            })
         );
     }
 
@@ -333,7 +358,10 @@ mod tests {
         let mut daemon = sighting("claude-code", "s1");
         daemon.has_lines = true;
         let fused = run(
-            vec![("claude_code", vec![native]), (DAEMON_RUNS_SOURCE, vec![daemon])],
+            vec![
+                ("claude_code", vec![native]),
+                (DAEMON_RUNS_SOURCE, vec![daemon]),
+            ],
             vec![],
         );
         assert_eq!(node(&fused, "claude-code:s1").lines_source, Some(1));
@@ -367,18 +395,32 @@ mod tests {
         daemon.can_stop = true;
 
         let fused = run(
-            vec![("claude_code", vec![native]), (DAEMON_RUNS_SOURCE, vec![daemon])],
+            vec![
+                ("claude_code", vec![native]),
+                (DAEMON_RUNS_SOURCE, vec![daemon]),
+            ],
             vec![],
         );
 
         let n = node(&fused, "claude-code:s1");
-        assert_eq!(n.node.state, NodeState::Done, "the run is the authoritative liveness");
+        assert_eq!(
+            n.node.state,
+            NodeState::Done,
+            "the run is the authoritative liveness"
+        );
         assert_eq!(n.node.ended_at, Some(at(50)), "ended_at is the run's too");
-        assert!(!n.node.capabilities.stop, "a finished run cannot be stopped");
+        assert!(
+            !n.node.capabilities.stop,
+            "a finished run cannot be stopped"
+        );
         assert_eq!(n.node.label, "native label");
         assert_eq!(n.node.role.as_deref(), Some("planner"));
         assert_eq!(n.node.started_at, at(5), "started_at stays native");
-        assert_eq!(n.daemon_source, Some(1), "the hub finds the run's status through this");
+        assert_eq!(
+            n.daemon_source,
+            Some(1),
+            "the hub finds the run's status through this"
+        );
     }
 
     #[test]
@@ -391,13 +433,19 @@ mod tests {
         daemon.can_stop = true;
 
         let fused = run(
-            vec![("claude_code", vec![native]), (DAEMON_RUNS_SOURCE, vec![daemon])],
+            vec![
+                ("claude_code", vec![native]),
+                (DAEMON_RUNS_SOURCE, vec![daemon]),
+            ],
             vec![],
         );
 
         let n = node(&fused, "claude-code:s1");
         assert_eq!(n.node.state, NodeState::Busy);
-        assert_eq!(n.node.ended_at, None, "a live node has no end, whatever the adapter saw");
+        assert_eq!(
+            n.node.ended_at, None,
+            "a live node has no end, whatever the adapter saw"
+        );
         assert!(n.node.capabilities.stop);
     }
 
@@ -454,15 +502,21 @@ mod tests {
                 vec![edge(("claude-code", "child"), ("claude-code", "c"))], // run_launch
             ],
         );
-        assert_eq!(node(&fused, "claude-code:child").node.parent_id.as_deref(), Some("claude-code:a"));
+        assert_eq!(
+            node(&fused, "claude-code:child").node.parent_id.as_deref(),
+            Some("claude-code:a")
+        );
 
         // Without the native parent, the first edge source wins.
         let child = sighting("codex-cli", "child");
         let fused = run(
-            vec![(
-                "claude_code",
-                vec![sighting("claude-code", "b"), sighting("claude-code", "c")],
-            ), ("codex_cli", vec![child])],
+            vec![
+                (
+                    "claude_code",
+                    vec![sighting("claude-code", "b"), sighting("claude-code", "c")],
+                ),
+                ("codex_cli", vec![child]),
+            ],
             vec![
                 vec![edge(("codex-cli", "child"), ("claude-code", "b"))],
                 vec![edge(("codex-cli", "child"), ("claude-code", "c"))],
@@ -500,7 +554,10 @@ mod tests {
                 vec![edge(("codex-cli", "c"), ("claude-code", "p"))],
             ],
         );
-        assert_eq!(node(&fused, "codex-cli:c").node.parent_id.as_deref(), Some("claude-code:p"));
+        assert_eq!(
+            node(&fused, "codex-cli:c").node.parent_id.as_deref(),
+            Some("claude-code:p")
+        );
     }
 
     #[test]
@@ -536,7 +593,10 @@ mod tests {
                 edge(("codex-cli", "c"), ("claude-code", "z")),
             ]],
         );
-        assert_eq!(node(&fused, "codex-cli:c").node.parent_id.as_deref(), Some("claude-code:z"));
+        assert_eq!(
+            node(&fused, "codex-cli:c").node.parent_id.as_deref(),
+            Some("claude-code:z")
+        );
 
         // Both are sighted: the first wins, even though "a" sorts before "z".
         let fused = run(
@@ -546,7 +606,10 @@ mod tests {
                 edge(("codex-cli", "c"), ("claude-code", "a")),
             ]],
         );
-        assert_eq!(node(&fused, "codex-cli:c").node.parent_id.as_deref(), Some("claude-code:z"));
+        assert_eq!(
+            node(&fused, "codex-cli:c").node.parent_id.as_deref(),
+            Some("claude-code:z")
+        );
     }
 
     #[test]
@@ -559,7 +622,10 @@ mod tests {
             vec![vec![edge(("claude-code", "a"), ("claude-code", "b"))]], // would put a under b
         );
         assert_eq!(node(&fused, "claude-code:a").node.parent_id, None);
-        assert_eq!(node(&fused, "claude-code:b").node.parent_id.as_deref(), Some("claude-code:a"));
+        assert_eq!(
+            node(&fused, "claude-code:b").node.parent_id.as_deref(),
+            Some("claude-code:a")
+        );
         assert_eq!(
             fused.ignored_cycles,
             vec![("claude-code:a".to_owned(), "claude-code:b".to_owned())]
@@ -615,12 +681,28 @@ mod tests {
             vec![],
         );
         let live = node(&fused, "daemon:run-1").node.capabilities;
-        assert_eq!(live, Capabilities { stop: true, open_run: true, full_transcript: false, pin: true });
+        assert_eq!(
+            live,
+            Capabilities {
+                stop: true,
+                open_run: true,
+                full_transcript: false,
+                pin: true
+            }
+        );
         let done = node(&fused, "daemon:run-2").node.capabilities;
         assert!(!done.stop, "a finished run cannot be stopped");
         assert!(done.open_run);
         let child = node(&fused, "claude-code:c").node.capabilities;
-        assert_eq!(child, Capabilities { stop: false, open_run: false, full_transcript: false, pin: false });
+        assert_eq!(
+            child,
+            Capabilities {
+                stop: false,
+                open_run: false,
+                full_transcript: false,
+                pin: false
+            }
+        );
     }
 
     #[test]
@@ -683,7 +765,10 @@ mod tests {
         daemon.last_activity_at = at(30);
         let other = sighting("claude-code", "a");
         let fused = run(
-            vec![("claude_code", vec![native, other]), (DAEMON_RUNS_SOURCE, vec![daemon])],
+            vec![
+                ("claude_code", vec![native, other]),
+                (DAEMON_RUNS_SOURCE, vec![daemon]),
+            ],
             vec![],
         );
         assert_eq!(node(&fused, "claude-code:s").last_activity_at, at(30));

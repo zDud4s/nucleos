@@ -199,13 +199,26 @@ impl AgentSource for FakeSource {
             .unwrap()
             .iter()
             .any(|s| &s.key == key)
-            .then(|| NodeRef { key: key.clone(), path: Some(self.path_of(key)) })
+            .then(|| NodeRef {
+                key: key.clone(),
+                path: Some(self.path_of(key)),
+            })
     }
     /// Offsets count lines: `Offset(n)` means "n lines already delivered".
     async fn read_lines(&self, node: &NodeRef, from: Offset) -> SourceResult<LinesRead> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        let lines = self.lines.lock().unwrap().get(&node.key).cloned().unwrap_or_default();
-        let start = if from == Offset::TAIL { 0 } else { (from.0 as usize).min(lines.len()) };
+        let lines = self
+            .lines
+            .lock()
+            .unwrap()
+            .get(&node.key)
+            .cloned()
+            .unwrap_or_default();
+        let start = if from == Offset::TAIL {
+            0
+        } else {
+            (from.0 as usize).min(lines.len())
+        };
         Ok(LinesRead {
             offset: Offset(lines.len() as u64),
             lines: lines[start..].to_vec(),
@@ -213,7 +226,11 @@ impl AgentSource for FakeSource {
             last_activity_at: None,
         })
     }
-    async fn transcript_page(&self, _: &NodeRef, _: Option<Cursor>) -> SourceResult<TranscriptPage> {
+    async fn transcript_page(
+        &self,
+        _: &NodeRef,
+        _: Option<Cursor>,
+    ) -> SourceResult<TranscriptPage> {
         Ok(self.transcript.lock().unwrap().clone())
     }
 }

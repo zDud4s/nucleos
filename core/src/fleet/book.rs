@@ -182,7 +182,11 @@ impl Book {
             pending.drain(..excess);
         }
         if !read.lines.is_empty() || read.last_activity_at.is_some() || read.usage.is_some() {
-            self.note_metrics(id, read.last_activity_at.unwrap_or(now), read.usage.as_ref());
+            self.note_metrics(
+                id,
+                read.last_activity_at.unwrap_or(now),
+                read.usage.as_ref(),
+            );
         }
     }
 
@@ -275,7 +279,11 @@ impl Book {
         let sighted: BTreeSet<NodeId> = fused.iter().map(|f| f.node.id.clone()).collect();
         for mut incoming in fused {
             let id = incoming.node.id.clone();
-            settle_end(&mut incoming, self.known.get(&id).map(|e| &e.fused.node), now);
+            settle_end(
+                &mut incoming,
+                self.known.get(&id).map(|e| &e.fused.node),
+                now,
+            );
             self.note_metrics(&id, incoming.last_activity_at, incoming.usage.as_ref());
             match self.known.get_mut(&id) {
                 Some(entry) => {
@@ -378,7 +386,11 @@ impl Book {
                 lines.insert(node.id.clone(), shown);
             }
         }
-        FleetEvent::Snapshot { nodes, metrics, lines }
+        FleetEvent::Snapshot {
+            nodes,
+            metrics,
+            lines,
+        }
     }
 
     /// Merges a metrics change into the node's record and queues it when something moved.
@@ -465,7 +477,11 @@ impl Book {
             .into_iter()
             .map(|node_id| FleetEvent::Removed { node_id })
             .collect();
-        events.extend(changed.into_iter().map(|node| FleetEvent::Node { node: node.clone() }));
+        events.extend(
+            changed
+                .into_iter()
+                .map(|node| FleetEvent::Node { node: node.clone() }),
+        );
         self.view = new_view;
 
         // A node that just became visible (a new one, or one the caps let in) has metrics and
@@ -555,7 +571,11 @@ fn settle_end(incoming: &mut FusedNode, previous: Option<&FleetNode>, now: Times
 }
 
 fn end_of(entry: &Entry) -> Timestamp {
-    entry.fused.node.ended_at.unwrap_or(entry.fused.last_activity_at)
+    entry
+        .fused
+        .node
+        .ended_at
+        .unwrap_or(entry.fused.last_activity_at)
 }
 
 /// The nodes of one tree that fit the cap, and how many `Done` nodes each kept node stands in for.
@@ -608,7 +628,9 @@ fn cap_tree(tree: &[&Entry]) -> (BTreeSet<NodeId>, BTreeMap<NodeId, u32>) {
                 *omitted.entry(parent.to_owned()).or_default() += 1;
                 break;
             }
-            at = by_id.get(parent).and_then(|p| p.fused.node.parent_id.as_deref());
+            at = by_id
+                .get(parent)
+                .and_then(|p| p.fused.node.parent_id.as_deref());
         }
     }
     (kept, omitted)
@@ -616,10 +638,14 @@ fn cap_tree(tree: &[&Entry]) -> (BTreeSet<NodeId>, BTreeMap<NodeId, u32>) {
 
 fn ancestors_of(id: &str, by_id: &BTreeMap<&str, &Entry>) -> Vec<NodeId> {
     let mut found = Vec::new();
-    let mut at = by_id.get(id).and_then(|e| e.fused.node.parent_id.as_deref());
+    let mut at = by_id
+        .get(id)
+        .and_then(|e| e.fused.node.parent_id.as_deref());
     while let Some(parent) = at {
         found.push(parent.to_owned());
-        at = by_id.get(parent).and_then(|e| e.fused.node.parent_id.as_deref());
+        at = by_id
+            .get(parent)
+            .and_then(|e| e.fused.node.parent_id.as_deref());
     }
     found
 }
@@ -683,7 +709,10 @@ mod tests {
     fn an_unchanged_sighting_emits_nothing_and_a_state_change_emits_one_node() {
         let mut book = Book::new(BTreeSet::new());
         book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(1));
-        assert!(book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(2)).is_empty());
+        assert!(
+            book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(2))
+                .is_empty()
+        );
 
         let events = book.apply_fusion(vec![root_node(R, NodeState::Idle)], at(3));
         assert_eq!(nodes_of(&events).len(), 1);
@@ -696,24 +725,36 @@ mod tests {
         let mut book = Book::new(BTreeSet::new());
         book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(10));
         book.apply_fusion(vec![root_node(R, NodeState::Done)], at(20));
-        assert_eq!(book.lookup("claude-code:root").unwrap().node.ended_at, Some(at(20)));
+        assert_eq!(
+            book.lookup("claude-code:root").unwrap().node.ended_at,
+            Some(at(20))
+        );
         // A later round must not move it.
         book.apply_fusion(vec![root_node(R, NodeState::Done)], at(30));
-        assert_eq!(book.lookup("claude-code:root").unwrap().node.ended_at, Some(at(20)));
+        assert_eq!(
+            book.lookup("claude-code:root").unwrap().node.ended_at,
+            Some(at(20))
+        );
 
         // Met already dead: its last activity.
         let mut book = Book::new(BTreeSet::new());
         let mut dead = root_node(R, NodeState::Lost);
         dead.last_activity_at = at(5);
         book.apply_fusion(vec![dead], at(100));
-        assert_eq!(book.lookup("claude-code:root").unwrap().node.ended_at, Some(at(5)));
+        assert_eq!(
+            book.lookup("claude-code:root").unwrap().node.ended_at,
+            Some(at(5))
+        );
 
         // Met already dead with an `ended_at` of its own: that one.
         let mut book = Book::new(BTreeSet::new());
         let mut sighted = root_node(R, NodeState::Done);
         sighted.node.ended_at = Some(at(7));
         book.apply_fusion(vec![sighted], at(100));
-        assert_eq!(book.lookup("claude-code:root").unwrap().node.ended_at, Some(at(7)));
+        assert_eq!(
+            book.lookup("claude-code:root").unwrap().node.ended_at,
+            Some(at(7))
+        );
     }
 
     #[test]
@@ -725,13 +766,19 @@ mod tests {
         let mut finished = root_node(R, NodeState::Done);
         finished.node.ended_at = Some(at(15));
         book.apply_fusion(vec![finished], at(20));
-        assert_eq!(book.lookup("claude-code:root").unwrap().node.ended_at, Some(at(20)));
+        assert_eq!(
+            book.lookup("claude-code:root").unwrap().node.ended_at,
+            Some(at(20))
+        );
 
         // Once dead, the first stamp stays, whatever a later sighting says.
         let mut again = root_node(R, NodeState::Done);
         again.node.ended_at = Some(at(25));
         book.apply_fusion(vec![again], at(30));
-        assert_eq!(book.lookup("claude-code:root").unwrap().node.ended_at, Some(at(20)));
+        assert_eq!(
+            book.lookup("claude-code:root").unwrap().node.ended_at,
+            Some(at(20))
+        );
     }
 
     #[test]
@@ -783,18 +830,31 @@ mod tests {
         assert_eq!(snapshot_nodes(&book), ["claude-code:root"]);
 
         let events = book.set_pin("claude-code:root", false, at(10_001)).unwrap();
-        assert_eq!(removed_of(&events), ["claude-code:root"], "past its window, it goes at once");
+        assert_eq!(
+            removed_of(&events),
+            ["claude-code:root"],
+            "past its window, it goes at once"
+        );
     }
 
     #[test]
     fn pins_are_validated() {
         let mut book = Book::new(BTreeSet::new());
         book.apply_fusion(
-            vec![root_node(R, NodeState::Busy), child_node(("claude-code", "kid"), R, NodeState::Busy)],
+            vec![
+                root_node(R, NodeState::Busy),
+                child_node(("claude-code", "kid"), R, NodeState::Busy),
+            ],
             at(1),
         );
-        assert_eq!(book.set_pin("claude-code:ghost", true, at(2)), Err(PinError::Unknown));
-        assert_eq!(book.set_pin("claude-code:kid", true, at(2)), Err(PinError::NotARoot));
+        assert_eq!(
+            book.set_pin("claude-code:ghost", true, at(2)),
+            Err(PinError::Unknown)
+        );
+        assert_eq!(
+            book.set_pin("claude-code:kid", true, at(2)),
+            Err(PinError::NotARoot)
+        );
     }
 
     #[test]
@@ -803,18 +863,27 @@ mod tests {
         pins.insert("claude-code:root".to_owned());
         let mut book = Book::new(pins);
         let events = book.apply_fusion(vec![done_root(0)], at(10_000));
-        assert!(nodes_of(&events)[0].pinned, "a pinned old tree is shown and flagged");
+        assert!(
+            nodes_of(&events)[0].pinned,
+            "a pinned old tree is shown and flagged"
+        );
     }
 
     #[test]
     fn a_live_node_that_goes_unsighted_becomes_lost_on_the_second_miss() {
         let mut book = Book::new(BTreeSet::new());
         book.apply_fusion(
-            vec![root_node(R, NodeState::Busy), child_node(("claude-code", "kid"), R, NodeState::Busy)],
+            vec![
+                root_node(R, NodeState::Busy),
+                child_node(("claude-code", "kid"), R, NodeState::Busy),
+            ],
             at(1),
         );
         // The child is missing from this round only.
-        assert!(book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(2)).is_empty());
+        assert!(
+            book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(2))
+                .is_empty()
+        );
         let events = book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(3));
         let kid = nodes_of(&events)[0].clone();
         assert_eq!(kid.state, NodeState::Lost);
@@ -823,10 +892,25 @@ mod tests {
 
         // Sighted again in time: the miss counter restarts.
         let mut book = Book::new(BTreeSet::new());
-        book.apply_fusion(vec![root_node(R, NodeState::Busy), child_node(("claude-code", "kid"), R, NodeState::Busy)], at(1));
+        book.apply_fusion(
+            vec![
+                root_node(R, NodeState::Busy),
+                child_node(("claude-code", "kid"), R, NodeState::Busy),
+            ],
+            at(1),
+        );
         book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(2));
-        book.apply_fusion(vec![root_node(R, NodeState::Busy), child_node(("claude-code", "kid"), R, NodeState::Busy)], at(3));
-        assert!(book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(4)).is_empty());
+        book.apply_fusion(
+            vec![
+                root_node(R, NodeState::Busy),
+                child_node(("claude-code", "kid"), R, NodeState::Busy),
+            ],
+            at(3),
+        );
+        assert!(
+            book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(4))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -856,14 +940,21 @@ mod tests {
         let shown = snapshot_nodes(&book);
         assert_eq!(shown.len(), 50);
         assert!(shown.contains(&"claude-code:t59".to_owned()));
-        assert!(!shown.contains(&"claude-code:t09".to_owned()), "the ten stalest are left out");
+        assert!(
+            !shown.contains(&"claude-code:t09".to_owned()),
+            "the ten stalest are left out"
+        );
 
         // A fresher tree displaces the stalest visible one: it is announced, the other removed.
         let mut fresh = root_node(("claude-code", "fresh"), NodeState::Busy);
         fresh.last_activity_at = at(500);
         let events = book.apply_fusion(vec![fresh], at(501));
         assert_eq!(removed_of(&events), ["claude-code:t10"]);
-        assert!(nodes_of(&events).iter().any(|n| n.id == "claude-code:fresh"));
+        assert!(
+            nodes_of(&events)
+                .iter()
+                .any(|n| n.id == "claude-code:fresh")
+        );
     }
 
     #[test]
@@ -884,8 +975,14 @@ mod tests {
 
         let shown = snapshot_nodes(&book);
         assert_eq!(shown.len(), 50);
-        assert!(shown.contains(&"claude-code:t00".to_owned()), "the pinned tree is shown");
-        assert!(!shown.contains(&"claude-code:t10".to_owned()), "the pin took one place");
+        assert!(
+            shown.contains(&"claude-code:t00".to_owned()),
+            "the pinned tree is shown"
+        );
+        assert!(
+            !shown.contains(&"claude-code:t10".to_owned()),
+            "the pin took one place"
+        );
         assert!(shown.contains(&"claude-code:t11".to_owned()));
     }
 
@@ -899,23 +996,36 @@ mod tests {
             nodes.push(kid);
         }
         for i in 0..live {
-            nodes.push(child_node(("claude-code", &format!("live{i}")), R, NodeState::Busy));
+            nodes.push(child_node(
+                ("claude-code", &format!("live{i}")),
+                R,
+                NodeState::Busy,
+            ));
         }
         nodes
     }
 
     #[test]
-    fn a_tree_is_cut_to_five_hundred_nodes_live_first_oldest_done_out_and_the_count_on_the_parent() {
+    fn a_tree_is_cut_to_five_hundred_nodes_live_first_oldest_done_out_and_the_count_on_the_parent()
+    {
         let mut book = Book::new(BTreeSet::new());
         book.apply_fusion(big_tree(600, 3), at(1000));
 
-        let FleetEvent::Snapshot { nodes, .. } = book.snapshot() else { panic!() };
+        let FleetEvent::Snapshot { nodes, .. } = book.snapshot() else {
+            panic!()
+        };
         assert_eq!(nodes.len(), TREE_NODES);
         assert_eq!(nodes.iter().filter(|n| n.id.contains("live")).count(), 3);
         let root = nodes.iter().find(|n| n.id == "claude-code:root").unwrap();
         assert_eq!(root.done_omitted, 600 - (TREE_NODES as u32 - 4));
-        assert!(nodes.iter().any(|n| n.id == "claude-code:d599"), "the newest done is kept");
-        assert!(!nodes.iter().any(|n| n.id == "claude-code:d000"), "the oldest done is not");
+        assert!(
+            nodes.iter().any(|n| n.id == "claude-code:d599"),
+            "the newest done is kept"
+        );
+        assert!(
+            !nodes.iter().any(|n| n.id == "claude-code:d000"),
+            "the oldest done is not"
+        );
     }
 
     #[test]
@@ -935,11 +1045,20 @@ mod tests {
         ));
         book.apply_fusion(nodes, at(1000));
 
-        let FleetEvent::Snapshot { nodes, .. } = book.snapshot() else { panic!() };
-        assert!(nodes.iter().any(|n| n.id == "claude-code:d000"), "kept as the grandchild's parent");
+        let FleetEvent::Snapshot { nodes, .. } = book.snapshot() else {
+            panic!()
+        };
+        assert!(
+            nodes.iter().any(|n| n.id == "claude-code:d000"),
+            "kept as the grandchild's parent"
+        );
         assert!(nodes.iter().any(|n| n.id == "claude-code:grandchild"));
         let total_omitted: u32 = nodes.iter().map(|n| n.done_omitted).sum();
-        assert_eq!(nodes.len() as u32 + total_omitted, 522, "every node is either shown or counted");
+        assert_eq!(
+            nodes.len() as u32 + total_omitted,
+            522,
+            "every node is either shown or counted"
+        );
     }
 
     #[test]
@@ -955,7 +1074,9 @@ mod tests {
         let events = book.apply_fusion(vec![newer], at(1001));
 
         assert_eq!(events.len(), 1);
-        let FleetEvent::Snapshot { nodes, .. } = &events[0] else { panic!("{events:?}") };
+        let FleetEvent::Snapshot { nodes, .. } = &events[0] else {
+            panic!("{events:?}")
+        };
         assert_eq!(nodes.len(), 500);
         assert!(!nodes.iter().any(|n| n.id == "claude-code:d000"));
     }
@@ -998,12 +1119,21 @@ mod tests {
         let mut book = live_book();
         book.apply_lines("claude-code:root", outcome(&["a", "b"], 10), at(5));
 
-        assert!(book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(6)).is_empty(), "no node event");
+        assert!(
+            book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(6))
+                .is_empty(),
+            "no node event"
+        );
         let lines = book.flush_lines();
         assert_eq!(lines_of(&lines), [("claude-code:root", vec!["a", "b"])]);
         let metrics = book.flush_metrics();
-        assert!(matches!(&metrics[..], [FleetEvent::Metrics { metrics }] if metrics[0].last_activity_at == at(5)));
-        assert!(book.flush_lines().is_empty() && book.flush_metrics().is_empty(), "drained");
+        assert!(
+            matches!(&metrics[..], [FleetEvent::Metrics { metrics }] if metrics[0].last_activity_at == at(5))
+        );
+        assert!(
+            book.flush_lines().is_empty() && book.flush_metrics().is_empty(),
+            "drained"
+        );
     }
 
     #[test]
@@ -1011,7 +1141,10 @@ mod tests {
         let mut book = live_book();
         book.apply_lines("claude-code:root", outcome(&["a"], 2), at(5));
         book.apply_lines("claude-code:root", outcome(&["b", "c"], 6), at(5));
-        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:root", vec!["a", "b", "c"])]);
+        assert_eq!(
+            lines_of(&book.flush_lines()),
+            [("claude-code:root", vec!["a", "b", "c"])]
+        );
     }
 
     #[test]
@@ -1025,7 +1158,9 @@ mod tests {
         let emitted = lines_of(&flushed);
         assert_eq!(emitted[0].1.len(), RING_LINES);
         assert_eq!(emitted[0].1.last(), Some(&"l299"));
-        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else {
+            panic!()
+        };
         assert_eq!(lines["claude-code:root"].len(), RING_LINES);
         assert_eq!(lines["claude-code:root"][0].text, "l288");
     }
@@ -1036,7 +1171,11 @@ mod tests {
         let mut kid = child_node(("claude-code", "kid"), R, NodeState::Busy);
         kid.last_activity_at = at(1);
         book.apply_fusion(vec![root_node(R, NodeState::Busy), kid], at(1));
-        book.apply_lines("claude-code:kid", outcome(&["one", "two", "three"], 14), at(2));
+        book.apply_lines(
+            "claude-code:kid",
+            outcome(&["one", "two", "three"], 14),
+            at(2),
+        );
         book.flush_lines();
 
         let mut done = child_node(("claude-code", "kid"), R, NodeState::Done);
@@ -1044,8 +1183,13 @@ mod tests {
         book.apply_fusion(vec![root_node(R, NodeState::Busy), done], at(3));
         book.apply_lines("claude-code:kid", outcome(&["closing"], 22), at(3));
 
-        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:kid", vec!["closing"])]);
-        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        assert_eq!(
+            lines_of(&book.flush_lines()),
+            [("claude-code:kid", vec!["closing"])]
+        );
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else {
+            panic!()
+        };
         assert_eq!(lines["claude-code:kid"].len(), 1);
         assert_eq!(lines["claude-code:kid"][0].text, "closing");
     }
@@ -1062,21 +1206,36 @@ mod tests {
     fn metrics_merge_and_unchanged_metrics_are_silent() {
         let mut book = live_book();
         let mut read = outcome(&["a"], 2);
-        read.usage = Some(Usage { context_tokens: Some(100), cost_usd: None });
+        read.usage = Some(Usage {
+            context_tokens: Some(100),
+            cost_usd: None,
+        });
         book.apply_lines("claude-code:root", read, at(5));
         let mut read = outcome(&[], 2);
-        read.usage = Some(Usage { context_tokens: None, cost_usd: Some(0.25) });
+        read.usage = Some(Usage {
+            context_tokens: None,
+            cost_usd: Some(0.25),
+        });
         book.apply_lines("claude-code:root", read, at(6));
 
-        let FleetEvent::Metrics { metrics } = book.flush_metrics().remove(0) else { panic!() };
+        let FleetEvent::Metrics { metrics } = book.flush_metrics().remove(0) else {
+            panic!()
+        };
         assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].context_tokens, Some(100), "a missing field never erases a value");
+        assert_eq!(
+            metrics[0].context_tokens,
+            Some(100),
+            "a missing field never erases a value"
+        );
         assert_eq!(metrics[0].cost_usd, Some(0.25));
         assert_eq!(metrics[0].last_activity_at, at(6));
 
         // The same numbers again: nothing to say.
         let mut read = outcome(&[], 2);
-        read.usage = Some(Usage { context_tokens: Some(100), cost_usd: Some(0.25) });
+        read.usage = Some(Usage {
+            context_tokens: Some(100),
+            cost_usd: Some(0.25),
+        });
         read.last_activity_at = Some(at(6));
         book.apply_lines("claude-code:root", read, at(7));
         assert!(book.flush_metrics().is_empty());
@@ -1112,7 +1271,10 @@ mod tests {
         risen.last_activity_at = at(500);
         let events = book.apply_fusion(vec![risen], at(501));
         assert!(nodes_of(&events).iter().any(|n| n.id == "claude-code:t00"));
-        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:t00", vec!["hidden"])]);
+        assert_eq!(
+            lines_of(&book.flush_lines()),
+            [("claude-code:t00", vec!["hidden"])]
+        );
     }
 
     #[test]
@@ -1133,7 +1295,11 @@ mod tests {
 
         let again = book.read_jobs(ReadWhich::AllLive);
         assert_eq!(again.len(), 1);
-        assert_eq!(again[0].offset, Offset(42), "reads continue from the stored offset");
+        assert_eq!(
+            again[0].offset,
+            Offset(42),
+            "reads continue from the stored offset"
+        );
     }
 
     #[test]
@@ -1143,7 +1309,11 @@ mod tests {
         book.apply_lines("claude-code:root", outcome(&["a"], 2), at(2));
 
         book.apply_fusion(vec![root_node(R, NodeState::Done)], at(3));
-        assert_eq!(book.read_jobs(ReadWhich::Pending).len(), 1, "the closing read");
+        assert_eq!(
+            book.read_jobs(ReadWhich::Pending).len(),
+            1,
+            "the closing read"
+        );
         assert!(book.read_jobs(ReadWhich::AllLive).is_empty());
     }
 
@@ -1159,11 +1329,17 @@ mod tests {
 
         let only_one: BTreeSet<usize> = [1].into_iter().collect();
         let jobs = book.read_jobs(ReadWhich::LiveOf(&only_one));
-        assert_eq!(jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), ["claude-code:other"]);
+        assert_eq!(
+            jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["claude-code:other"]
+        );
 
         let ids: BTreeSet<NodeId> = ["claude-code:root".to_owned()].into_iter().collect();
         let jobs = book.read_jobs(ReadWhich::Ids(&ids));
-        assert_eq!(jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), ["claude-code:root"]);
+        assert_eq!(
+            jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["claude-code:root"]
+        );
     }
 
     #[test]
@@ -1181,7 +1357,10 @@ mod tests {
         assert!(ids.is_empty() && unknown);
 
         let overflow: HashSet<PathBuf> = [PathBuf::new()].into_iter().collect();
-        assert!(book.match_paths(&overflow).1, "an empty path means events were lost");
+        assert!(
+            book.match_paths(&overflow).1,
+            "an empty path means events were lost"
+        );
     }
 
     /// A node whose lines come from a native adapter (registry index 1) and that daemon_runs
@@ -1201,16 +1380,25 @@ mod tests {
         book.read_jobs(ReadWhich::Pending);
         book.apply_lines("claude-code:root", outcome(&["working"], 8), at(2));
         book.flush_lines();
-        assert!(book.error_jobs().is_empty(), "a live node has no run status to report");
+        assert!(
+            book.error_jobs().is_empty(),
+            "a live node has no run status to report"
+        );
 
         book.apply_fusion(vec![native_with_run(NodeState::Done)], at(3));
-        assert!(book.error_jobs().is_empty(), "the native closing read comes first");
+        assert!(
+            book.error_jobs().is_empty(),
+            "the native closing read comes first"
+        );
         book.read_jobs(ReadWhich::Pending);
         book.apply_lines("claude-code:root", outcome(&["all done"], 20), at(3));
 
         let jobs = book.error_jobs();
         assert_eq!(jobs.len(), 1);
-        assert_eq!((jobs[0].id.as_str(), jobs[0].source, jobs[0].offset), ("claude-code:root", 0, Offset::TAIL));
+        assert_eq!(
+            (jobs[0].id.as_str(), jobs[0].source, jobs[0].offset),
+            ("claude-code:root", 0, Offset::TAIL)
+        );
         assert!(book.error_jobs().is_empty(), "asked once");
 
         // The daemon source answered with its whole last line set; only the Error one is kept.
@@ -1220,14 +1408,21 @@ mod tests {
         ];
         book.apply_error("claude-code:root", status);
         book.flush_lines();
-        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else {
+            panic!()
+        };
         assert_eq!(lines["claude-code:root"].len(), 1);
         assert_eq!(lines["claude-code:root"][0].text, "timed_out");
-        assert_eq!(lines["claude-code:root"][0].kind, crate::fleet::model::TermKind::Error);
+        assert_eq!(
+            lines["claude-code:root"][0].kind,
+            crate::fleet::model::TermKind::Error
+        );
 
         // A later native read of the dead node does not push the Error line out.
         book.apply_lines("claude-code:root", outcome(&["late"], 30), at(4));
-        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else {
+            panic!()
+        };
         assert_eq!(lines["claude-code:root"][0].text, "timed_out");
     }
 
@@ -1242,9 +1437,15 @@ mod tests {
 
         book.apply_error(
             "claude-code:root",
-            vec![TermLine::new(crate::fleet::model::TermKind::Error, "cancelled")],
+            vec![TermLine::new(
+                crate::fleet::model::TermKind::Error,
+                "cancelled",
+            )],
         );
-        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:root", vec!["cancelled"])]);
+        assert_eq!(
+            lines_of(&book.flush_lines()),
+            [("claude-code:root", vec!["cancelled"])]
+        );
     }
 
     #[test]
@@ -1257,7 +1458,10 @@ mod tests {
         assert_eq!(book.error_jobs().len(), 1);
         book.apply_error(
             "claude-code:root",
-            vec![TermLine::new(crate::fleet::model::TermKind::Final, "All green")],
+            vec![TermLine::new(
+                crate::fleet::model::TermKind::Final,
+                "All green",
+            )],
         );
         assert!(book.flush_lines().is_empty());
 

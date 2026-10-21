@@ -7,13 +7,13 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use super::FleetEnv;
 use super::fuse::DAEMON_RUNS_SOURCE;
-use super::model::{clean_label, Cursor, NodeKey, NodeState, Timestamp, TranscriptPage};
+use super::model::{Cursor, NodeKey, NodeState, Timestamp, TranscriptPage, clean_label};
 use super::source::{
     AgentSource, LinesRead, NodeRef, Offset, Sighting, SourceError, SourceResult, Usage,
 };
 use super::tail::project_of;
-use super::FleetEnv;
 use stream::FINAL_DONE;
 
 pub mod stream;
@@ -75,8 +75,7 @@ impl DaemonRuns {
         if terminal && ended.unwrap_or(started_at) < since {
             return None;
         }
-        let (key, harness_label) =
-            key_of(row.runner.as_deref(), row.session_id.as_deref(), row.id);
+        let (key, harness_label) = key_of(row.runner.as_deref(), row.session_id.as_deref(), row.id);
         let last_activity_at = if terminal {
             ended.unwrap_or(started_at)
         } else {
@@ -219,9 +218,9 @@ impl AgentSource for DaemonRuns {
     }
 
     async fn read_lines(&self, node: &NodeRef, from: Offset) -> SourceResult<LinesRead> {
-        let run_id = self.run_of(&node.key).ok_or_else(|| {
-            SourceError::msg(format!("unknown daemon run {}", node.key.id()))
-        })?;
+        let run_id = self
+            .run_of(&node.key)
+            .ok_or_else(|| SourceError::msg(format!("unknown daemon run {}", node.key.id())))?;
         if let Some((raw, offset)) = stream::tail_lines(&self.run_tails, run_id, from) {
             let parsed = stream::parse_lines(&raw);
             let last_activity_at = (!raw.is_empty()).then(Utc::now);
@@ -251,7 +250,10 @@ impl AgentSource for DaemonRuns {
             });
         }
         Ok(LinesRead {
-            lines: vec![stream::final_line(&status, stdout_tail.as_deref().unwrap_or(""))],
+            lines: vec![stream::final_line(
+                &status,
+                stdout_tail.as_deref().unwrap_or(""),
+            )],
             offset: FINAL_DONE,
             usage: None,
             last_activity_at: None,
@@ -293,7 +295,11 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let home = tempfile::tempdir().unwrap();
         (
-            FleetEnv { pool, home: home.path().to_path_buf(), run_tails: Default::default() },
+            FleetEnv {
+                pool,
+                home: home.path().to_path_buf(),
+                run_tails: Default::default(),
+            },
             home,
         )
     }
@@ -344,28 +350,96 @@ mod tests {
     #[test]
     fn runner_and_session_decide_the_key() {
         let claude = |r, s| key_of(r, s, 9);
-        assert_eq!(claude(Some("claude"), Some("s1")), (NodeKey::new("claude-code", "s1"), "claude-code"));
-        assert_eq!(claude(Some("codex"), Some("s1")), (NodeKey::new("codex-cli", "s1"), "codex-cli"));
-        assert_eq!(claude(None, Some("s1")).0, NodeKey::new("claude-code", "s1"));
-        assert_eq!(claude(Some("claude"), None), (NodeKey::new("daemon", "run-9"), "daemon"));
-        assert_eq!(claude(Some("claude"), Some("")).0, NodeKey::new("daemon", "run-9"));
-        assert_eq!(claude(Some("ollama"), Some("s1")).0, NodeKey::new("daemon", "run-9"));
+        assert_eq!(
+            claude(Some("claude"), Some("s1")),
+            (NodeKey::new("claude-code", "s1"), "claude-code")
+        );
+        assert_eq!(
+            claude(Some("codex"), Some("s1")),
+            (NodeKey::new("codex-cli", "s1"), "codex-cli")
+        );
+        assert_eq!(
+            claude(None, Some("s1")).0,
+            NodeKey::new("claude-code", "s1")
+        );
+        assert_eq!(
+            claude(Some("claude"), None),
+            (NodeKey::new("daemon", "run-9"), "daemon")
+        );
+        assert_eq!(
+            claude(Some("claude"), Some("")).0,
+            NodeKey::new("daemon", "run-9")
+        );
+        assert_eq!(
+            claude(Some("ollama"), Some("s1")).0,
+            NodeKey::new("daemon", "run-9")
+        );
     }
 
     #[tokio::test]
     async fn discover_sights_live_runs_and_recent_ones_and_skips_old_ones() {
         let (env, _home) = env().await;
         let now = Utc::now();
-        let live = insert(&env.pool, "running", Some("s1"), Some("claude"), now - Duration::minutes(2), None, None).await;
-        let waiting = insert(&env.pool, "awaiting_approval", Some("s2"), None, now - Duration::minutes(3), None, None).await;
-        let done = insert(&env.pool, "completed", Some("s3"), Some("codex"), now - Duration::minutes(6), Some(now - Duration::minutes(2)), None).await;
-        let orphan = insert(&env.pool, "interrupted", None, None, now - Duration::minutes(8), Some(now - Duration::minutes(3)), None).await;
-        let _old = insert(&env.pool, "completed", Some("s5"), None, now - Duration::hours(2), Some(now - Duration::hours(1)), None).await;
+        let live = insert(
+            &env.pool,
+            "running",
+            Some("s1"),
+            Some("claude"),
+            now - Duration::minutes(2),
+            None,
+            None,
+        )
+        .await;
+        let waiting = insert(
+            &env.pool,
+            "awaiting_approval",
+            Some("s2"),
+            None,
+            now - Duration::minutes(3),
+            None,
+            None,
+        )
+        .await;
+        let done = insert(
+            &env.pool,
+            "completed",
+            Some("s3"),
+            Some("codex"),
+            now - Duration::minutes(6),
+            Some(now - Duration::minutes(2)),
+            None,
+        )
+        .await;
+        let orphan = insert(
+            &env.pool,
+            "interrupted",
+            None,
+            None,
+            now - Duration::minutes(8),
+            Some(now - Duration::minutes(3)),
+            None,
+        )
+        .await;
+        let _old = insert(
+            &env.pool,
+            "completed",
+            Some("s5"),
+            None,
+            now - Duration::hours(2),
+            Some(now - Duration::hours(1)),
+            None,
+        )
+        .await;
         let source = DaemonRuns::new(&env);
 
         let sightings = source.discover(now - Duration::minutes(10)).await.unwrap();
 
-        let by_id = |id: i64| sightings.iter().find(|s| s.run_id == Some(id)).expect("sighted");
+        let by_id = |id: i64| {
+            sightings
+                .iter()
+                .find(|s| s.run_id == Some(id))
+                .expect("sighted")
+        };
         assert_eq!(sightings.len(), 4);
         let live = by_id(live);
         assert_eq!(live.key, NodeKey::new("claude-code", "s1"));
@@ -382,7 +456,10 @@ mod tests {
         assert!(done.ended_at.is_some());
         let orphan = by_id(orphan);
         assert_eq!(orphan.state, NodeState::Lost);
-        assert_eq!(orphan.key, NodeKey::new("daemon", &format!("run-{}", orphan.run_id.unwrap())));
+        assert_eq!(
+            orphan.key,
+            NodeKey::new("daemon", &format!("run-{}", orphan.run_id.unwrap()))
+        );
         assert_eq!(orphan.harness_label, "daemon");
     }
 
@@ -391,20 +468,70 @@ mod tests {
         let (env, _home) = env().await;
         let now = Utc::now();
         // A resumed session writes a second `runs` row under the same session id.
-        let live = insert(&env.pool, "running", Some("shared"), Some("claude"), now - Duration::minutes(5), None, None).await;
-        let _newer_done = insert(&env.pool, "completed", Some("shared"), Some("claude"), now - Duration::minutes(4), Some(now - Duration::minutes(1)), None).await;
-        let _older_done = insert(&env.pool, "completed", Some("again"), Some("claude"), now - Duration::minutes(6), Some(now - Duration::minutes(5)), None).await;
-        let newest_done = insert(&env.pool, "failed", Some("again"), Some("claude"), now - Duration::minutes(3), Some(now - Duration::minutes(2)), None).await;
+        let live = insert(
+            &env.pool,
+            "running",
+            Some("shared"),
+            Some("claude"),
+            now - Duration::minutes(5),
+            None,
+            None,
+        )
+        .await;
+        let _newer_done = insert(
+            &env.pool,
+            "completed",
+            Some("shared"),
+            Some("claude"),
+            now - Duration::minutes(4),
+            Some(now - Duration::minutes(1)),
+            None,
+        )
+        .await;
+        let _older_done = insert(
+            &env.pool,
+            "completed",
+            Some("again"),
+            Some("claude"),
+            now - Duration::minutes(6),
+            Some(now - Duration::minutes(5)),
+            None,
+        )
+        .await;
+        let newest_done = insert(
+            &env.pool,
+            "failed",
+            Some("again"),
+            Some("claude"),
+            now - Duration::minutes(3),
+            Some(now - Duration::minutes(2)),
+            None,
+        )
+        .await;
         let source = DaemonRuns::new(&env);
 
         let sightings = source.discover(now - Duration::minutes(10)).await.unwrap();
 
         assert_eq!(sightings.len(), 2, "one sighting per key: {sightings:?}");
-        let shared = sightings.iter().find(|s| s.key == NodeKey::new("claude-code", "shared")).unwrap();
-        assert_eq!(shared.run_id, Some(live), "the live run beats a newer finished one");
+        let shared = sightings
+            .iter()
+            .find(|s| s.key == NodeKey::new("claude-code", "shared"))
+            .unwrap();
+        assert_eq!(
+            shared.run_id,
+            Some(live),
+            "the live run beats a newer finished one"
+        );
         assert_eq!(shared.state, NodeState::Busy);
-        let again = sightings.iter().find(|s| s.key == NodeKey::new("claude-code", "again")).unwrap();
-        assert_eq!(again.run_id, Some(newest_done), "with no live run the highest id wins");
+        let again = sightings
+            .iter()
+            .find(|s| s.key == NodeKey::new("claude-code", "again"))
+            .unwrap();
+        assert_eq!(
+            again.run_id,
+            Some(newest_done),
+            "with no live run the highest id wins"
+        );
         // The handle follows the survivor, so a read never targets the shadowed run.
         assert_eq!(source.run_of(&shared.key), Some(live));
         assert_eq!(source.run_of(&again.key), Some(newest_done));
@@ -426,7 +553,16 @@ mod tests {
         for (status, _) in &table {
             let session = format!("sess-{status}");
             let (created, ended) = (now - Duration::minutes(5), now - Duration::minutes(1));
-            insert(&env.pool, status, Some(&session), Some("claude"), created, Some(ended), Some(stdout)).await;
+            insert(
+                &env.pool,
+                status,
+                Some(&session),
+                Some("claude"),
+                created,
+                Some(ended),
+                Some(stdout),
+            )
+            .await;
         }
         let source = DaemonRuns::new(&env);
         source.discover(now - Duration::minutes(10)).await.unwrap();
@@ -438,7 +574,10 @@ mod tests {
             assert_eq!(read.lines, vec![expected], "{status}");
             assert_eq!(read.offset, FINAL_DONE);
             let again = source.read_lines(&node, FINAL_DONE).await.unwrap();
-            assert!(again.lines.is_empty(), "{status} delivers its last line once");
+            assert!(
+                again.lines.is_empty(),
+                "{status} delivers its last line once"
+            );
         }
     }
 
@@ -446,14 +585,25 @@ mod tests {
     async fn a_running_run_is_read_from_its_live_buffer_incrementally() {
         let (env, _home) = env().await;
         let now = Utc::now();
-        let id = insert(&env.pool, "running", Some("live"), Some("claude"), now, None, None).await;
+        let id = insert(
+            &env.pool,
+            "running",
+            Some("live"),
+            Some("claude"),
+            now,
+            None,
+            None,
+        )
+        .await;
         let buffer = Arc::new(Mutex::new(
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}],\"usage\":{\"input_tokens\":7}}}\n{\"type\":\"assis".to_owned(),
         ));
         env.run_tails.lock().unwrap().insert(id, buffer.clone());
         let source = DaemonRuns::new(&env);
         source.discover(now - Duration::minutes(10)).await.unwrap();
-        let node = source.node_ref(&NodeKey::new("claude-code", "live")).unwrap();
+        let node = source
+            .node_ref(&NodeKey::new("claude-code", "live"))
+            .unwrap();
 
         let first = source.read_lines(&node, Offset::TAIL).await.unwrap();
         assert_eq!(first.lines, vec![TermLine::new(TermKind::Text, "hello")]);
@@ -474,10 +624,21 @@ mod tests {
     async fn a_running_run_without_a_buffer_yet_reads_nothing_and_keeps_its_offset() {
         let (env, _home) = env().await;
         let now = Utc::now();
-        insert(&env.pool, "running", Some("early"), Some("claude"), now, None, None).await;
+        insert(
+            &env.pool,
+            "running",
+            Some("early"),
+            Some("claude"),
+            now,
+            None,
+            None,
+        )
+        .await;
         let source = DaemonRuns::new(&env);
         source.discover(now - Duration::minutes(10)).await.unwrap();
-        let node = source.node_ref(&NodeKey::new("claude-code", "early")).unwrap();
+        let node = source
+            .node_ref(&NodeKey::new("claude-code", "early"))
+            .unwrap();
         let read = source.read_lines(&node, Offset::TAIL).await.unwrap();
         assert!(read.lines.is_empty());
         assert_eq!(read.offset, Offset::TAIL);
@@ -514,7 +675,10 @@ mod tests {
         let sightings = source.discover(now - Duration::minutes(10)).await.unwrap();
 
         let label = &sightings[0].label;
-        assert!(!label.contains("ghp_") && !label.contains(&token[4..14]), "{label}");
+        assert!(
+            !label.contains("ghp_") && !label.contains(&token[4..14]),
+            "{label}"
+        );
         assert!(label.chars().count() <= 80);
     }
 

@@ -791,8 +791,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_first_subscriber_starts_the_hub_and_the_last_one_stops_it_and_frees_the_watcher()
-    {
+    async fn the_first_subscriber_starts_the_hub_and_the_last_one_stops_it_and_frees_the_watcher() {
         let h = harness();
         h.source.set(vec![root("a")]);
         assert!(!h.hub.is_running());
@@ -1149,9 +1148,19 @@ mod tests {
 
         tokio::time::sleep(HEARTBEAT + Duration::from_millis(50)).await;
         let events = drain(&mut sub).await;
-        assert_eq!(kinds(&events).iter().filter(|k| **k == "heartbeat").count(), 1, "{events:?}");
+        assert_eq!(
+            kinds(&events).iter().filter(|k| **k == "heartbeat").count(),
+            1,
+            "{events:?}"
+        );
         tokio::time::sleep(HEARTBEAT).await;
-        assert_eq!(kinds(&drain(&mut sub).await).iter().filter(|k| **k == "heartbeat").count(), 1);
+        assert_eq!(
+            kinds(&drain(&mut sub).await)
+                .iter()
+                .filter(|k| **k == "heartbeat")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1165,7 +1174,12 @@ mod tests {
         tokio::time::sleep(SAFETY_NET + Duration::from_millis(50)).await;
 
         let events = drain(&mut sub).await;
-        assert!(events.iter().any(|e| e["t"] == "node" && e["node"]["id"] == "claude-code:late"), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["t"] == "node" && e["node"]["id"] == "claude-code:late"),
+            "{events:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1178,14 +1192,20 @@ mod tests {
 
         for n in 0..5 {
             h.source.push_line(&key, &format!("line {n}"));
-            h.hub.dirty_pass([h.source.path_of(&key)].into_iter().collect()).await;
+            h.hub
+                .dirty_pass([h.source.path_of(&key)].into_iter().collect())
+                .await;
         }
         tokio::time::sleep(Duration::from_millis(1_050)).await;
 
         let events = drain(&mut sub).await;
         let lines: Vec<_> = events.iter().filter(|e| e["t"] == "lines").collect();
         let metrics = events.iter().filter(|e| e["t"] == "metrics").count();
-        assert_eq!(lines.len(), 1, "five reads inside one batch become one event: {events:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "five reads inside one batch become one event: {events:?}"
+        );
         assert_eq!(lines[0]["lines"].as_array().unwrap().len(), 5);
         assert_eq!(metrics, 1);
     }
@@ -1193,20 +1213,34 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hung_source_is_cut_after_the_source_timeout_and_logged_once() {
         let h = harness_with(
-            HubConfig { source_timeout: Duration::from_secs(1), ..HubConfig::default() },
+            HubConfig {
+                source_timeout: Duration::from_secs(1),
+                ..HubConfig::default()
+            },
             true,
         );
         h.source.set(vec![root("a")]);
         let mut sub = h.hub.subscribe().await;
         drain(&mut sub).await;
 
-        h.source.hang_discover.store(true, std::sync::atomic::Ordering::SeqCst);
+        h.source
+            .hang_discover
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         h.hub.safety_net().await;
         h.hub.safety_net().await;
 
         // The warm-up discovery plus the two hung ones: each came back (cut), none stalled the hub.
-        assert_eq!(h.source.discoveries.load(std::sync::atomic::Ordering::SeqCst), 3);
-        assert_eq!(h.hub.state().logged.len(), 1, "the same timeout is logged once");
+        assert_eq!(
+            h.source
+                .discoveries
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            h.hub.state().logged.len(),
+            1,
+            "the same timeout is logged once"
+        );
         assert!(h.hub.is_running());
     }
 
@@ -1247,19 +1281,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_run_that_did_not_succeed_ends_done_with_an_error_line_and_a_successful_one_does_not() {
+    async fn a_run_that_did_not_succeed_ends_done_with_an_error_line_and_a_successful_one_does_not()
+    {
         for status in ["failed", "cancelled", "timed_out"] {
             let snapshot = snapshot_after_run_ended(status).await;
             assert_eq!(snapshot["nodes"][0]["state"], "done", "{status}");
-            let lines = snapshot["lines"]["claude-code:a"].as_array().expect("lines");
-            assert_eq!(lines.len(), 1, "a finished node shows only its last line: {status}");
+            let lines = snapshot["lines"]["claude-code:a"]
+                .as_array()
+                .expect("lines");
+            assert_eq!(
+                lines.len(),
+                1,
+                "a finished node shows only its last line: {status}"
+            );
             assert_eq!(lines[0]["kind"], "error", "{status}");
             assert_eq!(lines[0]["text"], status);
         }
 
         let snapshot = snapshot_after_run_ended("completed").await;
-        let lines = snapshot["lines"]["claude-code:a"].as_array().expect("lines");
-        assert_eq!(lines[0]["kind"], "text", "success keeps the native closing line");
+        let lines = snapshot["lines"]["claude-code:a"]
+            .as_array()
+            .expect("lines");
+        assert_eq!(
+            lines[0]["kind"], "text",
+            "success keeps the native closing line"
+        );
         assert_eq!(lines[0]["text"], "closing words");
     }
 
@@ -1274,8 +1320,14 @@ mod tests {
         h.source.set(vec![done, kid]);
 
         // Stopped hub: validated against a one-shot look.
-        assert_eq!(h.hub.pin("claude-code:ghost", true).await, Err(PinError::Unknown));
-        assert_eq!(h.hub.pin("claude-code:kid", true).await, Err(PinError::NotARoot));
+        assert_eq!(
+            h.hub.pin("claude-code:ghost", true).await,
+            Err(PinError::Unknown)
+        );
+        assert_eq!(
+            h.hub.pin("claude-code:kid", true).await,
+            Err(PinError::NotARoot)
+        );
         h.hub.pin("claude-code:a", true).await.unwrap();
         assert!(!h.hub.is_running());
 
@@ -1284,7 +1336,12 @@ mod tests {
         assert_eq!(drain(&mut sub).await[0]["nodes"][0]["pinned"], true);
         h.hub.pin("claude-code:a", false).await.unwrap();
         let events = drain(&mut sub).await;
-        assert!(events.iter().any(|e| e["t"] == "node" && e["node"]["pinned"] == false), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["t"] == "node" && e["node"]["pinned"] == false),
+            "{events:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1307,10 +1364,20 @@ mod tests {
         let page = h.hub.transcript("claude-code:a", None).await.unwrap();
         assert!(!page.entries[0].text.contains("ghp_"), "{page:?}");
         assert!(!page.entries[0].detail.as_deref().unwrap().contains("ghp_"));
-        assert_eq!(page.before.as_deref(), Some("120"), "the cursor passes through untouched");
+        assert_eq!(
+            page.before.as_deref(),
+            Some("120"),
+            "the cursor passes through untouched"
+        );
 
-        assert_eq!(h.hub.transcript("claude-code:b", None).await, Err(TranscriptError::NoTranscript));
-        assert_eq!(h.hub.transcript("claude-code:nope", None).await, Err(TranscriptError::UnknownNode));
+        assert_eq!(
+            h.hub.transcript("claude-code:b", None).await,
+            Err(TranscriptError::NoTranscript)
+        );
+        assert_eq!(
+            h.hub.transcript("claude-code:nope", None).await,
+            Err(TranscriptError::UnknownNode)
+        );
     }
 
     // Plain `#[tokio::test]`: `start_paused` would auto-advance the clock while sqlx's pool waits

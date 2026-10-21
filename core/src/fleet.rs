@@ -11,9 +11,9 @@ pub mod model;
 pub mod route;
 pub mod source;
 pub mod tail;
-pub mod watch;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +37,7 @@ pub type Sources = (Vec<Arc<dyn AgentSource>>, Vec<Arc<dyn EdgeSource>>);
 /// Every source, in precedence order. Each track adds ONE `push` line here; nothing else in this
 /// file changes. Edge sources are applied in the order they are listed: native edges first (they
 /// come from the `AgentSource`s themselves), then `work_nodes`, then `run_launch`.
+#[allow(clippy::vec_init_then_push)]
 pub fn sources(env: &FleetEnv) -> Sources {
     let _ = env;
     #[allow(unused_mut, clippy::vec_init_then_push)]
