@@ -3,14 +3,11 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { ArrowLeft, ArrowRight, Bot, Lock, LockOpen, Plus, RotateCw, Square, X } from "lucide-react";
 import { useProjects } from "../data/system";
 import {
-  addAgentTab,
   EMPTY_PROJECT_TABS as EMPTY,
   findTabById,
   findTabBySessionId,
   listenBrowserEvents,
   newTab,
-  removeTabById,
-  setTabSessionId,
   tabBack,
   tabClose,
   tabCreate,
@@ -26,14 +23,18 @@ import {
   type TabMap,
   type TabState,
 } from "../data/browser-tabs";
+import { ensureAgentEnv, reportAgentTabClosed } from "../data/browser-agent";
 import {
-  agentTabUrl,
-  ensureAgentEnv,
-  mintNonce,
-  reportAgentTabClosed,
-  startAgentPoller,
-} from "../data/browser-agent";
-import { embeddedAck } from "../data/browser-embedded";
+  consumeFocus,
+  getBrowserState,
+  markCreated,
+  setAgentNotice,
+  setBoundsProvider,
+  setTabMap,
+  unmarkCreated,
+  useBrowserStore,
+} from "../data/browser-store";
+import { AgentControlBar } from "./AgentControlBar";
 import { Button, ErrorNote, IconButton } from "../ui";
 import { useOverlayOpen } from "../ui/overlay";
 import { resolveOmnibox } from "./browser-omnibox";
@@ -56,9 +57,8 @@ export function BrowserPage() {
   const [picked, setPicked] = useState<string | null>(null);
   const project = picked ?? projects[0]?.project_id ?? null;
 
-  const [tabMap, setTabMap] = useState<TabMap>({});
-  const tabMapRef = useRef<TabMap>(tabMap);
-  tabMapRef.current = tabMap;
+  const { tabMap, created, focusIntent, agentNotice } = useBrowserStore();
+  const [highlightControl, setHighlightControl] = useState(false);
   const [runtimeMissing, setRuntimeMissing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -68,8 +68,8 @@ export function BrowserPage() {
 
   const current = project === null ? EMPTY : (tabMap[project] ?? EMPTY);
   const active = current.tabs.find((tab) => tab.id === current.activeId) ?? null;
-  // Tabs whose native webview exists; a tab is only shown once its creation has resolved.
-  const [created, setCreated] = useState<ReadonlySet<string>>(() => new Set());
+  // `created` (from the store) holds the tabs whose native webview exists; a tab is only shown
+  // once its creation has resolved.
   const activeReady = active !== null && created.has(active.id);
   const shownId = overlayOpen || runtimeMissing || !activeReady ? null : (active?.id ?? null);
   const tabCount = current.tabs.length;
@@ -83,6 +83,36 @@ export function BrowserPage() {
     }
     return lastBounds.current;
   }, []);
+
+  // Tell the store where the native webview goes, so agent tabs opened while this page is not
+  // mounted are created with real bounds once it is.
+  useEffect(() => {
+    setBoundsProvider(readBounds);
+    return () => setBoundsProvider(null);
+  }, [readBounds]);
+
+  // An agent focus request: switch to its project and tab, and draw the eye to the control bar.
+  useEffect(() => {
+    if (focusIntent === null) return;
+    const found = findTabBySessionId(getBrowserState().tabMap, focusIntent.sessionId);
+    if (found !== undefined) {
+      setPicked(focusIntent.project);
+      const tabId = found.tab.id;
+      setTabMap((map) => {
+        const entry = map[focusIntent.project];
+        if (entry === undefined || entry.activeId === tabId) return map;
+        return { ...map, [focusIntent.project]: { ...entry, activeId: tabId } };
+      });
+      setHighlightControl(true);
+    }
+    consumeFocus();
+  }, [focusIntent]);
+
+  useEffect(() => {
+    if (!highlightControl) return;
+    const timer = setTimeout(() => setHighlightControl(false), 3000);
+    return () => clearTimeout(timer);
+  }, [highlightControl]);
 
   const guard = useCallback((work: Promise<unknown>) => {
     work.then(
@@ -147,10 +177,10 @@ export function BrowserPage() {
       tabCreate(projectId, "owner", id, url, readBounds()).then(
         () => {
           // Skip a tab closed while it was being created.
-          const open = Object.values(tabMapRef.current).some((entry) =>
+          const open = Object.values(getBrowserState().tabMap).some((entry) =>
             entry.tabs.some((tab) => tab.id === id),
           );
-          if (open) setCreated((set) => new Set(set).add(id));
+          if (open) markCreated(id);
         },
         (e: unknown) => {
         setError(message(e));
@@ -190,15 +220,15 @@ export function BrowserPage() {
         }),
       onNewWindow: (w: NewWindow) => {
         // An agent tab's popups are dropped: the agent owns that tab's navigation.
-        if (findTabById(tabMapRef.current, w.fromTabId)?.tab.role === "agent") return;
-        const owner = Object.entries(tabMapRef.current).find(([, entry]) =>
+        if (findTabById(getBrowserState().tabMap, w.fromTabId)?.tab.role === "agent") return;
+        const owner = Object.entries(getBrowserState().tabMap).find(([, entry]) =>
           entry.tabs.some((tab) => tab.id === w.fromTabId),
         );
         if (owner !== undefined) handlers.current.openTab(owner[0], w.url);
       },
       onProcessFailed: (f: ProcessFailed) => {
         handlers.current.patchTab(f.tabId, { failed: true });
-        const found = findTabById(tabMapRef.current, f.tabId);
+        const found = findTabById(getBrowserState().tabMap, f.tabId);
         if (found?.tab.role === "agent" && found.tab.sessionId !== undefined) {
           void reportAgentTabClosed(found.tab.sessionId);
         }
@@ -219,79 +249,14 @@ export function BrowserPage() {
 
   // Prepare the agent browser environment once per project; never blocks the owner's tabs.
   const ensured = useRef<Set<string>>(new Set());
-  const [agentNotice, setAgentNotice] = useState<Record<string, string>>({});
   useEffect(() => {
     if (project === null || ensured.current.has(project)) return;
     ensured.current.add(project);
     const target = project;
     void ensureAgentEnv(target).then((result) => {
-      if (!result.ok) setAgentNotice((n) => ({ ...n, [target]: result.reason }));
+      if (!result.ok) setAgentNotice(target, result.reason);
     });
   }, [project]);
-
-  const agentHandlers = useRef({
-    onOpen: (_req: { request_id: string; project: string; url: string; kind: string }) => {},
-    onClose: (_req: { request_id: string; project: string; session_id: string; kind: string }) => {},
-  });
-  const handling = useRef<Set<string>>(new Set());
-  agentHandlers.current = {
-    onOpen: (req) => {
-      if (handling.current.has(req.request_id)) return;
-      handling.current.add(req.request_id);
-      const tabId = crypto.randomUUID();
-      const nonce = mintNonce();
-      const url = agentTabUrl(nonce);
-      setTabMap((map) => addAgentTab(map, req.project, newTab(tabId, url, "agent")));
-      const drop = () =>
-        setTabMap((map) => removeTabById(map, tabId).map);
-      void (async () => {
-        try {
-          await tabCreate(req.project, "agent", tabId, url, readBounds());
-          // Skip a tab closed while it was being created.
-          if (findTabById(tabMapRef.current, tabId) === undefined) return;
-          setCreated((set) => new Set(set).add(tabId));
-          const { session_id } = await embeddedAck(req.request_id, nonce);
-          setTabMap((map) => setTabSessionId(map, tabId, session_id));
-        } catch (e: unknown) {
-          setError(message(e));
-          drop();
-          setCreated((set) => {
-            const next = new Set(set);
-            next.delete(tabId);
-            return next;
-          });
-        }
-      })();
-    },
-    onClose: (req) => {
-      const found = findTabBySessionId(tabMapRef.current, req.session_id);
-      if (found === undefined) return;
-      const id = found.tab.id;
-      void tabClose(id).catch(() => {});
-      setCreated((set) => {
-        const next = new Set(set);
-        next.delete(id);
-        return next;
-      });
-      setTabMap((map) => removeTabById(map, id).map);
-    },
-  };
-
-  // The poller runs while the page is mounted. The spec says "every 1 s while the shell runs";
-  // hoisting it to the shell root is a follow-up if BrowserPage is not always mounted.
-  const stopPoller = useRef<(() => void) | null>(null);
-  useEffect(() => {
-    if (stopPoller.current === null) {
-      stopPoller.current = startAgentPoller({
-        onOpen: (req) => agentHandlers.current.onOpen(req),
-        onClose: (req) => agentHandlers.current.onClose(req),
-      });
-    }
-    return () => {
-      stopPoller.current?.();
-      stopPoller.current = null;
-    };
-  }, []);
 
   function switchProject(next: string) {
     guard(tabsShow(null, readBounds()));
@@ -311,15 +276,17 @@ export function BrowserPage() {
     const activeId =
       current.activeId === id ? (tabs[Math.min(index, tabs.length - 1)]?.id ?? null) : current.activeId;
     setTabMap((map) => ({ ...map, [project]: { tabs, activeId } }));
-    setCreated((set) => {
-      const next = new Set(set);
-      next.delete(id);
-      return next;
-    });
+    unmarkCreated(id);
     guard(tabClose(id));
     if (closing?.role === "agent" && closing.sessionId !== undefined) {
       void reportAgentTabClosed(closing.sessionId);
     }
+  }
+
+  function openInMyTabs(tab: Tab) {
+    if (project === null) return;
+    const url = tab.url === "" || tab.url.startsWith("about:blank") ? "about:blank" : tab.url;
+    openTab(project, url);
   }
 
   function submit(event: FormEvent) {
@@ -437,7 +404,14 @@ export function BrowserPage() {
           </Button>
         </p>
       ) : null}
-      {active?.role === "agent" ? <div className="browser-agent-bar">Agent is driving</div> : null}
+      {active?.role === "agent" ? (
+        <AgentControlBar
+          key={active.id}
+          tab={active}
+          highlight={highlightControl}
+          onOpenInMyTabs={openInMyTabs}
+        />
+      ) : null}
       {project !== null && agentNotice[project] !== undefined ? (
         <p className="browser-agent-notice">
           Agent browser unavailable: {agentNotice[project]}. Your own tabs still work.

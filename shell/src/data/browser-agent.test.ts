@@ -69,6 +69,30 @@ describe("startAgentPoller", () => {
     stop();
   });
 
+  it("routes a focus request once to onFocus", async () => {
+    const onFocus = vi.fn();
+    emb.embeddedRequests.mockResolvedValue([
+      { request_id: "f", kind: "focus", project: "p", session_id: "s1" },
+    ]);
+    const stop = startAgentPoller({ ...mk(), onFocus });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(onFocus.mock.calls[0][0].session_id).toBe("s1");
+    stop();
+  });
+
+  it("a focus without a handler is harmless", async () => {
+    const h = mk();
+    emb.embeddedRequests.mockResolvedValue([
+      { request_id: "f", kind: "focus", project: "p", session_id: "s1" },
+      { request_id: "a", kind: "open", project: "p", url: "u" },
+    ]);
+    const stop = startAgentPoller(h);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(h.onOpen).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
   it("ignores unknown kinds and incomplete requests", async () => {
     const h = mk();
     emb.embeddedRequests.mockResolvedValue([

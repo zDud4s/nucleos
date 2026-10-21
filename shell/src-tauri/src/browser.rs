@@ -52,6 +52,9 @@ const NEW_WINDOW_EVENT: &str = "browser://new-window";
 const PROCESS_FAILED_EVENT: &str = "browser://process-failed";
 /// `{}`: the WebView2 runtime is not installed.
 const RUNTIME_MISSING_EVENT: &str = "browser://runtime-missing";
+/// `{project, role, closedTabIds}`: the agent environment was rebuilt because `proxyAddr` changed;
+/// the listed tabs were closed (the keepalive webview is not among them).
+const ENV_REBUILT_EVENT: &str = "browser://env-rebuilt";
 
 /// A tab's webview label is this prefix followed by the tab id the React side minted.
 const LABEL_PREFIX: &str = "browser-";
@@ -475,6 +478,25 @@ struct TabState {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct EnvRebuilt {
+    project: String,
+    role: String,
+    closed_tab_ids: Vec<String>,
+}
+
+/// The tab ids behind the labels of closed webviews, in order. Keepalive webviews and labels that
+/// are not browser tabs are left out.
+fn closed_tab_ids(labels: &[String]) -> Vec<String> {
+    labels
+        .iter()
+        .filter_map(|label| tab_id_of_label(label))
+        .filter(|id| !is_keepalive_tab_id(id))
+        .map(str::to_string)
+        .collect()
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct NewWindow {
     from_tab_id: String,
     url: String,
@@ -709,14 +731,20 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
         existing.as_ref().and_then(|e| e.proxy_addr.as_deref()),
         proxy_addr,
     );
+    // Labels of the webviews actually closed by a rebuild, for the env-rebuilt event.
+    let mut closed_labels: Vec<String> = Vec::new();
+    let mut rebuilt = false;
     let generation = match (decision, &existing) {
         (RebuildDecision::Reuse, Some(env)) => return Ok(env.clone()),
         (RebuildDecision::Rebuild, Some(old)) => {
+            rebuilt = true;
             // Close every webview of the environment, the keepalive included, before rebuilding.
             let ids = state.registry().tabs_of(key);
             for id in ids {
-                if let Some(webview) = app.get_webview(&label_for(&id)) {
+                let label = label_for(&id);
+                if let Some(webview) = app.get_webview(&label) {
                     let _ = webview.close();
+                    closed_labels.push(label);
                 }
                 state.registry().remove_tab(&id);
             }
@@ -743,6 +771,17 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
     };
     create_keepalive(app, &key.project, &env)?;
     state.registry().replace_env(key, env.clone());
+    if rebuilt {
+        let _ = app.emit_to(
+            MAIN_LABEL,
+            ENV_REBUILT_EVENT,
+            EnvRebuilt {
+                project: key.project.clone(),
+                role: Role::Agent.as_str().to_string(),
+                closed_tab_ids: closed_tab_ids(&closed_labels),
+            },
+        );
+    }
     Ok(env)
 }
 
@@ -1096,6 +1135,37 @@ pub fn browser_tab_close(app: AppHandle, tab_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn labels(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn closed_tab_ids_maps_labels_in_order() {
+        let got = closed_tab_ids(&labels(&["browser-b", "browser-a", "browser-c"]));
+        assert_eq!(got, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn closed_tab_ids_excludes_keepalive_labels() {
+        let got = closed_tab_ids(&labels(&[
+            "browser-a",
+            "browser-agent-keepalive-p",
+            "browser-b",
+        ]));
+        assert_eq!(got, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn closed_tab_ids_skips_labels_without_prefix() {
+        let got = closed_tab_ids(&labels(&["main", "notch", "browser-", "browser-a"]));
+        assert_eq!(got, vec!["a"]);
+    }
+
+    #[test]
+    fn closed_tab_ids_of_nothing_is_empty() {
+        assert!(closed_tab_ids(&[]).is_empty());
+    }
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()

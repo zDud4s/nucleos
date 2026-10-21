@@ -13,7 +13,8 @@ import { apiFetch, isApiRefusal } from "./client";
 
 export type EmbeddedRequest = {
   request_id: string;
-  kind: "open" | "close" | string;
+  /** "open" (url), "close" (session_id) or "focus" (session_id: bring that tab to the front). */
+  kind: "open" | "close" | "focus" | string;
   project: string;
   url?: string;
   session_id?: string;
@@ -46,6 +47,32 @@ export function embeddedClosed(sessionId: string): Promise<void> {
   return apiFetch<void>(
     `/browser/embedded/sessions/${encodeURIComponent(sessionId)}/closed`,
     post({}),
+  );
+}
+
+/** Reply to an owner switch: nothing for "human" (204), the grant chain for "agent". */
+export type OwnerReply = { chain: string[]; row_id: number } | undefined;
+
+/** Hand a session to the person ("human") or back to the agent ("agent"). */
+export function embeddedOwner(
+  sessionId: number | string,
+  owner: "human" | "agent",
+): Promise<OwnerReply> {
+  return apiFetch<OwnerReply>(
+    `/browser/embedded/sessions/${encodeURIComponent(String(sessionId))}/owner`,
+    post({ owner }),
+  );
+}
+
+/** Keep (or release) a session's grant chain, optionally writable. */
+export function embeddedKeep(
+  sessionId: number | string,
+  keep: boolean,
+  writable: boolean,
+): Promise<{ granted: string[] }> {
+  return apiFetch<{ granted: string[] }>(
+    "/browser/keep",
+    post({ session_id: sessionId, keep, writable }),
   );
 }
 

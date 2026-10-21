@@ -101,6 +101,33 @@ describe("browser-embedded", () => {
     expect(c.auth).toBe("Bearer token-abc");
   });
 
+  it("embeddedOwner posts the owner; human gives undefined, agent gives the chain", async () => {
+    const m = await fresh();
+    fetchMock.mockResolvedValue(res(204));
+    await expect(m.embeddedOwner(7, "human")).resolves.toBeUndefined();
+    let c = lastCall();
+    expect(c.url).toMatch(/\/browser\/embedded\/sessions\/7\/owner$/);
+    expect(c.method).toBe("POST");
+    expect(JSON.parse(c.body as string)).toEqual({ owner: "human" });
+    expect(c.auth).toBe("Bearer token-abc");
+
+    fetchMock.mockResolvedValue(res(200, { chain: ["a", "b"], row_id: 3 }));
+    await expect(m.embeddedOwner(7, "agent")).resolves.toEqual({ chain: ["a", "b"], row_id: 3 });
+    c = lastCall();
+    expect(JSON.parse(c.body as string)).toEqual({ owner: "agent" });
+  });
+
+  it("embeddedKeep posts session_id, keep and writable", async () => {
+    const m = await fresh();
+    fetchMock.mockResolvedValue(res(200, { granted: ["x"] }));
+    await expect(m.embeddedKeep(7, true, false)).resolves.toEqual({ granted: ["x"] });
+    const c = lastCall();
+    expect(c.url).toMatch(/\/browser\/keep$/);
+    expect(c.method).toBe("POST");
+    expect(JSON.parse(c.body as string)).toEqual({ session_id: 7, keep: true, writable: false });
+    expect(c.auth).toBe("Bearer token-abc");
+  });
+
   it("409 pillar_off is recognised by isPillarOff", async () => {
     const m = await fresh();
     fetchMock.mockResolvedValue(res(409, { refusal: "pillar_off" }));

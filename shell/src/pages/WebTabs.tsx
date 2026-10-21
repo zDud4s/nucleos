@@ -20,7 +20,8 @@ import { Web, WebHeader } from "./Web";
  * panel is local state. Sessions stays mounted (hidden) for the whole page life: its "keep
  * these?" question lives in local state and outranks everything, because the window it asks
  * about has already closed, so toggling panels must not throw it away. A session asking for the
- * wheel is counted on its toggle.
+ * wheel is counted on its toggle. On Windows the Sessions panel lists no sessions: it hosts only
+ * the open bar, the chain dialogue and the site grants.
  */
 export function webPanelOf(pathname: string): "archive" | null {
   return pathname === "/web/archive" || pathname.startsWith("/web/pages/") ? "archive" : null;
