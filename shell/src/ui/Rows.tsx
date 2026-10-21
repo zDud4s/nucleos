@@ -1,4 +1,6 @@
 import type { ReactNode } from "react";
+import { motion } from "motion/react";
+import { rowMotion } from "../lib/motion";
 
 export interface RowsProps {
   /**
@@ -69,6 +71,13 @@ export interface RowProps {
    * a class of its own.
    */
   className?: string;
+  /**
+   * For a live-polled list: a row that arrives fades its contents in (the row itself stays opaque,
+   * see `rowMotion`); a row that leaves goes at once. Put the rows, keyed, inside an
+   * `AnimatePresence initial={false}` so the first render arrives still. Off by default: a static
+   * list owes nobody an animation.
+   */
+  animated?: boolean;
   children: ReactNode;
 }
 
@@ -126,7 +135,7 @@ export function Rows({ label, as = "ul", className, children }: RowsProps) {
  * with the narrow brief its doc gives; `layout`, `current` and `dense` remain the
  * way to say the things the shared layer owns.
  */
-export function Row({ layout = "stack", current, dense, className, children }: RowProps) {
+export function Row({ layout = "stack", current, dense, className, animated, children }: RowProps) {
   const classes = [
     "ui-rows-row",
     layout === "line" ? "ui-rows-row-line" : undefined,
@@ -136,5 +145,12 @@ export function Row({ layout = "stack", current, dense, className, children }: R
   ]
     .filter((c) => c !== undefined)
     .join(" ");
+  if (animated === true) {
+    return (
+      <motion.li className={classes} data-motion="" {...rowMotion}>
+        {children}
+      </motion.li>
+    );
+  }
   return <li className={classes}>{children}</li>;
 }

@@ -2,6 +2,8 @@ import React from "react";
 import type { Root } from "react-dom/client";
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
+import { MotionConfig } from "motion/react";
+import { transition } from "../lib/motion";
 import { lastPlace, rememberPlace } from "./last-place";
 import { installPacing } from "./pacing";
 import { createAppRouter } from "../router";
@@ -33,7 +35,10 @@ export function mountMainWindow(root: Root, queryClient: QueryClient): void {
   root.render(
     <React.StrictMode>
       <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
+        {/* WAAPI ignores the CSS reduced-motion clamp, so `motion` is asked to honour it here. */}
+        <MotionConfig reducedMotion="user" transition={transition}>
+          <RouterProvider router={router} />
+        </MotionConfig>
       </QueryClientProvider>
     </React.StrictMode>,
   );
