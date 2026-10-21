@@ -8,7 +8,25 @@ const mocks = vi.hoisted(() => ({
   listeners: new Map<string, (e: { payload: unknown }) => void>(),
   unlisten: vi.fn(),
   overlay: { open: false },
+  ensureAgentEnv: vi.fn(),
+  stopPoller: vi.fn(),
+  startAgentPoller: vi.fn(),
+  reportAgentTabClosed: vi.fn(),
+  embeddedAck: vi.fn(),
+  poller: { handlers: null as null | {
+    onOpen: (r: { request_id: string; project: string; url: string; kind: string }) => void;
+    onClose: (r: { request_id: string; project: string; session_id: string; kind: string }) => void;
+  } },
 }));
+
+vi.mock("../data/browser-agent", () => ({
+  ensureAgentEnv: mocks.ensureAgentEnv,
+  startAgentPoller: mocks.startAgentPoller,
+  mintNonce: () => "nonce-1",
+  agentTabUrl: (n: string) => `about:blank#${n}`,
+  reportAgentTabClosed: mocks.reportAgentTabClosed,
+}));
+vi.mock("../data/browser-embedded", () => ({ embeddedAck: mocks.embeddedAck }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -68,6 +86,19 @@ beforeEach(() => {
   mocks.listeners.clear();
   mocks.unlisten.mockClear();
   mocks.overlay.open = false;
+  mocks.ensureAgentEnv.mockReset();
+  mocks.ensureAgentEnv.mockResolvedValue({ ok: true, cdpHttp: "http://127.0.0.1:1" });
+  mocks.stopPoller.mockReset();
+  mocks.poller.handlers = null;
+  mocks.startAgentPoller.mockReset();
+  mocks.startAgentPoller.mockImplementation((handlers) => {
+    mocks.poller.handlers = handlers;
+    return mocks.stopPoller;
+  });
+  mocks.reportAgentTabClosed.mockReset();
+  mocks.reportAgentTabClosed.mockResolvedValue(undefined);
+  mocks.embeddedAck.mockReset();
+  mocks.embeddedAck.mockResolvedValue({ session_id: "s1" });
   rect.width = 800;
   rect.height = 600;
   rect.y = 100;
@@ -232,6 +263,104 @@ describe("BrowserPage", () => {
     expect(calls("browser_tabs_show")[0].tabId).toBeNull();
     expect(screen.getByText("No tabs open in this project.")).toBeTruthy();
     expect(last(calls("browser_tabs_show"))?.tabId).toBeNull();
+  });
+
+  describe("agent tabs", () => {
+    const openReq = { request_id: "r1", project: "alpha", url: "https://a.example/", kind: "embedded" };
+
+    async function openAgent(): Promise<string> {
+      await waitFor(() => expect(mocks.poller.handlers).not.toBeNull());
+      act(() => mocks.poller.handlers!.onOpen(openReq));
+      await waitFor(() => expect(mocks.embeddedAck).toHaveBeenCalled());
+      await waitFor(() => expect(document.querySelector('[data-role="agent"]')).not.toBeNull());
+      // Let the ack resolve and the session id land in the tab.
+      await act(async () => {});
+      return last(calls("browser_tab_create"))!.tabId as string;
+    }
+
+    it("ensures the agent environment once per project", async () => {
+      render(<BrowserPage />);
+      await waitFor(() => expect(mocks.ensureAgentEnv).toHaveBeenCalledWith("alpha"));
+      const combo = screen.getByRole("combobox", { name: "Project" });
+      fireEvent.change(combo, { target: { value: "beta" } });
+      await waitFor(() => expect(mocks.ensureAgentEnv).toHaveBeenCalledWith("beta"));
+      fireEvent.change(combo, { target: { value: "alpha" } });
+      expect(mocks.ensureAgentEnv).toHaveBeenCalledTimes(2);
+    });
+
+    it("shows a quiet notice when the environment is unavailable, owner tabs still work", async () => {
+      mocks.ensureAgentEnv.mockResolvedValue({ ok: false, reason: "no chrome" });
+      render(<BrowserPage />);
+      expect(await screen.findByText(/Agent browser unavailable: no chrome/)).toBeTruthy();
+      await openTab();
+      expect(calls("browser_tab_create")[0]).toMatchObject({ role: "owner" });
+    });
+
+    it("starts the poller once", async () => {
+      render(<BrowserPage />);
+      await waitFor(() => expect(mocks.startAgentPoller).toHaveBeenCalledTimes(1));
+    });
+
+    it("opens an agent tab and acknowledges it with the nonce", async () => {
+      render(<BrowserPage />);
+      await openAgent();
+      expect(last(calls("browser_tab_create"))).toMatchObject({
+        project: "alpha",
+        role: "agent",
+        url: "about:blank#nonce-1",
+      });
+      expect(mocks.embeddedAck).toHaveBeenCalledWith("r1", "nonce-1");
+      expect(document.querySelector('[data-role="agent"]')).not.toBeNull();
+    });
+
+    it("shows the driving bar only while the agent tab is active", async () => {
+      render(<BrowserPage />);
+      expect(screen.queryByText("Agent is driving")).toBeNull();
+      await openAgent();
+      expect(screen.getByText("Agent is driving")).toBeTruthy();
+      fireEvent.click(screen.getAllByRole("button", { name: "New tab" })[0]);
+      await waitFor(() => expect(screen.queryByText("Agent is driving")).toBeNull());
+    });
+
+    it("closes the tab when the daemon asks", async () => {
+      render(<BrowserPage />);
+      const tabId = await openAgent();
+      await waitFor(() => expect(mocks.embeddedAck).toHaveBeenCalled());
+      act(() =>
+        mocks.poller.handlers!.onClose({
+          request_id: "r2",
+          project: "alpha",
+          session_id: "s1",
+          kind: "embedded",
+        }),
+      );
+      await waitFor(() => expect(calls("browser_tab_close")).toEqual([{ tabId }]));
+      expect(document.querySelector('[data-role="agent"]')).toBeNull();
+      expect(mocks.reportAgentTabClosed).not.toHaveBeenCalled();
+    });
+
+    it("reports a user close of an agent tab", async () => {
+      render(<BrowserPage />);
+      await openAgent();
+      fireEvent.click(screen.getByRole("button", { name: /^Close/ }));
+      expect(mocks.reportAgentTabClosed).toHaveBeenCalledWith("s1");
+    });
+
+    it("reports a process failure of an agent tab", async () => {
+      render(<BrowserPage />);
+      const tabId = await openAgent();
+      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      emit("process-failed", { tabId, kind: "crashed" });
+      expect(mocks.reportAgentTabClosed).toHaveBeenCalledWith("s1");
+    });
+
+    it("drops a new-window event from an agent tab", async () => {
+      render(<BrowserPage />);
+      const tabId = await openAgent();
+      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      emit("new-window", { fromTabId: tabId, url: "https://popup.example/" });
+      expect(calls("browser_tab_create")).toHaveLength(1);
+    });
   });
 
   it("unsubscribes from the events on unmount", async () => {

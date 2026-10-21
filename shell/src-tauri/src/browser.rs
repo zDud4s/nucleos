@@ -1,8 +1,8 @@
 //! §spec browser-integrado
 //!
 //! The integrated browser, owner side: every tab is a child webview of the main window, positioned
-//! over the `/web` page's content area by the React side. Phase 1 has the `owner` environment only
-//! (no CDP, no daemon); the `agent` environment is refused until a later round.
+//! over the `/web` page's content area by the React side. The `owner` environment has no CDP; the
+//! `agent` environment is built by `browser_env_ensure` (proxy, CDP port, hidden keepalive webview).
 //!
 //! **Browser webviews hold no Tauri IPC.** `capabilities/default.json` is scoped to the window
 //! `main` and has no `remote` section, so no capability reaches a remote origin. This app also ships
@@ -27,6 +27,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::browser_agent::{
+    agent_args, free_loopback_port, generation_dir_name, is_keepalive_tab_id, keepalive_label,
+    keepalive_tab_id, rebuild_decision, RebuildDecision,
+};
 use serde::{Deserialize, Serialize};
 use tauri::webview::{NewWindowResponse, PageLoadEvent, WebviewBuilder};
 use tauri::{
@@ -143,6 +147,7 @@ fn check_project(project: &str) -> Result<(), String> {
 /// A tab id ends up inside a webview label, which tauri restricts to a small alphabet.
 fn check_tab_id(tab_id: &str) -> Result<(), String> {
     let ok = !tab_id.is_empty()
+        && !is_keepalive_tab_id(tab_id)
         && tab_id.len() <= 64
         && tab_id
             .chars()
@@ -312,6 +317,12 @@ fn looks_like_runtime_missing(message: &str) -> bool {
 pub struct EnvInfo {
     args: String,
     data_dir: PathBuf,
+    /// The agent environment's proxy; `None` for the owner.
+    proxy_addr: Option<String>,
+    /// The agent environment's CDP port; `None` for the owner.
+    cdp_port: Option<u16>,
+    /// Which `agent[-n]` data directory this build uses; 0 for the owner and a first agent build.
+    generation: u32,
 }
 
 /// Environments by key, and which environment each tab belongs to. No tauri types: testable bare.
@@ -366,6 +377,25 @@ impl Registry {
         self.tabs.remove(tab_id)
     }
 
+    /// A copy of the environment registered for `key`, if any.
+    fn env(&self, key: &EnvKey) -> Option<EnvInfo> {
+        self.envs.get(key).cloned()
+    }
+
+    /// Registers `info` for `key`, replacing any previous environment.
+    fn replace_env(&mut self, key: &EnvKey, info: EnvInfo) {
+        self.envs.insert(key.clone(), info);
+    }
+
+    /// The ids of the live tabs of the environment `key`.
+    fn tabs_of(&self, key: &EnvKey) -> Vec<String> {
+        self.tabs
+            .iter()
+            .filter(|(_, k)| *k == key)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     #[cfg(test)]
     fn env_of(&self, tab_id: &str) -> Option<&EnvKey> {
         self.tabs.get(tab_id)
@@ -381,6 +411,8 @@ impl Registry {
 #[derive(Default)]
 pub struct Browser {
     registry: Mutex<Registry>,
+    /// Serialises agent-environment ensure calls for the whole build.
+    agent_gate: Mutex<()>,
 }
 
 impl Browser {
@@ -643,18 +675,105 @@ fn webview_of(app: &AppHandle, tab_id: &str) -> Result<tauri::Webview, String> {
         .ok_or_else(|| "unknown_tab".to_string())
 }
 
-/// The environment for `key` (created lazily), or the refusal of an environment this phase lacks.
+/// The environment for `key`. The owner one is created lazily; the agent one is only built by
+/// [`ensure_agent_env`] (through `browser_env_ensure`), so here it is returned if registered and
+/// `agent_env_missing` otherwise.
 fn ensure_env(app: &AppHandle, key: &EnvKey) -> Result<EnvInfo, String> {
+    let state = app.state::<Browser>();
     if key.role == Role::Agent {
-        return Err("agent_env_unavailable".to_string());
+        return state
+            .registry()
+            .env(key)
+            .ok_or_else(|| "agent_env_missing".to_string());
     }
     let base = app.path().local_data_dir().map_err(|e| e.to_string())?;
-    let state = app.state::<Browser>();
     let mut registry = state.registry();
     Ok(registry.ensure_env(key, || EnvInfo {
         args: browser_args(&[]),
         data_dir: data_dir(&base, key),
+        proxy_addr: None,
+        cdp_port: None,
+        generation: 0,
     }))
+}
+
+/// Builds (or reuses, or rebuilds) the agent environment of `key` for `proxy_addr`. Blocking-thread
+/// only: it calls `add_child`, which must not run on the main thread (see the module docs). Calls
+/// are serialised by `Browser::agent_gate`; the registry lock is never held across webview work.
+fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<EnvInfo, String> {
+    let state = app.state::<Browser>();
+    let _gate = state.agent_gate.lock().unwrap_or_else(|e| e.into_inner());
+
+    let existing = state.registry().env(key);
+    let decision = rebuild_decision(
+        existing.as_ref().and_then(|e| e.proxy_addr.as_deref()),
+        proxy_addr,
+    );
+    let generation = match (decision, &existing) {
+        (RebuildDecision::Reuse, Some(env)) => return Ok(env.clone()),
+        (RebuildDecision::Rebuild, Some(old)) => {
+            // Close every webview of the environment, the keepalive included, before rebuilding.
+            let ids = state.registry().tabs_of(key);
+            for id in ids {
+                if let Some(webview) = app.get_webview(&label_for(&id)) {
+                    let _ = webview.close();
+                }
+                state.registry().remove_tab(&id);
+            }
+            if let Some(webview) = app.get_webview(&keepalive_label(&key.project)?) {
+                let _ = webview.close();
+            }
+            // Always a fresh directory: WebView2 may refuse the old one with new arguments while
+            // the old browser process still lingers.
+            old.generation + 1
+        }
+        _ => 0,
+    };
+
+    let base = app.path().local_data_dir().map_err(|e| e.to_string())?;
+    let port = free_loopback_port()?;
+    let extra = agent_args(proxy_addr, port);
+    let refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let env = EnvInfo {
+        args: browser_args(&refs),
+        data_dir: data_dir(&base, key).with_file_name(generation_dir_name(generation)),
+        proxy_addr: Some(proxy_addr.to_string()),
+        cdp_port: Some(port),
+        generation,
+    };
+    create_keepalive(app, &key.project, &env)?;
+    state.registry().replace_env(key, env.clone());
+    Ok(env)
+}
+
+/// The hidden `about:blank` webview that keeps the agent environment's browser process (and so its
+/// CDP port) alive. Built with a plain builder: no tab state, no handlers, no events.
+fn create_keepalive(app: &AppHandle, project: &str, env: &EnvInfo) -> Result<(), String> {
+    let window = app
+        .get_window(MAIN_LABEL)
+        .ok_or_else(|| "no_main_window".to_string())?;
+    let blank = Url::parse("about:blank").map_err(|e| e.to_string())?;
+    let builder = WebviewBuilder::new(keepalive_label(project)?, WebviewUrl::External(blank))
+        .data_directory(env.data_dir.clone())
+        .additional_browser_args(&env.args)
+        .disable_drag_drop_handler();
+    match window.add_child(
+        builder,
+        LogicalPosition::new(0.0, 0.0),
+        LogicalSize::new(1.0, 1.0),
+    ) {
+        Ok(webview) => {
+            let _ = webview.hide();
+            Ok(())
+        }
+        Err(e) => {
+            let message = e.to_string();
+            if looks_like_runtime_missing(&message) {
+                let _ = app.emit_to(MAIN_LABEL, RUNTIME_MISSING_EVENT, serde_json::json!({}));
+            }
+            Err(message)
+        }
+    }
 }
 
 fn build_webview(
@@ -788,15 +907,42 @@ pub struct EnsureReply {
     cdp_http: Option<String>,
 }
 
+/// `async` so tauri runs it off the main thread; the agent build (which calls `add_child`) goes to
+/// `spawn_blocking`. `proxy_addr` is required for the agent environment and refused for the owner.
 #[tauri::command]
-pub fn browser_env_ensure(
+pub async fn browser_env_ensure(
     app: AppHandle,
     project: String,
     role: String,
+    proxy_addr: Option<String>,
 ) -> Result<EnsureReply, String> {
     let key = EnvKey::new(&project, &role)?;
-    ensure_env(&app, &key)?;
-    Ok(EnsureReply { cdp_http: None })
+    match key.role {
+        Role::Owner => {
+            if proxy_addr.is_some() {
+                return Err("owner_proxy_unexpected".to_string());
+            }
+            ensure_env(&app, &key)?;
+            Ok(EnsureReply { cdp_http: None })
+        }
+        Role::Agent => {
+            let proxy = proxy_addr
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| "agent_proxy_required".to_string())?;
+            keepalive_tab_id(&project)?;
+            let env =
+                tauri::async_runtime::spawn_blocking(move || ensure_agent_env(&app, &key, &proxy))
+                    .await
+                    .map_err(|e| e.to_string())??;
+            let port = env
+                .cdp_port
+                .ok_or_else(|| "agent_env_missing".to_string())?;
+            Ok(EnsureReply {
+                cdp_http: Some(format!("http://127.0.0.1:{port}")),
+            })
+        }
+    }
 }
 
 /// `async` so tauri runs it off the main thread, and the build itself on `spawn_blocking`: see the
@@ -811,9 +957,6 @@ pub async fn browser_tab_create(
     bounds: Bounds,
 ) -> Result<(), String> {
     let key = EnvKey::new(&project, &role)?;
-    if key.role == Role::Agent {
-        return Err("agent_env_unavailable".to_string());
-    }
     check_tab_id(&tab_id)?;
     bounds.validate()?;
     let url = checked_url(&app, &url)?;
@@ -912,7 +1055,9 @@ pub fn browser_tabs_show(
     let tabs: Vec<String> = window
         .webviews()
         .iter()
-        .filter_map(|w| tab_id_of_label(w.label()).map(str::to_string))
+        .filter_map(|w| tab_id_of_label(w.label()))
+        .filter(|id| !is_keepalive_tab_id(id))
+        .map(str::to_string)
         .collect();
 
     // Apply the plan even when it carries an error: an unknown target must still hide the others.
@@ -967,7 +1112,70 @@ mod tests {
         EnvInfo {
             args: args.to_string(),
             data_dir: PathBuf::from("d"),
+            proxy_addr: None,
+            cdp_port: None,
+            generation: 0,
         }
+    }
+
+    #[test]
+    fn owner_and_agent_envs_of_one_project_are_distinct() {
+        let owner = EnvKey::new("p", "owner").unwrap();
+        let agent = EnvKey::new("p", "agent").unwrap();
+        assert_ne!(owner, agent);
+        let base = Path::new("base");
+        assert_ne!(data_dir(base, &owner), data_dir(base, &agent));
+        assert!(data_dir(base, &agent).ends_with("agent"));
+
+        let mut registry = Registry::default();
+        let a = registry.ensure_env(&owner, || env("owner-args"));
+        let b = registry.ensure_env(&agent, || env("agent-args"));
+        assert_eq!(a.args, "owner-args");
+        assert_eq!(b.args, "agent-args");
+        assert_eq!(
+            registry.ensure_env(&owner, || env("other")).args,
+            "owner-args"
+        );
+    }
+
+    #[test]
+    fn registry_env_replace_and_tabs_of() {
+        let owner = key("p", Role::Owner);
+        let agent = key("p", Role::Agent);
+        let mut registry = Registry::default();
+        assert_eq!(registry.env(&agent), None);
+        registry.replace_env(&agent, env("one"));
+        assert_eq!(registry.env(&agent), Some(env("one")));
+        registry.replace_env(&agent, env("two"));
+        assert_eq!(registry.env(&agent).unwrap().args, "two");
+        assert_eq!(registry.env(&owner), None);
+
+        registry.replace_env(&owner, env("o"));
+        registry.reserve_tab("t1", agent.clone()).unwrap();
+        registry.finish_tab("t1").unwrap();
+        registry.reserve_tab("t2", owner.clone()).unwrap();
+        registry.finish_tab("t2").unwrap();
+        assert_eq!(registry.tabs_of(&agent), vec!["t1".to_string()]);
+        assert_eq!(registry.tabs_of(&owner), vec!["t2".to_string()]);
+        registry.remove_tab("t1");
+        assert!(registry.tabs_of(&agent).is_empty());
+    }
+
+    #[test]
+    fn keepalive_tab_ids_are_refused_as_tab_ids() {
+        assert_eq!(
+            check_tab_id("agent-keepalive-p"),
+            Err("invalid_tab_id".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_generation_dirs_are_siblings_of_the_base_dir() {
+        let agent = EnvKey::new("p", "agent").unwrap();
+        let base = Path::new("base");
+        let g = data_dir(base, &agent).with_file_name(generation_dir_name(2));
+        assert!(g.ends_with("agent-2"));
+        assert_eq!(g.parent(), data_dir(base, &agent).parent());
     }
 
     #[test]

@@ -3,6 +3,8 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 /// The integrated browser: owner tabs as child webviews of the main window.
 mod browser;
+/// Pure helpers for the agent browser environment.
+mod browser_agent;
 pub mod daemon;
 /// The OS calls that carry those decisions out, and nothing else. Holds no rules.
 pub mod dictation;
