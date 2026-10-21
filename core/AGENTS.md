@@ -296,6 +296,8 @@ the contract, not a snapshot.
 | `channels/routing/announce.rs` | Feed lines to the primary channel's outbox (policy, project thread or prefix, 24 h TTL). |
 | `channels/schema.rs` | Test-only: checks that migrations 0220-0227 and 0230 create the channel tables, indexes and CHECKs. |
 | `channels/strings.rs` | Single table of user-visible channel text. |
+| `channels/switch_tests.rs` | Test-only: tests for the Telegram channel switch (`telegram_switch.rs`). |
+| `channels/telegram_switch.rs` | The Telegram channel switch. |
 | `channels/testkit.rs` | Test-only: helpers that build a real `AppState` over a fresh pool. |
 | `channels/tokens.rs` | Button action tokens and their housekeeping. |
 | `chats/groups.rs` | User-defined groups for the Chats column (migration 0157): CRUD and assignment; deleting a group ungroups its chats. Never touches turns. |

@@ -163,7 +163,9 @@ jobs:
           # The highest any sidecar's go.mod asks for. `gates.sh` discovers the modules rather than
           # listing them, so a new sidecar needs nothing here unless it needs a newer Go.
           go-version: '1.26.x'
-          cache-dependency-path: sidecars/*/go.sum
+          cache-dependency-path: |
+            sidecars/*/go.sum
+            sidecars/lib/*/go.sum
 
       - run: bash scripts/gates.sh sidecars
 

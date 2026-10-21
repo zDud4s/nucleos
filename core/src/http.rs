@@ -17165,6 +17165,99 @@ mod tests {
         assert_eq!(relays, 0, "a refused relay must leave no row behind");
     }
 
+    /// Shared by the two channel-origin relay tests: a relay POST from a run whose `origin` column
+    /// holds `origin`, answered with the refusal slug.
+    async fn relay_refusal_for_run_origin(origin: Option<&str>, via_send_message: bool) -> String {
+        let state = test_state().await;
+        let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let to_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let sending_run_id: i64 = if via_send_message {
+            crate::assistant::send_message(
+                &state,
+                &from_chat_id,
+                "ola",
+                crate::assistant::Origin::Channel("telegram"),
+            )
+            .await
+            .unwrap()
+        } else {
+            sqlx::query_scalar(
+                "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+                 VALUES ('ola', 'running', 'assistant', ?, ?, ?) RETURNING id",
+            )
+            .bind(&from_chat_id)
+            .bind(origin)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+        };
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{to_chat_id}/relay"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .header(
+                        crate::daemon_client::RUN_ID_HEADER,
+                        sending_run_id.to_string(),
+                    )
+                    .body(Body::from(
+                        serde_json::json!({ "text": "onward" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let relays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(relays, 0, "a refused relay must leave no row behind");
+        json_body(response).await["refusal"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A turn that arrived through a channel sidecar may not relay: it is remote like Telegram, so
+    /// the gate answers with the remote-origin refusal and not `unknown_origin`.
+    #[tokio::test]
+    async fn a_relay_asked_for_by_a_channel_turn_is_refused_as_remote_origin() {
+        assert_eq!(
+            relay_refusal_for_run_origin(None, true).await,
+            "telegram_origin"
+        );
+    }
+
+    /// A run row written with the migrated spelling `channel:telegram` (what the v2 sidecar
+    /// records) reads back as a channel origin and cannot forward.
+    #[tokio::test]
+    async fn a_run_with_the_migrated_channel_telegram_origin_cannot_forward() {
+        assert_eq!(
+            relay_refusal_for_run_origin(Some("channel:telegram"), false).await,
+            "telegram_origin"
+        );
+        // An unregistered channel id stays unknown and is refused as such.
+        assert_eq!(
+            relay_refusal_for_run_origin(Some("channel:nope"), false).await,
+            "unknown_origin"
+        );
+    }
+
     /// A sending turn whose origin nobody recorded is refused, not assumed to be the permissive
     /// answer.
     ///
