@@ -5,3 +5,631 @@ mod record;
 mod session;
 #[cfg(test)]
 mod fixture;
+
+// The FINAL production `use` block of this file (later tasks add none). `Cursor`, `TermLine` and
+// `AgentMeta` are first used in Tasks 13-16 and warn as unused until then.
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
+
+use crate::fleet::FleetEnv;
+use crate::fleet::limits;
+use crate::fleet::model::{clean_label, Cursor, NodeKey, NodeState, TermLine, Timestamp, TranscriptPage};
+use crate::fleet::source::{AgentSource, LinesRead, NodeRef, Offset, Sighting, SourceError, SourceResult, Usage};
+use crate::fleet::tail;
+use record::TurnMark;
+use session::{AgentMeta, ProcessProbe, SessionFile};
+
+const HARNESS: &str = "claude-code";
+
+/// Chars of a session name or subagent description kept as the node label (contract amendment 18).
+const LABEL_CHARS: usize = 80;
+
+/// `(mtime, len)` of a file: changes whenever Claude Code rewrites or appends to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    mtime: SystemTime,
+    len: u64,
+}
+
+impl Stamp {
+    fn of(md: &std::fs::Metadata) -> Self {
+        Self {
+            mtime: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            len: md.len(),
+        }
+    }
+}
+
+fn utc(t: SystemTime) -> Timestamp {
+    DateTime::<Utc>::from(t)
+}
+
+/// Ids become path components; accept only what Claude Code itself generates (uuids, hex).
+fn safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Counters the tests read to prove discovery is incremental (spec §4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct Stats {
+    session_parses: u32,
+    meta_parses: u32,
+    subagent_listings: u32,
+    tail_reads: u32,
+    /// Fallback searches of every project directory for a transcript (Task 10, negative cache).
+    project_scans: u32,
+}
+
+/// A daemon run that names this session (`runs.session_id`).
+#[derive(Clone, Debug)]
+struct RunRow {
+    id: i64,
+    status: String,
+    cwd: Option<String>,
+    created_at: Option<Timestamp>,
+    completed_at: Option<Timestamp>,
+}
+
+/// What the last 64 KB of a transcript say.
+#[derive(Clone, Debug, Default)]
+struct TailFacts {
+    model: Option<String>,
+    usage: Option<Usage>,
+    /// `Some(true)`: last conversation record closed the turn. `None`: none found in the window.
+    closed: Option<bool>,
+}
+
+struct ChildCache {
+    meta: AgentMeta,
+    meta_path: PathBuf,
+    meta_stamp: Stamp,
+    transcript: PathBuf,
+    started_at: Timestamp,
+    last_activity: Timestamp,
+}
+
+/// What a registry entry said about its root. Kept after Claude Code deletes the entry (it does
+/// at a clean exit), so a root that stays known as `Done` keeps its label, project and role.
+#[derive(Clone, Debug)]
+struct Identity {
+    name: Option<String>,
+    cwd: Option<String>,
+    kind: Option<String>,
+}
+
+impl Identity {
+    fn of(file: &SessionFile) -> Self {
+        Self {
+            name: file.name.clone(),
+            cwd: file.cwd.clone(),
+            kind: file.kind.clone(),
+        }
+    }
+}
+
+/// Everything remembered about one root session; survives its registry entry (Claude Code
+/// deletes `sessions/<pid>.json` at exit) until it leaves the retention window.
+#[derive(Default)]
+struct RootCache {
+    /// This pass's registry entry and whether its process is the one that wrote it.
+    registry: Option<(SessionFile, bool)>,
+    /// The stamp of the file `registry` came from (to remember an evicted stale one, see `State`).
+    registry_stamp: Option<Stamp>,
+    /// Filled whenever a registry entry attaches; the fallback once the entry is gone.
+    last_identity: Option<Identity>,
+    run: Option<RunRow>,
+    transcript: Option<PathBuf>,
+    /// `mtime` of `projects/` when the fallback search for the transcript last found nothing;
+    /// the search is repeated only when that mtime moves (a new project directory appeared).
+    transcript_miss: Option<SystemTime>,
+    transcript_stamp: Option<Stamp>,
+    tail: TailFacts,
+    started_at: Option<Timestamp>,
+    /// Transcript mtime.
+    last_activity: Option<Timestamp>,
+    subagents_mtime: Option<SystemTime>,
+    children: HashMap<String, ChildCache>,
+}
+
+impl RootCache {
+    /// The working directory: the registry entry's (this pass's, else the last one seen), else the
+    /// daemon run's.
+    fn cwd(&self) -> Option<String> {
+        self.last_identity
+            .as_ref()
+            .and_then(|i| i.cwd.clone())
+            .or_else(|| self.run.as_ref().and_then(|r| r.cwd.clone()))
+    }
+}
+
+#[derive(Default)]
+struct State {
+    /// One entry per `sessions/*.json` seen: its stamp and what it parsed to (`None` = unreadable).
+    sessions: HashMap<PathBuf, (Stamp, Option<SessionFile>)>,
+    roots: HashMap<String, RootCache>,
+    /// Sessions whose DEAD registry file was evicted as outside the retention window, with the
+    /// file's stamp. Without this, a stale `<pid>.json` left on disk would rebuild its root (a
+    /// transcript lookup and a tail read) on every 5 s pass; with it, nothing is touched until the
+    /// file changes or goes away.
+    stale: HashMap<String, Stamp>,
+    stats: Stats,
+}
+
+/// What `watch_paths` and `node_ref` read. Published at the end of every scan, so those two
+/// synchronous methods (called from async code) never wait for the scan mutex, which a scan holds
+/// across file IO.
+#[derive(Default)]
+struct Snapshot {
+    /// Directories to watch beyond the fixed `sessions/` and `projects/`: each known root's
+    /// project directory and each existing `<session>/subagents/` directory. Sorted, deduplicated.
+    watch: Vec<PathBuf>,
+    /// Native id (session id or agent id) -> transcript path.
+    nodes: HashMap<String, PathBuf>,
+}
+
+struct Inner {
+    home: PathBuf,
+    probe: Arc<dyn ProcessProbe>,
+    state: Mutex<State>,
+    published: RwLock<Arc<Snapshot>>,
+    warned: Mutex<HashSet<String>>,
+}
+
+pub struct ClaudeCode {
+    pool: SqlitePool,
+    inner: Arc<Inner>,
+}
+
+impl ClaudeCode {
+    pub fn new(env: &FleetEnv) -> Self {
+        Self::with_probe(env.pool.clone(), env.home.clone(), Arc::new(session::OsProbe))
+    }
+
+    pub(crate) fn with_probe(pool: SqlitePool, home: PathBuf, probe: Arc<dyn ProcessProbe>) -> Self {
+        Self {
+            pool,
+            inner: Arc::new(Inner {
+                home,
+                probe,
+                state: Mutex::new(State::default()),
+                published: RwLock::new(Arc::default()),
+                warned: Mutex::new(HashSet::new()),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> Stats {
+        self.inner.state.lock().unwrap().stats
+    }
+
+    #[cfg(test)]
+    fn warnings(&self) -> usize {
+        self.inner.warned.lock().unwrap().len()
+    }
+}
+
+impl Inner {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One log line per cause for the life of the process (spec §4 "Tolerância").
+    fn warn_once(&self, cause: &str) {
+        let mut seen = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert(cause.to_owned()) {
+            tracing::warn!("claude_code: {cause}");
+        }
+    }
+
+    fn claude_dir(&self) -> PathBuf {
+        self.home.join(".claude")
+    }
+
+    /// Lists `sessions/` (tiny: one file per live process) and re-parses only the files whose
+    /// stamp changed. Claude Code rewrites these in place, so the directory mtime is no signal.
+    fn refresh_registry(&self, st: &mut State) {
+        let dir = self.claude_dir().join("sessions");
+        let mut present = HashSet::new();
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            for item in read.flatten() {
+                let path = item.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(md) = item.metadata() else { continue };
+                let stamp = Stamp::of(&md);
+                present.insert(path.clone());
+                if st.sessions.get(&path).map(|(s, _)| *s) == Some(stamp) {
+                    continue;
+                }
+                st.stats.session_parses += 1;
+                let parsed = std::fs::read_to_string(&path)
+                    .map_err(|_| "session file is unreadable")
+                    .and_then(|text| session::parse_session(&text));
+                let file = match parsed {
+                    Ok(file) => {
+                        tracing::debug!(version = ?file.version, "claude_code: session file read");
+                        Some(file)
+                    }
+                    Err(cause) => {
+                        self.warn_once(cause);
+                        None
+                    }
+                };
+                st.sessions.insert(path, (stamp, file));
+            }
+        }
+        st.sessions.retain(|path, _| present.contains(path));
+    }
+
+    /// `projects/<cwd with every non-alphanumeric as '-'>/<session>.jsonl`, else any project dir.
+    ///
+    /// The expected path costs one stat and is checked on every call. The fallback (one stat per
+    /// project directory) runs only when the `projects/` directory mtime differs from `*miss`, the
+    /// mtime at which the previous fallback found nothing: a transcript that lives in a project
+    /// directory that does not follow the cwd is looked for again only once a new project
+    /// directory appears. (A transcript created inside an ALREADY existing foreign project
+    /// directory is not noticed until then; accepted, the cwd-derived path is the normal case.)
+    fn find_transcript(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        miss: &mut Option<SystemTime>,
+        stats: &mut Stats,
+    ) -> Option<PathBuf> {
+        let projects = self.claude_dir().join("projects");
+        let file = format!("{session_id}.jsonl");
+        if let Some(cwd) = cwd {
+            let encoded: String = cwd
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let path = projects.join(encoded).join(&file);
+            if path.is_file() {
+                *miss = None;
+                return Some(path);
+            }
+        }
+        let mtime = std::fs::metadata(&projects).and_then(|md| md.modified()).ok()?;
+        if *miss == Some(mtime) {
+            return None;
+        }
+        stats.project_scans += 1;
+        let found = std::fs::read_dir(&projects)
+            .ok()?
+            .flatten()
+            .map(|item| item.path().join(&file))
+            .find(|path| path.is_file());
+        *miss = if found.is_none() { Some(mtime) } else { None };
+        found
+    }
+}
+
+/// Model, newest usage and whether the turn is closed, from the last complete lines. A single
+/// line can exceed 64 KB (attachments reach 140 KB), so the window grows until a conversation
+/// record is found.
+fn tail_facts(path: &Path) -> TailFacts {
+    let page = limits::TRANSCRIPT_PAGE_BYTES;
+    let mut facts = TailFacts::default();
+    for window in [limits::TAIL_BYTES, page, 4 * page] {
+        let Ok((lines, _)) = tail::read_lines_before(path, None, window) else {
+            break;
+        };
+        facts = TailFacts::default();
+        for line in lines.iter().rev() {
+            let Some(parsed) = record::parse_line(line) else { continue };
+            if facts.closed.is_none() {
+                facts.closed = parsed.mark.map(|m| m == TurnMark::Closed);
+            }
+            if facts.model.is_none() {
+                facts.model = parsed.model;
+            }
+            if let Some(u) = parsed.usage {
+                let have = facts
+                    .usage
+                    .get_or_insert(Usage { context_tokens: None, cost_usd: None });
+                if have.context_tokens.is_none() {
+                    have.context_tokens = u.context_tokens;
+                }
+                if have.cost_usd.is_none() {
+                    have.cost_usd = u.cost_usd;
+                }
+            }
+        }
+        if facts.closed.is_some() {
+            break;
+        }
+    }
+    facts
+}
+
+/// The first record's timestamp, else the file's creation/modification time.
+fn started_at_of(path: &Path) -> Option<Timestamp> {
+    use std::io::{BufRead, BufReader, Read};
+    let first = std::fs::File::open(path).ok().and_then(|file| {
+        let mut line = String::new();
+        // Bounded: a first record can be a 140 KB attachment.
+        BufReader::new(file.take(256 * 1024)).read_line(&mut line).ok()?;
+        serde_json::from_str::<serde_json::Value>(&line)
+            .ok()?
+            .get("timestamp")?
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc))
+    });
+    first.or_else(|| {
+        let md = std::fs::metadata(path).ok()?;
+        md.created().or_else(|_| md.modified()).ok().map(utc)
+    })
+}
+
+impl Inner {
+    /// Folds this pass's registry entries and daemon runs into the root cache.
+    fn attach_sources(&self, st: &mut State, runs: HashMap<String, RunRow>) {
+        // Two files may name one session (a resumed one): prefer the live one.
+        let mut regs: HashMap<String, (SessionFile, bool, Stamp)> = HashMap::new();
+        for (stamp, file) in st.sessions.values() {
+            let Some(file) = file else { continue };
+            let alive = session::is_same_process(file, &*self.probe);
+            let keep_existing = matches!(regs.get(&file.session_id), Some((_, true, _))) && !alive;
+            if !keep_existing {
+                regs.insert(file.session_id.clone(), (file.clone(), alive, *stamp));
+            }
+        }
+        for root in st.roots.values_mut() {
+            root.registry = None;
+            root.registry_stamp = None;
+            root.run = None;
+        }
+        // Forget stale marks whose registry file is gone.
+        st.stale.retain(|id, _| regs.contains_key(id));
+        for (id, (file, alive, stamp)) in regs {
+            if !safe_id(&id) {
+                continue;
+            }
+            // A dead entry evicted as stale stays out until its file changes (a live one never is).
+            if !alive && st.stale.get(&id) == Some(&stamp) {
+                continue;
+            }
+            st.stale.remove(&id);
+            let root = st.roots.entry(id).or_default();
+            root.last_identity = Some(Identity::of(&file));
+            root.registry = Some((file, alive));
+            root.registry_stamp = Some(stamp);
+        }
+        // Daemon runs: added in Task 12.
+        let _ = runs;
+    }
+
+    /// Transcript path, tail facts and start time of one root; reads only when the stamp moved.
+    fn refresh_root(&self, id: &str, root: &mut RootCache, stats: &mut Stats) {
+        if !root.transcript.as_ref().is_some_and(|p| p.is_file()) {
+            let cwd = root.cwd();
+            root.transcript =
+                self.find_transcript(id, cwd.as_deref(), &mut root.transcript_miss, stats);
+            root.transcript_stamp = None;
+        }
+        if let Some(path) = root.transcript.clone() {
+            match std::fs::metadata(&path) {
+                Ok(md) => {
+                    let stamp = Stamp::of(&md);
+                    if root.transcript_stamp != Some(stamp) {
+                        stats.tail_reads += 1;
+                        root.tail = tail_facts(&path);
+                        root.transcript_stamp = Some(stamp);
+                        root.last_activity = Some(utc(stamp.mtime));
+                    }
+                }
+                Err(_) => root.transcript = None,
+            }
+        }
+        if root.started_at.is_none() {
+            root.started_at = root
+                .registry
+                .as_ref()
+                .and_then(|(s, _)| s.started_at)
+                .or_else(|| root.run.as_ref().and_then(|r| r.created_at))
+                .or_else(|| root.transcript.as_deref().and_then(started_at_of));
+        }
+    }
+
+    fn scan(&self, since: Timestamp, runs: HashMap<String, RunRow>) -> Vec<Sighting> {
+        let _ = since; // used from Task 14
+        let mut guard = self.lock();
+        let st = &mut *guard;
+        self.refresh_registry(st);
+        self.attach_sources(st, runs);
+        let mut out = Vec::new();
+        let ids: Vec<String> = st.roots.keys().cloned().collect();
+        for id in ids {
+            let Some(root) = st.roots.get_mut(&id) else { continue };
+            self.refresh_root(&id, root, &mut st.stats);
+            let Some(state) = root_state(root) else { continue };
+            out.push(root_sighting(&id, root, state));
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
+    }
+}
+
+/// extended in Tasks 11 and 12
+fn root_state(root: &RootCache) -> Option<NodeState> {
+    match &root.registry {
+        Some((file, true)) => Some(if file.status.as_deref() == Some("busy") {
+            NodeState::Busy
+        } else {
+            NodeState::Idle
+        }),
+        _ => None,
+    }
+}
+
+fn root_activity(root: &RootCache) -> Option<Timestamp> {
+    let registry = root.registry.as_ref().and_then(|(s, _)| s.updated_at);
+    root.last_activity.into_iter().chain(registry).max()
+}
+
+/// Label, role and project come from `last_identity`, so a root keeps them after Claude Code
+/// deletes its registry entry at exit.
+fn root_sighting(id: &str, root: &RootCache, state: NodeState) -> Sighting {
+    let cwd = root.cwd();
+    let role = match (&root.last_identity, &root.run) {
+        (Some(identity), _) => match identity.kind.as_deref() {
+            None | Some("interactive") => Some("chat".to_owned()),
+            Some(other) => Some(other.to_owned()),
+        },
+        (None, Some(_)) => Some("job".to_owned()),
+        _ => None,
+    };
+    // Amendment 18: every label goes through `clean_label` (collapse, redact, cut).
+    let label = clean_label(
+        &root
+            .last_identity
+            .as_ref()
+            .and_then(|i| i.name.clone())
+            .or_else(|| root.run.as_ref().map(|r| format!("run {}", r.id)))
+            .unwrap_or_else(|| id.chars().take(8).collect()),
+        LABEL_CHARS,
+    );
+    let activity = root_activity(root).unwrap_or_else(Utc::now);
+    let ended = matches!(state, NodeState::Done | NodeState::Lost).then_some(activity);
+    Sighting {
+        key: NodeKey::new(HARNESS, id),
+        parent: None,
+        harness_label: HARNESS.to_owned(),
+        model: root.tail.model.clone(),
+        role,
+        label,
+        project: cwd.as_deref().and_then(tail::project_of),
+        state,
+        started_at: root.started_at.unwrap_or(activity),
+        ended_at: ended,
+        last_activity_at: activity,
+        run_id: root.run.as_ref().map(|r| r.id),
+        can_stop: false,
+        has_lines: root.transcript.is_some(),
+        has_transcript: root.transcript.is_some(),
+        usage: root.tail.usage.clone(),
+    }
+}
+
+#[async_trait]
+impl AgentSource for ClaudeCode {
+    fn name(&self) -> &'static str {
+        "claude_code"
+    }
+
+    fn watch_paths(&self) -> Vec<PathBuf> {
+        Vec::new() // Task 17
+    }
+
+    async fn discover(&self, since: Timestamp) -> SourceResult<Vec<Sighting>> {
+        let inner = self.inner.clone();
+        let runs = HashMap::new(); // Task 12
+        Ok(tokio::task::spawn_blocking(move || inner.scan(since, runs)).await?)
+    }
+
+    fn node_ref(&self, _key: &NodeKey) -> Option<NodeRef> {
+        None // Task 17
+    }
+
+    async fn read_lines(&self, _node: &NodeRef, _from: Offset) -> SourceResult<LinesRead> {
+        Err(SourceError::msg("read_lines: Task 15"))
+    }
+
+    async fn transcript_page(&self, _node: &NodeRef, _before: Option<Cursor>) -> SourceResult<TranscriptPage> {
+        Err(SourceError::msg("transcript_page: Task 16"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The FINAL `use` block of this module (later tasks add none). `TermKind` / `TranscriptEntry`
+    // are first used in Tasks 15-16 and warn as unused until then.
+    use super::*;
+    use crate::fleet::claude_code::fixture::{self as fx, FakeProbe, Home};
+    use crate::fleet::model::{NodeState, TermKind, TranscriptEntry};
+    use serde_json::json;
+
+    pub(super) fn since() -> Timestamp {
+        Utc::now() - chrono::Duration::minutes(10)
+    }
+
+    async fn setup(home: &Home, probe: &Arc<FakeProbe>) -> (ClaudeCode, crate::storage::TempDb) {
+        let db = crate::storage::TempDb::new().await;
+        let probe: Arc<dyn ProcessProbe> = probe.clone();
+        (ClaudeCode::with_probe(db.pool.clone(), home.path(), probe), db)
+    }
+
+    fn root_id() -> String {
+        format!("claude-code:{}", fx::SESSION)
+    }
+
+    fn find<'a>(all: &'a [Sighting], id: &str) -> &'a Sighting {
+        all.iter().find(|s| s.key.id() == id).unwrap_or_else(|| {
+            panic!("no sighting {id}; have {:?}", all.iter().map(|s| s.key.id()).collect::<Vec<_>>())
+        })
+    }
+
+    #[tokio::test]
+    async fn a_live_registry_root_is_one_busy_sighting_with_its_facts() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+
+        let all = cc.discover(since()).await.unwrap();
+
+        assert_eq!(all.len(), 1);
+        let root = find(&all, &root_id());
+        assert_eq!(root.state, NodeState::Busy);
+        assert_eq!(root.label, "proj-1");
+        assert_eq!(root.project.as_deref(), Some("proj"));
+        assert_eq!(root.model.as_deref(), Some("claude-test-1"));
+        assert_eq!(root.role.as_deref(), Some("chat"));
+        assert_eq!(root.harness_label, "claude-code");
+        assert_eq!(root.parent, None);
+        assert_eq!(root.run_id, None);
+        assert_eq!(root.ended_at, None);
+        assert!(!root.can_stop && root.has_lines && root.has_transcript);
+        assert_eq!(root.started_at.timestamp_millis(), 1_792_523_514_511);
+        assert_eq!(root.usage.as_ref().and_then(|u| u.context_tokens), Some(330));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_or_idle_registry_root_is_idle() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "waiting", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(find(&all, &root_id()).state, NodeState::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_live_root_without_a_transcript_yet_has_no_lines() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        let root = find(&all, &root_id());
+        assert_eq!(root.state, NodeState::Busy);
+        assert!(!root.has_lines && !root.has_transcript);
+    }
+}
