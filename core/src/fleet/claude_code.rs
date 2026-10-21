@@ -461,10 +461,147 @@ impl Inner {
             let Some(root) = st.roots.get_mut(&id) else { continue };
             self.refresh_root(&id, root, &mut st.stats);
             let Some(state) = root_state(root) else { continue };
+            self.refresh_children(root, &mut st.stats);
             out.push(root_sighting(&id, root, state));
+            child_sightings(&id, root, state, &mut out);
         }
         out.sort_by(|a, b| a.key.cmp(&b.key));
         out
+    }
+}
+
+impl Inner {
+    fn read_meta(&self, path: &Path) -> AgentMeta {
+        let parsed = std::fs::read_to_string(path)
+            .map_err(|_| "agent meta file is unreadable")
+            .and_then(|text| session::parse_meta(&text));
+        match parsed {
+            Ok(meta) => meta,
+            // A half-written or odd meta degrades to a bare child; it is re-read when it changes.
+            Err(cause) => {
+                self.warn_once(cause);
+                AgentMeta::default()
+            }
+        }
+    }
+
+    fn load_child(&self, dir: &Path, agent: &str, stats: &mut Stats) -> Option<ChildCache> {
+        let meta_path = dir.join(format!("agent-{agent}.meta.json"));
+        let meta_stamp = Stamp::of(&std::fs::metadata(&meta_path).ok()?);
+        stats.meta_parses += 1;
+        let transcript = dir.join(format!("agent-{agent}.jsonl"));
+        let last_activity = std::fs::metadata(&transcript)
+            .map(|md| utc(Stamp::of(&md).mtime))
+            .unwrap_or_else(|_| utc(meta_stamp.mtime));
+        Some(ChildCache {
+            meta: self.read_meta(&meta_path),
+            meta_path,
+            meta_stamp,
+            started_at: started_at_of(&transcript).unwrap_or(last_activity),
+            transcript,
+            last_activity,
+        })
+    }
+
+    /// Spec §4 "Descoberta incremental": the `subagents/` directory is relisted only when ITS mtime
+    /// moved; a known child is never re-read from scratch. An unfinished child is re-stat-ed each
+    /// pass, because `finished` is written in place and does not touch the directory mtime.
+    fn refresh_children(&self, root: &mut RootCache, stats: &mut Stats) {
+        let Some(transcript) = root.transcript.as_ref() else {
+            return;
+        };
+        let dir = transcript.with_extension("").join("subagents");
+        let Ok(md) = std::fs::metadata(&dir) else {
+            root.children.clear();
+            root.subagents_mtime = None;
+            return;
+        };
+        let mtime = md.modified().ok();
+        if root.subagents_mtime != mtime {
+            stats.subagent_listings += 1;
+            root.subagents_mtime = mtime;
+            if let Ok(read) = std::fs::read_dir(&dir) {
+                for item in read.flatten() {
+                    let name = item.file_name().to_string_lossy().into_owned();
+                    let Some(agent) = name
+                        .strip_prefix("agent-")
+                        .and_then(|n| n.strip_suffix(".meta.json"))
+                    else {
+                        continue;
+                    };
+                    if !safe_id(agent) || root.children.contains_key(agent) {
+                        continue;
+                    }
+                    if let Some(child) = self.load_child(&dir, agent, stats) {
+                        root.children.insert(agent.to_owned(), child);
+                    }
+                }
+            }
+        }
+        for child in root.children.values_mut().filter(|c| !c.meta.is_closed()) {
+            if let Ok(md) = std::fs::metadata(&child.meta_path) {
+                let stamp = Stamp::of(&md);
+                if stamp != child.meta_stamp {
+                    stats.meta_parses += 1;
+                    child.meta = self.read_meta(&child.meta_path);
+                    child.meta_stamp = stamp;
+                }
+            }
+            if let Ok(md) = std::fs::metadata(&child.transcript) {
+                child.last_activity = utc(Stamp::of(&md).mtime);
+            }
+        }
+    }
+}
+
+fn child_sightings(id: &str, root: &RootCache, root_state: NodeState, out: &mut Vec<Sighting>) {
+    let root_key = NodeKey::new(HARNESS, id);
+    let root_project = root.cwd().as_deref().and_then(tail::project_of);
+    for (agent, child) in &root.children {
+        let state = if child.meta.is_closed() {
+            NodeState::Done
+        } else if matches!(root_state, NodeState::Busy | NodeState::Idle) {
+            NodeState::Busy
+        } else {
+            // Spec §3: unfinished and the root is gone.
+            NodeState::Lost
+        };
+        // The native parent edge: a known parent agent, else the root. An unknown or self
+        // `parentAgentId` degrades to the root rather than leaving the child dangling.
+        let parent = child
+            .meta
+            .parent_agent_id
+            .as_deref()
+            .filter(|p| *p != agent && root.children.contains_key(*p))
+            .map(|p| NodeKey::new(HARNESS, p))
+            .unwrap_or_else(|| root_key.clone());
+        out.push(Sighting {
+            key: NodeKey::new(HARNESS, agent),
+            parent: Some(parent),
+            harness_label: HARNESS.to_owned(),
+            model: child.meta.model.clone(),
+            role: child.meta.agent_type.clone(),
+            // Amendment 18: every label goes through `clean_label` (collapse, redact, cut).
+            label: clean_label(
+                &child
+                    .meta
+                    .description
+                    .clone()
+                    .or_else(|| child.meta.agent_type.clone())
+                    .unwrap_or_else(|| agent.clone()),
+                LABEL_CHARS,
+            ),
+            project: root_project.clone(),
+            state,
+            started_at: child.started_at,
+            ended_at: matches!(state, NodeState::Done | NodeState::Lost).then_some(child.last_activity),
+            last_activity_at: child.last_activity,
+            run_id: None,
+            can_stop: false,
+            has_lines: true,
+            has_transcript: true,
+            usage: None,
+        });
     }
 }
 
@@ -901,6 +1038,142 @@ mod tests {
         assert_eq!(all.len(), 1);
         let root = find(&all, &root_id());
         assert_eq!((root.state, root.run_id), (NodeState::Idle, Some(5)));
+    }
+
+    /// Root alive (busy) with four children: a1 finished, a2 running, a3 under a1, a4 pointing at
+    /// an agent that does not exist.
+    fn with_children(alive: bool) -> (Home, Arc<FakeProbe>) {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &if alive { fx::closed_turn() } else { fx::open_turn() });
+        let s = fx::SESSION;
+        home.subagent(s, "a1", json!({"agentType":"Explore","description":"read specs","model":"sonnet","finished":true}), &fx::closed_turn());
+        home.subagent(s, "a2", json!({"agentType":"general-purpose","description":"write code"}), &fx::open_turn());
+        home.subagent(s, "a3", json!({"agentType":"Explore","description":"deeper","parentAgentId":"a1","spawnDepth":2}), &fx::open_turn());
+        home.subagent(s, "a4", json!({"agentType":"Explore","description":"orphan","parentAgentId":"ghost"}), &fx::open_turn());
+        let probe = Arc::new(FakeProbe::new());
+        if alive {
+            probe.alive(100, "777");
+        }
+        (home, probe)
+    }
+
+    fn child_id(agent: &str) -> String {
+        format!("claude-code:{agent}")
+    }
+
+    #[tokio::test]
+    async fn children_hang_off_the_root_or_off_their_parent_agent() {
+        let (home, probe) = with_children(true);
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+
+        let root_key = NodeKey::new("claude-code", fx::SESSION);
+        assert_eq!(find(&all, &child_id("a1")).parent.as_ref(), Some(&root_key));
+        assert_eq!(find(&all, &child_id("a2")).parent.as_ref(), Some(&root_key));
+        assert_eq!(find(&all, &child_id("a3")).parent.as_ref(), Some(&NodeKey::new("claude-code", "a1")));
+        // Unknown parentAgentId: no heuristics, the parent is the root.
+        assert_eq!(find(&all, &child_id("a4")).parent.as_ref(), Some(&root_key));
+        let a1 = find(&all, &child_id("a1"));
+        assert_eq!(a1.model.as_deref(), Some("sonnet"));
+        assert_eq!(a1.role.as_deref(), Some("Explore"));
+        assert_eq!(a1.label, "read specs");
+        assert!(!a1.can_stop && a1.has_lines && a1.has_transcript);
+        assert_eq!(a1.project.as_deref(), Some("proj"));
+    }
+
+    #[tokio::test]
+    async fn child_state_follows_the_finished_marker_and_the_root() {
+        let (home, probe) = with_children(true);
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        let a1 = find(&all, &child_id("a1"));
+        assert_eq!(a1.state, NodeState::Done);
+        assert_eq!(a1.ended_at, Some(a1.last_activity_at));
+        let a2 = find(&all, &child_id("a2"));
+        assert_eq!((a2.state, a2.ended_at), (NodeState::Busy, None));
+
+        // Same tree, root dead with a pending tool call: unfinished children are Lost.
+        let (home, probe) = with_children(false);
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(find(&all, &root_id()).state, NodeState::Lost);
+        assert_eq!(find(&all, &child_id("a1")).state, NodeState::Done);
+        let a2 = find(&all, &child_id("a2"));
+        assert_eq!(a2.state, NodeState::Lost);
+        assert!(a2.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_user_stopped_child_is_done_and_a_bare_meta_degrades() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        home.subagent(fx::SESSION, "s1", json!({"agentType":"general-purpose","stoppedByUser":true}), &fx::open_turn());
+        home.subagent(fx::SESSION, "b1", json!({}), &[]);
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+
+        assert_eq!(find(&all, &child_id("s1")).state, NodeState::Done);
+        let bare = find(&all, &child_id("b1"));
+        assert_eq!((bare.model.clone(), bare.role.clone()), (None, None));
+        assert_eq!(bare.label, "b1");
+        assert_eq!(bare.parent, Some(NodeKey::new("claude-code", fx::SESSION)));
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_a_label_is_redacted_by_clean_label() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let token = format!("ghp_{}", "a".repeat(36));
+        home.subagent(
+            fx::SESSION,
+            "k1",
+            json!({"agentType":"Explore","description": format!("push with {token} now")}),
+            &fx::open_turn(),
+        );
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+
+        let label = find(&all, &child_id("k1")).label.clone();
+        assert!(label.contains("[SECRET:github]"), "{label}");
+        assert!(!label.contains(&token), "{label}");
+    }
+
+    #[tokio::test]
+    async fn a_run_resolved_root_gets_its_subagents_too() {
+        let home = Home::new();
+        home.transcript(fx::SESSION, &fx::open_turn());
+        home.subagent(fx::SESSION, "a1", json!({"agentType":"Explore","description":"d"}), &fx::open_turn());
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, db) = setup(&home, &probe).await;
+        insert_run(&db.pool, 5, "running", "claude", None).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(find(&all, &root_id()).run_id, Some(5));
+        assert_eq!(find(&all, &child_id("a1")).state, NodeState::Busy);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_meta_file_degrades_to_a_bare_child_and_is_logged_once() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        home.subagent(fx::SESSION, "m1", json!({}), &[]);
+        std::fs::write(home.meta_path(fx::SESSION, "m1"), "{\"agentTy").unwrap();
+        home.subagent(fx::SESSION, "m2", json!({}), &[]);
+        std::fs::write(home.meta_path(fx::SESSION, "m2"), "{\"agentTy").unwrap();
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert!(all.iter().any(|s| s.key.id() == child_id("m1")));
+        assert!(all.iter().any(|s| s.key.id() == child_id("m2")));
+        assert_eq!(cc.warnings(), 1);
     }
 
     #[tokio::test]
