@@ -317,6 +317,7 @@ the contract, not a snapshot.
 | `fleet/source.rs` | The adapter contract of the live fleet tree: `AgentSource` and `EdgeSource`, and the `Sighting`, `Offset`, `LinesRead`, `Edge` they exchange, plus `SourceError` / `SourceResult` (their error type; no `anyhow`). The only place a harness's format may be known is behind these traits. |
 | `fleet/event.rs` | The `GET /fleet/live` events as one serde enum (`{"t":"snapshot"|"node"|"metrics"|"lines"|"removed"|"heartbeat"}`). |
 | `fleet/tail.rs` | Incremental file reading for the fleet adapters: complete lines from an offset (partial last line kept back, truncation restarts at the tail, first sight jumps to the last 64 KB), backwards paging for the full transcript, and `project_of`. |
+| `fleet/codex_cli.rs` | Fleet live tree (spec `2026-10-20-fleet-arvore-viva-design.md` §4): the Codex CLI `AgentSource` over `~/.codex/sessions` rollouts — record-to-terminal-line mapping shared by lines and transcript, head and tail fact readers, an incremental directory/file cache, the liveness rule and paged transcripts. |
 | `governance/triage.rs` | Parent of `governance/triage/`. The email pillar's triage execution machinery: the sandbox a run executes in, and the startup verification that proves its hook barrier is really in force. |
 | `governance/triage/sandbox.rs` | The sandbox a triage run executes in, and the startup check that its hook barrier holds. |
 | `governance/triage/prompt.rs` | Turning stored messages into the prompt a triage batch sees (`build_prompt`, `triage_inputs`). |
