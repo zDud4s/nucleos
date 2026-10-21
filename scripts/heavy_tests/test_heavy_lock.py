@@ -31,12 +31,12 @@ import os, pathlib, sys, time
 
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 tag = sys.argv[-1]
-# order.txt first, the .start marker last: tests treat the marker as "started" and then read
-# order.txt, so the marker must not be visible before the line it vouches for.
+# order.txt and .token first, the .start marker last: tests treat the marker as "started" and
+# then read the other marks, so the marker must not be visible before what it vouches for.
 with open(d / "order.txt", "a") as f:
     f.write(tag + "\n")
-(d / f"{tag}.start").write_text(str(os.getpid()))
 (d / f"{tag}.token").write_text(os.environ.get("NUCLEOS_HEAVY_TOKEN", ""))
+(d / f"{tag}.start").write_text(str(os.getpid()))
 while not ((d / f"{tag}.stop").exists() or (d / "all.stop").exists()):
     time.sleep(0.05)
 '''
@@ -49,7 +49,7 @@ import os, pathlib, subprocess, sys, time
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 state = pathlib.Path(os.environ["NUCLEOS_HEAVY_DIR"])
 tag = sys.argv[-1]
-(d / f"{tag}.start").write_text(str(os.getpid()))
+# The .start marker is written last: tests read the other marks as soon as it exists.
 (d / f"{tag}.held_env").write_text(os.environ.get("NUCLEOS_HEAVY_HELD", ""))
 (d / f"{tag}.prio_env").write_text(os.environ.get("NUCLEOS_HEAVY_PRIO", ""))
 (d / f"{tag}.token_env").write_text(os.environ.get("NUCLEOS_HEAVY_TOKEN", ""))
@@ -57,6 +57,7 @@ held = state / "held"
 (d / f"{tag}.held_files").write_text(
     ",".join(sorted(p.name for p in held.iterdir())) if held.exists() else ""
 )
+(d / f"{tag}.start").write_text(str(os.getpid()))
 if os.environ.get("HOLDER_NESTED"):
     env = dict(os.environ)
     env["NUCLEOS_HEAVY_WAIT_MAX"] = "20"

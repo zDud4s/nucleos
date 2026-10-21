@@ -544,6 +544,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
             held_dir.mkdir(parents=True, exist_ok=True)
+            _sweep_held_tmp(directory)
             qfile.write_text(json.dumps(rec), encoding="utf-8")
             queued = True
         while True:
@@ -611,6 +612,27 @@ def release_token(directory: Path) -> None:
     try:
         (directory / "held" / str(os.getpid())).unlink()
     except OSError:
+        pass
+
+
+def _sweep_held_tmp(directory: Path) -> None:
+    """Unlink `.held-<pid>.tmp` files whose pid is dead. Called under the Mutex: the only writer
+    of these files is `drop_token_weight`, which holds it, so only a broker killed mid-write
+    leaves one. No age test, because `drop_token_weight` utimes the tmp to the held record's
+    mtime; a live pid (possibly an old broker, or a reused pid) keeps its tmp. Never raises."""
+    try:
+        for p in Path(directory).glob(".held-*.tmp"):
+            try:
+                pid = int(p.name[len(".held-"):-len(".tmp")])
+            except ValueError:
+                continue
+            try:
+                if is_alive(pid):
+                    continue
+                p.unlink()
+            except OSError:
+                pass
+    except Exception:
         pass
 
 
@@ -1291,12 +1313,14 @@ def _watch_yield(proc, job, in_job: bool, stats: dict, yield_check, stop,
 
 
 def _watch_phase(stats: dict, cb, stop: threading.Event) -> None:
-    """Call `cb` once, as soon as the output has shown a `Running ...`/`Doc-tests` header (the
-    compile is over, the tests have started). Polls the stats the pump threads fill; never
+    """Call `cb` once, as soon as the output has shown a `Running ...`/`Doc-tests` header or
+    nextest's `Starting N tests across M binaries` line (printed once the build is over): the
+    compile is over, the tests have started. Polls the stats the pump threads fill; never
     raises."""
     while not stop.wait(0.25):
         try:
-            if stats.get("progress", {}).get("binary"):
+            prog = stats.get("progress", {})
+            if prog.get("binary") or prog.get("runner") == "nextest":
                 try:
                     cb()
                 except Exception:
