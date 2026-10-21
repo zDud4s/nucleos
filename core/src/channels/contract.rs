@@ -9,6 +9,34 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod decode;
+pub use decode::*;
+
+#[cfg(test)]
+mod conformance;
+
+/// Where the shared fixtures live, relative to the `nucleos-core` package root.
+#[cfg(test)]
+pub(crate) const FIXTURES_REL: &str = "../sidecars/lib/channelkit/contract/fixtures";
+
+/// The fixture directory of the checkout this test binary was compiled in.
+#[cfg(test)]
+pub(crate) fn fixtures_dir() -> std::path::PathBuf {
+    let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let running_in = std::env::current_dir().expect("the working directory must be readable");
+    // Same guard as governance/redact.rs: a shared target directory can hand this checkout a
+    // binary compiled in another worktree, which would then read that worktree's fixtures and
+    // pass while checking nothing. Cargo runs tests from the package root, so the two agree.
+    assert_eq!(
+        built_in,
+        running_in.as_path(),
+        "compiled in {} but running in {}; touch this file to force a rebuild",
+        built_in.display(),
+        running_in.display(),
+    );
+    built_in.join(FIXTURES_REL)
+}
+
 pub const CONTRACT_VERSION: &str = "1.0.0";
 
 /// The largest `retry_after_ms` an adapter may report (24 h). Shared with the adapter kit.
@@ -383,8 +411,8 @@ pub struct Button {
     pub token: String,
 }
 
-// The decode layer (`decode`, `Shape`, `ErrorCode`, `ContractError`, `ErrorResponse`,
-// `FIXTURES_REL`) uses its own raw serde types and arrives with D1-D3/FX; nothing above changes.
+// The decode layer (`decode`, `Shape`, `ErrorCode`, `ContractError`, `ErrorResponse`)
+// uses its own raw serde types and arrives with D1-D3/FX; nothing above changes.
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

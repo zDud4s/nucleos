@@ -495,6 +495,7 @@ async fn write_items(
     let reasoning = format!("distilled from job #{job_id} ({})", cause.as_str());
 
     let mut tx = pool.begin().await?;
+    let mut proposed_any = false;
     for (index, item) in items.iter().enumerate() {
         let Some(fingerprint) = crate::knowledge::title_fingerprint(&item.title) else {
             continue;
@@ -558,6 +559,7 @@ async fn write_items(
                 crate::knowledge::record_distilled(&mut tx, &declaration, &provenance).await?
             }
             Door::Propose => {
+                proposed_any = true;
                 crate::knowledge::propose_in_with(&mut tx, declaration, &provenance)
                     .await
                     .map_err(|e| match e {
@@ -590,7 +592,12 @@ async fn write_items(
     .bind(STATUS_RUNNING)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await
+    tx.commit().await?;
+    // Only after the commit: a waker must never see a proposal the database does not hold yet.
+    if proposed_any {
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
+    }
+    Ok(())
 }
 
 /// Distil one claimed row. Every failure ends in [`fail`]; nothing is returned.
@@ -1767,6 +1774,18 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "proposed");
         assert_eq!(quoted_events(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn wake_signal_distilled_items_bump_proposals() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_failed").await;
+        link_project_note(&pool, PROJECT_NOTE).await;
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow_and_update();
+        process_answer(&pool, QUOTING_EPISODE).await;
+        // Other tests of this binary share the global bus: assert a lower bound only.
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 
     #[tokio::test]

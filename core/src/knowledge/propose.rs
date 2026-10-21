@@ -79,6 +79,8 @@ pub async fn propose(
     let ids = propose_in(&mut tx, declaration).await?;
     tx.commit().await?;
     crate::embed::nudge();
+    // After the commit, so a woken reader finds the proposal.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     Ok(ids)
 }
 
@@ -493,4 +495,36 @@ pub(super) async fn reconfirm_row_in(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// Declaring a learning wakes the proposals topic once the transaction has committed.
+    ///
+    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_knowledge_propose_bumps_proposals() {
+        let pool = crate::testdb::fresh_pool().await;
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow();
+
+        propose(
+            &pool,
+            Declaration {
+                project_id: None,
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title: "Wake lesson",
+                body: "Signals the proposals topic.",
+                reasoning: "wake signal test",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
 }

@@ -3080,6 +3080,34 @@ mod tests {
             .expect("nobody told the director to stop asking, only not that one");
     }
 
+    /// A `propose` action reaches the person's queue, so the proposals topic is signalled once the
+    /// transaction is committed.
+    #[tokio::test]
+    async fn wake_signal_team_action_proposal_bumps_proposals() {
+        let (state, _root) = state_with_root().await;
+        let run_id = team_with_grant(&state, "send_email", "propose").await;
+        let (director_run, _) = director_and_specialist(&state, &run_id).await;
+        let scope = Scope::TeamRun(run_id.clone());
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow_and_update();
+
+        propose_action(
+            &state,
+            &scope,
+            &as_node(director_run),
+            &ProposeActionRequest {
+                kind: "send_email".to_owned(),
+                payload: an_email(),
+                why: "the list asked to be told".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Other tests of this binary share the global bus: assert a lower bound only.
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
+
     /// Attribution, from the same header and by the same rule: the item that asked is recorded, the
     /// director's own request is recorded as nobody's item, and a node this run does not know is
     /// recorded as neither rather than as a guess.

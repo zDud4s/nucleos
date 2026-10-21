@@ -141,6 +141,8 @@ pub async fn append_on(
     .bind(created_at)
     .execute(conn)
     .await?;
+    // A level-triggered hint that the feed changed. `append` reaches it through this function.
+    crate::wake::bump(crate::wake::Topic::Feed);
     Ok(result.last_insert_rowid())
 }
 
@@ -647,6 +649,30 @@ mod tests {
 
     async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await
+    }
+
+    /// The wake bus is process-wide, so other tests may bump it too: assert `>= 1`, never `==`.
+    #[tokio::test]
+    async fn wake_signal_feed_append_bumps_feed() {
+        let pool = test_pool().await;
+        let rx = crate::wake::subscribe(crate::wake::Topic::Feed);
+        let before = *rx.borrow();
+        append(&pool, None, "wake_test", "a line", None, None)
+            .await
+            .unwrap();
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
+
+    #[tokio::test]
+    async fn wake_signal_feed_append_on_bumps_feed() {
+        let pool = test_pool().await;
+        let rx = crate::wake::subscribe(crate::wake::Topic::Feed);
+        let before = *rx.borrow();
+        let mut conn = pool.acquire().await.unwrap();
+        super::append_on(conn.as_mut(), None, "wake_test", "a line", None, None)
+            .await
+            .unwrap();
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 
     #[tokio::test]

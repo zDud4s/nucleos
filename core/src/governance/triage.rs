@@ -554,6 +554,38 @@ pub async fn triage_now(
     pass(state, loop_state, now, true).await
 }
 
+/// Why an on-request triage could not run, as the HTTP status the caller is answered with.
+#[derive(Debug)]
+pub struct TriageError(pub axum::http::StatusCode);
+
+/// Triage what is waiting because someone asked: the service behind `POST /email/triage`.
+///
+/// An unarmed pillar is an answer, not an error: nothing is queued and the reason says why. The
+/// pass itself runs uncancellable, because launching writes a claim across the batch's rows and a
+/// caller that disconnects must not leave that half-written.
+pub async fn triage_on_request(
+    state: &crate::state::AppState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<TriageOutcome, TriageError> {
+    if !state.email.armed.load(std::sync::atomic::Ordering::Relaxed) {
+        // Not an error the caller can fix by retrying: the pillar is off, or its barrier failed
+        // verification at startup and it is deliberately staying off.
+        return Ok(TriageOutcome {
+            queued: 0,
+            run_id: None,
+            reason: Some("the email pillar is not armed".to_string()),
+        });
+    }
+
+    let state = state.clone();
+    crate::door::uncancellable(async move {
+        let mut loop_state = LoopState::default();
+        triage_now(&state, &mut loop_state, now).await
+    })
+    .await
+    .map_err(TriageError)
+}
+
 async fn pass(
     state: &crate::state::AppState,
     loop_state: &mut LoopState,
@@ -2911,6 +2943,28 @@ mod tests {
     fn silence_is_a_failed_verification() {
         assert_eq!(interpret_barrier_probe("   "), Err(BarrierError::NoOpinion));
         assert_eq!(interpret_barrier_probe(""), Err(BarrierError::NoOpinion));
+    }
+
+    #[tokio::test]
+    async fn triage_on_request_when_not_armed_says_so_and_queues_nothing() {
+        let state = test_state().await;
+        assert!(
+            !state.email.armed.load(std::sync::atomic::Ordering::Relaxed),
+            "the default email runtime is not armed"
+        );
+
+        let outcome = triage_on_request(&state, chrono::Utc::now())
+            .await
+            .expect("an unarmed pillar is an answer, not an error");
+
+        assert_eq!(
+            outcome,
+            TriageOutcome {
+                queued: 0,
+                run_id: None,
+                reason: Some("the email pillar is not armed".to_string()),
+            }
+        );
     }
 
     async fn test_state() -> crate::state::AppState {

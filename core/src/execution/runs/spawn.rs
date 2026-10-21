@@ -117,7 +117,11 @@ where
     // has already written the status it chose.
     let pool = state.pool.clone();
     tokio::spawn(async move {
-        let Err(error) = join.await else { return };
+        let Err(error) = join.await else {
+            // A normal end: the body already wrote its terminal state before returning.
+            nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
+            return;
+        };
         if error.is_cancelled() {
             return;
         }
@@ -130,6 +134,8 @@ where
         .execute(&pool)
         .await;
         warn_on_terminal_write_err(&failed, id, "failed");
+        // After the UPDATE, so a woken reader finds the run already `failed`.
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
     });
 }
 
@@ -1089,4 +1095,109 @@ pub(super) async fn fail_provisioning(
         Some(&crate::feed::run_subject(&state.pool, id).await),
     )
     .await;
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use std::time::Duration;
+
+    use crate::execution::runs::{finalize_termination, spawn_registered};
+
+    async fn seed_running(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'real', '2026-10-19T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn status_of(pool: &sqlx::SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A run body that returns normally wakes the runs topic.
+    ///
+    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_runs_on_normal_end() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        let before = *rx.borrow_and_update();
+
+        spawn_registered(&state, id, async {});
+
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the supervisor never signalled the normal end")
+            .unwrap();
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
+
+    /// When the receiver wakes after a panic, the run already reads `failed`.
+    #[tokio::test]
+    async fn wake_signal_runs_after_a_panic_update() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        rx.borrow_and_update();
+
+        spawn_registered(&state, id, async { panic!("run body blew up") });
+
+        // Poll until the row is terminal, then require a signal that is not older than the write.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while status_of(&state.pool, id).await != "failed" {
+            assert!(std::time::Instant::now() < deadline, "the run never failed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("the supervisor never signalled the panic")
+            .unwrap();
+        assert_eq!(status_of(&state.pool, id).await, "failed");
+    }
+
+    /// A cancel is signalled by `finalize_termination`, which won the status write.
+    #[tokio::test]
+    async fn wake_signal_runs_on_cancel_via_finalize_termination() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        spawn_registered(&state, id, std::future::pending::<()>());
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        let before = *rx.borrow();
+
+        assert!(finalize_termination(&state, id, "cancelled").await);
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
+
+    /// The bump never comes before the `UPDATE`: a receiver that wakes finds `cancelled`.
+    #[tokio::test]
+    async fn wake_signal_runs_not_before_the_cancel_update() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        spawn_registered(&state, id, std::future::pending::<()>());
+        let mut rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        rx.borrow_and_update();
+        let pool = state.pool.clone();
+        let watcher = tokio::spawn(async move {
+            rx.changed().await.unwrap();
+            status_of(&pool, id).await
+        });
+
+        assert!(finalize_termination(&state, id, "cancelled").await);
+
+        let seen = tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("the watcher never woke")
+            .unwrap();
+        assert_eq!(seen, "cancelled");
+    }
 }
