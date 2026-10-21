@@ -514,10 +514,15 @@ def _queue_order(items: list[tuple[Path, dict]], state: Path | None = None
 
 
 def acquire_token(directory: Path, rec: dict, wait_cap: float,
-                  arrival_ns: int | None = None) -> tuple[bool, float]:
+                  arrival_ns: int | None = None, light=None) -> tuple[bool, float]:
     """Queue, wait for the head position and room, then hold. Returns (admitted, waited_s).
     Not admitted means the wait cap expired; the queue entry is gone either way (when
-    admitted it has become the holder file)."""
+    admitted it has become the holder file).
+
+    `light`, when given, is tried while queued (first right after the static check fails, then
+    every NUCLEOS_HEAVY_LIGHT_RETRY_S), always OUTSIDE the Mutex hold since it takes the Mutex
+    itself. When it returns True the request is admitted WITHOUT a held/<pid> record: the
+    caller's callable has registered the light run and tells the caller by its own side effect."""
     queue_dir, held_dir = directory / "queue", directory / "held"
     me = os.getpid()
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
@@ -533,6 +538,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     except Exception:
         shadow = None
     admitted = False
+    light_retry = _env_float("NUCLEOS_HEAVY_LIGHT_RETRY_S", 2.0)
+    last_light = None
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -564,6 +571,21 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                         queued = False
                         admitted = True
                         return True, time.time() - t0
+            if light is not None and (last_light is None
+                                      or time.monotonic() - last_light >= light_retry):
+                last_light = time.monotonic()
+                try:
+                    got_light = bool(light())
+                except Exception:
+                    got_light = False
+                if got_light:
+                    try:
+                        qfile.unlink()
+                    except OSError:
+                        pass
+                    queued = False
+                    admitted = True
+                    return True, time.time() - t0
             now = time.time()
             if now - t0 >= wait_cap:
                 sys.stderr.write(
@@ -590,6 +612,53 @@ def release_token(directory: Path) -> None:
         (directory / "held" / str(os.getpid())).unlink()
     except OSError:
         pass
+
+
+def try_light_lane(directory: Path, rec: dict, argv: list[str], verdict, kind: str,
+                   warm: bool) -> bool:
+    """Start a proven-small class without a token while the budget is full. On True the run
+    is registered in `light/<pid>` (counted against NUCLEOS_HEAVY_LIGHT_MAX, reaped like any
+    holder) and the caller must `release_light` when it ends. Never raises: any doubt is False,
+    which leaves the request in the ordinary queue."""
+    try:
+        if warm or kind == "cargo" or _is_cargo(argv):
+            return False
+        if verdict is not None and getattr(verdict, "kind", None) == "cargo":
+            return False
+        hc = _cost_mod()
+        cls = rec.get("cls")
+        if hc is None or not hc.light_enabled() or not isinstance(cls, str) or not cls:
+            return False
+        if cls.split("|", 1)[0] == "cargo":
+            return False
+        entry = hc.light_entry(hc.load_light(directory), cls)
+        if entry is None:
+            return False
+        p = hc.probe()
+        if p.get("busy_cores") is None:
+            # busy_cores is a difference of two samples; a fresh process has one.
+            time.sleep(hc.PRIME_S)
+            p = hc.probe()
+        if not hc.light_fits(entry, p)[0]:
+            return False
+        light_dir = directory / "light"
+        with Mutex(directory):
+            light_dir.mkdir(parents=True, exist_ok=True)
+            if len(_entries(light_dir)) >= hc.light_max():
+                return False
+            (light_dir / str(os.getpid())).write_text(
+                json.dumps({"pid": os.getpid(), "ctime": rec.get("ctime"), "cls": cls}),
+                encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def release_light(directory: Path) -> None:
+    try:
+        (directory / "light" / str(os.getpid())).unlink()
+    except Exception:
+        pass  # no record, or no state dir yet: nothing to give back
 
 
 # ------------------------------------------------------------------- worktree lock
@@ -2022,6 +2091,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     t_start = time.time()
     fp = None  # (crate dir, target dir, fingerprint) once computed
     hit = False
+    light = False  # admitted through the light lane (light/<pid>, no token)
     lease = None  # (k, slot dir, previous owner) of a leased target-dir pool slot
     root = None
     try:
@@ -2210,9 +2280,20 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             t_q = time.time()
             arrival_q = arrival or time.time_ns()
             poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
+
+            def _light_attempt() -> bool:
+                # Only a plain command qualifies: one that takes the worktree lock or a
+                # target-dir slot is cargo work, whatever its class says.
+                nonlocal light
+                if lock_hash is not None or pool or crate is not None:
+                    return False
+                if try_light_lane(directory, rec, argv, verdict, kind, warm):
+                    light = True
+                return light
+
             while True:
                 admitted, _ = acquire_token(directory, rec, max(0.0, cap - (time.time() - t_q)),
-                                            arrival_q)
+                                            arrival_q, light=_light_attempt)
                 if not admitted:
                     _release_all(directory, lock_hash, False)
                     lock_hash = None
@@ -2220,6 +2301,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                                  wait_lock, argv, waited_on="token",
                                  wait_token=time.time() - t_q)
                     return EXIT_QUEUE_TIMEOUT
+                if light:
+                    break  # admitted by the light lane: no token to hold or hand back
                 holding = True
                 if not pool:
                     break
@@ -2303,6 +2386,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         }
         if warm:
             row["warm"] = True
+        if light:
+            row["lane"] = "light"
         if session:
             row["session"] = session
         if eff_td:
@@ -2370,6 +2455,10 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         _cost_mod().rebuild_costs(directory)
     except Exception:
         pass
+    try:
+        _cost_mod().rebuild_light(directory)
+    except Exception:
+        pass
     return _PREEMPTED if preempted else code
 
 
@@ -2407,6 +2496,7 @@ def _release_all(directory, lock_hash, holding: bool, lease=None) -> None:
     """Free the target slot, hand the worktree lock on, keep the token until its new owner
     is queued, then drop the token. Never raises: release must not turn a finished run into
     a failure. The slot goes first so the lock's next owner can take it back by affinity."""
+    release_light(directory)
     release_slot(directory, lease)
     try:
         succ = release_lock(directory, lock_hash) if lock_hash else None
