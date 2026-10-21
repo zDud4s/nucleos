@@ -875,7 +875,7 @@ mod tests {
                 failures.push(format!("{name}: {why}"));
             }
         }
-        assert!(all.len() >= 8,"only {} scenarios found", all.len());
+        assert!(all.len() >= 8, "only {} scenarios found", all.len());
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
@@ -1060,10 +1060,7 @@ mod tests {
 
         let kinds: Vec<&str> = wire.iter().map(|(kind, _)| kind.as_str()).collect();
         assert_eq!(kinds, ["send", "edit", "edit", "send"]);
-        assert_eq!(
-            wire[0].1,
-            strings::render(&Text::Working { turn: run_id })
-        );
+        assert_eq!(wire[0].1, strings::render(&Text::Working { turn: run_id }));
         assert_eq!(
             wire[1].1,
             strings::render(&Text::Progress {
@@ -1095,7 +1092,11 @@ mod tests {
         assert_eq!(kinds, ["send", "send"]);
         assert_eq!(wire[1].1, "All done.");
         assert_eq!(
-            count(&st.pool, "SELECT COUNT(*) FROM channel_outbox WHERE action = 'edit'").await,
+            count(
+                &st.pool,
+                "SELECT COUNT(*) FROM channel_outbox WHERE action = 'edit'"
+            )
+            .await,
             0
         );
     }
@@ -1113,7 +1114,13 @@ mod tests {
         // due at once, quiet in between, due again 4 s later, and silent past the 15 min cap.
         let mut tracker = TypingRefresh::default();
         let t0 = Instant::now();
-        for (second, due) in [(0, true), (2, false), (4, true), (6, false), (16 * 60, false)] {
+        for (second, due) in [
+            (0, true),
+            (2, false),
+            (4, true),
+            (6, false),
+            (16 * 60, false),
+        ] {
             refresh_typing(&st, &mut tracker, t0 + Duration::from_secs(second)).await;
             let polled = with.poll(Duration::ZERO).await.json();
             let want = if due { typing.clone() } else { json!([]) };

@@ -382,7 +382,11 @@ async fn stream_text(state: &AppState, text: &str) -> Stimulated {
         "message": { "content": [{ "type": "text", "text": text }] },
     });
     let tail = std::sync::Arc::new(std::sync::Mutex::new(line.to_string()));
-    state.run_tails.lock().map_err(|e| e.to_string())?.insert(run, tail);
+    state
+        .run_tails
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(run, tail);
     // A fresh throttle per tick: the scenario drives the cadence, not the wall clock.
     streaming::stream_progress(
         state,

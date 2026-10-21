@@ -206,7 +206,9 @@ pub fn render(text: &Text) -> String {
         }
         Text::CaptureAnswered { job } => format!("Answered capture request #{job}."),
         Text::CaptureLate { note } => {
-            format!("Noted (#{note}), but that question has moved on - the answer was kept as a plain note.")
+            format!(
+                "Noted (#{note}), but that question has moved on - the answer was kept as a plain note."
+            )
         }
         Text::AlreadyHandled => "That one was already handled.".to_string(),
         Text::Approved { id } => format!("Approved #{id}."),
