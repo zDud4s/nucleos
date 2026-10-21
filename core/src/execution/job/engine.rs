@@ -33,12 +33,19 @@ pub(super) async fn read_emission_bytes(
     }
 }
 
+// clippy 1.97 flags this thread_local even though its initializer is already `const`.
 #[cfg(test)]
-thread_local! {
-    /// Counts `read_emission_bytes("plan")` calls on this thread (current-thread test runtimes), so
-    /// a test can pin "plan.json is read once per landing".
-    pub(super) static PLAN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+#[allow(clippy::missing_const_for_thread_local)]
+mod plan_reads {
+    thread_local! {
+        /// Counts `read_emission_bytes("plan")` calls on this thread (current-thread test runtimes),
+        /// so a test can pin "plan.json is read once per landing".
+        pub(in crate::execution::job) static PLAN_READS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
 }
+#[cfg(test)]
+pub(super) use plan_reads::PLAN_READS;
 
 /// Keys of a node's emission that hold a list/object and are read by a typed parser instead.
 fn opaque_for(node_id: &str) -> &'static [&'static str] {
