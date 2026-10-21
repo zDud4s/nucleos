@@ -43,22 +43,22 @@ function renderRuns(path = "/runs") {
 }
 
 /**
- * The header's New run, which is the control that owns the panel.
+ * The header's New run, which is the control that opens the dialog.
  *
- * Picked by `aria-expanded` rather than by position: an empty index offers a
+ * Picked by `aria-haspopup` rather than by position: an empty index offers a
  * second "New run" inside its teaching block, and that one is a shortcut to the
- * same panel rather than its owner.
+ * same dialog rather than its owner.
  */
 async function newRunButton(): Promise<HTMLElement> {
   const buttons = await screen.findAllByRole("button", { name: "New run" });
-  const owner = buttons.find((button) => button.hasAttribute("aria-expanded"));
-  if (owner === undefined) throw new Error("no New run button owns the panel");
+  const owner = buttons.find((button) => button.hasAttribute("aria-haspopup"));
+  if (owner === undefined) throw new Error("no New run button opens the dialog");
   return owner;
 }
 
 async function openNewRun(): Promise<void> {
   fireEvent.click(await newRunButton());
-  await screen.findByRole("heading", { name: "New run" });
+  await screen.findByRole("dialog", { name: "New run" });
 }
 
 /* ------------------------------------------------------------- fixtures -- */
@@ -479,7 +479,7 @@ describe("Runs - the index", () => {
     expect(screen.queryByText(/No runs yet/)).toBeNull();
   });
 
-  it("an empty machine points at New run, and its own button opens the panel", async () => {
+  it("an empty machine points at New run, and its own button opens the dialog", async () => {
     daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [] })));
 
     await renderRuns();
@@ -487,7 +487,7 @@ describe("Runs - the index", () => {
     const teach = (await screen.findByText(/No runs yet/)).parentElement as HTMLElement;
     expect(teach.textContent).toMatch(/Start one with New run/);
     fireEvent.click(within(teach).getByRole("button", { name: "New run" }));
-    expect((await newRunButton()).getAttribute("aria-expanded")).toBe("true");
+    expect(await screen.findByRole("dialog", { name: "New run" })).toBeTruthy();
   });
 
   it("the excerpt is the row's link and the run id is not one", async () => {
@@ -726,36 +726,48 @@ describe("Runs - New run", () => {
 
     await renderRuns();
     const opener = await newRunButton();
-    expect(opener.getAttribute("aria-expanded")).toBe("false");
-    // Closed is not absent: the panel is there for `aria-controls` to name.
-    const panel = document.getElementById(opener.getAttribute("aria-controls") ?? "");
-    expect(panel?.hidden).toBe(true);
+    expect(screen.queryByRole("dialog")).toBeNull();
 
+    // A real click focuses the button, which is what Radix hands focus back to; jsdom's does not.
+    opener.focus();
     fireEvent.click(opener);
 
-    expect(opener.getAttribute("aria-expanded")).toBe("true");
-    expect(panel?.hidden).toBe(false);
+    await screen.findByRole("dialog", { name: "New run" });
     const prompt = screen.getByLabelText("Prompt");
     await waitFor(() => expect(document.activeElement).toBe(prompt));
 
     fireEvent.keyDown(prompt, { key: "Escape" });
 
-    expect(opener.getAttribute("aria-expanded")).toBe("false");
-    expect(panel?.hidden).toBe(true);
-    expect(document.activeElement).toBe(opener);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("keeps a half-written request across a close", async () => {
+    daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
+
+    await renderRuns();
+    await openNewRun();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    await openNewRun();
+    expect((screen.getByLabelText("Prompt") as HTMLTextAreaElement).value).toBe("tidy the imports");
   });
 
   it("Close does what Escape does", async () => {
     daemon.apiFetch.mockImplementation(runsFetch(world({ rows: [row()] })));
 
     await renderRuns();
-    await openNewRun();
+    // Taken before the dialog opens: the page under it is hidden from the tree meanwhile.
     const opener = await newRunButton();
+    opener.focus();
+    await openNewRun();
 
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
 
-    expect(opener.getAttribute("aria-expanded")).toBe("false");
-    expect(document.activeElement).toBe(opener);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 
   it("Start run waits for a prompt, and says why", async () => {
@@ -809,6 +821,30 @@ describe("Runs - New run", () => {
     });
   });
 
+  it("starts in the project the list is filtered to", async () => {
+    const answer = runsFetch(world());
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/runs" && init?.method === "POST") return { id: 92 };
+      return await answer(path, init);
+    });
+
+    await renderRuns("/runs?project=beta");
+    await openNewRun();
+    await waitFor(() =>
+      expect((screen.getByLabelText("Project for this run") as HTMLSelectElement).value).toBe("beta"),
+    );
+
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start run" }));
+
+    await waitFor(() => {
+      const posted = daemon.apiFetch.mock.calls.find(
+        ([path, init]) => path === "/runs" && (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(JSON.parse((posted?.[1] as RequestInit).body as string)).toMatchObject({ project_id: "beta" });
+    });
+  });
+
   it("choosing real says what it acts on and swaps Start run for a hold, so one click cannot start it", async () => {
     daemon.apiFetch.mockImplementation(runsFetch(world()));
 
@@ -842,7 +878,7 @@ describe("Runs - New run", () => {
     fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
 
     const note = await screen.findByText(
-      "The kill switch is engaged — the background service will refuse this run until it is released.",
+      "The kill switch is engaged: the background service will refuse this run until it is released.",
     );
     const start = screen.getByRole("button", { name: "Start run" }) as HTMLButtonElement;
     // Still pressable: the reading here can be a poll behind the switch.
@@ -1125,7 +1161,7 @@ describe("Runs - chat turns", () => {
     expect(screen.queryByRole("button", { name: /^Clear \d+ filters?$/ })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "More filters" }));
-    fireEvent.click(screen.getByRole("checkbox", { name: "Show chat turns" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Show chat turns" }));
     await waitFor(() => {
       expect(searchOf(router)).toEqual({ chats: "show" });
     });
