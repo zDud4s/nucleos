@@ -944,7 +944,6 @@ mod tests {
             startup_config: Default::default(),
             token: Token("test-token".into()),
             pool,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner {
                 delay: Mutex::new(delay),

@@ -11,7 +11,6 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     Shell,
-    Telegram,
     /// Spoken into the microphone of the machine this daemon runs on.
     ///
     /// A variant and not a flag on `Shell`, because the two differ in what happens to the ANSWER:
@@ -32,7 +31,9 @@ impl Origin {
     /// ship-dark feature, so anything not explicitly asking for the new path gets the old one.
     pub fn from_wire(value: Option<&str>) -> Self {
         match value {
-            Some("telegram") => Self::Telegram,
+            // Legacy spelling of the Telegram origin, kept so a message queued before the
+            // channel registry still resolves; never built from any other bare wire string.
+            Some("telegram") => Self::Channel(crate::channels::registry::TELEGRAM.id),
             Some("voice") => Self::Voice,
             Some("browser-panel") => Self::BrowserPanel,
             Some(wire) => wire
@@ -45,7 +46,7 @@ impl Origin {
 
     /// Whether the sender is somebody on the far side of a network rather than at this machine.
     pub fn is_remote(self) -> bool {
-        matches!(self, Self::Telegram | Self::Channel(_))
+        matches!(self, Self::Channel(_))
     }
 
     /// How this origin is written down, so a message that waits is sent as the thing it was.
@@ -55,7 +56,6 @@ impl Origin {
     /// Telegram turn back into the shell.
     pub fn as_wire(self) -> &'static str {
         match self {
-            Self::Telegram => "telegram",
             Self::Voice => "voice",
             Self::BrowserPanel => "browser-panel",
             Self::Shell => "shell",
@@ -73,7 +73,6 @@ impl Origin {
 /// spoken turn is somebody at this machine, which is the presence the exemption is about.
 fn doctrine_for(state: &crate::state::AppState, origin: Origin) -> Option<String> {
     match origin {
-        Origin::Telegram => state.telegram_doctrine.clone(),
         Origin::Channel(id) => state.channels.config(id).and_then(|config| config.doctrine),
         Origin::Shell | Origin::Voice | Origin::BrowserPanel => None,
     }
@@ -98,7 +97,7 @@ pub const NO_LOCAL_MODEL: &str = "this chat is set to the local model and none i
 /// `NO_LOCAL_MODEL`'s sibling and not its synonym, and the two have to stay apart because the
 /// failure they each guard is aimed at a different wallet. A chat that says `local` and finds no
 /// local model falls back to the CLI today when the choice was only inferred (`origin ==
-/// Origin::Telegram`) and refuses only when a person SAID `local` outright — because
+/// Origin::Channel(_)`) and refuses only when a person SAID `local` outright — because
 /// the CLI has always answered an unmarked Telegram message, so refusing there would take the bot
 /// off the air to enforce a promise nobody made. `openrouter` has no such history: nothing before
 /// this brain existed could ever have chosen it, so there is no old behaviour to preserve and no
@@ -1489,14 +1488,16 @@ mod tests {
     }
 
     #[test]
-    fn telegram_wire_is_unchanged() {
-        assert_eq!(Origin::Telegram.as_wire(), "telegram");
-        assert_eq!(Origin::from_wire(Some("telegram")), Origin::Telegram);
+    fn legacy_telegram_wire_maps_to_the_channel() {
+        assert_eq!(
+            Origin::from_wire(Some("telegram")),
+            Origin::Channel("telegram")
+        );
+        assert_eq!(Origin::Channel("telegram").as_wire(), "channel:telegram");
     }
 
     #[test]
     fn is_remote_only_for_telegram_and_channels() {
-        assert!(Origin::Telegram.is_remote());
         assert!(Origin::Channel("telegram").is_remote());
         assert!(!Origin::Shell.is_remote());
         assert!(!Origin::Voice.is_remote());
@@ -1507,8 +1508,7 @@ mod tests {
     async fn a_channel_turn_without_own_instructions_gets_the_channel_doctrine() {
         use crate::channels::registry::ChannelConfig;
         let mut state = crate::channels::testkit::state().await;
-        state.telegram_doctrine = Some("be brief".to_string());
-        // No config for the channel: no doctrine, and the legacy Telegram one is not borrowed.
+        // No config for the channel: no doctrine.
         assert_eq!(doctrine_for(&state, Origin::Channel("telegram")), None);
         let configs = std::collections::HashMap::from([(
             "telegram",
@@ -1522,10 +1522,6 @@ mod tests {
         assert_eq!(
             doctrine_for(&state, Origin::Channel("telegram")),
             Some("answer in one line".to_string())
-        );
-        assert_eq!(
-            doctrine_for(&state, Origin::Telegram),
-            Some("be brief".to_string())
         );
         assert_eq!(doctrine_for(&state, Origin::Shell), None);
     }
@@ -1548,7 +1544,6 @@ mod tests {
     #[test]
     fn an_undeclared_local_scope_is_remote_for_a_channel_origin() {
         assert!(undeclared_brain_wants_local(Origin::Channel("telegram")));
-        assert!(undeclared_brain_wants_local(Origin::Telegram));
         assert!(!undeclared_brain_wants_local(Origin::Shell));
     }
 
@@ -1557,7 +1552,6 @@ mod tests {
             startup_config: Default::default(),
             token: Token("t".into()),
             pool: crate::testdb::fresh_pool().await,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
@@ -1698,9 +1692,14 @@ mod tests {
             .await
             .unwrap();
         // The v1 Telegram spelling has no `telegram:` prefix and is never a channel conversation.
-        send_message(&state, &a_chat("-100200"), "hello", Origin::Telegram)
-            .await
-            .unwrap();
+        send_message(
+            &state,
+            &a_chat("-100200"),
+            "hello",
+            Origin::Channel("telegram"),
+        )
+        .await
+        .unwrap();
 
         assert!(acked_turns(&state.pool).await.is_empty());
         assert_eq!(outbox_count(&state.pool).await, 0);
@@ -2200,7 +2199,7 @@ mod tests {
         cancelled_turn_in(&state.pool, &chat).await;
         drain_queued(&state, &chat).await;
         let slot = ChatSlot::acquire(&chat).expect("the chat should be free");
-        send_or_queue(&state, &chat, "again", &[], Origin::Telegram)
+        send_or_queue(&state, &chat, "again", &[], Origin::Channel("telegram"))
             .await
             .unwrap();
         drop(slot);

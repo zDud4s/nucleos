@@ -246,7 +246,10 @@ pub(super) async fn sending_turn_of(
             .flatten();
     let (chat_id, origin) = row?;
     let origin = match origin.as_deref() {
-        Some("telegram") => Some(crate::assistant::Origin::Telegram),
+        // The bare legacy spelling (migration 0235 rewrites stored rows to `channel:telegram`).
+        Some("telegram") => Some(crate::assistant::Origin::Channel(
+            crate::channels::registry::TELEGRAM.id,
+        )),
         Some("shell") => Some(crate::assistant::Origin::Shell),
         // `from_wire` is consulted only for the `channel:` family, because it maps every unknown
         // spelling to `Shell` and that leniency would certify an unreadable origin as local.
@@ -266,7 +269,7 @@ pub(super) async fn sending_turn_of(
 
 /// `relay::admit`'s six refusals, turned into a status and a body that names which one fired —
 /// see `Refusal`'s own doc for what each means. 409 for the five the gate actually DECIDED (the
-/// destination is gone or archived, the sender is Telegram, the chain refuses the hop, the chain has
+/// destination is gone or archived, the sender is remote, the chain refuses the hop, the chain has
 /// spent its ceiling, the owner is away): a caller can read the slug and know why, the same way `post_assistant_message` already
 /// answers 409 for a chat mid-turn. 500 for `Unreadable` alone, because that
 /// variant is not a decision about the relay — the gate could not read enough to make one — and
@@ -283,7 +286,7 @@ pub(super) fn relay_refusal_response(
                 "to_chat_id": to_chat_id,
             })),
         ),
-        Refusal::TelegramOrigin => refusal(StatusCode::CONFLICT, "telegram_origin"),
+        Refusal::RemoteOrigin => refusal(StatusCode::CONFLICT, "remote_origin"),
         Refusal::Chain(Verdict::Itself) => refusal(StatusCode::CONFLICT, "relay_to_self"),
         Refusal::Chain(Verdict::Cycle { at }) => (
             StatusCode::CONFLICT,
@@ -353,7 +356,7 @@ pub(super) enum RelayAttempt {
     /// would send an operator looking for a bad run id when the answer is a row that predates 0119.
     ///
     /// Refused rather than defaulted, which is that migration's whole argument: a run whose origin
-    /// nobody wrote down is not a run known to be safe, and `relay::admit`'s Telegram brake is
+    /// nobody wrote down is not a run known to be safe, and `relay::admit`'s remote-origin brake is
     /// worth exactly as much as the honesty of what is handed to it.
     UnknownOrigin,
     Refused(crate::relay::Refusal),
@@ -400,7 +403,7 @@ pub(super) async fn relay_send_to_chat(
         //
         // `admit` is asked about the SENDER: where the message asking for this relay came from,
         // read off `runs.origin` above rather than asserted here. That read is what makes
-        // `relay::Refusal::TelegramOrigin` reachable at all — before 0119 the column did not exist,
+        // `relay::Refusal::RemoteOrigin` reachable at all — before 0119 the column did not exist,
         // this handler had nothing truer than `Origin::Shell` to pass, and the brake was live in
         // its own unit tests and dead everywhere else.
         //
@@ -477,7 +480,7 @@ pub(super) fn relay_outcome_response(
 ///
 /// **The gate is the same gate, and reads the same facts.** `relay::admit` is asked about the
 /// origin of the TURN being forwarded, not about the person doing the forwarding — so forwarding a
-/// turn that arrived from Telegram is refused, exactly as a model relaying from one would be.
+/// turn that arrived from a remote channel is refused, exactly as a model relaying from one would be.
 /// Passing `Origin::Shell` here because a human is at the window was the alternative, and it would
 /// have been telling the gate something untrue about the turn in order to get a different answer.
 /// One rule, read one way, from one column.

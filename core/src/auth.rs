@@ -1279,7 +1279,6 @@ mod tests {
             startup_config: Default::default(),
             token: Token(token.to_string()),
             pool,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,

@@ -392,7 +392,7 @@ export function SessionColumn({
           <Teach title="No conversations yet">
             <p>Say something to start one: press New conversation above and write in the box.</p>
             <p>
-              Telegram&apos;s own conversations do not show up here — only the ones you start from
+              Conversations from other channels do not show up here — only the ones you start from
               this app do.
             </p>
           </Teach>

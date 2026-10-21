@@ -2595,13 +2595,13 @@ describe("Chats - archiving a conversation", () => {
 /* --------------------------------------------------------- A8: empty list -- */
 
 describe("Chats - an empty list", () => {
-  it("names Telegram conversations' absence rather than saying nothing is here", async () => {
+  it("names other channels' conversations' absence rather than saying nothing is here", async () => {
     daemon.apiFetch.mockImplementation(chatsFetch([], {}));
 
     await renderChats("/chats");
 
     expect(await screen.findByRole("heading", { name: "No conversations yet" })).toBeDefined();
-    expect(await screen.findByText(/Telegram/)).toBeDefined();
+    expect(await screen.findByText(/Conversations from other channels/)).toBeDefined();
   });
 });
 

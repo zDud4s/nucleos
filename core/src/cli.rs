@@ -495,22 +495,6 @@ async fn pressao() {
     }
 }
 
-fn set_telegram_token() {
-    match read_secret_from_stdin("paste the bot token, then press Enter:") {
-        Some(value) => match secrets::store_secret(TELEGRAM_TOKEN_KEY, &value) {
-            Ok(()) => println!("telegram bot token stored in the system credential store"),
-            Err(e) => {
-                eprintln!("failed to store telegram token: {e}");
-                std::process::exit(1);
-            }
-        },
-        None => {
-            eprintln!("no bot token was read from stdin");
-            std::process::exit(1);
-        }
-    }
-}
-
 // The door the `github-token` comes in by. `secrets.rs` has always exposed store/load/delete and
 // nothing put this key there, so the pillar could be configured, enabled and credential-less with
 // no way to fix it that did not involve writing a second program.
@@ -772,10 +756,6 @@ pub(super) async fn run_subcommand() -> bool {
     }
     if std::env::args().any(|a| a == "--pressao") {
         pressao().await;
-        return true;
-    }
-    if std::env::args().any(|a| a == "--set-telegram-token") {
-        set_telegram_token();
         return true;
     }
     if std::env::args().any(|a| a == "--set-github-token") {

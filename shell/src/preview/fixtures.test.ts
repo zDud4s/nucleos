@@ -326,7 +326,7 @@ describe("the channel management fixtures", () => {
     const area = config.settings.find((row) => row.area === "channels/telegram");
     expect(area?.path).toBe("channels/telegram.yaml");
     expect(area?.what).toBe(CHANNEL_WHAT);
-    expect(config.settings.some((row) => row.area === "telegram")).toBe(true);
+    expect(config.settings.some((row) => row.area === "telegram")).toBe(false);
     const secrets = answer("/config/secrets") as { secrets: { key: string; area: string }[] };
     expect(secrets.secrets.find((row) => row.key === "telegram-token")?.area).toBe("channels/telegram");
     const health = answer("/health/readout") as { subsystems: { name: string; status: string; reason?: string }[] };

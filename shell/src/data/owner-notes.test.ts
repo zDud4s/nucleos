@@ -36,9 +36,6 @@ describe("originLabel", () => {
       "Discord",
     );
   });
-  it("labels the legacy telegram origin", () => {
-    expect(originLabel("telegram")).toBe("Telegram");
-  });
 });
 
 function setup() {

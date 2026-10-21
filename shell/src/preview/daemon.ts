@@ -2951,7 +2951,6 @@ const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["calendar", "Working hours and the default timezone.", 'default_tz: Europe/Lisbon\nworking_hours_start: "09:00"\nworking_hours_end: "18:00"\n'],
   ["web", "The search provider and how many results a query returns.", null],
   ["browser", "Which browser driver the browser pillar starts.", "driver: chrome\n"],
-  ["telegram", "The bot and the chat notifications are sent to.", null],
   ["channels/telegram", CHANNEL_TELEGRAM_WHAT, null],
   ["github", "Which account `gh` acts as.", null],
   ["council", "Who sits on the council and how votes are counted.", null],

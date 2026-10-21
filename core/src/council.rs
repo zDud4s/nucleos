@@ -903,7 +903,6 @@ mod tests {
             startup_config: Default::default(),
             token: crate::auth::Token("control-token".into()),
             pool: test_pool().await,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner,
             triage_runner: None,

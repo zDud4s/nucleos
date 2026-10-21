@@ -14,7 +14,6 @@ use cli::*;
 use startup::*;
 
 const TOKEN_KEY: &str = "daemon-token";
-const TELEGRAM_TOKEN_KEY: &str = "telegram-token";
 /// The mailbox password (spec §3.4). An app password, in Credential Manager rather than in
 /// `~/.nucleos/email.yaml`, so the one secret the pillar needs never sits in a file next to the config.
 const EMAIL_PASSWORD_KEY: &str = "email-imap-password";
@@ -314,10 +313,6 @@ async fn main() {
     let browser_config = machine_file(machine_config::BROWSER_FILE)
         .as_deref()
         .map(config::load_browser_config)
-        .unwrap_or_default();
-    let telegram_config = machine_file(machine_config::TELEGRAM_FILE)
-        .as_deref()
-        .map(config::load_telegram_config)
         .unwrap_or_default();
     // The path is named once and reused, because two facts come off it: what the file SAYS
     // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
@@ -764,7 +759,6 @@ async fn main() {
         // The root every file above was read from, so the settings page writes the same files the
         // daemon reads. `None` was already warned about where it was resolved.
         machine_config_root: machine_config_root.clone(),
-        telegram_doctrine: telegram_config.doctrine,
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
             triage_sandbox,

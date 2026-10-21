@@ -883,7 +883,7 @@ pub(super) struct TurnLaunch {
     pub(super) cwd: Option<std::path::PathBuf>,
     pub(super) tool_policy: crate::execution::runner::ToolPolicy,
     /// The configured Telegram doctrine, already resolved against `origin` in `send_message` —
-    /// `Some` only for an `Origin::Telegram` turn whose operator configured one, `None` otherwise.
+    /// `Some` only for an `Origin::Channel` turn whose operator configured one, `None` otherwise.
     ///
     /// Carried on the struct rather than re-derived where it is used, because `origin` is gone by
     /// then: this is read inside the task `spawn_assistant_turn` spawns, where `chats::answering`
@@ -1481,7 +1481,6 @@ mod tests {
             startup_config: Default::default(),
             token: crate::auth::Token("t".into()),
             pool: crate::testdb::fresh_pool().await,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner,
             triage_runner: None,

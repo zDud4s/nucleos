@@ -2973,7 +2973,6 @@ mod tests {
             startup_config: Default::default(),
             token: crate::auth::Token("verification-token".into()),
             pool,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,

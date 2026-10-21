@@ -401,15 +401,6 @@ pub struct AppState {
     ///
     /// The trait cannot READ a secret back, only answer whether one is set. See its own doc.
     pub secrets: std::sync::Arc<dyn crate::secrets::SecretStore>,
-    /// The standing instructions a Telegram turn is launched with when the chat itself gave none,
-    /// resolved once at startup from `~/.nucleos/telegram.yaml`.
-    ///
-    /// `None` — absent file, unreadable file, malformed file, or a `doctrine` that was blank —
-    /// means every turn is launched exactly as it was before this field existed: nothing prepended,
-    /// nothing changed. It is read only for `Origin::Telegram` turns (`assistant.rs`), and even
-    /// then only fills the slot when the chat's own `system_prompt` is empty — a person's own
-    /// instructions always win.
-    pub telegram_doctrine: Option<String>,
     /// Read-only after startup, so it is shared rather than copied per clone of the state.
     pub email: Arc<EmailRuntime>,
     /// The voice pillar's settings, its transcriber and its HTTP client, resolved once at startup.

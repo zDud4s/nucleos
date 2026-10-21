@@ -23,8 +23,7 @@ import { keys } from "./keys";
 /* ----------------------------------------------------------------- shapes -- */
 
 export type NoteState = "active" | "archived";
-// The bare "telegram" member is transitional until phase 4; remove it then.
-export type NoteOrigin = "shell" | "telegram" | `channel:${string}`;
+export type NoteOrigin = "shell" | `channel:${string}`;
 
 const capitalise = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -34,7 +33,7 @@ export function originLabel(
   channels?: ReadonlyArray<{ id: string; label: string }>,
 ): string {
   if (origin === "shell") return "shell";
-  const id = origin.startsWith("channel:") ? origin.slice("channel:".length) : origin;
+  const id = origin.slice("channel:".length);
   return channels?.find((c) => c.id === id)?.label ?? capitalise(id);
 }
 

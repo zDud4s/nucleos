@@ -306,7 +306,6 @@ mod tests {
             // Recognisable on purpose: this is the value a fallback would reach for.
             token: Token("control-token".into()),
             pool,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,

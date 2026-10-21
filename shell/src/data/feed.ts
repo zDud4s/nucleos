@@ -645,8 +645,8 @@ export const NOTIFY_FAMILIES: { selector: string; label: string }[] = [
 ];
 
 /**
- * Whether a feed kind may be forwarded under a policy — the sidecar's `Policy.Allows`
- * (`sidecars/telegram/notifier/policy.go`), written a second time for the one consumer that
+ * Whether a feed kind may be forwarded under a policy — the channel notifier's
+ * `Policy.Allows` (the Go sidecars' notify policy), written a second time for the one consumer that
  * decides in the window: the desktop notifier.
  *
  * An exact kind rule wins; otherwise the LONGEST matching family prefix decides; otherwise the
