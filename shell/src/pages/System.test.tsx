@@ -801,11 +801,12 @@ describe("System - unsaved limits", () => {
 });
 
 describe("System - appearance", () => {
-  it("keeps the quota notch preference under Appearance on the Machine tab", async () => {
+  it("keeps the quota notch preference on the Machine tab, a panel beside the machine's own", async () => {
     daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
     await renderSystemAt("/system/settings");
 
-    expect(await screen.findByRole("region", { name: "Appearance" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 2, name: "Quota notch" })).toBeDefined();
+    expect(screen.queryByRole("region", { name: "Appearance" })).toBeNull();
   });
 });
 
