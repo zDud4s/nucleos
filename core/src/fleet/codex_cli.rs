@@ -96,6 +96,8 @@ fn map_record(record: &Value) -> Vec<Mapped> {
         (Some("response_item"), "message") => assistant_message(payload),
         (Some("event_msg"), "item_completed") => user_item(payload),
         (Some("event_msg"), "user_message") => prompt(str_of(payload, "message").unwrap_or("")),
+        (Some("event_msg"), "task_complete") => task_complete(payload),
+        (Some("event_msg"), "turn_aborted") => vec![Mapped::new(TermKind::Error, "turn aborted")],
         (Some("response_item"), "function_call") => function_call(payload),
         (Some("response_item"), "custom_tool_call") => custom_call(payload),
         (Some("response_item"), "function_call_output" | "custom_tool_call_output") => output(payload),
@@ -189,6 +191,56 @@ fn output(payload: &Value) -> Vec<Mapped> {
         return Vec::new();
     }
     vec![Mapped::new(TermKind::Result, result_summary(&text)).with_detail(text)]
+}
+
+fn task_complete(payload: &Value) -> Vec<Mapped> {
+    match str_of(payload, "last_agent_message").filter(|text| !text.trim().is_empty()) {
+        Some(text) => vec![Mapped::new(TermKind::Final, text)],
+        None => vec![Mapped::new(TermKind::Status, "turn complete")],
+    }
+}
+
+/// The context size after the latest request: `last_token_usage.total_tokens` (input plus output),
+/// falling back to `input_tokens`. Codex reports no price, so `cost_usd` stays `None`. A
+/// `token_count` whose `info` is `null` (rate-limit-only update) carries no usage.
+fn usage_of(record: &Value) -> Option<Usage> {
+    if str_of(record, "type")? != "event_msg" || record.pointer("/payload/type")?.as_str()? != "token_count" {
+        return None;
+    }
+    let last = record.pointer("/payload/info/last_token_usage")?;
+    let tokens = last.get("total_tokens").or_else(|| last.get("input_tokens"))?.as_i64()?;
+    Some(Usage { context_tokens: Some(tokens), cost_usd: None })
+}
+
+fn ts_of(record: &Value) -> Option<Timestamp> {
+    parse_ts(str_of(record, "timestamp")?)
+}
+
+fn parse_ts(text: &str) -> Option<Timestamp> {
+    DateTime::parse_from_rfc3339(text).ok().map(|at| at.with_timezone(&Utc))
+}
+
+/// What a batch of raw rollout lines says.
+struct Parsed {
+    mapped: Vec<Mapped>,
+    usage: Option<Usage>,
+    last_at: Option<Timestamp>,
+}
+
+/// Maps complete lines in order. A line that is not json is skipped, never an error.
+fn parse_lines(raw: &[String]) -> Parsed {
+    let mut parsed = Parsed { mapped: Vec::new(), usage: None, last_at: None };
+    for line in raw {
+        let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+        if let Some(at) = ts_of(&record) {
+            parsed.last_at = Some(at);
+        }
+        if let Some(usage) = usage_of(&record) {
+            parsed.usage = Some(usage);
+        }
+        parsed.mapped.extend(map_record(&record));
+    }
+    parsed
 }
 
 #[cfg(test)]
@@ -341,5 +393,43 @@ mod tests {
         let detail = mapped(&line)[0].detail.clone().unwrap();
         assert_eq!(detail.chars().count(), DETAIL_CHARS + 1);
         assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn task_complete_is_the_final_line_or_a_status() {
+        let with = rec("event_msg", json!({"type": "task_complete", "last_agent_message": "All green."}));
+        let got = mapped(&with);
+        assert_eq!((got[0].kind, got[0].text.as_str()), (TermKind::Final, "All green."));
+        let without = rec("event_msg", json!({"type": "task_complete", "last_agent_message": null}));
+        assert_eq!(mapped(&without)[0].kind, TermKind::Status);
+        let aborted = rec("event_msg", json!({"type": "turn_aborted"}));
+        assert_eq!(mapped(&aborted)[0].kind, TermKind::Error);
+    }
+
+    #[test]
+    fn usage_comes_from_the_last_token_usage_and_tolerates_a_null_info() {
+        let line = |info: Value| rec("event_msg", json!({"type": "token_count", "info": info}));
+        let got = usage_of(&serde_json::from_str(&line(json!({"last_token_usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}))).unwrap());
+        assert_eq!(got, Some(Usage { context_tokens: Some(120), cost_usd: None }));
+        let fallback = usage_of(&serde_json::from_str(&line(json!({"last_token_usage": {"input_tokens": 100}}))).unwrap());
+        assert_eq!(fallback.unwrap().context_tokens, Some(100));
+        assert_eq!(usage_of(&serde_json::from_str(&line(Value::Null)).unwrap()), None);
+        let other = rec("event_msg", json!({"type": "task_started"}));
+        assert_eq!(usage_of(&serde_json::from_str(&other).unwrap()), None);
+    }
+
+    #[test]
+    fn parse_lines_skips_garbage_and_keeps_the_latest_usage_and_timestamp() {
+        let raw = [
+            "{broken".to_owned(),
+            String::new(),
+            rec("event_msg", json!({"type": "token_count", "info": {"last_token_usage": {"total_tokens": 10}}})),
+            rec("response_item", json!({"type": "message", "role": "assistant", "content": [{"text": "hi"}]})),
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":30}}},"timestamp":"2026-10-20T10:05:00Z"}"#.to_owned(),
+        ];
+        let parsed = parse_lines(&raw);
+        assert_eq!(parsed.mapped.len(), 1);
+        assert_eq!(parsed.usage.unwrap().context_tokens, Some(30));
+        assert_eq!(parsed.last_at.unwrap().to_rfc3339(), "2026-10-20T10:05:00+00:00");
     }
 }
