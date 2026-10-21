@@ -1445,7 +1445,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    pub(super) async fn test_state() -> AppState {
+    pub(crate) async fn test_state() -> AppState {
         let pool = crate::testdb::fresh_pool().await;
         AppState {
             startup_config: Default::default(),

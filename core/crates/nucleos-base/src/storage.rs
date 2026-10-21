@@ -910,12 +910,12 @@ mod tests {
         assert_eq!(old, 0);
     }
 
-    /// Migration `0230` takes the phase names out of `jobs.status`, gives every live job already
+    /// Migration `0231` takes the phase names out of `jobs.status`, gives every live job already
     /// past planning a passed `plan` node row, drops the write-only `stage_cursor` and adds the
     /// graph snapshot columns.
     #[tokio::test]
-    async fn migration_0230_rewrites_phases_backfills_plan_rows_and_drops_stage_cursor() {
-        let pool = crate::testdb::pool_migrated_through(229).await;
+    async fn migration_0231_rewrites_phases_backfills_plan_rows_and_drops_stage_cursor() {
+        let pool = crate::testdb::pool_migrated_through(230).await;
         // (status, resume_status, items, expected status, expected resume, plan row expected)
         #[allow(clippy::type_complexity)]
         let cases: [(&str, Option<&str>, i64, &str, Option<&str>, bool); 11] = [
@@ -979,7 +979,7 @@ mod tests {
             }
         }
 
-        crate::testdb::apply_migration(&pool, 230).await;
+        crate::testdb::apply_migration(&pool, 231).await;
 
         for (index, (status, _, _, want_status, want_resume, want_plan)) in cases.iter().enumerate()
         {
