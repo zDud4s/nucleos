@@ -39,21 +39,10 @@ pub(super) fn retried_launch(
     report: &str,
 ) -> super::dispatch::NodeLaunch {
     if let Some(kind) = runner.and_then(crate::models::route_advice::RunnerKind::parse) {
-        // The retry pins the engine the first attempt ran on, so it keeps the sandbox that was the
-        // barrier there; a Codex retry with none recorded runs read-only, as `codex exec` does.
-        let sandbox = (kind == crate::models::route_advice::RunnerKind::Codex).then(|| {
-            launch
-                .pin
-                .as_ref()
-                .and_then(|pin| pin.sandbox)
-                .or(launch.codex_sandbox.map(|sandbox| sandbox.as_str()))
-                .unwrap_or("read-only")
-        });
         launch.pin = Some(super::dispatch::EnginePin {
             runner: kind,
             model,
             effort,
-            sandbox,
         });
     }
     launch.prompt = super::dispatch::retry_prompt(&launch.prompt, report);

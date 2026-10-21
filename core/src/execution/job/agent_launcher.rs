@@ -11,7 +11,7 @@
 //! A node WITHOUT `agent:` goes to [`ProtocolAndBody`], untouched.
 use std::sync::Arc;
 
-use crate::agents::capabilities::{CodexSandbox, Engine};
+use crate::agents::capabilities::Engine;
 use crate::agents::launch::{self, AgentLaunch, LaunchError, Pins};
 use crate::agents::output::{self, OutputShape};
 use crate::models::route_advice::RunnerKind;
@@ -64,7 +64,6 @@ fn pin_of(
     pin: Option<(Engine, String)>,
     effort: Option<&str>,
     label: &str,
-    sandbox: Option<CodexSandbox>,
 ) -> Result<Option<EnginePin>, LaunchRefused> {
     let Some((engine, model)) = pin else {
         return Ok(None);
@@ -80,10 +79,6 @@ fn pin_of(
         effort: effort
             .filter(|effort| !effort.is_empty())
             .map(str::to_owned),
-        // Only Codex has a sandbox to pin; an agent that asks for no fs/shell/web gets read-only,
-        // the same default the generated Codex prefix states.
-        sandbox: (runner == RunnerKind::Codex)
-            .then(|| sandbox.unwrap_or(CodexSandbox::ReadOnly).as_str()),
     }))
 }
 
@@ -107,10 +102,8 @@ fn node_launch(
     effort: Option<&str>,
     label: &str,
 ) -> Result<NodeLaunch, LaunchRefused> {
-    let codex_sandbox = launch.tools.as_ref().and_then(|tools| tools.codex_sandbox);
-    let pin = pin_of(launch.pin, effort, label, codex_sandbox)?;
+    let pin = pin_of(launch.pin, effort, label)?;
     Ok(NodeLaunch {
-        codex_sandbox,
         prompt: launch.prompt,
         // A pin bypasses the router, so there is nothing to restrict then.
         restrict_runners: pin.is_none().then_some(launch.runners),
@@ -212,63 +205,18 @@ mod tests {
             Some((Engine::Codex, "gpt-5".to_owned())),
             Some("high"),
             "r@1.0.0",
-            None,
         )
         .unwrap()
         .expect("a pin");
         assert_eq!(pin.runner, RunnerKind::Codex);
         assert_eq!(pin.model.as_deref(), Some("gpt-5"));
         assert_eq!(pin.effort.as_deref(), Some("high"));
-        // A Codex pin always names a sandbox: the agent's, else read-only.
-        assert_eq!(pin.sandbox, Some("read-only"));
-        let bare = pin_of(
-            Some((Engine::Claude, String::new())),
-            None,
-            "r@1.0.0",
-            Some(CodexSandbox::WorkspaceWrite),
-        )
-        .unwrap()
-        .expect("a pin");
+        let bare = pin_of(Some((Engine::Claude, String::new())), None, "r@1.0.0")
+            .unwrap()
+            .expect("a pin");
         assert_eq!(bare.runner, RunnerKind::Claude);
         assert_eq!((bare.model, bare.effort), (None, None));
-        assert_eq!(bare.sandbox, None, "a Claude pin has no sandbox to pin");
-        assert!(
-            pin_of(None, Some("high"), "r@1.0.0", None)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_codex_pinned_launch_carries_the_sandbox_its_capabilities_translate_to() {
-        let launch = |sandbox: Option<CodexSandbox>| AgentLaunch {
-            prompt: "p".to_owned(),
-            runners: vec![RunnerKind::Codex],
-            pin: Some((Engine::Codex, "gpt-5".to_owned())),
-            output: OutputShape::free("anything"),
-            tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
-            tools: Some(crate::agents::capabilities::EngineTools {
-                tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
-                claude_allowed_tools: Vec::new(),
-                codex_sandbox: sandbox,
-                codex_web_search: false,
-                local_tools: Vec::new(),
-                mcp: false,
-            }),
-        };
-        let writing =
-            node_launch(launch(Some(CodexSandbox::WorkspaceWrite)), None, "r@1.0.0").unwrap();
-        assert_eq!(writing.codex_sandbox, Some(CodexSandbox::WorkspaceWrite));
-        assert_eq!(
-            writing.pin.and_then(|pin| pin.sandbox),
-            Some("workspace-write")
-        );
-        let reading = node_launch(launch(Some(CodexSandbox::ReadOnly)), None, "r@1.0.0").unwrap();
-        assert_eq!(reading.pin.and_then(|pin| pin.sandbox), Some("read-only"));
-        // Nothing asked of the filesystem: the pin still runs read-only.
-        let bare = node_launch(launch(None), None, "r@1.0.0").unwrap();
-        assert_eq!(bare.codex_sandbox, None);
-        assert_eq!(bare.pin.and_then(|pin| pin.sandbox), Some("read-only"));
+        assert!(pin_of(None, Some("high"), "r@1.0.0").unwrap().is_none());
     }
 
     #[test]
@@ -302,7 +250,7 @@ mod tests {
     #[test]
     fn a_local_pin_is_unavailable_for_a_node() {
         let Err(LaunchRefused::Unavailable(why)) =
-            pin_of(Some((Engine::Local, "m".to_owned())), None, "r@1.0.0", None)
+            pin_of(Some((Engine::Local, "m".to_owned())), None, "r@1.0.0")
         else {
             panic!("a local pin is Unavailable");
         };
