@@ -58,6 +58,10 @@ pub struct NodeLaunch {
     /// effort the launch runs at.
     pub effort: Option<String>,
     pub output: Option<Arc<dyn OutputCheck>>,
+    /// The Codex sandbox the agent's capabilities translate to, when the launch is pinned to Codex.
+    /// It is also carried by the pin itself (`EnginePin::sandbox`), which is what the runner is built
+    /// from; this is the same fact at the launch level.
+    pub codex_sandbox: Option<crate::agents::capabilities::CodexSandbox>,
 }
 
 impl NodeLaunch {
@@ -69,6 +73,7 @@ impl NodeLaunch {
             pin: None,
             effort: None,
             output: None,
+            codex_sandbox: None,
         }
     }
 }

@@ -849,13 +849,31 @@ pub(super) async fn create_run_with(
             inherit_classifier_hook(root, tree);
         }
     }
-    let governed_by_classifier = classifier_governs_tools(mode, tool_policy, spawn_cwd.as_deref());
+    // A node pinned to Codex is shaped for Codex up front: `codex exec` has no `PreToolUse` hook and
+    // no permission modes, so the classifier does not govern it and `Bypass` would be refused. Its
+    // barrier is the sandbox the pin carries (derived from the agent's capabilities). Only when the
+    // router holds Codex, since otherwise the pin never reaches a Codex runner and the run keeps the
+    // shape it would have had.
+    let pinned_to_codex = node.is_some_and(|node| {
+        node.launch
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.runner == crate::models::route_advice::RunnerKind::Codex)
+    }) && state.runner.router().is_some_and(|router| {
+        router
+            .available(crate::models::route_advice::RunnerKind::Codex)
+            .is_some()
+    });
+    let governed_by_classifier =
+        !pinned_to_codex && classifier_governs_tools(mode, tool_policy, spawn_cwd.as_deref());
     // An unattended, unrestricted run the classifier does not govern runs with nothing watching it
     // and the CLI's barrier still up; say so on the feed instead of leaving it to be discovered.
+    // Not for a Codex pin, where the sandbox is the barrier by design.
     if runs_unattended(mode)
         && tool_policy == crate::execution::runner::ToolPolicy::Unrestricted
         && !plan_only
         && !governed_by_classifier
+        && !pinned_to_codex
     {
         let spawn_dir = spawn_cwd.as_deref().map_or_else(
             || "(no directory)".to_owned(),
