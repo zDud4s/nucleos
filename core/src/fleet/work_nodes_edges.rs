@@ -39,7 +39,10 @@ const DAEMON_HARNESS: &str = "daemon";
 pub(super) const MAX_EDGE_ROWS: i64 = 2000;
 
 pub(super) fn session_keys(session_id: &str) -> Vec<NodeKey> {
-    SESSION_HARNESSES.iter().map(|harness| NodeKey::new(harness, session_id)).collect()
+    SESSION_HARNESSES
+        .iter()
+        .map(|harness| NodeKey::new(harness, session_id))
+        .collect()
 }
 
 /// Every key `daemon_runs` could have sighted run `run_id` under, given its `runs.session_id`.
@@ -57,7 +60,9 @@ pub(super) fn run_keys(run_id: i64, session_id: Option<&str>) -> Vec<NodeKey> {
 /// after `since`. An unparseable stamp counts as inside: dropping an edge over a bad date would
 /// hide a real parent.
 pub(super) fn in_window(stamp: &str, since: Timestamp) -> bool {
-    DateTime::parse_from_rfc3339(stamp).map(|at| at >= since).unwrap_or(true)
+    DateTime::parse_from_rfc3339(stamp)
+        .map(|at| at >= since)
+        .unwrap_or(true)
 }
 
 /// A lower bound for SQL text comparison, one hour before `since`: text order is exact only up to
@@ -204,8 +209,14 @@ impl EdgeSource for WorkNodesEdges {
             let (children, parents) = (row.child_keys(), row.parent_keys());
             for child in &children {
                 for parent in &parents {
-                    if child != parent && child.native_id != parent.native_id && seen.insert((child.clone(), parent.clone())) {
-                        edges.push(Edge { child: child.clone(), parent: parent.clone() });
+                    if child != parent
+                        && child.native_id != parent.native_id
+                        && seen.insert((child.clone(), parent.clone()))
+                    {
+                        edges.push(Edge {
+                            child: child.clone(),
+                            parent: parent.clone(),
+                        });
                     }
                 }
             }
@@ -225,7 +236,10 @@ mod tests {
 
     #[test]
     fn a_bare_session_id_is_a_candidate_for_every_native_harness() {
-        assert_eq!(labels(&session_keys("s1")), ["claude-code:s1", "codex-cli:s1"]);
+        assert_eq!(
+            labels(&session_keys("s1")),
+            ["claude-code:s1", "codex-cli:s1"]
+        );
     }
 
     #[test]
@@ -244,7 +258,10 @@ mod tests {
         assert!(in_window("2026-10-20T10:00:00.5+00:00", since));
         assert!(in_window("2026-10-20T11:00:00Z", since));
         assert!(!in_window("2026-10-20T09:59:59Z", since));
-        assert!(in_window("garbage", since), "a bad stamp degrades to kept, never to lost edges");
+        assert!(
+            in_window("garbage", since),
+            "a bad stamp degrades to kept, never to lost edges"
+        );
     }
 
     #[test]
@@ -265,13 +282,25 @@ mod tests {
 
     impl<'a> NodeSpec<'a> {
         fn new(id: &'a str) -> Self {
-            Self { id, parent: None, status: "running", session: None, run: None, chat: None, stamp: "" }
+            Self {
+                id,
+                parent: None,
+                status: "running",
+                session: None,
+                run: None,
+                chat: None,
+                stamp: "",
+            }
         }
     }
 
     async fn insert(pool: &SqlitePool, spec: NodeSpec<'_>) {
         let now = Utc::now().to_rfc3339();
-        let stamp = if spec.stamp.is_empty() { now.as_str() } else { spec.stamp };
+        let stamp = if spec.stamp.is_empty() {
+            now.as_str()
+        } else {
+            spec.stamp
+        };
         sqlx::query(
             "INSERT INTO work_nodes (id, root_id, parent_id, depth, kind, title, goal, status,
                                      session_id, run_id, chat_id, created_at, updated_at)
@@ -300,15 +329,36 @@ mod tests {
             let (harness, native) = id.split_once(':').unwrap();
             NodeKey::new(harness, native)
         };
-        Edge { child: split(child), parent: split(parent) }
+        Edge {
+            child: split(child),
+            parent: split(parent),
+        }
     }
 
     #[tokio::test]
     async fn a_child_in_another_harness_session_gets_a_cross_harness_edge() {
         let pool = crate::testdb::fresh_pool().await;
-        insert(&pool, NodeSpec { session: Some("claude-sess"), ..NodeSpec::new("root") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), session: Some("codex-sess"), ..NodeSpec::new("leaf") }).await;
-        let edges = WorkNodesEdges::new(pool).edges(since_10_min()).await.unwrap();
+        insert(
+            &pool,
+            NodeSpec {
+                session: Some("claude-sess"),
+                ..NodeSpec::new("root")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                session: Some("codex-sess"),
+                ..NodeSpec::new("leaf")
+            },
+        )
+        .await;
+        let edges = WorkNodesEdges::new(pool)
+            .edges(since_10_min())
+            .await
+            .unwrap();
         // 2 child candidates x 2 parent candidates; fusion keeps the one both ends of which are sighted.
         assert_eq!(edges.len(), 4);
         assert!(edges.contains(&pair("codex-cli:codex-sess", "claude-code:claude-sess")));
@@ -318,18 +368,67 @@ mod tests {
     #[tokio::test]
     async fn a_child_sharing_its_parents_session_adds_no_self_edge() {
         let pool = crate::testdb::fresh_pool().await;
-        insert(&pool, NodeSpec { session: Some("s"), ..NodeSpec::new("root") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), session: Some("s"), ..NodeSpec::new("leaf") }).await;
-        assert!(WorkNodesEdges::new(pool).edges(since_10_min()).await.unwrap().is_empty());
+        insert(
+            &pool,
+            NodeSpec {
+                session: Some("s"),
+                ..NodeSpec::new("root")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                session: Some("s"),
+                ..NodeSpec::new("leaf")
+            },
+        )
+        .await;
+        assert!(
+            WorkNodesEdges::new(pool)
+                .edges(since_10_min())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn roots_and_nodes_with_no_identity_make_no_edges() {
         let pool = crate::testdb::fresh_pool().await;
-        insert(&pool, NodeSpec { session: Some("s"), ..NodeSpec::new("root") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), ..NodeSpec::new("anonymous") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), session: Some("  "), ..NodeSpec::new("blank") }).await;
-        assert!(WorkNodesEdges::new(pool).edges(since_10_min()).await.unwrap().is_empty());
+        insert(
+            &pool,
+            NodeSpec {
+                session: Some("s"),
+                ..NodeSpec::new("root")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                ..NodeSpec::new("anonymous")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                session: Some("  "),
+                ..NodeSpec::new("blank")
+            },
+        )
+        .await;
+        assert!(
+            WorkNodesEdges::new(pool)
+                .edges(since_10_min())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -337,17 +436,52 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let with_session = sqlx::query("INSERT INTO runs (prompt, status, mode, created_at, session_id) VALUES ('p','running','real',?, 'cs')")
             .bind(Utc::now().to_rfc3339()).execute(&pool).await.unwrap().last_insert_rowid();
-        let sessionless = sqlx::query("INSERT INTO runs (prompt, status, mode, created_at) VALUES ('p','running','real',?)")
-            .bind(Utc::now().to_rfc3339()).execute(&pool).await.unwrap().last_insert_rowid();
-        insert(&pool, NodeSpec { session: Some("parent-s"), ..NodeSpec::new("root") }).await;
+        let sessionless = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at) VALUES ('p','running','real',?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        insert(
+            &pool,
+            NodeSpec {
+                session: Some("parent-s"),
+                ..NodeSpec::new("root")
+            },
+        )
+        .await;
         let a = with_session.to_string();
         let b = sessionless.to_string();
-        insert(&pool, NodeSpec { parent: Some("root"), run: Some(a.as_str()), ..NodeSpec::new("a") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), run: Some(b.as_str()), ..NodeSpec::new("b") }).await;
-        let edges = WorkNodesEdges::new(pool).edges(since_10_min()).await.unwrap();
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                run: Some(a.as_str()),
+                ..NodeSpec::new("a")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                run: Some(b.as_str()),
+                ..NodeSpec::new("b")
+            },
+        )
+        .await;
+        let edges = WorkNodesEdges::new(pool)
+            .edges(since_10_min())
+            .await
+            .unwrap();
         assert!(edges.contains(&pair("claude-code:cs", "claude-code:parent-s")));
         assert!(edges.contains(&pair("codex-cli:cs", "codex-cli:parent-s")));
-        assert!(edges.contains(&pair(&format!("daemon:run-{sessionless}"), "claude-code:parent-s")));
+        assert!(edges.contains(&pair(
+            &format!("daemon:run-{sessionless}"),
+            "claude-code:parent-s"
+        )));
     }
 
     #[tokio::test]
@@ -364,23 +498,78 @@ mod tests {
         turn("2026-10-20T10:05:00+00:00", "speaking-session").await;
         turn("2026-10-20T10:30:00+00:00", "later-session").await;
         let stamp = "2026-10-20T10:10:00+00:00";
-        insert(&pool, NodeSpec { chat: Some("chat-1"), stamp, ..NodeSpec::new("root") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), session: Some("kid"), stamp, ..NodeSpec::new("leaf") }).await;
+        insert(
+            &pool,
+            NodeSpec {
+                chat: Some("chat-1"),
+                stamp,
+                ..NodeSpec::new("root")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                session: Some("kid"),
+                stamp,
+                ..NodeSpec::new("leaf")
+            },
+        )
+        .await;
         let since: Timestamp = "2026-10-20T09:00:00Z".parse().unwrap();
         let edges = WorkNodesEdges::new(pool).edges(since).await.unwrap();
         assert!(edges.contains(&pair("claude-code:kid", "claude-code:speaking-session")));
-        assert!(!edges.iter().any(|e| e.parent.native_id == "later-session" || e.parent.native_id == "old-session"));
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.parent.native_id == "later-session"
+                    || e.parent.native_id == "old-session")
+        );
     }
 
     #[tokio::test]
     async fn the_retention_window_keeps_open_nodes_and_drops_old_closed_ones() {
         let pool = crate::testdb::fresh_pool().await;
         let old = "2026-01-01T00:00:00+00:00";
-        insert(&pool, NodeSpec { session: Some("p"), stamp: old, ..NodeSpec::new("root") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), session: Some("open-kid"), stamp: old, ..NodeSpec::new("open") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), session: Some("done-kid"), status: "done", stamp: old, ..NodeSpec::new("closed") }).await;
-        let edges = WorkNodesEdges::new(pool).edges(since_10_min()).await.unwrap();
-        assert!(edges.iter().any(|e| e.child.native_id == "open-kid"), "a running node outlives the window");
+        insert(
+            &pool,
+            NodeSpec {
+                session: Some("p"),
+                stamp: old,
+                ..NodeSpec::new("root")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                session: Some("open-kid"),
+                stamp: old,
+                ..NodeSpec::new("open")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                session: Some("done-kid"),
+                status: "done",
+                stamp: old,
+                ..NodeSpec::new("closed")
+            },
+        )
+        .await;
+        let edges = WorkNodesEdges::new(pool)
+            .edges(since_10_min())
+            .await
+            .unwrap();
+        assert!(
+            edges.iter().any(|e| e.child.native_id == "open-kid"),
+            "a running node outlives the window"
+        );
         assert!(!edges.iter().any(|e| e.child.native_id == "done-kid"));
     }
 
@@ -389,21 +578,45 @@ mod tests {
     /// id (parent: a Claude Code session) must yield an edge whose `child` equals `sighting.key`.
     #[tokio::test]
     async fn an_edge_child_is_the_key_codex_cli_sights_for_that_session() {
-        use crate::fleet::codex_cli::{write_minimal_rollout, CodexCli};
+        use crate::fleet::codex_cli::{CodexCli, write_minimal_rollout};
         use crate::fleet::source::AgentSource;
 
         const CODEX_ID: &str = "01a14120-24a4-7bc3-9946-a787ff71b89f";
         let home = tempfile::tempdir().unwrap();
         write_minimal_rollout(home.path(), CODEX_ID);
-        let sightings = CodexCli::new(home.path().to_path_buf()).discover(since_10_min()).await.unwrap();
+        let sightings = CodexCli::new(home.path().to_path_buf())
+            .discover(since_10_min())
+            .await
+            .unwrap();
         assert_eq!(sightings.len(), 1, "the rollout is discovered");
 
         let pool = crate::testdb::fresh_pool().await;
-        insert(&pool, NodeSpec { session: Some("claude-sess"), ..NodeSpec::new("root") }).await;
-        insert(&pool, NodeSpec { parent: Some("root"), session: Some(CODEX_ID), ..NodeSpec::new("leaf") }).await;
-        let edges = WorkNodesEdges::new(pool).edges(since_10_min()).await.unwrap();
+        insert(
+            &pool,
+            NodeSpec {
+                session: Some("claude-sess"),
+                ..NodeSpec::new("root")
+            },
+        )
+        .await;
+        insert(
+            &pool,
+            NodeSpec {
+                parent: Some("root"),
+                session: Some(CODEX_ID),
+                ..NodeSpec::new("leaf")
+            },
+        )
+        .await;
+        let edges = WorkNodesEdges::new(pool)
+            .edges(since_10_min())
+            .await
+            .unwrap();
         assert!(
-            edges.contains(&Edge { child: sightings[0].key.clone(), parent: NodeKey::new("claude-code", "claude-sess") }),
+            edges.contains(&Edge {
+                child: sightings[0].key.clone(),
+                parent: NodeKey::new("claude-code", "claude-sess")
+            }),
             "no edge ends on {:?}: {edges:?}",
             sightings[0].key
         );

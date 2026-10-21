@@ -32,6 +32,7 @@ pub type Sources = (Vec<Arc<dyn AgentSource>>, Vec<Arc<dyn EdgeSource>>);
 /// Every source, in precedence order. Each track adds ONE `push` line here; nothing else in this
 /// file changes. Edge sources are applied in the order they are listed: native edges first (they
 /// come from the `AgentSource`s themselves), then `work_nodes`, then `run_launch`.
+#[allow(clippy::vec_init_then_push)]
 pub fn sources(env: &FleetEnv) -> Sources {
     let _ = env;
     #[allow(unused_mut, clippy::vec_init_then_push)]
@@ -41,8 +42,12 @@ pub fn sources(env: &FleetEnv) -> Sources {
     agents.push(Arc::new(codex_cli::CodexCli::new(env.home.clone())));
     #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut edges: Vec<Arc<dyn EdgeSource>> = Vec::new();
-    edges.push(std::sync::Arc::new(work_nodes_edges::WorkNodesEdges::new(env.pool.clone())));
-    edges.push(std::sync::Arc::new(run_launch::RunLaunchEdges::new(env.pool.clone())));
+    edges.push(std::sync::Arc::new(work_nodes_edges::WorkNodesEdges::new(
+        env.pool.clone(),
+    )));
+    edges.push(std::sync::Arc::new(run_launch::RunLaunchEdges::new(
+        env.pool.clone(),
+    )));
     (agents, edges)
 }
 

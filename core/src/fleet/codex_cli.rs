@@ -19,9 +19,12 @@ use serde_json::Value;
 
 use super::limits;
 use super::model::{
-    clean_label, collapse_ws, Cursor, NodeKey, NodeState, TermKind, TermLine, Timestamp, TranscriptEntry, TranscriptPage,
+    Cursor, NodeKey, NodeState, TermKind, TermLine, Timestamp, TranscriptEntry, TranscriptPage,
+    clean_label, collapse_ws,
 };
-use super::source::{AgentSource, LinesRead, NodeRef, Offset, Sighting, SourceError, SourceResult, Usage};
+use super::source::{
+    AgentSource, LinesRead, NodeRef, Offset, Sighting, SourceError, SourceResult, Usage,
+};
 use super::tail;
 
 /// The longest `detail` kept for one transcript entry (a tool input or output), in chars.
@@ -38,7 +41,11 @@ struct Mapped {
 
 impl Mapped {
     fn new(kind: TermKind, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into(), detail: None }
+        Self {
+            kind,
+            text: text.into(),
+            detail: None,
+        }
     }
 
     fn with_detail(mut self, detail: impl Into<String>) -> Self {
@@ -57,7 +64,11 @@ impl Mapped {
     /// The transcript entry: the summary uncut (whitespace collapsed by `model::collapse_ws`, which
     /// `TermLine::new` also uses), the detail whole.
     fn into_entry(self) -> TranscriptEntry {
-        TranscriptEntry { kind: self.kind, text: collapse_ws(&self.text), detail: self.detail }
+        TranscriptEntry {
+            kind: self.kind,
+            text: collapse_ws(&self.text),
+            detail: self.detail,
+        }
     }
 }
 
@@ -81,7 +92,11 @@ fn content_text(content: Option<&Value>) -> String {
     content
         .and_then(Value::as_array)
         .map(|items| {
-            items.iter().filter_map(|item| str_of(item, "text")).collect::<Vec<_>>().join("\n")
+            items
+                .iter()
+                .filter_map(|item| str_of(item, "text"))
+                .collect::<Vec<_>>()
+                .join("\n")
         })
         .unwrap_or_default()
 }
@@ -100,7 +115,9 @@ fn map_record(record: &Value) -> Vec<Mapped> {
         (Some("event_msg"), "turn_aborted") => vec![Mapped::new(TermKind::Error, "turn aborted")],
         (Some("response_item"), "function_call") => function_call(payload),
         (Some("response_item"), "custom_tool_call") => custom_call(payload),
-        (Some("response_item"), "function_call_output" | "custom_tool_call_output") => output(payload),
+        (Some("response_item"), "function_call_output" | "custom_tool_call_output") => {
+            output(payload)
+        }
         _ => Vec::new(),
     }
 }
@@ -110,11 +127,17 @@ fn assistant_message(payload: &Value) -> Vec<Mapped> {
         return Vec::new();
     }
     let text = content_text(payload.get("content"));
-    if text.trim().is_empty() { Vec::new() } else { vec![Mapped::new(TermKind::Text, text)] }
+    if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![Mapped::new(TermKind::Text, text)]
+    }
 }
 
 fn user_item(payload: &Value) -> Vec<Mapped> {
-    let Some(item) = payload.get("item") else { return Vec::new() };
+    let Some(item) = payload.get("item") else {
+        return Vec::new();
+    };
     if str_of(item, "type") != Some("UserMessage") {
         return Vec::new();
     }
@@ -122,7 +145,11 @@ fn user_item(payload: &Value) -> Vec<Mapped> {
 }
 
 fn prompt(text: &str) -> Vec<Mapped> {
-    if text.trim().is_empty() { Vec::new() } else { vec![Mapped::new(TermKind::Prompt, text)] }
+    if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![Mapped::new(TermKind::Prompt, text)]
+    }
 }
 
 /// Tool names whose calls say nothing a reader needs (`wait` polls a running script cell).
@@ -130,15 +157,27 @@ const QUIET_TOOLS: [&str; 1] = ["wait"];
 
 /// The first non-blank line of `text`, trimmed.
 fn first_line(text: &str) -> String {
-    text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("").to_owned()
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// The argument most likely to say what a tool call does, from a parsed `arguments` object.
 fn argument_preview(arguments: &Value) -> Option<String> {
-    ["command", "cmd", "path", "file_path", "query", "patch", "explanation"]
-        .iter()
-        .find_map(|key| str_of(arguments, key))
-        .map(first_line)
+    [
+        "command",
+        "cmd",
+        "path",
+        "file_path",
+        "query",
+        "patch",
+        "explanation",
+    ]
+    .iter()
+    .find_map(|key| str_of(arguments, key))
+    .map(first_line)
 }
 
 fn tool_line(name: &str, preview: &str) -> String {
@@ -204,12 +243,20 @@ fn task_complete(payload: &Value) -> Vec<Mapped> {
 /// falling back to `input_tokens`. Codex reports no price, so `cost_usd` stays `None`. A
 /// `token_count` whose `info` is `null` (rate-limit-only update) carries no usage.
 fn usage_of(record: &Value) -> Option<Usage> {
-    if str_of(record, "type")? != "event_msg" || record.pointer("/payload/type")?.as_str()? != "token_count" {
+    if str_of(record, "type")? != "event_msg"
+        || record.pointer("/payload/type")?.as_str()? != "token_count"
+    {
         return None;
     }
     let last = record.pointer("/payload/info/last_token_usage")?;
-    let tokens = last.get("total_tokens").or_else(|| last.get("input_tokens"))?.as_i64()?;
-    Some(Usage { context_tokens: Some(tokens), cost_usd: None })
+    let tokens = last
+        .get("total_tokens")
+        .or_else(|| last.get("input_tokens"))?
+        .as_i64()?;
+    Some(Usage {
+        context_tokens: Some(tokens),
+        cost_usd: None,
+    })
 }
 
 fn ts_of(record: &Value) -> Option<Timestamp> {
@@ -217,7 +264,9 @@ fn ts_of(record: &Value) -> Option<Timestamp> {
 }
 
 fn parse_ts(text: &str) -> Option<Timestamp> {
-    DateTime::parse_from_rfc3339(text).ok().map(|at| at.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// What a batch of raw rollout lines says.
@@ -229,9 +278,15 @@ struct Parsed {
 
 /// Maps complete lines in order. A line that is not json is skipped, never an error.
 fn parse_lines(raw: &[String]) -> Parsed {
-    let mut parsed = Parsed { mapped: Vec::new(), usage: None, last_at: None };
+    let mut parsed = Parsed {
+        mapped: Vec::new(),
+        usage: None,
+        last_at: None,
+    };
     for line in raw {
-        let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if let Some(at) = ts_of(&record) {
             parsed.last_at = Some(at);
         }
@@ -258,11 +313,15 @@ struct TailFacts {
 fn scan_tail(raw: &[String]) -> TailFacts {
     let mut facts = TailFacts::default();
     for line in raw {
-        let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         let ptype = record.pointer("/payload/type").and_then(Value::as_str);
         match (str_of(&record, "type"), ptype) {
             (Some("event_msg"), Some("task_started")) => facts.turn_open = Some(true),
-            (Some("event_msg"), Some("task_complete" | "turn_aborted")) => facts.turn_open = Some(false),
+            (Some("event_msg"), Some("task_complete" | "turn_aborted")) => {
+                facts.turn_open = Some(false)
+            }
             (Some("turn_context"), _) => {
                 if let Some(model) = record.pointer("/payload/model").and_then(Value::as_str) {
                     facts.model = Some(model.to_owned());
@@ -740,7 +799,8 @@ mod tests {
 
     /// One rollout line as the CLI writes it.
     fn rec(kind: &str, payload: Value) -> String {
-        json!({"timestamp": "2026-10-20T10:00:00.000Z", "type": kind, "payload": payload}).to_string()
+        json!({"timestamp": "2026-10-20T10:00:00.000Z", "type": kind, "payload": payload})
+            .to_string()
     }
 
     fn mapped(line: &str) -> Vec<Mapped> {
@@ -781,7 +841,10 @@ mod tests {
             json!({"type": "item_completed",
                    "item": {"type": "UserMessage", "content": [{"type": "text", "text": "fix the build"}]}}),
         );
-        let event = rec("event_msg", json!({"type": "user_message", "message": "fix the build"}));
+        let event = rec(
+            "event_msg",
+            json!({"type": "user_message", "message": "fix the build"}),
+        );
         for line in [item, event] {
             let got = mapped(&line);
             assert_eq!(got.len(), 1, "{line}");
@@ -795,7 +858,13 @@ mod tests {
         );
         assert!(mapped(&agent).is_empty());
         // event_msg/agent_message duplicates response_item/message (0.160).
-        assert!(mapped(&rec("event_msg", json!({"type": "agent_message", "message": "x"}))).is_empty());
+        assert!(
+            mapped(&rec(
+                "event_msg",
+                json!({"type": "agent_message", "message": "x"})
+            ))
+            .is_empty()
+        );
     }
 
     #[test]
@@ -831,7 +900,10 @@ mod tests {
         );
         let got = mapped(&line);
         assert_eq!(got[0].kind, TermKind::Tool);
-        assert_eq!(got[0].text, "exec const r = await tools.exec_command({cmd: \"ls\"});");
+        assert_eq!(
+            got[0].text,
+            "exec const r = await tools.exec_command({cmd: \"ls\"});"
+        );
         assert!(got[0].detail.as_deref().unwrap().ends_with("text(r);"));
     }
 
@@ -870,14 +942,20 @@ mod tests {
         let got = mapped(&as_list);
         assert_eq!(got[0].text, "4 lines");
         // A tool output with neither shape degrades to an empty summary rather than failing.
-        let odd = rec("response_item", json!({"type": "function_call_output", "output": {"a": 1}}));
+        let odd = rec(
+            "response_item",
+            json!({"type": "function_call_output", "output": {"a": 1}}),
+        );
         assert_eq!(mapped(&odd)[0].text, "0 lines");
     }
 
     #[test]
     fn a_huge_tool_output_keeps_a_capped_detail() {
         let big = "x".repeat(DETAIL_CHARS * 2);
-        let line = rec("response_item", json!({"type": "function_call_output", "output": big}));
+        let line = rec(
+            "response_item",
+            json!({"type": "function_call_output", "output": big}),
+        );
         let detail = mapped(&line)[0].detail.clone().unwrap();
         assert_eq!(detail.chars().count(), DETAIL_CHARS + 1);
         assert!(detail.ends_with('…'));
@@ -885,10 +963,19 @@ mod tests {
 
     #[test]
     fn task_complete_is_the_final_line_or_a_status() {
-        let with = rec("event_msg", json!({"type": "task_complete", "last_agent_message": "All green."}));
+        let with = rec(
+            "event_msg",
+            json!({"type": "task_complete", "last_agent_message": "All green."}),
+        );
         let got = mapped(&with);
-        assert_eq!((got[0].kind, got[0].text.as_str()), (TermKind::Final, "All green."));
-        let without = rec("event_msg", json!({"type": "task_complete", "last_agent_message": null}));
+        assert_eq!(
+            (got[0].kind, got[0].text.as_str()),
+            (TermKind::Final, "All green.")
+        );
+        let without = rec(
+            "event_msg",
+            json!({"type": "task_complete", "last_agent_message": null}),
+        );
         assert_eq!(mapped(&without)[0].kind, TermKind::Status);
         let aborted = rec("event_msg", json!({"type": "turn_aborted"}));
         assert_eq!(mapped(&aborted)[0].kind, TermKind::Error);
@@ -898,10 +985,22 @@ mod tests {
     fn usage_comes_from_the_last_token_usage_and_tolerates_a_null_info() {
         let line = |info: Value| rec("event_msg", json!({"type": "token_count", "info": info}));
         let got = usage_of(&serde_json::from_str(&line(json!({"last_token_usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}))).unwrap());
-        assert_eq!(got, Some(Usage { context_tokens: Some(120), cost_usd: None }));
-        let fallback = usage_of(&serde_json::from_str(&line(json!({"last_token_usage": {"input_tokens": 100}}))).unwrap());
+        assert_eq!(
+            got,
+            Some(Usage {
+                context_tokens: Some(120),
+                cost_usd: None
+            })
+        );
+        let fallback = usage_of(
+            &serde_json::from_str(&line(json!({"last_token_usage": {"input_tokens": 100}})))
+                .unwrap(),
+        );
         assert_eq!(fallback.unwrap().context_tokens, Some(100));
-        assert_eq!(usage_of(&serde_json::from_str(&line(Value::Null)).unwrap()), None);
+        assert_eq!(
+            usage_of(&serde_json::from_str(&line(Value::Null)).unwrap()),
+            None
+        );
         let other = rec("event_msg", json!({"type": "task_started"}));
         assert_eq!(usage_of(&serde_json::from_str(&other).unwrap()), None);
     }
@@ -918,11 +1017,17 @@ mod tests {
         let parsed = parse_lines(&raw);
         assert_eq!(parsed.mapped.len(), 1);
         assert_eq!(parsed.usage.unwrap().context_tokens, Some(30));
-        assert_eq!(parsed.last_at.unwrap().to_rfc3339(), "2026-10-20T10:05:00+00:00");
+        assert_eq!(
+            parsed.last_at.unwrap().to_rfc3339(),
+            "2026-10-20T10:05:00+00:00"
+        );
     }
 
     fn lines(kinds: &[(&str, Value)]) -> Vec<String> {
-        kinds.iter().map(|(kind, payload)| rec(kind, payload.clone())).collect()
+        kinds
+            .iter()
+            .map(|(kind, payload)| rec(kind, payload.clone()))
+            .collect()
     }
 
     #[test]
@@ -931,20 +1036,29 @@ mod tests {
             ("event_msg", json!({"type": "task_started"})),
             ("event_msg", json!({"type": "task_complete"})),
             ("event_msg", json!({"type": "task_started"})),
-            ("response_item", json!({"type": "function_call", "name": "exec", "input": "x"})),
+            (
+                "response_item",
+                json!({"type": "function_call", "name": "exec", "input": "x"}),
+            ),
         ]));
         assert_eq!(open.turn_open, Some(true));
         let closed = scan_tail(&lines(&[
             ("event_msg", json!({"type": "task_started"})),
             ("event_msg", json!({"type": "task_complete"})),
-            ("event_msg", json!({"type": "token_count", "info": {"last_token_usage": {"total_tokens": 7}}})),
+            (
+                "event_msg",
+                json!({"type": "token_count", "info": {"last_token_usage": {"total_tokens": 7}}}),
+            ),
         ]));
         assert_eq!(closed.turn_open, Some(false));
         assert_eq!(closed.usage.unwrap().context_tokens, Some(7));
         let aborted = scan_tail(&lines(&[("event_msg", json!({"type": "turn_aborted"}))]));
         assert_eq!(aborted.turn_open, Some(false));
         // No marker in the tail window at all: unknown, which `liveness` reads as open.
-        assert_eq!(scan_tail(&lines(&[("response_item", json!({"type": "reasoning"}))])).turn_open, None);
+        assert_eq!(
+            scan_tail(&lines(&[("response_item", json!({"type": "reasoning"}))])).turn_open,
+            None
+        );
     }
 
     /// Documents a deliberate limit: a tail window with no turn marker at all (a turn so long that its
@@ -955,11 +1069,20 @@ mod tests {
     #[test]
     fn a_tail_without_any_turn_marker_is_busy_then_lost_never_done() {
         let facts = scan_tail(&lines(&[
-            ("response_item", json!({"type": "function_call", "name": "exec", "input": "x"})),
-            ("response_item", json!({"type": "function_call_output", "output": "ok"})),
+            (
+                "response_item",
+                json!({"type": "function_call", "name": "exec", "input": "x"}),
+            ),
+            (
+                "response_item",
+                json!({"type": "function_call_output", "output": "ok"}),
+            ),
         ]));
         assert_eq!(facts.turn_open, None);
-        assert_eq!(liveness(facts.turn_open, Duration::from_secs(5)), NodeState::Busy);
+        assert_eq!(
+            liveness(facts.turn_open, Duration::from_secs(5)),
+            NodeState::Busy
+        );
         let stale = limits::CODEX_LIVE_MTIME + Duration::from_secs(1);
         assert_eq!(liveness(facts.turn_open, stale), NodeState::Lost);
     }
