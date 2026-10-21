@@ -1,6 +1,8 @@
 import { useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import {
   fitSeatLabel,
+  STATE_WORDS,
+  truncate,
   VIEW_H,
   VIEW_W,
   type Balance,
@@ -8,7 +10,6 @@ import {
   type CourtJudge,
   type CourtLink,
   type CourtSeat,
-  type SeatState,
 } from "./court-model";
 
 /**
@@ -48,8 +49,6 @@ const JUDGE_LABEL_CHARS = 16;
  */
 const JUDGE_SUB_CHARS = 13;
 
-const clip = (text: string, room: number) => (text.length > room ? `${text.slice(0, room - 1)}…` : text);
-
 /**
  * Characters a role keeps under its seat. The two seats either side of the arc's
  * foot sit ~90 viewBox units apart on the same line, and two 16-character roles at
@@ -65,16 +64,7 @@ export function ordinal(n: number): string {
   return `${n}${suffix}`;
 }
 
-const STATE_WORDS: Partial<Record<SeatState, string>> = {
-  speaking: "speaking",
-  thinking: "thinking",
-  ok: "done",
-  cancelled: "cancelled",
-  skipped: "skipped",
-  waiting: "waiting",
-};
-
-/** `Seat N, name[, role][, state]` — a masked seat is named by its letter, so the label does not unmask it. */
+/** `Seat N, name[, role][, state]`: a masked seat is named by its letter, so the label does not unmask it. */
 export function seatLabel(seat: CourtSeat, mode: "setup" | "session"): string {
   const parts = [`Seat ${seat.index + 1}`, seat.state === "empty" ? "empty" : seat.label];
   if (seat.sublabel !== null) parts.push(seat.sublabel);
@@ -271,11 +261,11 @@ function Judge({ judge, selected }: { judge: CourtJudge; selected: boolean }) {
       <rect className="council-court-bench" x={CX - 60} y={40} width={120} height={30} rx={5} />
       {/* Two 12px-ish lines in a 30-unit bench: the baselines sit 15 apart so they do not touch. */}
       <text className="council-court-judge-label" x={CX} y={judge.sub === null ? 59 : 52} textAnchor="middle">
-        {clip(judge.label, JUDGE_LABEL_CHARS)}
+        {truncate(judge.label, JUDGE_LABEL_CHARS)}
       </text>
       {judge.sub !== null && (
         <text className="council-court-small" x={CX} y={67} textAnchor="middle">
-          {clip(judge.sub, JUDGE_SUB_CHARS)}
+          {truncate(judge.sub, JUDGE_SUB_CHARS)}
         </text>
       )}
     </g>
@@ -490,7 +480,7 @@ function Seat({
       )}
       {seat.sublabel !== null && (
         <text className="council-court-role" x={x} y={y + r + 12} textAnchor="middle">
-          {clip(seat.sublabel, ROLE_ROOM)}
+          {truncate(seat.sublabel, ROLE_ROOM)}
         </text>
       )}
       {(seat.rank !== null || seat.dissent) && (

@@ -47,7 +47,7 @@ export function OnboardPanel({
     found.configured_gate !== null
       ? "the gate this project's rules already name"
       : proposal === null
-        ? "nothing in the folder suggests one — leave it blank for none"
+        ? "nothing in the folder suggests one: leave it blank for none"
         : `proposed from ${proposal.source}`;
 
   return (
@@ -59,7 +59,7 @@ export function OnboardPanel({
       </p>
       <p className="text-sm text-text-muted">
         {found.harnesses.length === 0
-          ? "No way of working found in the folder — which is fine; none is needed."
+          ? "No way of working found in the folder, which is fine; none is needed."
           : `Found: ${found.harnesses.map((harness) => harness.path).join(", ")}.`}
       </p>
       <Field label="Gate command" helper={source}>
@@ -102,7 +102,7 @@ export function OnboardPanel({
  * `rules_unreadable`, `hook_unwritable`) are left to it — its words say which line.
  */
 const ONBOARD_SENTENCES: Record<string, string> = {
-  no_project_root: "this project has no folder on record — give it one first.",
+  no_project_root: "this project has no folder on record: give it one first.",
   no_such_folder: "there is nothing at that path.",
   not_a_folder: "that path is a file, not a folder.",
   not_absolute: "the folder has to be an absolute path.",

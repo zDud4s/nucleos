@@ -91,8 +91,8 @@ export function Work({ team, runs, capped }: WorkProps) {
           <Quiet
             says={
               live.length > 0
-                ? "Nothing finished yet — the tasks above are still running."
-                : "No tasks yet — ask this team for something above."
+                ? "Nothing finished yet. The tasks above are still running."
+                : "No tasks yet. Ask this team for something above."
             }
           />
         )}
@@ -181,7 +181,7 @@ function Composer({ teamId, runs }: { teamId: string; runs: TeamRun[] }) {
       {/* Only until the task shows up in the lists below; after that the note is stale. */}
       {started !== undefined && !runs.some((run) => run.id === started.id) && (
         <p className="teams-note">
-          Started — <Link to={`/team-runs/${started.id}`}>{start.variables?.request ?? "this task"}</Link>{" "}
+          Started: <Link to={`/team-runs/${started.id}`}>{start.variables?.request ?? "this task"}</Link>{" "}
           has nothing in it yet; the {DAEMON_NAME} has not picked it up.
         </p>
       )}
@@ -204,7 +204,7 @@ function StartRefusal({ error }: { error: unknown }) {
       <RefusalNote
         refusal={error}
         sentences={{
-          too_many_requests: "The budget window is exhausted for now — it reopens",
+          too_many_requests: "The budget window is exhausted for now. It reopens later.",
           ...daemonProse(error),
         }}
       />
@@ -265,7 +265,7 @@ function LiveTask({ run, ceiling }: { run: TeamRun; ceiling: number | null }) {
  */
 function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
   if (items.length === 0) {
-    return <Quiet says="Nothing planned yet — the background service has not picked this up." />;
+    return <Quiet says="Nothing planned yet. The background service has not picked this up." />;
   }
 
   const rounds = [...new Set(items.map((item) => item.round))].sort((a, b) => a - b);
@@ -283,13 +283,13 @@ function Rounds({ items, round }: { items: TeamItem[]; round: number }) {
                 <span
                   className={`teams-round-item teams-round-${item.state}`}
                   key={item.ordinal}
-                  title={`${item.state} — ${item.description}`}
+                  title={`${item.state}: ${item.description}`}
                 >
                   {item.agent_id}
                   <span className="teams-round-mark" aria-hidden="true">
                     {MARK[item.state] ?? "·"}
                   </span>
-                  <span className="sr-only">{`${item.state} — ${item.description}`}</span>
+                  <span className="sr-only">{`${item.state}: ${item.description}`}</span>
                 </span>
               ))}
           </span>

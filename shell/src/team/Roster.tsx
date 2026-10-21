@@ -119,7 +119,7 @@ export function Roster({ team, runs, onOpenCharter }: RosterProps) {
         <svg
           className="teams-org-svg"
           role="group"
-          aria-label={`${team.name} — how this team is put together`}
+          aria-label={`${team.name}: how this team is put together`}
           viewBox={`0 0 ${view.width} ${view.height}`}
           width={Math.round(view.width * SCALE)}
           height={Math.round(view.height * SCALE)}
@@ -172,7 +172,7 @@ export function Roster({ team, runs, onOpenCharter }: RosterProps) {
       */}
       {headless ? (
         <Quiet
-          says="Nobody is in charge of this team yet — it will refuse every task until somebody is."
+          says="Nobody is in charge of this team yet. It will refuse every task until somebody is."
           action={
             onOpenCharter === undefined ? undefined : (
               <Button onClick={onOpenCharter}>Choose a Director</Button>
@@ -269,7 +269,7 @@ function Box({ node, box }: { node: RosterNode; box: RosterBox }) {
     <g
       className={`teams-org-node ${KIND[node.layer]}${tone}${gone}`}
       transform={`translate(${box.x}, ${box.y})`}
-      aria-label={`${node.label} — ${spoken(node)}`}
+      aria-label={`${node.label}: ${spoken(node)}`}
     >
       {node.href === null ? (
         body

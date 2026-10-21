@@ -727,7 +727,7 @@ export function Files() {
     if (runsOnOpen(name)) {
       setOpenError({
         name,
-        reason: "a program is never run from here, since anything can land in this folder — download it to use it",
+        reason: "a program is never run from here, since anything can land in this folder. Download it to use it",
       });
       return;
     }
@@ -739,7 +739,7 @@ export function Files() {
       (error: unknown) => {
         // The opener rejects with a bare string; either way the OS's words come after ours.
         const said = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-        setOpenError({ name, reason: said === "" ? "Could not open it" : `Could not open it — ${said}` });
+        setOpenError({ name, reason: said === "" ? "Could not open it" : `Could not open it: ${said}` });
       },
     );
   }
@@ -782,7 +782,7 @@ export function Files() {
   const news =
     progress !== null ? (
       <p className="fi-progress" role="status">
-        uploading {progress.done + 1} of {progress.total} —{" "}
+        uploading {progress.done + 1} of {progress.total}:{" "}
         <span className="fi-progress-name">{progress.name}</span>, {formatBytes(progress.size)}…
       </p>
     ) : flash !== null ? (
@@ -799,7 +799,7 @@ export function Files() {
         <span className="fi-cut-what">
           {cut.entries.length === 1 ? `${cut.entries[0]?.name ?? ""} cut` : `${String(cut.entries.length)} items cut`}
           {cut.from === path
-            ? " — open the folder it goes to, then Ctrl+V"
+            ? ": open the folder it goes to, then Ctrl+V"
             : ` from ${cut.from === "" ? "files/" : `files/${cut.from}/`}`}
         </span>
         {cut.from !== path && (
@@ -912,7 +912,7 @@ export function Files() {
               failures={restoreFailures}
               sentences={RESTORE_SENTENCES}
               what="it is still in the trash"
-              summary={(n) => `${String(n)} restores did not go through — they are still in the trash`}
+              summary={(n) => `${String(n)} restores did not go through, so they are still in the trash`}
               labelFor={(failure) => `Dismiss the note about ${failure}`}
               onDismiss={(failure) => setPathFailures((current) => current.filter((item) => item !== failure))}
               onDismissAll={() => setPathFailures([])}

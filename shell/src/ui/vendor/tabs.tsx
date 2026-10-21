@@ -4,6 +4,7 @@ import * as React from "react"
 import { Tabs as TabsPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/cn"
+import { SlideMark } from "../SlideMark"
 
 /*
   The registry's Tabs, in the shape `dialog.tsx` and `dropdown-menu.tsx` already
@@ -26,11 +27,45 @@ import { cn } from "@/lib/cn"
   with Popper, so it emits no style the menu surface does not already prove.
 */
 
+/*
+  **The sliding underline needs to know which trigger is active, and a trigger cannot.** Radix
+  writes `data-state` onto the DOM but exposes no value to React from inside `Trigger`. So `Tabs`
+  keeps its own copy of the value, the way Radix's controllable state does — `value` when the
+  caller controls it, else `defaultValue` followed through `onValueChange` — and hands it down with
+  an id unique to this tab list, which is the `layoutId` the active trigger's mark shares. Radix
+  still owns the real state; this copy only decides where the decorative mark is drawn, and the
+  props the caller passes are untouched.
+*/
+const TabsMarkContext = React.createContext<{ value: string | undefined; id: string }>({
+  value: undefined,
+  id: "",
+})
+
 function Tabs({
   className,
+  value,
+  defaultValue,
+  onValueChange,
   ...props
 }: React.ComponentProps<typeof TabsPrimitive.Root>) {
-  return <TabsPrimitive.Root data-slot="tabs" className={cn("ui-tabs", className)} {...props} />
+  const id = React.useId()
+  const [inner, setInner] = React.useState(defaultValue)
+  const current = value ?? inner
+  return (
+    <TabsMarkContext.Provider value={{ value: current, id }}>
+      <TabsPrimitive.Root
+        data-slot="tabs"
+        className={cn("ui-tabs", className)}
+        value={value}
+        defaultValue={defaultValue}
+        onValueChange={(next) => {
+          setInner(next)
+          onValueChange?.(next)
+        }}
+        {...props}
+      />
+    </TabsMarkContext.Provider>
+  )
 }
 
 function TabsList({
@@ -44,10 +79,15 @@ function TabsList({
 
 function TabsTrigger({
   className,
+  children,
   ...props
 }: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
+  const mark = React.useContext(TabsMarkContext)
   return (
-    <TabsPrimitive.Trigger data-slot="tabs-trigger" className={cn("ui-tab", className)} {...props} />
+    <TabsPrimitive.Trigger data-slot="tabs-trigger" className={cn("ui-tab", className)} {...props}>
+      {children}
+      {mark.value === props.value ? <SlideMark layoutId={mark.id} kind="rule" /> : null}
+    </TabsPrimitive.Trigger>
   )
 }
 

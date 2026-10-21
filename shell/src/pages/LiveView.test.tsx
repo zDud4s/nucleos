@@ -191,7 +191,7 @@ describe("LiveView", () => {
     render(<LiveView sessionId={7} />);
     await settle();
     expect(daemon.openStream).toHaveBeenCalledTimes(1);
-    expect(screen.getByText(/Connection lost — reconnecting/)).toBeDefined();
+    expect(screen.getByText(/Connection lost, reconnecting/)).toBeDefined();
 
     const delays = [1000, 2000, 4000, 8000, 16000, 30000, 30000];
     let calls = 1;
@@ -412,7 +412,7 @@ describe("LiveView", () => {
     fireEvent.mouseDown(img, { clientX: 100, clientY: 50, button: 0, buttons: 1, detail: 1 });
     await settle();
 
-    expect(screen.getByText("The wheel is no longer yours — watching only.")).toBeDefined();
+    expect(screen.getByText("The wheel is no longer yours. Watching only.")).toBeDefined();
     expect(screen.queryByLabelText("drive session 7")).toBeNull();
     expect(screen.getByAltText("live view of session 7")).toBeDefined();
 

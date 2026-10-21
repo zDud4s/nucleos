@@ -34,6 +34,7 @@ import { useKillSwitch } from "../data/system";
 import { clock } from "../lib/timeline";
 import {
   Button,
+  Callout,
   ConfirmButton,
   ConflictNote,
   ErrorNote,
@@ -550,10 +551,10 @@ function CiListing({ listed }: { listed: string }) {
       {verdict.listed === 0 ? null : verdict.failed === 0 ? (
         <p className="text-sm text-text-muted">No failed run among the {verdict.listed} listed.</p>
       ) : (
-        <p className="ws-alert">
+        <Callout tone="danger">
           {verdict.failed} of the {verdict.listed} listed runs did not succeed; they are marked
           below.
-        </p>
+        </Callout>
       )}
       <Well as="pre" capped>
         {lines.map((line, index) => (

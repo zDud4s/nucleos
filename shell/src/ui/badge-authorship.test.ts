@@ -17,6 +17,7 @@ const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: s
   ["analytics/DevtimeSection.tsx", { literals: 2, reason: "`estimated` marks a cost the shell derived from tokens and `unreliable rule` a low-precision rule the analytics read reports; both are facts about a figure's quality, not a lifecycle state of anything, and no núcleo state machine writes either." }],
   ["analytics/pipeline/panels.tsx", { literals: 1, reason: "`suspect` flags an owner-wait figure the analytics read reports as low-confidence; it is a fact about the figure's quality, not a lifecycle state of anything, and no núcleo state machine writes it." }],
   ["calendar/DaySheet.tsx", { literals: 5, reason: "facts about a day — today, not a working day, a short or long one, a proposed occurrence. No núcleo state machine writes any of them." }],
+  ["channels/PrimaryChannelControl.tsx", { literals: 1, reason: "`primary` is a fact about the channel's role (which one carries the agent's own messages), not a lifecycle state; no núcleo state machine writes it." }],
   ["channels/IdentitiesPanel.tsx", { literals: 2, reason: "`home` and `all topics` are facts about one conversation (where notifications go, whether a group covers its threads), not a lifecycle state of anything; no núcleo state machine writes either." }],
   ["pages/Autopilot.tsx", { literals: 1, reason: "a shadow decision's action class is an identifier, not a domain state." }],
   ["pages/AutopilotJudge.tsx", { literals: 2, reason: "a verdict's action class is an identifier, and the judge's band is its opinion about one action (would allow, would refuse), not a lifecycle state of anything." }],
@@ -27,8 +28,7 @@ const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: s
   ["pages/Feed.tsx", { literals: 1, tables: ["readFeedKind"], reason: "the ignorance device for an unknown feed kind — the same posture as StateBadge, in the slice that owns feed kinds." }],
   ["pages/RunDetail.tsx", { literals: 1, reason: "the llm-router mode a run was routed under (shadow or apply) is machine configuration read off the run, not a lifecycle state of the run." }],
   ["pages/System.tsx", { literals: 1, reason: "a token's authority level is an identifier off the wire, not a lifecycle state." }],
-  ["pages/Voice.tsx", { literals: 8, reason: "the dictation phase and the spoken conversation's phase both live entirely in the webview (`lib/conversation.ts` for the second) — no núcleo literal exists for either." }],
-  ["team/Decisions.tsx", { literals: 1, reason: "`granted — nobody decides` is a sentence about an absent proposal, not a state of one." }],
+  ["team/Decisions.tsx", { literals: 1, reason: "`granted: nobody decides` is a sentence about an absent proposal, not a state of one." }],
 ]);
 
 function callSites(source: string): { line: number; attrs: string }[] {

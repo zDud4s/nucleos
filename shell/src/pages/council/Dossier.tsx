@@ -8,7 +8,7 @@ import {
   type CouncilView,
   type StepView,
 } from "../../data/council";
-import { Button, ErrorNote, Skeleton } from "../../ui";
+import { Button, Chip, ErrorNote, Quiet, Skeleton } from "../../ui";
 import { CouncilRich } from "../CouncilRich";
 import { CouncilSynthesis } from "../CouncilSynthesis";
 import { StepTail } from "../CouncilRounds";
@@ -22,7 +22,7 @@ import {
   type CourtDraft,
   type Occupant,
 } from "./court-draft";
-import { type Court, type CourtSeat, type Moment } from "./court-model";
+import { STATE_LINE, type Court, type CourtSeat, type Moment } from "./court-model";
 
 /**
  * What is written on the file the room points at: the case, a chair, the
@@ -221,24 +221,13 @@ function Roles({
   return (
     <div className="council-dossier-chips" role="group" aria-label="Roles">
       {roles.map((role) => (
-        <button
-          key={role}
-          type="button"
-          className="council-dossier-chip council-dossier-chip-role"
-          aria-pressed={current === role}
-          onClick={() => onRole(role)}
-        >
+        <Chip key={role} pressed={current === role} onToggle={() => onRole(role)}>
           {roleWords(role)}
-        </button>
+        </Chip>
       ))}
-      <button
-        type="button"
-        className="council-dossier-chip"
-        aria-pressed={current === null || current === ""}
-        onClick={() => onRole(null)}
-      >
+      <Chip pressed={current === null || current === ""} onToggle={() => onRole(null)}>
         no role
-      </button>
+      </Chip>
     </div>
   );
 }
@@ -289,28 +278,26 @@ function ConveneChips({ onPick }: { onPick: (who: Occupant) => void }) {
       {seatable.length > 0 && (
         <div className="council-dossier-chips" role="group" aria-label="Agents">
           {seatable.map((agent) => (
-            <button
+            <Button
               key={agent.id}
-              type="button"
-              className="council-dossier-chip"
+              variant="quiet"
               onClick={() => onPick({ seat: { agent: agent.id }, name: agent.name })}
             >
               {agent.name}
-            </button>
+            </Button>
           ))}
         </div>
       )}
       {choices.length > 0 && (
         <div className="council-dossier-chips" role="group" aria-label="Models">
           {choices.map((model) => (
-            <button
+            <Button
               key={model.id}
-              type="button"
-              className="council-dossier-chip"
+              variant="quiet"
               onClick={() => onPick({ seat: seatOfModel(model), name: model.label })}
             >
               {model.label}
-            </button>
+            </Button>
           ))}
         </div>
       )}
@@ -376,23 +363,23 @@ function Verdict({ view }: { view: CouncilView }) {
   if (view.status === "done") {
     body =
       view.synthesis === null && view.synthesis_structured === null && view.error === null ? (
-        <p className="council-dossier-hint">transcript expired</p>
+        <Quiet compact says="transcript expired" />
       ) : (
         <CouncilSynthesis view={view} />
       );
   } else if (view.status === "error") {
     body = <ErrorNote>{view.error ?? "the council failed"}</ErrorNote>;
   } else if (view.status === "cancelled") {
-    body = <p className="council-dossier-hint">council cancelled</p>;
+    body = <Quiet compact says="council cancelled" />;
   } else if (writing) {
     body =
       view.synthesis_run_id !== null ? (
         <StepTail key={view.synthesis_run_id} runId={view.synthesis_run_id} name={name} />
       ) : (
-        <p className="council-dossier-hint">The chair is writing the verdict…</p>
+        <Quiet compact says="The chair is writing the verdict…" />
       );
   } else {
-    body = <p className="council-dossier-hint">The chair has not spoken yet.</p>;
+    body = <Quiet compact says="The chair has not spoken yet." />;
   }
   return (
     <section className="council-dossier-section" aria-labelledby="council-dossier-title">
@@ -402,15 +389,6 @@ function Verdict({ view }: { view: CouncilView }) {
     </section>
   );
 }
-
-const STATE_LINE: Record<string, string> = {
-  waiting: "has not spoken yet",
-  thinking: "thinking…",
-  speaking: "speaking",
-  ok: "done",
-  cancelled: "cancelled",
-  skipped: "skipped",
-};
 
 function SeatNotes({ view, seat }: { view: CouncilView; seat: CourtSeat }) {
   const record = view.seats.find((s) => s.seat_idx === seat.index);
@@ -445,8 +423,8 @@ function StepText({ view, step, voter }: { view: CouncilView; step: StepView; vo
   };
   if (step.phase === "critique") {
     const critique = step.critique;
-    if (critique === null) return <p className="council-dossier-hint">no readable critique for this round.</p>;
-    if (critique.ranking.length === 0) return <p className="council-dossier-hint">abstained</p>;
+    if (critique === null) return <Quiet compact says="no readable critique for this round." />;
+    if (critique.ranking.length === 0) return <Quiet compact says="abstained" />;
     return (
       <>
         <ol className="council-dossier-ballot" aria-label={`Ballot of ${voter}`}>
@@ -461,7 +439,7 @@ function StepText({ view, step, voter }: { view: CouncilView; step: StepView; vo
               <p className="council-dossier-review-on">{`On ${nameOf(target)}'s answer`}</p>
               <ul>
                 {review.points.map((point, i) => (
-                  <li key={i}>{`${point.stance}: ${point.claim} — ${point.why}`}</li>
+                  <li key={i}>{`${point.stance}: ${point.claim} (${point.why})`}</li>
                 ))}
               </ul>
             </div>
@@ -477,10 +455,10 @@ function StepText({ view, step, voter }: { view: CouncilView; step: StepView; vo
       <>
         <p className="council-dossier-hint">{step.why !== null && step.why !== "" ? `${verdict}: ${step.why}` : verdict}</p>
         {step.changed === true &&
-          (step.answer !== null ? <CouncilRich text={step.answer} /> : <p className="council-dossier-hint">transcript expired</p>)}
+          (step.answer !== null ? <CouncilRich text={step.answer} /> : <Quiet compact says="transcript expired" />)}
       </>
     );
   }
-  if (step.answer === null) return <p className="council-dossier-hint">transcript expired</p>;
+  if (step.answer === null) return <Quiet compact says="transcript expired" />;
   return <CouncilRich text={step.answer} />;
 }

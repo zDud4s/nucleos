@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useConcurrency } from "../data/fleet";
+import { Button, Field, SlotPips, Switch } from "../ui";
 import { useConnection, useFleetStore, useLayoutVersion } from "./hooks";
 import { NO_PROJECT } from "./layout";
 import type { ConnectionState } from "./types";
@@ -37,32 +38,31 @@ export function TopBar({ project, onProject, onlyActive, onOnlyActive, follow, o
 
   return (
     <div className="fleet-bar" role="toolbar" aria-label="Fleet view">
-      <select
-        aria-label="Project"
-        value={project ?? ""}
-        onChange={(event) => onProject(event.target.value === "" ? null : event.target.value)}
-      >
-        <option value="">All projects</option>
-        {projects.map((name) => (
-          <option key={name} value={name}>
-            {name}
-          </option>
-        ))}
-      </select>
-      <label className="fleet-check">
-        <input type="checkbox" checked={onlyActive} onChange={(event) => onOnlyActive(event.target.checked)} />
-        Active only
-      </label>
+      {/* `Field` carries the shared field styling (`.ui-field select`); its label is spoken, not drawn. */}
+      <Field label="Project" labelHidden>
+        <select
+          value={project ?? ""}
+          onChange={(event) => onProject(event.target.value === "" ? null : event.target.value)}
+        >
+          <option value="">All projects</option>
+          {projects.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </Field>
+      <Switch label="Active only" checked={onlyActive} onChange={onOnlyActive} />
       <span className="fleet-grow" />
-      <button type="button" className="fleet-btn" aria-pressed={follow} onClick={() => onFollow(!follow)}>
+      <Button aria-pressed={follow} onClick={() => onFollow(!follow)}>
         Follow
-      </button>
-      <button type="button" className="fleet-btn" onClick={onFit}>
-        Fit
-      </button>
+      </Button>
+      <Button onClick={onFit}>Fit</Button>
       {house !== undefined && (
-        <span className="fleet-pill" title="Concurrency slots held / house limit">
-          slots {house.held}/{house.limit}
+        <span className="fleet-slots">
+          slots
+          {/* The house count says how many are held, not what each is doing, so each pip is unread. */}
+          <SlotPips held={Array.from({ length: house.held }, () => ({ domain: "slot" as const, state: null }))} limit={house.limit} />
         </span>
       )}
       <span className={`fleet-conn fleet-conn-${connection}`} role="status" aria-label="Connection">

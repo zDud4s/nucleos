@@ -190,7 +190,7 @@ describe("Roster", () => {
   it("draws the team itself, with the limits it runs under", async () => {
     await renderRoster(team(), [listRow()]);
 
-    expect(await screen.findByLabelText("Finanças — 2 on the roster")).toBeTruthy();
+    expect(await screen.findByLabelText("Finanças: 2 on the roster")).toBeTruthy();
     expect(screen.getByText("4 rounds · 2 at a time")).toBeTruthy();
     expect(screen.getByText("$5.00 ceiling · 5 open actions")).toBeTruthy();
   });
@@ -198,9 +198,9 @@ describe("Roster", () => {
   it("draws the whole structure when nothing at all is running", async () => {
     await renderRoster(team(), []);
 
-    expect(await screen.findByLabelText("Finanças — 2 on the roster")).toBeTruthy();
-    expect(screen.getByLabelText("controller — directs")).toBeTruthy();
-    expect(screen.getByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
+    expect(await screen.findByLabelText("Finanças: 2 on the roster")).toBeTruthy();
+    expect(screen.getByLabelText("controller: directs")).toBeTruthy();
+    expect(screen.getByLabelText("Auditor Sénior: checks the books")).toBeTruthy();
     expect(screen.getByText("Nothing in flight.")).toBeTruthy();
   });
 
@@ -208,37 +208,37 @@ describe("Roster", () => {
     await renderRoster(team({ director_agent_id: "", members: ["auditor"] }), []);
 
     expect(await screen.findByText(/Nobody is in charge of this team yet/)).toBeTruthy();
-    expect(screen.getByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
+    expect(screen.getByLabelText("Auditor Sénior: checks the books")).toBeTruthy();
   });
 
   it("draws the director, the roster and the work in flight", async () => {
     await renderRoster(team(), [listRow()]);
 
-    expect(await screen.findByLabelText("controller — directs")).toBeTruthy();
-    expect(await screen.findByLabelText("Auditor Sénior — checks the books")).toBeTruthy();
-    expect(await screen.findByLabelText("pull the bank export — done")).toBeTruthy();
+    expect(await screen.findByLabelText("controller: directs")).toBeTruthy();
+    expect(await screen.findByLabelText("Auditor Sénior: checks the books")).toBeTruthy();
+    expect(await screen.findByLabelText("pull the bank export: done")).toBeTruthy();
   });
 
   it("links each piece of work to its task", async () => {
     await renderRoster(team(), [listRow()]);
 
-    const work = await screen.findByLabelText("pull the bank export — done");
+    const work = await screen.findByLabelText("pull the bank export: done");
     expect(work.querySelector("a")?.getAttribute("href")).toBe("/team-runs/run-live-1");
   });
 
   it("says the state in words beside the glyph, never in colour alone", async () => {
     await renderRoster(team(), [listRow()]);
 
-    const work = await screen.findByLabelText("pull the bank export — done");
+    const work = await screen.findByLabelText("pull the bank export: done");
     expect(within(work).getByText("done")).toBeTruthy();
   });
 
   it("draws the glyph the daemon's own state names map to", async () => {
     await renderRoster(team(), [listRow()]);
 
-    const running = await screen.findByLabelText("match them line by line — running");
+    const running = await screen.findByLabelText("match them line by line: running");
     expect(running.querySelector(".teams-org-mark")?.textContent).toBe("⋯");
-    const done = await screen.findByLabelText("pull the bank export — done");
+    const done = await screen.findByLabelText("pull the bank export: done");
     expect(done.querySelector(".teams-org-mark")?.textContent).toBe("✓");
   });
 
@@ -252,7 +252,7 @@ describe("Roster", () => {
 
   it("makes the chart's scroll area a focusable, named region", async () => {
     const { container } = await renderRoster(team(), []);
-    await screen.findByLabelText("Finanças — 2 on the roster");
+    await screen.findByLabelText("Finanças: 2 on the roster");
 
     const scroll = container.querySelector(".teams-org-scroll");
     expect(scroll?.getAttribute("role")).toBe("region");
@@ -271,12 +271,12 @@ describe("Roster", () => {
   it("marks a member whose agent was deleted", async () => {
     await renderRoster(team({ members: ["controller", "ghost"] }), []);
 
-    expect(await screen.findByLabelText("ghost — deleted from the catalogue")).toBeTruthy();
+    expect(await screen.findByLabelText("ghost: deleted from the catalogue")).toBeTruthy();
   });
 
   it("routes the director's own edge around the roster rather than through it", async () => {
     const { container } = await renderRoster(team(), [listRow()]);
-    await screen.findByLabelText("match them line by line — running");
+    await screen.findByLabelText("match them line by line: running");
 
     const crossing = container.querySelector(".teams-org-edge-far");
     // Orthogonal, not a curve. A bezier from rank 0 to rank 2 passes under a specialist's box and
@@ -286,7 +286,7 @@ describe("Roster", () => {
 
   it("does not move a box when only a state changes", async () => {
     const { queryClient, state } = await renderRoster(team(), [listRow()]);
-    const before = (await screen.findByLabelText("pull the bank export — done")).getAttribute(
+    const before = (await screen.findByLabelText("pull the bank export: done")).getAttribute(
       "transform",
     );
     expect(before).not.toBeNull();
@@ -296,7 +296,7 @@ describe("Roster", () => {
       await queryClient.invalidateQueries();
     });
 
-    const after = await screen.findByLabelText("pull the bank export — failed");
+    const after = await screen.findByLabelText("pull the bank export: failed");
     expect(after.getAttribute("transform")).toBe(before);
   });
 });

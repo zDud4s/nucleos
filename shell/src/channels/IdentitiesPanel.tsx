@@ -11,10 +11,13 @@ import {
 } from "../data/channels";
 import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
+import { Callout } from "../ui/Callout";
 import { ErrorNote } from "../ui/ErrorNote";
 import { Modal } from "../ui/Modal";
+import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
 import { Section } from "../ui/Section";
+import { Skeleton } from "../ui/Skeleton";
 import "./identities.css";
 
 const SENTENCES: Record<string, string> = {
@@ -57,14 +60,14 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
   const busy = setHome.isPending || remove.isPending;
 
   if (identities.isPending) {
-    return <p role="status">reading the identities…</p>;
+    return <Skeleton label="Reading the identities" lines={3} />;
   }
   if (identities.isError) {
     const error = identities.error;
     if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
     return (
       <ErrorNote onRetry={() => void identities.refetch()}>
-        Could not reach the {DAEMON_NAME} — the paired identities are not known
+        Could not reach the {DAEMON_NAME}: the paired identities are not known
       </ErrorNote>
     );
   }
@@ -112,15 +115,15 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
   return (
     <div className="identities-panel">
       {outcome !== null && (
-        <p role="status" className="identities-outcome">
-          {outcome}
-        </p>
+        <div className="identities-outcome">
+          <Quiet compact announce says={outcome} />
+        </div>
       )}
       {setHome.isError &&
         (isApiRefusal(setHome.error) ? (
           <RefusalNote refusal={setHome.error} sentences={SENTENCES} />
         ) : (
-          <ErrorNote>Could not reach the {DAEMON_NAME} — the home was not changed</ErrorNote>
+          <ErrorNote>Could not reach the {DAEMON_NAME}: the home was not changed</ErrorNote>
         ))}
       <Modal
         open={removal !== null}
@@ -144,21 +147,25 @@ export function IdentitiesPanel({ channel, primary = false }: { channel: Channel
           </>
         }
       >
-        {warnings.map((w) => (
-          <p key={w} className="identities-warning">
-            {w}
-          </p>
-        ))}
+        {warnings.length > 0 && (
+          <div className="identities-warnings">
+            {warnings.map((w) => (
+              <Callout key={w} tone="pending">
+                {w}
+              </Callout>
+            ))}
+          </div>
+        )}
         {remove.isError &&
           (isApiRefusal(remove.error) ? (
             <RefusalNote refusal={remove.error} sentences={SENTENCES} />
           ) : (
-            <ErrorNote>Could not reach the {DAEMON_NAME} — nothing was removed</ErrorNote>
+            <ErrorNote>Could not reach the {DAEMON_NAME}: nothing was removed</ErrorNote>
           ))}
       </Modal>
       <Section label="Paired" level={3}>
         {senders.length === 0 ? (
-          <p className="identities-empty">nobody is paired on this channel yet</p>
+          <Quiet compact says="nobody is paired on this channel yet" />
         ) : (
           senders.map((sender) => (
             <SenderGroup
@@ -215,9 +222,11 @@ function SenderGroup({
       <div className="identities-sender-head">
         <span className="identities-sender-name">{named ? sender.sender_name : sender.sender_ref}</span>
         {named && <span className="identities-sender-ref">{sender.sender_ref}</span>}
-        <Button variant="quiet" disabled={busy} onClick={() => onRemove(null)}>
-          Remove sender
-        </Button>
+        <span className="identities-actions">
+          <Button variant="quiet" disabled={busy} onClick={() => onRemove(null)}>
+            Remove sender
+          </Button>
+        </span>
       </div>
       <ul className="identities-conversations">
         {sender.conversations.map((c) => (
@@ -227,18 +236,20 @@ function SenderGroup({
             data-testid="identity-conversation"
             data-ref={c.conversation_ref}
           >
-            <span>{c.kind}</span>
+            <span className="identities-conversation-kind">{c.kind}</span>
             <span className="identities-conversation-ref">{c.conversation_ref}</span>
             {c.home && <Badge tone="active">home</Badge>}
             {c.covers_threads && <Badge tone="info">all topics</Badge>}
-            {!c.home && (
-              <Button variant="quiet" disabled={busy} onClick={() => onMakeHome(c.conversation_ref)}>
-                Make home
+            <span className="identities-actions">
+              {!c.home && (
+                <Button variant="quiet" disabled={busy} onClick={() => onMakeHome(c.conversation_ref)}>
+                  Make home
+                </Button>
+              )}
+              <Button variant="quiet" disabled={busy} onClick={() => onRemove(c)}>
+                Remove conversation
               </Button>
-            )}
-            <Button variant="quiet" disabled={busy} onClick={() => onRemove(c)}>
-              Remove conversation
-            </Button>
+            </span>
           </li>
         ))}
       </ul>

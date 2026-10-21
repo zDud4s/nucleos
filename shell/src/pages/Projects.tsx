@@ -344,6 +344,9 @@ function ConcernRow({ concern }: { concern: Concern }) {
 /**
  * The four views, with a divider that says they are not four peers.
  *
+ * The shared tab strip (`.ui-tab-list`, `.ui-tab`) used directly rather than `LinkTabs`, which
+ * has no non-link tab and no divider.
+ *
  * Browse, Search and Diff are three ways of reading the tree and are superseded
  * by the Código mode the day it grows them. "On its own" answers a different
  * question, is superseded by nothing that exists, and holds the page's two
@@ -366,17 +369,16 @@ function ViewTabs({
   noFolder: boolean;
 }) {
   return (
-    <nav className="pj-tabs" aria-label="Project views">
+    <nav className="ui-tab-list pj-tabs" aria-label="Project views">
       {VIEWS.map((candidate) => {
-        const classes = ["pj-tab"];
-        if (candidate === view) classes.push("pj-tab-active");
+        const current = candidate === view;
         /* The divider, on the one view that is not one of the three. */
-        if (candidate === "rules") classes.push("pj-tab-apart");
-        if (noFolder && candidate !== view && (candidate === "search" || candidate === "diff")) {
+        const apart = candidate === "rules" ? " pj-tab-apart" : "";
+        if (noFolder && !current && (candidate === "search" || candidate === "diff")) {
           return (
             <span
               key={candidate}
-              className="pj-tab pj-tab-off"
+              className="ui-tab pj-tab-off"
               aria-disabled="true"
               title="No folder is recorded for this project, so there is nothing to read"
             >
@@ -388,9 +390,10 @@ function ViewTabs({
         return (
           <Link
             key={candidate}
-            className={classes.join(" ")}
+            className={`ui-tab${apart}`}
             to={inspectPath(projectId, candidate)}
-            aria-current={candidate === view ? "page" : undefined}
+            aria-current={current ? "page" : undefined}
+            data-state={current ? "active" : "inactive"}
           >
             {VIEW_LABEL[candidate]}
           </Link>
@@ -473,7 +476,7 @@ function InspectAbsence({
     const said =
       projectRoot === null
         ? "This project has no folder recorded, so there is nothing to look inside. A folder is named when the project is put into shadow or acting, on the Autopilot page."
-        : `Not found — and the ${DAEMON_NAME} answers the same way for two different things: that path is not there, or the folder recorded for this project (${projectRoot}) is gone from the disk. Check the folder before hunting for the file.`;
+        : `Not found. The ${DAEMON_NAME} answers the same way for two different things: that path is not there, or the folder recorded for this project (${projectRoot}) is gone from the disk. Check the folder before hunting for the file.`;
     return (
       <>
         <RefusalNote refusal={error} sentences={{ [error.code]: said }} />
@@ -777,7 +780,7 @@ function FileView({
       )}
       {!file.isError && file.data === undefined && <p className="pj-loading" role="status">Reading the file…</p>}
       {file.data !== undefined && file.data === "" && (
-        <Quiet says="that file is empty — a real answer, not a failed read." />
+        <Quiet says="that file is empty: a real answer, not a failed read." />
       )}
       {file.data !== undefined && file.data !== "" && <FileBody text={file.data} line={line} />}
     </Panel>
@@ -875,7 +878,7 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
     >
       <Why lead="Plain text, over the files under the folder you name.">
         <p>
-          The {DAEMON_NAME} does the walking, so this reaches files no editor has open — and it reads, only
+          The {DAEMON_NAME} does the walking, so this reaches files no editor has open. It reads, only
           ever reads.
         </p>
       </Why>
@@ -1004,7 +1007,7 @@ function DiffPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
     >
       <Why lead="What is in the working tree and not yet in a commit.">
         <p>
-          Read once when you open this and again when you ask — a tree changes because a person or a
+          Read once when you open this and again when you ask: a tree changes because a person or a
           job changed it, not on a timer, so polling it would be a git call every three seconds for
           an answer nobody is watching.
         </p>
@@ -1015,7 +1018,7 @@ function DiffPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
       )}
       {!diff.isError && diff.data === undefined && <p className="pj-loading" role="status">Reading the tree…</p>}
       {diff.data !== undefined && diff.data.trim() === "" && (
-        <Quiet says="nothing is uncommitted — the tree is clean." />
+        <Quiet says="nothing is uncommitted: the tree is clean." />
       )}
       {diff.data !== undefined && diff.data.trim() !== "" && <DiffBody diff={diff.data} />}
     </Panel>
@@ -1039,7 +1042,7 @@ function DiffBody({ diff }: { diff: string }) {
     return (
       <>
         <p className="pj-note">
-          {lines.length.toLocaleString()} lines — past {DIFF_LINE_CAP.toLocaleString()} this is
+          {lines.length.toLocaleString()} lines: past {DIFF_LINE_CAP.toLocaleString()} this is
           drawn as plain text, because a span per line is a page element per line.
         </p>
         <pre className="pj-diff">

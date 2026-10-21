@@ -220,7 +220,7 @@ function Instruments({ run, alive }: { run: TeamRunView; alive: boolean }) {
         <StatCard
           label="Cost"
           value={money(run.cost_usd)}
-          detail={run.root_id === run.id ? "this run's own spend" : "this run's own spend — it is part of a chain"}
+          detail={run.root_id === run.id ? "this run's own spend" : "this run's own spend: it is part of a chain"}
         />
         {/* A word and not a figure, so it is set at the rank a word can be read at: the
             display face at `--text-3xl` turned "between rounds" into two lines of headline
@@ -305,7 +305,7 @@ function OriginLine({ run }: { run: TeamRunView }) {
       {run.root_id !== run.id && (
         <>
           {" "}
-          This run is part of a chain — <Link to={`/team-runs/${run.root_id}`}>see the root</Link>.
+          This run is part of a chain: <Link to={`/team-runs/${run.root_id}`}>see the root</Link>.
         </>
       )}
     </p>
@@ -323,7 +323,7 @@ function OriginText({ run }: { run: TeamRunView }) {
   }
   return (
     <>
-      Another run started this one — <Link to={`/team-runs/${run.parent_id}`}>the run it came from</Link>.
+      Another run started this one: <Link to={`/team-runs/${run.parent_id}`}>the run it came from</Link>.
     </>
   );
 }
@@ -450,7 +450,7 @@ function ActionCard({ action }: { action: TeamAction }) {
       )}
       <p className="teams-note">
         {action.ordinal === null ? "The director asked" : "A specialist asked"}
-        {" — "}
+        {": "}
         {action.proposal_id === null ? "this team may do that without asking" : "waiting on a decision"}
       </p>
     </Row>

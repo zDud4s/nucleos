@@ -5560,7 +5560,7 @@ describe("Chats - what a tool answered", () => {
     expect(daemon.apiFetch).not.toHaveBeenCalledWith("/assistant/turns/4/tools");
 
     fireEvent.click(
-      await screen.findByRole("button", { name: /Bash cargo test dates:: — what it answered/ }),
+      await screen.findByRole("button", { name: /Bash cargo test dates:: \(what it answered\)/ }),
     );
 
     expect(await screen.findByText("test result: ok. 3 passed; 0 failed")).toBeDefined();
@@ -5590,7 +5590,7 @@ describe("Chats - what a tool answered", () => {
     );
     await renderChats("/chats/c-1");
 
-    fireEvent.click(await screen.findByRole("button", { name: /Read big.rs — what it answered/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Read big.rs \(what it answered\)/ }));
 
     // The defect this prevents: somebody concludes the file ends where the excerpt does.
     // The grouping separator is the machine's, not this test's: `toLocaleString` writes 41,203

@@ -27,7 +27,7 @@ function verdict(overrides: Partial<JudgeVerdict> = {}): JudgeVerdict {
 describe("the judge's words", () => {
   it("says which way the judge leaned, and when a guard held it back", () => {
     expect(readJudgeBand(verdict())).toBe("would allow");
-    expect(readJudgeBand(verdict({ capped: true }))).toBe("would allow — held back by a guard");
+    expect(readJudgeBand(verdict({ capped: true }))).toBe("would allow, held back by a guard");
     expect(readJudgeBand(verdict({ band: "deny" }))).toBe("would refuse");
   });
 

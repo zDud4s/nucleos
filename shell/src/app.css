@@ -502,6 +502,8 @@
      the notch's black is one step from the page's, so a hairline is what keeps the bubble from
      dissolving into whatever it covers. */
   border: 1px solid var(--border);
+  /* 18px on purpose: the bubble's curve is drawn to sit beside the 31px notch curves above, and
+     the nearest token (--radius-xl, 12px) reads as a different shape. */
   border-radius: 18px;
   box-shadow: var(--shadow-lg);
   /* One authored moment, and it is the reveal itself: the bubble arrives from the ring it belongs
@@ -1387,11 +1389,8 @@
   color: var(--text);
 }
 
-.nav-switch-empty {
-  margin: 0;
+.nav-switch .ui-quiet-compact {
   padding: var(--space-3) var(--space-2);
-  color: var(--text-muted);
-  font-size: var(--text-sm);
 }
 
 .nav-switch-foot {
@@ -1749,7 +1748,7 @@
   position: absolute;
   right: var(--space-1);
   min-width: 0;
-  font-size: 0.5rem;
+  font-size: var(--text-xs);
   overflow: hidden;
   text-indent: -100vw;
   width: 0.4rem;
@@ -2089,69 +2088,6 @@
   text-align: center;
 }
 
-/**
- * The drawer itself: the one floating surface in this slice.
- *
- * Fixed to the right edge and the full height of the window, over the page and
- * not over the rail — you opened it from the rail and may want to keep reading
- * the footer while it is open. It does not dim the page behind it and traps
- * nothing: this is a place to look, not a modal decision, and a scrim would
- * make a panel opened out of curiosity feel like something that has to be
- * answered.
- */
-.app-drawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  z-index: var(--z-overlay);
-  display: grid;
-  grid-template-rows: auto 1fr;
-  width: min(26rem, 100vw);
-  height: 100vh;
-  border-left: 1px solid var(--border);
-  background: var(--surface);
-  box-shadow: var(--shadow-lg);
-}
-
-.app-drawer-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  padding: var(--space-4);
-  border-bottom: 1px solid var(--border);
-}
-
-.app-drawer-title {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
-}
-
-.app-drawer-close {
-  flex: none;
-  padding: 0 var(--space-2);
-  border: none;
-  border-radius: var(--radius-sm);
-  background: none;
-  color: var(--text-faint);
-  font-size: var(--text-lg);
-  line-height: 1;
-  cursor: pointer;
-}
-
-.app-drawer-close:hover {
-  color: var(--text);
-}
-
-.app-drawer-body {
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: none;
-  padding: var(--space-4);
-}
-
 .app-drawer-section + .app-drawer-section {
   margin-top: var(--space-5);
 }
@@ -2164,15 +2100,6 @@
   letter-spacing: var(--tracking-wider);
   text-transform: uppercase;
   color: var(--text-faint);
-}
-
-/* An empty section says what empty means here, rather than showing nothing and
-   leaving the reader to decide whether the panel is broken. */
-.app-drawer-empty {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
 }
 
 .app-drawer-list {
@@ -2509,6 +2436,31 @@
 
 .app-home-cell .ui-stat {
   height: 100%;
+}
+
+/* A card that has not been read yet is a `Skeleton` that holds its tier's height, so the grid does
+   not move when the figure lands. The lead pair's card is ~9rem (2.75rem figure, label, detail,
+   padding); a quiet card is ~6rem. */
+.app-home-cell .ui-skeleton {
+  align-items: flex-start;
+  max-width: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.app-home-lead .ui-skeleton {
+  min-height: 9rem;
+}
+
+.app-home-quiet .ui-skeleton {
+  min-height: 6rem;
+}
+
+.app-home-spend .ui-skeleton {
+  min-height: 2.5rem;
+  padding: 0;
+  border: 0;
+  background: none;
 }
 
 /* Lead: the figure at full display size and room around it. */

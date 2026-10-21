@@ -111,7 +111,7 @@ describe("KillSwitchControl", () => {
     const said = screen.getByText(/^armed: Really release/);
     expect(said.getAttribute("role")).toBe("status");
     expect(said.textContent).toBe(
-      "armed: Really release — work resumes — press again to confirm",
+      "armed: Really release, work resumes. Press again to confirm",
     );
   });
 

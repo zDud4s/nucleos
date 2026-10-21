@@ -139,18 +139,42 @@ describe("Home", () => {
     expect(document.body.textContent).not.toContain("núcleo");
   });
 
-  it("shows an em dash rather than a zero while nothing has been read", async () => {
-    // A count nobody has managed to fetch and a count that is genuinely zero are
-    // different pieces of news, and only one of them means you can go to lunch.
-    // Only the budget answers; the rest never does, so the grid is real cards, not the skeleton.
+  it("holds a skeleton, not a dash and 'reading…', in each card still waiting for its read", async () => {
+    // Only the budget answers; the rest never does, so the grid is real cards for what landed and
+    // a Skeleton the size of the card for what has not.
     daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
       path === "/autopilot/budget" ? daemonFetch(daemonState())(path, init) : new Promise(() => {}),
     );
 
     await renderWithRouter(<Home />);
 
-    for (const label of ["Projects", "Shadow decisions pending", "Waiting on you"]) {
-      expect(within(await card(label)).getByText("—")).toBeDefined();
+    await spendRow();
+    for (const label of [
+      "Loading waiting on you",
+      "Loading subsystem health",
+      "Loading projects",
+      "Loading shadow decisions",
+    ]) {
+      expect((await screen.findByText(label)).closest("[role=status]")).not.toBeNull();
+    }
+    expect(screen.queryAllByRole("article")).toHaveLength(0);
+    expect(document.body.textContent).not.toContain("reading");
+  });
+
+  it("shows an em dash rather than a zero when a read failed", async () => {
+    // A count nobody has managed to fetch and a count that is genuinely zero are
+    // different pieces of news, and only one of them means you can go to lunch.
+    const answer = daemonFetch(daemonState());
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/projects" ? Promise.reject(new Error("down")) : answer(path, init),
+    );
+
+    await renderWithRouter(<Home />);
+
+    for (const label of ["Projects", "Shadow decisions pending"]) {
+      const failed = await card(label);
+      expect(within(failed).getByText("—")).toBeDefined();
+      expect(failed.textContent).toContain("could not read");
     }
   });
 

@@ -1,5 +1,5 @@
 import { useAllCaptures } from "../data/captures";
-import { Button, Panel, Quiet } from "../ui";
+import { Button, Panel, Quiet, Skeleton } from "../ui";
 import { CaptureAnswerForm } from "./CaptureAnswerForm";
 import { formatItem } from "./item-ref";
 import "./capture.css";
@@ -9,7 +9,7 @@ const CLOSED_TEXT = { answered: "answered", dismissed: "dismissed", expired: "ex
 /** The side panel of one capture request: the form while open, a read-only record once closed. */
 export function CapturePanel({ id, onSelect }: { id: number; onSelect(item: string): void }) {
   const all = useAllCaptures();
-  if (all.data === undefined) return <Quiet says="Loading…" />;
+  if (all.data === undefined) return <Skeleton label="Loading the request" lines={3} />;
   const request = all.data.find((candidate) => candidate.job_id === id);
   if (request === undefined) return <Quiet says="That request is not known." />;
 

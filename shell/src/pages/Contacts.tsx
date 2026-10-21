@@ -12,6 +12,7 @@ import {
   type MergeSuggestion,
 } from "../data/contacts";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 import { useDecideContactMerge, type ApprovalOutcome } from "../data/waiting";
 import {
   Badge,
@@ -55,8 +56,7 @@ function headline(rows: Correspondent[] | undefined): string | undefined {
   if (rows === undefined) return undefined;
   if (rows.length === 0) return "no one has written in yet";
   const shared = mergedContactIds(rows);
-  const noun = rows.length === 1 ? "address" : "addresses";
-  const first = `${rows.length} ${noun}`;
+  const first = plural(rows.length, "address", "addresses");
   // Count addresses and not contacts: the number sits beside the address total, and
   // "2 sharing" next to "7 addresses" read as two addresses when it was two people.
   const sharing = rows.filter((row) => shared.has(row.contact_id)).length;
@@ -106,7 +106,7 @@ function mergedContactIds(rows: Correspondent[]): Set<number> {
 
 function RosterError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>The {DAEMON_NAME} is not responding — nothing is known about the roster</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding: nothing is known about the roster</ErrorNote>;
 }
 
 /**
@@ -165,7 +165,7 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
   return (
     <Panel title="Identity questions" aside={<Count n={view.data?.length} />}>
       <p className="contacts-note">
-        Two records that may be one person. Yes merges them — undo it per address in People below.
+        Two records that may be one person. Yes merges them (undo it per address in People below).
         No is permanent: this pair is never suggested again.
       </p>
       {view.isError && rows.length === 0 && <MergesError error={view.error} />}
@@ -188,7 +188,7 @@ function IdentityQuestions({ view }: { view: ReturnType<typeof useContactMerges>
 
 function MergesError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>The {DAEMON_NAME} is not responding — nothing is known about the suggested merges</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding: nothing is known about the suggested merges</ErrorNote>;
 }
 
 function IdentityQuestion({
@@ -223,7 +223,7 @@ function IdentityQuestion({
       {conflict && (
         <div id={noteId}>
           <ConflictNote>
-            These two carry standing decisions that disagree, so approving will be refused — settle one
+            These two carry standing decisions that disagree, so approving will be refused. Settle one
             of them and decide this again.
           </ConflictNote>
         </div>
@@ -278,7 +278,7 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
             <li key={address}>{address}</li>
           ))}
         </ul>
-        <p className="contacts-meta">{side.messages_in} message{side.messages_in === 1 ? "" : "s"} in</p>
+        <p className="contacts-meta">{plural(side.messages_in, "message")} in</p>
       </div>
     </Section>
   );
@@ -293,10 +293,10 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
  * what lets that exact wording through instead of this generic fallback.
  */
 const IDENTITY_SENTENCES: Record<string, string> = {
-  conflict: "someone already answered this — the list clears it on the next read",
+  conflict: "someone already answered this, and the list clears it on the next read",
   not_found: "that question is gone; there is nothing left to decide",
   unprocessable: `the ${DAEMON_NAME} found nothing usable in this suggestion to act on`,
-  internal: `the ${DAEMON_NAME} failed while recording the decision — nothing changed`,
+  internal: `the ${DAEMON_NAME} failed while recording the decision: nothing changed`,
 };
 
 /**
@@ -337,7 +337,7 @@ function DecisionNotes({
 }
 
 function IdentityRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>The {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>The {DAEMON_NAME} is not responding: nothing was decided</ErrorNote>;
   const sentences = { ...IDENTITY_SENTENCES, ...daemonProse(error) };
   return <RefusalNote refusal={error} sentences={sentences} />;
 }
@@ -518,7 +518,7 @@ function PersonCard({
       )}
       {merged && <p className="contacts-sameas">Same person as {sameAs.join(", ")}</p>}
       <p className="contacts-meta">
-        {row.messages_in} message{row.messages_in === 1 ? "" : "s"} in · last seen{" "}
+        {plural(row.messages_in, "message")} in · last seen{" "}
         <RelativeTime at={row.last_seen} />
       </p>
       <div className="contacts-card-actions">
@@ -588,7 +588,7 @@ function VerdictError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "no mail has ever arrived from that address" }} />;
   }
-  return <ErrorNote>The {DAEMON_NAME} is not responding — that verdict was not recorded</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding: that verdict was not recorded</ErrorNote>;
 }
 
 /* ------------------------------------------------------------- unmerge -- */
@@ -637,5 +637,5 @@ function UnmergeError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "that address is no longer in the roster" }} />;
   }
-  return <ErrorNote>The {DAEMON_NAME} is not responding — that address was not pulled apart</ErrorNote>;
+  return <ErrorNote>The {DAEMON_NAME} is not responding: that address was not pulled apart</ErrorNote>;
 }

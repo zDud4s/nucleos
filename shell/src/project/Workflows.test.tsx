@@ -267,12 +267,12 @@ describe("the workflows mode", () => {
     expect(state.workflowChanges).toEqual([]);
 
     const replace = await screen.findByRole("button", {
-      name: "replace — this copy's edits are lost",
+      name: "replace: this copy's edits are lost",
     });
     fireEvent.click(replace);
     expect(state.workflowChanges).toEqual([]);
     // The live region, not the label: both labels are always in the DOM, one of them hidden.
-    expect(await screen.findByText(/armed: replace — this copy's edits are lost/)).toBeTruthy();
+    expect(await screen.findByText(/armed: replace: this copy's edits are lost/)).toBeTruthy();
 
     // Past the 300ms dwell that stops a double-click from confirming its own arming.
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -290,7 +290,7 @@ describe("the workflows mode", () => {
     const stop = await screen.findByRole("button", { name: "stop using it" });
     fireEvent.click(stop);
     expect(state.workflowChanges).toEqual([]);
-    expect(await screen.findByText(/armed: stop — 2 overrides go with the pin/)).toBeTruthy();
+    expect(await screen.findByText(/armed: stop: 2 overrides go with the pin/)).toBeTruthy();
 
     await new Promise((resolve) => setTimeout(resolve, 350));
     fireEvent.click(stop);

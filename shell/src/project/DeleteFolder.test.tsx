@@ -242,7 +242,7 @@ describe("deleting a project's folder", () => {
 
     typeTheName(panel, "nucleos");
     fireEvent.click(panel.getByRole("button", { name: "delete the folder" }));
-    expect(await panel.findByText(/kill switch is engaged — nothing was deleted/)).toBeTruthy();
+    expect(await panel.findByText(/kill switch is engaged: nothing was deleted/)).toBeTruthy();
   });
 
   /**

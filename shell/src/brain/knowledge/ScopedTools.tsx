@@ -6,7 +6,7 @@ import {
   useRevokeLoadoutTool,
   type LoadoutTool,
 } from "../../data/loadout-tools";
-import { Button, ErrorNote, Quiet, RefusalNote, RelativeTime, Row, Rows, Skeleton } from "../../ui";
+import { ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime, Row, Rows, Skeleton } from "../../ui";
 import "./knowledge.css";
 
 export interface ScopedToolsProps {
@@ -28,7 +28,7 @@ export function ScopedTools({ ownerKind, ownerId }: ScopedToolsProps) {
   let body: ReactNode;
   if (active.isError) {
     body = (
-      <ErrorNote onRetry={() => void active.refetch()}>the {DAEMON_NAME} is not responding — these tools are unknown</ErrorNote>
+      <ErrorNote onRetry={() => void active.refetch()}>the {DAEMON_NAME} is not responding: these tools are unknown</ErrorNote>
     );
   } else if (active.data === undefined) {
     body = <Skeleton label="Loading tools…" lines={2} />;
@@ -86,13 +86,14 @@ function ToolRow({
         </span>
       </div>
       <div>
-        <Button
-          aria-label={`Revoke ${row.tool}`}
-          onClick={onRevoke}
+        <ConfirmButton
+          label="Revoke"
+          confirmLabel="Take this tool back"
+          sayAs={`Revoke ${row.tool}`}
+          variant="danger"
           disabled={deciding}
-        >
-          Revoke
-        </Button>
+          onConfirm={onRevoke}
+        />
       </div>
     </Row>
   );
@@ -106,16 +107,16 @@ function originOf(row: LoadoutTool): string {
 
 const TOOL_SENTENCES: Record<string, string> = {
   conflict:
-    "this one was already decided, or is no longer active — the list clears it on the next read",
+    "this one was already decided, or is no longer active. The list clears it on the next read",
   not_found: "that one is gone; there is nothing left to decide",
-  unprocessable: `the ${DAEMON_NAME} found no such team — nothing was changed`,
-  internal: `the ${DAEMON_NAME} failed while carrying the decision out — nothing was changed`,
+  unprocessable: `the ${DAEMON_NAME} found no such team, so nothing was changed`,
+  internal: `the ${DAEMON_NAME} failed while carrying the decision out, so nothing was changed`,
 };
 
 /** What the tool doors say when they say no; shared by the section and the Brain's queue. */
 export function ToolRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>;
+    return <ErrorNote>the {DAEMON_NAME} is not responding: nothing was decided</ErrorNote>;
   }
   return <RefusalNote refusal={error} sentences={TOOL_SENTENCES} />;
 }

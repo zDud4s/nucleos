@@ -20,6 +20,7 @@ import { StaleNote } from "../ui/StaleNote";
 import { Teach } from "../ui/Teach";
 import { readState } from "../ui/state-map";
 import type { Removed } from "./RemoveProject";
+import { plural } from "../lib/plural";
 
 /**
  * Every project the núcleo knows, sorted by what it asks of somebody.
@@ -127,14 +128,14 @@ export function Roster() {
 }
 
 /**
- * The headline's prefix while the roster is stale — "as of 14:02:11 — ".
+ * The headline's prefix while the roster is stale — "as of 14:02:11: ".
  *
  * The same clock `StaleNote` prints, so the two agree to the second. A roster that has never been
  * read successfully has no data to be stale about, so the zero case is only a guard.
  */
 function asOf(dataUpdatedAt: number): string {
-  if (dataUpdatedAt <= 0) return "last known — ";
-  return `as of ${new Date(dataUpdatedAt).toLocaleTimeString(UI_LOCALE, { hour12: false })} — `;
+  if (dataUpdatedAt <= 0) return "last known: ";
+  return `as of ${new Date(dataUpdatedAt).toLocaleTimeString(UI_LOCALE, { hour12: false })}: `;
 }
 
 function RosterError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
@@ -226,8 +227,8 @@ function LeftTheRoster({ removed }: { removed: Removed }) {
   const where =
     removed.projectRoot === null ? "it had no folder named" : `its folder is still at ${removed.projectRoot}`;
   const says = removed.forgot
-    ? `${removed.projectId} left the roster and its history was deleted — ${where}.`
-    : `${removed.projectId} left the roster — ${where}, and its history is kept.`;
+    ? `${removed.projectId} left the roster and its history was deleted: ${where}.`
+    : `${removed.projectId} left the roster: ${where}, and its history is kept.`;
 
   return (
     <div ref={line} tabIndex={-1} className="mb-4">
@@ -271,8 +272,8 @@ const NARROW_COLUMNS = "grid-cols-[minmax(0,1fr)_auto_auto]";
  */
 function inFlight(jobs: number, runs: number): string | null {
   const parts: string[] = [];
-  if (jobs > 0) parts.push(`${jobs} ${jobs === 1 ? "job" : "jobs"}`);
-  if (runs > 0) parts.push(`${runs} ${runs === 1 ? "run" : "runs"}`);
+  if (jobs > 0) parts.push(plural(jobs, "job"));
+  if (runs > 0) parts.push(plural(runs, "run"));
   if (parts.length === 0) return null;
   return parts.join(" and ");
 }

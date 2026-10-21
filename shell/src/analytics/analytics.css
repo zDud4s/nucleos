@@ -537,28 +537,23 @@
   color: var(--text-muted);
 }
 
-.an-dt-tokens {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums;
+/* A model id or "Total" is a row head but not a column label: `.ui-table` would uppercase it. */
+.an-dt .ui-table tbody th,
+.an-dt .ui-table tfoot th {
+  font-size: inherit;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: normal;
+  color: inherit;
 }
 
-.an-dt-tokens th,
-.an-dt-tokens td {
-  padding: var(--space-1) var(--space-2);
-  text-align: right;
-}
-
-.an-dt-tokens th:first-child,
-.an-dt-tokens thead th:nth-child(2),
-.an-dt-tokens tbody td:nth-child(2) {
-  text-align: left;
-}
-
-.an-dt-tokens tfoot {
-  border-top: 1px solid var(--border);
+.an-dt .ui-table tfoot {
   font-weight: 600;
+}
+
+.an-dt .ui-table tfoot > tr > :is(th, td) {
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
 }
 
 .an-dt-finding-list {

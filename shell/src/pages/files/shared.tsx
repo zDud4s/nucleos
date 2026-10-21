@@ -1,8 +1,20 @@
-import { useLayoutEffect, useState } from "react";
+import { useLayoutEffect, useState, type KeyboardEvent } from "react";
 import { DAEMON_NAME } from "../../copy";
 import { isApiRefusal } from "../../data/client";
 import { MAX_UPLOAD_BYTES, type Trashed } from "../../data/files";
+import { clockText } from "../../lib/when";
 import { ErrorNote, RefusalNote } from "../../ui";
+
+/**
+ * A keydown handler that calls `close` on Escape and ignores every other key. The inline forms
+ * of this page (move, new folder, the clash question, the folder-delete question) all put
+ * themselves away the same way, so the key test is written once.
+ */
+export function onEscape(close: () => void): (event: KeyboardEvent) => void {
+  return (event) => {
+    if (event.key === "Escape") close();
+  };
+}
 
 /* ------------------------------------------------------------- refusals -- */
 
@@ -10,7 +22,7 @@ import { ErrorNote, RefusalNote } from "../../ui";
 export const LIST_SENTENCES: Record<string, string> = {
   bad_request: `that path leaves the files root, which the ${DAEMON_NAME} will not follow`,
   not_found: "there is nothing at that path",
-  conflict: "that path names a file, not a folder — there is nothing to list inside it",
+  conflict: "that path names a file, not a folder, so there is nothing to list inside it",
   internal: `the ${DAEMON_NAME} could not read that folder from disk`,
 };
 
@@ -22,12 +34,12 @@ export const SEARCH_SENTENCES: Record<string, string> = {
 /** `POST /files/folder` — the only refusal it can give beyond 503 is 400. */
 export const CREATE_FOLDER_SENTENCES: Record<string, string> = {
   bad_request:
-    `that path leaves the files root, is unsafe, or names the root itself — none of which the ${DAEMON_NAME} will create`,
+    `that path leaves the files root, is unsafe, or names the root itself, none of which the ${DAEMON_NAME} will create`,
 };
 
 export const UPLOAD_SENTENCES: Record<string, string> = {
   bad_request: `that folder leaves the files root, which the ${DAEMON_NAME} will not follow`,
-  conflict: "that folder is not actually a folder — there is a file there instead",
+  conflict: "that folder is not actually a folder: there is a file there instead",
   http_413: `that file is larger than the ${String(MAX_UPLOAD_BYTES / (1024 * 1024))} MB the daemon will accept in one upload`,
   internal: `the ${DAEMON_NAME} could not write that file to disk`,
 };
@@ -36,22 +48,22 @@ export const UPLOAD_SENTENCES: Record<string, string> = {
 export const MOVE_SENTENCES: Record<string, string> = {
   bad_request:
     "that move leaves the files root, is unsafe, targets the root itself, or moves a folder into itself",
-  not_found: "the folder the destination would live in does not exist — a typo is never turned into a new folder",
-  conflict: "there is already something there — a move never overwrites",
+  not_found: "the folder the destination would live in does not exist, and a typo is never turned into a new folder",
+  conflict: "there is already something there, and a move never overwrites",
   internal: `the ${DAEMON_NAME} could not make that move on disk`,
 };
 
 export const DELETE_SENTENCES: Record<string, string> = {
   bad_request: "the files root itself cannot be deleted",
-  conflict: "that folder has something in it — deleting it too means deleting everything inside",
+  conflict: "that folder has something in it, and deleting it too means deleting everything inside",
   internal: `the ${DAEMON_NAME} could not move that to the trash, so it is still where it was`,
 };
 
 /** `POST /files/restore` — held to the move rule, so its 409 and 404 read like the move's. */
 export const RESTORE_SENTENCES: Record<string, string> = {
   bad_request: "that is not something the trash holds",
-  not_found: "the folder it came from is gone — a restore never makes one up; recreate it, then restore",
-  conflict: "something else now sits where it came from — a restore never overwrites; move that aside first",
+  not_found: "the folder it came from is gone, and a restore never makes one up; recreate it, then restore",
+  conflict: "something else now sits where it came from, and a restore never overwrites; move that aside first",
   internal: `the ${DAEMON_NAME} could not move it back out of the trash`,
 };
 
@@ -61,7 +73,7 @@ export const TRASH_SENTENCES: Record<string, string> = {
 };
 
 export const DOWNLOAD_SENTENCES: Record<string, string> = {
-  conflict: "that path is a folder, not a file — there is nothing to download",
+  conflict: "that path is a folder, not a file, so there is nothing to download",
   not_found: "that file is gone",
 };
 
@@ -79,11 +91,11 @@ export function RefusalOrError({
   const [at] = useState(() => new Date());
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={sentences} />;
   const said = error instanceof Error && error.message.trim() !== "" ? ` (${error.message})` : "";
-  const clock = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const clock = clockText(at.getTime());
   return (
     <ErrorNote>
       The {DAEMON_NAME} could not be reached at {clock}
-      {said} — {what}
+      {said}: {what}
     </ErrorNote>
   );
 }

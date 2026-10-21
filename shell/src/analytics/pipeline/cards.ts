@@ -1,6 +1,7 @@
 import type { ChartDatum, ChartKey } from "../../ui";
 import type { Autopilot, Gate, Jobs, Landing, PipelineReport, Postgate, Pressure } from "../../data/analytics-pipeline";
 import { isBlockError } from "../../data/analytics-pipeline";
+import { plural } from "../../lib/plural";
 import { versus } from "../series";
 import type { Metric } from "../sections";
 import { NO_DATA, clauses, humanSeconds, percentOr } from "./format";
@@ -51,7 +52,7 @@ function redFor(postgate: Postgate, now: string): string {
 
 function postgateCard(postgate: Postgate, report: PipelineReport): Metric<PipelineKey> {
   const key: ChartKey = { key: "red", label: "Red time", className: "ui-chart-failed" };
-  const reverts = postgate.reverts > 0 ? `${postgate.reverts} ${postgate.reverts === 1 ? "revert" : "reverts"}` : "";
+  const reverts = postgate.reverts > 0 ? plural(postgate.reverts, "revert") : "";
   const window =
     postgate.red_s_in_window > 0
       ? `${humanSeconds(postgate.red_s_in_window)} red in ${report.days} days`

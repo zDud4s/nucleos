@@ -11,7 +11,8 @@ import {
   type PairedIdentity,
   type PairingCode,
 } from "../data/channels";
-import { Button, CopyButton, ErrorNote, Modal, RefusalNote } from "../ui";
+import { Button, CopyButton, ErrorNote, Modal, RefusalNote, Skeleton } from "../ui";
+import { useNow } from "../lib/useNow";
 import "./pairing.css";
 
 export interface PairingDialogProps {
@@ -60,7 +61,9 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
   const start = useStartPairing(channel.id);
   const cancel = useCancelPairing(channel.id);
   const [code, setCode] = useState<PairingCode | null>(null);
-  const [now, setNow] = useState(() => Date.now());
+  // When the code arrived. The shared clock below is idle while there is no code, so its first
+  // reading after the code lands can be hours old and would draw a fresh code as expired for a tick.
+  const [arrivedAt, setArrivedAt] = useState(0);
   const asked = useRef(false);
   const queryClient = useQueryClient();
 
@@ -69,7 +72,7 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
     mutateAsync().then(
       (pairing) => {
         setCode(pairing);
-        setNow(Date.now());
+        setArrivedAt(Date.now());
         // Drop the mutation's own copy of the answer; only this state keeps the code.
         reset();
       },
@@ -106,19 +109,15 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
     ask();
   }
 
-  useEffect(() => {
-    if (!open || code === null) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [open, code]);
-
   function close() {
     if (code !== null) cancel.mutate();
     setCode(null);
     onOpenChange(false);
   }
 
-  const remaining = code === null ? 0 : Date.parse(code.expires_at) - now;
+  // Ticks once a second while the dialog is open with a code in hand.
+  const now = useNow(1000, open && code !== null);
+  const remaining = code === null ? 0 : Date.parse(code.expires_at) - Math.max(now, arrivedAt);
   const error = start.error;
 
   return (
@@ -136,7 +135,7 @@ export function PairingDialog({ channel, open, onOpenChange }: PairingDialogProp
         </Button>
       }
     >
-      {code === null && error === null && <p role="status">asking for a code…</p>}
+      {code === null && error === null && <Skeleton label="Asking for a code" />}
       {error instanceof ApiRefusal && <RefusalNote refusal={error} sentences={SENTENCES} />}
       {error !== null && !(error instanceof ApiRefusal) && (
         <ErrorNote>the {DAEMON_NAME} could not be reached for a code; check that it is running, then try again</ErrorNote>

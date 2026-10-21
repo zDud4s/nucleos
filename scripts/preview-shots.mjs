@@ -622,6 +622,17 @@ const SHOTS_TO_TAKE = [
   ["91-files-light", { path: "/files", theme: "light" }],
   ["92-files-narrow", { path: "/files", viewport: { width: 800, height: 600 } }],
   ["93-files-empty", { path: "/files?empty=1" }],
+  /* System: the channels, notifications and machine-settings subviews. */
+  ["99-system-channels", { path: "/system/channels" }],
+  ["99a-system-channels-light", { path: "/system/channels", theme: "light" }],
+  ["99b-system-notifications", { path: "/system/notifications" }],
+  ["99c-system-settings", { path: "/system/settings" }],
+  /* The System page's health, limits, backups and tokens tabs (`?view=`). */
+  ["95-system-health", { path: "/system/health" }],
+  ["95a-system-health-light", { path: "/system/health", theme: "light" }],
+  ["96-system-limits", { path: "/system/limits" }],
+  ["97-system-backups", { path: "/system/backups" }],
+  ["98-system-tokens", { path: "/system/tokens" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));

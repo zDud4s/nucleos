@@ -39,9 +39,11 @@ import {
   Row,
   Rows,
   Section,
+  Skeleton,
   StateBadge,
 } from "../ui";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 import "./browser.css";
 
 /**
@@ -126,14 +128,14 @@ function headline(rows: BrowserSession[] | undefined, subsystem: SubsystemReadou
   // The pillar being down outranks how many sessions are open: none of them can be doing
   // anything. The reason travels with it — it was in a panel at the bottom of the page.
   if (subsystem !== null && subsystem.status !== "ok" && subsystem.status !== "disabled") {
-    const why = subsystem.reason === undefined ? "" : ` — ${subsystem.reason}`;
+    const why = subsystem.reason === undefined ? "" : `: ${subsystem.reason}`;
     return `the browser sidecar is ${subsystem.status}${why}`;
   }
   if (rows === undefined) return undefined;
   if (rows.length === 0) return "nothing is open right now";
   const asking = rows.filter((row) => row.mode === "wheel-requested").length;
-  const noun = rows.length === 1 ? "session" : "sessions";
-  return asking === 0 ? `${rows.length} ${noun} open` : `${rows.length} ${noun} open — ${asking} asking for the wheel`;
+  const open = plural(rows.length, "session");
+  return asking === 0 ? `${open} open` : `${open} open, ${asking} asking for the wheel`;
 }
 
 /** The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s pattern. */
@@ -146,7 +148,7 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 
 function MutationNote({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — {what}</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: {what}</ErrorNote>;
 }
 
 /* --------------------------------------------------------- live sessions -- */
@@ -175,7 +177,7 @@ function LiveSessions({
       {/* The empty line says where a session comes from, which is the next step; "nothing is open"
           alone read as a list that failed to load. */}
       {view.data !== undefined && rows.length === 0 && (
-        <Quiet says="no windows are open — open one above, or an agent will when it needs a browser." />
+        <Quiet says="no windows are open. Open one above, or an agent will when it needs a browser." />
       )}
       {rows.length > 0 && (
         <p className="browser-note">
@@ -183,7 +185,7 @@ function LiveSessions({
         </p>
       )}
       {view.isError && view.data === undefined && <MutationNote error={view.error} what="nothing is known about the open sessions" />}
-      {view.data === undefined && !view.isError && <p className="browser-loading">reading the open sessions…</p>}
+      {view.data === undefined && !view.isError && <Skeleton label="Reading the open sessions" lines={3} />}
       {rows.length > 0 && (
         <Rows label="Live sessions">
           {rows.map((session) => (
@@ -267,7 +269,7 @@ function SessionRow({
       {session.refusal !== null && <p className="browser-refusal">{session.refusal}</p>}
       {session.mode === "wheel-requested" && (
         <p className="browser-waiting-link">
-          waiting on a decision — <Link to="/waiting">answer it there</Link>
+          waiting on a decision: <Link to="/waiting">answer it there</Link>
         </p>
       )}
       <div className="browser-actions">
@@ -381,17 +383,17 @@ function ChainDialogue({
   useEffect(() => {
     dialogueRef.current?.focus();
   }, []);
-  const origins = chain.length === 1 ? "origin" : "origins";
+  const origins = plural(chain.length, "origin");
   const grantLabel = writable
-    ? `Grant read on ${chain.length} ${origins}, and form submission on the site you ended on`
-    : `Grant read on ${chain.length} ${origins}`;
+    ? `Grant read on ${origins}, and form submission on the site you ended on`
+    : `Grant read on ${origins}`;
 
   return (
     <div ref={dialogueRef} className="browser-chain-dialogue" tabIndex={-1} role="group" aria-label="Keep these?">
     <Panel title="Keep these?">
       <p className="browser-note">
-        The window closed, and this is where it went. Nothing is granted yet — say yes to the whole
-        set or no to all of it; there is no picking a few origins out of the chain.
+        The window closed, and this is where it went. Nothing is granted yet: say yes to the whole
+        set or no to all of it. There is no picking a few origins out of the chain.
       </p>
       <ol className="browser-chain" aria-label="Navigation chain">
         {chain.map((url, index) => (
@@ -493,7 +495,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
   if (projects.data !== undefined && options.length === 0) {
     return (
       <div className="browser-bar-block">
-        <Quiet says="no project is registered yet — a window opens on a project's profile." />
+        <Quiet says="no project is registered yet. A window opens on a project's profile." />
         {unavailable && <SidecarTrouble health={health} />}
       </div>
     );
@@ -565,8 +567,8 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
 
       {open.data !== undefined && (
         <p className="browser-outcome" role="status">
-          opened session #{open.data.id} on the {open.data.profile_kind} profile {open.data.profile_id} —
-          give it back below when you are done
+          opened session #{open.data.id} on the {open.data.profile_kind} profile {open.data.profile_id}.
+          Give it back below when you are done
         </p>
       )}
       {open.isError && <MutationNote error={open.error} what="the window could not be opened" />}
@@ -574,12 +576,9 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
         <p className="browser-outcome" role="status">
           opened session #{withAgent.data.session.id} with the agent
           {withAgent.data.session.profile_kind === "ephemeral"
-            ? " in a throwaway profile, with none of the project's logins — to use your login here, log in with Open a window and keep the site first"
+            ? " in a throwaway profile, with none of the project's logins. To use your login here, log in with Open a window and keep the site first"
             : ""}{" "}
-          —{" "}
-          <Link to="/chats/$chatId" params={{ chatId: withAgent.data.chat_id }}>
-            open its conversation
-          </Link>
+          (<Link to="/chats/$chatId" params={{ chatId: withAgent.data.chat_id }}>open its conversation</Link>)
         </p>
       )}
       {withAgent.isError && (
@@ -611,7 +610,7 @@ function SidecarTrouble({ health }: { health: ReturnType<typeof useBrowserHealth
       )}
       {restarts > 0 && (
         <>
-          {restarts} restart{restarts === 1 ? "" : "s"}
+          {plural(restarts, "restart")}
           {" · "}
         </>
       )}
@@ -674,7 +673,7 @@ function SiteGrants() {
       {projectId !== undefined && (
         <>
           {sites.isError && rows.length === 0 && <MutationNote error={sites.error} what="nothing is known about this project's sites" />}
-          {sites.data === undefined && !sites.isError && <p className="browser-loading">reading the sites…</p>}
+          {sites.data === undefined && !sites.isError && <Skeleton label="Reading the sites" lines={3} />}
           {sites.data !== undefined && rows.length === 0 && (
             <Quiet says={`${projectId} has not logged into anything yet.`} />
           )}
@@ -708,7 +707,7 @@ function SiteGrants() {
             />
             {forget.data !== undefined && (
               <p className="browser-outcome" role="status">
-                stopped {forget.data.stopped} running session{forget.data.stopped === 1 ? "" : "s"} and cleared every site
+                stopped {plural(forget.data.stopped, "running session")} and cleared every site
               </p>
             )}
             {forget.isError && <MutationNote error={forget.error} what="the profile could not be forgotten" />}
@@ -841,7 +840,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
         <RelativeTime at={wrote.written_at} />
       </div>
       <p className="browser-meta browser-write-meta">
-        {wrote.field_count} field{wrote.field_count === 1 ? "" : "s"}
+        {plural(wrote.field_count, "field")}
         {shown !== "" && <>: {shown}</>}
         {more > 0 && <> and {more} more</>}
       </p>
@@ -850,7 +849,7 @@ function WriteRow({ wrote }: { wrote: Written }) {
         // "a document was posted" are not the same event, and a person scanning this list for
         // something they did not expect is looking for exactly this difference.
         <p className="browser-meta browser-write-meta browser-files">
-          with {wrote.files.length === 1 ? "a file" : `${wrote.files.length} files`}:{" "}
+          with {wrote.files.length === 1 ? "a file" : plural(wrote.files.length, "file")}:{" "}
           {wrote.files.join(", ")}
         </p>
       )}

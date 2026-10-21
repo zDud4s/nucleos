@@ -18,7 +18,7 @@ function provider(name: string) {
 afterEach(() => window.localStorage.removeItem("nucleos.notch-hidden"));
 
 describe("NotchProviders", () => {
-  it("offers one checkbox per reported subscription and remembers an untick", async () => {
+  it("offers one switch per reported subscription and remembers an untick", async () => {
     daemon.apiFetch.mockResolvedValue({ providers: [provider("claude"), provider("codex")], source: "sidecar", cached: false });
     const { findByLabelText } = renderWithQuery(<NotchProviders />);
     const codex = (await findByLabelText("Show codex")) as HTMLInputElement;

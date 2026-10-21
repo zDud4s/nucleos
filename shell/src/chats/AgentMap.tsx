@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useLiveTurnSnapshot, useChatTasks, useStopTask, useTurnTools, type ChatTask } from "../data/chats";
 import { turnIsLive, type ToolCall, type Turn } from "../lib/turns";
 import { displayName } from "../lib/modelName";
+import { plural } from "../lib/plural";
+import { useNow } from "../lib/useNow";
 import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
+import { Quiet } from "../ui/Quiet";
+import { tokenCount } from "../ui/readings";
 import { cacheState, leftText } from "./cache";
 
 /** A Task or Agent call is a subagent; nothing else spawns a child conversation. */
@@ -117,8 +121,6 @@ function cardDuration(call: ToolCall, working: boolean, now: number): string | n
   return Number.isNaN(to) ? null : durationText(to - from);
 }
 
-const tokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
-
 const spent = (card: AgentCard) => card.task?.total_tokens ?? card.call.tokens;
 
 function titleOf(card: AgentCard): string {
@@ -148,10 +150,10 @@ function Card({ card, now, onOpen }: { card: AgentCard; now: number; onOpen: () 
   if (card.kind === "background") meta.push(`shell${duration ? ` · ${duration}` : ""}`);
   else if (duration) meta.push(duration);
   const used = spent(card);
-  if (used != null) meta.push(`${tokens(used)} tokens`);
+  if (used != null) meta.push(`${tokenCount(used)} tokens`);
   // How much it did, at a glance; what it did is one click away.
   if (card.kind === "subagent" && card.calls.length > 0)
-    meta.push(`${card.calls.length} tool call${card.calls.length === 1 ? "" : "s"}`);
+    meta.push(plural(card.calls.length, "tool call"));
   const failed = failedCard(card);
   if (failed) meta.push(statusLabel(card));
   return (
@@ -159,7 +161,7 @@ function Card({ card, now, onOpen }: { card: AgentCard; now: number; onOpen: () 
       type="button"
       className="agent-card"
       onClick={onOpen}
-      aria-label={`${titleOf(card)} — ${statusLabel(card)}`}
+      aria-label={`${titleOf(card)}: ${statusLabel(card)}`}
     >
       <span className="agent-card-title">
         <Dot working={card.working} failed={failed} />
@@ -204,7 +206,7 @@ function AgentDetail({
     card.call.model ? displayName(card.call.model) : null,
   ].filter((x): x is string => x !== null);
   const used = spent(card);
-  const timing = [duration, used != null ? `${tokens(used)} tokens` : null].filter(
+  const timing = [duration, used != null ? `${tokenCount(used)} tokens` : null].filter(
     (x): x is string => x !== null,
   );
   const answer = card.task?.summary ?? card.call.result ?? null;
@@ -255,7 +257,11 @@ function AgentDetail({
             <details className="agent-section">
               <summary>{`Tool calls (${card.calls.length})`}</summary>
               <ul className="agent-calls" aria-label="Its tool calls">
-                {card.calls.length === 0 && <li className="agent-calls-none">No tool calls recorded.</li>}
+                {card.calls.length === 0 && (
+                  <li>
+                    <Quiet compact says="No tool calls recorded." />
+                  </li>
+                )}
                 {card.calls.map((c, i) => (
                   <li key={`${c.id ?? c.name}-${i}`}>
                     <span className="agent-calls-name">{c.name}</span>
@@ -328,7 +334,11 @@ function AgentTranscript({ card, onClose }: { card: AgentCard; onClose: () => vo
       size="lg"
     >
       <ol className="agent-transcript" aria-label="Transcript">
-        {steps.length === 0 && <li className="agent-calls-none">No tool calls recorded.</li>}
+        {steps.length === 0 && (
+          <li>
+            <Quiet compact says="No tool calls recorded." />
+          </li>
+        )}
         {steps.map((step, i) => {
           const c = (step.id !== undefined ? full.get(step.id) : undefined) ?? step;
           const running = c.finished_at === undefined && card.working;
@@ -409,7 +419,7 @@ export function AgentMapBody({
   const filled = [...turns].reverse().find((t) => t.contextFill != null)?.contextFill ?? null;
   const rootMeta = [
     last?.model ? displayName(last.model) : null,
-    filled !== null ? `${tokens(filled)} tokens` : "tokens not reported yet",
+    filled !== null ? `${tokenCount(filled)} tokens` : "tokens not reported yet",
   ].filter((x): x is string => x !== null);
   return (
     <div className="agent-map">
@@ -439,7 +449,7 @@ export function AgentMapBody({
       {groups.background.length > 0 && (
         <section className="agent-bg">
           <h3 className="agent-bg-title">
-            {groups.background.length} background task{groups.background.length === 1 ? "" : "s"}
+            {plural(groups.background.length, "background task")}
           </h3>
           <div className="agent-bg-cards">
             {groups.background.map((c) => (
@@ -450,16 +460,6 @@ export function AgentMapBody({
       )}
     </div>
   );
-}
-
-/** Re-render on a timer. Local to the chips: the rest of the page does not need the tick. */
-function useNow(everyMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), everyMs);
-    return () => clearInterval(id);
-  }, [everyMs]);
-  return now;
 }
 
 /**
@@ -520,7 +520,7 @@ export function ChatChips({
           onClick={() => setOpen(true)}
           title="Open the agent map"
         >
-          <span aria-hidden="true">●</span> {shown} agent{shown === 1 ? "" : "s"}
+          <span aria-hidden="true">●</span> {plural(shown, "agent")}
         </button>
       )}
       {open && (

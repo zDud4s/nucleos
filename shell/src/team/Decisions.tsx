@@ -81,7 +81,7 @@ export function Decisions({ team, runs }: DecisionsProps) {
         <p>
           The limit here is <strong>your attention</strong>, not the team&apos;s capacity:
           only the actions it has been granted as <em>asks first</em> ever queue. Anything granted
-          as <em>does it</em> happens within about ten seconds and never appears — change that on
+          as <em>does it</em> happens within about ten seconds and never appears. Change that on
           the Charter tab, under Powers.
         </p>
       </Teach>
@@ -180,7 +180,7 @@ function ActionCard({ action }: { action: TeamAction }) {
         <RelativeTime at={action.created_at} />
         {/* `null` means the grant was `allow`: nobody decides and it happens on
             the next tick (ten seconds). It is here to be seen, not to be answered. */}
-        {action.proposal_id === null && <Badge tone="info">granted — nobody decides</Badge>}
+        {action.proposal_id === null && <Badge tone="info">granted: nobody decides</Badge>}
       </div>
 
       <blockquote className="teams-act-why">{action.why}</blockquote>
@@ -213,7 +213,7 @@ function ActionCard({ action }: { action: TeamAction }) {
       )}
       {reject.isSuccess && (
         <p className="teams-act-outcome" role="status">
-          Refused — it won&apos;t happen.
+          Refused. It won&apos;t happen.
         </p>
       )}
       {approve.isError && <DecisionRefusal error={approve.error} what="this was not approved" />}
@@ -441,7 +441,7 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
       )}
       {reject.isSuccess && (
         <p className="teams-act-outcome" role="status">
-          Refused — it won&apos;t happen.
+          Refused. It won&apos;t happen.
         </p>
       )}
       {hire.isError && <DecisionRefusal error={hire.error} what="nobody was hired" />}

@@ -2,7 +2,7 @@ import { ChannelCard } from "../channels/ChannelCard";
 import { useChannels, type RoutingState } from "../data/channels";
 import { isApiRefusal } from "../data/client";
 import { DAEMON_NAME } from "../copy";
-import { ErrorNote, RefusalNote } from "../ui";
+import { Callout, ErrorNote, Quiet, RefusalNote, Skeleton } from "../ui";
 import "./channels.css";
 
 /** One sentence per routing problem; `ok` has none, so nothing is drawn for it. */
@@ -20,22 +20,22 @@ export function ChannelsView() {
     if (isApiRefusal(channels.error)) return <RefusalNote refusal={channels.error} />;
     return (
       <ErrorNote onRetry={() => void channels.refetch()}>
-        the {DAEMON_NAME} is not responding — nothing is known about the channels
+        the {DAEMON_NAME} is not responding: nothing is known about the channels
       </ErrorNote>
     );
   }
   if (!channels.data) {
-    return <p className="sy-note" role="status">reading the channels…</p>;
+    return <Skeleton label="Reading the channels" variant="cards" count={3} />;
   }
 
   const { routing, primary, channels: list } = channels.data;
   return (
     <div className="ch-page">
       {routing.state !== "ok" ? (
-        <p className="ch-routing-warning" role="note">{ROUTING[routing.state]}</p>
+        <Callout tone="pending">{ROUTING[routing.state]}</Callout>
       ) : null}
       {list.length === 0 ? (
-        <p className="sy-note">no channel adapters are built into this daemon</p>
+        <Quiet says="no channel adapters are built into this daemon" />
       ) : (
         <div className="ch-grid">
           {list.map((channel) => (

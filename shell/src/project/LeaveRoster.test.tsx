@@ -85,7 +85,7 @@ describe("leaving the roster, from inside the project", () => {
 
     await waitFor(() => expect(rendered.router.state.location.pathname).toBe("/projects"));
     const line = await screen.findByText(
-      "spent left the roster — its folder is still at C:/Projects/spent, and its history is kept.",
+      "spent left the roster: its folder is still at C:/Projects/spent, and its history is kept.",
     );
     const quiet = line.closest(".ui-quiet") as HTMLElement;
     expect(quiet.getAttribute("role")).toBe("status");
@@ -137,7 +137,7 @@ describe("leaving the roster, from inside the project", () => {
     await waitFor(() => expect(state.removed[0]).toEqual({ projectId: "spent", forgetHistory: true }));
     expect(
       await screen.findByText(
-        "spent left the roster and its history was deleted — its folder is still at C:/Projects/spent.",
+        "spent left the roster and its history was deleted: its folder is still at C:/Projects/spent.",
       ),
     ).toBeTruthy();
   });

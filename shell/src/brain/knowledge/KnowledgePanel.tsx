@@ -9,7 +9,7 @@ import {
 } from "../../data/knowledge";
 import { useNotesGraph, type NotesGraph } from "../../data/owner-notes";
 import { useProjects } from "../../data/system";
-import { Button, ConfirmButton, ErrorNote, Quiet } from "../../ui";
+import { Button, ConfirmButton, ErrorNote, Quiet, Skeleton } from "../../ui";
 import { ForceGraph } from "../ForceGraph";
 import { Segments } from "../Segments";
 import { backlinks, buildModel, localModel } from "../graph-model";
@@ -54,8 +54,8 @@ export function KnowledgePanel({ id, onSelect }: KnowledgePanelProps) {
   const reject = useRejectKnowledge();
   const revert = useRevertKnowledge();
 
-  if (knowledge.isError) return <ErrorNote>the {DAEMON_NAME} is not responding — the row is not known</ErrorNote>;
-  if (knowledge.data === undefined) return <Quiet says="Loading…" />;
+  if (knowledge.isError) return <ErrorNote>the {DAEMON_NAME} is not responding: the row is not known</ErrorNote>;
+  if (knowledge.data === undefined) return <Skeleton label="Loading the knowledge row" lines={4} />;
   const row = knowledge.data.find((candidate) => candidate.id === id);
   if (row === undefined) {
     return (
@@ -129,7 +129,7 @@ function Backlinks({
   wide: NotesGraph | undefined;
   onSelect(ref: string): void;
 }) {
-  if (wide === undefined) return <Quiet says="Loading…" />;
+  if (wide === undefined) return <Skeleton label="Loading the links" lines={2} />;
   const links = backlinks(wide, "knowledge", String(id));
   if (links.length === 0) return <Quiet says="No note points here." />;
   return (
@@ -190,7 +190,7 @@ function LocalGraph({
         />
       </div>
       {local === null ? (
-        <Quiet says="Loading the local graph…" />
+        <Skeleton label="Loading the local graph" lines={3} />
       ) : (
         <ForceGraph
           compact

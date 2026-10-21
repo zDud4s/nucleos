@@ -84,7 +84,7 @@ export function CouncilDeliberation({ view, running }: { view: CouncilView; runn
         /* Its own element, apart from the facts line in the header: the round it
            stopped at is the fact here, and the header only says that it did. */
         <p className="council-note council-stopped">
-          Stopped early at round {view.rounds_run} — no seat changed its answer,
+          Stopped early at round {view.rounds_run}: no seat changed its answer,
           so another round would have changed nothing.
         </p>
       )}
@@ -236,7 +236,7 @@ function AnswerCell({ seat }: { seat: SeatView }) {
         // `ok` with no text is the pruned case: the seat did answer, and the
         // transcript that held it is simply gone now.
         <p className="council-seat-answer">
-          {answer.status === "ok" ? "answered — the text has expired" : "no answer recorded"}
+          {answer.status === "ok" ? "answered, but the text has expired" : "no answer recorded"}
         </p>
       )}
     </>
@@ -321,7 +321,7 @@ function ReviewsGiven({
                 <li className="council-point" key={index}>
                   <span className="council-point-stance">{point.stance}</span>{" "}
                   <span>{point.claim}</span>
-                  <span className="council-point-why"> — {point.why}</span>
+                  <span className="council-point-why">: {point.why}</span>
                 </li>
               ))}
             </ul>

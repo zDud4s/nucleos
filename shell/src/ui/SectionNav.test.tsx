@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { SectionNav } from "./SectionNav";
 
 const ITEMS = [
@@ -21,6 +21,30 @@ describe("SectionNav", () => {
       "location",
     );
     expect(screen.getByRole("link", { name: "Ledger" }).getAttribute("aria-current")).toBeNull();
+  });
+
+  it("scrolls smoothly to the section, updates the hash and focuses it", () => {
+    const target = document.createElement("section");
+    target.id = "ledger";
+    target.scrollIntoView = vi.fn();
+    document.body.appendChild(target);
+    render(<SectionNav label="On this page" items={ITEMS} />);
+    fireEvent.click(screen.getByRole("link", { name: "Ledger" }));
+    expect(target.scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "start" });
+    expect(window.location.hash).toBe("#ledger");
+    expect(document.activeElement).toBe(target);
+    target.remove();
+  });
+
+  it("leaves a ctrl-click to the browser", () => {
+    const target = document.createElement("section");
+    target.id = "ledger";
+    target.scrollIntoView = vi.fn();
+    document.body.appendChild(target);
+    render(<SectionNav label="On this page" items={ITEMS} />);
+    fireEvent.click(screen.getByRole("link", { name: "Ledger" }), { ctrlKey: true });
+    expect(target.scrollIntoView).not.toHaveBeenCalled();
+    target.remove();
   });
 
   it("marks nothing when no section is current", () => {

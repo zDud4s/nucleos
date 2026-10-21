@@ -101,7 +101,7 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
                 batch.data !== undefined &&
                 batch.data.failed.length > 0 && (
                   <ErrorNote>
-                    {batch.data.done} decided; {batch.data.failed.length} could not be — they
+                    {batch.data.done} decided; {batch.data.failed.length} could not be: they
                     were already decided, or are gone. The list clears on the next read.
                   </ErrorNote>
                 )}
@@ -122,7 +122,7 @@ export function WaitingPanel({ rows }: WaitingPanelProps) {
                         // is the one-line absence that component is for. It was set faint, which is
                         // the rung for metadata standing beside content — here the sentence is all
                         // the row has to say in place of its two buttons.
-                        <Quiet says="no question to answer — decide in the daemon" />
+                        <Quiet says="no question to answer: decide in the daemon" />
                       ) : (
                         <RowDecisions
                           proposalId={row.proposal_id}
@@ -232,18 +232,18 @@ function RowDecisions({
  */
 const DECISION_SENTENCES: Record<string, string> = {
   conflict:
-    "this one was already decided, or is no longer in force — the list clears it on the next read",
+    "this one was already decided, or is no longer in force. The list clears it on the next read",
   not_found: "that one is gone; there is nothing left to decide",
   unprocessable:
     `the ${DAEMON_NAME} found nothing usable inside the proposal to act on`,
   internal:
-    `the ${DAEMON_NAME} failed while carrying the decision out — nothing was changed`,
+    `the ${DAEMON_NAME} failed while carrying the decision out, so nothing was changed`,
 };
 
 export function DecisionRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} is not responding: nothing was decided</ErrorNote>
     );
   }
   return <RefusalNote refusal={error} sentences={DECISION_SENTENCES} />;

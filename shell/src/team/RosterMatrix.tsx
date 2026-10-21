@@ -1,4 +1,5 @@
 import type { TeamView } from "../data/teams";
+import { plural } from "../lib/plural";
 import { Quiet } from "../ui";
 
 /**
@@ -103,7 +104,7 @@ export function RosterMatrix({ teams }: RosterMatrixProps) {
         says={
           teams.length === 0
             ? "no team has been created yet."
-            : "no team has anybody in it yet — a task cannot start without a roster."
+            : "no team has anybody in it yet, and a task cannot start without a roster."
         }
       />
     );
@@ -118,8 +119,8 @@ export function RosterMatrix({ teams }: RosterMatrixProps) {
     <div className="teams-matrix-scroll">
       <table className="teams-matrix">
         <caption className="teams-matrix-caption">
-          {specialists.length} {specialists.length === 1 ? "specialist" : "specialists"} across{" "}
-          {teams.length} {teams.length === 1 ? "team" : "teams"}. ◉ directs · ● on staff
+          {plural(specialists.length, "specialist")} across {plural(teams.length, "team")}. ◉ directs · ● on
+          staff
         </caption>
         <thead>
           <tr>

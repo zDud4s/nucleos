@@ -13,7 +13,8 @@ import {
 import { compactTokens } from "../../data/project-readings";
 import { AreaChart, Badge, ShareBar, usd, type ChartKey } from "../../ui";
 import { versus } from "../series";
-import { joined, plural, summary, type PanelContent } from "../sections";
+import { plural } from "../../lib/plural";
+import { joined, summary, type PanelContent } from "../sections";
 import { EMPTY, PRESSURE_KEY, series, stuckCount, type PipelineKey } from "./cards";
 import { NO_DATA, clauses, distLine, humanSeconds, percentOr } from "./format";
 
@@ -80,7 +81,7 @@ function postgatePanel(postgate: Postgate, report: PipelineReport): PanelContent
     title: "Red time per day",
     aside: joined([
       `${postgate.red_events} red`,
-      plural(postgate.reverts, "revert", "reverts"),
+      plural(postgate.reverts, "revert"),
       versus(postgate.red_s_in_window, postgate.prev_red_s, report.days),
     ]),
     body: (

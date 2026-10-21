@@ -24,6 +24,11 @@
  */
 
 :root {
+  /* Dark is the base and light the override (see above); declaring both lets the user agent draw
+     its own chrome — scrollbars, form controls, the canvas behind an unstyled page — in the same
+     scheme as the palette instead of a white scrollbar in a dark window. */
+  color-scheme: dark light;
+
   /* ---------------------------------------------------------------- type -- */
   /* The three families declared in fonts.css, each with a job. */
   --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
@@ -74,6 +79,7 @@
   --radius-sm: 3px;
   --radius-md: 6px;
   --radius-lg: 10px;
+  --radius-xl: 0.75rem;
   --radius-pill: 999px;
 
   /* ---------------------------------------------------- surfaces & text -- */
@@ -204,6 +210,10 @@
   /* What a modal lays over the page: dark enough that the page reads as paused, light enough that
      it is still recognisably the page you were on. */
   --scrim: rgba(5, 7, 10, 0.62);
+  /* For a viewer that shows one picture and nothing else: the page behind it is not a context to
+     keep recognisable, it is a distraction. Stays dark in the light theme as well, because a pale
+     dim around a photograph changes how the photograph reads. */
+  --scrim-strong: rgba(5, 7, 10, 0.82);
 
   /* ------------------------------------------------------------ motion -- */
   /**
@@ -373,5 +383,52 @@
     --shadow-md: 0 4px 14px rgba(18, 21, 27, 0.1);
     --shadow-lg: 0 18px 48px rgba(18, 21, 27, 0.16);
     --scrim: rgba(18, 21, 27, 0.38);
+  }
+}
+
+/* ------------------------------------------------- horizontal scroll fade -- */
+
+/**
+ * The horizontal twin of `--scroll-fade`, for a strip that scrolls sideways (the project tab rows).
+ *
+ * A vertical column can fade both ends all the time because a line is 20px tall and the fade is
+ * 16px. A tab is not: a permanent fade at the left edge would dim the first tab's label while the
+ * strip is at rest, and one at the right would dim the last, when the strip is scrolled all the way
+ * along and has nothing more to promise. So the two fade widths are registered lengths driven by
+ * the strip's own scroll position: the right edge fades while there is more to the right, the left
+ * edge once something has scrolled off to the left, and a strip that fits has neither, because its
+ * scroll timeline is inactive and both fall back to 0.
+ *
+ * A strip uses it by setting `mask-image` to the gradient below and the animation shorthand that
+ * follows (see `.pj-tabs`, `.ws-tabs`). `animation` resets the timeline and the range, so they are
+ * written after it. Without scroll-driven animations the strip simply has no fade, as before.
+ */
+@property --scroll-fade-l {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --scroll-fade-r {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@keyframes scroll-fade-l {
+  from {
+    --scroll-fade-l: 0px;
+  }
+  to {
+    --scroll-fade-l: var(--space-4);
+  }
+}
+
+@keyframes scroll-fade-r {
+  from {
+    --scroll-fade-r: var(--space-4);
+  }
+  to {
+    --scroll-fade-r: 0px;
   }
 }

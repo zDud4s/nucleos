@@ -93,7 +93,7 @@ describe("buildModel note links", () => {
   it("makes a gone knowledge target a missing stub", () => {
     const m = buildModel(graph([note(1)], [link(1, "knowledge", "99")]), [], [], filters());
     expect(m.nodes.find((n) => n.id === "k:99")).toMatchObject({
-      kind: "knowledge", missing: true, label: "knowledge — gone",
+      kind: "knowledge", missing: true, label: "knowledge (gone)",
     });
   });
 

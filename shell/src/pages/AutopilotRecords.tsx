@@ -81,7 +81,7 @@ function RecordPanel({
           <RefusalNote refusal={error} />
         ) : (
           <ErrorNote>
-            Could not reach the {DAEMON_NAME} — nothing is known about {what}
+            Could not reach the {DAEMON_NAME}: nothing is known about {what}
           </ErrorNote>
         )}
       </Section>
@@ -140,8 +140,8 @@ export function SkippedItemsPanel() {
       why={
         <>
           Work a job put down overnight because it needed a decision, and
-          carried on without. Nothing resumes from here — the tree moved on
-          hours ago — so the only thing left is to read it and put it away.
+          carried on without. Nothing resumes from here: the tree moved on
+          hours ago, so the only thing left is to read it and put it away.
           This is a record of a decision the night already took, not one held
           for you, which is why the Waiting page does not list it.
         </>
@@ -169,7 +169,7 @@ export function SkippedItemsPanel() {
               </div>
               {work.detail !== null && <p className="waiting-reasoning">{work.detail}</p>}
               <p className="waiting-meta">
-                <span>{proposal.tool_name ?? "an action that names no tool"}</span>{" — "}
+                <span>{proposal.tool_name ?? "an action that names no tool"}</span>{", "}
                 <span>
                   {proposal.reasoning.trim() === ""
                     ? "nothing was recorded about why"

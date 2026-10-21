@@ -13,6 +13,7 @@ import {
 import { Link } from "@tanstack/react-router";
 import { FeedEmbed } from "../app/FeedEmbed";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   READINESS_MIN_AGREE_PERCENT,
@@ -42,6 +43,7 @@ import {
 import {
   Badge,
   Button,
+  Callout,
   ConfirmButton,
   Disclosure,
   Count,
@@ -58,9 +60,13 @@ import {
   Rows,
   Section,
   SectionNav,
+  Skeleton,
   StaleNote,
   StateBadge,
+  Table,
+  Td,
   Teach,
+  Th,
   readState,
   usd,
 } from "../ui";
@@ -294,7 +300,7 @@ function RosterError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      Could not reach the {DAEMON_NAME} — nothing is known about the roster.
+      Could not reach the {DAEMON_NAME}: nothing is known about the roster.
     </ErrorNote>
   );
 }
@@ -318,34 +324,27 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
 
 function KillBanner() {
   return (
-    <p className="ap-banner ap-banner-kill" role="status">
-      <span className="ap-banner-title">Emergency stop is engaged</span>
-      <span className="ap-banner-text">
-        Nothing autonomous starts while this is on — no scheduled rule, no repo
-        trigger, no job. The switch is under the rail, on every page. Everything
-        below is what <em>would</em> happen once it is released.
-      </span>
-    </p>
+    <Callout tone="danger" title="Emergency stop is engaged" role="status">
+      Nothing autonomous starts while this is on: no scheduled rule, no repo
+      trigger, no job. The switch is under the rail, on every page. Everything
+      below is what <em>would</em> happen once it is released.
+    </Callout>
   );
 }
 
 function BudgetPausedBanner({ budget }: { budget: BudgetView }) {
   return (
-    <p className="ap-banner ap-banner-budget" role="status">
-      <span className="ap-banner-title">
-        Autonomous work is held by the budget
-      </span>
-      <span className="ap-banner-text">
-        {budget.reason ?? `The ${DAEMON_NAME} did not say which ceiling`} — $
-        {budget.window_spend_usd.toFixed(2)} spent this{" "}
-        {PERIOD_NOUN[budget.period] ?? budget.period}
-        {budget.limit_usd === null
-          ? ""
-          : ` against a ceiling of $${budget.limit_usd.toFixed(2)}`}
-        . This clears itself when the window rolls or the ceiling is raised; it
-        is not a fault.
-      </span>
-    </p>
+    // Paused, never danger: a ceiling holding work is not a fault, so the notice stays warm.
+    <Callout tone="paused" title="Autonomous work is held by the budget" role="status">
+      {budget.reason ?? `The ${DAEMON_NAME} did not say which ceiling`}: $
+      {budget.window_spend_usd.toFixed(2)} spent this{" "}
+      {PERIOD_NOUN[budget.period] ?? budget.period}
+      {budget.limit_usd === null
+        ? ""
+        : ` against a ceiling of $${budget.limit_usd.toFixed(2)}`}
+      . This clears itself when the window rolls or the ceiling is raised; it
+      is not a fault.
+    </Callout>
   );
 }
 
@@ -376,7 +375,7 @@ function Ledger({
             {pending} to review across the roster
           </Link>
           {held > 0 &&
-            (held === 1 ? " — 1 project's queue full" : ` — ${held} projects' queues full`)}
+            (held === 1 ? ", 1 project's queue full" : `, ${held} projects' queues full`)}
         </p>
       )}
       {/* The window's spend against its ceiling, drawn: at 80% the meter turns amber and says so. */}
@@ -791,7 +790,7 @@ function ProjectCarousel({
         onSuccess: () => {
           onRefusals((current) => without(current, id));
           setSaid(
-            `${id} is now ${readState("autopilot", mode)?.label ?? mode} — ${MODE_MEANING[mode]}`,
+            `${id} is now ${readState("autopilot", mode)?.label ?? mode}: ${MODE_MEANING[mode]}`,
           );
         },
         onError: (error) => {
@@ -825,12 +824,12 @@ function ProjectCarousel({
         <Teach title="No project is under autopilot">
           <p>
             A project appears here once the {DAEMON_NAME} has been told where it lives.
-            Nothing is broken and nothing is hidden — there is simply no project
+            Nothing is broken and nothing is hidden. There is simply no project
             to govern yet.
           </p>
         </Teach>
       )}
-      {!answered && <p className="ap-loading">Reading the roster…</p>}
+      {!answered && <Skeleton label="Reading the roster" lines={3} />}
       {focused !== undefined && (
         <>
           {/* The setting leads, in the document and on the screen: project, mode, switch. The fan
@@ -1057,9 +1056,9 @@ function FanCard({
         )}
       </div>
       {refused ? (
-        <p className="ap-fan-exception">Setting refused — see below</p>
+        <p className="ap-fan-exception">Setting refused, see below</p>
       ) : project.queue_full ? (
-        <p className="ap-fan-exception">Queue full — review one to release it</p>
+        <p className="ap-fan-exception">Queue full: review one to release it</p>
       ) : null}
       <FanVisor project={project} />
       <FanFacts project={project} />
@@ -1334,7 +1333,7 @@ function FocusSetting({
       )}
       {failed && (
         <ErrorNote>
-          Could not reach the {DAEMON_NAME} — this project&apos;s setting is unchanged.
+          Could not reach the {DAEMON_NAME}: this project&apos;s setting is unchanged.
         </ErrorNote>
       )}
     </>
@@ -1361,7 +1360,7 @@ function ShadowReviewPanel({
       <Section label="Shadow decisions">
         {/* The selected row is the subject; name it because its light-theme mark has no fill weight, while "this project" is only for the first render. */}
         <Quiet says={`Nothing is waiting for a verdict on ${project?.project_id ?? "this project"}.`}>
-          <p className="ap-note">What the classifier decided while enforcing nothing. Answering these is the only thing that moves a project toward acting on its own — agreeing says the classifier read the action the way you would, disagreeing says it did not, and both are evidence.</p>
+          <p className="ap-note">What the classifier decided while enforcing nothing. Answering these is the only thing that moves a project toward acting on its own: agreeing says the classifier read the action the way you would, disagreeing says it did not, and both are evidence.</p>
         </Quiet>
       </Section>
     );
@@ -1387,7 +1386,7 @@ function ShadowReviewPanel({
       {projectId !== null &&
         !decisions.isError &&
         decisions.data === undefined && (
-          <p className="ap-loading">Reading the shadow decisions…</p>
+          <Skeleton label="Reading the shadow decisions" lines={3} />
         )}
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Shadow decisions">
@@ -1466,7 +1465,7 @@ function ShadowReviewPanel({
 function VerdictError({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>Could not reach the {DAEMON_NAME} — nothing was recorded.</ErrorNote>
+      <ErrorNote>Could not reach the {DAEMON_NAME}: nothing was recorded.</ErrorNote>
     );
   }
   return (
@@ -1545,7 +1544,7 @@ function ScoreboardPanel({
       {projectId !== null &&
         !scoreboard.isError &&
         scoreboard.data === undefined && (
-          <p className="ap-loading">Reading the scoreboard…</p>
+          <Skeleton label="Reading the scoreboard" lines={3} />
         )}
       {evidence.length > 0 && (
         <TallyTable label="Shadow evidence" rows={evidence} />
@@ -1572,20 +1571,19 @@ function ScoreboardPanel({
 
 function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
   return (
-    <table className="ap-score">
-      <caption className="ap-score-caption">{label}</caption>
+    <Table caption={label}>
       <thead>
         <tr>
-          <th scope="col">action class</th>
-          <th scope="col">mode</th>
-          <th scope="col">seen</th>
-          <th scope="col">allow</th>
-          <th scope="col">ask</th>
-          <th scope="col">deny</th>
-          <th scope="col">reviewed</th>
-          <th scope="col">agreed</th>
-          <th scope="col">disagreed</th>
-          <th scope="col">agreement</th>
+          <Th>action class</Th>
+          <Th>mode</Th>
+          <Th num>seen</Th>
+          <Th num>allow</Th>
+          <Th num>ask</Th>
+          <Th num>deny</Th>
+          <Th num>reviewed</Th>
+          <Th num>agreed</Th>
+          <Th num>disagreed</Th>
+          <Th>agreement</Th>
         </tr>
       </thead>
       <tbody>
@@ -1594,21 +1592,21 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
             <th scope="row" className="ap-score-class">
               {row.action_class}
             </th>
-            <td>{row.mode}</td>
-            <td className="ap-score-num">{row.total}</td>
-            <td className="ap-score-num">{row.would_allow}</td>
-            <td className="ap-score-num">{row.would_pend}</td>
-            <td className="ap-score-num">{row.would_deny}</td>
-            <td className="ap-score-num">{row.reviewed}</td>
-            <td className="ap-score-num">{row.agree}</td>
-            <td className="ap-score-num">{row.disagree}</td>
-            <td className="ap-score-agree">
+            <Td>{row.mode}</Td>
+            <Td num>{row.total}</Td>
+            <Td num>{row.would_allow}</Td>
+            <Td num>{row.would_pend}</Td>
+            <Td num>{row.would_deny}</Td>
+            <Td num>{row.reviewed}</Td>
+            <Td num>{row.agree}</Td>
+            <Td num>{row.disagree}</Td>
+            <Td>
               <Agreement row={row} />
-            </td>
+            </Td>
           </tr>
         ))}
       </tbody>
-    </table>
+    </Table>
   );
 }
 
@@ -1709,7 +1707,7 @@ function TriggerKills() {
         <ListError error={kills.error} what="the trigger brakes" />
       )}
       {!kills.isError && kills.data === undefined && (
-        <p className="ap-loading">Reading the trigger brakes…</p>
+        <Skeleton label="Reading the trigger brakes" lines={2} />
       )}
       <Rows label="Trigger brakes">
         {TRIGGER_SCOPES.map((scope) => {
@@ -1753,7 +1751,7 @@ function TriggerKills() {
       </Rows>
       {setKill.isError && (
         <ErrorNote>
-          That brake was not changed — the {DAEMON_NAME} refused or could not be reached.
+          That brake was not changed: the {DAEMON_NAME} refused or could not be reached.
         </ErrorNote>
       )}
     </Panel>
@@ -1817,7 +1815,7 @@ function JobsPanel({
             {targetWaitingWhere === null ? "" : ` (${targetWaitingWhere})`} against its ceiling of{" "}
             {target.wip_limit ?? "none"}.{" "}
             <Link className="ap-link" to="/waiting">
-              Review {target.open_review_items === 1 ? "1 item" : `${target.open_review_items} items`}
+              Review {plural(target.open_review_items, "item")}
             </Link>{" "}
             and the brake releases itself.
           </p>
@@ -1869,12 +1867,12 @@ function JobRow({ job }: { job: Job }) {
       </div>
       <p className="ap-meta">
         round {job.round + 1} of {job.max_rounds}
-        {job.rule_name === null ? "" : ` — ${job.rule_name}`}
+        {job.rule_name === null ? "" : `, ${job.rule_name}`}
         {/* A directed job looks nothing like a sequential one from the inside
             and looked exactly like it from here. Said with the ceiling, because
             the team's name alone does not say what having one buys. */}
         {job.team_id !== null &&
-          ` — ${job.team_name ?? job.team_id}, up to ${job.team_max_parallel ?? 1} at once`}
+          ` (${job.team_name ?? job.team_id}, up to ${job.team_max_parallel ?? 1} at once)`}
       </p>
       <div className="ap-actions">
         <ConfirmButton
@@ -1891,7 +1889,7 @@ function JobRow({ job }: { job: Job }) {
         </Link>
       </div>
       {cancel.isError && (
-        <ErrorNote>Could not reach the {DAEMON_NAME} — job {job.id} was not stopped.</ErrorNote>
+        <ErrorNote>Could not reach the {DAEMON_NAME}: job {job.id} was not stopped.</ErrorNote>
       )}
     </Inset>
   );
@@ -1900,16 +1898,16 @@ function JobRow({ job }: { job: Job }) {
 function JobError({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
-      <ErrorNote>Could not reach the {DAEMON_NAME} — no job was started.</ErrorNote>
+      <ErrorNote>Could not reach the {DAEMON_NAME}: no job was started.</ErrorNote>
     );
   return (
     <RefusalNote
       refusal={error}
       sentences={{
         kill_switch:
-          "the emergency stop is engaged — nothing autonomous starts until it is released",
+          "the emergency stop is engaged: nothing autonomous starts until it is released",
         conflict: "that project has no room right now",
-        locked: "that project is held — nothing new starts here",
+        locked: "that project is held: nothing new starts here",
       }}
     />
   );
@@ -1931,7 +1929,7 @@ function ListError({ error, what }: { error: unknown; what: string }) {
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      Could not reach the {DAEMON_NAME} — nothing is known about {what}.
+      Could not reach the {DAEMON_NAME}: nothing is known about {what}.
     </ErrorNote>
   );
 }

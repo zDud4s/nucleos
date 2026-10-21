@@ -36,6 +36,44 @@ export function elapsedText(started: number, now: number): string {
   return `${Math.floor(minutes / 60)}:${pad(minutes % 60)}:${pad(seconds % 60)}`;
 }
 
+/**
+ * A length of time as a person would say it: "12s", "4m", "1h 05m", "2h".
+ *
+ * The compact reading for a span that is not being watched — how long is left, how long a run
+ * took. NOT `elapsedText`, which is the stopwatch (`4:05`) for a thing in flight. The unit steps
+ * with the size, and only the two largest are ever drawn: seconds under a minute, whole minutes
+ * under an hour, then hours and zero-padded minutes (the pad keeps "1h 05m" from reading as 1h 5m
+ * beside "1h 45m" in a column), with an exact hour left bare.
+ *
+ * `round` says which way a partial unit goes, because the two honest answers differ by use:
+ * `floor` (the default) for time that has passed — a 119 s run took "1m", it has not taken two —
+ * and `ceil` for time that is left, so a chip never reads "0m" while something still remains.
+ * Never negative: a span a clock error made backwards reads as nought.
+ */
+export function formatSpan(ms: number, { round = "floor" }: { round?: "floor" | "ceil" } = {}): string {
+  const whole = round === "ceil" ? Math.ceil : Math.floor;
+  const seconds = Math.max(0, whole(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = whole(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? `${hours}h` : `${hours}h ${String(rest).padStart(2, "0")}m`;
+}
+
+/**
+ * The time of day on a 24-hour clock, "07:05", in the reader's own zone.
+ *
+ * Hand-built from the local hours and minutes rather than `toLocaleTimeString`, which answers
+ * "7:05 AM" or "07.05" depending on the machine's locale — and a column of times that changes
+ * shape between two people's windows is not one a test can pin.
+ */
+export function clockText(ms: number): string {
+  const at = new Date(ms);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}`;
+}
+
 /** Local midnight before `ms`. Local, because a person's "yesterday" is their own. */
 function midnight(ms: number): number {
   const day = new Date(ms);

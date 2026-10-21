@@ -74,9 +74,9 @@ describe("the notifications view", () => {
     renderWithQuery(<NotificationsView />);
 
     const jobs = (await screen.findByText("jobs")).closest("label")!;
-    expect((within(jobs).getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+    expect((within(jobs).getByRole("switch") as HTMLInputElement).checked).toBe(false);
     const team = screen.getByText("team").closest("label")!;
-    expect((within(team).getByRole("checkbox") as HTMLInputElement).checked).toBe(true);
+    expect((within(team).getByRole("switch") as HTMLInputElement).checked).toBe(true);
   });
 
   it("sends the whole policy, with exactly one rule per family switch", async () => {
@@ -88,7 +88,7 @@ describe("the notifications view", () => {
     renderWithQuery(<NotificationsView />);
 
     const jobs = (await screen.findByText("jobs")).closest("label")!;
-    fireEvent.click(within(jobs).getByRole("checkbox"));
+    fireEvent.click(within(jobs).getByRole("switch"));
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
 
     await waitFor(() => expect(sent).toHaveLength(1));
@@ -106,7 +106,7 @@ describe("the notifications view", () => {
     renderWithQuery(<NotificationsView />);
 
     const jobs = (await screen.findByText("jobs")).closest("label")!;
-    fireEvent.click(within(jobs).getByRole("checkbox"));
+    fireEvent.click(within(jobs).getByRole("switch"));
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
 
     // Absence and "allowed" behave the same today, but only absence keeps
@@ -120,7 +120,7 @@ describe("the notifications view", () => {
     renderWithQuery(<NotificationsView />);
 
     const jobs = (await screen.findByText("jobs")).closest("label")!;
-    const box = within(jobs).getByRole("checkbox");
+    const box = within(jobs).getByRole("switch");
     fireEvent.click(box);
     expect(screen.queryByText(/unsaved changes/i)).not.toBeNull();
     fireEvent.click(box);
@@ -141,7 +141,7 @@ describe("the notifications view", () => {
     renderWithQuery(<NotificationsView />);
 
     const jobs = (await screen.findByText("jobs")).closest("label")!;
-    const box = within(jobs).getByRole("checkbox");
+    const box = within(jobs).getByRole("switch");
     fireEvent.click(box);
     fireEvent.click(box);
 
@@ -197,7 +197,7 @@ describe("the notifications view", () => {
     renderWithQuery(<NotificationsView />);
 
     const jobs = (await screen.findByText("jobs")).closest("label")!;
-    fireEvent.click(within(jobs).getByRole("checkbox"));
+    fireEvent.click(within(jobs).getByRole("switch"));
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
 
     expect(await screen.findByText(/Needs Reply/)).toBeDefined();
@@ -386,7 +386,7 @@ describe("the notifications view", () => {
 
       const worktrees = await familyRow("worktrees");
       // The override `true` beats the default `false`.
-      expect((within(worktrees).getByRole("checkbox") as HTMLInputElement).checked).toBe(true);
+      expect((within(worktrees).getByRole("switch") as HTMLInputElement).checked).toBe(true);
       expect(within(worktrees).getByText("override")).toBeDefined();
       // Same value as the default: pinned to it.
       const jobs = await familyRow("jobs");
@@ -409,7 +409,7 @@ describe("the notifications view", () => {
 
       const after = await familyRow("worktrees");
       expect(within(after).getByText("default")).toBeDefined();
-      expect((within(after).getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+      expect((within(after).getByRole("switch") as HTMLInputElement).checked).toBe(false);
       expect(within(after).queryByRole("button", { name: /reset to default/i })).toBeNull();
       expect(screen.queryByText(/unsaved changes/i)).not.toBeNull();
     });
@@ -424,7 +424,7 @@ describe("the notifications view", () => {
 
       // Turning the (default-off) worktrees family on must store an explicit `true`.
       const worktrees = await familyRow("worktrees");
-      fireEvent.click(within(worktrees).getByRole("checkbox"));
+      fireEvent.click(within(worktrees).getByRole("switch"));
       expect(save.disabled).toBe(false);
       fireEvent.click(save);
 
@@ -472,7 +472,7 @@ describe("the notifications view", () => {
       renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
 
       const worktrees = await familyRow("worktrees");
-      fireEvent.click(within(worktrees).getByRole("checkbox"));
+      fireEvent.click(within(worktrees).getByRole("switch"));
       fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
 
       expect(await screen.findByText("selector_too_long")).toBeDefined();
@@ -494,13 +494,13 @@ describe("the notifications view", () => {
       const view = renderWithQuery(<NotificationsView channel="telegram" onChannelChange={vi.fn()} />);
 
       const worktrees = await familyRow("worktrees");
-      fireEvent.click(within(worktrees).getByRole("checkbox"));
+      fireEvent.click(within(worktrees).getByRole("switch"));
       expect(screen.queryByText(/unsaved changes/i)).not.toBeNull();
 
       rerenderWith(view, <NotificationsView channel="email" onChannelChange={vi.fn()} />);
       await waitFor(() => expect(screen.queryByText(/unsaved changes/i)).toBeNull());
       const worktreesAfter = await familyRow("worktrees");
-      expect((within(worktreesAfter).getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+      expect((within(worktreesAfter).getByRole("switch") as HTMLInputElement).checked).toBe(false);
       const team = await familyRow("team");
       expect(within(team).getByText("override")).toBeDefined();
     });
@@ -531,7 +531,7 @@ describe("the notifications view", () => {
       expect(screen.queryByText(/reset to default/i)).toBeNull();
       expect(within(jobs).queryByText(/^(default|override|pinned)$/)).toBeNull();
 
-      fireEvent.click(within(jobs).getByRole("checkbox"));
+      fireEvent.click(within(jobs).getByRole("switch"));
       fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
       await waitFor(() => expect(puts).toHaveLength(1));
       expect(puts[0].path).toBe("/notifications/policy");

@@ -195,7 +195,7 @@ describe("Voice — hotkey registration", () => {
 
     await renderVoice();
 
-    expect(await screen.findByText("armed, but the hotkeys did not register — use the buttons below")).toBeDefined();
+    expect(await screen.findByText("armed, but the hotkeys did not register: use the buttons below")).toBeDefined();
     const capture = screen.getByRole("group", { name: "Capture" });
     expect(within(capture).getByText("hotkeys failed")).toBeDefined();
     expect(within(capture).queryByText("idle")).toBeNull();
@@ -334,7 +334,7 @@ describe("Voice — the spoken conversation", () => {
 
     await renderVoice();
 
-    expect(await screen.findByText("no transcriber is set up — spoken turns cannot be understood yet")).toBeDefined();
+    expect(await screen.findByText("no transcriber is set up: spoken turns cannot be understood yet")).toBeDefined();
     expect(screen.queryByRole("button", { name: "Start talking" })).toBeNull();
   });
 
@@ -443,7 +443,7 @@ describe("Voice — the spoken conversation", () => {
 
     await renderVoice();
 
-    expect(await screen.findByText("silence — nothing is reaching the microphone")).toBeDefined();
+    expect(await screen.findByText("silence: nothing is reaching the microphone")).toBeDefined();
   });
 });
 
@@ -555,7 +555,7 @@ describe("Voice — the room", () => {
     // Heard and still being answered: the person's own words, with what is happening to them.
     ({ container, unmount } = await renderRoom({ phase: "thinking", heard: "what time is it" }));
     captions = await findCaptions(container);
-    expect(captions.querySelector(".voice-caption-label")?.textContent).toBe("heard — sending");
+    expect(captions.querySelector(".voice-caption-label")?.textContent).toBe("heard: sending");
     expect(captions.querySelector(".voice-caption-words")?.textContent).toContain("“what time is it”");
     unmount();
 
@@ -674,11 +674,10 @@ describe("Voice — the room", () => {
     fireEvent.click(opener);
 
     const drawer = await screen.findByRole("dialog", { name: "Voice archive" });
-    expect(drawer.id).toBe("voice-archive");
+    expect(drawer.closest("#voice-archive")).not.toBeNull();
     expect(opener.getAttribute("aria-expanded")).toBe("true");
-    // Focus moves in, onto the way out.
-    const close = within(drawer).getByRole("button", { name: "Close" });
-    await waitFor(() => expect(document.activeElement).toBe(close));
+    // Focus moves in, onto the drawer itself, so the first Tab lands on the first control.
+    await waitFor(() => expect(document.activeElement).toBe(drawer));
 
     // It opens on the memos, and the other lists are one tab away.
     expect(within(drawer).getByRole("tablist", { name: "Archive sections" })).toBeDefined();

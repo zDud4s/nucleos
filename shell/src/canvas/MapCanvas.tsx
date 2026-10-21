@@ -18,6 +18,7 @@ import type {
 } from "../data/project-map";
 import { useFileItems } from "../data/project-map";
 import { DAEMON_NAME } from "../copy";
+import { plural, pluralWord } from "../lib/plural";
 import { SectionTitle } from "../ui";
 import { NODE_H, type Layout } from "./layered";
 import {
@@ -173,8 +174,7 @@ export function MapCanvas({
       ) : open !== null && inside !== null ? (
         <div className="flex flex-col gap-2">
           <p className="text-xs text-text-faint">
-            {members.length} file{members.length === 1 ? "" : "s"} · {inside.links.length} import
-            {inside.links.length === 1 ? "" : "s"} between them
+            {plural(members.length, "file")} · {plural(inside.links.length, "import")} between them
           </p>
           <Traffic matrix={matrix} title={open} onOpen={enter} />
           {inside.refused.length > 0 ? (
@@ -189,7 +189,7 @@ export function MapCanvas({
           ) : (
             <Graph
               drawn={inside.drawn}
-              title={`${open} · ${members.length} file${members.length === 1 ? "" : "s"}`}
+              title={`${open} · ${plural(members.length, "file")}`}
               full={full}
               onFull={setFull}
               onOpen={setOpenFile}
@@ -672,7 +672,7 @@ function Around({
     <div className="flex flex-col gap-2">
       <Refused reasons={refused} />
       <p className="max-w-prose text-xs text-text-muted">
-        One file at a time, then — this shows the chosen one and everything in this community that
+        One file at a time, then. This shows the chosen one and everything in this community that
         touches it, either way. It is a smaller picture and not a looser one.
       </p>
       {/*
@@ -703,7 +703,7 @@ function Around({
       ) : (
         <Graph
           drawn={slice.drawn}
-          title={`around ${moduleName(at!)} · ${slice.members.length - 1} neighbour${slice.members.length === 2 ? "" : "s"}`}
+          title={`around ${moduleName(at!)} · ${plural(slice.members.length - 1, "neighbour")}`}
           full={full}
           onFull={onFull}
           onOpen={onOpen}
@@ -784,7 +784,7 @@ function FileLevel({
     <div className="flex flex-col gap-2">
       {found.isError ? (
         <p className="text-sm text-text-muted">
-          The {DAEMON_NAME} could not read this file — it may have moved since the map was walked.
+          The {DAEMON_NAME} could not read this file. It may have moved since the map was walked.
         </p>
       ) : found.data === undefined ? (
         <p className="text-sm text-text-faint">Reading the file…</p>
@@ -843,7 +843,7 @@ function Claims({
                 neither green nor a state tone but `--accent`, the one colour reserved for the
                 wordmark, links and the focus ring. "Stamped" is not one of the seven tones either,
                 so it does not get a tone invented for it — it gets words, which `standingLabel`
-                already supplies ("stamped", "lapsed — the code moved since", "nobody has looked").
+                already supplies ("stamped", "lapsed: the code moved since", "nobody has looked").
                 What is left to carry is emphasis, and emphasis in this system is one rung: the
                 owner's word in `--text`, its absence in `--text-faint`.
               */}
@@ -885,7 +885,7 @@ function FileDrawing({
     return (
       <p className="text-sm text-text-muted">
         Nothing here reads this language yet, so this file has no declarations to draw. It is not
-        missing from the map — the level above counts it, and says the same thing about it.
+        missing from the map. The level above counts it, and says the same thing about it.
       </p>
     );
   }
@@ -902,8 +902,8 @@ function FileDrawing({
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-text-muted">
         <span>
-          <span className="font-display text-sm text-text">{facts.items}</span> declaration
-          {facts.items === 1 ? "" : "s"}
+          <span className="font-display text-sm text-text">{facts.items}</span>{" "}
+          {pluralWord(facts.items, "declaration")}
         </span>
         <span>
           <span className="font-display text-sm text-text">{facts.exported}</span> reachable from
@@ -925,7 +925,7 @@ function FileDrawing({
       ) : (
         <Graph
           drawn={drawing.drawn}
-          title={`${facts.items} declaration${facts.items === 1 ? "" : "s"}`}
+          title={plural(facts.items, "declaration")}
           full={full}
           onFull={onFull}
           /*
@@ -1014,7 +1014,7 @@ function Matrix({
   };
   const files = (title: string) => {
     const count = matrix.members.get(title)?.length ?? 0;
-    return `${count} file${count === 1 ? "" : "s"}`;
+    return plural(count, "file");
   };
   /*
     The longest row header as printed — title, a space, the file count — and the longest title
@@ -1056,15 +1056,15 @@ function Matrix({
           How to read this matrix
         </summary>
         <p className="mb-0 mt-1">
-          {matrix.files} files joined by {matrix.deps} dependencies —{" "}
+          {matrix.files} files joined by {matrix.deps} dependencies,{" "}
           {(matrix.deps / matrix.files).toFixed(1)} each. No arrangement of boxes and arrows
           survives that, so this is a matrix: each row uses the columns marked in it. The files were
           grouped into {matrix.order.length} communities found from the imports themselves, and
           ordered so as little as possible points backwards.{" "}
           <span className="text-text">
             A mark above the diagonal points forwards. A heavier mark below it points backwards
-          </span>{" "}
-          — and no reordering removes it.
+          </span>
+          . No reordering removes it.
         </p>
       </details>
       <Stage
@@ -1184,12 +1184,12 @@ function Matrix({
                           ? `${row} · ${files(row)}`
                           : weight === undefined
                             ? `${row} does not use ${column}`
-                            : `${row} uses ${column} — ${weight}, pointing ${j > i ? "forwards" : "backwards"}`;
+                            : `${row} uses ${column}: ${weight}, pointing ${j > i ? "forwards" : "backwards"}`;
                       return (
                         <td
                           key={column}
                           data-say={say}
-                          title={weight === undefined ? undefined : `${row} uses ${column} — ${weight}`}
+                          title={weight === undefined ? undefined : `${row} uses ${column}: ${weight}`}
                           className={`h-[19px] w-[19px] border border-border text-center ${tone}`}
                         >
                           {bare ? "" : (weight ?? "")}

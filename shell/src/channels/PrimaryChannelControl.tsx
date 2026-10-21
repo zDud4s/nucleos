@@ -1,8 +1,10 @@
 import { isApiRefusal } from "../data/client";
 import { useSetPrimaryChannel, type Channel } from "../data/channels";
+import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { ConfirmButton } from "../ui/ConfirmButton";
 import { ErrorNote } from "../ui/ErrorNote";
+import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
 
 /**
@@ -40,7 +42,7 @@ export function PrimaryChannelControl({ channel, primary }: { channel: Channel; 
     <div className="ch-primary">
       {isPrimary ? (
         <>
-          <span className="ch-primary-badge">primary</span>
+          <Badge tone="info">primary</Badge>
           <ConfirmButton
             label="Clear primary"
             confirmLabel="Clear: notifications will have no destination"
@@ -55,12 +57,10 @@ export function PrimaryChannelControl({ channel, primary }: { channel: Channel; 
         </Button>
       )}
       {channel.state === "offline" ? (
-        <p className="ui-quiet">the outbox keeps the notifications and delivers them when the adapter is back</p>
+        <Quiet compact says="the outbox keeps the notifications and delivers them when the adapter is back" />
       ) : null}
       {setPrimary.isSuccess && reseeded ? (
-        <p className="ui-quiet" role="status">
-          new channel: it starts from now, without replaying what it missed
-        </p>
+        <Quiet compact announce says="new channel: it starts from now, without replaying what it missed" />
       ) : null}
       {error ? (
         isApiRefusal(error) ? (

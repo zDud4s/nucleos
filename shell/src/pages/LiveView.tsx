@@ -3,6 +3,7 @@ import { isApiRefusal, openStream } from "../data/client";
 import { InputBatcher, keyEvent, modifiers, mouseButton, toPage } from "../data/liveInput";
 import { backoffDelay, readRecords, type FrameMeta, type InputEvent, type OpenPrompt, type PromptAnswer } from "../data/liveRecords";
 import { postAnswer, postInput } from "../data/seat";
+import { useNow } from "../lib/useNow";
 import { LivePrompt } from "./LivePrompt";
 
 type Status =
@@ -12,8 +13,8 @@ type Status =
   | { kind: "ended"; sentence: string };
 
 const STALE_AFTER_MS = 5000;
-const LOST_WHEEL = "The wheel is no longer yours — watching only.";
-const NOT_HOLDER = "This view does not hold the seat — give it back or close it.";
+const LOST_WHEEL = "The wheel is no longer yours. Watching only.";
+const NOT_HOLDER = "This view does not hold the seat. Give it back or close it.";
 const ANSWER_FAILED = "The answer could not be sent.";
 const ANSWER_TOO_LARGE = "Those files are too large together.";
 
@@ -64,7 +65,6 @@ export function LiveView({
   const [status, setStatus] = useState<Status>({ kind: "connecting" });
   const [src, setSrc] = useState<string | null>(null);
   const [lastFrameAt, setLastFrameAt] = useState<number | null>(null);
-  const [now, setNow] = useState(() => Date.now());
   const [dropped, setDropped] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [answering, setAnswering] = useState(0);
@@ -234,7 +234,6 @@ export function LiveView({
               if (previous !== null) URL.revokeObjectURL(previous);
               setSrc(next);
               setLastFrameAt(Date.now());
-              setNow(Date.now());
               setStatus({ kind: "live" });
             } else if (record.kind === "meta") {
               metaRef.current = record.meta;
@@ -286,11 +285,10 @@ export function LiveView({
   }, [sessionId, visible]);
 
   const flowing = status.kind === "live" && lastFrameAt !== null;
-  useEffect(() => {
-    if (!flowing) return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [flowing, lastFrameAt]);
+  // The shared clock can read a moment older than a frame that has just landed, so the silence is
+  // never counted from before the frame itself.
+  const tick = useNow(1000, flowing);
+  const now = Math.max(tick, lastFrameAt ?? 0);
 
   const silentFor = lastFrameAt === null ? 0 : Math.floor((now - lastFrameAt) / 1000);
   const stale = flowing && now - (lastFrameAt ?? now) > STALE_AFTER_MS;
@@ -326,7 +324,7 @@ export function LiveView({
         {status.kind === "live" && <span className="browser-live-marker">live</span>}
         {stale && <span className="browser-live-quiet">{`unchanged for ${silentFor}s`}</span>}
         {status.kind === "connecting" && <span className="browser-live-quiet">connecting…</span>}
-        {status.kind === "reconnecting" && <span className="browser-live-quiet">Connection lost — reconnecting</span>}
+        {status.kind === "reconnecting" && <span className="browser-live-quiet">Connection lost, reconnecting</span>}
         {shownNotice !== null && <span className="browser-live-quiet">{shownNotice}</span>}
         {status.kind === "ended" && <span className="browser-live-end">{status.sentence}</span>}
       </div>

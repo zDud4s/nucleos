@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "@tanstack/react-router";
+import { Pin } from "lucide-react";
 import { useCancelRun } from "../data/runs";
 import { usePin } from "./pins";
 import { useFleetUi } from "./ui-context";
@@ -57,7 +58,7 @@ function PinButton({ node }: { node: WireNode }) {
         disabled={pin.isPending}
         onClick={() => pin.mutate({ rootId: node.id, pinned: node.pinned })}
       >
-        📌
+        <Pin aria-hidden="true" size={14} strokeWidth={1.75} />
       </button>
       {pin.isError && <span className="fleet-confirm-note">{node.pinned ? "could not unpin" : "could not pin"}</span>}
     </>

@@ -50,7 +50,7 @@ describe("TopBar", () => {
     const store = new FleetStore();
     const onOnlyActive = vi.fn(), onFollow = vi.fn(), onFit = vi.fn();
     await show(store, { onOnlyActive, onFollow, onFit, follow: true });
-    fireEvent.click(screen.getByLabelText("Active only"));
+    fireEvent.click(screen.getByRole("switch", { name: "Active only" }));
     expect(onOnlyActive).toHaveBeenCalledWith(true);
     const follow = screen.getByRole("button", { name: "Follow" });
     expect(follow.getAttribute("aria-pressed")).toBe("true");
@@ -63,12 +63,12 @@ describe("TopBar", () => {
   it("shows slots n/limit from the house capacity, and nothing when it cannot be read", async () => {
     const store = new FleetStore();
     const view = await show(store);
-    expect(await screen.findByText("slots 3/8")).toBeDefined();
+    expect(await screen.findByText("3 of 8 slots held, room for 5")).toBeDefined();
     view.unmount();
     daemon.apiFetch.mockRejectedValue(new ApiRefusal(503, "unavailable", ""));
     await show(store);
     await act(async () => {});
-    expect(screen.queryByText(/^slots /)).toBeNull();
+    expect(screen.queryByText(/slots held/)).toBeNull();
   });
 
   it("says the connection state", async () => {

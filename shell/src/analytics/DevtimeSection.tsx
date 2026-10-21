@@ -12,7 +12,9 @@ import {
   type Verdict,
 } from "../data/devtime";
 import { compactTokens, humanMinutes } from "../data/project-readings";
-import { AreaChart, Badge, Button, ErrorNote, ShareBar, Skeleton, StaleNote, usd } from "../ui";
+import { percentText } from "../lib/format";
+import { plural } from "../lib/plural";
+import { AreaChart, Badge, Button, ErrorNote, Segmented, ShareBar, Skeleton, StaleNote, Table, Td, Th, usd } from "../ui";
 import {
   COST_KEYS,
   KIND_KEYS,
@@ -31,7 +33,7 @@ import {
   wastedByClass,
 } from "./devtime-series";
 import { versus, windowShares } from "./series";
-import { Card, MetricCard, joined, plural, summary, unreachable, type Metric } from "./sections";
+import { Card, MetricCard, joined, summary, unreachable, type Metric } from "./sections";
 
 /**
  * Development time (spec analytics-devtime §7): the owner's own sessions, under F1's readout, with the
@@ -49,7 +51,6 @@ type DevtimeMetric = "active" | "waste" | "interruptions" | "cost";
 const DETAIL_HEIGHT = 220;
 const EMPTY = "No sessions in this window";
 const minutes = (ms: number) => duration(ms, humanMinutes);
-const percent = (fraction: number) => `${Math.round(fraction * 100)}%`;
 const count = (value: number) => String(Math.round(value));
 const safeId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "");
 
@@ -147,13 +148,13 @@ function devtimeMetrics(report: DevtimeOverview): Metric<DevtimeMetric>[] {
     },
     {
       key: "waste", label: "Waste",
-      value: totals.waste_ratio === null ? undefined : `${minutes(totals.wasted_ms)} · ${percent(totals.waste_ratio)}`,
+      value: totals.waste_ratio === null ? undefined : `${minutes(totals.wasted_ms)} · ${percentText(totals.waste_ratio)}`,
       sub: versusPoints(totals.waste_ratio, totals.previous.waste_ratio, days),
       spark: { data: wastedByClass(series), keys: WASTE_KEYS.slice(1), tone: "ui-chart-rework", format: minutes },
     },
     {
       key: "interruptions", label: "Interruptions",
-      value: totals.interruption_rate === null ? undefined : `${percent(totals.interruption_rate)} of turns`,
+      value: totals.interruption_rate === null ? undefined : `${percentText(totals.interruption_rate)} of turns`,
       sub: versusPoints(totals.interruption_rate, totals.previous.interruption_rate, days),
       spark: { data: turnBars(series), keys: TURN_KEYS, tone: "ui-chart-avoidable", format: count },
     },
@@ -184,13 +185,15 @@ function ActivePanel({ report }: { report: DevtimeOverview }) {
   const keys = by === "waste" ? WASTE_KEYS : KIND_KEYS;
   return (
     <>
-      <div className="ui-switch" role="group" aria-label="Stack by">
-        {(["waste", "kind"] as const).map((option) => (
-          <button key={option} type="button" className="ui-switch-seg" aria-pressed={option === by} onClick={() => setBy(option)}>
-            {option === "waste" ? "By waste" : "By kind"}
-          </button>
-        ))}
-      </div>
+      <Segmented
+        label="Stack by"
+        value={by}
+        options={[
+          { value: "waste", label: "By waste" },
+          { value: "kind", label: "By kind" },
+        ]}
+        onChange={setBy}
+      />
       <AreaChart data={data} keys={keys} label={`Active time per day by ${by}, last ${report.days} days`}
                  format={minutes} empty={EMPTY} tone="ui-chart-useful" height={DETAIL_HEIGHT} />
       {summary(data, minutes)}
@@ -242,35 +245,43 @@ function TokensPanel({ report }: { report: DevtimeOverview }) {
   const sum = (row: ModelTokens) => row.input + row.cache_read + row.cache_creation + row.output;
   const hit = (row: ModelTokens) => {
     const base = row.input + row.cache_read + row.cache_creation;
-    return base === 0 ? "—" : percent(row.cache_read / base);
+    return percentText(base === 0 ? null : row.cache_read / base);
   };
   return (
     <>
-      <table className="an-dt-tokens" aria-label="Tokens by model">
-        <thead><tr><th>Model</th><th>Effort</th><th>Tokens</th><th>Cache hit</th><th>Cost</th></tr></thead>
+      <Table label="Tokens by model">
+        <thead>
+          <tr>
+            <Th>Model</Th>
+            <Th>Effort</Th>
+            <Th num>Tokens</Th>
+            <Th num>Cache hit</Th>
+            <Th num>Cost</Th>
+          </tr>
+        </thead>
         <tbody>
           {tokens.by_model.map((row) => (
             <tr key={`${row.model}:${row.effort}`}>
-              <th scope="row">{row.model === "unknown" ? "Unknown" : row.model}</th>
-              <td>{row.effort === "unknown" ? "—" : row.effort}</td>
-              <td>{compactTokens(sum(row))}</td>
-              <td>{hit(row)}</td>
-              <td>{row.cost_usd === null ? "no price" : usd(row.cost_usd)}</td>
+              <Th scope="row">{row.model === "unknown" ? "Unknown" : row.model}</Th>
+              <Td>{row.effort === "unknown" ? "—" : row.effort}</Td>
+              <Td num>{compactTokens(sum(row))}</Td>
+              <Td num>{hit(row)}</Td>
+              <Td num>{row.cost_usd === null ? "no price" : usd(row.cost_usd)}</Td>
             </tr>
           ))}
         </tbody>
         <tfoot>
           <tr>
-            <th scope="row">Total</th>
-            <td />
-            <td>{compactTokens(tokens.by_model.reduce((total, row) => total + sum(row), 0))}</td>
-            <td>{tokens.cache_hit_ratio === null ? "—" : percent(tokens.cache_hit_ratio)}</td>
-            <td>{tokens.cost_usd === null ? "—" : usd(tokens.cost_usd)}</td>
+            <Th scope="row">Total</Th>
+            <Td />
+            <Td num>{compactTokens(tokens.by_model.reduce((total, row) => total + sum(row), 0))}</Td>
+            <Td num>{percentText(tokens.cache_hit_ratio)}</Td>
+            <Td num>{tokens.cost_usd === null ? "—" : usd(tokens.cost_usd)}</Td>
           </tr>
         </tfoot>
-      </table>
+      </Table>
       {tokens.unpriced_models.length > 0 ? (
-        <p className="an-note">{`Cost does not include ${plural(tokens.unpriced_models.length, "model", "models")} without a price.`}</p>
+        <p className="an-note">{`Cost does not include ${plural(tokens.unpriced_models.length, "model")} without a price.`}</p>
       ) : null}
       {range !== null ? (
         <p className="an-note">{`Between ${range[0]} and ${range[1]}: older usage has no cache-duration split, so its cache writes are priced as 1-hour (the high end) and as 5-minute at the low end.`}</p>
@@ -312,7 +323,7 @@ const PANELS: Record<DevtimeMetric, PanelContent> = {
     aside: ({ totals }) =>
       totals.correction_rate === null || totals.correction_coverage === null
         ? ""
-        : `correction rate ${percent(totals.correction_rate)} over ${percent(totals.correction_coverage)} of turns`,
+        : `correction rate ${percentText(totals.correction_rate)} over ${percentText(totals.correction_coverage)} of turns`,
     body: (r) => <InterruptionsPanel report={r} />,
   },
   cost: { title: "Tokens and estimated cost", body: (r) => <TokensPanel report={r} /> },
@@ -352,9 +363,7 @@ function FindingsSection({ projectId, days }: { projectId?: string; days: Analyt
           </ul>
           {findings.data.items.length === 0 ? <p className="an-note">No findings in this window.</p> : null}
           {findings.data.next_cursor !== null ? (
-            <button type="button" className="ui-btn" onClick={() => setCursor(findings.data?.next_cursor ?? undefined)}>
-              Next page
-            </button>
+            <Button onClick={() => setCursor(findings.data?.next_cursor ?? undefined)}>Next page</Button>
           ) : null}
         </>
       )}
@@ -390,10 +399,17 @@ function FindingRow({ item, days, inProject }: { item: DevtimeFinding; days: Ana
       <span title="A sort weight, not minutes lost">{`weight ${Math.round(item.cost_ms / 1000)}`}</span>
       {rule === null ? null : <span>{precisionText(rule, inProject)}</span>}
       {rule?.low_precision ? <Badge tone="paused">unreliable rule</Badge> : null}
-      <span className="ui-switch" role="group" aria-label="Verdict">
-        <button type="button" className="ui-switch-seg" aria-pressed={shown === "confirmed"} onClick={() => choose("confirmed")}>Confirm</button>
-        <button type="button" className="ui-switch-seg" aria-pressed={shown === "not_rework"} onClick={() => choose("not_rework")}>Not rework</button>
-      </span>
+      <Segmented<Verdict | "">
+        label="Verdict"
+        value={shown ?? ""}
+        options={[
+          { value: "confirmed", label: "Confirm" },
+          { value: "not_rework", label: "Not rework" },
+        ]}
+        onChange={(next) => {
+          if (next !== "") choose(next);
+        }}
+      />
       {failed ? <ErrorNote>The mark was not saved.</ErrorNote> : null}
     </li>
   );

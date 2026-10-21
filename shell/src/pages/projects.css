@@ -277,73 +277,56 @@
 /* ================================================================== tabs == */
 
 /**
- * The four views, as links.
+ * The four views, as links, drawn with the shared tab strip (`.ui-tab-list`, `.ui-tab`).
  *
- * **Not `Tabs` from `../ui`, and that is a finding rather than an oversight.**
- * These are routes: each one is a real `<a href>` to
- * `/projects/<id>/inspect/<view>`, so it opens in a new window, it is announced
- * as a link, and the current one carries `aria-current="page"`. Radix's
- * `Trigger` stamps `role="tab"` onto whatever it renders — `asChild` included —
- * which replaces the link role, swaps `aria-current` for `aria-selected`,
- * collapses four tab stops into one roving one, and points `aria-controls` at
- * panels that only exist for the route you are already on. A tab widget
- * switches panels inside a page; this switches pages. `System.tsx` reached the
- * same conclusion about its own three, and the two now agree to the
- * declaration.
- *
- * What was adopted instead is the rule underneath the appearance, so the two
- * read as one thing: `.ui-tab`'s indicator is `--text` and not `--accent`. The
- * brand colour marks the wordmark, links and the focus ring and nothing else —
- * a selection wearing it reads as a status, and a status wearing it reads as
- * something you can click.
+ * Routes rather than panels, so not Radix `Tabs` (see `ui/LinkTabs`); `LinkTabs` itself has no
+ * non-link tab and no divider, so the page uses the classes directly. This sheet adds only what is
+ * the project page's own: a strip that scrolls on one line, a view that is unavailable, and the
+ * divider before the fourth view.
  */
-.pj-tabs {
-  display: flex;
+.ui-tab-list.pj-tabs {
   /* One line that scrolls: wrapping put "Permissions" and "Analytics" on a second line at 800-850px. */
   flex-wrap: nowrap;
   overflow-x: auto;
   scroll-snap-type: x proximity;
-  gap: var(--space-1);
   margin-bottom: var(--space-4);
-  border-bottom: 1px solid var(--border);
+  /* A cut-off tab reads as "there is more": the edges fade while the strip overflows (see the
+     horizontal scroll fade in tokens.css). */
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--scroll-fade-l),
+    #000 calc(100% - var(--scroll-fade-r)),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--scroll-fade-l),
+    #000 calc(100% - var(--scroll-fade-r)),
+    transparent 100%
+  );
+  animation: scroll-fade-l linear both, scroll-fade-r linear both;
+  animation-timeline: scroll(self inline), scroll(self inline);
+  animation-range: 0 var(--space-4), calc(100% - var(--space-4)) 100%;
+  /* Driven by scroll position, not by time: the reduced-motion clamp must not zero it. */
+  animation-duration: auto !important;
 }
 
-.pj-tab {
+/* A tab in the scrolling strip keeps its width and snaps to the start. */
+.pj-tabs > .ui-tab {
   flex: 0 0 auto;
-  white-space: nowrap;
   scroll-snap-align: start;
-  padding: var(--space-2) var(--space-3);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-  text-decoration: none;
-  /* Transparent until selected, so nothing moves on selection. */
-  border-bottom: 2px solid transparent;
-}
-
-.pj-tab:hover {
-  color: var(--text);
-}
-
-/* The global ring at the -2px offset the system allows an inset case. Colour
-   and width untouched. */
-.pj-tab:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
-}
-
-.pj-tab-active {
-  color: var(--text);
-  border-bottom-color: var(--text);
 }
 
 /* A view there is nothing for — no folder is recorded — still on the row, so
    what is missing leaves a trace, at the disabled opacity every control uses. */
-.pj-tab-off {
+.pj-tabs > .pj-tab-off {
   opacity: var(--opacity-disabled);
   cursor: not-allowed;
 }
 
-.pj-tab-off:hover {
+.pj-tabs > .pj-tab-off:hover {
   color: var(--text-muted);
 }
 
@@ -355,7 +338,7 @@
  * project does without you, is superseded by nothing that exists, and holds the
  * only control on the page. The rule says so without a second row of chrome.
  */
-.pj-tab-apart {
+.pj-tabs > .pj-tab-apart {
   margin-left: var(--space-3);
   padding-left: var(--space-5);
   border-left: 1px solid var(--border);
@@ -854,45 +837,6 @@
   overflow-x: auto;
 }
 
-.pj-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-sm);
-}
-
-.pj-table thead th {
-  padding: 0 var(--space-3) var(--space-2);
-  border-bottom: 1px solid var(--border-strong);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  text-align: left;
-  white-space: nowrap;
-  color: var(--text-faint);
-}
-
-.pj-table tbody th,
-.pj-table tbody td {
-  padding: var(--space-3);
-  border-bottom: 1px solid var(--border);
-  text-align: left;
-  vertical-align: top;
-}
-
-/* The problem row carries the border for the pair, so a rule and its reason read
-   as one thing rather than as two rows that happen to be adjacent. */
-.pj-table tbody tr.pj-row-problem th,
-.pj-table tbody tr.pj-row-problem td {
-  border-bottom: 0;
-}
-
-.pj-row-name {
-  min-width: 14rem;
-  max-width: 22rem;
-  font-weight: var(--weight-regular);
-}
-
 .pj-row-title {
   display: flex;
   align-items: baseline;
@@ -930,12 +874,6 @@
 .pj-row-where {
   display: block;
   margin-top: 2px;
-}
-
-/* Figures line up under each other, which is the whole reason this is a table. */
-.pj-col-num {
-  width: 1%;
-  white-space: nowrap;
 }
 
 .pj-figure {
@@ -996,17 +934,6 @@
 
 .pj-branch-name {
   color: var(--text);
-}
-
-/*
-  Why a rule will never fire, and the gate's contradiction, are `ErrorNote`s now
-  — the ladder's full Wrong Red box. They were `.pj-problem`, the same fill with
-  a 3px left stripe on it, which the system reserves for the refusal note.
-
-  Under the rule it belongs to, so the pair reads as one.
-*/
-.pj-problem-cell {
-  padding-top: 0 !important;
 }
 
 /* The same weight for a rules file that would not parse — it stops the whole
@@ -1155,13 +1082,4 @@
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
   color: var(--text);
-}
-
-/* A consequence worth reading before the button is pressed — a ceiling of zero —
-   in the ember of "held", because that is exactly what it will do. */
-.pj-warn {
-  margin: 0;
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--tone-paused-fg);
 }

@@ -58,7 +58,7 @@ export function standingLabel(standing: Standing | undefined): string {
     case "partial":
       return "part-way, and you know it";
     case "lapsed":
-      return "lapsed — the code moved since";
+      return "lapsed: the code moved since";
     case "withdrawn":
       return "withdrawn";
     case "never":

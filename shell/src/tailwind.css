@@ -224,5 +224,6 @@
   --radius-sm: 3px;
   --radius-md: 6px;
   --radius-lg: 10px;
+  --radius-xl: 0.75rem;
   --radius-pill: 999px;
 }

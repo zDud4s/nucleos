@@ -191,7 +191,7 @@ describe("BrainPanel", () => {
         expect.objectContaining({ method: "POST", body: JSON.stringify({ kind: "skill" }) }),
       ),
     );
-    expect(await screen.findByText(/Proposed — waiting for your approval in/)).toBeTruthy();
+    expect(await screen.findByText(/Proposed. Waiting for your approval in/)).toBeTruthy();
     expect(screen.getByRole("link", { name: "the Brain" }).getAttribute("href")).toBe("/brain?item=knowledge%3A1");
   });
 

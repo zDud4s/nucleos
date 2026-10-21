@@ -106,7 +106,7 @@ export function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                 <div className="waiting-cluster">
                   <ConfirmButton
                     label={`Approve request #${proposal.id}`}
-                    confirmLabel="Approve — keep these two apart"
+                    confirmLabel="Approve: keep these two apart"
                     subject={`#${proposal.id}`}
                     variant="approve"
                     disabled={approve.isPending || pair.low === null || pair.high === null}
@@ -115,7 +115,7 @@ export function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
                   />
                   <ConfirmButton
                     label={`Decline request #${proposal.id}`}
-                    confirmLabel="Decline — let them run together"
+                    confirmLabel="Decline: let them run together"
                     subject={`#${proposal.id}`}
                     variant="ghost"
                     disabled={reject.isPending}

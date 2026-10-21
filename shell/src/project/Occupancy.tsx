@@ -96,7 +96,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
     return (
       <div className="flex flex-col gap-2">
         <p className="text-sm text-text-muted">
-          No worktree ceiling set — {slots.length} {slots.length === 1 ? "worktree" : "worktrees"}{" "}
+          No worktree ceiling set: {slots.length} {slots.length === 1 ? "worktree" : "worktrees"}{" "}
           in use.
         </p>
         {slots.length === 0 ? null : (
@@ -149,7 +149,7 @@ export function Occupancy({ projectId }: OccupancyProps) {
       */}
       {slots.length > limit ? (
         <p className="text-xs text-tone-paused-fg">
-          {slots.length} in flight against a ceiling of {limit} — the ceiling was lowered under work
+          {slots.length} in flight against a ceiling of {limit}: the ceiling was lowered under work
           already running.
         </p>
       ) : null}

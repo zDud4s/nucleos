@@ -15,8 +15,10 @@
 .brain-force {
   --brain-node: var(--text-muted);
 
-  --brain-edge: rgba(152, 161, 178, 0.28);
-  --brain-edge-strong: rgba(231, 234, 240, 0.75);
+  /* The edges are the label tones at a fraction of their strength, so they follow the palette
+     instead of restating its hex. `color-mix` resolves to a plain colour the canvas can paint. */
+  --brain-edge: color-mix(in srgb, var(--text-muted) 28%, transparent);
+  --brain-edge-strong: color-mix(in srgb, var(--text) 75%, transparent);
   --brain-label: var(--text-muted);
   --brain-label-strong: var(--text);
   --brain-ring: var(--text);
@@ -35,8 +37,8 @@
 
 @media (prefers-color-scheme: light) {
   .brain-force {
-    --brain-edge: rgba(87, 96, 110, 0.3);
-    --brain-edge-strong: rgba(20, 23, 29, 0.7);
+    --brain-edge: color-mix(in srgb, var(--text-muted) 30%, transparent);
+    --brain-edge-strong: color-mix(in srgb, var(--text) 70%, transparent);
   }
 }
 

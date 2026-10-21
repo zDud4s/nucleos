@@ -83,7 +83,7 @@ describe("Fleet", () => {
     expect(await screen.findByRole("article", { name: /^nucleos-37/ })).toBeDefined();
     expect(screen.getByRole("article", { name: /^chunk 2/ })).toBeDefined();
     expect(screen.getByRole("article", { name: /^deal-sniper-c0/ })).toBeDefined();
-    expect(await screen.findByText("slots 3/8")).toBeDefined();
+    expect(await screen.findByText("3 of 8 slots held, room for 5")).toBeDefined();
     expect(screen.queryByText("Nothing is running")).toBeNull();
   });
 
@@ -107,7 +107,7 @@ describe("Fleet", () => {
     fireEvent.change(screen.getByLabelText("Project"), { target: { value: "other" } });
     expect(screen.queryByRole("article", { name: /^alpha/ })).toBeNull();
     expect(screen.getByRole("article", { name: /^gamma/ })).toBeDefined();
-    fireEvent.click(screen.getByLabelText("Active only"));
+    fireEvent.click(screen.getByRole("switch", { name: "Active only" }));
     expect(screen.queryByRole("article", { name: /^gamma/ })).toBeNull();
     expect(screen.getByRole("article", { name: /^beta/ })).toBeDefined();
   });
@@ -173,7 +173,7 @@ describe("Fleet", () => {
     );
     await screen.findByRole("article", { name: /^alpha/ });
     fireEvent.change(screen.getByLabelText("Project"), { target: { value: "other" } });
-    fireEvent.click(screen.getByLabelText("Active only"));
+    fireEvent.click(screen.getByRole("switch", { name: "Active only" }));
     expect(await screen.findByText("Nothing matches this project")).toBeDefined();
     expect(screen.queryByText("Nothing is running")).toBeNull();
   });
@@ -201,9 +201,9 @@ describe("Fleet", () => {
   it("after three failed reconnects with nothing to show, says the stream cannot be reached", async () => {
     daemon.openStream.mockRejectedValue(new Error("down"));
     await renderWithRouter(<Fleet />);
-    expect(screen.queryByText("Can't reach the fleet stream — retrying")).toBeNull();
+    expect(screen.queryByText("Can't reach the fleet stream, retrying")).toBeNull();
     // Attempts fail at 0 s, 1 s and 3 s of the real backoff (1, 2 s): the third is the note.
-    expect(await screen.findByText("Can't reach the fleet stream — retrying", {}, { timeout: 6000 })).toBeDefined();
+    expect(await screen.findByText("Can't reach the fleet stream, retrying", {}, { timeout: 6000 })).toBeDefined();
     expect(screen.getByText("◌ reconnecting…")).toBeDefined();
   }, 10_000);
 

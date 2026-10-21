@@ -36,6 +36,7 @@ import {
 import { JudgeOpinionsBlock } from "./AutopilotJudge";
 import { readRunStream, type RunEvent } from "../lib/run-stream";
 import "./runs.css";
+import { plural, pluralWord } from "../lib/plural";
 
 /**
  * One run, in full.
@@ -79,7 +80,7 @@ function UnknownRun({ raw }: { raw: string | undefined }) {
       <Crumb />
       <PageHeader title="Run" />
       <ErrorNote>
-        <code>{raw ?? "(nothing)"}</code> is not a run id — runs are numbered.
+        <code>{raw ?? "(nothing)"}</code> is not a run id: runs are numbered.
       </ErrorNote>
     </>
   );
@@ -271,7 +272,7 @@ function FactsPanel({ run }: { run: Run }) {
         <Fact label="Project">{run.project_id ?? "no project"}</Fact>
         <Fact label="Session">{run.session_id ?? "none recorded"}</Fact>
         <Fact label="Turns">{run.num_turns === null ? "none recorded" : String(run.num_turns)}</Fact>
-        <Fact label="Steerable">{run.steerable ? "yes — it accepts more turns" : "no"}</Fact>
+        <Fact label="Steerable">{run.steerable ? "yes: it accepts more turns" : "no"}</Fact>
       </dl>
 
       <RouteBlock run={run} />
@@ -384,15 +385,15 @@ function PromptBudget({ authored, cliOwn }: { authored: number | null; cliOwn: n
             nodes: React would render three children, and a reading split across
             three nodes is one no test — and no screen reader — can match as the
             sentence it is. */}
-        <span className="ui-cost-money">{`≈ ${grouped(authored)} estimate — what we wrote`}</span>
+        <span className="ui-cost-money">{`≈ ${grouped(authored)} estimate: what we wrote`}</span>
         <span className="ui-cost-tokens">
-          {cliOwn === null ? "the rest is unknown" : `≈ ${grouped(cliOwn)} estimate — the CLI's own`}
+          {cliOwn === null ? "the rest is unknown" : `≈ ${grouped(cliOwn)} estimate: the CLI's own`}
         </span>
       </p>
       <p className="runs-successor">
         {cliOwn === null
           ? "This run reported no token usage, so there is nothing to subtract our share from."
-          : "Tool schemas, standing instructions, helpers and the prompt, against everything else the CLI sent — undivided, because nothing here can tell its parts apart."}
+          : "Tool schemas, standing instructions, helpers and the prompt, against everything else the CLI sent: undivided, because nothing here can tell its parts apart."}
       </p>
     </>
   );
@@ -629,7 +630,7 @@ function BriefingRow({ item }: { item: BriefingItem }) {
 function StopDecisionLine({ decision, highlight }: { decision: StopDecision; highlight?: boolean }) {
   return (
     <div className={highlight ? "runs-gate-line" : "runs-gate-note"}>
-      <span>{`${decision.tool_name} — ${decision.decision} (${decision.action_class})`}</span>
+      <span>{`${decision.tool_name}: ${decision.decision} (${decision.action_class})`}</span>
       {decision.reason !== null && <span>{` ${decision.reason}`}</span>}
       {decision.tool_input !== null && decision.tool_input !== "" && (
         <pre className="runs-pre">{decision.tool_input}</pre>
@@ -644,7 +645,7 @@ function StopDecisionLine({ decision, highlight }: { decision: StopDecision; hig
 /** Seconds as a person reads them. Whole minutes: nothing here turns on a second. */
 function minutes(seconds: number): string {
   const whole = Math.round(seconds / 60);
-  return whole === 1 ? "1 minute" : `${whole} minutes`;
+  return plural(whole, "minute");
 }
 
 /* ----------------------------------------------------------------- tail -- */
@@ -736,12 +737,12 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
           204 below, which says exactly where it is. */}
       {tail.isError && (
         <ErrorNote onRetry={() => void tail.refetch()}>
-          Could not read the live tail — the {DAEMON_NAME} is not answering.
+          Could not read the live tail: the {DAEMON_NAME} is not answering.
         </ErrorNote>
       )}
       {chunk === RECORDED && (
         <p className="runs-tail-note">
-          recorded — this run has no live tail; what it wrote is in the stored output below
+          recorded: this run has no live tail; what it wrote is in the stored output below
           {recorded === null ? ", and the daemon kept none of it" : ""}.
         </p>
       )}
@@ -768,7 +769,7 @@ function RunTail({ id, alive, recorded }: { id: number; alive: boolean; recorded
             aria-label="Live output"
           >
             {events.length === 0 ? (
-              <p className="runs-tail-note">nothing to read yet — the agent is working</p>
+              <p className="runs-tail-note">nothing to read yet: the agent is working</p>
             ) : (
               <RunEventList events={events} />
             )}
@@ -881,7 +882,7 @@ const RunEventRow = memo(function RunEventRow({ event }: { event: RunEvent }) {
         )}
         {event.kind === "result" && event.more > 0 && (
           <span className="runs-event-more">
-            … {event.more} more {event.more === 1 ? "line" : "lines"} — Raw shows them
+            … {event.more} more {pluralWord(event.more, "line")}. Raw shows them
           </span>
         )}
       </div>
@@ -926,7 +927,7 @@ function StdStreams({ run }: { run: Run }) {
           ) : (
             <div className="runs-events-well" tabIndex={0} role="region" aria-label="Stored output">
               {events.length === 0 ? (
-                <p className="runs-tail-note">nothing a person reads — Raw shows the wire</p>
+                <p className="runs-tail-note">nothing a person reads: Raw shows the wire</p>
               ) : (
                 <RunEventList events={events} />
               )}
@@ -939,7 +940,7 @@ function StdStreams({ run }: { run: Run }) {
         <p className="runs-tail-note">
           {run.stdout === null && run.stderr === null
             ? "nothing was recorded for this run"
-            : "hidden — this is usually long, and the gate above is the verdict"}
+            : "hidden: this is usually long, and the gate above is the verdict"}
         </p>
       )}
     </Panel>
@@ -1047,7 +1048,7 @@ function SteerRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        Could not reach the {DAEMON_NAME} — the turn was not delivered.
+        Could not reach the {DAEMON_NAME}: the turn was not delivered.
       </ErrorNote>
     );
   }
@@ -1055,9 +1056,9 @@ function SteerRefusal({ error }: { error: unknown }) {
     <RefusalNote
       refusal={error}
       sentences={{
-        conflict: "this run is not listening any more — it has ended, or its channel is already closed",
+        conflict: "this run is not listening any more: it has ended, or its channel is already closed",
         forbidden: "this run may never be spoken to: the mode it was launched in has no tools to steer",
-        not_found: "there is no such run — it may have been swept",
+        not_found: "there is no such run: it may have been swept",
       }}
     />
   );
@@ -1076,7 +1077,7 @@ function DetailError({ error, onRetry }: { error: unknown; onRetry?: () => void 
   }
   return (
     <ErrorNote onRetry={onRetry}>
-      Could not reach the {DAEMON_NAME} — nothing is known about this run.
+      Could not reach the {DAEMON_NAME}: nothing is known about this run.
     </ErrorNote>
   );
 }
@@ -1085,7 +1086,7 @@ function MutationNote({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      Could not reach the {DAEMON_NAME} — {what}.
+      Could not reach the {DAEMON_NAME}: {what}.
     </ErrorNote>
   );
 }
