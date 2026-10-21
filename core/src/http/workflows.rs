@@ -281,9 +281,11 @@ pub(super) async fn post_project_workflow(
     .await?;
     let record = materialized_record(&state, &id)?;
     let project_id = id.clone();
+    let agents_home = agents_home(&state);
 
     let (installed, placed) = tokio::task::spawn_blocking(move || {
         let bundle = bundle_or_refusal(&library, &body.name, Some(&body.version))?;
+        check_bundle_agent_facts(&bundle, agents_home.as_deref())?;
         crate::workflows::install(&pins, &bundle)?;
         let placed = materialize_after_pin(&root, &pins, &library, &record, &bundle.name);
         Ok::<_, crate::workflows::Refused>((bundle, placed))
@@ -302,6 +304,38 @@ pub(super) async fn post_project_workflow(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Where the installed agent packages live, `<machine root>/agents` (the same place the launcher
+/// and `startup` read). `None` on a state with no machine root.
+fn agents_home(state: &AppState) -> Option<PathBuf> {
+    state
+        .machine_config_root
+        .as_ref()
+        .map(|root| root.join("agents"))
+}
+
+/// Refuse a bundle whose decisions compare an agent node's fact to a value that agent never
+/// declares (`workflows::graph::check_agent_facts`), before it is pinned.
+///
+/// Lenient about everything that is not that one mistake: a bundle with no graph, or one that does
+/// not parse, passes here (`consent_gate` already reported a parse failure), and an agent that is
+/// not installed or has no readable `output.md` is skipped, since installing a workflow must not
+/// depend on the order its agents were installed in.
+fn check_bundle_agent_facts(
+    bundle: &crate::workflows::Bundle,
+    agents_home: Option<&std::path::Path>,
+) -> Result<(), crate::workflows::Refused> {
+    let Some(graph) = graph_in(std::path::Path::new(&bundle.path)) else {
+        return Ok(());
+    };
+    crate::workflows::graph::check_agent_facts(&graph, |reference| {
+        let home = agents_home?;
+        let reference = crate::agents::package::PackageRef::parse(reference).ok()?;
+        let package = crate::agents::package::load_installed(home, &reference).ok()?;
+        crate::agents::output::parse_output_md(&package.output_md).ok()
+    })
+    .map_err(crate::workflows::Refused::InvalidGraph)
 }
 
 /// This project's materialization record, `~/.nucleos/projects/<id>/materialized.yaml`.
@@ -481,9 +515,11 @@ pub(super) async fn post_project_workflow_update(
     let record = materialized_record(&state, &id)?;
     let now = chrono::Utc::now();
     let project_id = id.clone();
+    let agents_home = agents_home(&state);
 
     let (bundle, placed) = tokio::task::spawn_blocking(move || {
         let bundle = bundle_or_refusal(&library, &name, body.version.as_deref())?;
+        check_bundle_agent_facts(&bundle, agents_home.as_deref())?;
         crate::workflows::update(&root, &pins, &bundle, now)?;
         let placed = materialize_after_pin(&root, &pins, &library, &record, &bundle.name);
         Ok::<_, crate::workflows::Refused>((bundle, placed))

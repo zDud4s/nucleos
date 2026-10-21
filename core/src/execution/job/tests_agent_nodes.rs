@@ -474,20 +474,71 @@ async fn output_is_validated_before_the_emission_is_read() {
         .await
         .expect("the emission of a failed node is not read");
 
-    // The same file behind a VALID answer is read, and refused.
+    // Behind a VALID answer of a checked node the daemon replaces the file with the facts it
+    // derives from the reply (none for `Strict`), so the agent's nested value is gone.
     let (state, job, _run, dir) = triage_ended("completed", "OK", 0).await;
-    std::fs::write(
-        dir.path().join(".nucleos").join("triage.json"),
-        r#"{"size":{"nested":true}}"#,
-    )
-    .unwrap();
+    let emission = dir.path().join(".nucleos").join("triage.json");
+    std::fs::write(&emission, r#"{"size":{"nested":true}}"#).unwrap();
     engine::land_nodes_with(&Strict, &state, &job)
         .await
         .unwrap();
     assert_eq!(triage_status(&state.pool, job.id).await, "passed");
+    assert_eq!(std::fs::read_to_string(&emission).unwrap(), "{}");
     engine::build_facts(&state.pool, &job, dir.path(), &graph)
         .await
-        .expect_err("a passed node's nested emission is refused");
+        .expect("the daemon's emission replaced the agent's nested one");
+}
+
+/// Approves and derives `verdict: approved`, as a reviewer's `## Verdict` one-of would.
+struct EmitsVerdict;
+
+impl OutputCheck for EmitsVerdict {
+    fn check(&self, _text: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn facts(&self, _reply: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut facts = serde_json::Map::new();
+        facts.insert("verdict".into(), "approved".into());
+        facts
+    }
+}
+
+struct EmitsVerdictLauncher;
+
+#[async_trait::async_trait]
+impl AgentNodeLauncher for EmitsVerdictLauncher {
+    async fn launch(
+        &self,
+        _ctx: &NodeCtx<'_>,
+        protocol: String,
+    ) -> Result<NodeLaunch, LaunchRefused> {
+        Ok(NodeLaunch {
+            output: Some(Arc::new(EmitsVerdict)),
+            ..NodeLaunch::plain(protocol)
+        })
+    }
+
+    async fn output_check(&self, _ctx: &NodeCtx<'_>) -> Option<Arc<dyn OutputCheck>> {
+        Some(Arc::new(EmitsVerdict))
+    }
+}
+
+#[tokio::test]
+async fn the_daemon_writes_the_emission_from_the_validated_reply() {
+    let (state, job, _run, dir) = triage_ended("completed", "whatever", 0).await;
+    engine::land_nodes_with(&EmitsVerdictLauncher, &state, &job)
+        .await
+        .unwrap();
+    assert_eq!(triage_status(&state.pool, job.id).await, "passed");
+    let emission = dir.path().join(".nucleos").join("triage.json");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&emission).unwrap()).unwrap();
+    assert_eq!(written, serde_json::json!({"verdict": "approved"}));
+    let facts = engine::build_facts(&state.pool, &job, dir.path(), &graph_of(TRIAGE))
+        .await
+        .unwrap();
+    assert_eq!(facts.get("triage.verdict"), Some("approved"));
 }
 
 #[tokio::test]

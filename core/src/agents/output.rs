@@ -246,6 +246,69 @@ pub fn validate(shape: &OutputShape, answer: &str) -> Result<(), OutputReport> {
     }
 }
 
+/// `## Verdict` -> `verdict`: lowercase, runs of non-alphanumerics folded to one `_`, trimmed of `_`.
+fn fact_key(heading: &str) -> String {
+    let mut key = String::new();
+    for c in heading.chars() {
+        if c.is_alphanumeric() {
+            key.extend(c.to_lowercase());
+        } else if !key.ends_with('_') {
+            key.push('_');
+        }
+    }
+    key.trim_matches('_').to_owned()
+}
+
+/// PURE. The facts a reply that passes [`validate`] carries: one per section declaring `one-of:`,
+/// keyed by the normalised heading, valued by the same first line the one-of check compared.
+/// Sections without `one-of:` yield nothing. A reply that matched the `alt-shape:` instead of the
+/// main shape yields nothing: alt sections declare no `one-of:`. Call it only on a validated reply.
+pub fn facts(shape: &OutputShape, answer: &str) -> Vec<(String, String)> {
+    let found = split_sections(answer);
+    if let Some(alt) = &shape.alt {
+        let has = |name: &str| found.iter().any(|(heading, _)| heading == name);
+        if has(&alt[0]) && !shape.sections.iter().any(|spec| has(&spec.heading)) {
+            return Vec::new();
+        }
+    }
+    let mut cursor = 0;
+    let mut out = Vec::new();
+    for spec in &shape.sections {
+        let Some(offset) = found[cursor..]
+            .iter()
+            .position(|(heading, _)| *heading == spec.heading)
+        else {
+            continue;
+        };
+        let body = &found[cursor + offset].1;
+        cursor += offset + 1;
+        if spec.one_of.is_empty() {
+            continue;
+        }
+        if let Some(first) = body
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+        {
+            out.push((fact_key(&spec.heading), bare(first).to_owned()));
+        }
+    }
+    out
+}
+
+impl OutputShape {
+    /// PURE. The closed value set of every fact [`facts`] can yield: the fact key (normalised
+    /// heading) mapped to the section's declared `one-of:` values. Only main-shape sections with a
+    /// non-empty `one-of:` appear; alt-shape sections declare none.
+    pub fn fact_values(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.sections
+            .iter()
+            .filter(|spec| !spec.one_of.is_empty())
+            .map(|spec| (fact_key(&spec.heading), spec.one_of.clone()))
+            .collect()
+    }
+}
+
 /// Checks an answer against the alternative shape: every heading present, in order, non-empty.
 fn validate_alt(alt: &[String], found: &[(String, Vec<&str>)]) -> Result<(), OutputReport> {
     let mut problems: Vec<String> = Vec::new();
@@ -301,6 +364,44 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn facts_come_from_one_of_sections_only() {
+        let answer = "## Findings\n- none\n\n## Verdict\n`approved`\n";
+        assert_eq!(
+            facts(&shape(), answer),
+            vec![("verdict".to_owned(), "approved".to_owned())]
+        );
+    }
+
+    #[test]
+    fn fact_values_declare_the_one_of_set_per_fact_key() {
+        let values = shape().fact_values();
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values["verdict"],
+            vec!["approved".to_owned(), "changes".to_owned()]
+        );
+    }
+
+    #[test]
+    fn fact_keys_are_normalised_headings() {
+        assert_eq!(fact_key("Final  Verdict!"), "final_verdict");
+        let shape = parse_output_md("## Next Step\none-of: go | stop\n").unwrap();
+        assert_eq!(
+            facts(&shape, "## Next Step\n**stop**\nwhy\n"),
+            vec![("next_step".to_owned(), "stop".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_alt_shape_reply_yields_no_facts() {
+        let shape = parse_output_md(
+            "alt-shape: ## Blocked\n\n## Findings\nx\n\n## Verdict\none-of: approved | changes\n",
+        )
+        .unwrap();
+        assert!(facts(&shape, "## Blocked\nno access\n").is_empty());
     }
 
     #[test]

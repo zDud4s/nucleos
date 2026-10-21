@@ -9999,6 +9999,45 @@ mod tests {
         assert!(body["detail"].as_str().unwrap().contains("nowhere"));
     }
 
+    /// A decision that compares an agent node's fact to a value the agent never declares can never
+    /// be true, so the install is refused rather than pinning a branch that silently never fires.
+    #[tokio::test]
+    async fn installing_a_workflow_whose_decision_names_an_undeclared_agent_value_is_refused() {
+        let mut state = test_state().await;
+        let (_lib, library) = library_with(&[("harness", "1.0", "description: x\n")]);
+        std::fs::write(
+            library.join("harness/1.0/graph.yaml"),
+            "nodes:\n  - {id: review, type: agent, agent: 'reviewer@1.0.0'}\n  - {id: d, type: decision, condition: 'review.verdict == shipit'}\n  - {id: yes, type: agent}\n  - {id: no, type: agent}\nedges:\n  - {from: review, to: d}\n  - {from: d, to: yes, when: true}\n  - {from: d, to: no, when: false}\n",
+        )
+        .unwrap();
+        state.workflow_library = Some(library);
+        let home = with_project_home(&mut state);
+        let package = home.path().join("agents/reviewer/1.0.0");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("agent.md"),
+            "---\nname: reviewer\nversion: 1.0.0\ndescription: d\ncapabilities: [fs.read]\n---\nReview.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("output.md"),
+            "## Verdict\none-of: approved | changes\n",
+        )
+        .unwrap();
+        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+
+        let (status, body) = workflow_call(
+            state,
+            "POST",
+            "/projects/alpha/workflows",
+            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["refusal"], "invalid_graph");
+        assert!(body["detail"].as_str().unwrap().contains("shipit"));
+    }
+
     /// Installing is consenting: the route lists every command verbatim, and an update says which
     /// of them the new version changed.
     ///

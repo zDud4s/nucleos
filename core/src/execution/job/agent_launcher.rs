@@ -32,6 +32,13 @@ impl OutputCheck for ShapeCheck {
     fn check(&self, text: &str) -> Result<(), String> {
         output::validate(&self.0, text).map_err(|report| report.to_string())
     }
+
+    fn facts(&self, reply: &str) -> serde_json::Map<String, serde_json::Value> {
+        output::facts(&self.0, reply)
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::Value::String(value)))
+            .collect()
+    }
 }
 
 /// The caller-side pin of a node: its `tool` and `model`. An empty string pins nothing.

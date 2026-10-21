@@ -194,6 +194,28 @@ pub(super) async fn land_nodes_with(
     Ok(())
 }
 
+/// Writes `<artifacts>/<node_id>.json` atomically (temp file in the same directory, then rename),
+/// replacing whatever the agent may have written there.
+async fn write_emission(
+    worktree: &Path,
+    node_id: &str,
+    facts: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<()> {
+    let path = crate::workflows::facts::emission_path(worktree, node_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dir = path.parent().unwrap_or(worktree);
+    tokio::fs::create_dir_all(dir).await?;
+    let tmp = dir.join(format!(".{node_id}.json.tmp"));
+    let body = serde_json::to_vec(facts)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    tokio::fs::write(&tmp, body).await?;
+    if let Err(error) = tokio::fs::rename(&tmp, &path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn land_node(
     launcher: &dyn AgentNodeLauncher,
@@ -258,6 +280,8 @@ async fn land_node(
     // worktree, which `spawn_node` takes by value afterwards.
     let (mut verdict, mut retry_launch): (Landing, Option<super::dispatch::NodeLaunch>) =
         (Landing::Pass, None);
+    // Set only for a node with an output check whose reply passed: the facts the daemon writes.
+    let mut emission: Option<serde_json::Map<String, serde_json::Value>> = None;
     if let Some(node) = graph.graph.nodes.iter().find(|node| node.id == node_id) {
         let ctx = super::dispatch::NodeCtx {
             state,
@@ -275,6 +299,9 @@ async fn land_node(
             let stdout = stdout.unwrap_or_default();
             let reply = crate::execution::runner::extract_reply(&stdout).unwrap_or(stdout);
             verdict = validation_verdict(attempts.max(0) as usize, check.check(&reply));
+            if matches!(verdict, Landing::Pass) {
+                emission = Some(check.facts(&reply));
+            }
             // A row left over from an earlier round cannot be relaunched here: `spawn_node` links
             // the run of the CURRENT round's row.
             if let Landing::Retry(report) = verdict.clone()
@@ -291,6 +318,7 @@ async fn land_node(
                     job.prompt.as_deref().unwrap_or_default(),
                     round,
                     &keys,
+                    true,
                 );
                 match resolve_launch_with(launcher, &ctx, protocol).await {
                     Ok(launch) => {
@@ -316,6 +344,14 @@ async fn land_node(
     use crate::models::route_advice::Outcome;
     match verdict {
         Landing::Pass => {
+            if let Some(facts) = emission {
+                // Choice: a failed write is logged and the node still passes. The reply was valid;
+                // the missing emission makes the engine's section 4.5 rule stop the job if a
+                // `when:` reads one of its keys, and a job that reads none is unaffected.
+                if let Err(error) = write_emission(&worktree.0, node_id, &facts).await {
+                    tracing::warn!(job_id = job.id, node_id, %error, "could not write the node's emission from its reply");
+                }
+            }
             // Reported HERE and not at the run's end: `judged_later` kept `outcome_at_run_end`
             // silent for this run, because passing the validator is part of the verdict.
             tell_the_router(state, decision, Outcome::Pass);
