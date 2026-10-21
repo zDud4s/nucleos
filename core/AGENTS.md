@@ -294,7 +294,7 @@ the contract, not a snapshot.
 | `channels/routing/seed.rs` | Routing cursors per channel (seed, reseed, turn watermark) and the routing state readout. |
 | `channels/routing/alerts.rs` | Kill switch and budget pause/resume announcements to the primary channel, and the gate that spaces spend-driven budget evaluations. |
 | `channels/routing/announce.rs` | Feed lines to the primary channel's outbox (policy, project thread or prefix, 24 h TTL). |
-| `channels/schema.rs` | Test-only: checks that migrations 0220-0227 and 0230 create the channel tables, indexes and CHECKs. |
+| `channels/schema.rs` | Test-only: checks that migrations 0220-0227, 0230 and 0237 create the channel tables, indexes and CHECKs. |
 | `channels/strings.rs` | Single table of user-visible channel text. |
 | `channels/switch_tests.rs` | Test-only: tests for the Telegram channel switch (`telegram_switch.rs`). |
 | `channels/telegram_switch.rs` | The Telegram channel switch. |

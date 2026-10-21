@@ -63,7 +63,9 @@ fn backoff_ms(attempts: i64) -> i64 {
         .min(BACKOFF_MAX_MS)
 }
 
-fn decide(ack: contract::Ack, attempts: i64, now: DateTime<Utc>) -> Decision {
+/// `best_effort` is a progress row: any failure, retryable or not, is final (it is stale by the
+/// time a retry would run, and must not hold back the ordered lane).
+fn decide(ack: contract::Ack, attempts: i64, now: DateTime<Utc>, best_effort: bool) -> Decision {
     match ack {
         contract::Ack::Ok {
             ok: true,
@@ -73,7 +75,7 @@ fn decide(ack: contract::Ack, attempts: i64, now: DateTime<Utc>) -> Decision {
             Decision::Fail(FailReason::Adapter("ack_not_ok".to_string()))
         }
         contract::Ack::Failed { failed } => {
-            if !failed.retryable {
+            if !failed.retryable || best_effort {
                 return Decision::Fail(FailReason::Adapter(failed.reason));
             }
             if attempts >= MAX_DELIVERIES {
@@ -128,7 +130,7 @@ pub async fn ack(
         }
     }
 
-    let outcome_state = match decide(ack, attempts, now) {
+    let outcome_state = match decide(ack, attempts, now, class == Class::Progress.as_str()) {
         Decision::Done(refs) => {
             let refs =
                 serde_json::to_string(&refs).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
@@ -164,7 +166,9 @@ pub async fn ack(
             .bind(id)
             .execute(&mut *tx)
             .await?;
-            if reason == FailReason::Adapter(THREAD_NOT_FOUND.to_string()) {
+            if reason == FailReason::Adapter(THREAD_NOT_FOUND.to_string())
+                && class != Class::Progress.as_str()
+            {
                 fall_back(
                     &mut tx,
                     state,
@@ -348,6 +352,26 @@ mod tests {
         push_to(state, "c1").await
     }
 
+    async fn push_progress_edit(state: &AppState, conversation: &str, target: i64) -> i64 {
+        let mut conn = state.pool.acquire().await.unwrap();
+        enqueue(
+            &mut conn,
+            &ConversationKey::new("fake", conversation),
+            NewAction::Edit {
+                target,
+                parts: vec![OutPart::Text {
+                    text: "working".to_string(),
+                }],
+                buttons: None,
+            },
+            Class::Progress,
+            Some(Subject::Run(1)),
+            at(0),
+        )
+        .await
+        .unwrap()
+    }
+
     async fn deliver(state: &AppState, now: DateTime<Utc>) {
         lease(state, "fake", StdDuration::ZERO, now).await.unwrap();
     }
@@ -411,6 +435,43 @@ mod tests {
 
     fn outcome(state: ActionState, ignored: bool) -> Option<AckOutcome> {
         Some(AckOutcome { state, ignored })
+    }
+
+    #[tokio::test]
+    async fn progress_failure_is_never_retried_nor_blocks_the_lane() {
+        let state = crate::channels::testkit::state().await;
+        // The channel can edit, so the progress edits below are delivered instead of dropped.
+        sqlx::query(
+            "INSERT INTO channel_presence (channel, kind, contract, capabilities, hello_at)              VALUES ('fake', 'fake', '1', '{\"edit\":true,\"max_text\":4096}', 't')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let target = push(&state).await;
+        deliver(&state, at(0)).await;
+        settle(&state, target, ok(&["p1"]), at(1)).await;
+        let retryable = push_progress_edit(&state, "c1", target).await;
+        let behind = push(&state).await;
+
+        deliver(&state, at(2)).await;
+        let got = settle(&state, retryable, failed(true, Some(500), "rate_limited"), at(3)).await;
+        assert_eq!(got, outcome(ActionState::Failed, false));
+        let (st, attempts, reason, lease, settled, _) = row(&state.pool, retryable).await;
+        assert_eq!((st.as_str(), attempts), ("failed", 1));
+        assert_eq!(reason.as_deref(), Some("rate_limited"));
+        assert_eq!((lease, settled.is_some()), (None, true));
+
+        // The row behind it is delivered on the very next poll, not after a backoff.
+        deliver(&state, at(3)).await;
+        assert_eq!(row(&state.pool, behind).await.0, "leased");
+
+        // A permanent failure is final as well.
+        settle(&state, behind, ok(&["p2"]), at(4)).await;
+        let permanent = push_progress_edit(&state, "c1", target).await;
+        deliver(&state, at(5)).await;
+        let got = settle(&state, permanent, failed(false, None, "message_gone"), at(6)).await;
+        assert_eq!(got, outcome(ActionState::Failed, false));
+        assert_eq!(row(&state.pool, permanent).await.0, "failed");
     }
 
     #[tokio::test]

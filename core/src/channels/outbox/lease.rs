@@ -209,7 +209,20 @@ async fn lease_once(
         .execute(&mut *tx)
         .await?;
         // The stored row stays as enqueued; only the delivered copy is degraded.
-        actions.push(degrade::degrade(&mut tx, channel, &caps, built).await?);
+        match degrade::degrade(&mut tx, channel, &caps, built).await? {
+            Some(action) => actions.push(action),
+            None => {
+                // A best-effort progress edit that cannot be applied in place: settled without a
+                // delivery, so it neither retries nor holds back the conversation.
+                sqlx::query(
+                    "UPDATE channel_outbox SET state = 'done', fail_reason = 'dropped',                      lease_until = NULL, settled_at = ? WHERE id = ?",
+                )
+                .bind(&stamped)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
     }
     tx.commit().await?;
 
