@@ -27,11 +27,11 @@ describe("the resolver's words", () => {
     const readiness = (overrides: Partial<ResolveReadiness>): ResolveReadiness => ({
       reviewed: 10, agree: 10, less_cautious: 0, ready: true, ...overrides,
     });
-    expect(readReadiness(readiness({}))).toBe("10 reviewed, 10 agree — ready");
+    expect(readReadiness(readiness({}))).toBe("10 reviewed, 10 agree, ready");
     expect(readReadiness(readiness({ reviewed: 4, agree: 4, ready: false }))).toBe("4 of 10 reviews");
-    expect(readReadiness(readiness({ agree: 8, ready: false }))).toBe("8 of 10 agree — under 90%");
+    expect(readReadiness(readiness({ agree: 8, ready: false }))).toBe("8 of 10 agree, under 90%");
     expect(readReadiness(readiness({ less_cautious: 1, ready: false }))).toBe(
-      "1 review where the judge was less careful than you — not ready",
+      "1 review where the judge was less careful than you, not ready",
     );
   });
 });

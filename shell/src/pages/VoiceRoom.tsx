@@ -388,17 +388,22 @@ interface Palette {
   light: boolean;
 }
 
-/** jsdom answers "" for every custom property, and a theme may lack one: a missing colour is a fallback, never a throw. */
+/**
+ * jsdom answers "" for every custom property, and a theme may lack one: a missing colour is a fallback, never a throw.
+ * The fallback is a neutral of the right polarity (black or white for a ground, grey for a line or
+ * text) rather than a copy of the token's hex, so the palette is only ever defined in `tokens.css`.
+ */
 function readPalette(light: boolean): Palette {
   const css = getComputedStyle(document.documentElement);
-  const pick = (name: string, dark: string, bright: string) => css.getPropertyValue(name).trim() || (light ? bright : dark);
+  const ground = light ? "#fff" : "#000";
+  const pick = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
   return {
-    muted: pick("--text-muted", "#98a1b2", "#545d6c"),
-    border: pick("--border", "#262b35", "#dcdfe6"),
-    borderStrong: pick("--border-strong", "#39404d", "#b4bbc7"),
-    back: pick("--surface-sunken", "#08090c", "#eceef3"),
-    plate: pick("--bg", "#0c0e12", "#f5f6f9"),
-    bg: pick("--bg", "#0c0e12", "#f5f6f9"),
+    muted: pick("--text-muted", "#808080"),
+    border: pick("--border", "#808080"),
+    borderStrong: pick("--border-strong", "#808080"),
+    back: pick("--surface-sunken", ground),
+    plate: pick("--bg", ground),
+    bg: pick("--bg", ground),
     light,
   };
 }

@@ -217,12 +217,12 @@ describe("headlineFor", () => {
 describe("gateFor", () => {
   it("the gate speaks for every project, an acting one included", () => {
     const acting = gateFor(project({ project_id: "bravo", mode: "active" }));
-    expect(acting.text).toBe("acting on its own — “Turn off” stops it at once");
+    expect(acting.text).toBe("acting on its own: “Turn off” stops it at once");
     expect(acting.open).toBe(true);
 
     // Acting even while the row still says promotable: the gate has been passed, not reached.
     const stillPromotable = gateFor(project({ mode: "active", promotable: true }));
-    expect(stillPromotable.text).toBe("acting on its own — “Turn off” stops it at once");
+    expect(stillPromotable.text).toBe("acting on its own: “Turn off” stops it at once");
     expect(stillPromotable.open).toBe(true);
 
     const earned = gateFor(
@@ -236,7 +236,7 @@ describe("gateFor", () => {
       }),
     );
     expect(earned.text).toBe(
-      "every class it has exercised clears the bar, and at least one is a class the classifier withheld — it has earned this",
+      "every class it has exercised clears the bar, and at least one is a class the classifier withheld, so it has earned this",
     );
     expect(earned.open).toBe(true);
 

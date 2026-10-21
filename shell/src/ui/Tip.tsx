@@ -104,7 +104,21 @@ export function Tip({ tip, children, name, persist, className }: TipProps) {
     );
   } else {
     trigger = (
-      <span className="ui-tip-text" tabIndex={0} aria-describedby={tipId} onClick={toggle}>
+      <span
+        className="ui-tip-text"
+        role="button"
+        tabIndex={0}
+        aria-expanded={pinned}
+        aria-describedby={tipId}
+        onClick={toggle}
+        onKeyDown={(event) => {
+          // Enter and Space pin the tip like a click does, as a native button would.
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            toggle();
+          }
+        }}
+      >
         {children}
       </span>
     );

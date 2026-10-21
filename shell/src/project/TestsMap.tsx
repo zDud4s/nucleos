@@ -37,8 +37,8 @@ export function TestsMap({ projectId }: TestsMapProps) {
     <div className="flex flex-col gap-2">
       {state === "valid" && (
         <p className="text-sm">
-          <code>nucleos.tests.yaml</code> — {groups.length} {groups.length === 1 ? "group" : "groups"}
-          : {groups.join(", ")}
+          <code>nucleos.tests.yaml</code> ({groups.length} {groups.length === 1 ? "group" : "groups"}
+          ): {groups.join(", ")}
         </p>
       )}
       {state === "invalid" && (

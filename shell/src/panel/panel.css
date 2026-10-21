@@ -1,9 +1,11 @@
 :host {
   all: initial;
 }
+/* `tokens.css` is adopted into the same shadow root (see main.tsx), so every custom property here
+   is defined and none needs a fallback. */
 .panel-root {
-  font-family: var(--font-sans, system-ui, sans-serif);
-  color: var(--text, #111);
+  font-family: var(--font-body);
+  color: var(--text);
 }
 .panel-pellicle {
   position: fixed;
@@ -11,9 +13,11 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.18);
-  color: #fff;
-  font-size: 15px;
+  /* The quiet end of the modal dim: the page is paused but still visible, because the agent is
+     working on it. A third of `--scrim` lands on the 0.18 black this used to be in the dark theme. */
+  background: color-mix(in srgb, var(--scrim) 30%, transparent);
+  color: var(--text);
+  font-size: var(--text-base);
   cursor: pointer;
 }
 .panel-strip {
@@ -24,20 +28,20 @@
   width: 360px;
   display: flex;
   flex-direction: column;
-  background: var(--surface, #fff);
-  border-left: 1px solid var(--border, #ddd);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
   box-sizing: border-box;
 }
 .panel-top {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border-bottom: 1px solid var(--border, #ddd);
+  gap: var(--space-2);
+  padding: var(--space-2) 10px;
+  border-bottom: 1px solid var(--border);
 }
 .panel-host {
   flex: 1;
-  opacity: 0.6;
+  opacity: var(--opacity-quiet);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -49,19 +53,19 @@
 }
 .panel-band,
 .panel-keep {
-  padding: 8px 10px;
-  border-top: 1px solid var(--border, #ddd);
+  padding: var(--space-2) 10px;
+  border-top: 1px solid var(--border);
 }
 .panel-keep-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .panel-tab {
   position: fixed;
   top: 40%;
   right: 0;
   width: 28px;
-  padding: 8px 0;
+  padding: var(--space-2) 0;
   writing-mode: vertical-rl;
   cursor: pointer;
 }
@@ -76,34 +80,31 @@
 }
 :where(.panel-root) button {
   background: transparent;
-  border: 1px solid var(--border, #ddd);
-  border-radius: var(--radius-md, 6px);
-  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-1) 10px;
   cursor: pointer;
 }
 :where(.panel-root) button:where(:hover) {
-  background: var(--surface-raised, #f4f4f4);
+  background: var(--surface-raised);
 }
 .panel-root .panel-main {
-  background: var(--solid, #111);
-  color: var(--solid-ink, #fff);
+  background: var(--solid);
+  color: var(--solid-ink);
   border-color: transparent;
 }
 .panel-root .panel-main:hover {
-  background: var(--solid, #111);
+  background: var(--solid);
   opacity: 0.9;
 }
 .panel-top > button {
   border: 0;
-  padding: 2px 8px;
-  color: var(--text-muted, #666);
+  padding: 2px var(--space-2);
+  color: var(--text-muted);
 }
 .panel-state {
-  font-weight: var(--weight-medium, 500);
-}
-.panel-pellicle {
-  font-family: var(--font-body, system-ui, sans-serif);
+  font-weight: var(--weight-medium);
 }
 .panel-strip > .chats-composer-box {
-  margin: var(--space-2, 8px);
+  margin: var(--space-2);
 }

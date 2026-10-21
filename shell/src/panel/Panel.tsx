@@ -96,8 +96,21 @@ export function Panel({ send, subscribe }: PanelProps) {
   return (
     <div className="panel-root">
       {driving ? (
-        <div className="panel-pellicle" onClick={() => send(takeWheel())}>
-          The agent is driving — Take the wheel
+        // A div with button semantics rather than a <button>: `.panel-pellicle` is a full-page dim and
+        // a native button would need a border/font reset in panel.css to keep that look.
+        <div
+          className="panel-pellicle"
+          role="button"
+          tabIndex={0}
+          onClick={() => send(takeWheel())}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              send(takeWheel());
+            }
+          }}
+        >
+          The agent is driving. Take the wheel
         </div>
       ) : null}
       <aside className="panel-strip" aria-label="Agent panel">

@@ -1,8 +1,9 @@
+import { Panel, Quiet, Skeleton, Switch } from "../ui";
 import { useHiddenProviders } from "../app/notch-providers";
 import { useQuota } from "../data/quota";
 
 /**
- * Which subscriptions the quota notch draws, one checkbox each, beside the quota brake.
+ * Which subscriptions the quota notch draws, one switch each, beside the quota brake.
  *
  * The list is what the sidecar reports plus whatever is hidden, so a provider hidden once can be
  * brought back even on a day the sidecar did not report it. A subscription never signed in on this
@@ -18,30 +19,28 @@ export function NotchProviders() {
   const names = [...reported, ...hidden.filter((name) => !reported.includes(name))];
 
   return (
-    <section className="sy-budget-group">
-      <h3 className="sy-budget-heading">Quota notch</h3>
-      <p className="sy-field-hint">
+    <Panel title="Quota notch">
+      <p className="sy-note sy-notch-note">
         A preference of this screen only: it is kept in this browser, not on the background service,
-        and does not follow you to another machine. Each tick below decides whether the notch at
+        and does not follow you to another machine. Each switch below decides whether the notch at
         the top of the window draws that subscription.
       </p>
-      {names.length === 0 ? (
-        <p className="sy-field-hint">no subscription has been read on this machine yet — sign in to one and it will appear here</p>
+      {quota.isPending && names.length === 0 ? (
+        <Skeleton label="Reading the subscriptions" />
+      ) : names.length === 0 ? (
+        <Quiet compact says="No subscription has been read on this machine yet. Sign in to one and it will appear here." />
       ) : (
-        names.map((name) => (
-          <div className="sy-field" key={name}>
-            <label className="sy-check">
-              <input
-                type="checkbox"
-                checked={!hidden.includes(name)}
-                onChange={(event) => setShown(name, event.target.checked)}
-              />
-              {`Show ${name}`}
-            </label>
-          </div>
-        ))
+        <ul className="sy-notch-list" aria-label="Subscriptions">
+          {names.map((name) => (
+            <li key={name}>
+              <Switch label={`Show ${name}`} checked={!hidden.includes(name)} onChange={(next) => setShown(name, next)} />
+            </li>
+          ))}
+        </ul>
       )}
-      <p className="sy-field-hint">Saved as you tick. Only what the notch draws changes; the quota brake is not affected.</p>
-    </section>
+      <p className="sy-note sy-notch-note">
+        Saved as you switch. Only what the notch draws changes; the quota brake is not affected.
+      </p>
+    </Panel>
   );
 }

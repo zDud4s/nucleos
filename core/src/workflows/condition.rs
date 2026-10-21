@@ -62,6 +62,23 @@ impl Condition {
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.comparisons.iter().map(|c| c.key.as_str())
     }
+
+    /// Every comparison as its key and the literal value(s) it compares against, in
+    /// source order: one value for `==`/`!=`, the whole list for `in`. Literals are
+    /// the strings the evaluator compares (a quoted value yields its unquoted text;
+    /// bare numbers and booleans are their source text).
+    pub fn comparisons(&self) -> Vec<(&str, Vec<String>)> {
+        self.comparisons
+            .iter()
+            .map(|c| {
+                let values = match &c.op {
+                    Op::Eq(v) | Op::Ne(v) => vec![v.clone()],
+                    Op::In(vs) => vs.clone(),
+                };
+                (c.key.as_str(), values)
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------- tokenizer
@@ -534,5 +551,18 @@ mod tests {
     fn keys_lists_every_key_read_in_order() {
         let c = parse("b.y == 1 or a.x in [p, q] or b.y != 2").unwrap();
         assert_eq!(c.keys().collect::<Vec<_>>(), ["b.y", "a.x", "b.y"]);
+    }
+
+    #[test]
+    fn comparisons_yield_each_key_with_its_literals() {
+        let c = parse("a.x == \"needs review\" or a.y in [p, 3] or a.z != true").unwrap();
+        assert_eq!(
+            c.comparisons(),
+            vec![
+                ("a.x", vec!["needs review".to_string()]),
+                ("a.y", vec!["p".to_string(), "3".to_string()]),
+                ("a.z", vec!["true".to_string()]),
+            ]
+        );
     }
 }

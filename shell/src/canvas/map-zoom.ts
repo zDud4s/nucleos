@@ -1,4 +1,5 @@
 // §spec mapa-do-projeto
+import { percentText } from "../lib/format";
 
 /**
  * How far out a drawing has to stand to be seen at all.
@@ -81,7 +82,7 @@ export function zoomBy(current: number, direction: 1 | -1): number {
 
 /** How a factor is said out loud: `80%`, never `0.8` and never `80.00000001%`. */
 export function zoomLabel(zoom: number): string {
-  return `${Math.round(zoom * 100)}%`;
+  return percentText(zoom);
 }
 
 /**

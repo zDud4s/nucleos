@@ -1,5 +1,6 @@
 import type { Turn } from "../lib/turns";
 import { turnIsLive } from "../lib/turns";
+import { formatSpan } from "../lib/when";
 
 const MINUTE = 60_000;
 
@@ -34,11 +35,10 @@ export function cacheState(turns: Turn[] | undefined, now: number): CacheState |
   return { kind: "warm", ms: left, approx };
 }
 
-/** "42m", "1h 05m", "<1m". Rounds up so a chip never reads 0m while the cache is still warm. */
+/**
+ * "42m", "1h 05m". Rounds up so a chip never reads 0m while the cache is still warm, and never
+ * drops to seconds: the chip ticks every 30 s, so a count of seconds would be stale as it is drawn.
+ */
 export function leftText(ms: number): string {
-  const minutes = Math.max(1, Math.ceil(ms / MINUTE));
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return rest === 0 ? `${hours}h` : `${hours}h ${String(rest).padStart(2, "0")}m`;
+  return formatSpan(Math.max(MINUTE, ms), { round: "ceil" });
 }

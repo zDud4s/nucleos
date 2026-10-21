@@ -134,3 +134,14 @@ export { FilterBar } from "./FilterBar";
 export type { FilterBarProps } from "./FilterBar";
 export { ListFilter } from "./ListFilter";
 export type { ListFilterProps, ListFilterChip } from "./ListFilter";
+
+export { Segmented, type SegmentedOption, type SegmentedProps } from "./Segmented";
+export { Switch, type SwitchProps } from "./Switch";
+export { Callout, type CalloutProps } from "./Callout";
+export { Drawer, type DrawerProps } from "./Drawer";
+/**
+ * A table and its two cells in one module — the exception to one primitive per file `Rows.tsx`
+ * records: `num` and `muted` mean nothing on a cell outside a `.ui-table`.
+ */
+export { Table, Td, Th, type TableProps, type TdProps, type ThProps } from "./Table";
+export { LinkTabs, type LinkTab, type LinkTabsProps } from "./LinkTabs";

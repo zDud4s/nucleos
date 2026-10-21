@@ -17,6 +17,7 @@ import {
   type CouncilView,
 } from "../data/council";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 import { CouncilDeliberation } from "./CouncilRounds";
 import { clearDraft, draftFrom, offerDraft, peekDraft } from "./council-draft";
 import { Courtroom, type CourtSelection } from "./council/Courtroom";
@@ -118,17 +119,17 @@ export function Council() {
 function headlineFor(rows: CouncilSummary[], answered: boolean): string | undefined {
   if (!answered) return undefined;
   if (rows.length === 0) return "no council has been convened";
-  const noun = rows.length === 1 ? "council" : "councils";
+  const count = plural(rows.length, "council");
   const running = rows.filter((row) => row.status === "running").length;
   return running === 0
-    ? `${rows.length} ${noun}, none deliberating`
-    : `${rows.length} ${noun}, ${running} deliberating`;
+    ? `${count}, none deliberating`
+    : `${count}, ${running} deliberating`;
 }
 
 function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
-    <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME} — nothing is known about the councils</ErrorNote>
+    <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME}: nothing is known about the councils</ErrorNote>
   );
 }
 
@@ -290,7 +291,7 @@ function OfferedSeats({ draft, onDraft }: { draft: CourtDraft; onDraft: (draft: 
  * those would throw away the one part of the refusal worth reading.
  */
 function ConveneRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>Could not reach the {DAEMON_NAME} — no council was convened</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>Could not reach the {DAEMON_NAME}: no council was convened</ErrorNote>;
   return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
 }
 
@@ -438,7 +439,7 @@ function CouncilSession({ id, detail }: { id: string; detail: CouncilView }) {
         <StateBadge domain="council" state={detail.status} />
         <span className="council-phase">{progressOf(detail)}</span>
         <span className="council-phase">
-          {detail.rounds_run} of {detail.rounds} {detail.rounds === 1 ? "round" : "rounds"} run
+          {detail.rounds_run} of {plural(detail.rounds, "round")} run
         </span>
         {detail.stopped_early && <span className="council-early">stopped early</span>}
         <span className="council-chairman">{chairmanLine(detail)}</span>
@@ -504,10 +505,10 @@ function DetailError({ error }: { error: unknown }) {
       />
     );
   }
-  return <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about this council</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME}: nothing is known about this council</ErrorNote>;
 }
 
 function CancelRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>Could not reach the {DAEMON_NAME} — this council was not stopped</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME}: this council was not stopped</ErrorNote>;
 }

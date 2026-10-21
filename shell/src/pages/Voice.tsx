@@ -7,6 +7,8 @@ import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { useVoiceConversation, type ConversationView } from "../data/conversation";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { useVoiceChat } from "../data/voice-chat";
+import { percentText } from "../lib/format";
+import { plural } from "../lib/plural";
 import type { SilenceReason } from "../lib/vad";
 import {
   useDeleteMemo,
@@ -18,11 +20,11 @@ import {
   type VoicePhase,
 } from "../data/voice";
 import {
-  Badge,
   Button,
   ConfirmButton,
   CopyButton,
   Count,
+  Drawer,
   ErrorNote,
   PageHeader,
   Panel,
@@ -31,6 +33,7 @@ import {
   RelativeTime,
   Row,
   Rows,
+  Skeleton,
   StaleNote,
   StateBadge,
   Tabs,
@@ -83,14 +86,12 @@ function headline(
 ): string | undefined {
   if (config === undefined) return undefined;
   if (!config.armed) return "no transcriber is set up yet";
-  if (registerFailed) return "armed, but the hotkeys did not register — use the buttons below";
+  if (registerFailed) return "armed, but the hotkeys did not register: use the buttons below";
   if (conflicts !== null && conflicts.length > 0) {
-    return `armed — ${conflicts.length} hotkey${conflicts.length === 1 ? "" : "s"} is taken by another app`;
+    return `armed: ${plural(conflicts.length, "hotkey")} ${conflicts.length === 1 ? "is" : "are"} taken by another app`;
   }
   if (memos === undefined || dictations === undefined) return "armed";
-  const memoNoun = memos.length === 1 ? "memo" : "memos";
-  const dictationNoun = dictations.length === 1 ? "dictation" : "dictations";
-  return `armed — ${memos.length} ${memoNoun}, ${dictations.length} ${dictationNoun}`;
+  return `armed: ${plural(memos.length, "memo")}, ${plural(dictations.length, "dictation")}`;
 }
 
 /** The daemon's own sentence, when it really sent one — the pattern `Web.tsx` and `Contacts.tsx` share. */
@@ -163,10 +164,17 @@ export function Voice() {
 
   function closeArchive() {
     setArchiveOpen(false);
-    // Focus goes back where it came from: a drawer that closes and leaves it on nothing strands
-    // anybody navigating by keyboard at the top of the page.
-    archiveButton.current?.focus();
   }
+
+  // Focus goes back to the opener once the drawer is gone: a drawer that closes and leaves it on
+  // nothing strands anybody navigating by keyboard at the top of the page. `Drawer` restores focus
+  // to whatever held it on open, which is nothing when the opener was pressed without taking focus
+  // (a touch tap, Safari), so the page names the opener itself, after the drawer's own cleanup.
+  const archiveWasOpen = useRef(false);
+  useEffect(() => {
+    if (!archiveOpen && archiveWasOpen.current) archiveButton.current?.focus();
+    archiveWasOpen.current = archiveOpen;
+  }, [archiveOpen]);
 
   /* The dock grows (stacked columns, notes, outcomes) and the captions and the orb are placed
      against its top edge. Its measured height goes to the room as a CSS variable, so they step
@@ -307,19 +315,14 @@ export function Voice() {
   );
 }
 
-/** "2 memos", "1 memo" — the noun agrees with the number. */
-function plural(n: number, noun: string): string {
-  return `${n} ${n === 1 ? noun : `${noun}s`}`;
-}
-
 /* ------------------------------------------------------------ the archive -- */
 
 /**
  * The drawer: what has been captured, and how the pillar is configured.
  *
- * Mounted only while open, so nothing in it is reachable by keyboard when it is shut. It takes focus
- * onto its Close button as it mounts; closing — that button, or Escape pressed inside the drawer — gives
- * focus back to the button that opened it.
+ * Mounted only while open, so nothing in it is reachable by keyboard when it is shut. `Drawer` moves
+ * focus in as it mounts; closing it (its Close button, or Escape pressed inside) hands focus back to
+ * the button that opened it. The wrapper carries the id the opener's `aria-controls` points at.
  */
 function Archive({
   config,
@@ -334,33 +337,9 @@ function Archive({
   deleteMemo: ReturnType<typeof useDeleteMemo>;
   onClose: () => void;
 }) {
-  const closeButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    closeButton.current?.focus();
-  }, []);
-
   return (
-    <div
-      id="voice-archive"
-      className="voice-archive"
-      role="dialog"
-      aria-modal="false"
-      aria-label="Voice archive"
-      onKeyDown={(event) => {
-        // Escape belongs to this drawer, not to the window: inside an armed or held ConfirmButton it
-        // stands that control down and nothing more, so the confirmation is not lost half-way.
-        if (event.key !== "Escape" || event.defaultPrevented) return;
-        if ((event.target as HTMLElement).closest(".ui-confirm-armed, .ui-confirm-holding") !== null) return;
-        onClose();
-      }}
-    >
-      <div className="voice-archive-head">
-        <h2>Archive</h2>
-        <button type="button" className="ui-button ui-button-ghost" ref={closeButton} onClick={onClose}>
-          Close
-        </button>
-      </div>
-      <div className="voice-archive-body">
+    <div id="voice-archive">
+      <Drawer title="Voice archive" onClose={onClose}>
         <Tabs defaultValue="memos">
           <TabsList aria-label="Archive sections">
             <TabsTrigger value="memos">
@@ -381,7 +360,7 @@ function Archive({
             <ConfigReadout config={config} />
           </TabsContent>
         </Tabs>
-      </div>
+      </Drawer>
     </div>
   );
 }
@@ -414,7 +393,7 @@ function Captions({ voice, hotkey }: { voice: ConversationView; hotkey: string }
     label = "nucleos";
     words = answer;
   } else if (heard !== null) {
-    label = !on ? "last heard" : phase === "thinking" ? "heard — sending" : "heard";
+    label = !on ? "last heard" : phase === "thinking" ? "heard: sending" : "heard";
     words = `“${heard}”`;
   }
 
@@ -440,7 +419,7 @@ const VOICE_YAML_PATH = "~/.nucleos/voice.yaml";
 function NotArmed() {
   return (
     <div className="voice-notarmed">
-      <Quiet says="no transcriber is set up — spoken turns cannot be understood yet" />
+      <Quiet says="no transcriber is set up: spoken turns cannot be understood yet" />
       <Teach title="Voice needs a transcriber">
         <p>
           Voice turns your speech into text with a transcriber program that runs on this machine. None is
@@ -507,17 +486,12 @@ function useChordRequest(armed: boolean | undefined, press: () => Promise<void>)
 }
 
 /**
- * What each phase is called, and its one colour.
- *
- * Mapped here rather than in `state-map.ts`, for the reason that file's own docstring gives: it holds
- * the domains the núcleo writes as Rust literals, and `ConversationPhase` is this shell's state
- * machine. {@link PhaseBadge} two screens down is the same shape for the same reason.
+ * What each phase is called, and its one colour: the `voice_conversation` domain of `state-map.ts`,
+ * which says in its own docstring that the núcleo does not write it. {@link PhaseBadge} two screens
+ * down reads `voice_phase` the same way.
  */
 function ConversationBadge({ phase }: { phase: ConversationView["phase"] }) {
-  if (phase === "off") return <Badge tone="off">off</Badge>;
-  if (phase === "listening") return <Badge tone="active">listening</Badge>;
-  if (phase === "hearing") return <Badge tone="pending">hearing you</Badge>;
-  return <Badge tone="info">{phase === "thinking" ? "thinking" : "answering"}</Badge>;
+  return <StateBadge domain="voice_conversation" state={phase} />;
 }
 
 /**
@@ -533,9 +507,9 @@ function ConversationBadge({ phase }: { phase: ConversationView["phase"] }) {
  */
 const SILENCE_SENTENCES: Record<SilenceReason, string> = {
   noMicrophone: "the microphone is not sending any sound",
-  flat: "silence — nothing is reaching the microphone",
-  byLoudness: "not loud enough to open a turn — speak up or come closer",
-  belowThreshold: "sound, but not speech — noise, or too far from the microphone",
+  flat: "silence: nothing is reaching the microphone",
+  byLoudness: "not loud enough to open a turn: speak up or come closer",
+  belowThreshold: "sound, but not speech: noise, or too far from the microphone",
 };
 
 /**
@@ -606,7 +580,7 @@ function ConversationStatus({ voice }: { voice: ConversationView }) {
           aria-valuemin={0}
           aria-valuemax={1}
           aria-valuenow={voice.level}
-          aria-valuetext={`level ${Math.round(voice.level * 100)}%, a turn opens at ${Math.round(voice.threshold * 100)}%`}
+          aria-valuetext={`level ${percentText(voice.level)}, a turn opens at ${percentText(voice.threshold)}`}
           className="voice-meter"
           data-open={voice.level >= voice.threshold ? "" : undefined}
         >
@@ -632,10 +606,10 @@ function ConversationStatus({ voice }: { voice: ConversationView }) {
           ignored its own voice ×{voice.ignoredEcho}
         </span>
       )}
-      {on && !voice.hasVoice && <span>no voice on this machine — the answer will be written</span>}
+      {on && !voice.hasVoice && <span>no voice on this machine: the answer will be written</span>}
       {voice.listeningWith === "energy" && (
         <span>
-          listening by loudness — noise may open a turn
+          listening by loudness: noise may open a turn
           {voice.whyByLoudness === null ? "" : ` (${voice.whyByLoudness})`}
         </span>
       )}
@@ -647,18 +621,13 @@ function ConversationStatus({ voice }: { voice: ConversationView }) {
 /* ---------------------------------------------------------- phase badge -- */
 
 /**
- * The capture phase, local to this page — not a `StateBadge` domain, because
- * `ui/state-map.ts` covers only states verified against the núcleo's own
- * enums, and this one is a fact this page's reducer invents, not one the
- * daemon sends over the wire.
+ * The capture phase, read from the `voice_phase` domain of `state-map.ts` — a fact this page's
+ * reducer invents rather than one the daemon sends, which that domain's docstring says.
  */
 function PhaseBadge({ phase, registerFailed }: { phase: VoicePhase; registerFailed: boolean }) {
   // `idle` above an error is two readings of one moment. When the hotkeys did not register,
   // the head says the thing the note underneath is about.
-  if (phase === "idle" && registerFailed) return <Badge tone="danger">hotkeys failed</Badge>;
-  if (phase === "idle") return <Badge tone="off">idle</Badge>;
-  if (phase === "recording") return <Badge tone="pending">recording</Badge>;
-  return <Badge tone="info">transcribing</Badge>;
+  return <StateBadge domain="voice_phase" state={phase === "idle" && registerFailed ? "hotkeys_failed" : phase} />;
 }
 
 /* ------------------------------------------------------------- capture -- */
@@ -744,7 +713,7 @@ function CaptureOutcomeNote({ outcome }: { outcome: CaptureOutcome | null }) {
      */
     return (
       <Quiet
-        says="nothing was heard — check the microphone is not muted and the right input device is selected"
+        says="nothing was heard: check the microphone is not muted and the right input device is selected"
         announce
       />
     );
@@ -752,7 +721,7 @@ function CaptureOutcomeNote({ outcome }: { outcome: CaptureOutcome | null }) {
   if (outcome.kind === "done") {
     return (
       <p className="voice-outcome" role="status">
-        captured — <StateBadge domain="voice_cleanup" state={outcome.result.state} />
+        captured: <StateBadge domain="voice_cleanup" state={outcome.result.state} />
       </p>
     );
   }
@@ -764,7 +733,7 @@ function CaptureOutcomeNote({ outcome }: { outcome: CaptureOutcome | null }) {
 
 function CaptureRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — this capture was not sent</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: this capture was not sent</ErrorNote>;
 }
 
 /** `held` is one of the sentences the host sends verbatim — rendered as-is, never paraphrased. */
@@ -786,13 +755,13 @@ function DeliveryNote({ delivery }: { delivery: Delivery | null }) {
 
 function HotkeyConflictNote({ failed, registerFailed }: { failed: string[] | null; registerFailed: boolean }) {
   if (registerFailed) {
-    return <ErrorNote>the hotkeys could not be registered — the host is not responding</ErrorNote>;
+    return <ErrorNote>the hotkeys could not be registered: the host is not responding</ErrorNote>;
   }
   if (failed === null || failed.length === 0) return null;
   const noun = failed.length === 1 ? "this hotkey" : "these hotkeys";
   return (
     <p className="voice-hotkey-conflict" role="alert">
-      {noun} could not be registered — something else on this machine already holds{" "}
+      {noun} could not be registered, because something else on this machine already holds{" "}
       {failed.length === 1 ? "it" : "them"}: {failed.join(", ")}
     </p>
   );
@@ -805,13 +774,13 @@ function ConfigReadout({ config }: { config: ReturnType<typeof useVoiceConfig> }
   return (
     <Panel title="Configuration" variant="dim">
       {data === undefined && config.isError && <ConfigError error={config.error} />}
-      {data === undefined && !config.isError && <p className="voice-loading">reading the configuration…</p>}
+      {data === undefined && !config.isError && <Skeleton label="Reading the configuration" lines={3} />}
       {data !== undefined && (
         <>
           <dl className="voice-config">
             <div className="voice-config-fact">
               <dt>state</dt>
-              <dd>{data.armed ? "armed — a transcriber is configured" : "not armed — no transcriber is configured"}</dd>
+              <dd>{data.armed ? "armed: a transcriber is configured" : "not armed: no transcriber is configured"}</dd>
             </div>
             <div className="voice-config-fact">
               <dt>dictation hotkey</dt>
@@ -823,7 +792,7 @@ function ConfigReadout({ config }: { config: ReturnType<typeof useVoiceConfig> }
             </div>
             <div className="voice-config-fact">
               <dt>cleanup model</dt>
-              <dd>{data.cleanup_model ?? "none — every capture comes back raw"}</dd>
+              <dd>{data.cleanup_model ?? "none: every capture comes back raw"}</dd>
             </div>
             <div className="voice-config-fact">
               <dt>dictation retention</dt>
@@ -846,7 +815,7 @@ function ConfigReadout({ config }: { config: ReturnType<typeof useVoiceConfig> }
             </ul>
           )}
           <p className="voice-config-source">
-            Read from <code>~/.nucleos/voice.yaml</code> — the prompt above is the literal text this pillar
+            Read from <code>~/.nucleos/voice.yaml</code>: the prompt above is the literal text this pillar
             uses, not a path to the file it comes from.
           </p>
         </>
@@ -861,7 +830,7 @@ function formatBytes(n: number): string {
 
 function ConfigError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the voice configuration</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about the voice configuration</ErrorNote>;
 }
 
 /* ------------------------------------------------------------------ lists -- */
@@ -881,14 +850,14 @@ function MemoList({
       {rows !== undefined && rows.length === 0 ? (
         <Section label="Memos">
           <Quiet says="no memos yet">
-            <p>A memo is a capture that stays a note — use Start memo, or press the memo hotkey from anywhere.</p>
+            <p>A memo is a capture that stays a note: use Start memo, or press the memo hotkey from anywhere.</p>
           </Quiet>
         </Section>
       ) : (
     <Panel title="Memos" aside={<Count n={rows?.length} />}>
       {stale && <StaleNote dataUpdatedAt={memos.dataUpdatedAt} />}
       {memos.isError && rows === undefined && <MemosError error={memos.error} />}
-      {rows === undefined && !memos.isError && <p className="voice-loading">reading the memos…</p>}
+      {rows === undefined && !memos.isError && <Skeleton label="Reading the memos" lines={3} />}
       {rows !== undefined && rows.length > 0 && (
         <Rows label="Memos">
           {rows.map((row) => (
@@ -910,12 +879,12 @@ function MemoList({
 
 function MemosError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the memos</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about the memos</ErrorNote>;
 }
 
 function DeleteMemoError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — that memo was not deleted</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: that memo was not deleted</ErrorNote>;
 }
 
 function DictationList({ dictations }: { dictations: ReturnType<typeof useDictations> }) {
@@ -927,14 +896,14 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
       {rows !== undefined && rows.length === 0 ? (
         <Section label="Dictations">
           <Quiet says="no dictations yet">
-            <p className="voice-note">A dictation is a capture that gets pasted where you were typing — use Start dictation, or press the dictation hotkey from anywhere.</p>
+            <p className="voice-note">A dictation is a capture that gets pasted where you were typing: use Start dictation, or press the dictation hotkey from anywhere.</p>
           </Quiet>
         </Section>
       ) : (
     <Panel title="Dictations" variant="dim" aside={<Count n={rows?.length} />}>
       {stale && <StaleNote dataUpdatedAt={dictations.dataUpdatedAt} />}
       {dictations.isError && rows === undefined && <DictationsError error={dictations.error} />}
-      {rows === undefined && !dictations.isError && <p className="voice-loading">reading the dictations…</p>}
+      {rows === undefined && !dictations.isError && <Skeleton label="Reading the dictations" lines={3} />}
       {rows !== undefined && rows.length > 0 && (
         <Rows label="Dictations">
           {rows.map((row) => (
@@ -950,7 +919,7 @@ function DictationList({ dictations }: { dictations: ReturnType<typeof useDictat
 
 function DictationsError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about the dictations</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about the dictations</ErrorNote>;
 }
 
 function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () => void; deleting?: boolean }) {

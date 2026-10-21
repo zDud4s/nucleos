@@ -90,7 +90,7 @@ export function IdeVerifyPanel({
             <ConfirmButton
               variant="ghost"
               label="Switch on"
-              confirmLabel="Switch on — write into every IDE worktree"
+              confirmLabel="Switch on: write into every IDE worktree"
               disabled={busy}
               onConfirm={() => send(true)}
             />
@@ -126,7 +126,7 @@ function Report({ answer }: { answer: IdeVerifyAnswer }) {
       <p className="pj-changed-said">{summary}</p>
       {answer.worktrees.map((worktree) => (
         <p key={worktree.path} className="pj-note">
-          <code className="pj-verbatim">{worktree.path}</code> —{" "}
+          <code className="pj-verbatim">{worktree.path}</code>:{" "}
           {STATE_WORDS[worktree.state] ?? worktree.state}
           {worktree.reason !== undefined && worktree.reason !== "" && (
             <> ({worktree.reason})</>
@@ -140,7 +140,7 @@ function Report({ answer }: { answer: IdeVerifyAnswer }) {
 function IdeVerifyError({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the {DAEMON_NAME} gave no reply — IDE verify is unchanged</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} gave no reply: IDE verify is unchanged</ErrorNote>
     );
   }
   return (

@@ -21,8 +21,9 @@ import {
   useSetChannelNotifyPolicy,
   useSetNotifyPolicy,
 } from "../data/system";
-import { Button, ErrorNote, Panel, RefusalNote } from "../ui";
+import { Button, Callout, ErrorNote, Panel, Quiet, RefusalNote, Section, Skeleton, Switch } from "../ui";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 
 /**
  * Which notifications reach the messaging channels.
@@ -86,7 +87,7 @@ function DefaultMode({
   if (stored.isError) return <NotificationsError error={stored.error} what="the notification policy" />;
   if (observed.isError) return <NotificationsError error={observed.error} what="the kinds this machine writes" />;
   if (!draft || !stored.data || !observed.data) {
-    return <p className="sy-note" role="status">reading the notification policy…</p>;
+    return <Skeleton label="Reading the notification policy" lines={3} />;
   }
 
   return (
@@ -123,7 +124,7 @@ function ChannelMode({
   if (stored.isError) return <NotificationsError error={stored.error} what="the notification policy" />;
   if (observed.isError) return <NotificationsError error={observed.error} what="the kinds this machine writes" />;
   if (!draft || !stored.data || !observed.data) {
-    return <p className="sy-note" role="status">reading the notification policy…</p>;
+    return <Skeleton label="Reading the notification policy" lines={3} />;
   }
 
   return (
@@ -259,39 +260,47 @@ function PolicyEditor({
               {saved && !dirty ? "saved" : null}
             </span>
             <Button
+              variant="primary"
               onClick={() => {
                 save.mutate(draft, { onSuccess: () => setSaved(true) });
               }}
-              disabled={!dirty || save.isPending}>
-              {save.isPending ? "saving…" : "Save"}
+              disabled={!dirty || save.isPending}
+            >
+              {save.isPending ? "Saving…" : "Save"}
             </Button>
           </div>
         }
       >
-        <p className="sy-note sy-notify-never">
-          Proposals, the kill switch and budget alerts are never silenced by these switches, whatever
-          you set here.
-        </p>
+        <div className="sy-notify-never">
+          <Callout tone="info">
+            Proposals, the kill switch and budget alerts are never silenced by these switches,
+            whatever you set here.
+          </Callout>
+        </div>
         <p className="sy-note">
-          A family is a prefix, and a kind can override its family. Anything no rule claims is sent —
+          A family is a prefix, and a kind can override its family. Anything no rule claims is sent,
           so a machine nobody has configured behaves exactly as it did before this screen existed.
           The adapter picks this up on its next round: nothing needs restarting.
         </p>
         {base && primary === false && (
-          <p className="sy-note">
-            This channel is dormant: it is not the primary. Its overrides are stored and take effect
-            when it becomes the primary.
-          </p>
+          <div className="sy-notify-never">
+            <Callout tone="pending">
+              This channel is dormant: it is not the primary. Its overrides are stored and take effect
+              when it becomes the primary.
+            </Callout>
+          </div>
         )}
         {base && empty && (
-          <p className="sy-note">This channel inherits everything from the default.</p>
+          <div className="sy-notify-never">
+            <Quiet compact says="This channel inherits everything from the default." />
+          </div>
         )}
 
         {save.isError &&
           (isApiRefusal(save.error) ? (
             <RefusalNote refusal={save.error} />
           ) : (
-            <ErrorNote>the {DAEMON_NAME} is not responding — nothing was saved</ErrorNote>
+            <ErrorNote>the {DAEMON_NAME} is not responding: nothing was saved</ErrorNote>
           ))}
 
         <ul className="sy-notify-families">
@@ -309,11 +318,10 @@ function PolicyEditor({
         </ul>
 
         {loose.length > 0 && (
-          <>
-            <h3 className="sy-notify-heading">On their own</h3>
+          <Section label="On their own" level={3}>
             <p className="sy-note">
               Kinds no family prefix claims. Each is silenced on its own; there is no group switch
-              because there is no group — the grouping here is presentation, not a rule.
+              because there is no group: the grouping here is presentation, not a rule.
             </p>
             <ul className="sy-notify-kinds sy-notify-loose">
               {loose.map((row) => (
@@ -327,7 +335,7 @@ function PolicyEditor({
                 />
               ))}
             </ul>
-          </>
+          </Section>
         )}
       </Panel>
     </>
@@ -355,7 +363,7 @@ function ChannelScopeSelector({
 
   return (
     <>
-      <label className="sy-meta" htmlFor={selectId}>
+      <label className="sy-notify-scope-label" htmlFor={selectId}>
         Channel
       </label>
       <select
@@ -372,7 +380,7 @@ function ChannelScopeSelector({
           </option>
         ))}
       </select>
-      {channels.isError && <span className="sy-note">the channel list did not load</span>}
+      {channels.isError && <span className="sy-notify-scope-label">the channel list did not load</span>}
     </>
   );
 }
@@ -388,20 +396,14 @@ function DesktopSwitch() {
   const [on, setOn] = useDesktopNotify();
   return (
     <Panel title="Desktop notifications">
-      <label className="sy-notify-switch">
-        <input
-          type="checkbox"
-          className="sy-switch"
-          checked={on}
-          onChange={(event) => setOn(event.target.checked)}
-        />
-        <span className="sy-notify-label">
-          Also show these on this computer&apos;s desktop when the window is not in front
-        </span>
-      </label>
-      <p className="sy-note">
+      <Switch
+        label="Also show these on this computer's desktop when the window is not in front"
+        checked={on}
+        onChange={setOn}
+      />
+      <p className="sy-note sy-notify-lead">
         Waiting approvals, conversations that answered, and the feed lines the choices below allow
-        — the same ones your channels get.
+        (the same ones your channels get).
       </p>
     </Panel>
   );
@@ -429,7 +431,7 @@ function samePolicy(a: NotifyPolicy, b: NotifyPolicy | undefined): boolean {
 
 function NotificationsError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about {what}</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about {what}</ErrorNote>;
 }
 
 type RuleSource = "default" | "override" | "pinned";
@@ -453,14 +455,9 @@ function SourceMark({
         {source}
       </span>
       {source !== "default" && onReset && (
-        <button
-          type="button"
-          className="sy-rule-reset"
-          aria-label={`Reset to default: ${what}`}
-          onClick={onReset}
-        >
+        <Button variant="quiet" aria-label={`Reset to default: ${what}`} onClick={onReset}>
           Reset to default
-        </button>
+        </Button>
       )}
     </>
   );
@@ -484,7 +481,6 @@ function FamilyItem({
 }) {
   const [open, setOpen] = useState(false);
   const card = useRef<HTMLLIElement>(null);
-  const disclose = useRef<HTMLButtonElement>(null);
   const popId = useId();
 
   /*
@@ -501,7 +497,7 @@ function FamilyItem({
       if (event.key === "Escape") {
         setOpen(false);
         // The kinds unmount with the popover; without this the focus falls to the body.
-        disclose.current?.focus();
+        card.current?.querySelector<HTMLButtonElement>("button[aria-expanded]")?.focus();
       }
     }
     document.addEventListener("pointerdown", onPointer);
@@ -519,15 +515,11 @@ function FamilyItem({
   return (
     <li ref={card} className={open ? "sy-notify-family sy-notify-family-open" : "sy-notify-family"}>
       <div className="sy-notify-family-row">
-        <label className="sy-notify-switch">
-          <input
-            type="checkbox"
-            className="sy-switch"
-            checked={on}
-            onChange={(event) => onFamily(family.selector, event.target.checked)}
-          />
-          <span className="sy-notify-label">{family.label ?? family.selector}</span>
-        </label>
+        <Switch
+          label={family.label ?? family.selector}
+          checked={on}
+          onChange={(next) => onFamily(family.selector, next)}
+        />
         {/* A prefix somebody stored that this build has no name for. Shown as itself rather than
             hidden: the rule is in force either way, and a rule you cannot see is one you cannot
             undo. */}
@@ -539,17 +531,16 @@ function FamilyItem({
             onReset={onReset && (() => onReset(family.selector, "families"))}
           />
         )}
-        <button
-          type="button"
-          ref={disclose}
-          className="sy-notify-disclose"
-          aria-expanded={open}
-          aria-controls={open ? popId : undefined}
-          onClick={() => setOpen(!open)}
-        >
-          {family.kinds.length} kind{family.kinds.length === 1 ? "" : "s"}{" "}
-          <span aria-hidden="true">{open ? "▾" : "▸"}</span>
-        </button>
+        <span className="sy-notify-disclose">
+          <Button
+            variant="quiet"
+            aria-expanded={open}
+            aria-controls={open ? popId : undefined}
+            onClick={() => setOpen(!open)}
+          >
+            {plural(family.kinds.length, "kind")} <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+          </Button>
+        </span>
       </div>
       {open && family.kinds.length > 0 && (
         <ul id={popId} className="sy-notify-kinds sy-notify-pop">
@@ -628,12 +619,12 @@ function KindItem({
         // would name a thing that does not exist. Spec §7.3 asks for a plain
         // switch here; `inherit` and `always` both send it, so the two states
         // this draws are the two it can be in.
-        <input
-          type="checkbox"
-          className="sy-switch"
+        <Switch
+          label={label}
+          labelHidden
           id={controlId}
           checked={row.verdict !== "never"}
-          onChange={(event) => onKind(row.kind, event.target.checked ? "inherit" : "never")}
+          onChange={(next) => onKind(row.kind, next ? "inherit" : "never")}
         />
       )}
     </li>

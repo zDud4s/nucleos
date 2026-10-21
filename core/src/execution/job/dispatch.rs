@@ -36,6 +36,12 @@ pub trait OutputCheck: Send + Sync {
     /// `text` is the run's final assistant message (`runs.stdout`). `Err(report)` is appended
     /// verbatim to the single retry prompt.
     fn check(&self, text: &str) -> Result<(), String>;
+
+    /// The facts the daemon writes as the node's emission from a reply that passed [`check`]
+    /// (`<node>.<key>` for the workflow's `when:` conditions). Default: none.
+    fn facts(&self, _reply: &str) -> serde_json::Map<String, serde_json::Value> {
+        Default::default()
+    }
 }
 
 /// What a launcher decides. Field-for-field the agentes-spec `AgentLaunch { prompt, runners, pin,
@@ -52,6 +58,10 @@ pub struct NodeLaunch {
     /// effort the launch runs at.
     pub effort: Option<String>,
     pub output: Option<Arc<dyn OutputCheck>>,
+    /// The Codex sandbox the agent's capabilities translate to, when the launch is pinned to Codex.
+    /// It is also carried by the pin itself (`EnginePin::sandbox`), which is what the runner is built
+    /// from; this is the same fact at the launch level.
+    pub codex_sandbox: Option<crate::agents::capabilities::CodexSandbox>,
 }
 
 impl NodeLaunch {
@@ -63,6 +73,7 @@ impl NodeLaunch {
             pin: None,
             effort: None,
             output: None,
+            codex_sandbox: None,
         }
     }
 }
@@ -178,14 +189,26 @@ pub fn launcher() -> Arc<dyn AgentNodeLauncher> {
 
 /// PURE. The engine half for a node that is NOT one of the autopilot's hard-coded kinds: the facts
 /// protocol of spec 4.1, the artifacts directory, the round and the job task. `emits_to` names the
-/// keys the workflow reads from this node's emission (may be empty).
+/// keys the workflow reads from this node's emission (may be empty). `daemon_emits` is true for a
+/// node with an output check: the daemon derives the emission from the validated reply, so the
+/// agent is told to write nothing and to follow its output format in its final message.
 pub fn composed_protocol(
     node_id: &str,
     artifacts: &str,
     task: &str,
     round: i64,
     emits_to: &[&str],
+    daemon_emits: bool,
 ) -> String {
+    if daemon_emits {
+        return format!(
+            "You are the `{node_id}` node of an autonomous job, round {round}. Work in the current \
+             working tree.\n\n\
+             The job asks for:\n{task}\n\n\
+             Do not write any file for the workflow. Your final reply is what the workflow reads: \
+             it must follow your output format exactly."
+        );
+    }
     let artifacts = artifacts.trim_end_matches(['/', '\\']);
     let keys = if emits_to.is_empty() {
         String::new()
@@ -362,6 +385,7 @@ mod tests {
             "sort the inbox",
             2,
             &["size", "risky"],
+            false,
         );
         assert!(text.contains("/w/.nucleos/triage.json"), "{text}");
         assert!(!text.contains("//triage.json"), "{text}");
@@ -369,8 +393,26 @@ mod tests {
         assert!(text.contains("Do NOT nest"), "{text}");
         assert!(text.contains("sort the inbox") && text.contains("round 2"));
         assert!(text.contains("`size`, `risky`"), "{text}");
-        let bare = composed_protocol("triage", "/w/.nucleos", "t", 1, &[]);
+        let bare = composed_protocol("triage", "/w/.nucleos", "t", 1, &[], false);
         assert!(!bare.contains("reads these keys"));
+    }
+
+    #[test]
+    fn composed_protocol_for_a_daemon_emission_asks_for_no_file() {
+        let text = composed_protocol("review", "/w/.nucleos", "check it", 1, &["verdict"], true);
+        assert!(!text.contains("review.json"), "{text}");
+        assert!(
+            !text.contains("flat JSON") && !text.contains("Do NOT nest"),
+            "{text}"
+        );
+        assert!(
+            text.contains("final reply is what the workflow reads"),
+            "{text}"
+        );
+        assert!(
+            text.contains("check it") && text.contains("round 1"),
+            "{text}"
+        );
     }
 
     struct Marker;

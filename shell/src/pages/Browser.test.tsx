@@ -367,7 +367,7 @@ describe("Browser - health", () => {
 
     await renderBrowser();
 
-    expect(await screen.findByText("the browser sidecar is down — not-running")).toBeDefined();
+    expect(await screen.findByText("the browser sidecar is down: not-running")).toBeDefined();
   });
 
   it("reports the one browser subsystem the daemon has", async () => {

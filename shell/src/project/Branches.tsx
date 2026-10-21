@@ -47,7 +47,7 @@ export function Branches({ projectId }: BranchesProps) {
   if (branches.isError && branches.data === undefined) {
     return (
       <ErrorNote>
-        The {DAEMON_NAME} could not read this project&rsquo;s branches — its folder may have moved.
+        The {DAEMON_NAME} could not read this project&rsquo;s branches: its folder may have moved.
       </ErrorNote>
     );
   }

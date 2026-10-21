@@ -9,7 +9,8 @@ import {
   type AnalyticsReport,
   type QuotaHistory,
 } from "../data/analytics";
-import { ErrorNote, SectionNav, Skeleton, StaleNote, StatCard } from "../ui";
+import { clockText } from "../lib/when";
+import { ErrorNote, SectionNav, Segmented, Skeleton, StaleNote, StatCard } from "../ui";
 import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, unreachable, type MetricKey } from "./sections";
 import { PipelineSection } from "./PipelineSection";
 import { DevtimeSection } from "./DevtimeSection";
@@ -42,11 +43,6 @@ export interface AnalyticsViewProps {
 const COVERAGE =
   "Every run counts here, in every mode. The global autonomy ceiling counts only some modes, so these totals can be higher than its. Run cost is dated by when a run finished; the ceiling dates it by when it started. The judge's cost is included as its own part, dated by its verdict.";
 
-/** Local wall-clock, 24-hour — the same reading `ModeState`'s readings line gives. */
-function clockOf(at: number): string {
-  return new Date(at).toTimeString().slice(0, 5);
-}
-
 export function AnalyticsView({ projectId, days: asked, onDaysChange }: AnalyticsViewProps) {
   const [local, setLocal] = useState<AnalyticsDays>(DEFAULT_DAYS);
   // Kept across a window change and a refetch: switching 30 to 7 days keeps the chart being read.
@@ -65,26 +61,19 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
   return (
     <div className="an-view">
       <div className="an-head">
-        <div className="ui-switch" role="group" aria-label="Window">
-          {WINDOWS.map((option) => (
-            <button
-              key={option}
-              type="button"
-              className="ui-switch-seg"
-              aria-pressed={option === days}
-              onClick={() => {
-                if (option !== days) choose(option);
-              }}
-            >
-              {option} days
-            </button>
-          ))}
-        </div>
+        <Segmented
+          label="Window"
+          value={days}
+          options={WINDOWS.map((option) => ({ value: option, label: `${option} days` }))}
+          onChange={(option) => {
+            if (option !== days) choose(option);
+          }}
+        />
         <div className="an-range">
           <p className="an-head-note">
             {data === undefined
               ? "days in UTC"
-              : `${data.window.from} to ${data.window.to}, days in UTC · read at ${clockOf(report.dataUpdatedAt)}`}
+              : `${data.window.from} to ${data.window.to}, days in UTC · read at ${clockText(report.dataUpdatedAt)}`}
           </p>
           {data === undefined || data.counted.modes === "all" ? (
             <details className="an-about">

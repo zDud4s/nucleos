@@ -31,10 +31,6 @@ const ALLOWED = new Map<string, { reason: string; only?: string }>([
     "system.css:.sy-settings-item-current",
     { reason: "the System settings list's current row, the same case as the rail's", only: "var(--accent-quiet)" },
   ],
-  [
-    "system.css:.sy-token-level:has(input:checked)",
-    { reason: "the chosen token level: the current choice in a set, like a current row", only: "var(--accent-quiet)" },
-  ],
   ["contacts.css:.contacts-avatar", { reason: "the contact's initials disc, the owner's call on 2026-10-05" }],
 ]);
 

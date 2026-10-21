@@ -75,7 +75,9 @@ function answer(code = CODE, statuses: object[] = [WAITING]) {
   });
 }
 
-async function tick(ms = 3000) {
+// One poll interval and a little over: the answer to a poll that fires on the last tick still needs a
+// macrotask or two (the query cache notifies on a zero timer) before it reaches the screen.
+async function tick(ms = 3100) {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(ms);
   });

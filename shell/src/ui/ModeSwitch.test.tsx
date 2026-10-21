@@ -31,7 +31,7 @@ const LABEL = "Let alpha act";
  * region — the eye reads the label, the ear is told the consequence.
  */
 const CONSEQUENCE =
-  "alpha acts on its own — 3 of its 4 proposal slots already in use, no approval";
+  "alpha acts on its own: 3 of its 4 proposal slots already in use, no approval";
 
 /**
  * The one control both surfaces that set a project's autonomy now use.

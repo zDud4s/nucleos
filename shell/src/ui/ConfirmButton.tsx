@@ -63,7 +63,7 @@ const ARM_WINDOW_MS = 4000;
  * Three rounds later the roster's interlock says "armed: alpha acts on its own — 3 of its 4
  * proposal slots already in use, no approval — press again to confirm": twenty-three words,
  * about six and a half seconds at 180 wpm, inside a four-second window. The control expired
- * while it was still explaining itself, and then queued "disarmed — nothing changed" behind
+ * while it was still explaining itself, and then queued "disarmed: nothing changed" behind
  * the sentence it had interrupted.
  */
 const MS_PER_WORD = 400;
@@ -329,10 +329,10 @@ export function ConfirmButton({
       : `${confirmLabel} · ${subject}`;
   const armedSaid =
     spoken === null
-      ? "armed — press again to confirm"
+      ? "armed: press again to confirm"
       : subject === undefined
-        ? `armed: ${spoken} — press again to confirm`
-        : `armed: ${subject} — ${spoken} — press again to confirm`;
+        ? `armed: ${spoken}. Press again to confirm`
+        : `armed: ${subject}. ${spoken}. Press again to confirm`;
   // The hold's own announcement. It says "hold" so that somebody who pressed and heard nothing
   // else knows the gesture is a duration, and it names the consequence for the same reason the
   // armed one does.
@@ -341,7 +341,7 @@ export function ConfirmButton({
       ? "hold to confirm"
       : subject === undefined
         ? `hold to confirm: ${spoken}`
-        : `hold to confirm: ${subject} — ${spoken}`;
+        : `hold to confirm: ${subject}. ${spoken}`;
 
   function report(next: boolean) {
     if (reported.current === next) return;
@@ -390,7 +390,7 @@ export function ConfirmButton({
     clearTimers();
     setArmed(false);
     report(false);
-    setSaid("disarmed — nothing changed");
+    setSaid("disarmed: nothing changed");
   }
 
   /*
@@ -451,7 +451,7 @@ export function ConfirmButton({
     }
     setHolding(false);
     report(false);
-    setSaid("released — nothing changed");
+    setSaid("released: nothing changed");
   }
 
   /** The fill completed with the press still down: this is the decision. */

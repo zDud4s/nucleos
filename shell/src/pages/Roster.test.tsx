@@ -313,7 +313,7 @@ describe("the roster", () => {
     const note = await screen.findByText(/view is stale — last good read/);
     const needs = group("Needs you");
     expect(note.compareDocumentPosition(needs) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByText(/^as of \d\d:\d\d:\d\d — 2 projects · 2 items to review$/)).toBeDefined();
+    expect(screen.getByText(/^as of \d\d:\d\d:\d\d: 2 projects · 2 items to review$/)).toBeDefined();
     expect((needs.parentElement as HTMLElement).className).toContain("text-text-muted");
     expect(names("Needs you")).toEqual(["alpha"]);
     expect(names("Quiet")).toEqual(["beta"]);
@@ -344,7 +344,7 @@ describe("the roster", () => {
     await renderApp({ initialPath: "/projects" });
 
     const alert = await screen.findByText(/Could not load the projects/);
-    expect(screen.queryByText(/reading the roster/)).toBeNull();
+    expect(screen.queryByText(/Loading the projects/)).toBeNull();
     expect(screen.queryByRole("status", { name: /Loading the projects/ })).toBeNull();
     answering = true;
     await act(async () => {

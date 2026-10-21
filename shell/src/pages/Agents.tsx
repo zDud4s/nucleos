@@ -33,9 +33,17 @@ import {
   RelativeTime,
   Skeleton,
   StaleNote,
+  Table,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+  Td,
   Teach,
+  Th,
 } from "../ui";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 import "./agents.css";
 import { LoadoutPreview } from "./LoadoutPreview";
 
@@ -154,7 +162,7 @@ export function Agents() {
         <Teach title="No agent has been hired yet">
           <p>
             An agent is a name, a speciality a director reads to delegate, a prompt, an engine and a
-            tool policy — add one to start the catalogue.
+            tool policy. Add one to start the catalogue.
           </p>
           <p>
             <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
@@ -227,7 +235,7 @@ function headlineFor(
   if (!answered) return undefined;
   if (rows.length === 0) return "no agent in the catalogue";
 
-  const parts = [`${rows.length} ${rows.length === 1 ? "agent" : "agents"}`];
+  const parts = [plural(rows.length, "agent")];
 
   const seatless = rows.filter((row) => !canTakeASeat(row)).length;
   if (seatless > 0) parts.push(`${seatless} without a model`);
@@ -246,7 +254,7 @@ function headlineFor(
 function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
-    <ErrorNote onRetry={onRetry}>the {DAEMON_NAME} is not responding — nothing is known about the catalogue</ErrorNote>
+    <ErrorNote onRetry={onRetry}>the {DAEMON_NAME} is not responding: nothing is known about the catalogue</ErrorNote>
   );
 }
 
@@ -260,14 +268,14 @@ function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
  * rather than showing the daemon's silence back.
  */
 function SaveRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding — this agent was not saved</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding: this agent was not saved</ErrorNote>;
   return (
     <RefusalNote
       refusal={error}
       sentences={{
         conflict: "an agent of that name already exists",
-        bad_request: `the ${DAEMON_NAME} refused this — check the name, engine, model and tool policy`,
-        not_found: "this agent no longer exists — it may have been deleted elsewhere",
+        bad_request: `the ${DAEMON_NAME} refused this: check the name, engine, model and tool policy`,
+        not_found: "this agent no longer exists, it may have been deleted elsewhere",
       }}
     />
   );
@@ -292,7 +300,7 @@ function SaveRefusal({ error }: { error: unknown }) {
  * that it does.
  */
 function DeleteRefusal({ error }: { error: unknown }) {
-  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding — this agent was not deleted</ErrorNote>;
+  if (!isApiRefusal(error)) return <ErrorNote>the {DAEMON_NAME} is not responding: this agent was not deleted</ErrorNote>;
   return (
     <RefusalNote
       refusal={error}
@@ -332,20 +340,15 @@ function Catalogue({
 }) {
   return (
     <div className="agents-scroller">
-      <table className="agents-table">
-        <caption className="sr-only">
-          Every agent in the catalogue, what it runs on and how much of it is spoken for
-        </caption>
+      <Table label="Every agent in the catalogue, what it runs on and how much of it is spoken for">
         <thead>
           <tr>
-            <th scope="col">Agent</th>
-            <th scope="col">Engine</th>
-            <th scope="col">Model</th>
-            <th scope="col">Tools</th>
-            <th scope="col" className="agents-col-num">
-              Employed
-            </th>
-            <th scope="col">Changed</th>
+            <Th>Agent</Th>
+            <Th>Engine</Th>
+            <Th>Model</Th>
+            <Th>Tools</Th>
+            <Th num>Employed</Th>
+            <Th>Changed</Th>
           </tr>
         </thead>
         <tbody>
@@ -360,7 +363,7 @@ function Catalogue({
             />
           ))}
         </tbody>
-      </table>
+      </Table>
       <p className="agents-key">
         ◉ directs a team · ● on a team&rsquo;s roster · ■ has tools · □ no tools · ? this shell has no
         reading for that policy · ≠ renamed since the {DAEMON_NAME} learned its id
@@ -412,9 +415,9 @@ function CatalogueRow({
       <td>
         <Tools agent={agent} />
       </td>
-      <td className="agents-col-num">
+      <Td num>
         <Employed employment={employment} known={employmentKnown} />
-      </td>
+      </Td>
       <td className="agents-changed">
         <RelativeTime at={agent.updated_at} />
       </td>
@@ -486,10 +489,10 @@ function Model({ agent }: { agent: Agent }) {
   return (
     <span
       className="agents-model agents-model-default"
-      title="names no model, so it can never take a council seat — a seat records the model it ran"
+      title="names no model, so it can never take a council seat, because a seat records the model it ran"
     >
       the engine&rsquo;s default
-      <span className="sr-only"> — names no model, so it can never take a council seat</span>
+      <span className="sr-only"> (names no model, so it can never take a council seat)</span>
     </span>
   );
 }
@@ -564,7 +567,7 @@ function Employed({ employment, known }: { employment: Employment; known: boolea
     return (
       <span className="agents-figure agents-figure-unknown" title="the team list has not answered yet">
         <span aria-hidden="true">·</span>
-        <span className="sr-only">the team list has not answered — this is not zero</span>
+        <span className="sr-only">the team list has not answered, so this is not zero</span>
       </span>
     );
   }
@@ -832,7 +835,6 @@ function AgentEditor({
   const del = useDeleteAgent();
   const valid = draftIsValid(draft);
   const formId = useId();
-  const tabsId = useId();
   const dirty = JSON.stringify(draft) !== JSON.stringify(draftFromAgent(agent));
 
   function patch(next: Partial<AgentDraft>) {
@@ -876,91 +878,66 @@ function AgentEditor({
         )
       }
     >
-      <div className="agents-tabs" role="tablist" aria-label="Agent sections">
-        {EDITOR_TABS.map(([key, text]) => (
-          <button
-            key={key}
-            type="button"
-            role="tab"
-            id={`${tabsId}-${key}`}
-            aria-selected={tab === key}
-            aria-controls={`${tabsId}-panel`}
-            tabIndex={tab === key ? 0 : -1}
-            className="agents-tab"
-            onClick={() => setTab(key)}
-            onKeyDown={(event) => {
-              const at = EDITOR_TABS.findIndex(([k]) => k === tab);
-              const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
-              if (step === 0) return;
+      <Tabs value={tab} onValueChange={(next) => setTab(next as EditorTab)}>
+        <TabsList aria-label="Agent sections">
+          {EDITOR_TABS.map(([key, text]) => (
+            <TabsTrigger key={key} value={key}>
+              {text}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <TabsContent value="definition">
+          <form
+            id={formId}
+            className="agents-form"
+            onSubmit={(event) => {
               event.preventDefault();
-              const next = EDITOR_TABS[(at + step + EDITOR_TABS.length) % EDITOR_TABS.length]![0];
-              setTab(next);
-              document.getElementById(`${tabsId}-${next}`)?.focus();
+              if (!valid || update.isPending) return;
+              /*
+                Stays open and reseeds from the daemon's answer, the way the charter
+                editor does. Two things come of it: what you see next is what the
+                {DAEMON_NAME} stored rather than what you typed — trimmed, and a blank model
+                turned back into the engine's default — and the row above changes
+                under you, which is the acknowledgement that a form closing itself
+                used to be standing in for. The footer says "Saved" as well, because
+                that row sits behind the overlay.
+              */
+              setSaved(false);
+              update.mutate(
+                { id: agent.id, request: requestFromDraft(draft) },
+                {
+                  onSuccess: (savedAgent) => {
+                    setDraft(draftFromAgent(savedAgent));
+                    setSaved(true);
+                  },
+                },
+              );
             }}
           >
-            {text}
-          </button>
-        ))}
-      </div>
-      <div role="tabpanel" id={`${tabsId}-panel`} aria-labelledby={`${tabsId}-${tab}`} className="agents-tabpanel">
-        {tab === "definition" && (
-          <>
-            <form
-              id={formId}
-              className="agents-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (!valid || update.isPending) return;
-                /*
-                  Stays open and reseeds from the daemon's answer, the way the charter
-                  editor does. Two things come of it: what you see next is what the
-                  {DAEMON_NAME} stored rather than what you typed — trimmed, and a blank model
-                  turned back into the engine's default — and the row above changes
-                  under you, which is the acknowledgement that a form closing itself
-                  used to be standing in for. The footer says "Saved" as well, because
-                  that row sits behind the overlay.
-                */
-                setSaved(false);
-                update.mutate(
-                  { id: agent.id, request: requestFromDraft(draft) },
-                  {
-                    onSuccess: (savedAgent) => {
-                      setDraft(draftFromAgent(savedAgent));
-                      setSaved(true);
-                    },
-                  },
-                );
-              }}
-            >
-              <AgentFields draft={draft} onChange={patch} />
-              {/*
-                Said here rather than nowhere, because it is the one consequence of
-                this form that is not obvious: `job::persona_for` reads an agent's
-                prompt when an item is DISPATCHED and does not store it on the row,
-                so saving reaches work that was planned before the edit.
-              */}
-              <p className="agents-aside">
-                Saving reaches work that is already queued — an item reads its agent&rsquo;s prompt
-                when it is dispatched, not when it was planned.
-              </p>
-            </form>
-            {update.isError && <SaveRefusal error={update.error} />}
-          </>
-        )}
+            <AgentFields draft={draft} onChange={patch} />
+            {/*
+              Said here rather than nowhere, because it is the one consequence of
+              this form that is not obvious: `job::persona_for` reads an agent's
+              prompt when an item is DISPATCHED and does not store it on the row,
+              so saving reaches work that was planned before the edit.
+            */}
+            <p className="agents-aside">
+              Saving reaches work that is already queued: an item reads its agent&rsquo;s prompt
+              when it is dispatched, not when it was planned.
+            </p>
+          </form>
+          {update.isError && <SaveRefusal error={update.error} />}
+        </TabsContent>
 
-        {tab === "memory" && (
-          <>
-            <ContextRefs ownerKind="agent" ownerId={agent.id} />
-            <ScopedMemory scopeKind="agent" scopeId={agent.id} />
-          </>
-        )}
+        <TabsContent value="memory">
+          <ContextRefs ownerKind="agent" ownerId={agent.id} />
+          <ScopedMemory scopeKind="agent" scopeId={agent.id} />
+        </TabsContent>
 
-        {tab === "tools" && (
-          <>
-            <ScopedTools ownerKind="agent" ownerId={agent.id} />
-            <LoadoutPreview agentId={agent.id} />
-          </>
-        )}
+        <TabsContent value="tools">
+          <ScopedTools ownerKind="agent" ownerId={agent.id} />
+          <LoadoutPreview agentId={agent.id} />
+        </TabsContent>
 
         {/*
           The delete, and what this page can see standing on it — before the
@@ -969,23 +946,21 @@ function AgentEditor({
           button greyed out by a stale reading is worse than a refusal that tells
           the truth.
         */}
-        {tab === "remove" && (
-          <>
-            <div className="agents-remove">
-              <p className="agents-holds">{holdSentence(agent, employment, employmentKnown)}</p>
-              <ConfirmButton
-                label="Delete"
-                confirmLabel={`Delete ${agent.name}`}
-                variant="danger"
-                intent="stop"
-                disabled={del.isPending}
-                onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}
-              />
-            </div>
-            {del.isError && <DeleteRefusal error={del.error} />}
-          </>
-        )}
-      </div>
+        <TabsContent value="remove">
+          <div className="agents-remove">
+            <p className="agents-holds">{holdSentence(agent, employment, employmentKnown)}</p>
+            <ConfirmButton
+              label="Delete"
+              confirmLabel={`Delete ${agent.name}`}
+              variant="danger"
+              intent="stop"
+              disabled={del.isPending}
+              onConfirm={() => del.mutate(agent.id, { onSuccess: onClose })}
+            />
+          </div>
+          {del.isError && <DeleteRefusal error={del.error} />}
+        </TabsContent>
+      </Tabs>
     </Modal>
   );
 }
@@ -1024,7 +999,7 @@ function holdSentence(agent: Agent, employment: Employment, known: boolean): str
   }
 
   if (unemployed(employment)) {
-    return `No team names ${agent.name}. Work it is already holding — ${work}.`;
+    return `No team names ${agent.name}. Work it is already holding: ${work}.`;
   }
 
   const standings = [
@@ -1032,5 +1007,5 @@ function holdSentence(agent: Agent, employment: Employment, known: boolean): str
     employment.staffs.length > 0 ? `is on the roster of ${employment.staffs.join(", ")}` : null,
   ].filter((part) => part !== null);
 
-  return `${agent.name} ${standings.join(" and ")}. The ${DAEMON_NAME} refuses a delete while that is true — and also while ${work}.`;
+  return `${agent.name} ${standings.join(" and ")}. The ${DAEMON_NAME} refuses a delete while that is true, and also while ${work}.`;
 }

@@ -36,7 +36,7 @@ describe("RouteError", () => {
 
     // No clipboard, so the sentence and not a button — a control that cannot do
     // its job is worse than the instruction to do it by hand.
-    expect(screen.getByText(/this window cannot copy for you/)).toBeTruthy();
+    expect(screen.getByText(/This window cannot copy for you/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /copy/i })).toBeNull();
   });
 

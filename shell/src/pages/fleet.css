@@ -33,30 +33,11 @@
   min-width: 0;
 }
 
-.fleet-check {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  color: var(--text-muted);
+/* The shared field select, sized for a toolbar: `.ui-field select` asks for 14rem. */
+.fleet-bar .ui-field select {
+  min-width: 10rem;
 }
 
-.fleet-btn {
-  padding: var(--space-1) var(--space-3);
-  font: inherit;
-  color: var(--text);
-  background: var(--surface-raised);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-}
-
-/* A toggle that is on: the neutral top rung, as a current row is marked elsewhere. */
-.fleet-btn[aria-pressed="true"] {
-  border-color: var(--text);
-  box-shadow: inset 2px 0 0 var(--text);
-}
-
-.fleet-btn:focus-visible,
 .fleet-act:focus-visible,
 .fleet-node:focus-visible,
 .fleet-earlier:focus-visible,
@@ -66,14 +47,14 @@
   outline-offset: 2px;
 }
 
-.fleet-pill {
-  padding: 2px var(--space-3);
+/* The house's slots: the word, then the lamps. */
+.fleet-slots {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-pill);
 }
 
 .fleet-conn {
@@ -114,9 +95,6 @@
   inset: 0;
   display: grid;
   place-items: center;
-  margin: 0;
-  font-size: var(--text-md);
-  color: var(--text-muted);
 }
 
 /* One quiet line under the loading skeleton: the stream cannot be reached yet. */
@@ -340,7 +318,9 @@
   height: 216px;
   padding: 6px 10px;
   overflow: hidden;
-  font: 12px/17px var(--font-mono);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
   background: var(--surface-sunken);
 }
 
@@ -349,7 +329,7 @@
 .fleet-term-card {
   flex: 1;
   height: auto;
-  padding: 4px 10px;
+  padding: var(--space-1) 10px;
   justify-content: flex-start;
 }
 
@@ -585,9 +565,8 @@
   gap: var(--space-2);
 }
 
-.fleet-panel-close {
+.fleet-panel-title .ui-icon-button {
   margin-left: auto;
-  font-size: var(--text-lg);
 }
 
 .fleet-panel-sub {
@@ -601,7 +580,9 @@
   flex: 1;
   padding: 10px var(--space-4);
   overflow: auto;
-  font: 12px/18px var(--font-mono);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
   background: var(--surface-sunken);
 }
 
@@ -653,7 +634,6 @@
 
 @media (forced-colors: active) {
   .fleet-node,
-  .fleet-btn,
   .fleet-act {
     border-color: CanvasText;
   }

@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { joinPath, useMove, type Entry } from "../../data/files";
 import { Button, Inset } from "../../ui";
-import { MOVE_SENTENCES, type MoveDone, RefusalOrError } from "./shared";
+import { MOVE_SENTENCES, type MoveDone, RefusalOrError, onEscape } from "./shared";
 import { FolderTree } from "./FolderTree";
 
 /* ---------------------------------------------------------------- move -- */
@@ -112,9 +112,7 @@ export function MoveForm({
         event.preventDefault();
         void submit();
       }}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") onClose();
-      }}
+      onKeyDown={onEscape(onClose)}
     >
       <Inset className="fi-move">
         <p id={headingId} className="fi-move-head">
@@ -144,13 +142,13 @@ export function MoveForm({
         <p className="fi-move-target" role="status">
           {same && !picked ? (
             <>
-              Pick the folder to move {one !== undefined ? "it" : "them"} into — {one !== undefined ? "it is" : "they are"} in{" "}
-              <span className="fi-move-what">{here}</span> now.
+              Pick the folder to move {one !== undefined ? "it" : "them"} into ({one !== undefined ? "it is" : "they are"} in{" "}
+              <span className="fi-move-what">{here}</span> now).
             </>
           ) : same ? (
-            `That is where ${one !== undefined ? "it is" : "they are"} now — pick another folder.`
+            `That is where ${one !== undefined ? "it is" : "they are"} now. Pick another folder.`
           ) : intoItself ? (
-            "A folder cannot go inside itself — pick one outside it."
+            "A folder cannot go inside itself. Pick one outside it."
           ) : (
             <>
               To <span className="fi-move-what">{where}/</span>
@@ -159,7 +157,7 @@ export function MoveForm({
                   , as <span className="fi-move-what">{joinPath(where, one.name)}</span>
                 </>
               )}
-              <span className="fi-move-again"> — click it again, or press Move</span>
+              <span className="fi-move-again">: click it again, or press Move</span>
             </>
           )}
         </p>

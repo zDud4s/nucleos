@@ -7,7 +7,7 @@ import {
   useWriteProjectFile,
   type Claim,
 } from "../data/project-config";
-import { ErrorNote, Inset, Quiet, StaleNote } from "../ui";
+import { Button, ErrorNote, Field, Inset, Quiet, StaleNote } from "../ui";
 
 /**
  * The files this app is the legitimate author of, and the editor for them.
@@ -86,7 +86,7 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
       */}
       <p className="text-xs text-text-faint">
         Every other file in this project belongs to the repository. Those are read here and edited in
-        VS Code, at the file and the line — the Code mode has the door.
+        VS Code, at the file and the line. The Code mode has the door.
       </p>
     </div>
   );
@@ -100,7 +100,7 @@ export function OwnedFiles({ projectId }: OwnedFilesProps) {
  */
 const REFUSALS: Record<string, string> = {
   kill_switch:
-    "the emergency stop is engaged, so nothing writes — including this. The file is still editable in an editor.",
+    "the emergency stop is engaged, so nothing writes, including this. The file is still editable in an editor.",
   no_project_root: `the ${DAEMON_NAME} has no folder recorded for this project.`,
   not_ours: `the ${DAEMON_NAME} does not consider this app the author of that file.`,
   unwritable: "that path does not land inside the folder it belongs in.",
@@ -142,13 +142,7 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
     <Inset>
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <p className="font-mono text-sm text-text">{shown}</p>
-        <button
-          type="button"
-          onClick={() => setOpen(!open)}
-          className="rounded-md border border-border px-2 py-1 text-xs text-text-muted hover:border-border-strong"
-        >
-          {open ? "close" : "edit"}
-        </button>
+        <Button onClick={() => setOpen(!open)}>{open ? "close" : "edit"}</Button>
       </div>
       <p className="text-xs text-text-muted">{claim.what}</p>
 
@@ -162,17 +156,17 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
                 There is no such file yet. Saving will create it.
               </p>
             ) : null}
-            <textarea
-              aria-label={shown}
-              value={text}
-              spellCheck={false}
-              rows={14}
-              onChange={(event) => setDraft(event.target.value)}
-              className="w-full rounded-md border border-border bg-surface-sunken p-2 font-mono text-xs text-text"
-            />
+            <Field label={shown} labelHidden>
+              <textarea
+                value={text}
+                spellCheck={false}
+                rows={14}
+                onChange={(event) => setDraft(event.target.value)}
+                className="font-mono! text-xs!"
+              />
+            </Field>
             <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
+              <Button
                 disabled={!dirty || write.isPending}
                 onClick={() =>
                   write.mutate(
@@ -182,10 +176,9 @@ function OwnedFile({ projectId, claim }: { projectId: string; claim: Claim }) {
                     { onSuccess: () => setDraft(null) },
                   )
                 }
-                className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
               >
                 {write.isPending ? "saving…" : "save"}
-              </button>
+              </Button>
               {dirty ? <span className="text-xs text-text-faint">unsaved changes</span> : null}
               {write.isSuccess && !dirty ? (
                 <span className="text-xs text-text-muted">saved</span>

@@ -24,7 +24,7 @@ import {
   type TeachKind,
 } from "../data/owner-notes";
 import { useProjects } from "../data/system";
-import { Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime, Skeleton } from "../ui";
 import { ForceGraph } from "./ForceGraph";
 import { Segments } from "./Segments";
 import { backlinks, buildModel, localModel } from "./graph-model";
@@ -53,8 +53,8 @@ export interface BrainPanelProps {
 }
 
 const TEACH_SENTENCES: Record<string, string> = {
-  already_taught: "This note is already taught — its lesson is still pending or active.",
-  archived: "An archived note cannot be taught — restore it first.",
+  already_taught: "This note is already taught. Its lesson is still pending or active.",
+  archived: "An archived note cannot be taught: restore it first.",
   unknown_kind: `The ${DAEMON_NAME} does not know that kind of lesson.`,
 };
 
@@ -159,8 +159,8 @@ function NotePanel({
   // fallback ("Telegram") until another render; it does not repaint by itself.
   const cachedChannels = useQueryClient().getQueryData<ChannelsReadout>(keys.channels.all);
 
-  if (detail.isError) return <ErrorNote>the {DAEMON_NAME} is not responding — the note is not known</ErrorNote>;
-  if (detail.data === undefined) return <Quiet says="Loading…" />;
+  if (detail.isError) return <ErrorNote>the {DAEMON_NAME} is not responding: the note is not known</ErrorNote>;
+  if (detail.data === undefined) return <Skeleton label="Loading the note" lines={4} />;
   const { note, links_out, links_in, events } = detail.data;
   const archived = note.state === "archived";
   // Oldest first, whatever order the daemon sent.
@@ -230,7 +230,7 @@ function NotePanel({
             <li key={event.id}>
               <span className="brain-history-kind">
                 {event.kind}
-                {event.detail !== null && event.detail !== "" ? ` — ${event.detail}` : ""}
+                {event.detail !== null && event.detail !== "" ? `: ${event.detail}` : ""}
               </span>{" "}
               <RelativeTime at={event.at} />
             </li>
@@ -323,7 +323,7 @@ function LocalGraph({
         <Segments label="Local graph depth" value={depth} options={DEPTHS} onChange={setDepth} />
       </div>
       {local === null ? (
-        <Quiet says="Loading the local graph…" />
+        <Skeleton label="Loading the local graph" lines={3} />
       ) : (
         <ForceGraph
           compact
@@ -438,7 +438,7 @@ function Teach({ id }: { id: number }) {
       </div>
       {teach.isSuccess && (
         <p role="status">
-          Proposed — waiting for your approval in <Link to="/brain" search={{ item: `knowledge:${teach.data.knowledge_id}` }}>the Brain</Link>
+          Proposed. Waiting for your approval in <Link to="/brain" search={{ item: `knowledge:${teach.data.knowledge_id}` }}>the Brain</Link>
         </p>
       )}
       {teach.isError && <Failure error={teach.error} sentences={TEACH_SENTENCES} />}

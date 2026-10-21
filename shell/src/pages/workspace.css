@@ -58,7 +58,7 @@
   margin: 0;
   padding: 0;
   list-style: none;
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background: var(--surface-raised);
 }
 
@@ -105,7 +105,7 @@
 .ws-metrics {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background: var(--surface-raised);
   overflow: hidden;
 }
@@ -130,7 +130,7 @@
   padding: 0;
   list-style: none;
   overflow: hidden;
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
 }
 
 .ws-slot {
@@ -231,7 +231,7 @@
   gap: 0;
   overflow: visible;
   border: 0;
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background: var(--surface-raised);
 }
 
@@ -270,7 +270,7 @@
   gap: var(--space-3);
   padding: var(--space-4);
   border: 0;
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
 }
 
 /* The readings' cards lose their frames and become the four cells of `.ws-metrics`. */
@@ -317,7 +317,7 @@
 .ws-page .ui-quiet-ask::before {
   content: "i";
   font-family: var(--font-display);
-  font-size: 0.6875rem;
+  font-size: var(--text-xs);
   font-weight: var(--weight-bold);
   line-height: 1;
 }
@@ -423,7 +423,7 @@ a.ws-lead-door:hover {
 }
 
 .ws-lead .ws-foot {
-  padding: 0 0 0 calc(0.5rem + var(--space-3));
+  padding: 0 0 0 calc(var(--space-2) + var(--space-3));
 }
 
 /**
@@ -609,14 +609,6 @@ a.ws-lead-door:hover {
   padding-inline: var(--space-4);
 }
 
-/* A failed CI run, said as a sentence in the wrong colour rather than a red box on a grey box. */
-.ws-alert {
-  margin: 0;
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  color: var(--tone-danger-fg);
-}
-
 /* Field labels in this page are sentence case, like every title above them. */
 .ws-page .ui-field-label {
   font-size: var(--text-sm);
@@ -675,6 +667,27 @@ a.ws-lead-door:hover {
     flex-wrap: nowrap;
     overflow-x: auto;
     scroll-snap-type: x proximity;
+    /* A cut-off tab reads as "there is more": the edges fade while the strip overflows (see the
+       horizontal scroll fade in tokens.css). */
+    mask-image: linear-gradient(
+      to right,
+      transparent 0,
+      #000 var(--scroll-fade-l),
+      #000 calc(100% - var(--scroll-fade-r)),
+      transparent 100%
+    );
+    -webkit-mask-image: linear-gradient(
+      to right,
+      transparent 0,
+      #000 var(--scroll-fade-l),
+      #000 calc(100% - var(--scroll-fade-r)),
+      transparent 100%
+    );
+    animation: scroll-fade-l linear both, scroll-fade-r linear both;
+    animation-timeline: scroll(self inline), scroll(self inline);
+    animation-range: 0 var(--space-4), calc(100% - var(--space-4)) 100%;
+    /* Driven by scroll position, not by time: the reduced-motion clamp must not zero it. */
+    animation-duration: auto !important;
   }
 
   .ws-tabs .ui-tab {
@@ -879,7 +892,7 @@ button.ws-lead-door:hover {
   max-width: 100%;
   overflow-x: auto;
   padding: var(--space-3);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background: var(--surface-raised);
 }
 
@@ -977,13 +990,13 @@ button.ws-lead-door:hover {
 
 .ws-atlas-node-name {
   fill: var(--text);
-  font-size: 13px;
+  font-size: var(--text-sm);
   font-weight: var(--weight-medium);
 }
 
 .ws-atlas-node-meta {
   fill: var(--text-muted);
-  font-size: 12px;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
 }
 
@@ -1003,7 +1016,7 @@ button.ws-lead-door:hover {
   min-width: 5.5rem;
   padding: var(--space-3) var(--space-2);
   border: 1px dashed var(--border-strong);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background: transparent;
   color: var(--text-muted);
   font: inherit;
@@ -1222,7 +1235,7 @@ button.ws-lead-door:hover {
 .ws-waiting {
   display: flex;
   flex-direction: column;
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background: var(--surface-raised);
 }
 
@@ -1302,7 +1315,7 @@ button.ws-lead-door:hover {
   position: relative;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background-color: var(--surface-sunken);
   background-image: radial-gradient(circle, var(--border) 1px, transparent 1.2px);
   cursor: grab;
@@ -1377,8 +1390,7 @@ button.ws-lead-door:hover {
   color: var(--text);
 }
 
-.ws-canvas-tools > button:focus-visible,
-.ws-canvas-close:focus-visible {
+.ws-canvas-tools > button:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
@@ -1400,7 +1412,7 @@ button.ws-lead-door:hover {
   width: min(26rem, calc(100% - 2 * var(--space-3)));
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: 0.75rem;
+  border-radius: var(--radius-xl);
   background: var(--surface);
   cursor: auto;
   user-select: text;
@@ -1409,24 +1421,4 @@ button.ws-lead-door:hover {
 .ws-canvas-panel > .ws-atlas-detail {
   padding-right: var(--space-6);
   background: none;
-}
-
-.ws-canvas-close {
-  position: absolute;
-  top: var(--space-2);
-  right: var(--space-2);
-  width: 1.75rem;
-  height: 1.75rem;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: none;
-  color: var(--text-muted);
-  font-size: var(--text-lg);
-  line-height: 1;
-  cursor: pointer;
-}
-
-.ws-canvas-close:hover {
-  background: var(--surface-raised);
-  color: var(--text);
 }

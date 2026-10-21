@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { agreementText, seatName, type CouncilView, type Synthesis } from "../data/council";
+import { plural } from "../lib/plural";
 import { Panel, Quiet } from "../ui";
 import { CouncilRich } from "./CouncilRich";
 
@@ -41,7 +42,7 @@ export function CouncilSynthesis({ view }: { view: CouncilView }) {
       <Panel title="Synthesis">
         {view.synthesis_status === "degraded" && (
           <p className="council-synthesis-degraded" role="note">
-            unstructured synthesis — the chairman&apos;s answer could not be read as consensus,
+            unstructured synthesis: the chairman&apos;s answer could not be read as consensus,
             disagreements and open questions, so it is shown as written.
           </p>
         )}
@@ -88,7 +89,7 @@ function StructuredSynthesis({ synthesis, view }: { synthesis: Synthesis; view: 
         <p className="council-synthesis-why">{synthesis.confidence.why}</p>
         {agreement !== null && (
           <span className="council-synthesis-agreement">
-            {`${agreementText(agreement)} · ${agreement.ballots} ${agreement.ballots === 1 ? "ballot" : "ballots"}`}
+            {`${agreementText(agreement)} · ${plural(agreement.ballots, "ballot")}`}
           </span>
         )}
       </div>

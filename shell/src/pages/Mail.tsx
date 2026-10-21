@@ -35,6 +35,7 @@ import {
   type QueryLike,
 } from "../ui";
 import "./mail.css";
+import { plural } from "../lib/plural";
 
 /**
  * Mail — the inbound queue, one triage button, and the configuration that
@@ -234,11 +235,10 @@ function TriageStatus({ triage }: { triage: TriageMutation }) {
  */
 function TriageOutcomeNote({ outcome }: { outcome: TriageOutcome }) {
   if (outcome.queued > 0) {
-    const noun = outcome.queued === 1 ? "message" : "messages";
-    const run = outcome.run_id === null ? "" : ` — run ${outcome.run_id}`;
+    const run = outcome.run_id === null ? "" : `, run ${outcome.run_id}`;
     return (
       <p className="mail-outcome">
-        Queued {outcome.queued} {noun} for triage{run}
+        Queued {plural(outcome.queued, "message")} for triage{run}
       </p>
     );
   }
@@ -339,11 +339,11 @@ function EmptyQueue({ filtered }: { filtered: boolean }) {
   return (
     <Teach title={filtered ? "Nothing matches that search" : "The inbound queue is empty"}>
       {filtered ? (
-        <p>Clear the search above to see the whole queue — an empty match is not an empty inbox.</p>
+        <p>Clear the search above to see the whole queue: an empty match is not an empty inbox.</p>
       ) : (
         <p>
           Nothing has arrived, or everything that has has already been read out of the queue.
-          Retention keeps a rolling window of mail, not a history — this list is what is here now.
+          Retention keeps a rolling window of mail, not a history: this list is what is here now.
         </p>
       )}
     </Teach>
@@ -379,7 +379,7 @@ function QueueList({
       )}
       {rows.length >= MAIL_QUEUE_LIMIT && (
         <p className="mail-ceiling">
-          Showing the newest {MAIL_QUEUE_LIMIT} — narrow the search to reach further back.
+          Showing the newest {MAIL_QUEUE_LIMIT}: narrow the search to reach further back.
         </p>
       )}
     </>
@@ -493,11 +493,11 @@ function ConfigPanel({
  * asked for until somebody arms the pillar.
  */
 function configState(data: EmailConfigView): ReactNode {
-  if (!data.enabled) return "not enabled — nothing is fetched";
+  if (!data.enabled) return "not enabled: nothing is fetched";
   if (!data.armed) {
     return (
       <>
-        enabled but not <Term term="armed">armed</Term> — mail arrives, triage does not run
+        enabled but not <Term term="armed">armed</Term>: mail arrives, triage does not run
       </>
     );
   }
@@ -534,8 +534,8 @@ function configLocalTriage(data: EmailConfigView): string {
  */
 function CursorFact({ mailbox, cursor, loading }: { mailbox: string; cursor: MailCursor | undefined; loading: boolean }) {
   if (loading) return <span className="mail-loading">Reading the sync position…</span>;
-  if (cursor === null) return <>nothing recorded yet for {mailbox} — it has not been synced.</>;
-  if (cursor === undefined) return <>unknown — the sync position could not be read</>;
+  if (cursor === null) return <>nothing recorded yet for {mailbox}: it has not been synced.</>;
+  if (cursor === undefined) return <>unknown: the sync position could not be read</>;
   return (
     <span className="mail-config-data">
       UID validity {cursor.uidvalidity} · last UID {cursor.last_uid}
@@ -562,7 +562,7 @@ function SkippedAbsence() {
           costs every reader who already knows it. */}
       <Quiet says="a message the fetcher could not parse is never a row in this queue.">
         <p>
-          A message the fetcher could not parse does not appear above — it is written only as a line
+          A message the fetcher could not parse does not appear above: it is written only as a line
           on the feed, kind <code className="mail-kind">email_fetch_skipped</code>, with the reason
           in its text. Open <Link to="/feed">the feed</Link> and filter by that kind to read them.
         </p>

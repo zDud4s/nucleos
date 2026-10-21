@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { ApiRefusal } from "../../data/client";
 import { tool, toolsDaemon } from "./tools-test-helpers";
 import { ScopedTools } from "./ScopedTools";
@@ -16,6 +16,9 @@ vi.mock("../../data/client", async (original) => ({
 beforeEach(() => {
   daemon.apiFetch.mockReset();
 });
+
+// The interlock ignores a second activation inside its dwell (a double-click is one gesture).
+const pastTheDwell = () => act(async () => void (await new Promise((r) => setTimeout(r, 350))));
 
 describe("ScopedTools - own tools", () => {
   it("lists only the active tools of its owner with their origin, and counts the waiting ones", async () => {
@@ -42,7 +45,7 @@ describe("ScopedTools - own tools", () => {
     expect(region.textContent).not.toContain("team_report");
     expect(region.textContent).not.toContain("team_action");
     expect(await screen.findByText("1 more waiting for you in the Brain")).toBeDefined();
-    expect(screen.getAllByRole("button", { name: /^Revoke / })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(2);
   });
 
   it("asks the daemon for this owner's rows only", async () => {
@@ -61,7 +64,11 @@ describe("ScopedTools - own tools", () => {
     );
 
     await renderWithRouter(<ScopedTools ownerKind="agent" ownerId="scout" />);
-    fireEvent.click(await screen.findByRole("button", { name: "Revoke web_read" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    // Revoking is behind the interlock: the first activation only arms it.
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/loadout/tools/2/revoke", expect.anything());
+    await pastTheDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Take this tool back" }));
 
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith(
@@ -79,7 +86,9 @@ describe("ScopedTools - own tools", () => {
     );
 
     await renderWithRouter(<ScopedTools ownerKind="agent" ownerId="scout" />);
-    fireEvent.click(await screen.findByRole("button", { name: "Revoke web_read" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    await pastTheDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Take this tool back" }));
 
     expect(await screen.findByText(/already decided|no longer active/i)).toBeDefined();
   });

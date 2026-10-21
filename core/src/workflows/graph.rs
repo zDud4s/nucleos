@@ -670,6 +670,53 @@ fn reaches(graph: &Graph, from: &str, target: &str) -> bool {
     false
 }
 
+/// Every decision literal that reads a catalogue agent's declared closed set (`one-of:`) must be
+/// in that set. `load` resolves an agent ref exactly as written in the graph (`reviewer@1.0.0`)
+/// to its output shape. Skipped silently: nodes without `agent:`, refs `load` cannot resolve, keys
+/// the shape does not declare with a `one-of:`, and conditions that do not parse (`validate`
+/// reports those).
+pub fn check_agent_facts(
+    graph: &Graph,
+    load: impl Fn(&str) -> Option<crate::agents::output::OutputShape>,
+) -> Result<(), String> {
+    // Node id -> its agent ref and that agent's closed sets, `None` when the shape is unknown.
+    type Declared<'a> = Option<(&'a str, BTreeMap<String, Vec<String>>)>;
+    let mut declared: BTreeMap<&str, Declared> = BTreeMap::new();
+    for node in &graph.nodes {
+        let Some(reference) = node.agent.as_deref() else {
+            continue;
+        };
+        declared.insert(
+            node.id.as_str(),
+            load(reference).map(|shape| (reference, shape.fact_values())),
+        );
+    }
+    for node in graph.nodes.iter().filter(|n| n.kind == Kind::Decision) {
+        let Some(Ok(parsed)) = node.condition.as_deref().map(condition::parse) else {
+            continue;
+        };
+        for (key, values) in parsed.comparisons() {
+            let Some((namespace, fact)) = key.split_once('.') else {
+                continue;
+            };
+            let Some(Some((reference, facts))) = declared.get(namespace) else {
+                continue;
+            };
+            let Some(allowed) = facts.get(fact) else {
+                continue;
+            };
+            if let Some(bad) = values.iter().find(|v| !allowed.contains(v)) {
+                return Err(format!(
+                    "`{}` compares `{key}` to `{bad}`, but `{reference}` declares only {}",
+                    node.id,
+                    allowed.join(" | ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether anything branches on how this node exited.
 pub fn is_gate(edges: &[Edge], node_id: &str) -> bool {
     edges
@@ -1219,5 +1266,94 @@ edges:
     fn the_autopilot_graph_has_no_agent_references() {
         let graph = parse(include_str!("../../assets/autopilot/1.0.0/graph.yaml")).unwrap();
         assert!(graph.nodes.iter().all(|node| node.agent.is_none()));
+    }
+
+    fn reviewer_shape(_reference: &str) -> Option<crate::agents::output::OutputShape> {
+        crate::agents::output::parse_output_md(
+            "## Findings\nBullets.\n\n## Verdict\none-of: approved | changes\n",
+        )
+        .ok()
+    }
+
+    fn agent_facts_graph(condition: &str) -> Graph {
+        parse(&format!(
+            "nodes:\n  - id: reviewer\n    type: agent\n    agent: reviewer@1.0.0\n  - id: plain\n    type: agent\n  - id: route\n    type: decision\n    condition: '{condition}'\n  - {{id: yes, type: agent}}\n  - {{id: no, type: agent}}\nedges:\n  - {{from: reviewer, to: route}}\n  - {{from: route, to: yes, when: true}}\n  - {{from: route, to: no, when: false}}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_facts_accept_declared_literals() {
+        for cond in [
+            "reviewer.verdict == approved",
+            "reviewer.verdict != \"changes\"",
+            "reviewer.verdict in [approved, changes]",
+        ] {
+            assert_eq!(
+                check_agent_facts(&agent_facts_graph(cond), reviewer_shape),
+                Ok(()),
+                "{cond}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_facts_refuse_an_undeclared_literal_for_eq_and_in() {
+        let err = check_agent_facts(&agent_facts_graph("reviewer.verdict == x"), reviewer_shape)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "`route` compares `reviewer.verdict` to `x`, but `reviewer@1.0.0` declares only approved | changes"
+        );
+        let err = check_agent_facts(
+            &agent_facts_graph("reviewer.verdict in [approved, nope]"),
+            reviewer_shape,
+        )
+        .unwrap_err();
+        assert!(err.contains("to `nope`"), "{err}");
+    }
+
+    #[test]
+    fn agent_facts_skip_what_they_cannot_judge() {
+        // Undeclared key, node without `agent:`, unresolved ref, unparseable condition.
+        for cond in [
+            "reviewer.other == x",
+            "plain.verdict == x",
+            "job.verdict == x",
+            "reviewer.verdict ==",
+        ] {
+            let graph = Graph {
+                nodes: vec![
+                    Node {
+                        id: "reviewer".into(),
+                        kind: Kind::Agent,
+                        agent: Some("reviewer@1.0.0".into()),
+                        ..bare_node("reviewer")
+                    },
+                    Node {
+                        id: "plain".into(),
+                        ..bare_node("plain")
+                    },
+                    Node {
+                        id: "route".into(),
+                        kind: Kind::Decision,
+                        condition: Some(cond.into()),
+                        ..bare_node("route")
+                    },
+                ],
+                edges: Vec::new(),
+            };
+            assert_eq!(check_agent_facts(&graph, reviewer_shape), Ok(()), "{cond}");
+        }
+        let graph = agent_facts_graph("reviewer.verdict == x");
+        assert_eq!(check_agent_facts(&graph, |_| None), Ok(()));
+    }
+
+    fn bare_node(id: &str) -> Node {
+        let graph = parse(&format!(
+            "nodes:\n  - id: {id}\n    type: agent\nedges: []\n"
+        ))
+        .unwrap();
+        graph.nodes[0].clone()
     }
 }

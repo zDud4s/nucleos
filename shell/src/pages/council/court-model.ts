@@ -15,6 +15,7 @@ import {
   type StepView,
   type Synthesis,
 } from "../../data/council";
+import { plural } from "../../lib/plural";
 // `court-constants.ts` holds `MAX_COUNCIL_SEATS = 8` (`config::MAX_COUNCIL_SEATS`) on its own,
 // because `court-draft.ts` needs it and imports from this file's neighbourhood.
 import { MAX_COUNCIL_SEATS } from "./court-constants";
@@ -392,6 +393,33 @@ export function truncate(text: string, room = LECTERN_CHARS): string {
   return t.length > room ? `${t.slice(0, room - 1)}…` : t;
 }
 
+/**
+ * The six session seat states that read as plain words; `failed` carries its own reason and
+ * `empty` / `seated` are setup-only, so none of the three has an entry. Both maps below are typed
+ * by `SeatState` and so cannot name a state the model does not have.
+ */
+type SeatWords = Partial<Record<SeatState, string>>;
+
+/** A seat's state as a label fragment: `Seat 2, opus, thinking` (the courtroom's accessible names). */
+export const STATE_WORDS: SeatWords = {
+  speaking: "speaking",
+  thinking: "thinking",
+  ok: "done",
+  cancelled: "cancelled",
+  skipped: "skipped",
+  waiting: "waiting",
+};
+
+/** The same states as the dossier's sentence about a seat: `Seat 2 · opus · has not spoken yet`. */
+export const STATE_LINE: SeatWords = {
+  waiting: "has not spoken yet",
+  thinking: "thinking…",
+  speaking: "speaking",
+  ok: "done",
+  cancelled: "cancelled",
+  skipped: "skipped",
+};
+
 const PHASE_WORDS: Record<PhaseName, string> = {
   answer: "opening", critique: "deliberation", revise: "rebuttal", synthesis: "verdict",
 };
@@ -483,7 +511,7 @@ function wingOf(view: CouncilView, m: Moment, live: boolean, seats: CourtSeat[])
   if (view.status === "cancelled") return { title: "COUNCIL CANCELLED", sub: null };
   if (view.status === "error") return { title: "COUNCIL FAILED", sub: null };
   if (view.status === "done" && m.phase === "synthesis") {
-    const parts = [`${view.rounds_run} ${view.rounds_run === 1 ? "ROUND" : "ROUNDS"}`];
+    const parts = [plural(view.rounds_run, "round").toUpperCase()];
     if (view.agreement !== null) parts.push(AGREEMENT_WORDS[view.agreement.level] ?? view.agreement.level);
     if (view.stopped_early) parts.push("stopped early");
     return { title: parts.join(" · "), sub: null };

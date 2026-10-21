@@ -8,7 +8,9 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { X } from "lucide-react";
 import type { ProjectMap } from "../data/project-map";
+import { IconButton } from "../ui";
 import {
   drawColumn,
   neighbours,
@@ -274,9 +276,9 @@ function Canvas({
 
       {panel === null ? null : (
         <aside className="ws-canvas-panel">
-          <button type="button" className="ws-canvas-close" aria-label="Close" onClick={onClose}>
-            ×
-          </button>
+          <span className="absolute top-2 right-2">
+            <IconButton label="Close" icon={X} onClick={onClose} />
+          </span>
           {panel}
         </aside>
       )}
@@ -637,7 +639,7 @@ function SeamDetail({ data }: { data: ProjectMap }) {
       {seam.uncalled.length > 0 ? (
         <details className="ws-disclosure">
           <summary className="text-sm text-text-muted">
-            {seam.uncalled.length} routes no screen calls — agents and sidecars may
+            {seam.uncalled.length} routes no screen calls: agents and sidecars may
           </summary>
           <ul className="ws-atlas-files mt-2">
             {seam.uncalled.map((route) => (

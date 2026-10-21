@@ -1,6 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { Check, FolderRoot } from "lucide-react";
-import { Button, Modal } from "../ui";
+import { Button, Modal, Quiet } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import { useHome, useProjects } from "../data/system";
 
@@ -100,12 +100,10 @@ export function ProjectPicker({
       <div className="chats-picker" role="radiogroup" aria-label="Where this conversation runs">
         {projects.isPending && <p className="chats-loading">reading the projects…</p>}
         {projects.isError && projects.data === undefined && (
-          <p className="chats-picker-none">The {DAEMON_NAME} did not list its projects</p>
+          <Quiet compact says={`The ${DAEMON_NAME} did not list its projects`} />
         )}
         {projects.data !== undefined && choices.length === 0 && (
-          <p className="chats-picker-none">
-            no project on the roster has a folder yet — add one on the Projects page
-          </p>
+          <Quiet compact says="No project on the roster has a folder yet. Add one on the Projects page." />
         )}
         {projects.data !== undefined && (
           /* First, and set apart: it is not a project but the folder NucleOS itself runs from. */

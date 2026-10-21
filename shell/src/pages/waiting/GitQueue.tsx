@@ -150,7 +150,7 @@ export function GitQueuePanel({
               while — it is not a finding and is not drawn as one. */}
           {rows.length >= VCS_LIST_LIMIT && (
             <p className="waiting-ceiling">
-              the listing stops at {VCS_LIST_LIMIT} rows — this is the queue&apos;s
+              the listing stops at {VCS_LIST_LIMIT} rows. This is the queue&apos;s
               whole history, kept rather than pruned, so a full listing only means
               the daemon has been running a while
             </p>
@@ -203,7 +203,7 @@ function VcsRow({
           </p>
         )}
         <p className="waiting-meta" title={row.repo_key}>
-          {repoLabel(row.repo_key)} — asked from {row.origin}
+          {repoLabel(row.repo_key)}, asked from {row.origin}
         </p>
         {conflicts.length > 0 && (
           <div className="waiting-git-conflicts">
@@ -270,25 +270,25 @@ export function gitNextStep(
 ): { before: string; run?: number; after: string; yours: boolean } | null {
   if (row.status === "blocked") return { before: "submit it again", after: "", yours: true };
   if (row.status === "awaiting_owner")
-    return { before: "changes the test map — approve to let it land", after: "", yours: true };
+    return { before: "changes the test map, so approve to let it land", after: "", yours: true };
   if (row.status !== "escalated" || row.op !== "merge") return null;
   if (row.from_resolution === true)
     return {
       before:
-        "this merge was itself a resolution landing and conflicted again, so no agent is given it — resolve it by hand, or put it away if the merge no longer matters",
+        "this merge was itself a resolution landing and conflicted again, so no agent is given it. Resolve it by hand, or put it away if the merge no longer matters",
       after: "",
       yours: true,
     };
   const run = row.resolution_run_id;
   if (run == null)
     return {
-      before: "an agent is given this conflict within a minute — nothing to do yet",
+      before: "an agent is given this conflict within a minute, so there is nothing to do yet",
       after: "",
       yours: false,
     };
   switch (row.resolution_status) {
     case "running":
-      return { before: "", run, after: " is resolving it — nothing to do yet", yours: false };
+      return { before: "", run, after: " is resolving it, so there is nothing to do yet", yours: false };
     case "awaiting_approval":
       return { before: "", run, after: " is resolving it and waits on your approval", yours: true };
     case "completed": {
@@ -300,7 +300,7 @@ export function gitNextStep(
         return {
           before: "",
           run,
-          after: ` finished its resolution but its gate ${gate}, so the queue will not land it — open the run, land it by hand, or put it away if the merge no longer matters`,
+          after: ` finished its resolution but its gate ${gate}, so the queue will not land it. Open the run, land it by hand, or put it away if the merge no longer matters`,
           yours: true,
         };
       if (row.resolution_worktree_gone === true)
@@ -308,14 +308,14 @@ export function gitNextStep(
           before: "",
           run,
           after:
-            " finished its resolution but its worktree is gone, so the queue cannot land it — resolve it by hand, or put it away if the merge no longer matters",
+            " finished its resolution but its worktree is gone, so the queue cannot land it. Resolve it by hand, or put it away if the merge no longer matters",
           yours: true,
         };
       return {
         before: "",
         run,
         after:
-          " finished its resolution; the queue lands it and this clears on its own — if it stays, open the run to see why",
+          " finished its resolution; the queue lands it and this clears on its own. If it stays, open the run to see why",
         yours: false,
       };
     }
@@ -327,7 +327,7 @@ export function gitNextStep(
       return {
         before: "",
         run,
-        after: ` ended (${row.resolution_status}) without resolving it — resolve it by hand, or put it away if the merge no longer matters`,
+        after: ` ended (${row.resolution_status}) without resolving it. Resolve it by hand, or put it away if the merge no longer matters`,
         yours: true,
       };
     default:

@@ -257,13 +257,13 @@ export function FileTable(props: FileTableProps) {
         {entries !== undefined && entries.length === 0 && path === "" && (
           <Teach title="Nothing has been filed yet">
             <p>
-              Upload a file, make a folder, or drag something in from your file manager — a drop lands under the folder you
+              Upload a file, make a folder, or drag something in from your file manager. A drop lands under the folder you
               are looking at.
             </p>
           </Teach>
         )}
         {entries !== undefined && entries.length === 0 && path !== "" && (
-          <Quiet says="Nothing in this folder yet — upload, drop or make a folder here." />
+          <Quiet says="Nothing in this folder yet. Upload, drop or make a folder here." />
         )}
 
         {/* `fi-table-picking` once anything is picked: until then the row boxes
@@ -439,7 +439,7 @@ function useNameFit(cell: HTMLElement | null): number {
 function fileTitle(entry: { name: string; is_dir: boolean }, shown: string): string | undefined {
   const full = shown === entry.name ? null : entry.name;
   if (entry.is_dir) return full ?? undefined;
-  return full === null ? "Double-click to open" : `${full} — double-click to open`;
+  return full === null ? "Double-click to open" : `${full} (double-click to open)`;
 }
 
 function FileRow({

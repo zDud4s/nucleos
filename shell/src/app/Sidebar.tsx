@@ -3,6 +3,7 @@ import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { Check, ChevronsUpDown, LayoutList, PanelLeftClose, Plus, Search } from "lucide-react";
 import { NAV, SYSTEM_ITEM, type NavBadge, type NavItem } from "./nav";
 import type { AutopilotMode } from "../data/system";
+import { Quiet } from "../ui/Quiet";
 import { readState } from "../ui/state-map";
 import { DAEMON_NAME } from "../copy";
 import mark from "../assets/brand/mark.png";
@@ -377,7 +378,7 @@ function SwitcherPanel({
           )}
         </div>
         {projects !== undefined && typed !== "" && matches.length === 0 ? (
-          <p className="nav-switch-empty">No project called “{query.trim()}”.</p>
+          <Quiet compact says={`No project called “${query.trim()}”.`} />
         ) : null}
       </div>
 
@@ -480,7 +481,7 @@ function ProjectSwitcher({
           name into the note ("NucleOS the núcleo"). Collapsed there is no text at
           all, and a button whose whole content is an `alt=""` image has no name.
         */
-        aria-label={collapsed ? "Expand the sidebar" : `${name} — switch project`}
+        aria-label={collapsed ? "Expand the sidebar" : `${name}: switch project`}
         title={collapsed ? "Expand the sidebar" : undefined}
         onClick={collapsed ? onExpand : () => onOpenChange(!showing)}
       >

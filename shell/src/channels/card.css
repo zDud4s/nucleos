@@ -1,29 +1,73 @@
-/* Channel card (System > Channels). No colour of its own beyond the shared tokens. */
+/* Channel card (System > Channels): the body inside a `Panel`. Tokens only. */
 .ch-card {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2, 8px);
-  padding: var(--space-3, 12px);
-  border: 1px solid var(--line, rgba(128, 128, 128, 0.3));
-  border-radius: 8px;
+  align-items: flex-start;
+  gap: var(--space-3);
+  min-width: 0;
 }
-.ch-card-head {
+.ch-card > * { max-width: 100%; }
+/* The state word keeps the ink; a small dot beside it carries the tone, so colour only reinforces. */
+.ch-card-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+.ch-card-state::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-pill);
+  background: var(--text-faint);
+}
+.ch-card-state[data-state="online"]::before { background: var(--tone-active-fg); }
+.ch-card-state[data-state="starting"]::before { background: var(--tone-pending-fg); }
+.ch-card-state[data-state="offline"]::before,
+.ch-card-state[data-state="incompatible"]::before { background: var(--tone-danger-fg); }
+.ch-card-meta {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+.ch-card-facts {
   display: flex;
-  align-items: baseline;
-  gap: var(--space-2, 8px);
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.ch-card-missing { margin: 0 0 var(--space-2); padding-left: var(--space-4); }
+.ch-card-actions {
+  display: flex;
+  align-items: center;
   flex-wrap: wrap;
+  gap: var(--space-2);
+  width: 100%;
 }
-.ch-card-title { margin: 0; font-size: 1rem; }
-.ch-card-state { font-weight: 600; }
-.ch-card-state[data-state="offline"],
-.ch-card-state[data-state="incompatible"] { opacity: 0.85; text-decoration: underline dotted; }
-.ch-card-facts { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
-.ch-card-actions { display: flex; align-items: center; gap: var(--space-2, 8px); flex-wrap: wrap; }
-.ch-primary { display: flex; align-items: center; gap: var(--space-2, 8px); flex-wrap: wrap; }
-.ch-primary-badge {
-  padding: 0 6px;
-  border: 1px solid currentColor;
-  border-radius: 999px;
-  font-size: 0.75rem;
-  text-transform: uppercase;
+/* The way out to Health sits at the row's far edge, away from the two buttons. */
+.ch-card-health {
+  margin-left: auto;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
 }
+.ch-primary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.ch-caps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+.ch-caps strong { color: var(--text); font-weight: var(--weight-semibold); }

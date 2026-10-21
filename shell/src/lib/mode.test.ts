@@ -33,7 +33,7 @@ describe("promotionConsequence", () => {
       project({ project_id: "alpha", wip_limit: 4, open_review_items: 3 }),
     );
     expect(said).toBe(
-      "alpha acts on its own — 3 of its 4 proposal slots already in use, no approval",
+      "alpha acts on its own: 3 of its 4 proposal slots already in use, no approval",
     );
   });
 
@@ -48,7 +48,7 @@ describe("promotionConsequence", () => {
     const said = promotionConsequence(
       project({ project_id: "beta", wip_limit: null, open_review_items: 3 }),
     );
-    expect(said).toBe("beta acts on its own — no ceiling on proposals, no approval");
+    expect(said).toBe("beta acts on its own: no ceiling on proposals, no approval");
     expect(said).not.toContain("0");
     // Absence, not a number dressed as absence: nothing here counts anything.
     expect(said).not.toMatch(/in use/);
@@ -60,7 +60,7 @@ describe("promotionConsequence", () => {
       project({ project_id: "gamma", wip_limit: 2, open_review_items: 2 }),
     );
     expect(said).toBe(
-      "gamma acts on its own — 2 of its 2 proposal slots already in use, no approval",
+      "gamma acts on its own: 2 of its 2 proposal slots already in use, no approval",
     );
   });
 });
@@ -137,18 +137,14 @@ describe("MODE_SENTENCES", () => {
  * The 422 as it read before it became a list, pasted byte for byte from `MODE_SENTENCES`.
  *
  * A surface that still prints a sentence must print this one, not a re-join of the list that has
- * drifted by a comma. Its one non-ASCII character is the em dash, and a paste that lost it would pass
- * against itself — hence the guard at the top of the case. The shell composes this sentence itself
+ * drifted by a comma. The shell composes this sentence itself
  * (the daemon sends no prose), so the copy migration to DAEMON_NAME legitimately dropped the old daemon name.
  */
 const OLD_UNPROCESSABLE =
-  "the background service would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, the project onboarded to NucleOS, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file — plus, to act, a folder that is a git repository.";
+  "the background service would not put this project into that mode, and it did not say which prerequisite is missing. It needs all of these: a folder, the project onboarded to NucleOS, .claude/hooks/ask_daemon.py on disk, and a PreToolUse hook in .claude/settings.json naming that file. Plus, to act, a folder that is a git repository.";
 
 describe("MODE_REFUSAL_PROSE", () => {
   it("the prose form is byte-identical to the sentence it replaces", () => {
-    // Escapes, not the characters: a guard spelled with the same bytes as the paste proves nothing.
-    expect(OLD_UNPROCESSABLE).toContain("\u2014");
-
     expect(MODE_REFUSAL_PROSE).toBeDefined();
     expect(MODE_REFUSAL_PROSE.unprocessable).toBe(OLD_UNPROCESSABLE);
     expect(MODE_REFUSAL_PROSE.bad_request).toBe("that is not one of the three settings");

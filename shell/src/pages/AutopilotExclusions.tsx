@@ -29,7 +29,7 @@ export function ExclusionsPanel() {
   return (
     <Panel title="Never at the same time">
       {rules.isError && rules.data === undefined && (
-        <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about the exclusions.</ErrorNote>
+        <ErrorNote>Could not reach the {DAEMON_NAME}: nothing is known about the exclusions.</ErrorNote>
       )}
       {rules.data !== undefined && active.length === 0 && <Quiet says="No two jobs are kept apart." />}
       {active.length > 0 && (
@@ -39,7 +39,7 @@ export function ExclusionsPanel() {
           ))}
         </ul>
       )}
-      {revoke.isError && <ErrorNote>Could not reach the {DAEMON_NAME} — the rule was not lifted.</ErrorNote>}
+      {revoke.isError && <ErrorNote>Could not reach the {DAEMON_NAME}: the rule was not lifted.</ErrorNote>}
       <KeepApart jobs={jobs.data ?? []} rules={active} />
     </Panel>
   );
@@ -56,7 +56,7 @@ function ExclusionRow({ rule, onLift }: { rule: FleetExclusion; onLift: () => vo
         <RelativeTime at={rule.created_at} />
       </div>
       {/* Only the higher id waits: the daemon parks it while the lower one holds a slot. */}
-      <p className="ap-meta">never at the same time — job {rule.job_high} waits</p>
+      <p className="ap-meta">never at the same time: job {rule.job_high} waits</p>
       <div className="ap-actions">
         <ConfirmButton
           label="Lift"
@@ -139,7 +139,7 @@ function KeepApart({ jobs, rules }: { jobs: Job[]; rules: FleetExclusion[] }) {
         (isApiRefusal(propose.error) ? (
           <RefusalNote refusal={propose.error} />
         ) : (
-          <ErrorNote>Could not reach the {DAEMON_NAME} — nothing was asked.</ErrorNote>
+          <ErrorNote>Could not reach the {DAEMON_NAME}: nothing was asked.</ErrorNote>
         ))}
     </form>
   );

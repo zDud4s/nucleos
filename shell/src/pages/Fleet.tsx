@@ -8,7 +8,7 @@ import { FleetCanvas } from "../fleet/Surface";
 import { TopBar } from "../fleet/TopBar";
 import { TranscriptPanel } from "../fleet/TranscriptPanel";
 import { FleetUiContext, type FleetUi } from "../fleet/ui-context";
-import { PageHeader, Skeleton } from "../ui";
+import { PageHeader, Quiet, Skeleton } from "../ui";
 import "./fleet.css";
 
 const NONE: ReadonlySet<string> = new Set();
@@ -94,11 +94,13 @@ function FleetScreen() {
           <>
             <Skeleton label="Loading the fleet" variant="cards" count={3} />
             {failedReconnects >= UNREACHABLE_AFTER && (
-              <p className="fleet-note">Can't reach the fleet stream — retrying</p>
+              <p className="fleet-note">Can't reach the fleet stream, retrying</p>
             )}
           </>
         ) : nothing ? (
-          <p className="fleet-empty">{filtered ? "Nothing matches this project" : "Nothing is running"}</p>
+          <div className="fleet-empty">
+            <Quiet compact says={filtered ? "Nothing matches this project" : "Nothing is running"} />
+          </div>
         ) : (
           <FleetCanvas project={project} onlyActive={onlyActive} expanded={expanded} follow={follow} fitSignal={fitSignal} />
         )}

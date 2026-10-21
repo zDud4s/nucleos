@@ -105,6 +105,7 @@ const PAIRS: ReadonlyArray<readonly [string, string]> = [
   ["--radius-sm", "--radius-sm"],
   ["--radius-md", "--radius-md"],
   ["--radius-lg", "--radius-lg"],
+  ["--radius-xl", "--radius-xl"],
   ["--radius-pill", "--radius-pill"],
 ];
 

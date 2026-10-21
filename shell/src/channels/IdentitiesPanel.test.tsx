@@ -98,7 +98,7 @@ describe("IdentitiesPanel", () => {
   it("shows a loading status while the identities are read", async () => {
     daemon.apiFetch.mockImplementation(() => new Promise(() => {}));
     await renderWithRouter(<IdentitiesPanel channel={channel} />);
-    expect(screen.getByRole("status").textContent).toMatch(/reading the identities/);
+    expect(screen.getByRole("status").textContent).toMatch(/Reading the identities/);
   });
 
   it("explains a refusal", async () => {

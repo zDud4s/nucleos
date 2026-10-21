@@ -17,7 +17,7 @@ import {
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
-import { ErrorNote, Inset, ModeSwitch, Quiet, StaleNote } from "../ui";
+import { ErrorNote, Inset, ModeSwitch, Quiet, StaleNote, Table, Td, Th } from "../ui";
 import { OnboardPanel } from "./Onboard";
 
 /**
@@ -286,7 +286,7 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
   const reading = (
     <p id={readingId} aria-live="polite" className="text-base font-medium tabular-nums text-text">
       {limit === null
-        ? `no ceiling — ${open} ${open === 1 ? "proposal" : "proposals"} waiting on you`
+        ? `no ceiling: ${open} ${open === 1 ? "proposal" : "proposals"} waiting on you`
         : `${open} of ${limit} taken`}
     </p>
   );
@@ -377,8 +377,8 @@ function Ceiling({ project, stale }: { project: ProjectSummary; stale: boolean }
       {setLimit.isError ? (
         <ErrorNote>
           {refused === null
-            ? `The ceiling was not changed — the ${DAEMON_NAME} gave no reply.`
-            : `The ceiling was not changed — ${refused.detail}`}
+            ? `The ceiling was not changed: the ${DAEMON_NAME} gave no reply.`
+            : `The ceiling was not changed: ${refused.detail}`}
         </ErrorNote>
       ) : null}
     </Block>
@@ -451,7 +451,7 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
           Nothing recorded is not "zero of zero clear". A project that has never run in shadow has
           taken no measurement, and saying it failed one would be inventing a result.
         */
-        <Quiet says="Nothing recorded in shadow yet — there is no measurement here, which is not the same as a bad one." />
+        <Quiet says="Nothing recorded in shadow yet. There is no measurement here, which is not the same as a bad one." />
       ) : (
         <>
           {/*
@@ -467,30 +467,23 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
             {project.classes_ready} of {project.classes_total}{" "}
             {project.classes_total === 1 ? "class clears" : "classes clear"} the bar.
           </p>
-          <table className="w-full max-w-xl border-collapse text-xs">
-            <caption className="sr-only">Shadow decisions by action class</caption>
-            <thead>
-              <tr className="text-text-faint">
-                <th scope="col" className="pb-1 text-left font-normal">
-                  Class
-                </th>
-                <th scope="col" className="pb-1 text-right font-normal">
-                  Decided
-                </th>
-                <th scope="col" className="pb-1 text-right font-normal">
-                  Reviewed
-                </th>
-                <th scope="col" className="pb-1 text-right font-normal">
-                  Disagreed
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <ClassRow key={row.action_class} row={row} />
-              ))}
-            </tbody>
-          </table>
+          <div className="max-w-xl">
+            <Table label="Shadow decisions by action class">
+              <thead>
+                <tr>
+                  <Th>Class</Th>
+                  <Th num>Decided</Th>
+                  <Th num>Reviewed</Th>
+                  <Th num>Disagreed</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <ClassRow key={row.action_class} row={row} />
+                ))}
+              </tbody>
+            </Table>
+          </div>
           <p className="text-xs text-text-muted">
             The bar counts each distinct command once; this table counts every decision, so its
             numbers run higher than the bar&rsquo;s.
@@ -513,13 +506,23 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
  */
 function ClassRow({ row }: { row: ClassTally }) {
   return (
-    <tr className="border-t border-border">
-      <th scope="row" className="py-1 pr-3 text-left font-mono font-normal text-text">
-        {row.action_class}
-      </th>
-      <td className="py-1 text-right font-mono tabular-nums text-text-muted">{row.total}</td>
-      <td className="py-1 text-right font-mono tabular-nums text-text-muted">{row.reviewed}</td>
-      <td className="py-1 text-right font-mono tabular-nums text-text-muted">{row.disagree}</td>
+    <tr>
+      {/* A row header, which `Table` dresses as a column head (capitals, faint); the identifier
+          is the daemon's own spelling and is set back to it. */}
+      <Th scope="row">
+        <span className="font-mono text-sm font-normal tracking-normal text-text normal-case">
+          {row.action_class}
+        </span>
+      </Th>
+      <Td num muted>
+        {row.total}
+      </Td>
+      <Td num muted>
+        {row.reviewed}
+      </Td>
+      <Td num muted>
+        {row.disagree}
+      </Td>
     </tr>
   );
 }

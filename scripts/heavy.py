@@ -514,10 +514,15 @@ def _queue_order(items: list[tuple[Path, dict]], state: Path | None = None
 
 
 def acquire_token(directory: Path, rec: dict, wait_cap: float,
-                  arrival_ns: int | None = None) -> tuple[bool, float]:
+                  arrival_ns: int | None = None, light=None) -> tuple[bool, float]:
     """Queue, wait for the head position and room, then hold. Returns (admitted, waited_s).
     Not admitted means the wait cap expired; the queue entry is gone either way (when
-    admitted it has become the holder file)."""
+    admitted it has become the holder file).
+
+    `light`, when given, is tried while queued (first right after the static check fails, then
+    every NUCLEOS_HEAVY_LIGHT_RETRY_S), always OUTSIDE the Mutex hold since it takes the Mutex
+    itself. When it returns True the request is admitted WITHOUT a held/<pid> record: the
+    caller's callable has registered the light run and tells the caller by its own side effect."""
     queue_dir, held_dir = directory / "queue", directory / "held"
     me = os.getpid()
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
@@ -533,6 +538,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     except Exception:
         shadow = None
     admitted = False
+    light_retry = _env_float("NUCLEOS_HEAVY_LIGHT_RETRY_S", 2.0)
+    last_light = None
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -564,6 +571,21 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                         queued = False
                         admitted = True
                         return True, time.time() - t0
+            if light is not None and (last_light is None
+                                      or time.monotonic() - last_light >= light_retry):
+                last_light = time.monotonic()
+                try:
+                    got_light = bool(light())
+                except Exception:
+                    got_light = False
+                if got_light:
+                    try:
+                        qfile.unlink()
+                    except OSError:
+                        pass
+                    queued = False
+                    admitted = True
+                    return True, time.time() - t0
             now = time.time()
             if now - t0 >= wait_cap:
                 sys.stderr.write(
@@ -590,6 +612,98 @@ def release_token(directory: Path) -> None:
         (directory / "held" / str(os.getpid())).unlink()
     except OSError:
         pass
+
+
+def drop_token_weight(directory: Path, me_ctime) -> bool:
+    """Lower this process's own `held/<pid>` record to weight 1 (the test phase of a cargo run:
+    the compile is over, only the test binary runs). Never creates a record: it needs the one
+    this very process wrote (same pid and creation time) with a weight above 1, so a drop that
+    finds the record already gone does not recreate it. `release_token` unlinks outside the
+    Mutex, so a drop that read the record just before the unlink could in theory write it back;
+    that window is bounded by run_child's 5 s join of the watcher, and such a ghost is reaped
+    by `_entries` once this pid exits. The replacement is written outside `held/` (every file
+    there is read as a record), given the original's mtime/atime (the record has no "acquired",
+    so status and heavy_watch take the run's age from the file time), and moved over it under
+    the Mutex; the replace is retried once after 0.2 s (Windows readers can block it). Never
+    raises; False when nothing was changed."""
+    tmp = Path(directory) / f".held-{os.getpid()}.tmp"
+    try:
+        with Mutex(directory, 2.0):
+            path = Path(directory) / "held" / str(os.getpid())
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            if rec.get("pid") != os.getpid() or rec.get("ctime") != me_ctime:
+                return False
+            if int(rec.get("weight") or 1) <= 1:
+                return False
+            rec["weight"] = 1
+            tmp.write_text(json.dumps(rec), encoding="utf-8")
+            # Held records carry no "acquired": status and heavy_watch read a run's age from the
+            # file's mtime, so the replacement keeps the original's times.
+            st = path.stat()
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+            try:
+                os.replace(tmp, path)
+            except OSError:
+                # Windows: a reader (status/heavy_watch) holding the file open refuses the
+                # replace. The callback fires once, so retry once before giving up.
+                time.sleep(0.2)
+                os.replace(tmp, path)
+            return True
+    except BaseException as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        if not isinstance(exc, Exception):
+            raise
+        return False
+
+
+def try_light_lane(directory: Path, rec: dict, argv: list[str], verdict, kind: str,
+                   warm: bool) -> bool:
+    """Start a proven-small class without a token while the budget is full. On True the run
+    is registered in `light/<pid>` (counted against NUCLEOS_HEAVY_LIGHT_MAX, reaped like any
+    holder) and the caller must `release_light` when it ends. Never raises: any doubt is False,
+    which leaves the request in the ordinary queue."""
+    try:
+        if warm or kind == "cargo" or _is_cargo(argv):
+            return False
+        if verdict is not None and getattr(verdict, "kind", None) == "cargo":
+            return False
+        hc = _cost_mod()
+        cls = rec.get("cls")
+        if hc is None or not hc.light_enabled() or not isinstance(cls, str) or not cls:
+            return False
+        if cls.split("|", 1)[0] == "cargo":
+            return False
+        entry = hc.light_entry(hc.load_light(directory), cls)
+        if entry is None:
+            return False
+        p = hc.probe()
+        if p.get("busy_cores") is None:
+            # busy_cores is a difference of two samples; a fresh process has one.
+            time.sleep(hc.PRIME_S)
+            p = hc.probe()
+        if not hc.light_fits(entry, p)[0]:
+            return False
+        light_dir = directory / "light"
+        with Mutex(directory):
+            light_dir.mkdir(parents=True, exist_ok=True)
+            if len(_entries(light_dir)) >= hc.light_max():
+                return False
+            (light_dir / str(os.getpid())).write_text(
+                json.dumps({"pid": os.getpid(), "ctime": rec.get("ctime"), "cls": cls}),
+                encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def release_light(directory: Path) -> None:
+    try:
+        (directory / "light" / str(os.getpid())).unlink()
+    except Exception:
+        pass  # no record, or no state dir yet: nothing to give back
 
 
 # ------------------------------------------------------------------- worktree lock
@@ -1176,8 +1290,25 @@ def _watch_yield(proc, job, in_job: bool, stats: dict, yield_check, stop,
             return
 
 
+def _watch_phase(stats: dict, cb, stop: threading.Event) -> None:
+    """Call `cb` once, as soon as the output has shown a `Running ...`/`Doc-tests` header (the
+    compile is over, the tests have started). Polls the stats the pump threads fill; never
+    raises."""
+    while not stop.wait(0.25):
+        try:
+            if stats.get("progress", {}).get("binary"):
+                try:
+                    cb()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            return
+
+
 def run_child(argv: list[str], env: dict | None, job, low: bool = False,
-              progress: Path | None = None, yield_check=None) -> tuple[int, dict]:
+              progress: Path | None = None, yield_check=None,
+              on_test_phase=None) -> tuple[int, dict]:
     """Run argv, streaming stdout/stderr through; return (exit, stats). `low` runs it at
     below-normal CPU priority (Windows) with no console window of its own. With `progress`,
     that file holds, while it runs, the CPU its tree has used and what the output says about
@@ -1230,6 +1361,11 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
         writer = threading.Thread(target=_write_progress, args=(progress, stats, stop, cpu),
                                   daemon=True)
         writer.start()
+    phase = None
+    if on_test_phase is not None:
+        phase = threading.Thread(target=_watch_phase, args=(stats, on_test_phase, stop),
+                                 daemon=True)
+        phase.start()
     for t in threads:
         t.start()
     code = proc.wait()
@@ -1241,6 +1377,8 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     stop.set()
     if writer is not None:
         writer.join(timeout=5)
+    if phase is not None:
+        phase.join(timeout=5)  # a drop must not land after the token is released
     used = cpu() if cpu is not None else None
     if used is None and os.name != "nt":
         after = os.times()
@@ -2022,6 +2160,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     t_start = time.time()
     fp = None  # (crate dir, target dir, fingerprint) once computed
     hit = False
+    light = False  # admitted through the light lane (light/<pid>, no token)
     lease = None  # (k, slot dir, previous owner) of a leased target-dir pool slot
     root = None
     try:
@@ -2210,9 +2349,20 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             t_q = time.time()
             arrival_q = arrival or time.time_ns()
             poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
+
+            def _light_attempt() -> bool:
+                # Only a plain command qualifies: one that takes the worktree lock or a
+                # target-dir slot is cargo work, whatever its class says.
+                nonlocal light
+                if lock_hash is not None or pool or crate is not None:
+                    return False
+                if try_light_lane(directory, rec, argv, verdict, kind, warm):
+                    light = True
+                return light
+
             while True:
                 admitted, _ = acquire_token(directory, rec, max(0.0, cap - (time.time() - t_q)),
-                                            arrival_q)
+                                            arrival_q, light=_light_attempt)
                 if not admitted:
                     _release_all(directory, lock_hash, False)
                     lock_hash = None
@@ -2220,6 +2370,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                                  wait_lock, argv, waited_on="token",
                                  wait_token=time.time() - t_q)
                     return EXIT_QUEUE_TIMEOUT
+                if light:
+                    break  # admitted by the light lane: no token to hold or hand back
                 holding = True
                 if not pool:
                     break
@@ -2248,7 +2400,12 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                     time.sleep(poll)
             wait_token = time.time() - t_q
             env = dict(os.environ)
-            env["NUCLEOS_HEAVY_TOKEN"] = str(os.getpid())
+            if light:
+                # A light-lane run holds no token, so its child must not look like a token
+                # holder's: a heavy.py call made inside it queues for a token like any other.
+                env.pop("NUCLEOS_HEAVY_TOKEN", None)
+            else:
+                env["NUCLEOS_HEAVY_TOKEN"] = str(os.getpid())
         if pool and lease is None and nested:
             # No token to give back here (nested runs under its parent's token).
             t_s = time.time()
@@ -2300,9 +2457,12 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             "worktree": os.getcwd(), "agent": agent,
             "prio": prio, "eff_prio": prio, "kind": kind, "weight": weight,
             "wait_lock_s": round(wait_lock, 3), "wait_token_s": round(wait_token, 3),
+            "token": bool(holding), "nested": nested, "in_held": in_held,
         }
         if warm:
             row["warm"] = True
+        if light:
+            row["lane"] = "light"
         if session:
             row["session"] = session
         if eff_td:
@@ -2310,10 +2470,13 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     except Exception as exc:
         if lease is not None and env is not None:
             env.pop("CARGO_TARGET_DIR", None)  # the lease goes now: build without it
+        had_token = bool(holding)  # _release_all hands it back; the row says what it WAS
         _release_all(directory, lock_hash, holding, lease)
         code, stats = run_child(argv, env, None)
         append_log({
             "v": LOG_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "token": had_token, "nested": nested, "in_held": in_held,
+            "end": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "worktree": os.getcwd(), "agent": opts["agent"], "prio": None, "eff_prio": None,
             "kind": opts["kind"], "weight": None, "wait_lock_s": 0.0, "wait_token_s": 0.0,
             "run_s": round(time.time() - t_start, 3), "compiled": stats["compiled"],
@@ -2323,13 +2486,22 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         return code
 
     t_run = time.time()
+    drop_at: list[float] = []
     try:
         yield_check = None
         if warm and holding and not nested and not held:
             yield_check = lambda: _warm_should_yield(directory, lock_hash)  # noqa: E731
+        on_test_phase = None
+        if (holding and weight > 1 and _is_cargo(argv)
+                and not (nested or held or light or warm)
+                and os.environ.get("NUCLEOS_HEAVY_PHASE_DROP") != "0"):
+            def on_test_phase() -> None:
+                # The compile is over: the held weight falls to 1 while the tests run.
+                if drop_token_weight(directory, ctime):
+                    drop_at.append(time.time() - t_run)
         code, stats = run_child(argv, env, job, low=warm,
                                 progress=directory / "progress" / str(os.getpid()),
-                                yield_check=yield_check)
+                                yield_check=yield_check, on_test_phase=on_test_phase)
     except OSError as exc:
         sys.stderr.write(f"heavy: {argv[0]}: {exc}\n")
         code, stats = 127, _new_stats()
@@ -2345,7 +2517,10 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         **{k: stats[k] for k in ("cpu_s", "prep_cpu_s") if k in stats},
         "fp_hit": hit, "fp_miss": hit and stats["compiled"], "exit": code,
         "argv0": argv[0], "argv": _log_argv(argv),
+        "end": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     })
+    if drop_at:
+        row["weight_drop_s"] = round(drop_at[0], 3)
     if preempted:
         row["preempted"] = True
     try:
@@ -2368,6 +2543,10 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     _release_all(directory, lock_hash, holding, lease)
     try:
         _cost_mod().rebuild_costs(directory)
+    except Exception:
+        pass
+    try:
+        _cost_mod().rebuild_light(directory)
     except Exception:
         pass
     return _PREEMPTED if preempted else code
@@ -2407,6 +2586,7 @@ def _release_all(directory, lock_hash, holding: bool, lease=None) -> None:
     """Free the target slot, hand the worktree lock on, keep the token until its new owner
     is queued, then drop the token. Never raises: release must not turn a finished run into
     a failure. The slot goes first so the lock's next owner can take it back by affinity."""
+    release_light(directory)
     release_slot(directory, lease)
     try:
         succ = release_lock(directory, lock_hash) if lock_hash else None
@@ -2471,6 +2651,10 @@ def cmd_status() -> int:
     print(f"held: {len(held)}  weight: {sum(int(r.get('weight') or 1) for _, r in held)}")
     for f, rec in held:
         print(_line(rec, f"age={_age(f)}"))
+    light_runs = _entries(d / "light", reap=False)
+    print(f"light: {len(light_runs)}")
+    for f, rec in light_runs:
+        print(f"  pid={rec.get('pid')} cls={rec.get('cls')} age={_age(f)}")
     wt = d / "wt"
     locks = sorted(wt.glob("*.lock")) if wt.is_dir() else []
     lock_lines: list[str] = []

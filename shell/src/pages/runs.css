@@ -11,14 +11,9 @@
 
 /* ================================================================ new run == */
 
-/* Between the header and the filters, so opening it pushes the list down and
-   never sideways. No `display` here: the `hidden` attribute is what closes it. */
-.runs-compose {
-  margin-bottom: var(--space-5);
-}
-
-/* The panel body is the container, so the two halves decide by the width they
-   actually have — the same viewport is a different width with the rail open. */
+/* The dialog body (`Modal` size lg, 46rem at most) is the container, so the two
+   halves decide by the width they actually have: side by side on a wide window,
+   stacked on a narrow one. The dialog scrolls its own body on a short window. */
 .runs-compose-frame {
   container-type: inline-size;
 }
@@ -30,7 +25,7 @@
   align-items: start;
 }
 
-@container (min-width: 48rem) {
+@container (min-width: 36rem) {
   .runs-compose-grid {
     grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
   }
@@ -149,18 +144,6 @@
   color: var(--tone-paused-fg);
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
-}
-
-.runs-check {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
-.runs-check input {
-  accent-color: var(--text);
 }
 
 .runs-new-actions,

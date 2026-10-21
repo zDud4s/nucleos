@@ -12,7 +12,9 @@ import {
 } from "../data/project-commands";
 import {
   Button,
+  ConfirmButton,
   ErrorNote,
+  Field,
   Modal,
   Quiet,
   SHORTCUT_HINT,
@@ -118,8 +120,8 @@ export function Commands({ projectId }: CommandsProps) {
     return (
       <>
         <Quiet says="none declared" action={declare}>
-          A command is a name, something to run, and whether its result is a verdict on the project
-          — declaration rather than detection, so a list nobody agreed to cannot appear on its own.
+          A command is a name, something to run, and whether its result is a verdict on the project:
+          declaration rather than detection, so a list nobody agreed to cannot appear on its own.
         </Quiet>
         {stale}
         {manage}
@@ -152,13 +154,9 @@ export function Commands({ projectId }: CommandsProps) {
                 />
               ))
             )}
-            <button
-              type="button"
-              onClick={openPalette}
-              className="rounded-md border border-border px-2 py-1 text-xs text-text-faint hover:border-border-strong"
-            >
+            <Button onClick={openPalette}>
               all {rows.length} · {SHORTCUT_HINT}
-            </button>
+            </Button>
           </div>
 
           {refused !== null ? (
@@ -220,9 +218,13 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
               */}
               {row.source === "project" ? (
                 <span className="ml-auto">
-                  <Button variant="quiet" onClick={() => forget.mutate({ projectId, id: row.id })}>
-                    forget
-                  </Button>
+                  <ConfirmButton
+                    label="forget"
+                    confirmLabel={`Forget ${row.name}`}
+                    variant="danger"
+                    disabled={forget.isPending}
+                    onConfirm={() => forget.mutate({ projectId, id: row.id })}
+                  />
                 </span>
               ) : (
                 <span className="ml-auto text-xs text-text-faint">the workflow's</span>
@@ -238,36 +240,34 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
       */}
       <div className="flex flex-col gap-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-[10rem_1fr]">
-          <label className="flex flex-col gap-1 text-sm text-text-muted">
-            Command name
+          <Field label="Command name">
             <input
               placeholder="gate"
               value={name}
               spellCheck={false}
               onChange={(event) => setName(event.target.value)}
-              className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 text-sm text-text"
             />
-          </label>
-          <label className="flex flex-col gap-1 text-sm text-text-muted">
-            Folder it runs in
+          </Field>
+          <Field label="Folder it runs in">
             <input
               placeholder="the project root"
               value={cwd}
               spellCheck={false}
               onChange={(event) => setCwd(event.target.value)}
-              className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 text-sm text-text font-mono"
+              className="font-mono!"
             />
-          </label>
-          <label className="flex flex-col gap-1 text-sm text-text-muted sm:col-span-2">
-            What it runs
-            <input
-              placeholder="cargo test"
-              value={command}
-              spellCheck={false}
-              onChange={(event) => setCommand(event.target.value)}
-              className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 text-sm text-text font-mono"
-            />
-          </label>
+          </Field>
+          <div className="sm:col-span-2">
+            <Field label="What it runs">
+              <input
+                placeholder="cargo test"
+                value={command}
+                spellCheck={false}
+                onChange={(event) => setCommand(event.target.value)}
+                className="font-mono!"
+              />
+            </Field>
+          </div>
         </div>
 
         <div className="flex flex-col gap-2 text-sm text-text">
@@ -293,8 +293,8 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
           <span className="mr-auto text-xs text-text-faint">
             A name already declared is replaced rather than duplicated.
           </span>
-          <button
-            type="button"
+          <Button
+            variant="primary"
             disabled={!ready || declare.isPending}
             onClick={() =>
               declare.mutate(
@@ -319,10 +319,9 @@ function Manage({ projectId, rows }: { projectId: string; rows: ProjectCommand[]
                 },
               )
             }
-            className="rounded-md border border-border-strong px-4 py-1.5 text-sm text-text enabled:hover:bg-surface-raised disabled:opacity-40"
           >
             {declare.isPending ? "declaring…" : "declare"}
-          </button>
+          </Button>
         </div>
 
         {/* The núcleo's own words for `invalid`, which name the part that was wrong. */}
@@ -375,13 +374,11 @@ function GateButton({
   const running = row.last?.outcome === "running";
 
   return (
-    <button
-      type="button"
+    <Button
       disabled={disabled || running}
       onClick={onRun}
-      title={`${row.command} — ${said}`}
+      title={`${row.command}: ${said}`}
       aria-label={`${row.name}, ${said}`}
-      className="flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-text enabled:hover:border-border-strong disabled:opacity-60"
     >
       <span
         aria-hidden
@@ -395,6 +392,6 @@ function GateButton({
       />
       {row.name}
       <span className="text-xs text-text-faint">{running ? "running…" : said}</span>
-    </button>
+    </Button>
   );
 }

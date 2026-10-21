@@ -27,10 +27,12 @@ import {
 } from "../data/workflows";
 import { ConsentListing } from "../project/WorkflowConsent";
 import { MODE_MEANING, MODE_REFUSAL_PROSE } from "../lib/mode";
+import { plural } from "../lib/plural";
 import { Roster } from "./Roster";
 import "./new-project.css";
 import {
   Button,
+  Callout,
   ConflictNote,
   ErrorNote,
   Field,
@@ -102,7 +104,7 @@ export function NewProject() {
   async function browse() {
     setBrowseNote(null);
     if (!isTauri()) {
-      setBrowseNote("the folder picker only opens in the desktop app — here, type the path");
+      setBrowseNote("the folder picker only opens in the desktop app: here, type the path");
       return;
     }
     try {
@@ -116,7 +118,7 @@ export function NewProject() {
       setTyped(chosen);
       setLooking(chosen);
     } catch {
-      setBrowseNote("the folder picker did not open — type the path instead");
+      setBrowseNote("the folder picker did not open: type the path instead");
     }
   }
   const projects = useProjects();
@@ -144,7 +146,7 @@ export function NewProject() {
         description={
           count === undefined
             ? undefined
-            : `${count === 0 ? "No project" : `${count} ${count === 1 ? "project" : "projects"}`} on the roster — a new one always starts in shadow.`
+            : `${count === 0 ? "No project" : plural(count, "project")} on the roster: a new one always starts in shadow.`
         }
         size="lg"
       >
@@ -243,7 +245,7 @@ function pathFrom(search: Record<string, unknown>): string | null {
 const FOLDER_SENTENCES: Record<string, string> = {
   no_such_folder: "there is nothing at that path.",
   not_a_folder: "that path is a file, not a folder.",
-  not_absolute: "that has to be an absolute path — there is no folder for it to be relative to yet.",
+  not_absolute: "that has to be an absolute path: there is no folder for it to be relative to yet.",
 };
 
 function WhyNot({ error }: { error: unknown }) {
@@ -447,7 +449,7 @@ function Found({
   const blocker: string | null = taken
     ? `already registered as ${found.taken_by ?? ""}`
     : folderEdited
-      ? "the folder was edited after it was read — look again"
+      ? "the folder was edited after it was read: look again"
       : !shaped
         ? "the project id is not in shape yet"
         : clash
@@ -676,7 +678,7 @@ function Found({
             value={
               found.is_git
                 ? [found.branch, found.remote].filter(Boolean).join(" · ") || "a repository"
-                : "not a repository — which is allowed, but it can only ever run in shadow"
+                : "not a repository: which is allowed, but it can only ever run in shadow"
             }
           />
           {found.head === null ? null : <Row label="Last commit" value={found.head} mono />}
@@ -696,10 +698,10 @@ function Found({
             label="Project id"
             helper={
               shaped ? (
-                "Lowercase letters, digits and dashes — it becomes the project's address."
+                "Lowercase letters, digits and dashes: it becomes the project's address."
               ) : (
                 <>
-                  {projectId === "" ? "an id is needed" : "not an id yet"} — lowercase letters,
+                  {projectId === "" ? "an id is needed" : "not an id yet"}: lowercase letters,
                   digits and dashes, no dash at either end.
                   {shapedId(projectId) === "" ? null : (
                     <>
@@ -732,7 +734,7 @@ function Found({
             <ConflictNote>
               There is already a project called <span className="font-mono">{projectId}</span>.
               Adding this folder under that id would move that project here rather than add a new
-              one — choose another id.
+              one: choose another id.
             </ConflictNote>
           </div>
         ) : null}
@@ -762,7 +764,7 @@ function Found({
             <>
               <p className="np-hint">
                 Tick the ones worth a button on the project's page. Nothing unticked is saved, and none
-                of them becomes the gate — that is the field in step 3.
+                of them becomes the gate: that is the field in step 3.
               </p>
               <div className="np-list">
                 {found.commands.map((suggestion) => (
@@ -787,7 +789,7 @@ function Found({
               </div>
               {found.commands_omitted > 0 ? (
                 <p className="np-hint">
-                  {found.commands_omitted} more were found and are not listed — the rest can be
+                  {found.commands_omitted} more were found and are not listed: the rest can be
                   declared on the project's page.
                 </p>
               ) : null}
@@ -812,7 +814,7 @@ function Found({
             helper={
               found.gate === null
                 ? "Its exit code says the project is green. Nothing here suggests one; blank is none."
-                : `Its exit code says the project is green — proposed from ${found.gate.source}; blank is none.`
+                : `Its exit code says the project is green: proposed from ${found.gate.source}; blank is none.`
             }
           >
             <input
@@ -882,13 +884,11 @@ function Found({
           </div>
         </div>
 
-        <p className="np-callout">
-          <StateBadge domain="autopilot" state="shadow" />
-          <span>
-            It starts in shadow: {MODE_MEANING.shadow}. Nothing here can let it act — that is unlocked
-            later, on the project's page or on Autopilot, once the evidence earns it.
-          </span>
-        </p>
+        <Callout>
+          <StateBadge domain="autopilot" state="shadow" /> It starts in shadow: {MODE_MEANING.shadow}.
+          Nothing here can let it act: that is unlocked later, on the project's page or on Autopilot,
+          once the evidence earns it.
+        </Callout>
 
         {stopHolds && !registered ? (
           <div className="flex flex-col items-start gap-2">
@@ -984,7 +984,7 @@ function WriteRefused({ stage, error }: { stage: Planned | undefined; error: unk
     return (
       <ErrorNote>
         The {DAEMON_NAME} did not respond while {stage?.doing ?? "the project was being set up"}. Whether that
-        write landed is not known — the project's page will show what it has.
+        write landed is not known: the project's page will show what it has.
       </ErrorNote>
     );
   }
@@ -1046,7 +1046,7 @@ function OnboardWaiting({ projectId }: { projectId: string }) {
     <div className="flex flex-col items-start gap-2">
       <p className="max-w-(--measure) text-sm text-text">
         Registered as <span className="font-mono">{projectId}</span> in shadow. The stop is
-        engaged, so onboarding — the confirmed gate and the classifier hook — is waiting until it
+        engaged, so onboarding: the confirmed gate and the classifier hook: is waiting until it
         is released; it can be finished from the project's Settings once it is.
       </p>
       <Link
@@ -1095,7 +1095,7 @@ function Harnesses({
     <div className="np-group">
       <h3 className="np-group-title">Way of working</h3>
       <p className="np-hint">
-        Adopting it records that it is here — the folder is not copied, not rewritten, and nothing is
+        Adopting it records that it is here: the folder is not copied, not rewritten, and nothing is
         added to it. It receives no updates, because there is no library it came from.
       </p>
       <div className="np-options">
@@ -1109,9 +1109,7 @@ function Harnesses({
             />
             <span className="np-option-name font-mono">{harness.path}</span>
             <span className="np-option-meta">
-              <span>
-                {harness.files} {harness.files === 1 ? "file" : "files"}
-              </span>
+              <span>{plural(harness.files, "file")}</span>
               {" · "}
               {harness.what}
             </span>

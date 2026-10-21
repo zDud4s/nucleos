@@ -288,8 +288,8 @@ export interface JudgeVerdict {
  */
 export const JUDGE_RESIDUAL_RISK =
   "A judge fooled by text the agent read can still approve a command that runs code the agent " +
-  "wrote in the workspace itself — a new build.rs under cargo test, an npm script, a Python " +
-  "file — and that code can reach the network. Nothing but an operating-system network sandbox " +
+  "wrote in the workspace itself (a new build.rs under cargo test, an npm script, a Python " +
+  "file), and that code can reach the network. Nothing but an operating-system network sandbox " +
   "closes this, and there is none yet. Turning enforce on accepts this risk for this project.";
 
 /** What TypeSafe is, said once; every panel and dialog that sends it something uses this phrase. */
@@ -306,7 +306,7 @@ export const JUDGE_ENFORCE_DIALOG =
 
 export function readJudgeBand(verdict: JudgeVerdict): string {
   if (verdict.band === "deny") return "would refuse";
-  return verdict.capped ? "would allow — held back by a guard" : "would allow";
+  return verdict.capped ? "would allow, held back by a guard" : "would allow";
 }
 
 /** What the judge said about one decision (`judge::JudgeOpinion`). `band` is null when the call failed. */
@@ -347,14 +347,14 @@ export function useRunJudgeOpinions(runId: number) {
 
 /** One opinion in words: the number and the band, or why there is no number. */
 export function readJudgeOpinion(opinion: JudgeOpinion): string {
-  if (opinion.band === null) return `no answer — ${opinion.error ?? "not recorded"}`;
+  if (opinion.band === null) return `no answer: ${opinion.error ?? "not recorded"}`;
   const band =
     opinion.band === "deny"
       ? "would refuse"
       : opinion.band === "middle"
         ? "left it to the classifier"
         : opinion.capped
-          ? "would allow — held back by a guard"
+          ? "would allow, held back by a guard"
           : "would allow";
   return `${formatProbability(opinion.p)} · ${band}${opinion.enforced ? " (applied)" : ""}`;
 }
@@ -411,7 +411,7 @@ export function useSetProjectJudge() {
 export const RESOLVE_DATA_WARNING =
   "Resolving blocks sends TypeSafe what the judge alone never sends: the commands this project's " +
   "runs were refused as destructive, and the last 2000 characters of the project's gate output " +
-  "when a finished run fails its gate. Observing changes nothing a run does — it asks, and writes " +
+  "when a finished run fails its gate. Observing changes nothing a run does: it asks, and writes " +
   "the answer down for you to review.";
 
 export type ResolveEvent = "hard_deny" | "park" | "gate_failed";
@@ -458,12 +458,12 @@ export interface ResolveReadiness {
 export function readReadiness(r: ResolveReadiness): string {
   if (r.less_cautious > 0) {
     const reviews = r.less_cautious === 1 ? "review" : "reviews";
-    return `${r.less_cautious} ${reviews} where the judge was less careful than you — not ready`;
+    return `${r.less_cautious} ${reviews} where the judge was less careful than you, not ready`;
   }
   if (r.reviewed < RESOLVE_MIN_REVIEWED) return `${r.reviewed} of ${RESOLVE_MIN_REVIEWED} reviews`;
   return r.ready
-    ? `${r.reviewed} reviewed, ${r.agree} agree — ready`
-    : `${r.agree} of ${r.reviewed} agree — under ${RESOLVE_MIN_AGREE_PERCENT}%`;
+    ? `${r.reviewed} reviewed, ${r.agree} agree, ready`
+    : `${r.agree} of ${r.reviewed} agree, under ${RESOLVE_MIN_AGREE_PERCENT}%`;
 }
 
 export interface JudgeResolveStatus {
@@ -500,7 +500,7 @@ export const RESOLVE_ENFORCE_RISK =
   "Letting the resolver decide accepts, for this project: a run may be told to carry on without " +
   "an action a person would have approved, and finish with work half done (it is told to say what " +
   "is missing); a run may be stopped when the judge thinks an action is off its task; a finished " +
-  "run whose gate failed may be continued once, on its own, in the same conversation — that " +
+  "run whose gate failed may be continued once, on its own, in the same conversation; that " +
   "correction may break more than it fixes, and its prompt carries the gate's output, which the " +
   "agent itself may have written; and the judge's questions are measured only by the reviews " +
   "below, never by a test set. A hard refusal is never run, whatever the judge says.";

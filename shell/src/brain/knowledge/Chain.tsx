@@ -21,7 +21,7 @@ export function Chain({ id }: ChainProps) {
   if (history.isError) {
     return (
       <ErrorNote>
-        the {DAEMON_NAME} is not responding — this one&apos;s history is not known
+        the {DAEMON_NAME} is not responding: this one&apos;s history is not known
       </ErrorNote>
     );
   }

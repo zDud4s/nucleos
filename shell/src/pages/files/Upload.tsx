@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, type ReactNode } from "react";
+import { pluralWord } from "../../lib/plural";
 import { Button } from "../../ui";
-import { type ClashChoice, MAX_UPLOAD_LABEL, type PendingBatch, type UploadReport } from "./shared";
+import { type ClashChoice, MAX_UPLOAD_LABEL, onEscape, type PendingBatch, type UploadReport } from "./shared";
 
 /* -------------------------------------------------------------- upload -- */
 
@@ -88,9 +89,7 @@ export function ClashNote({
       role="group"
       aria-labelledby={headingId}
       aria-describedby={thenId}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") onCancel();
-      }}
+      onKeyDown={onEscape(onCancel)}
     >
       <p id={headingId}>
         {one ? "A file with this name is already in " : `${String(names.length)} files with these names are already in `}
@@ -126,7 +125,7 @@ export function ClashNote({
       <p id={thenId} className="fi-ask-then">
         Replace moves the {one ? "old one" : "old ones"} to Recently deleted. Keep both saves the new{" "}
         {one ? "file" : "files"} under a numbered name.
-        {others > 0 && ` The other ${String(others)} ${others === 1 ? "file goes" : "files go"} up either way.`}
+        {others > 0 && ` The other ${String(others)} ${pluralWord(others, "file goes", "files go")} up either way.`}
       </p>
     </div>
   );
@@ -186,13 +185,13 @@ export function UploadReportNote({ report, onDismiss }: { report: UploadReport; 
           </p>
         ) : (
           <p>
-            {report.refusals.length} of {total} file{total === 1 ? "" : "s"} from {from} stayed behind:
+            {report.refusals.length} of {total} {pluralWord(total, "file")} from {from} stayed behind:
           </p>
         )}
         {report.refusals.length > 0 && (
           <FoldedList>
             {report.refusals.map((refusal, index) => (
-              <li key={`${refusal.name}-${String(index)}`}>{`${refusal.name} — ${refusal.reason}`}</li>
+              <li key={`${refusal.name}-${String(index)}`}>{`${refusal.name}: ${refusal.reason}`}</li>
             ))}
           </FoldedList>
         )}
@@ -202,7 +201,7 @@ export function UploadReportNote({ report, onDismiss }: { report: UploadReport; 
             {saved.map((item, index) => (
               <li key={`${item.stored}-${String(index)}`}>
                 <span>{item.stored}</span>
-                {item.stored !== item.sent && <span className="fi-drop-renamed"> — renamed from {item.sent}</span>}
+                {item.stored !== item.sent && <span className="fi-drop-renamed"> (renamed from {item.sent})</span>}
               </li>
             ))}
           </FoldedList>

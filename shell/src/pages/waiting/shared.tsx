@@ -1,6 +1,7 @@
 import { useId, useLayoutEffect, useRef, useState, type FocusEvent, type ReactNode } from "react";
 import { isApiRefusal, type ApiRefusal } from "../../data/client";
 import type { ApprovalOutcome } from "../../data/waiting";
+import { pluralWord } from "../../lib/plural";
 import { Count, ErrorNote, Panel, Quiet, Skeleton, RefusalNote, Section, StaleNote } from "../../ui";
 import { DAEMON_NAME } from "../../copy";
 import type { Reading } from "./reading";
@@ -143,7 +144,7 @@ export const QUEUES = {
   wheel: {
     title: "Browser access requests",
     id: "waiting-wheel",
-    index: (n) => `browser access ${n === 1 ? "request" : "requests"}`,
+    index: (n) => `browser access ${pluralWord(n, "request")}`,
     says: "nothing has asked for browser access",
     why: (
       <>
@@ -159,13 +160,13 @@ export const QUEUES = {
   approvals: {
     title: "Action approvals",
     id: "waiting-approvals",
-    index: (n) => `action ${n === 1 ? "approval" : "approvals"}`,
+    index: (n) => `action ${pluralWord(n, "approval")}`,
     says: "nothing is waiting to be let through",
     why: (
       <>
         A run that reaches for something outside its permission stops where it
         is and files one of these. An empty queue means either that nothing
-        has asked, or that the autopilot is off — it is not a sign that
+        has asked, or that the autopilot is off. It is not a sign that
         anything is stuck.
       </>
     ),
@@ -173,12 +174,12 @@ export const QUEUES = {
   teamActions: {
     title: "Team actions",
     id: "waiting-team-actions",
-    index: (n) => `team ${n === 1 ? "action" : "actions"}`,
+    index: (n) => `team ${pluralWord(n, "action")}`,
     says: "no team is waiting on an action",
     why: (
       <>
         An action a team asked the daemon to carry out under a propose grant.
-        Approving does not do the thing — it lets the daemon do it on its next
+        Approving does not do the thing. It lets the daemon do it on its next
         tick, about ten seconds later.
       </>
     ),
@@ -191,7 +192,7 @@ export const QUEUES = {
     why: (
       <>
         A director asked for a specialist by name. The request is editable
-        here before it is granted; declining leaves nothing behind — the
+        here before it is granted; declining leaves nothing behind, so the
         team may ask again.
       </>
     ),
@@ -199,7 +200,7 @@ export const QUEUES = {
   merges: {
     title: "Contact merges",
     id: "waiting-merges",
-    index: (n) => `contact ${n === 1 ? "merge" : "merges"}`,
+    index: (n) => `contact ${pluralWord(n, "merge")}`,
     says: "no two contacts look like the same person",
     why: (
       <>
@@ -401,7 +402,7 @@ function ListError({
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote onRetry={onRetry}>
-      the {DAEMON_NAME} is not responding — nothing is known about {what}
+      the {DAEMON_NAME} is not responding, so nothing is known about {what}
     </ErrorNote>
   );
 }
@@ -417,12 +418,12 @@ function ListError({
  */
 const DECISION_SENTENCES: Record<string, string> = {
   conflict:
-    "this one was already answered — the list clears it on the next read, and nothing further is needed",
+    "this one was already answered. The list clears it on the next read, and nothing further is needed",
   not_found: "that proposal is gone; there is nothing left to decide",
   unprocessable:
     "the daemon accepted the request and found nothing usable inside the proposal to act on",
   internal:
-    "the daemon failed while carrying the decision out — nothing was changed",
+    "the daemon failed while carrying the decision out, so nothing was changed",
 };
 
 /**
@@ -450,7 +451,7 @@ export function DecisionRefusal({
 }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>the {DAEMON_NAME} is not responding — nothing was decided</ErrorNote>
+      <ErrorNote>the {DAEMON_NAME} is not responding, so nothing was decided</ErrorNote>
     );
   }
   const sentences = trustProse

@@ -133,13 +133,13 @@ export function roundsOf(picked: number | null, config: CouncilConfig | null): n
 export function conveneBlocked(pending: boolean, failed: boolean, config: CouncilConfig | null, d: CourtDraft): string | null {
   if (pending) return "Reading the council config…";
   if (failed || config === null) return "The council config could not be read.";
-  if (!config.configured) return "No roster in ~/.nucleos/council.yaml — add one and restart the background service.";
+  if (!config.configured) return "No roster in ~/.nucleos/council.yaml. Add one and restart the background service.";
   if (occupiedCount(d) === 0) return "Seat at least one member.";
   if (d.chairman === null) return "Choose a chairman.";
   if (d.touched) {
-    if (d.chairman.seat === null) return "The chairman keeps the file's default model — choose who presides.";
+    if (d.chairman.seat === null) return "The chairman keeps the file's default model. Choose who presides.";
     const at = d.chairs.findIndex((c) => c !== null && c.seat === null);
-    if (at >= 0) return `Seat ${at + 1} keeps the file's default model — choose who sits there.`;
+    if (at >= 0) return `Seat ${at + 1} keeps the file's default model. Choose who sits there.`;
   }
   return null;
 }

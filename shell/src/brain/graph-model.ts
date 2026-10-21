@@ -90,7 +90,7 @@ export function buildModel(
     if (link.target_kind === "knowledge") {
       // Every real row was added above; one that is absent but known was filtered, not gone.
       if (knownIds.has(link.target_ref)) return null;
-      return add({ id, kind: "knowledge", ref: link.target_ref, label: "knowledge — gone", bucket: "in_force", missing: true });
+      return add({ id, kind: "knowledge", ref: link.target_ref, label: "knowledge (gone)", bucket: "in_force", missing: true });
     }
     if (link.target_kind === "note") {
       // Archived and hidden, or gone: the nucleo resolved which; with no answer, it is gone.

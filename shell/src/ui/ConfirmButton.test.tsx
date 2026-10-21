@@ -184,7 +184,7 @@ describe("ConfirmButton", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
 
     expect(screen.getByRole("status").textContent).toBe(
-      "armed: Really delete — press again to confirm",
+      "armed: Really delete. Press again to confirm",
     );
 
     // And the prefix is load-bearing: the announcement is not a second exact copy of the
@@ -213,7 +213,7 @@ describe("ConfirmButton", () => {
       vi.advanceTimersByTime(4000);
     });
 
-    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+    expect(screen.getByRole("status").textContent).toBe("disarmed: nothing changed");
 
     // Arm it again and go through with it. The confirm path CLEARS the region rather than
     // reporting an expiry that did not happen: "nothing changed" after a delete would be
@@ -261,7 +261,7 @@ describe("ConfirmButton", () => {
       <ConfirmButton
         label="Let it act"
         confirmLabel="Let alpha act"
-        sayAs="alpha acts on its own — 3 of its 4 proposal slots already in use, no approval"
+        sayAs="alpha acts on its own: 3 of its 4 proposal slots already in use, no approval"
         variant="approve"
         onConfirm={vi.fn()}
       />,
@@ -274,7 +274,7 @@ describe("ConfirmButton", () => {
     const said = screen.getByText(/^armed: alpha acts on its own/);
     expect(said.getAttribute("role")).toBe("status");
     expect(said.textContent).toBe(
-      "armed: alpha acts on its own — 3 of its 4 proposal slots already in use, no approval — press again to confirm",
+      "armed: alpha acts on its own: 3 of its 4 proposal slots already in use, no approval. Press again to confirm",
     );
   });
 
@@ -288,10 +288,10 @@ describe("ConfirmButton", () => {
         }
         confirmLabel={
           <>
-            <span aria-hidden="true">▶</span>Really release — work resumes
+            <span aria-hidden="true">▶</span>Really release, work resumes
           </>
         }
-        sayAs="Really release — work resumes"
+        sayAs="Really release, work resumes"
         variant="danger-solid"
         onConfirm={vi.fn()}
       />,
@@ -303,7 +303,7 @@ describe("ConfirmButton", () => {
     // and name nothing at all — on the control that restarts every autonomous thing there is.
     const said = screen.getByText(/^armed: Really release/);
     expect(said.getAttribute("role")).toBe("status");
-    expect(screen.queryByText("armed — press again to confirm")).toBeNull();
+    expect(screen.queryByText("armed: press again to confirm")).toBeNull();
   });
 
   it("arming swaps only danger to danger-solid", () => {
@@ -346,7 +346,7 @@ describe("ConfirmButton", () => {
     const said = screen.getByText(/^armed: #101/);
     expect(said.getAttribute("role")).toBe("status");
     expect(said.textContent).toBe(
-      "armed: #101 — Let this action happen — press again to confirm",
+      "armed: #101. Let this action happen. Press again to confirm",
     );
   });
 
@@ -355,7 +355,7 @@ describe("ConfirmButton", () => {
       <ConfirmButton
         label="Let it act"
         confirmLabel="Let alpha act"
-        sayAs="alpha acts on its own — 3 of its 4 proposal slots already in use, no approval"
+        sayAs="alpha acts on its own: 3 of its 4 proposal slots already in use, no approval"
         variant="approve"
         onConfirm={vi.fn()}
       />,
@@ -377,8 +377,8 @@ describe("ConfirmButton", () => {
   });
 
   it("a sentence that changes under an armed control gets its own window", () => {
-    const first = "alpha acts on its own — no approval";
-    const second = "alpha acts on its own — 1 of its 4 proposal slots already in use";
+    const first = "alpha acts on its own: no approval";
+    const second = "alpha acts on its own: 1 of its 4 proposal slots already in use";
     const { rerender } = render(
       <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs={first} variant="approve" onConfirm={vi.fn()} />,
     );
@@ -393,7 +393,7 @@ describe("ConfirmButton", () => {
       <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs={second} variant="approve" onConfirm={vi.fn()} />,
     );
     expect(screen.getByRole("status").textContent).toBe(
-      `armed: ${second} — press again to confirm`,
+      `armed: ${second}. Press again to confirm`,
     );
 
     // The new sentence gets its own window rather than the remainder of the old one's. The
@@ -418,7 +418,7 @@ describe("ConfirmButton", () => {
       vi.advanceTimersByTime(2999);
     });
     expect(screen.getByRole("status").textContent).toBe(
-      "armed: Really delete — press again to confirm",
+      "armed: Really delete. Press again to confirm",
     );
 
     act(() => {
@@ -429,7 +429,7 @@ describe("ConfirmButton", () => {
     act(() => {
       vi.advanceTimersByTime(1000);
     });
-    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+    expect(screen.getByRole("status").textContent).toBe("disarmed: nothing changed");
 
     // And a confirm says neither: the action is about to happen and will speak for itself.
     fireEvent.click(screen.getByRole("button", { name: "Delete series" }));
@@ -519,7 +519,7 @@ describe("ConfirmButton", () => {
     fireEvent.keyDown(screen.getByRole("button", { name: "Really delete" }), { key: "Escape" });
 
     expect(screen.getByRole("button", { name: "Delete series" })).toBeDefined();
-    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+    expect(screen.getByRole("status").textContent).toBe("disarmed: nothing changed");
     expect(onConfirm).not.toHaveBeenCalled();
     expect(onArmedChange).toHaveBeenLastCalledWith(false);
   });
@@ -572,13 +572,13 @@ describe("ConfirmButton", () => {
     rerender(
       <ConfirmButton label="Let it act" confirmLabel="Let alpha act" sayAs="three" variant="approve" onConfirm={vi.fn()} />,
     );
-    expect(screen.getByRole("status").textContent).toBe("armed: three — press again to confirm");
+    expect(screen.getByRole("status").textContent).toBe("armed: three. Press again to confirm");
 
     act(() => {
       vi.advanceTimersByTime(2000);
     });
     expect(screen.getByRole("button", { name: "Let it act" })).toBeDefined();
-    expect(screen.getByRole("status").textContent).toBe("disarmed — nothing changed");
+    expect(screen.getByRole("status").textContent).toBe("disarmed: nothing changed");
   });
 
   /**
@@ -612,7 +612,7 @@ describe("ConfirmButton", () => {
     // four whether the cancelled one fired or not.
     const warnings = heard.filter((said, i) => said === "one second left" && heard[i - 1] !== "one second left");
     expect(warnings).toHaveLength(1);
-    expect(heard[heard.length - 1]).toBe("disarmed — nothing changed");
+    expect(heard[heard.length - 1]).toBe("disarmed: nothing changed");
   });
 
   /**
@@ -695,7 +695,7 @@ describe("ConfirmButton", () => {
 
     expect(screen.queryByRole("button", { name: "Delete series" })).not.toBeNull();
     expect(onArmedChange.mock.calls.map(([armed]) => armed)).toEqual([true, false]);
-    const said = screen.queryByText("disarmed — nothing changed");
+    const said = screen.queryByText("disarmed: nothing changed");
     expect(said).not.toBeNull();
     expect(said?.getAttribute("role")).toBe("status");
     expect(onConfirm).not.toHaveBeenCalled();

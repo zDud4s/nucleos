@@ -900,12 +900,27 @@ pub(super) async fn dispatch_agent_node_with(
         None => {
             let keys = keys_read_from(&graph.graph, &node.id);
             let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            // A node with an output check has its emission written by the daemon from the
+            // validated reply (landing), so the agent is not asked to write the file.
+            let daemon_emits = {
+                let ctx = NodeCtx {
+                    state,
+                    job,
+                    node,
+                    round,
+                    ordinal: None,
+                    worktree: &tree,
+                    facts,
+                };
+                launcher.output_check(&ctx).await.is_some()
+            };
             composed_protocol(
                 &node.id,
                 &artifacts,
                 job.prompt.as_deref().unwrap_or_default(),
                 round,
                 &keys,
+                daemon_emits,
             )
         }
     };

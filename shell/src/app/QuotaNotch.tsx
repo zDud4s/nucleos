@@ -750,7 +750,7 @@ function titleOf(provider: QuotaProvider): string {
   // it, and the doc described a plan. Here is where it belongs — beside the fidelity, which is
   // the other fact about the READING rather than about one window of it.
   const said = provider.severity.trim() === "" ? "" : ` · ${provider.severity.trim()}`;
-  const head = `${provider.provider} — ${provider.fidelity}${said}`;
+  const head = `${provider.provider} (${provider.fidelity})${said}`;
   if (provider.windows.length === 0) {
     return provider.detail === "" ? head : `${head}: ${provider.detail}`;
   }

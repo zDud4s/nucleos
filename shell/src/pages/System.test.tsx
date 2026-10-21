@@ -534,7 +534,7 @@ describe("System - health readout", () => {
     // what changed is that `ConfirmButton` now renders a polite region of its own — empty at
     // rest — so "the only status on the page" is no longer a way to name anything.
     const notice = await screen.findByText(/^The readout timed out before it could measure/);
-    expect(notice.getAttribute("role")).toBe("status");
+    expect(notice.closest("[role=status]")).not.toBeNull();
     expect(notice.textContent).toMatch(/timed out/i);
     expect(screen.queryByText(/missing/i)).toBeNull();
 
@@ -621,7 +621,7 @@ describe("System - health readout", () => {
     await waitFor(() => {
       expect(asked).toEqual(["browser"]);
     });
-    const note = await within(list).findByText("asked — the supervisor is trying now");
+    const note = await within(list).findByText("asked: the supervisor is trying now");
     expect(note.getAttribute("role")).toBe("status");
   });
 
@@ -883,7 +883,7 @@ describe("System - budget", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send these six fields" }));
 
     await waitFor(() => {
       const calls = daemon.apiFetch.mock.calls.filter(
@@ -922,7 +922,7 @@ describe("System - budget", () => {
     fireEvent.change(windowInput, { target: { value: "0" } });
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send these six fields" }));
 
     await waitFor(() => {
       expect(budgetCalls()).toHaveLength(2);
@@ -961,7 +961,7 @@ describe("System - budget", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
       await afterDwell();
-      fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
+      fireEvent.click(screen.getByRole("button", { name: "Send these six fields" }));
 
       const alert = await screen.findByRole("alert");
       expect(alert.textContent).toMatch(/the window limit/);
@@ -997,7 +997,7 @@ describe("System - budget", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Send these six fields to the daemon" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send these six fields" }));
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/the hourly limit/);
@@ -1027,7 +1027,7 @@ describe("System - quota brake", () => {
     const quotaBrake = await screen.findByRole("heading", { level: 3, name: "Quota brake" });
     const block = quotaBrake.closest("section");
     if (block === null) throw new Error("no quota brake block");
-    const enabled = within(block).getByRole("checkbox", { name: "Enable quota brake" }) as HTMLInputElement;
+    const enabled = within(block).getByRole("switch", { name: "Enable quota brake" }) as HTMLInputElement;
     const fiveHour = within(block).getByLabelText("Pause above 5h usage (%)") as HTMLInputElement;
     const sevenDay = within(block).getByLabelText("Pause above 7d usage (%)") as HTMLInputElement;
     expect(enabled.checked).toBe(false);
@@ -1040,7 +1040,7 @@ describe("System - quota brake", () => {
     fireEvent.change(sevenDay, { target: { value: "95" } });
     fireEvent.click(within(block).getByRole("button", { name: "Save quota brake" }));
     await afterDwell();
-    fireEvent.click(within(block).getByRole("button", { name: "Save these three quota brake settings to the daemon" }));
+    fireEvent.click(within(block).getByRole("button", { name: "Save these three settings" }));
 
     const quotaBrakePosts = () =>
       daemon.apiFetch.mock.calls.filter(
@@ -1059,7 +1059,7 @@ describe("System - quota brake", () => {
     fireEvent.change(fiveHour, { target: { value: "0" } });
     fireEvent.click(within(block).getByRole("button", { name: "Save quota brake" }));
     await afterDwell();
-    fireEvent.click(within(block).getByRole("button", { name: "Save these three quota brake settings to the daemon" }));
+    fireEvent.click(within(block).getByRole("button", { name: "Save these three settings" }));
 
     expect(await within(block).findByRole("alert")).toBeDefined();
     expect(quotaBrakePosts()).toHaveLength(1);
@@ -1200,7 +1200,7 @@ describe("System - backups", () => {
     fireEvent.click(screen.getByRole("button", { name: "Compact when it next starts" }));
 
     expect(
-      await screen.findByText("a restore is pending — compact after it has been applied"),
+      await screen.findByText("a restore is pending: compact after it has been applied"),
     ).toBeDefined();
     expect(screen.getByRole("button", { name: "Compact on next start" })).toBeDefined();
   });
@@ -1246,7 +1246,7 @@ describe("System - backups", () => {
     // By its words, not by being the row's only live region: the row's own interlock
     // ("Stage a restore") now carries one too, so that arming it is announced.
     const notice = await within(snap1Row).findByText(/^Nothing has changed yet/);
-    expect(notice.getAttribute("role")).toBe("status");
+    expect(notice.closest("[role=status]")).not.toBeNull();
     expect(notice.textContent).toMatch(/applies on the núcleo's next start/i);
     expect(notice.textContent).toMatch(/nothing has changed yet/i);
   });
@@ -1274,7 +1274,7 @@ describe("System - backups", () => {
 
     expect(
       await within(row).findByText(
-        "a restore is already staged, or that snapshot name is taken — only one can be pending",
+        "a restore is already staged, or that snapshot name is taken: only one can be pending",
       ),
     ).toBeDefined();
   });
@@ -1351,6 +1351,35 @@ describe("System - tokens", () => {
     expect(await screen.findByText("there is already a token with that name")).toBeDefined();
     // No secret ever reached the screen — the refusal is the whole outcome.
     expect(screen.queryByRole("group", { name: "a secret shown once" })).toBeNull();
+  });
+
+  it("asks once more before minting an admin token, and says what the chosen level can do", async () => {
+    const minted: { name: string; level: ApiTokenLevel }[] = [];
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(
+      systemFetch(world, {
+        onMint: (mint) => {
+          minted.push(mint);
+          return { name: mint.name, level: mint.level, created_at: "2026-08-17T09:00:00Z", token: "secret" };
+        },
+      }),
+    );
+
+    await renderSystemAt("/system/tokens");
+
+    const level = await screen.findByRole("group", { name: "Level" });
+    expect(within(level).getByRole("button", { name: "read-only" }).getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(within(level).getByRole("button", { name: "admin" }));
+    expect(within(level).getByRole("button", { name: "admin" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByText(/The admin level can do everything\./)).toBeDefined();
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "root-ish" } });
+    fireEvent.click(screen.getByRole("button", { name: "Mint token" }));
+    expect(minted).toEqual([]);
+    expect(screen.getByText(/Press the button again to mint it/)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mint an admin token" }));
+    await waitFor(() => { expect(minted).toEqual([{ name: "root-ish", level: "admin" }]); });
   });
 });
 
@@ -1709,7 +1738,7 @@ describe("System - the channels tab", () => {
     await renderSystemAt("/system/channels");
     const tab = await screen.findByRole("link", { name: "Channels" });
     expect(tab.getAttribute("aria-current")).toBe("page");
-    expect(await screen.findByRole("heading", { level: 3, name: "Telegram" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 2, name: "Telegram" })).toBeDefined();
   });
 
   it("reads the tabs in order, Channels between Tokens and Notifications", async () => {

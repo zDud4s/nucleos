@@ -10,6 +10,7 @@ import {
   type TriageCounts,
   type Watch,
 } from "../data/project-map";
+import { pluralWord } from "../lib/plural";
 import { Inset, RelativeTime, SectionTitle } from "../ui";
 import { GiveStamp } from "./GiveStamp";
 
@@ -101,10 +102,6 @@ const ROWS = 12;
 /** The first `limit` of a pile, and how many were left out. */
 function capped<T>(all: T[], limit = ROWS): { shown: T[]; hidden: number } {
   return { shown: all.slice(0, limit), hidden: Math.max(0, all.length - limit) };
-}
-
-function plural(count: number, one: string, many: string): string {
-  return count === 1 ? one : many;
 }
 
 /** A decision and where it stands, which is the only pairing this panel ever draws. */
@@ -204,7 +201,7 @@ export function StampsPanel({
             of one, and whatever mattered underneath goes unseen.
           */}
           <p className="max-w-prose text-xs text-text-muted">
-            Three verdicts, and the middle one always carries a note — §5.2 makes the note the whole
+            Three verdicts, and the middle one always carries a note: §5.2 makes the note the whole
             of amber, so its button waits until you have written one.
           </p>
         </div>
@@ -282,7 +279,7 @@ function GitSilent() {
   return (
     <p className="max-w-prose rounded-md border border-tone-pending-border bg-tone-pending-bg p-2 text-xs text-text-muted">
       Git would not answer when this map was read, so not one stamp below could be checked against
-      the code. Nothing here reports a change, and nothing here reports that there was none — read
+      the code. Nothing here reports a change, and nothing here reports that there was none. Read
       it again in a moment.
     </p>
   );
@@ -315,7 +312,7 @@ function NothingApproved() {
 function DayOne({ never }: { never: number }) {
   return (
     <p className="max-w-prose text-sm text-text-muted">
-      Nothing here is stamped. On day one that is the whole map — all {never} of it — and §10 is
+      Nothing here is stamped. On day one that is the whole map: all {never} of it, and §10 is
       deliberate about it: history does not get stamped, and this backlog blocks nothing.
     </p>
   );
@@ -354,7 +351,7 @@ function OnYourDesk({
         On your desk
       </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
-        {total} {plural(total, "stamp", "stamps")} you gave stopped being true. §7 puts the diff
+        {total} {pluralWord(total, "stamp", "stamps")} you gave stopped being true. §7 puts the diff
         between what you stamped and what is there now on the row: re-stamping is one click when it
         is cosmetic, and it is the right moment to look when it is not.
       </p>
@@ -367,7 +364,7 @@ function OnYourDesk({
       */}
       {flagged > 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
-          The other {flagged} on your desk are not stamps of yours at all — the triager put them
+          The other {flagged} on your desk are not stamps of yours at all: the triager put them
           there, and they are on its own panel below with the reason it gave.
         </p>
       ) : null}
@@ -403,7 +400,7 @@ function Why({ why }: { why: Lapse }) {
     return (
       <p className="max-w-prose text-xs text-text-muted">
         This map could not read what this stamp is watching, so it cannot say whether the code
-        moved — neither that it did nor that it did not.
+        moved: neither that it did nor that it did not.
       </p>
     );
   }
@@ -422,9 +419,9 @@ function Why({ why }: { why: Lapse }) {
 
   return (
     <div className="flex flex-col gap-1">
-      <Moved label="changed since you stamped it — is this still what you wanted?" paths={why.changed} />
-      <Moved label="appeared since you stamped it — did you ever look at these?" paths={why.added} />
-      <Moved label="gone since you stamped it — was that deliberate?" paths={why.gone} />
+      <Moved label="changed since you stamped it: is this still what you wanted?" paths={why.changed} />
+      <Moved label="appeared since you stamped it: did you ever look at these?" paths={why.added} />
+      <Moved label="gone since you stamped it: was that deliberate?" paths={why.gone} />
     </div>
   );
 }
@@ -469,8 +466,8 @@ function PartWay({
         Part-way, and you know it
       </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
-        {total} {plural(total, "decision", "decisions")} you stamped with a note. The note is on the
-        row and never on a hover — §5.2 makes it the whole of amber. This verdict does not expire
+        {total} {pluralWord(total, "decision", "decisions")} you stamped with a note. The note is on the
+        row and never on a hover. §5.2 makes it the whole of amber. This verdict does not expire
         when the code moves; it expires by time, because what rots is the note.
       </p>
       <ul aria-label="Stamps you gave with a note" className="flex flex-col gap-2">
@@ -528,17 +525,17 @@ function Withdrawn({
         Withdrawn, and the document has not caught up
       </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
-        {total} {plural(total, "decision", "decisions")} you changed your mind about. Withdrawing is
+        {total} {pluralWord(total, "decision", "decisions")} you changed your mind about. Withdrawing is
         a statement and not a forgetting: it stops the map asking without the line disappearing in
         silence. They are grouped by the document that still claims them, because the document is
-        the thing to change — and this map does not change one (§12).
+        the thing to change, and this map does not change one (§12).
       </p>
       {Array.from(bySlug.entries()).map(([slug, held]) => {
         const { shown, hidden } = capped(held);
         return (
           <div key={slug} className="flex flex-col gap-2">
             <p className="max-w-prose text-xs text-text">
-              {`${slug} still claims ${held.length} ${plural(held.length, "decision", "decisions")} you have withdrawn.`}
+              {`${slug} still claims ${held.length} ${pluralWord(held.length, "decision", "decisions")} you have withdrawn.`}
             </p>
             <ul aria-label={`Withdrawn under ${slug}`} className="flex flex-col gap-2">
               {shown.map(({ row, standing }) => (
@@ -599,14 +596,14 @@ function NeverExpires({
       <p className="max-w-prose text-xs text-text-muted">
         {`${stamps.unwatched} of your greens are standing on something that cannot move, so nothing will ever expire them.`}{" "}
         §7 says such a stamp is to be shown rather than enjoyed, and the three reasons below want
-        three different repairs — one of which is nothing.
+        three different repairs: one of which is nothing.
       </p>
 
       <Silence
         projectId={projectId}
         label="Greens with nothing to watch"
         rows={noAnchor}
-        sentence={`${stamps.no_anchor} of them: no readable module names the decision's section, so there is nothing to watch. A citation naming the section — and the document it belongs to — is what would give this green something to expire against.`}
+        sentence={`${stamps.no_anchor} of them: no readable module names the decision's section, so there is nothing to watch. A citation naming the section (and the document it belongs to) is what would give this green something to expire against.`}
       />
       <Silence
         projectId={projectId}
@@ -694,7 +691,7 @@ function Guessed({
         What your greens are watching
       </SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
-        {`${stamps.guessed} of your greens are watching files matched by section number alone. Code names the section and never says which document the section belongs to, so such a stamp will expire — and it may expire because an unrelated file that happens to write the same §N about a different document changed.`}
+        {`${stamps.guessed} of your greens are watching files matched by section number alone. Code names the section and never says which document the section belongs to, so such a stamp will expire, and it may expire because an unrelated file that happens to write the same §N about a different document changed.`}
       </p>
       <p className="max-w-prose text-xs text-text-muted">
         {`${certain} of your greens are watching an anchor this map is certain about: a readable module names the section and names the document it belongs to.`}
@@ -752,8 +749,8 @@ function NeverLooked({
         triage panel below is where that window's size is stated.
       */}
       <p className="max-w-prose text-xs text-text-muted">
-        {`${total} approved ${plural(total, "decision carries", "decisions carry")} no verdict of yours.`}{" "}
-        Most recently moved first, which is the order §10 asks for — and it is a fact about the git
+        {`${total} approved ${pluralWord(total, "decision carries", "decisions carry")} no verdict of yours.`}{" "}
+        Most recently moved first, which is the order §10 asks for, and it is a fact about the git
         log rather than a ranking: everything that has not moved lately ties.
       </p>
       {/*

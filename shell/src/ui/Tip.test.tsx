@@ -37,6 +37,18 @@ describe("Tip", () => {
     expect(screen.queryByText("the reason")).toBeNull();
   });
 
+  it("is a button for the keyboard: Enter and Space pin it, and aria-expanded follows", () => {
+    render(<Tip tip="the reason">the line</Tip>);
+    const trigger = screen.getByRole("button", { name: "the line" });
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("the reason")).toBeTruthy();
+    fireEvent.keyDown(trigger, { key: " " });
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("the reason")).toBeNull();
+  });
+
   it("closes on Escape and leaves focus where it was", () => {
     render(<Tip tip="the reason">the line</Tip>);
     const trigger = screen.getByText("the line");

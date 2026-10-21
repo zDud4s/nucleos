@@ -31,11 +31,15 @@ import {
   Sparkline,
   StaleNote,
   StateBadge,
+  Table,
+  Td,
   Teach,
+  Th,
   Tip,
   usd,
 } from "../ui";
 import "./teams.css";
+import { plural, pluralWord } from "../lib/plural";
 
 const NEW_TEAM_FORM = "new-team-form";
 const CREATE_WHY = "new-team-why";
@@ -187,7 +191,7 @@ export function Teams() {
       ) : rows.length === 0 ? (
         <Teach title="No team yet">
           <p>
-            A team is a permanent unit — Finance, Marketing, Security — not a task. It has a
+            A team is a permanent unit (Finance, Marketing, Security), not a task. It has a
             director, a roster of specialists, what it may do on its own, and the ceilings every
             task of its runs under. Tasks and routines belong to it and are set up inside it.
           </p>
@@ -230,9 +234,9 @@ function headlineFor(
   if (!answered) return undefined;
   if (rows.length === 0) return "No team yet";
 
-  const parts = [`${rows.length} ${rows.length === 1 ? "team" : "teams"}`];
+  const parts = [plural(rows.length, "team")];
   const people = specialistsOf(rows).length;
-  parts.push(`${people} ${people === 1 ? "specialist" : "specialists"}`);
+  parts.push(plural(people, "specialist"));
 
   // Without the task and decision reads there is nothing true to say about work or waiting.
   if (!readsAnswered) return parts.join(" · ");
@@ -243,7 +247,7 @@ function headlineFor(
   // "waiting", never a count presented as the daemon's own — see the module header.
   const known = new Set(runs.map((run) => run.team_id));
   const waiting = actions.filter((action) => known.has(runTeam(action, runs) ?? "")).length;
-  if (waiting > 0) parts.push(`${waiting} team action${waiting === 1 ? "" : "s"} waiting`);
+  if (waiting > 0) parts.push(`${plural(waiting, "team action")} waiting`);
 
   return parts.join(" · ");
 }
@@ -445,21 +449,20 @@ function DepartmentTable({
       </ul>
       <p className="teams-key-pulse">Pulse: a bar per day with runs, newest on the right.</p>
       <div className="teams-table-scroller">
-      <table className="teams-table">
-        <caption className="sr-only">Every team, with what it is doing now</caption>
+      <Table label="Every team, with what it is doing now">
         <thead>
           <tr>
-            <th scope="col" aria-sort={ariaSort("name")}>
+            <Th aria-sort={ariaSort("name")}>
               <SortButton label="Team" active={sort?.key === "name"} dir={sort?.dir} onClick={() => toggle("name")} />
-            </th>
-            <th scope="col">State</th>
-            <th scope="col" className="teams-col-num" aria-sort={ariaSort("staff")}>
+            </Th>
+            <Th>State</Th>
+            <Th num aria-sort={ariaSort("staff")}>
               <SortButton label="Staff" active={sort?.key === "staff"} dir={sort?.dir} onClick={() => toggle("staff")} />
-            </th>
-            <th scope="col" className="teams-col-num" aria-sort={ariaSort("live")}>
+            </Th>
+            <Th num aria-sort={ariaSort("live")}>
               <SortButton label="At work" active={sort?.key === "live"} dir={sort?.dir} onClick={() => toggle("live")} />
-            </th>
-            <th scope="col" className="teams-col-num" aria-sort={ariaSort("waiting")}>
+            </Th>
+            <Th num aria-sort={ariaSort("waiting")}>
               <Tip tip="Up to this many team actions may be waiting for a decision. Some may already be in progress.">
                 Waiting
               </Tip>
@@ -470,13 +473,11 @@ function DepartmentTable({
                 dir={sort?.dir}
                 onClick={() => toggle("waiting")}
               />
-            </th>
-            <th scope="col">On its own</th>
+            </Th>
+            <Th>On its own</Th>
             {/* Right-aligned because the bars are flushed right: a left-aligned title over
                 bars hugging the other edge reads as two columns. The unit is in the key above. */}
-            <th scope="col" className="teams-col-pulse">
-              Pulse
-            </th>
+            <Th num>Pulse</Th>
           </tr>
         </thead>
         <tbody>
@@ -491,7 +492,7 @@ function DepartmentTable({
             />
           ))}
         </tbody>
-      </table>
+      </Table>
       </div>
     </section>
   );
@@ -556,23 +557,23 @@ function DepartmentRow({
           {team.mission === "" ? "No description yet" : team.mission}
         </span>
       </th>
-      <td>
+      <Td>
         <RowState live={runsKnown ? live.length : null} waiting={waiting} />
-      </td>
-      <td className="teams-col-num">
+      </Td>
+      <Td num>
         <Headcount team={team} />
-      </td>
-      <td className="teams-col-num">
+      </Td>
+      <Td num>
         <Ratio value={runsKnown ? live.length : null} ceiling={team.max_live_runs} />
-      </td>
+      </Td>
       {/* Upper bound — see the module header. The column says "Waiting", never a
           count the daemon would recognise. */}
-      <td className="teams-col-num">
+      <Td num>
         <Ratio value={waiting} ceiling={team.max_open_actions} />
-      </td>
-      <td>
+      </Td>
+      <Td>
         <OnItsOwn grants={team.grants} triggers={triggers} />
-      </td>
+      </Td>
       <td className="teams-row-pulse">
         {!runsKnown ? (
           <span className="teams-pulse-none">?</span>
@@ -622,7 +623,7 @@ function Headcount({ team }: { team: TeamView }) {
     <span
       className="teams-figure teams-figure-none"
     >
-      0<span className="sr-only"> — nobody yet, so no task can start</span>
+      0<span className="sr-only">: nobody yet, so no task can start</span>
     </span>
   );
 }
@@ -642,7 +643,7 @@ function Ratio({ value, ceiling }: { value: number | null; ceiling: number }) {
     return (
       <span className="teams-figure">
         ?<span className="teams-figure-of"> / {ceiling}</span>
-        <span className="sr-only"> — not known yet</span>
+        <span className="sr-only">: not known yet</span>
       </span>
     );
   }
@@ -651,7 +652,7 @@ function Ratio({ value, ceiling }: { value: number | null; ceiling: number }) {
     <span className={full ? "teams-figure teams-figure-full" : "teams-figure"}>
       {value}
       <span className="teams-figure-of"> / {ceiling}</span>
-      {full && <span className="sr-only"> — at the ceiling</span>}
+      {full && <span className="sr-only">: at the ceiling</span>}
     </span>
   );
 }
@@ -767,7 +768,7 @@ function Routines({ armed, total }: { armed: number; total: number }) {
         <Mark mode="rule-off" />
         <span aria-hidden="true">{total}</span>
         <span className="sr-only">
-          {total} {total === 1 ? "routine" : "routines"}, none armed
+          {plural(total, "routine")}, none armed
         </span>
       </li>
     );
@@ -779,7 +780,7 @@ function Routines({ armed, total }: { armed: number; total: number }) {
       <Mark mode="rule" />
       <span aria-hidden="true">{armed}</span>
       <span className="sr-only">
-        {armed} armed {armed === 1 ? "routine" : "routines"}
+        {armed} armed {pluralWord(armed, "routine")}
       </span>
     </li>
   );
@@ -813,7 +814,7 @@ export function pulseOf(runs: TeamRun[]): number[] {
  * agreeing, and nothing on the screen would say which bar had been mislabelled.
  */
 export function pulseTitles(runs: TeamRun[]): string[] {
-  return pulseDays(runs).map(([day, count]) => `${count} run${count === 1 ? "" : "s"} on ${day}`);
+  return pulseDays(runs).map(([day, count]) => `${plural(count, "run")} on ${day}`);
 }
 
 /** The days this department has a run in, oldest first, with how many. */
@@ -828,5 +829,5 @@ function pulseDays(runs: TeamRun[]): [string, number][] {
 
 export function pulseLabel(count: number): string {
   if (count === 0) return "no run in the window";
-  return `the ${count} ${count === 1 ? "run" : "runs"} in the window`;
+  return `the ${plural(count, "run")} in the window`;
 }

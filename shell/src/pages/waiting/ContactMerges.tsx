@@ -92,14 +92,14 @@ export function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }
               {verdictsConflict(suggestion) && (
                 <ConflictNote>
                   These two carry standing decisions that disagree, so the daemon
-                  will refuse the merge — settle one of them and decide this
+                  will refuse the merge. Settle one of them and decide this
                   again.
                 </ConflictNote>
               )}
               <div className="waiting-cluster">
                 <ConfirmButton
                   label={`Merge #${suggestion.proposal_id}`}
-                  confirmLabel="Merge — they are one person"
+                  confirmLabel="Merge: they are one person"
                   subject={`#${suggestion.proposal_id}`}
                   variant="approve"
                   disabled={decide.isPending}
@@ -113,7 +113,7 @@ export function ContactMergeSection({ view }: { view: Reading<MergeSuggestion> }
                 />
                 <ConfirmButton
                   label={`Decline merge #${suggestion.proposal_id}`}
-                  confirmLabel="Decline — they are different people"
+                  confirmLabel="Decline: they are different people"
                   subject={`#${suggestion.proposal_id}`}
                   variant="ghost"
                   disabled={decide.isPending}

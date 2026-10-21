@@ -4,7 +4,8 @@ import { isApiRefusal } from "../data/client";
 import type { Anchored, Loss, Orphan } from "../data/project-map";
 import { useOrphanCheck, useRecordAnchor } from "../data/project-map";
 import { UI_LOCALE } from "../lib/locale";
-import { ErrorNote } from "../ui";
+import { pluralWord } from "../lib/plural";
+import { Button, ErrorNote } from "../ui";
 
 /**
  * §14's guard, on one row of *declared, with no code*.
@@ -44,18 +45,16 @@ export function OrphanCheck({ projectId, row }: { projectId: string; row: Anchor
     <div className="flex flex-col gap-1">
       {retryable ? (
         <div>
-          <button
-            type="button"
+          <Button
             disabled={ask.isPending}
             onClick={() => ask.mutate({ slug: row.spec_slug, section: row.section })}
-            className="rounded-md border border-border px-3 py-1 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
           >
             {ask.isPending
               ? "reading the history…"
               : answer === undefined
                 ? "was this ever named?"
                 : "ask git again"}
-          </button>
+          </Button>
         </div>
       ) : null}
       {ask.isError ? <Failed error={ask.error} /> : null}
@@ -92,7 +91,7 @@ function Failed({ error }: { error: unknown }) {
 
   const sentence =
     error.status === 422
-      ? "This decision’s heading carries no number, so there is nothing to look for in the history — the same reason it anchors nothing."
+      ? "This decision’s heading carries no number, so there is nothing to look for in the history: the same reason it anchors nothing."
       : error.status === 404
         ? "This project, or the document this decision came from, is not there any more."
         : error.detail;
@@ -115,14 +114,14 @@ function Answer({ answer }: { answer: Orphan }) {
       return (
         <p className="max-w-prose text-xs text-text-muted">
           Nothing in this repository's history ever named this section. It has no code, and that
-          is the whole of it — the comment was not deleted, it was never written.
+          is the whole of it: the comment was not deleted, it was never written.
         </p>
       );
 
     case "still_named":
       return (
         <p className="max-w-prose text-xs text-text-muted">
-          Something names it right now — {answer.paths.join(" · ")} — so this line is not what it
+          Something names it right now: {answer.paths.join(" · ")}, so this line is not what it
           looks like. Worth saying out loud rather than hiding the row: the panel and the history
           disagree, and one of them is stale.
         </p>
@@ -148,7 +147,7 @@ function Answer({ answer }: { answer: Orphan }) {
       return (
         <p className="max-w-prose text-xs text-text-muted">
           Nothing in the last {answer.window} commits named it. There is older history this did not
-          read, so this is <em>not found</em> and not <em>never named</em> — the two are different
+          read, so this is <em>not found</em> and not <em>never named</em>: the two are different
           facts and only one of them is a claim about your code.
         </p>
       );
@@ -202,8 +201,8 @@ function Remember({
   if (record.isSuccess) {
     return (
       <p className="max-w-prose text-xs text-text-muted">
-        Written down. {paths.join(" · ")} {plural(paths.length, "is", "are")} this decision’s code
-        now, and deleting the comment again will not take that away — it will say so instead.
+        Written down. {paths.join(" · ")} {pluralWord(paths.length, "is", "are")} this decision’s code
+        now, and deleting the comment again will not take that away. It will say so instead.
       </p>
     );
   }
@@ -211,16 +210,14 @@ function Remember({
   return (
     <div className="flex flex-col gap-1">
       <div>
-        <button
-          type="button"
+        <Button
           disabled={record.isPending}
           onClick={() => record.mutate({ decision_id: row.decision_id, paths })}
-          className="rounded-md border border-border px-3 py-1 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
         >
           {record.isPending
             ? "writing it down…"
-            : `write ${plural(paths.length, "this file", "these files")} down as its code`}
-        </button>
+            : `write ${pluralWord(paths.length, "this file", "these files")} down as its code`}
+        </Button>
       </div>
       {record.isError ? (
         <ErrorNote>
@@ -233,10 +230,6 @@ function Remember({
   );
 }
 
-function plural(count: number, one: string, many: string): string {
-  return count === 1 ? one : many;
-}
-
 /**
  * Where one file’s citation went.
  *
@@ -247,7 +240,7 @@ function Went({ loss }: { loss: Loss }) {
   return (
     <li className="max-w-prose text-xs text-text-muted">
       <span className="font-mono text-text">{loss.path}</span> named it until{" "}
-      <span className="font-mono">{loss.commit}</span> — “{loss.subject}”, on{" "}
+      <span className="font-mono">{loss.commit}</span>: “{loss.subject}”, on{" "}
       {new Date(loss.at * 1000).toLocaleDateString(UI_LOCALE)}
       {loss.renamed_to === null ? null : (
         <>
@@ -257,8 +250,8 @@ function Went({ loss }: { loss: Loss }) {
       )}
       {loss.declared ? null : (
         <>
-          {" "}
-          — the citation named a section and no document, so which spec it meant is a guess, the
+:
+          the citation named a section and no document, so which spec it meant is a guess, the
           same guess the rest of this panel makes about the present.
         </>
       )}

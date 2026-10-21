@@ -1,5 +1,15 @@
-import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type Dispatch,
+  type ReactNode,
+  type RefObject,
+  type SetStateAction,
+} from "react";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
+import { AnimatePresence } from "motion/react";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -21,6 +31,7 @@ import {
   type Preset,
 } from "../data/presets";
 import { routeTriple } from "../data/route";
+import { plural } from "../lib/plural";
 import { dayHeading, dayKey } from "../lib/timeline";
 import { useKillSwitch, useProjects, type ProjectSummary } from "../data/system";
 import {
@@ -30,8 +41,8 @@ import {
   ErrorNote,
   Field,
   ListFilter,
+  Modal,
   PageHeader,
-  Panel,
   Quiet,
   RefusalNote,
   Section,
@@ -43,6 +54,7 @@ import {
   readState,
   StaleNote,
   StateBadge,
+  Switch,
   Teach,
 } from "../ui";
 import "./runs.css";
@@ -124,7 +136,6 @@ export function Runs() {
   });
   const projects = useProjects();
   const [composing, setComposing] = useState(false);
-  const panelId = useId();
   const openerId = useId();
 
   /**
@@ -151,12 +162,20 @@ export function Runs() {
     });
   }
 
-  // Focus goes back to the control that opened the panel, which is the standard
-  // the project switcher set: a panel that closes and drops focus on `<body>`
-  // leaves a keyboard user at the top of the document.
+  // Focus goes back to the control that opened the dialog, which is the standard
+  // the project switcher set: a dialog that closes and drops focus on `<body>`
+  // leaves a keyboard user at the top of the document. Done here, after the
+  // close, because Radix hands focus back only to a `Dialog.Trigger` and this
+  // dialog is controlled by the page (and a click does not focus a button in
+  // every browser).
+  const wasComposing = useRef(false);
+  useEffect(() => {
+    if (wasComposing.current && !composing) document.getElementById(openerId)?.focus();
+    wasComposing.current = composing;
+  }, [composing, openerId]);
+
   function closeComposer() {
     setComposing(false);
-    document.getElementById(openerId)?.focus();
   }
 
   const started = (id: number) => void navigate({ to: `/runs/${id}` });
@@ -174,9 +193,8 @@ export function Runs() {
           <Button
             id={openerId}
             intent="go"
-            aria-expanded={composing}
-            aria-controls={panelId}
-            onClick={() => setComposing(!composing)}
+            aria-haspopup="dialog"
+            onClick={() => setComposing(true)}
           >
             New run
           </Button>
@@ -184,9 +202,9 @@ export function Runs() {
       />
 
       <NewRunPanel
-        id={panelId}
         open={composing}
         projects={projects.data}
+        filterProject={filters.project}
         onClose={closeComposer}
         onStarted={started}
       />
@@ -435,17 +453,14 @@ function RunFilterBar({
             </select>
           </Field>
 
-          <label className="runs-check">
-            <input
-              type="checkbox"
+          <div className="runs-check">
+            <Switch
+              label="Show chat turns"
               checked={showChats}
               disabled={filters.mode === "assistant"}
-              onChange={(event) =>
-                onChange({ chats: event.target.checked ? "show" : undefined })
-              }
+              onChange={(next) => onChange({ chats: next ? "show" : undefined })}
             />
-            Show chat turns
-          </label>
+          </div>
         </div>
       </Disclosure>
     </div>
@@ -519,7 +534,7 @@ function RunList({
         {filtered ? (
           <p>
             The {DAEMON_NAME} has runs, but none of them match. Clear the filters
-            above to see the whole index — an empty filtered list is not an empty
+            above to see the whole index: an empty filtered list is not an empty
             machine.
           </p>
         ) : (
@@ -549,19 +564,26 @@ function RunList({
   const attention = split.waiting.length + split.moving.length > 0;
   const now = Date.now();
 
+  // A row whose status changes leaves one list at once and fades in in the other (`Row animated`).
+  // `initial={false}` on every AnimatePresence below keeps the first mount, and a refetch that
+  // changes nothing, still.
   return (
     <div className="runs-index">
       {split.waiting.length > 0 && (
         <Section label="Needs you">
           <Rows label="Runs awaiting approval">
-            {split.waiting.map((row) => runRowOf(row, filters, "attention"))}
+            <AnimatePresence initial={false}>
+              {split.waiting.map((row) => runRowOf(row, filters, "attention"))}
+            </AnimatePresence>
           </Rows>
         </Section>
       )}
       {split.moving.length > 0 && (
         <Section label="Moving">
           <Rows label="Runs still moving">
-            {split.moving.map((row) => runRowOf(row, filters, "attention"))}
+            <AnimatePresence initial={false}>
+              {split.moving.map((row) => runRowOf(row, filters, "attention"))}
+            </AnimatePresence>
           </Rows>
         </Section>
       )}
@@ -575,7 +597,7 @@ function RunList({
         ))}
       {older.failed ? (
         <ErrorNote onRetry={older.load} retryLabel="Load older">
-          Could not load older runs — the ones above are still current.
+          Could not load older runs: the ones above are still current.
         </ErrorNote>
       ) : (
         older.more && (
@@ -721,7 +743,9 @@ function HistoryTable({
               <span className="ui-count">{day.rows.length}</span>
             </Heading>
             <Rows label={`Runs, ${day.title}${day.date === "" ? "" : ` ${day.date}`}`}>
-              {day.rows.map((row) => runRowOf(row, filters, "table"))}
+              <AnimatePresence initial={false}>
+                {day.rows.map((row) => runRowOf(row, filters, "table"))}
+              </AnimatePresence>
             </Rows>
           </section>
         );
@@ -781,13 +805,17 @@ function RunCells({
 
 /** One run as a row: also what a conversation's turns are drawn with (`kind="turn"`). */
 function RunRow({ row, kind }: { row: RunSearchResult; kind: RowKind }) {
+  // A turn nested in a conversation is not part of the polled index and stays still.
   // What ran is a cell of the facts, not a line of its own: it is a fact every
   // routed row has, and a third line under every row made the whole list a
   // third taller to say it.
   const ran = routeTriple([row.model, row.effort]);
   const cost = costOf(row);
   return (
-    <Row className={rowClass(kind)}>
+    <Row
+      className={rowClass(kind)}
+      animated={kind !== "turn"}
+    >
       <RunCells
         state={<RunState status={row.status} />}
         main={
@@ -862,7 +890,10 @@ function ConversationRow({
   const running = row.running_turns ?? 0;
   const name = row.chat_title ?? row.prompt_excerpt;
   return (
-    <Row className={rowClass(kind)}>
+    <Row
+      className={rowClass(kind)}
+      animated={kind !== "turn"}
+    >
       <RunCells
         state={<RunState status={stateOf(row)} />}
         main={
@@ -871,7 +902,7 @@ function ConversationRow({
               {name}
             </Link>
             <p className="runs-row-sub">
-              <span className="runs-row-id">{turns === 1 ? "1 turn" : `${turns} turns`}</span>
+              <span className="runs-row-id">{plural(turns, "turn")}</span>
               {running > 0 && <span className="runs-row-running">{`${running} running`}</span>}
               <span className="runs-row-toggle">
                 <Button
@@ -1030,13 +1061,14 @@ const MODE_CHOICES: readonly { mode: AskableMode; says: string }[] = [
   },
   {
     mode: "real",
-    says: "Acts on the files in the working directory — or the daemon's default — as they are. Nothing isolates it.",
+    says: "Acts on the files in the working directory (or the daemon's default) as they are. Nothing isolates it.",
   },
 ];
 
 interface RunDraft {
   prompt: string;
-  project: string;
+  /** `null` until somebody chooses: the form then follows the page's project filter. `""` is "no project". */
+  project: string | null;
   cwd: string;
   mode: AskableMode;
   steerable: boolean;
@@ -1057,7 +1089,7 @@ interface RunDraft {
  */
 const EMPTY_DRAFT: RunDraft = {
   prompt: "",
-  project: "",
+  project: null,
   cwd: "",
   mode: "shadow",
   steerable: false,
@@ -1065,63 +1097,54 @@ const EMPTY_DRAFT: RunDraft = {
 };
 
 /**
- * The New run panel, opened from the header.
+ * The New run dialog, opened from the header.
  *
- * Not a modal: starting a run needs neither an interruption nor a trap for
- * focus, and the list under it stays readable while somebody writes. It stays
- * mounted while closed so a half-written request survives closing it, which is
- * also what keeps the header button's `aria-controls` pointing at something.
+ * A modal: the owner's call (2026-10-21), reversing the earlier inline panel.
+ * The dialog's content unmounts on close, so the half-written request lives
+ * here, in the panel, which stays mounted on the page: closing and reopening
+ * finds the draft as it was, and a started run clears it.
  */
 function NewRunPanel({
-  id,
   open,
   projects,
+  filterProject,
   onClose,
   onStarted,
 }: {
-  id: string;
   open: boolean;
   projects: ProjectSummary[] | undefined;
+  /** The page's project filter, which a new run starts in. */
+  filterProject: string | undefined;
   onClose: () => void;
   onStarted: (id: number) => void;
 }) {
   const prompt = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    if (open) prompt.current?.focus();
-  }, [open]);
+  const [draft, setDraft] = useState<RunDraft>(EMPTY_DRAFT);
 
   return (
-    <div
-      id={id}
-      className="runs-compose"
-      hidden={!open}
-      // Escape anywhere inside closes it. Not stopped: an armed interlock in a
-      // preset row disarms on the same key, and both are the "no" it means.
-      onKeyDown={(event) => {
-        if (event.key === "Escape") onClose();
+    <Modal
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onClose();
       }}
+      title="New run"
+      size="lg"
+      initialFocus={prompt}
     >
-      <Panel
-        title="New run"
-        aside={
-          <Button variant="quiet" onClick={onClose}>
-            Close
-          </Button>
-        }
-      >
-        <div className="runs-compose-frame">
-          <div className="runs-compose-grid">
-            <NewRunForm
-              projects={projects}
-              promptRef={prompt}
-              onStarted={onStarted}
-            />
-            <PresetsList onStarted={onStarted} />
-          </div>
+      <div className="runs-compose-frame">
+        <div className="runs-compose-grid">
+          <NewRunForm
+            projects={projects}
+            filterProject={filterProject}
+            promptRef={prompt}
+            draft={draft}
+            setDraft={setDraft}
+            onStarted={onStarted}
+          />
+          <PresetsList onStarted={onStarted} />
         </div>
-      </Panel>
-    </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -1134,17 +1157,23 @@ function NewRunPanel({
  */
 function NewRunForm({
   projects,
+  filterProject,
   promptRef,
+  draft,
+  setDraft,
   onStarted,
 }: {
   projects: ProjectSummary[] | undefined;
+  filterProject: string | undefined;
   promptRef: RefObject<HTMLTextAreaElement | null>;
+  /** Held by the panel, which outlives the dialog's content, so closing keeps it. */
+  draft: RunDraft;
+  setDraft: Dispatch<SetStateAction<RunDraft>>;
   onStarted: (id: number) => void;
 }) {
   const create = useCreateRun();
   const save = useCreatePreset();
   const kill = useKillSwitch();
-  const [draft, setDraft] = useState<RunDraft>(EMPTY_DRAFT);
   const hintId = useId();
   const killId = useId();
   const realId = useId();
@@ -1154,9 +1183,21 @@ function NewRunForm({
     setDraft((current) => ({ ...current, ...next }));
   }
 
+  // Until somebody picks one, the run goes where the list is filtered to, or to the only project
+  // there is. A filter naming a project the select does not list would show a different option
+  // than it sends, so it is ignored.
+  const known = projects ?? [];
+  const followed =
+    filterProject !== undefined && known.some((project) => project.project_id === filterProject)
+      ? filterProject
+      : known.length === 1
+        ? known[0].project_id
+        : "";
+  const project = draft.project ?? followed;
+
   const body = {
     prompt: draft.prompt.trim(),
-    project_id: draft.project === "" ? null : draft.project,
+    project_id: project === "" ? null : project,
     cwd: draft.cwd.trim() === "" ? null : draft.cwd.trim(),
     mode: draft.mode,
   };
@@ -1171,7 +1212,7 @@ function NewRunForm({
   // `create_run` refuses an unattended mode for a project whose autopilot is
   // `off` (`core/src/runs.rs`, 422). Said before the press, from the project's
   // own reading, so the default mode is never a refusal waiting to happen.
-  const chosen = projects?.find((project) => project.project_id === draft.project);
+  const chosen = projects?.find((candidate) => candidate.project_id === project);
   const unwatched =
     chosen !== undefined && chosen.mode === "off" && draft.mode !== "real";
 
@@ -1226,7 +1267,7 @@ function NewRunForm({
         <div className="runs-new-where">
           <Field label="Project for this run">
             <select
-              value={draft.project}
+              value={project}
               onChange={(event) => patch({ project: event.target.value })}
             >
               <option value="">no project</option>
@@ -1264,25 +1305,22 @@ function NewRunForm({
         {unwatched && (
           <p className="runs-hold">
             {chosen.project_id} is off, and a {draft.mode} run is one nobody is
-            watching — the {DAEMON_NAME} refuses it until the project is in
+            watching: the {DAEMON_NAME} refuses it until the project is in
             shadow or active.
           </p>
         )}
 
         {/* Opt-in, exactly as the daemon has it: a run listens only because
             somebody asked for one that would. */}
-        <label className="runs-check">
-          <input
-            type="checkbox"
-            checked={draft.steerable}
-            onChange={(event) => patch({ steerable: event.target.checked })}
-          />
-          <span>Let me speak to this run after it starts</span>
-        </label>
+        <Switch
+          label="Let me speak to this run after it starts"
+          checked={draft.steerable}
+          onChange={(next) => patch({ steerable: next })}
+        />
 
         {engaged && (
           <p className="runs-hold" id={killId}>
-            {`The kill switch is engaged — the ${DAEMON_NAME} will refuse this run until it is released.`}
+            {`The kill switch is engaged: the ${DAEMON_NAME} will refuse this run until it is released.`}
           </p>
         )}
 
@@ -1427,7 +1465,7 @@ function PresetsList({ onStarted }: { onStarted: (id: number) => void }) {
       {saved !== undefined && saved.length === 0 && (
         <Quiet says="no saved requests">
           <p>
-            A preset is a run request with a name — fill the form in and use{" "}
+            A preset is a run request with a name: fill the form in and use{" "}
             <em>Save as preset</em> to keep one.
           </p>
         </Quiet>
@@ -1555,21 +1593,21 @@ function PresetRow({
  */
 const START_SENTENCES: Record<string, string> = {
   conflict:
-    "the kill switch is engaged, or this worktree run's project has no free slot — nothing was started",
+    "the kill switch is engaged, or this worktree run's project has no free slot: nothing was started",
   unavailable: `the kill switch or the project's autopilot mode could not be read, so the ${DAEMON_NAME} refused rather than start something either may have forbidden`,
   unprocessable:
-    "that project is off, and a shadow or worktree run is one nobody is watching — put the project in shadow or active first",
+    "that project is off, and a shadow or worktree run is one nobody is watching: put the project in shadow or active first",
   bad_request:
-    `the ${DAEMON_NAME} would not accept that request — check the mode against the directory`,
+    `the ${DAEMON_NAME} would not accept that request: check the mode against the directory`,
   internal:
-    `the ${DAEMON_NAME} failed to prepare the run — a worktree or the database, not your request`,
+    `the ${DAEMON_NAME} failed to prepare the run: a worktree or the database, not your request`,
 };
 
 function StartRefusal({ error, what }: { error: unknown; what: string }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        Could not reach the {DAEMON_NAME} — {what}.
+        Could not reach the {DAEMON_NAME}: {what}.
       </ErrorNote>
     );
   }
@@ -1586,7 +1624,7 @@ function PresetRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        Could not reach the {DAEMON_NAME} — the preset was not saved.
+        Could not reach the {DAEMON_NAME}: the preset was not saved.
       </ErrorNote>
     );
   }
@@ -1595,7 +1633,7 @@ function PresetRefusal({ error }: { error: unknown }) {
       refusal={error}
       sentences={{
         conflict:
-          "that name is taken — presets are named uniquely, so choose another",
+          "that name is taken: presets are named uniquely, so choose another",
       }}
     />
   );
@@ -1606,7 +1644,7 @@ function ListError({ error, onRetry }: { error: unknown; onRetry?: () => void })
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote onRetry={onRetry}>
-      Could not reach the {DAEMON_NAME} — nothing is known about the index.
+      Could not reach the {DAEMON_NAME}: nothing is known about the index.
     </ErrorNote>
   );
 }
@@ -1616,7 +1654,7 @@ function MutationNote({ error, what }: { error: unknown; what: string }) {
     return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      Could not reach the {DAEMON_NAME} — {what}.
+      Could not reach the {DAEMON_NAME}: {what}.
     </ErrorNote>
   );
 }
@@ -1660,7 +1698,7 @@ function headline(
     <>
       {said}; {moving};{" "}
       <Link to="/waiting">
-        {waiting} run{waiting === 1 ? "" : "s"} awaiting approval
+        {plural(waiting, "run")} awaiting approval
       </Link>
       {wrong}
     </>

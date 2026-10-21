@@ -1,9 +1,9 @@
+import { Segmented } from "../ui";
+
 /**
- * One choice out of a few, drawn as the app's segmented track (`.ui-switch`, `ui.css`) — the
- * same control Feed, Fleet and Runs use, so "how it is set now" reads the same on the Brain.
- *
- * A `group` of toggle buttons rather than radios: every caller and test already speaks
- * `aria-pressed`, and the pressed mark in `ui.css` is keyed on it.
+ * `Segmented` with its options as `[value, label]` tuples, the shape the Brain's constant tables
+ * (`DEPTHS`, `TYPE_FILTERS`, …) are written in. The control itself is the shared one, so "how it
+ * is set now" reads the same here as on Feed, Fleet and Runs.
  */
 export function Segments<T extends string | number>({
   label,
@@ -17,18 +17,11 @@ export function Segments<T extends string | number>({
   onChange: (next: T) => void;
 }) {
   return (
-    <div role="group" aria-label={label} className="ui-switch">
-      {options.map(([option, text]) => (
-        <button
-          key={String(option)}
-          type="button"
-          className="ui-switch-seg"
-          aria-pressed={value === option}
-          onClick={() => onChange(option)}
-        >
-          {text}
-        </button>
-      ))}
-    </div>
+    <Segmented
+      label={label}
+      value={value}
+      options={options.map(([option, text]) => ({ value: option, label: text }))}
+      onChange={onChange}
+    />
   );
 }

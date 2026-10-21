@@ -151,7 +151,7 @@ export function RemoveProject({
       */}
       {record.isError ? (
         <p className="text-xs text-text-muted">
-          the {DAEMON_NAME} did not say what {projectId} has on record — removing it still works, and the
+          the {DAEMON_NAME} did not say what {projectId} has on record: removing it still works, and the
           history is kept
         </p>
       ) : record.data === undefined ? (
@@ -182,7 +182,7 @@ export function RemoveProject({
       */}
       {held !== null && (
         <p className="ws-dialog-note">
-          Work is still in flight here — {held}. Removing waits until it finishes; nothing here
+          Work is still in flight here: {held}. Removing waits until it finishes; nothing here
           would stop it.
         </p>
       )}
@@ -196,18 +196,18 @@ export function RemoveProject({
               // statuses mean here. `not_found` in particular: the generic "there is nothing there
               // to act on" reads as a bug, and the true answer — somebody else already removed it —
               // is a thing that resolves itself.
-              in_flight: "work is still in flight here — nothing was removed",
+              in_flight: "work is still in flight here: nothing was removed",
               not_registered: `${projectId} is already off the roster`,
               not_found: `${projectId} is already off the roster`,
               history_referenced:
-                "something outside this project still points at its history — untick the box and" +
+                "something outside this project still points at its history: untick the box and" +
                 " remove it without forgetting, which is what happens by default",
             }}
           />
         ) : (
           // The app tried and could not: the error rung, next to the button that caused it. It was
           // faint 12px text — the one failure on this page that read quieter than a column label.
-          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was removed</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding: nothing was removed</ErrorNote>
         ))}
 
       {/* Drawn inside a modal: the answer row on its bottom edge, right-aligned, the act last. */}

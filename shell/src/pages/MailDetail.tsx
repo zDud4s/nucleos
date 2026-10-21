@@ -33,6 +33,7 @@ import {
   Tip,
 } from "../ui";
 import "./mail.css";
+import { plural } from "../lib/plural";
 
 /**
  * One message: who sent it, its body, its attachments, a reply, a standing
@@ -65,7 +66,7 @@ function UnknownEmail({ raw }: { raw: string | undefined }) {
       <Crumb to="/mail">Mail</Crumb>
       <PageHeader title="Message" />
       <ErrorNote>
-        <code>{raw ?? "(nothing)"}</code> is not a message id — messages are numbered.
+        <code>{raw ?? "(nothing)"}</code> is not a message id: messages are numbered.
       </ErrorNote>
     </>
   );
@@ -117,7 +118,7 @@ function KnownEmail({ id }: { id: number }) {
  */
 function headline(email: EmailDetail): string {
   const from = email.from_name ?? email.from_addr;
-  return `from ${from} — ${classWords(email.triage_class)}`;
+  return `from ${from}: ${classWords(email.triage_class)}`;
 }
 
 function classWords(triageClass: string | null): string {
@@ -227,8 +228,8 @@ function RequeueError({ error }: { error: unknown }) {
           // `eligible` above already ruled out the pruned-body 409 — a 409
           // that still arrives here can only be the other, indistinguishable
           // one: a live triage run already holds this message.
-          conflict: "a triage run is already holding this message — try again once it finishes",
-          not_found: "this message is no longer in the queue — it may have been swept",
+          conflict: "a triage run is already holding this message: try again once it finishes",
+          not_found: "this message is no longer in the queue: it may have been swept",
         }}
       />
     );
@@ -282,10 +283,9 @@ function AttachmentsPanel({ emailId, attachments }: { emailId: number; attachmen
 
 function SavedAllNote({ result }: { result: SavedAttachments }) {
   const where = result.folder === "" ? "the files root" : result.folder;
-  const noun = result.filenames.length === 1 ? "file" : "files";
   return (
     <p className="mail-outcome" role="status">
-      Saved {result.filenames.length} {noun} to {where}: {result.filenames.join(", ")}
+      Saved {plural(result.filenames.length, "file")} to {where}: {result.filenames.join(", ")}
     </p>
   );
 }
@@ -354,7 +354,7 @@ function AttachmentError({ error, what }: { error: unknown; what: string }) {
     return (
       <RefusalNote
         refusal={error}
-        sentences={{ unavailable: "no files folder is configured — nothing can be saved to disk" }}
+        sentences={{ unavailable: "no files folder is configured: nothing can be saved to disk" }}
       />
     );
   }
@@ -407,7 +407,7 @@ function SenderVerdict({ email }: { email: EmailDetail }) {
                TEXT, so an e-mail address there reserves the width of the whole address on a
                button that reads "Mute". The panel's own sentence already names the sender for
                the eye. */
-            sayAs={`Mute ${email.from_addr} — their mail stops being surfaced`}
+            sayAs={`Mute ${email.from_addr}: their mail stops being surfaced`}
             variant="ghost"
             disabled={verdict.isPending || standing === "mute"}
             onConfirm={() => verdict.mutate({ address: email.from_addr, verdict: "mute" })}
@@ -444,20 +444,20 @@ function standingSentence(address: string, verdict: string | null): ReactNode {
   if (verdict === "pin") {
     return (
       <>
-        <code>{address}</code> is pinned — their mail keeps being surfaced in full.
+        <code>{address}</code> is pinned: their mail keeps being surfaced in full.
       </>
     );
   }
   if (verdict === "mute") {
     return (
       <>
-        <code>{address}</code> is muted — their mail stops being surfaced.
+        <code>{address}</code> is muted: their mail stops being surfaced.
       </>
     );
   }
   return (
     <>
-      No standing decision about <code>{address}</code> — pin them to keep seeing their mail in full,
+      No standing decision about <code>{address}</code>: pin them to keep seeing their mail in full,
       or mute them to stop it being surfaced.
     </>
   );
@@ -465,9 +465,9 @@ function standingSentence(address: string, verdict: string | null): ReactNode {
 
 /** What the press just recorded — "recorded" alone did not say which of three buttons it was. */
 function verdictRecorded(verdict: "pin" | "mute" | null | undefined): string {
-  if (verdict === "pin") return "recorded — this sender is pinned";
-  if (verdict === "mute") return "recorded — this sender is muted";
-  if (verdict === null) return "recorded — no standing decision about this sender";
+  if (verdict === "pin") return "recorded: this sender is pinned";
+  if (verdict === "mute") return "recorded: this sender is muted";
+  if (verdict === null) return "recorded: no standing decision about this sender";
   return "recorded";
 }
 

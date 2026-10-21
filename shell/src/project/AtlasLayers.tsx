@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useAcceptLayers, useSetLayer, type Layering, type ProjectMap } from "../data/project-map";
 import { buildBands, isolate, ladder, maxLayer, type Band, type LayerBlock } from "./layers-model";
 import { DAEMON_NAME } from "../copy";
+import { Button } from "../ui";
 
 /**
  * The modules stacked by layer, highest first: what may import what, and which imports break it.
@@ -216,9 +217,13 @@ function BlockFiles({
             ))}
           </select>
           {layering.overridden.includes(path) ? (
-            <button type="button" onClick={() => setLayer.mutate({ path, layer: null })}>
+            <Button
+              variant="quiet"
+              disabled={setLayer.isPending}
+              onClick={() => setLayer.mutate({ path, layer: null })}
+            >
               reset
-            </button>
+            </Button>
           ) : null}
         </li>
       ))}

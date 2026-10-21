@@ -394,11 +394,7 @@ impl Router {
         for alternate in &self.alternates {
             let fits = match alternate.kind {
                 RunnerKind::Claude => true,
-                RunnerKind::Codex => {
-                    shape.permission == Permission::Default
-                        && !shape.classifier_governs_tools
-                        && shape.tool_policy == ToolPolicy::Unrestricted
-                }
+                RunnerKind::Codex => codex_can_take(shape),
             };
             if fits && !kinds.contains(&alternate.kind) {
                 kinds.push(alternate.kind);
@@ -552,6 +548,40 @@ pub struct RunShape {
     pub resume: bool,
 }
 
+/// Why `CodexCliRunner` would refuse a run of this shape, in a sentence; `None` when it can take it.
+/// The one place the Codex predicate lives: the router's `eligible` and a pinned launch both ask it.
+pub fn codex_refusal(shape: RunShape) -> Option<String> {
+    if shape.permission == Permission::Plan {
+        return Some(
+            "codex has no plan mode, so a plan-only run cannot be pinned to it".to_owned(),
+        );
+    }
+    if shape.permission != Permission::Default {
+        return Some(format!(
+            "codex exec cannot honour Permission::{:?}",
+            shape.permission
+        ));
+    }
+    if shape.classifier_governs_tools {
+        return Some(
+            "codex has no PreToolUse hook, so a classifier-governed run cannot be pinned to it"
+                .to_owned(),
+        );
+    }
+    if shape.tool_policy != ToolPolicy::Unrestricted {
+        return Some(format!(
+            "codex exec cannot honour ToolPolicy::{:?}",
+            shape.tool_policy
+        ));
+    }
+    None
+}
+
+/// Whether Codex can take a run of this shape.
+pub fn codex_can_take(shape: RunShape) -> bool {
+    codex_refusal(shape).is_none()
+}
+
 /// What the daemon would launch, or what it will.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Choice {
@@ -669,6 +699,10 @@ pub struct EnginePinRoute {
     pub runner: RunnerKind,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Codex only: the sandbox the pinned launch runs in (`read-only` | `workspace-write`), derived
+    /// from the agent's capabilities. On Codex this sandbox is the barrier, since `codex exec` has no
+    /// permission modes and no `PreToolUse` hook. `None` keeps the runner the daemon already holds.
+    pub sandbox: Option<&'static str>,
 }
 
 /// The runners the quota brake is holding right now, by the stored readings only.
@@ -753,7 +787,7 @@ pub async fn resolve(
     // A pin bypasses the router entirely, whatever mode the runs surface is in: no HTTP, no
     // decision id, and `route_mode` and the `advised_*` columns stay NULL.
     if let Some(pin) = pin {
-        return resolve_pin(pool, run_id, runner, router, pin).await;
+        return resolve_pin(pool, run_id, runner, router, pin, shape).await;
     }
     let mode = router.runs_mode();
     if mode == Mode::Off {
@@ -907,13 +941,16 @@ pub fn narrowed_runners(
 }
 
 /// A pinned launch: the runner the pin names (the wrapper `runner` when it is the primary), its
-/// model and effort, written in one UPDATE. A runner the router does not hold is refused.
+/// model and effort, written in one UPDATE. A runner the router does not hold is refused, and so is
+/// a Codex pin on a run of a shape Codex cannot take (the sentence names why, instead of leaving it
+/// to the runner's generic error).
 async fn resolve_pin(
     pool: &SqlitePool,
     run_id: i64,
     runner: Arc<dyn CommandRunner>,
     router: Arc<Router>,
     pin: EnginePinRoute,
+    shape: RunShape,
 ) -> Resolved {
     let Some(available) = router.available(pin.runner) else {
         return Resolved {
@@ -928,6 +965,20 @@ async fn resolve_pin(
             )),
         };
     };
+    if pin.runner == RunnerKind::Codex
+        && let Some(why) = codex_refusal(shape)
+    {
+        return Resolved {
+            runner,
+            model: pin.model,
+            effort: pin.effort,
+            decision_id: None,
+            router: None,
+            refused: Some(format!(
+                "this node is pinned to the codex engine, but {why}"
+            )),
+        };
+    }
     let effective_model = pin
         .model
         .clone()
@@ -943,10 +994,15 @@ async fn resolve_pin(
     {
         tracing::warn!(run_id, %error, "could not record a pinned run's engine");
     }
-    let chosen_runner = if pin.runner == router.primary.kind {
-        runner
-    } else {
-        Arc::clone(&available.runner)
+    let chosen_runner: Arc<dyn CommandRunner> = match (pin.runner, pin.sandbox) {
+        // The agent's sandbox is the barrier on Codex, so the launch gets a runner that pins it
+        // rather than the shared instance, which pins nothing.
+        (RunnerKind::Codex, Some(sandbox)) => Arc::new(crate::execution::runner::CodexCliRunner {
+            model: available.default_model.clone(),
+            sandbox_mode: Some(sandbox),
+        }),
+        _ if pin.runner == router.primary.kind => runner,
+        _ => Arc::clone(&available.runner),
     };
     Resolved {
         runner: chosen_runner,
@@ -2296,6 +2352,7 @@ mod tests {
                     runner: RunnerKind::Codex,
                     model: Some("gpt-5.6-terra".into()),
                     effort: Some("low".into()),
+                    sandbox: None,
                 }),
                 ..query()
             }),
@@ -2341,6 +2398,7 @@ mod tests {
                     runner: RunnerKind::Claude,
                     model: None,
                     effort: None,
+                    sandbox: None,
                 }),
                 ..query()
             }),
@@ -2380,6 +2438,7 @@ mod tests {
                     runner: RunnerKind::Codex,
                     model: Some("gpt-5.6-terra".into()),
                     effort: None,
+                    sandbox: None,
                 }),
                 ..query()
             }),
@@ -2392,6 +2451,91 @@ mod tests {
         assert!(why.contains("codex"), "{why}");
         let row = route_row(&pool, run_id).await;
         assert!(row.0.is_none() && row.2.is_none(), "nothing was recorded");
+    }
+
+    /// Resolves a Codex pin carrying `sandbox` for a run of `run_shape`.
+    async fn resolve_codex_pin(
+        sandbox: Option<&'static str>,
+        run_shape: RunShape,
+    ) -> (Resolved, Arc<dyn CommandRunner>, Arc<dyn CommandRunner>) {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (runner, codex) = routed(config(Mode::Apply, DEFAULT_URL), Arc::new(Probe));
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: RunnerKind::Codex,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: None,
+                    sandbox,
+                }),
+                ..query()
+            }),
+            run_shape,
+            Speed::Normal,
+        )
+        .await;
+        (resolved, runner, codex)
+    }
+
+    #[tokio::test]
+    async fn a_codex_pin_with_a_sandbox_launches_a_runner_that_pins_it() {
+        let (resolved, _, codex) = resolve_codex_pin(Some("read-only"), shape()).await;
+        assert!(resolved.refused.is_none());
+        assert!(
+            !Arc::ptr_eq(&resolved.runner, &codex),
+            "the shared alternate pins no sandbox, so a pinned launch needs a runner of its own"
+        );
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[tokio::test]
+    async fn a_codex_pin_on_a_shape_codex_cannot_take_is_refused_with_the_reason() {
+        for (run_shape, said) in [
+            (
+                RunShape {
+                    permission: Permission::Plan,
+                    ..shape()
+                },
+                "plan mode",
+            ),
+            (
+                RunShape {
+                    permission: Permission::Bypass,
+                    classifier_governs_tools: true,
+                    ..shape()
+                },
+                "Bypass",
+            ),
+            (
+                RunShape {
+                    classifier_governs_tools: true,
+                    ..shape()
+                },
+                "classifier",
+            ),
+        ] {
+            let (resolved, runner, _) = resolve_codex_pin(Some("read-only"), run_shape).await;
+            let why = resolved.refused.expect("the launch is refused");
+            assert!(why.contains("codex") && why.contains(said), "{why}");
+            assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        }
+    }
+
+    #[test]
+    fn the_codex_predicate_is_one_function_for_eligible_and_for_a_pin() {
+        assert!(codex_can_take(shape()));
+        let governed = RunShape {
+            classifier_governs_tools: true,
+            ..shape()
+        };
+        assert!(!codex_can_take(governed));
+        assert!(codex_refusal(governed).is_some());
     }
 
     #[tokio::test]

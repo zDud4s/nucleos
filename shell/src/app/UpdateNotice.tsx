@@ -40,7 +40,7 @@ export function UpdateNotice() {
       </Button>
       {failure === null ? null : (
         <ErrorNote>
-          the update could not be installed — {failure instanceof Error ? failure.message : String(failure)}
+          the update could not be installed: {failure instanceof Error ? failure.message : String(failure)}
         </ErrorNote>
       )}
     </div>

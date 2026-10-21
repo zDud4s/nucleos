@@ -145,12 +145,12 @@ export function JudgePanel({
     <Panel title="Judge" aside={<span className="ap-project-name">{projectId}</span>}>
       <p className="ap-note">
         A model asked about each tool call the classifier left open. Watching in shadow sends each
-        such call to TypeSafe — {TYPESAFE_LEAVES} — and changes nothing; letting it act lets its
+        such call to TypeSafe ({TYPESAFE_LEAVES}) and changes nothing; letting it act lets its
         answer stand, except for the classes and guards it may refuse but never approve.{" "}
         {TYPESAFE_DEFINITION}
       </p>
       {status.isError && status.data === undefined && (
-        <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about the judge.</ErrorNote>
+        <ErrorNote>Could not reach the {DAEMON_NAME}: nothing is known about the judge.</ErrorNote>
       )}
       {current !== undefined && (
         <p className="ap-reason">
@@ -217,13 +217,13 @@ export function JudgePanel({
       {/* Review item G: fails closed (the classifier decides alone), and would otherwise be silent. */}
       {status.data?.rules_error != null && (
         <ErrorNote>
-          {`This project's rules cannot be read — the judge has no effect until they can: ${status.data.rules_error}`}
+          {`This project's rules cannot be read, so the judge has no effect until they can: ${status.data.rules_error}`}
         </ErrorNote>
       )}
       {readiness !== undefined && (
         <>
           <p className="ap-note">
-            {readiness.reviewed} distinct actions reviewed, {readiness.agree} agreed — letting it act
+            {readiness.reviewed} distinct actions reviewed, {readiness.agree} agreed. Letting it act
             needs {READINESS_MIN_REVIEWED} at {READINESS_MIN_AGREE_PERCENT}%, on an active project.
           </p>
           {readiness.by_class.length > 0 && (
@@ -267,18 +267,18 @@ export function JudgePanel({
 
 function JudgeRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>Could not reach the {DAEMON_NAME} — the judge was not changed.</ErrorNote>;
+    return <ErrorNote>Could not reach the {DAEMON_NAME}: the judge was not changed.</ErrorNote>;
   }
   return (
     <RefusalNote
       refusal={error}
       sentences={{
         not_active: "the judge decides only on top of an active project",
-        not_ready: "the judge has not cleared the bar yet — review more of its verdicts below",
+        not_ready: "the judge has not cleared the bar yet: review more of its verdicts below",
         unknown_project: "this project is not on the autopilot's roster",
         invalid: "off, observe and enforce are the only settings",
         // A shell newer than its daemon: until the daemon has Task 9.5, the route still says this.
-        enforce_unavailable: `this ${DAEMON_NAME} does not accept enforce yet — update it to one that shows the residual risk first`,
+        enforce_unavailable: `this ${DAEMON_NAME} does not accept enforce yet: update it to one that shows the residual risk first`,
       }}
     />
   );

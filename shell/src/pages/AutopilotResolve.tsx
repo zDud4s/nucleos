@@ -88,7 +88,7 @@ export function ResolvePanel({
         {mode === "observe" && (
           <ConfirmButton
             label="Let the resolver decide"
-            confirmLabel="Let the resolver decide — I accept the risk above"
+            confirmLabel="Let the resolver decide: I accept the risk above"
             variant="danger"
             describedBy="resolve-enforce-risk"
             disabled={setMode.isPending || enforceShut}
@@ -185,7 +185,7 @@ function ResolutionCard({
           <ConfirmButton
             key={outcome}
             label={readOutcome(outcome)}
-            confirmLabel={`Yes — ${readOutcome(outcome)}`}
+            confirmLabel={`Yes, ${readOutcome(outcome)}`}
             variant="ghost"
             disabled={busy}
             onConfirm={() => onAnswer(outcome)}
@@ -198,19 +198,19 @@ function ResolutionCard({
 
 function ResolveRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>Could not reach the {DAEMON_NAME} — the resolver was not changed.</ErrorNote>;
+    return <ErrorNote>Could not reach the {DAEMON_NAME}: the resolver was not changed.</ErrorNote>;
   }
   return (
     <RefusalNote
       refusal={error}
       sentences={{
         not_active: "the resolver decides only on top of an active project",
-        not_ready: "the resolver has not cleared its bar yet — review more of its blocks below",
+        not_ready: "the resolver has not cleared its bar yet: review more of its blocks below",
         unknown_project: "this project is not on the autopilot's roster",
         invalid: "off, observe and enforce are the only settings",
         // A shell newer than its daemon: until the daemon shows the risk, the route still says this.
         enforce_unavailable:
-          `this ${DAEMON_NAME} does not accept enforce for the resolver yet — update it to one that shows the risk first`,
+          `this ${DAEMON_NAME} does not accept enforce for the resolver yet: update it to one that shows the risk first`,
       }}
     />
   );

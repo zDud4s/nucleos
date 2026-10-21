@@ -566,7 +566,7 @@ describe("QuotaNotch", () => {
     const loud = renderWithQuery(<QuotaNotch />);
     await loud.findByText(/claude: 7d 46% /);
     expect(loud.container.querySelector(".quota-notch-slot")!.getAttribute("title")).toContain(
-      "claude — official · warning",
+      "claude (official) · warning",
     );
     loud.unmount();
 
@@ -574,7 +574,7 @@ describe("QuotaNotch", () => {
     const quiet = renderWithQuery(<QuotaNotch />);
     await quiet.findByText(/claude: 7d 46% /);
     expect(quiet.container.querySelector(".quota-notch-slot")!.getAttribute("title")).toContain(
-      "claude — official\n",
+      "claude (official)\n",
     );
   });
 

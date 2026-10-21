@@ -1,3 +1,4 @@
+import { Chip } from "../ui";
 import type { GEdgeType, GFilters, GNodeKind } from "./graph-types";
 import { Mark } from "./marks";
 import { Segments } from "./Segments";
@@ -76,52 +77,44 @@ export function GraphFilters({
           onChange={(state) => onFilters({ ...filters, state })}
         />
         <span className="brain-bar-end">
-          <button
-            type="button"
-            className="brain-chip"
-            aria-pressed={filters.showArchived}
-            onClick={() => onFilters({ ...filters, showArchived: !filters.showArchived })}
+          <Chip
+            pressed={filters.showArchived}
+            onToggle={() => onFilters({ ...filters, showArchived: !filters.showArchived })}
           >
             Show archived
-          </button>
-          <button
-            type="button"
-            className="brain-chip"
-            aria-pressed={filters.showOrphans}
-            onClick={() => onFilters({ ...filters, showOrphans: !filters.showOrphans })}
+          </Chip>
+          <Chip
+            pressed={filters.showOrphans}
+            onToggle={() => onFilters({ ...filters, showOrphans: !filters.showOrphans })}
           >
             Show orphans
-          </button>
+          </Chip>
         </span>
       </div>
       <div className="brain-bar-line">
         <div role="group" aria-label="Node kinds" className="brain-chips">
           {NODE_KINDS.map((kind) => (
-            <button
+            <Chip
               key={kind}
-              type="button"
-              className="brain-chip"
-              aria-pressed={filters.nodeKinds.has(kind)}
-              onClick={() => onFilters({ ...filters, nodeKinds: toggled(filters.nodeKinds, kind) })}
+              pressed={filters.nodeKinds.has(kind)}
+              onToggle={() => onFilters({ ...filters, nodeKinds: toggled(filters.nodeKinds, kind) })}
             >
               <Mark hue={kind === "knowledge" ? "k-semantic" : kind} />
               {KIND_LABELS[kind]}
-            </button>
+            </Chip>
           ))}
         </div>
       </div>
       <div className="brain-bar-line">
-        <div role="group" aria-label="Link types" className="brain-chips">
+        <div role="group" aria-label="Link types" className="brain-chips brain-chips-link">
           {EDGE_TYPES.map((type) => (
-            <button
+            <Chip
               key={type}
-              type="button"
-              className="brain-chip brain-chip-link"
-              aria-pressed={filters.edgeTypes.has(type)}
-              onClick={() => onFilters({ ...filters, edgeTypes: toggled(filters.edgeTypes, type) })}
+              pressed={filters.edgeTypes.has(type)}
+              onToggle={() => onFilters({ ...filters, edgeTypes: toggled(filters.edgeTypes, type) })}
             >
               {EDGE_LABELS[type] ?? type}
-            </button>
+            </Chip>
           ))}
         </div>
       </div>

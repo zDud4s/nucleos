@@ -3,6 +3,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
 import { useAgents } from "../data/agents";
+import { plural } from "../lib/plural";
 import { ContextRefs } from "../context/ContextRefs";
 import { ScopedMemory } from "../brain/knowledge/ScopedMemory";
 import { ScopedTools } from "../brain/knowledge/ScopedTools";
@@ -268,7 +269,7 @@ function DeleteTeam({ team, live }: { team: TeamView; live: number }) {
     <section className="teams-bench-danger" aria-label="Delete this team">
       <p id={noteId} className="teams-bench-danger-note">
         {live > 0
-          ? `${live === 1 ? "1 task is" : `${live} tasks are`} still running. Let ${them} finish, or cancel ${them}, before deleting this team.`
+          ? `${plural(live, "task")} ${live === 1 ? "is" : "are"} still running. Let ${them} finish, or cancel ${them}, before deleting this team.`
           : "Deleting this team removes it for good. This cannot be undone."}
       </p>
       <ConfirmButton
@@ -535,7 +536,7 @@ function TeamForm({
         <fieldset className="teams-members">
           <legend className="teams-label">Members</legend>
           {members.length === 0 ? (
-            <p className="teams-note">No specialists exist yet — hire one on the Agents page first.</p>
+            <p className="teams-note">No specialists exist yet. Hire one on the Agents page first.</p>
           ) : (
             <ul className="teams-check-list">
               {members.map((agent) => {
@@ -686,7 +687,7 @@ function TeamForm({
               ? whyCannot(missing, badLimits.length > 0, whyNot)
               : existing === null
                 ? "Creating sends the roster and the powers as they are here."
-                : `${sectionsChanged} ${sectionsChanged === 1 ? "section" : "sections"} changed — the roster and the powers are sent whole, so what is here replaces what is there.`}
+                : `${plural(sectionsChanged, "section")} changed. The roster and the powers are sent whole, so what is here replaces what is there.`}
           </p>
           <Button type="submit" intent="go" disabled={!valid || mutation.isPending || checking}>
             {checking
@@ -759,7 +760,7 @@ function DriftGuard({
       <p className="teams-drift-said">
         This team changed while you had the form open, in{" "}
         {guard.drifted.length === 1 ? "a field" : "fields"} you were not editing. Saving as-is would
-        replace {guard.drifted.length === 1 ? "it" : "them"} — the roster and the powers go whole.
+        replace {guard.drifted.length === 1 ? "it" : "them"}: the roster and the powers go whole.
       </p>
       <ul className="teams-drift-list">
         {guard.drifted.map((one) => (

@@ -145,6 +145,7 @@ import {
   Modal,
   CopyButton,
   CostLine,
+  Callout,
   ErrorNote,
   IconButton,
   Quiet,
@@ -153,6 +154,9 @@ import {
   StaleNote,
 } from "../ui";
 import { elapsedText } from "../lib/when";
+import { plural } from "../lib/plural";
+import { useNow } from "../lib/useNow";
+import { tokenCount } from "../ui/readings";
 import { SessionColumn } from "../chats/SessionColumn";
 import { ChatTabs } from "../chats/ChatTabs";
 import { ChatChips } from "../chats/AgentMap";
@@ -512,7 +516,7 @@ function ListError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      The {DAEMON_NAME} is not responding — nothing is known about your conversations
+      The {DAEMON_NAME} is not responding. Nothing is known about your conversations
     </ErrorNote>
   );
 }
@@ -574,8 +578,8 @@ function WhatItCarries({
     <p className={over ? "chats-carries chats-carries-over" : "chats-carries"}>
       {`about ${k(carries)} of context`}
       {over
-        ? " — larger than any window a model has, so picking it up hands the model the last few exchanges instead"
-        : " — picked up where it left off, in a window wide enough to hold it"}
+        ? ", larger than any window a model has, so picking it up hands the model the last few exchanges instead"
+        : ", picked up where it left off, in a window wide enough to hold it"}
     </p>
   );
 }
@@ -681,7 +685,7 @@ function EditorDetail({
         placeholder="Carry on where you left off…"
         /* The `@` note, corrected for this one case: there IS a folder — it is the one the session
            was had in — and what is missing is a conversation here to ask about it. */
-        noFolderNote={`this conversation is not open here yet — say something to carry it on, and an @ will name the files in ${chosen.cwd}`}
+        noFolderNote={`this conversation is not open here yet. Say something to carry it on, and an @ will name the files in ${chosen.cwd}`}
         /* The one door that can answer this before the conversation exists. `chosen.tools` is the
            same question the turn itself asks, already answered for this session — see
            `OfferedSession`. */
@@ -722,11 +726,11 @@ function NoTools({ session }: { session: IdeSession }) {
 
   return (
     <div className="chats-new-notools">
-      <p className="chats-new-warning" role="status">
-        this session was had in a folder with no {DAEMON_NAME} hook — continued here,
+      <Callout tone="paused" role="status">
+        this session was had in a folder with no {DAEMON_NAME} hook. Continued here,
         it can talk about the code but <b>cannot read or change any file</b>,
         and cannot run anything
-      </p>
+      </Callout>
       <Button
         type="button"
         disabled={wire.isPending}
@@ -743,7 +747,7 @@ function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        The {DAEMON_NAME} is not responding — the folder was left alone
+        The {DAEMON_NAME} is not responding. The folder was left alone
       </ErrorNote>
     );
   }
@@ -751,7 +755,7 @@ function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
     <RefusalNote
       refusal={error}
       sentences={{
-        conflict: `${cwd}/.claude/settings.json could not be read as JSON, so it was left exactly as it is — open it and it will say why`,
+        conflict: `${cwd}/.claude/settings.json could not be read as JSON, so it was left exactly as it is. Open it and it will say why`,
         not_found: "that session is not on this machine any more",
       }}
     />
@@ -761,14 +765,14 @@ function WireRefusal({ error, cwd }: { error: unknown; cwd: string }) {
 function CreateRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
-      <ErrorNote>The {DAEMON_NAME} is not responding — nothing was opened</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} is not responding. Nothing was opened</ErrorNote>
     );
   return (
     <RefusalNote
       refusal={error}
       sentences={{
         not_found:
-          "that session is not on this machine — pick another, or start fresh",
+          "that session is not on this machine. Pick another, or start fresh",
       }}
     />
   );
@@ -1155,7 +1159,7 @@ function NothingOpen() {
         />
         {start.isError && <CreateRefusal error={start.error} />}
         <p className="chats-front-note">
-          Every turn is a billed run. Nothing here is ever quietly deleted —
+          Every turn is a billed run. Nothing here is ever quietly deleted:
           ending a conversation only archives it, and every turn it ever had
           stays readable.
         </p>
@@ -1184,7 +1188,7 @@ function StartBox({
   pending,
   onSay,
   placeholder = "Say something…",
-  noFolderNote = "this conversation has no folder yet — open it, point it at a project, and an @ will name its files",
+  noFolderNote = "this conversation has no folder yet. Open it, point it at a project, and an @ will name its files",
   tools = false,
 }: {
   pending: boolean;
@@ -1296,7 +1300,7 @@ function StartBox({
 
   return (
     <>
-      {noFolderYet && <p className="chats-mentions-none">{noFolderNote}</p>}
+      {noFolderYet && <Quiet compact says={noFolderNote} />}
       {choices.length > 0 && (
         <Choices
           label="Commands to run"
@@ -1442,9 +1446,7 @@ function StartBox({
           </button>
         </div>
         {attachError !== null && (
-          <p className="chats-mentions-none" role="status">
-            {attachError}
-          </p>
+          <Quiet compact announce says={attachError} />
         )}
       </form>
     </>
@@ -1545,7 +1547,7 @@ function DictateToggle({ dictation }: { dictation: DictationView }) {
       title={
         listening
           ? "stop, and write down what was said"
-          : "say it instead of typing it — the words land in the box for you to check before sending"
+          : "say it instead of typing it. The words land in the box for you to check before sending"
       }
       onClick={dictation.toggle}
     >
@@ -1779,7 +1781,7 @@ const PERMISSION_RUNGS: {
   {
     mode: "plan",
     label: "Plan",
-    why: "answers with a plan — it may still write the plan down",
+    why: "answers with a plan: it may still write the plan down",
     needsTools: false,
   },
   {
@@ -1848,7 +1850,7 @@ function PermissionPicker({
         data-mode={mode === "bypass" || mode === "dont_ask" || mode === "plan" ? mode : undefined}
         /* Spelled out: the visible text is a mode's NAME, and a control whose whole accessible name
            is "Manual" announces a fact rather than something you can press. */
-        aria-label={`Permissions: ${shown} — change what this conversation may do without asking`}
+        aria-label={`Permissions: ${shown}. Change what this conversation may do without asking`}
         disabled={disabled}
       >
         {shown}
@@ -1859,7 +1861,7 @@ function PermissionPicker({
         {/* Says when a pick lands: a rung is re-read on the running turn, Plan is fixed when the
             turn starts. Without the line, picking Plan mid-turn looks like it did nothing. */}
         <DropdownMenuLabel className="chats-permission-why pt-0 font-normal">
-          Applies to the running turn at once — Plan only from the next message.
+          Applies to the running turn at once. Plan only from the next message.
         </DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={mode}
@@ -2029,11 +2031,11 @@ function ProjectWithoutTools({ chatId, cwd }: { chatId: string; cwd: string }) {
 
   return (
     <div className="chats-project">
-      <p className="chats-new-warning" role="status">
-        this conversation is about {cwd}, which has no {DAEMON_NAME} hook — it can talk
+      <Callout tone="paused" role="status">
+        this conversation is about {cwd}, which has no {DAEMON_NAME} hook. It can talk
         about the code but <b>cannot read or change any file</b>, and cannot run
         anything
-      </p>
+      </Callout>
       <Button
         type="button"
         disabled={wire.isPending}
@@ -2063,9 +2065,9 @@ function WorkflowMissing({
 
   return (
     <div className="chats-project">
-      <p className="chats-new-warning" role="status">
+      <Callout tone="paused" role="status">
         this conversation is about {cwd}, a worktree the AI workflow was never
-        copied into — it has no orchestrate skill and no phase agents
+        copied into. It has no orchestrate skill and no phase agents
         {tools ? (
           ""
         ) : (
@@ -2073,10 +2075,10 @@ function WorkflowMissing({
             , and it <b>cannot read or change any file</b> or run anything
           </>
         )}
-      </p>
+      </Callout>
       <ConfirmButton
         label="Set up workflow"
-        confirmLabel="Set up workflow — write the project's pinned workflow into this worktree, overwriting its copy"
+        confirmLabel="Set up workflow: write the project's pinned workflow into this worktree, overwriting its copy"
         variant="ghost"
         disabled={seed.isPending}
         onConfirm={() => seed.mutate()}
@@ -2090,7 +2092,7 @@ function SeedRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        The {DAEMON_NAME} is not responding — the worktree was left as it was
+        The {DAEMON_NAME} is not responding. The worktree was left as it was
       </ErrorNote>
     );
   }
@@ -2101,7 +2103,7 @@ function SeedRefusal({ error }: { error: unknown }) {
         bad_request:
           "The background service wants an explicit confirmation before it writes anything",
         conflict:
-          "this folder is not a worktree of a project with a pinned workflow — nothing was written",
+          "this folder is not a worktree of a project with a pinned workflow. Nothing was written",
         not_found: "that conversation is no longer here",
       }}
     />
@@ -2112,7 +2114,7 @@ function ProjectRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
       <ErrorNote>
-        The {DAEMON_NAME} is not responding — the conversation was left as it was
+        The {DAEMON_NAME} is not responding. The conversation was left as it was
       </ErrorNote>
     );
   }
@@ -2121,9 +2123,9 @@ function ProjectRefusal({ error }: { error: unknown }) {
       refusal={error}
       sentences={{
         bad_request:
-          "that folder does not exist on this machine — choose another",
+          "that folder does not exist on this machine. Choose another",
         conflict:
-          "this conversation is answering — wait for the turn to end, then move it",
+          "this conversation is answering. Wait for the turn to end, then move it",
         not_found: "that conversation is no longer here",
       }}
     />
@@ -2140,7 +2142,7 @@ function TranscriptError({ error }: { error: unknown }) {
     );
   return (
     <ErrorNote>
-      The {DAEMON_NAME} is not responding — nothing is known about this conversation
+      The {DAEMON_NAME} is not responding. Nothing is known about this conversation
     </ErrorNote>
   );
 }
@@ -2242,7 +2244,7 @@ function TitleRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        The {DAEMON_NAME} is not responding — the name was not changed
+        The {DAEMON_NAME} is not responding. The name was not changed
       </ErrorNote>
     );
   return (
@@ -2259,13 +2261,13 @@ function TitleRefusal({ error }: { error: unknown }) {
 function AutoTitleRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
-      <ErrorNote>The {DAEMON_NAME} is not responding — no name was proposed</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} is not responding. No name was proposed</ErrorNote>
     );
   return (
     <RefusalNote
       refusal={error}
       sentences={{
-        unavailable: "no local model could name this — nothing has changed",
+        unavailable: "no local model could name this. Nothing has changed",
         conflict:
           "nothing has been said in this conversation yet, so there is nothing to name it after",
       }}
@@ -2393,9 +2395,9 @@ function MissingModelRow({
     bytes === null
       ? null
       : tooBig && size.data?.memory
-        ? `${gigabytes(bytes)} — this machine has ${gigabytes(size.data.memory)}`
+        ? `${gigabytes(bytes)}: this machine has ${gigabytes(size.data.memory)}`
         : fit === "tight"
-          ? `${gigabytes(bytes)} — fits, with little room left`
+          ? `${gigabytes(bytes)}: fits, with little room left`
           : gigabytes(bytes);
 
   return (
@@ -2431,7 +2433,7 @@ function MissingModelRow({
                      it and this is the last moment it can be reconsidered. */
                   (weight === null
                     ? "click again to download it"
-                    : `${weight} — click again to download`)
+                    : `${weight}: click again to download`)
                 : /* `unknown` degrades to exactly what this row said before it could ask: the
                      registry is a third party on the far side of the internet, and a window that
                      turned "could not ask" into a verdict would refuse a working model every time
@@ -2543,7 +2545,7 @@ function ModelMenu({
         className="chats-tool"
         /* Spelled out: the visible text is a model's NAME, and a control whose whole accessible
            name is "Sonnet 5" announces a fact rather than something you can press. */
-        aria-label={`Answered by ${shown} — change the model`}
+        aria-label={`Answered by ${shown}. Change the model`}
         disabled={disabled}
       >
         {shownProvider !== null && <ProviderMark provider={shownProvider} size={14} />}
@@ -2681,7 +2683,7 @@ function ModelMenu({
                         ? /* Said before the pick, not after: the local mark answers "is it running
                              here", and this one answers the question that matters just as much for
                              a hosted choice — whose machine the words end up on. */
-                          "off this machine — sent to a third-party provider"
+                          "off this machine: sent to a third-party provider"
                         : null,
                     /* Only `false` earns a mark. Absent is "nobody asked", which is the ordinary
                        state of every choice nothing has introspected — marking that would put a
@@ -2761,7 +2763,7 @@ function EffortSlider({
     <DropdownMenu>
       <DropdownMenuTrigger
         className="chats-tool"
-        aria-label={`Effort ${effort ?? "default"} — change the effort`}
+        aria-label={`Effort ${effort ?? "default"}. Change the effort`}
         disabled={disabled}
       >
         <span className="chats-effort-name">Effort</span>
@@ -2831,7 +2833,7 @@ function ModelRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        The {DAEMON_NAME} is not responding — the model was not changed
+        The {DAEMON_NAME} is not responding. The model was not changed
       </ErrorNote>
     );
   return (
@@ -2839,7 +2841,7 @@ function ModelRefusal({ error }: { error: unknown }) {
       refusal={error}
       sentences={{
         conflict:
-          "a turn is in flight right now — the model cannot change until it settles",
+          "a turn is in flight right now. The model cannot change until it settles",
       }}
     />
   );
@@ -2891,7 +2893,7 @@ function ChatReach({ chatId }: { chatId: string }) {
         Also reaches
         <span className="chats-tool-why">
           {known.length === 0
-            ? "none yet — open a folder in your editor"
+            ? "none yet. Open a folder in your editor"
             : granted.length === 0
               ? "only its own folder"
               : `${granted.length} more`}
@@ -3067,7 +3069,7 @@ function ChatInstructions({
       onOpenChange={onOpenChange}
       size="md"
       title="Standing instructions"
-      description="Added to what this conversation's model is already told — on every turn, not just the first. Nothing here replaces the model's own instructions."
+      description="Added to what this conversation's model is already told, on every turn, not just the first. Nothing here replaces the model's own instructions."
       footer={
         <Button
           variant="approve"
@@ -3193,7 +3195,7 @@ function ContextControls({ chatId }: { chatId: string }) {
           variant="quiet"
           onConfirm={() => clear.mutate(chatId)}
         />
-        <p className="chats-context-why">hold — the model stops seeing every turn so far; they stay here</p>
+        <p className="chats-context-why">hold: the model stops seeing every turn so far; they stay here</p>
       </div>
       {fresh.isError && <HelperRefusal error={fresh.error} />}
       {clear.isError && <HelperRefusal error={clear.error} />}
@@ -3245,7 +3247,7 @@ function whyHelperIsRefused(
   knownTools: string[],
 ): string | null {
   const name = helper.name.trim();
-  if (name === "") return "needs a name — it is what the model calls it by";
+  if (name === "") return "needs a name: it is what the model calls it by";
   if (name.startsWith("-"))
     return "cannot start with a dash: that reads as a flag";
   if (!/^[A-Za-z0-9_-]+$/.test(name))
@@ -3253,7 +3255,7 @@ function whyHelperIsRefused(
   if (others.some((other) => other !== helper && other.name.trim() === name))
     return "another helper already has this name, and one would replace the other";
   if (helper.description.trim() === "")
-    return "needs a description — it is what the model reads to decide whether to use it";
+    return "needs a description: it is what the model reads to decide whether to use it";
   if (helper.prompt.trim() === "") return "needs instructions to run under";
   // Checked only once the served list has actually arrived — before that every name would read as
   // unknown, and a helper opened with tools already set would flash a refusal it does not deserve.
@@ -3262,7 +3264,7 @@ function whyHelperIsRefused(
   if (helper.tools !== null && knownTools.length > 0) {
     const unknown = helper.tools.find((tool) => !knownTools.includes(tool));
     if (unknown !== undefined)
-      return `"${unknown}" is not a tool the daemon can grant — a pattern is refused the same as a name it does not know`;
+      return `"${unknown}" is not a tool the daemon can grant. A pattern is refused the same as a name it does not know`;
   }
   return null;
 }
@@ -3318,7 +3320,7 @@ function HelperToolsControl({
             onSelect={(event) => event.preventDefault()}
             onCheckedChange={(on) => onChange(on === true ? null : [])}
           >
-            no restriction — inherits the conversation
+            no restriction: inherits the conversation
           </DropdownMenuCheckboxItem>
           <DropdownMenuSeparator />
           {knownTools.map((name) => (
@@ -3440,7 +3442,7 @@ function ChatHelpers({
       onOpenChange={onOpenChange}
       size="md"
       title="Helpers"
-      description="Work this conversation can hand off. These are added to any the project already defines — they never hide them."
+      description="Work this conversation can hand off. These are added to any the project already defines. They never hide them."
       footer={
         <>
           <Button
@@ -3460,10 +3462,9 @@ function ChatHelpers({
     >
       <div className="chats-helpers">
         {draft.length === 0 && (
-          <p className="chats-helpers-none">
-            None yet. A helper is a name, what it is for, and the instructions
-            it runs under.
-          </p>
+          <Quiet compact says="None yet.">
+            A helper is a name, what it is for, and the instructions it runs under.
+          </Quiet>
         )}
 
         <ul className="chats-helpers-list">
@@ -3589,7 +3590,7 @@ function HelperRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        The {DAEMON_NAME} is not responding — the helpers were not saved
+        The {DAEMON_NAME} is not responding. The helpers were not saved
       </ErrorNote>
     );
   return <RefusalNote refusal={error} />;
@@ -3613,7 +3614,7 @@ function ArchiveControl({ chatId }: { chatId: string }) {
           })
         }
       />
-      <p className="chats-context-why">hold — off the list; every turn stays readable</p>
+      <p className="chats-context-why">hold: off the list; every turn stays readable</p>
       {archive.isError && <ArchiveRefusal error={archive.error} />}
     </div>
   );
@@ -3623,7 +3624,7 @@ function ArchiveRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
     return (
       <ErrorNote>
-        The {DAEMON_NAME} is not responding — the conversation was not archived
+        The {DAEMON_NAME} is not responding. The conversation was not archived
       </ErrorNote>
     );
   return <RefusalNote refusal={error} />;
@@ -3665,7 +3666,7 @@ function PickedUp({
   if (view.data === undefined) {
     return (
       <p className="chats-picked-up-unread">
-        what was said in the editor could not be read — only the turns below are
+        what was said in the editor could not be read. Only the turns below are
         shown
       </p>
     );
@@ -3675,7 +3676,7 @@ function PickedUp({
       <p className="chats-picked-up-cut">
         {already
           ? "this was picked up from a conversation in the editor that nobody spoke in."
-          : "nobody spoke in this one — saying something here starts it."}
+          : "nobody spoke in this one. Saying something here starts it."}
       </p>
     );
   }
@@ -3685,7 +3686,7 @@ function PickedUp({
           footnote. A person reads down from the top; the top is exactly where the gap is. */}
       {view.data.cut && (
         <p className="chats-picked-up-cut">
-          older messages are not shown — this conversation was read from its
+          older messages are not shown: this conversation was read from its
           recent end
         </p>
       )}
@@ -3732,7 +3733,7 @@ function PickedUp({
           somewhere else and cost nothing here. Only the tense changes. */}
       <p className="chats-picked-up-cut">
         {already
-          ? "picked up here — everything above was said in the editor and read back out of its own file. None of it was a run, and none of it was billed here."
+          ? "picked up here: everything above was said in the editor and read back out of its own file. None of it was a run, and none of it was billed here."
           : "everything above was said in the editor, and reading it here cost nothing. Say something and it carries on from this line."}
       </p>
       {/* Only once it HAS continued. Before that there is nothing to disclose about how it did,
@@ -3790,7 +3791,7 @@ function HowItContinued({
         this session was larger than any window a model has, so there was
         nothing to resume it into. The model was handed the last{" "}
         {handed.length === 1 ? "exchange" : `${handed.length} exchanges`} of it,
-        word for word, in front of an empty context — everything above them is
+        word for word, in front of an empty context: everything above them is
         here for you to read, not something it remembers.
       </p>
       <button
@@ -3883,7 +3884,7 @@ function ProjectChanges({ chatId }: { chatId: string }) {
           <div className="chats-changes-head">
             <p className="chats-changes-title">What is different in this project</p>
             <p className="chats-changes-note">
-              The working tree against its last commit, as it is now — not only what this
+              The working tree against its last commit, as it is now, not only what this
               conversation did.
             </p>
           </div>
@@ -4024,14 +4025,10 @@ function ChangedFiles({
   );
 }
 
-function plural(count: number, noun: string): string {
-  return `${count} ${noun}${count === 1 ? "" : "s"}`;
-}
-
 function ChangedRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
     return (
-      <ErrorNote>The {DAEMON_NAME} is not responding — nothing could be read</ErrorNote>
+      <ErrorNote>The {DAEMON_NAME} is not responding. Nothing could be read</ErrorNote>
     );
   }
   return (
@@ -4076,8 +4073,8 @@ function Asking({ asks, chatId }: { asks: Ask[]; chatId: string }) {
             this conversation wants to run <b>{ask.tool}</b>
             {ask.detail !== null && (
               <>
-                {" "}
-                — <code className="chats-asking-detail">{ask.detail}</code>
+                {": "}
+                <code className="chats-asking-detail">{ask.detail}</code>
               </>
             )}
           </p>
@@ -4368,13 +4365,16 @@ function previousTurn(all: Entry[], index: number): Turn | null {
 function DepartmentSaid({ notice }: { notice: ChatNotice }) {
   return (
     <li className="chats-notice">
-      <p className="chats-notice-who">
-        <Link className="chats-notice-from" to={`/teams/runs/${notice.team_run_id}`}>
-          {notice.from_agent_id}
-        </Link>{" "}
-        said this while working
-      </p>
-      <p className="chats-notice-body">{notice.body}</p>
+      {/* The who-line stays in the body rather than in `title`: it carries a link, and a title is a string. */}
+      <Callout>
+        <p className="chats-notice-who">
+          <Link className="chats-notice-from" to={`/teams/runs/${notice.team_run_id}`}>
+            {notice.from_agent_id}
+          </Link>{" "}
+          said this while working
+        </p>
+        <p className="chats-notice-body">{notice.body}</p>
+      </Callout>
     </li>
   );
 }
@@ -4400,8 +4400,9 @@ function NoticeBlock({
 function NucleosSaid({ notice }: { notice: ChatNotice }) {
   return (
     <li className="chats-notice">
-      <p className="chats-notice-who">NucleOS</p>
-      <p className="chats-notice-body">{notice.body}</p>
+      <Callout title="NucleOS">
+        <p className="chats-notice-body">{notice.body}</p>
+      </Callout>
     </li>
   );
 }
@@ -4419,18 +4420,19 @@ function RestartNotice({
   const send = useSendMessage(chatId);
   return (
     <li className="chats-notice">
-      <p className="chats-notice-who">NucleOS</p>
-      <p className="chats-notice-body">{notice.body}</p>
-      {latest && (
-        <Button
-          variant="ghost"
-          disabled={send.isPending}
-          onClick={() => send.mutate({ text: CONTINUE_MESSAGE, images: [] })}
-        >
-          Continue
-        </Button>
-      )}
-      {send.isError && <ErrorNote>the message could not be sent</ErrorNote>}
+      <Callout title="NucleOS">
+        <p className="chats-notice-body">{notice.body}</p>
+        {latest && (
+          <Button
+            variant="ghost"
+            disabled={send.isPending}
+            onClick={() => send.mutate({ text: CONTINUE_MESSAGE, images: [] })}
+          >
+            Continue
+          </Button>
+        )}
+        {send.isError && <ErrorNote>the message could not be sent</ErrorNote>}
+      </Callout>
     </li>
   );
 }
@@ -4516,7 +4518,7 @@ const TurnBlock = memo(function TurnBlock({
           type="button"
           className="chats-turn-again"
           aria-label="Put this question back in the box to change it"
-          title="put it back in the box — nothing is sent until you send it"
+          title="put it back in the box: nothing is sent until you send it"
           onClick={() => onReuse(turn.asked)}
         >
           <SquarePen className="chats-turn-again-icon" aria-hidden="true" />
@@ -4606,7 +4608,7 @@ function ContextFill({
           under every turn, and the full sentence it used to be ran the line to twice the
           width of the two numbers it was qualifying. What a person needs from it is the
           fact, not the explanation — and the explanation is one hover away. */}
-      {near && " — earlier turns summarised soon"}
+      {near && ", earlier turns summarised soon"}
     </span>
   );
 }
@@ -4642,7 +4644,7 @@ function useStopControl(
 /** Why the daemon would not stop the turn, in its own sentence when it gave one. */
 function StopRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
-    return <ErrorNote>The {DAEMON_NAME} is not responding — the turn was not stopped</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} is not responding. The turn was not stopped</ErrorNote>;
   return <RefusalNote refusal={error} />;
 }
 
@@ -4757,16 +4759,12 @@ function LiveAnswer({
  * `LiveAnswer` would re-render the words being written, the plan and the tool list once a second
  * for as long as a run lasts. Here the interval moves this span and nothing else.
  *
- * The interval is cleared on unmount, which is the moment the turn lands.
+ * The tick is `useNow`'s shared one-second clock, which stops with its last subscriber: the moment
+ * the turn lands.
  */
 function Elapsed({ since }: { since: string }) {
   const started = Date.parse(since);
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    const tick = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(tick);
-  }, []);
+  const now = useNow(1000);
 
   // A timestamp this side cannot read is not drawn as `NaN:aN`. The line above it already says
   // the turn is running, which is the part that matters.
@@ -4901,13 +4899,8 @@ function PictureOverlay({
       onClick={onClose}
     >
       <img className="chats-picture-full" src={url} alt={path} />
-      <button
-        type="button"
-        className="chats-picture-close"
-        aria-label="Close picture"
-      >
-        close
-      </button>
+      {/* `Modal` cannot host this: it is a titled panel in three fixed sizes, and a picture fills the window. */}
+      <IconButton icon={X} label="Close picture" />
     </div>,
     document.body,
   );
@@ -4935,12 +4928,7 @@ function Thought({
 }) {
   const [open, setOpen] = useState(false);
   if (thought.length === 0 && tokens === null) return null;
-  const size =
-    tokens === null
-      ? null
-      : tokens >= 1000
-        ? `${(tokens / 1000).toFixed(1)}k`
-        : `${tokens}`;
+  const size = tokens === null ? null : tokenCount(tokens);
   return (
     <div className="chats-thought">
       {thought.length === 0 ? (
@@ -5065,7 +5053,7 @@ function WhatItDid({
               type="button"
               className="chats-turn-did-open"
               aria-expanded={shown}
-              aria-label={`${call.name}${call.detail === null ? "" : ` ${call.detail}`} — what it answered`}
+              aria-label={`${call.name}${call.detail === null ? "" : ` ${call.detail}`} (what it answered)`}
               onClick={() => setOpen(shown ? null : index)}
             >
               <ChevronRight
@@ -5334,7 +5322,7 @@ function ForwardPanel({
             onChange={(event) => onText(event.target.value)}
           />
           {elsewhere.length === 0 && (
-            <p className="chats-forward-empty">there is no other conversation to hand this to.</p>
+            <Quiet compact says="there is no other conversation to hand this to." />
           )}
           <ul className="chats-forward-targets" aria-label="Hand it to">
             {elsewhere.map((row) => (
@@ -5393,7 +5381,7 @@ function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "cleared") {
     return (
       <p className="chats-mark chats-mark-restart" role="status">
-        cleared here — everything above stays readable, and the model past this
+        cleared here: everything above stays readable, and the model past this
         point was told none of it
       </p>
     );
@@ -5401,7 +5389,7 @@ function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "restart") {
     return (
       <p className="chats-mark chats-mark-restart" role="status">
-        the conversation restarted here — the model past this point was read the
+        the conversation restarted here: the model past this point was read the
         last few exchanges back, and remembers nothing older than those
       </p>
     );
@@ -5409,7 +5397,7 @@ function MarkNote({ mark }: { mark: Mark }) {
   if (mark.kind === "compacted") {
     return (
       <p className="chats-mark chats-mark-compacted" role="status">
-        summarised here — the conversation filled its window, so everything
+        summarised here: the conversation filled its window, so everything
         above was condensed into a summary the model carries on from. Same
         conversation, shorter memory of its early part.
       </p>
@@ -5417,10 +5405,10 @@ function MarkNote({ mark }: { mark: Mark }) {
   }
   const text =
     mark.to === "cloud"
-      ? "moved to the cloud model — from here, what you type leaves this machine"
+      ? "moved to the cloud model: from here, what you type leaves this machine"
       : mark.to === "openrouter"
-        ? "moved to the hosted model — from here, what you type goes to a third-party provider you chose"
-        : "moved to the local model — from here, this is answered on this machine";
+        ? "moved to the hosted model: from here, what you type goes to a third-party provider you chose"
+        : "moved to the local model: from here, this is answered on this machine";
   return (
     <p className="chats-mark chats-mark-brain" role="status">
       {text}
@@ -5432,7 +5420,7 @@ function MarkNote({ mark }: { mark: Mark }) {
 
 const MESSAGE_SENTENCES: Record<string, string> = {
   turn_in_progress:
-    "this conversation already has a turn in flight — it clears on its own once that turn answers",
+    "this conversation already has a turn in flight. It clears on its own once that turn answers",
   kill_switch:
     "the kill switch is engaged; nothing autonomous starts until it is released, and this cannot be sent either",
   no_local_model:
@@ -5443,10 +5431,10 @@ const MESSAGE_SENTENCES: Record<string, string> = {
   no_such_destination: "that conversation no longer exists, or was archived",
   relay_to_self: "this is the conversation you are already in",
   relay_cycle:
-    "that conversation already handed this one a message — passing it back would go in circles",
+    "that conversation already handed this one a message. Passing it back would go in circles",
   relay_too_deep: "this has already been handed on as far as it goes",
   relay_chain_over_budget:
-    "this chain of handovers has spent its ceiling — raise it in the budget settings to go on",
+    "this chain of handovers has spent its ceiling. Raise it in the budget settings to go on",
   owner_away:
     "nothing is handed over while nobody is at the machine to see it arrive",
   remote_origin:
@@ -5783,7 +5771,7 @@ ${was}`));
           <p className="chats-turn-asked chats-held-bubble">
             {held.text}
             {held.images.length > 0 &&
-              ` (+${held.images.length} ${held.images.length === 1 ? "picture" : "pictures"})`}
+              ` (+${plural(held.images.length, "picture")})`}
           </p>
           <button type="button" className="chats-held-edit" onClick={unhold}>
             Edit
@@ -5791,15 +5779,14 @@ ${was}`));
         </div>
       )}
       {nowhere && (
-        <p className="chats-mentions-none">
-          this conversation has no directory, so there are no files to name here
-        </p>
+        <Quiet compact says="this conversation has no directory, so there are no files to name here" />
       )}
       {orchestrateBlocked && (
-        <p className="chats-mentions-none" role="status">
-          /orchestrate needs this conversation's project to have the workflow and
-          its tools — set them up above, then send again
-        </p>
+        <Quiet
+          compact
+          announce
+          says="/orchestrate needs this conversation's project to have the workflow and its tools: set them up above, then send again"
+        />
       )}
       {choices.length > 0 && (
         <Choices
@@ -5931,9 +5918,7 @@ ${was}`));
       {sayNow.isError && <MessageRefusal error={sayNow.error} />}
       {stop?.error != null && <StopRefusal error={stop.error} />}
       {attachError !== null && (
-        <p className="chats-mentions-none" role="status">
-          {attachError}
-        </p>
+        <Quiet compact announce says={attachError} />
       )}
     </form>
   );
@@ -5984,7 +5969,7 @@ function Choices({
       ))}
       {truncated && (
         <li className="chats-mentions-cut">
-          more than these — keep typing to narrow it
+          more than these. Keep typing to narrow it
         </li>
       )}
     </ul>
@@ -5993,6 +5978,6 @@ function Choices({
 
 function MessageRefusal({ error }: { error: unknown }) {
   if (!isApiRefusal(error))
-    return <ErrorNote>The {DAEMON_NAME} is not responding — nothing was sent</ErrorNote>;
+    return <ErrorNote>The {DAEMON_NAME} is not responding. Nothing was sent</ErrorNote>;
   return <RefusalNote refusal={error} sentences={MESSAGE_SENTENCES} />;
 }

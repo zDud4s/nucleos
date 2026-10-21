@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useCaptureWait, useSetCaptureWait } from "../data/capture-wait";
-import { ErrorNote, RefusalNote } from "../ui";
+import { ErrorNote, Field, RefusalNote } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -28,27 +28,27 @@ export function CaptureWait() {
   }
 
   return (
-    <div className="sy-field">
-      <label htmlFor="sy-capture-wait">Capture wait (minutes)</label>
-      <input
-        id="sy-capture-wait"
-        className="sy-field-input"
-        type="number"
-        min={0}
-        max={10080}
-        value={shown}
-        disabled={set.isPending}
-        onChange={(event) => setDraft(event.target.value)}
-        onBlur={save}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") save();
-        }}
-      />
-      <p className="sy-field-hint">0 turns capture requests off; at most a week (10080).</p>
+    <div className="sy-pref">
+      <Field label="Capture wait (minutes)" helper="0 turns capture requests off; at most a week (10080).">
+        <input
+          id="sy-capture-wait"
+          className="sy-pref-input"
+          type="number"
+          min={0}
+          max={10080}
+          value={shown}
+          disabled={set.isPending}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={save}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") save();
+          }}
+        />
+      </Field>
       {refusal ? (
         <RefusalNote refusal={refusal} />
       ) : set.error ? (
-        <ErrorNote>the {DAEMON_NAME} is not responding — the capture wait was not changed</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} is not responding: the capture wait was not changed</ErrorNote>
       ) : null}
     </div>
   );

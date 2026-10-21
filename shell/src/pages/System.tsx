@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { validateSystemSearch } from "./systemSearch";
 import { isApiRefusal } from "../data/client";
@@ -24,7 +24,6 @@ import {
   useProjects,
   useQuotaBrake,
   useRevokeToken,
-  useRestartSidecar,
   useSetBudget,
   useSetQuotaBrake,
   useSidecars,
@@ -52,10 +51,13 @@ import {
 import {
   Badge,
   Button,
+  Callout,
   ConfirmButton,
   CopyButton,
   CopyOnce,
   ErrorNote,
+  Field,
+  LinkTabs,
   PageHeader,
   Panel,
   Quiet,
@@ -64,15 +66,24 @@ import {
   Row,
   Rows,
   Section,
+  Segmented,
+  Skeleton,
   StatCard,
   StateBadge,
+  Switch,
+  Table,
+  Td,
+  Th,
   Meter,
 } from "../ui";
 import { MachineSettings } from "./MachineSettings";
 import { ChannelsView } from "./ChannelsView";
+import { RestartSidecar } from "../channels/RestartSidecar";
 import { NotificationsView } from "./NotificationsView";
 import "./system.css";
 import { DAEMON_NAME } from "../copy";
+import { percentText } from "../lib/format";
+import { plural } from "../lib/plural";
 
 /**
  * System — the machine's own state, not a project's.
@@ -223,41 +234,22 @@ export function headlineNodeFor(readout: HealthReadout | undefined): ReactNode {
 }
 
 /**
- * The six views — links, and deliberately **not** `Tabs` from `../ui`.
- *
- * The primitive is the app's one tabs implementation and the reason to reach
- * for it is real: `Bench` gets Radix's roving focus and its `aria-controls`
- * wiring, and a second hand-rolled tab bar is how two of them come to behave
- * differently. It cannot carry this one, and the difference is not cosmetic.
- * These are routes rather than panels: every trigger here is a real `<a href>`
- * to `/system/<view>`, which opens in a new window, is announced as a link, and
- * marks the current one with `aria-current="page"`. Radix's `Trigger` puts
- * `role="tab"` on whatever it renders — `asChild` and a `Link` included — so
- * adopting it would replace the link role, swap `aria-current` for
- * `aria-selected`, collapse three tab stops into one roving one, and leave
- * `aria-controls` pointing at panels that exist only for the route you are
- * already on. A tab widget switches panels inside a page. This switches pages.
- *
- * What was adopted is the rule underneath the appearance: the current tab is
- * marked in `--text`, the way `.ui-tab[data-state="active"]` marks its own.
- * The border used to be `--accent`, which the system reserves for the wordmark,
- * links and the focus ring — a selection wearing the brand colour reads as a
- * status.
+ * The six views, as `LinkTabs`: routes rather than panels, so each tab is a real `<a href>` to
+ * `/system/<view>` marked with `aria-current="page"` (see `ui/LinkTabs`).
  */
 function ViewTabs({ view }: { view: SystemView }) {
   return (
-    <nav className="sy-tabs" aria-label="System views">
-      {VIEWS.map((candidate) => (
-        <Link
-          key={candidate}
-          className={candidate === view ? "sy-tab sy-tab-active" : "sy-tab"}
-          to={`/system/${candidate}`}
-          aria-current={candidate === view ? "page" : undefined}
-        >
-          {VIEW_LABEL[candidate]}
-        </Link>
-      ))}
-    </nav>
+    <div className="sy-tabs">
+      <LinkTabs
+        label="System views"
+        tabs={VIEWS.map((candidate) => ({
+          key: candidate,
+          to: `/system/${candidate}`,
+          label: VIEW_LABEL[candidate],
+          current: candidate === view,
+        }))}
+      />
+    </div>
   );
 }
 
@@ -299,11 +291,11 @@ function SpendSummary() {
       {budget.isError && budget.data === undefined && (
         <SystemListError error={budget.error} what="the budget" />
       )}
-      {!budget.isError && budget.data === undefined && <Loading>reading the budget…</Loading>}
+      {!budget.isError && budget.data === undefined && <Skeleton label="Reading the budget" />}
       {budget.data !== undefined && budget.data.paused && (
-        <p className="sy-budget-paused" role="status">
+        <Notice tone="paused" role="status">
           Autonomous work is currently held: {budget.data.reason}
-        </p>
+        </Notice>
       )}
       {budget.data !== undefined && (
         <dl className="sy-budget-spend">
@@ -329,17 +321,16 @@ function HealthReadoutPanel({
   return (
     <Panel title="Subsystems">
       {health.data === undefined && !health.isError && (
-        <Loading>reading…</Loading>
+        <Skeleton label="Reading the subsystems" />
       )}
       {health.isError && health.data === undefined && (
         <HealthError error={health.error} />
       )}
       {health.data !== undefined && isAggregateTimeout(health.data) && (
-        <p className="sy-timeout" role="status">
-          The readout timed out before it could measure anything below the
-          aggregate — the subsystems below were never reached, which is not
-          the same as all of them being down.
-        </p>
+        <Notice tone="pending" role="status">
+          The readout timed out before it could measure anything below the aggregate, so no
+          subsystem was reached. That is not the same as all of them being down.
+        </Notice>
       )}
       {health.data !== undefined && !isAggregateTimeout(health.data) && (
         <ul className="sy-subsystems" aria-label="Subsystems">
@@ -390,7 +381,7 @@ function RouterReportPanel() {
   }
   // Among shadow runs with advice only: an apply run launched its advice and cannot disagree.
   const shadowAdvised = data.shadow_advised;
-  const rate = shadowAdvised > 0 ? `${Math.round((data.matched / shadowAdvised) * 100)}%` : "n/a";
+  const rate = shadowAdvised > 0 ? percentText(data.matched / shadowAdvised) : "n/a";
   const pairs: RoutePair[] = data.pairs.slice(0, 5);
   const totals: readonly { label: string; value: string }[] = [
     { label: "Routed runs", value: String(data.runs) },
@@ -410,27 +401,26 @@ function RouterReportPanel() {
         ))}
       </dl>
       {pairs.length > 0 && (
-        <table className="sy-router-pairs">
-          <caption className="sy-router-caption">Ran → advised</caption>
+        <Table caption="Ran → advised">
           <thead>
             <tr>
-              <th scope="col">Pair</th>
-              <th scope="col">Runs</th>
-              <th scope="col">Passed</th>
-              <th scope="col">Failed</th>
+              <Th>Pair</Th>
+              <Th num>Runs</Th>
+              <Th num>Passed</Th>
+              <Th num>Failed</Th>
             </tr>
           </thead>
           <tbody>
             {pairs.map((pair, index) => (
               <tr key={index}>
-                <td>{`${pairLabel(pair.runner, pair.model, pair.effort)} → ${pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort)}`}</td>
-                <td>{pair.runs}</td>
-                <td>{pair.passed}</td>
-                <td>{pair.failed}</td>
+                <Td>{`${pairLabel(pair.runner, pair.model, pair.effort)} → ${pairLabel(pair.advised_runner, pair.advised_model, pair.advised_effort)}`}</Td>
+                <Td num>{pair.runs}</Td>
+                <Td num>{pair.passed}</Td>
+                <Td num>{pair.failed}</Td>
               </tr>
             ))}
           </tbody>
-        </table>
+        </Table>
       )}
     </Panel>
   );
@@ -474,50 +464,11 @@ function SubsystemRow({ row }: { row: SubsystemReadout }) {
   );
 }
 
-function RestartSidecar({ name }: { name: string }) {
-  const restart = useRestartSidecar();
-  return (
-    <>
-      <ConfirmButton
-        label="Restart"
-        /* No `subject`: the tile already names the sidecar, and the subject drawn into the
-           armed label made the control wider than the tile it sits in. */
-        confirmLabel="Start it again"
-        variant="quiet"
-        disabled={restart.isPending}
-        onConfirm={() => {
-          restart.mutate(name);
-        }}
-      />
-      {restart.isSuccess && (
-        <span className="sy-restart-asked" role="status">
-          asked — the supervisor is trying now
-        </span>
-      )}
-      {restart.isError &&
-        (isApiRefusal(restart.error) ? (
-          <RefusalNote
-            refusal={restart.error}
-            sentences={{
-              running: "it is running now — there was nothing to start",
-              not_supervised:
-                "nothing is supervising it — the daemon starts a sidecar only when its pillar is switched on, and only at startup",
-              kill_switch:
-                "the emergency stop is engaged — release it first; the supervisor keeps retrying on its own meanwhile",
-            }}
-          />
-        ) : (
-          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was asked of it</ErrorNote>
-        ))}
-    </>
-  );
-}
-
 function HealthError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      the {DAEMON_NAME} is not responding — nothing is known about the machine&apos;s
+      the {DAEMON_NAME} is not responding: nothing is known about the machine&apos;s
       health
     </ErrorNote>
   );
@@ -535,11 +486,11 @@ function SidecarCardsPanel({
   return (
     <Panel title="Sidecars">
       {sidecars.data === undefined && !sidecars.isError && (
-        <Loading>reading…</Loading>
+        <Skeleton label="Reading the sidecars" />
       )}
       {sidecars.isError && sidecars.data === undefined && (
         <ErrorNote>
-          the {DAEMON_NAME} is not responding — nothing is known about the sidecars
+          the {DAEMON_NAME} is not responding: nothing is known about the sidecars
         </ErrorNote>
       )}
       {sidecars.data !== undefined && sidecars.data.length > 0 && (
@@ -639,15 +590,15 @@ function ScopedKillsPanel() {
     <Panel title="Project brakes">
       <PanelNote empty={noProjects} says="no project is registered.">
         A project brake holds what that project would START; it stops nothing already running. An
-        absent row means the daemon was never told, which reads as released. The trigger brakes —
-        scheduled rules, repo triggers, e-mail triage — live on <Link to="/autopilot">Autopilot</Link>.
+        absent row means the daemon was never told, which reads as released. The trigger brakes
+        (scheduled rules, repo triggers, e-mail triage) live on <Link to="/autopilot">Autopilot</Link>.
       </PanelNote>
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
-      {!kills.isError && kills.data === undefined && <Loading>reading the project brakes…</Loading>}
+      {!kills.isError && kills.data === undefined && <Skeleton label="Reading the project brakes" />}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
-      {!projects.isError && projects.data === undefined && <Loading>reading the projects…</Loading>}
+      {!projects.isError && projects.data === undefined && <Skeleton label="Reading the projects" />}
       {projects.data !== undefined && projects.data.length > 0 && (
         <ul className="sy-brakes" aria-label="Project brakes">
           {projects.data.map((project) => {
@@ -687,7 +638,7 @@ function ScopedKillsPanel() {
       )}
       {setKill.isError && (
         <ErrorNote>
-          that brake was not changed — the {DAEMON_NAME} refused or is not responding
+          that brake was not changed: the {DAEMON_NAME} refused or is not responding
         </ErrorNote>
       )}
     </Panel>
@@ -828,12 +779,12 @@ function BudgetPanel() {
         <SystemListError error={budget.error} what="the budget" />
       )}
       {!budget.isError && budget.data === undefined && (
-        <Loading>reading the budget…</Loading>
+        <Skeleton label="Reading the budget" />
       )}
       {budget.data !== undefined && budget.data.paused && (
-        <p className="sy-budget-paused" role="status">
+        <Notice tone="paused" role="status">
           Autonomous work is currently held: {budget.data.reason}
-        </p>
+        </Notice>
       )}
       {budget.data !== undefined && (
         <dl className="sy-budget-spend">
@@ -852,11 +803,8 @@ function BudgetPanel() {
           <section className="sy-budget-group">
             <h3 className="sy-budget-heading">Spend limits</h3>
             <div className="sy-budget-fields">
-              <div className="sy-field">
-                <label htmlFor="sy-budget-window-limit">Window limit (USD)</label>
+              <Field label="Window limit (USD)">
                 <input
-                  id="sy-budget-window-limit"
-                  className="sy-field-input"
                   type="text"
                   inputMode="decimal"
                   placeholder="no ceiling"
@@ -869,12 +817,9 @@ function BudgetPanel() {
                     setBadCeilings([]);
                   }}
                 />
-              </div>
-              <div className="sy-field">
-                <label htmlFor="sy-budget-period">Period</label>
+              </Field>
+              <Field label="Period">
                 <select
-                  id="sy-budget-period"
-                  className="sy-field-input"
                   value={form.period}
                   onChange={(event) =>
                     setForm({
@@ -889,12 +834,9 @@ function BudgetPanel() {
                     </option>
                   ))}
                 </select>
-              </div>
-              <div className="sy-field">
-                <label htmlFor="sy-budget-hourly-limit">Hourly limit (USD)</label>
+              </Field>
+              <Field label="Hourly limit (USD)">
                 <input
-                  id="sy-budget-hourly-limit"
-                  className="sy-field-input"
                   type="text"
                   inputMode="decimal"
                   placeholder="no ceiling"
@@ -907,12 +849,9 @@ function BudgetPanel() {
                     setBadCeilings([]);
                   }}
                 />
-              </div>
-              <div className="sy-field">
-                <label htmlFor="sy-budget-per-run-reserve">Per-run reserve (USD)</label>
+              </Field>
+              <Field label="Per-run reserve (USD)">
                 <input
-                  id="sy-budget-per-run-reserve"
-                  className="sy-field-input"
                   type="text"
                   inputMode="decimal"
                   value={form.perRunReserve}
@@ -920,12 +859,9 @@ function BudgetPanel() {
                     setForm({ ...form, perRunReserve: event.target.value })
                   }
                 />
-              </div>
-              <div className="sy-field">
-                <label htmlFor="sy-budget-time-cost">Time cost per hour (USD)</label>
+              </Field>
+              <Field label="Time cost per hour (USD)">
                 <input
-                  id="sy-budget-time-cost"
-                  className="sy-field-input"
                   type="text"
                   inputMode="decimal"
                   value={form.timeCost}
@@ -933,26 +869,27 @@ function BudgetPanel() {
                     setForm({ ...form, timeCost: event.target.value })
                   }
                 />
-              </div>
-              <div className="sy-field">
-                <label htmlFor="sy-budget-relay-chain-limit">Relay chain limit (USD)</label>
+              </Field>
+              <Field
+                label="Relay chain limit (USD)"
+                helper="What one chain of conversations handing work to each other may spend."
+              >
                 <input
-                  id="sy-budget-relay-chain-limit"
-                  className="sy-field-input"
                   type="text"
                   inputMode="decimal"
-                  title="What one chain of conversations handing work to each other may spend before the next handover is refused"
                   value={form.relayChainLimit}
                   onChange={(event) =>
                     setForm({ ...form, relayChainLimit: event.target.value })
                   }
                 />
-              </div>
+              </Field>
             </div>
+            <div className="sy-save-row">
             <ConfirmButton
               label="Save budget"
-              confirmLabel="Send these six fields to the daemon"
+              confirmLabel="Send these six fields"
               variant="ghost"
+              disabled={setBudget.isPending}
               onConfirm={() => {
                 const windowLimit = parseCeiling(form.windowLimit);
                 const hourlyLimit = parseCeiling(form.hourlyLimit);
@@ -975,18 +912,19 @@ function BudgetPanel() {
                 setBudget.mutate(change, { onSuccess: () => { setBudgetSaved(true); } });
               }}
             />
-            <p className="sy-meta" role="status">{budgetSaved ? "saved" : null}</p>
+            <p className="sy-save-status" role="status">{budgetSaved ? "Saved" : null}</p>
+            </div>
             {badCeilings.length > 0 && (
               <div id="sy-budget-error">
                 <ErrorNote>
-                  the budget was not sent — {badCeilings.join(" and ")} must be a
+                  the budget was not sent: {badCeilings.join(" and ")} must be a
                   number, or blank for no ceiling
                 </ErrorNote>
               </div>
             )}
             {setBudget.isError && (
               <ErrorNote>
-                the budget was not changed — the {DAEMON_NAME} refused or is not responding
+                the budget was not changed: the {DAEMON_NAME} refused or is not responding
               </ErrorNote>
             )}
           </section>
@@ -994,25 +932,17 @@ function BudgetPanel() {
         {quotaBrakeForm !== null && quotaBrake.data !== undefined && (
           <section className="sy-budget-group">
             <h3 className="sy-budget-heading">Quota brake</h3>
-            <div className="sy-field">
-              <label className="sy-check">
-                <input
-                  type="checkbox"
-                  checked={quotaBrakeForm.enabled}
-                  onChange={(event) => {
-                    setQuotaBrakeForm({ ...quotaBrakeForm, enabled: event.target.checked });
-                    setQuotaSaved(false);
-                  }}
-                />
-                Enable quota brake
-              </label>
-            </div>
+            <Switch
+              label="Enable quota brake"
+              checked={quotaBrakeForm.enabled}
+              onChange={(next) => {
+                setQuotaBrakeForm({ ...quotaBrakeForm, enabled: next });
+                setQuotaSaved(false);
+              }}
+            />
             <div className="sy-budget-fields">
-              <div className="sy-field">
-                <label htmlFor="sy-quota-brake-five-hour">Pause above 5h usage (%)</label>
+              <Field label="Pause above 5h usage (%)">
                 <input
-                  id="sy-quota-brake-five-hour"
-                  className="sy-field-input"
                   type="text"
                   inputMode="numeric"
                   value={quotaBrakeForm.fiveHour}
@@ -1024,12 +954,9 @@ function BudgetPanel() {
                     setBadQuotaBrake(false);
                   }}
                 />
-              </div>
-              <div className="sy-field">
-                <label htmlFor="sy-quota-brake-seven-day">Pause above 7d usage (%)</label>
+              </Field>
+              <Field label="Pause above 7d usage (%)">
                 <input
-                  id="sy-quota-brake-seven-day"
-                  className="sy-field-input"
                   type="text"
                   inputMode="numeric"
                   value={quotaBrakeForm.sevenDay}
@@ -1041,16 +968,18 @@ function BudgetPanel() {
                     setBadQuotaBrake(false);
                   }}
                 />
-              </div>
+              </Field>
             </div>
             <p className="sy-field-hint">
               When {quotaBrake.data.provider}'s usage passes either level, new autonomous work
               waits until the window resets. Only {quotaBrake.data.provider}'s windows count.
             </p>
+            <div className="sy-save-row">
             <ConfirmButton
               label="Save quota brake"
-              confirmLabel="Save these three quota brake settings to the daemon"
+              confirmLabel="Save these three settings"
               variant="ghost"
+              disabled={setQuotaBrake.isPending}
               onConfirm={() => {
                 const fiveHour = parseQuotaPercent(quotaBrakeForm.fiveHour);
                 const sevenDay = parseQuotaPercent(quotaBrakeForm.sevenDay);
@@ -1069,14 +998,15 @@ function BudgetPanel() {
                 );
               }}
             />
-            <p className="sy-meta" role="status">{quotaSaved ? "saved" : null}</p>
+            <p className="sy-save-status" role="status">{quotaSaved ? "Saved" : null}</p>
+            </div>
             {badQuotaBrake && (
               <div id="sy-quota-error">
-                <ErrorNote>the quota brake was not sent — usage must be an integer from 1 to 100</ErrorNote>
+                <ErrorNote>the quota brake was not sent: usage must be an integer from 1 to 100</ErrorNote>
               </div>
             )}
             {setQuotaBrake.isError && (
-              <ErrorNote>the quota brake was not changed — the {DAEMON_NAME} refused or is not responding</ErrorNote>
+              <ErrorNote>the quota brake was not changed: the {DAEMON_NAME} refused or is not responding</ErrorNote>
             )}
           </section>
         )}
@@ -1118,7 +1048,7 @@ function SpacePanel() {
       {storage.isError && space === undefined && (
         <SystemListError error={storage.error} what="the space readout" />
       )}
-      {!storage.isError && space === undefined && <Loading>reading the space used…</Loading>}
+      {!storage.isError && space === undefined && <Skeleton label="Reading the space used" />}
       {space !== undefined && (
         <>
           <div className="sy-space-cards">
@@ -1168,10 +1098,10 @@ function SpacePanel() {
             )}
           </p>
           {space.compaction_pending ? (
-            <p className="sy-space-notes" role="status">
+            <Notice tone="info" role="status">
               Compaction is scheduled: the {DAEMON_NAME} rewrites the database when it next starts,
               and that start takes longer.
-            </p>
+            </Notice>
           ) : (
             <div className="sy-space-compact">
               <ConfirmButton
@@ -1211,14 +1141,14 @@ function CompactionError({ error }: { error: unknown }) {
       <RefusalNote
         refusal={error}
         sentences={{
-          conflict: "a restore is pending — compact after it has been applied",
+          conflict: "a restore is pending: compact after it has been applied",
         }}
       />
     );
   }
   return (
     <ErrorNote>
-      the compaction could not be scheduled — the {DAEMON_NAME} is not responding
+      the compaction could not be scheduled: the {DAEMON_NAME} is not responding
     </ErrorNote>
   );
 }
@@ -1256,13 +1186,13 @@ function BackupsPanel() {
       title="Backups"
       aside={
         <Button variant="ghost" disabled={takeBackup.isPending} onClick={() => takeBackup.mutate()}>
-          Take a backup now
+          {takeBackup.isPending ? "Taking a backup…" : "Take a backup now"}
         </Button>
       }
     >
       {backups.data !== undefined && backups.data.length > 0 && (
         <p className="sy-backups-summary">
-          {backups.data.length} {backups.data.length === 1 ? "snapshot" : "snapshots"} ·{" "}
+          {plural(backups.data.length, "snapshot")} ·{" "}
           {formatBytes(total)}
           {latest !== undefined && (
             <>
@@ -1273,18 +1203,18 @@ function BackupsPanel() {
         </p>
       )}
       <PanelNote empty={noBackups} says="no backup has been taken yet.">
-        Staging a restore changes nothing yet — the swap happens the next time the {DAEMON_NAME} starts.
+        Staging a restore changes nothing yet: the swap happens the next time the {DAEMON_NAME} starts.
       </PanelNote>
       {takeBackup.isError && (
         <ErrorNote>
-          the backup was not taken — the {DAEMON_NAME} refused or is not responding
+          the backup was not taken: the {DAEMON_NAME} refused or is not responding
         </ErrorNote>
       )}
       {backups.isError && backups.data === undefined && (
         <SystemListError error={backups.error} what="the backups" />
       )}
       {!backups.isError && backups.data === undefined && (
-        <Loading>reading the backups…</Loading>
+        <Skeleton label="Reading the backups" />
       )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <Rows label="Backups">
@@ -1326,9 +1256,9 @@ function BackupRow({ backup }: { backup: BackupInfo }) {
         />
       </div>
       {stageRestore.isSuccess && stageRestore.data !== undefined && (
-        <p className="sy-restore-applied" role="status">
-          Nothing has changed yet — {stageRestore.data.applies}
-        </p>
+        <Notice tone="info" role="status">
+          Nothing has changed yet: {stageRestore.data.applies}
+        </Notice>
       )}
       {stageRestore.isError && (
         <div className="sy-backup-error">
@@ -1346,7 +1276,7 @@ function RestoreError({ error }: { error: unknown }) {
         refusal={error}
         sentences={{
           conflict:
-            "a restore is already staged, or that snapshot name is taken — only one can be pending",
+            "a restore is already staged, or that snapshot name is taken: only one can be pending",
           not_found: "that snapshot is no longer there",
           unprocessable: `the ${DAEMON_NAME} could not verify that snapshot`,
           bad_request: `that snapshot name is not one the ${DAEMON_NAME} will accept`,
@@ -1356,7 +1286,7 @@ function RestoreError({ error }: { error: unknown }) {
   }
   return (
     <ErrorNote>
-      the restore could not be staged — the {DAEMON_NAME} is not responding
+      the restore could not be staged: the {DAEMON_NAME} is not responding
     </ErrorNote>
   );
 }
@@ -1375,15 +1305,15 @@ function PiiObservations() {
   return (
     <Panel title="PII observations">
       {pii.isError && pii.data === undefined && <SystemListError error={pii.error} what="the PII tally" />}
-      {!pii.isError && pii.data === undefined && <Loading>reading…</Loading>}
+      {!pii.isError && pii.data === undefined && <Skeleton label="Reading the PII tally" />}
       {pii.data !== undefined && pii.data.length === 0 && <Quiet says="nothing recorded." />}
       {pii.data !== undefined && pii.data.length > 0 && (
-        <table className="sy-pii-table">
+        <Table label="PII observations">
           <thead>
             <tr>
-              <th scope="col">Column</th>
-              <th scope="col">Class</th>
-              <th scope="col">Count</th>
+              <Th>Column</Th>
+              <Th>Class</Th>
+              <Th num>Count</Th>
             </tr>
           </thead>
           <tbody>
@@ -1391,7 +1321,7 @@ function PiiObservations() {
               <PiiTallyRowView key={`${row.column}-${row.class}`} row={row} />
             ))}
           </tbody>
-        </table>
+        </Table>
       )}
     </Panel>
   );
@@ -1400,9 +1330,9 @@ function PiiObservations() {
 function PiiTallyRowView({ row }: { row: PiiTallyRow }) {
   return (
     <tr>
-      <td>{row.column}</td>
-      <td>{row.class}</td>
-      <td>{row.count}</td>
+      <Td>{row.column}</Td>
+      <Td>{row.class}</Td>
+      <Td num>{row.count}</Td>
     </tr>
   );
 }
@@ -1413,9 +1343,9 @@ const TOKEN_LEVELS: ApiTokenLevel[] = ["read-only", "run-creating", "admin"];
 
 /** What each level allows, said beside the choice and not only in a paragraph above it. */
 const TOKEN_LEVEL_HINT: Record<ApiTokenLevel, string> = {
-  "read-only": "reads most things, not the budget or the kill switch",
-  "run-creating": "can also start work",
-  admin: "everything",
+  "read-only": "reads most things, not the budget or the kill switch.",
+  "run-creating": "can also start work.",
+  admin: "can do everything.",
 };
 
 function TokensView() {
@@ -1468,7 +1398,7 @@ function TokensPanel() {
   return (
     <Panel title="API tokens">
       <p className="sy-note">
-        A read-only token cannot read the budget or the kill switch — both sit
+        A read-only token cannot read the budget or the kill switch, since both sit
         outside its read allowlist. A run-creating token may start work. An
         admin token is everything.
       </p>
@@ -1490,52 +1420,35 @@ function TokensPanel() {
           if (!mintToken.isPending) handleMint();
         }}
       >
-        <div className="sy-field sy-mint-name">
-          <label htmlFor="sy-token-name">Name</label>
-          <input
-            id="sy-token-name"
-            className="sy-field-input"
-            type="text"
-            placeholder="e.g. ci-runner"
-            maxLength={64}
-            aria-describedby="sy-token-name-hint"
-            value={name}
-            onChange={(event) => {
-              setName(event.target.value);
+        <div className="sy-mint-name">
+          <Field label="Name">
+            <input
+              type="text"
+              placeholder="e.g. ci-runner"
+              maxLength={64}
+              aria-describedby="sy-token-hint"
+              value={name}
+              onChange={(event) => {
+                setName(event.target.value);
+                setAdminAsked(false);
+              }}
+            />
+          </Field>
+        </div>
+        <div className="sy-mint-level">
+          <span className="sy-mint-label" aria-hidden="true">
+            Level
+          </span>
+          <Segmented
+            label="Level"
+            value={level}
+            options={TOKEN_LEVELS.map((candidate) => ({ value: candidate, label: candidate }))}
+            onChange={(next) => {
+              setLevel(next);
               setAdminAsked(false);
             }}
           />
-          <span className="sy-field-hint" id="sy-token-name-hint">
-            1&ndash;64 characters: letters, digits, hyphen or underscore.
-          </span>
         </div>
-        <fieldset className="sy-token-levels">
-          <legend>Level</legend>
-          <div className="sy-token-level-set">
-            {TOKEN_LEVELS.map((candidate) => (
-              <div key={candidate} className="sy-token-level-item">
-              <label className="sy-token-level">
-                <input
-                  type="radio"
-                  name="sy-token-level"
-                  value={candidate}
-                  checked={level === candidate}
-                  aria-describedby={`sy-token-level-${candidate}`}
-                  onChange={() => {
-                    setLevel(candidate);
-                    setAdminAsked(false);
-                  }}
-                />
-                {candidate}
-              </label>
-              <span className="sr-only" id={`sy-token-level-${candidate}`}>
-                {TOKEN_LEVEL_HINT[candidate]}
-              </span>
-              </div>
-            ))}
-          </div>
-          <span className="sy-field-hint">{TOKEN_LEVEL_HINT[level]}</span>
-        </fieldset>
         <Button
           type="submit"
           variant="ghost"
@@ -1544,11 +1457,15 @@ function TokensPanel() {
           {adminAsked ? "Mint an admin token" : "Mint token"}
         </Button>
       </form>
+      <p className="sy-note" id="sy-token-hint">
+        1&ndash;64 characters: letters, digits, hyphen or underscore. The {level} level{" "}
+        {TOKEN_LEVEL_HINT[level]}
+      </p>
       {adminAsked && (
-        <p className="sy-note" role="status">
+        <Notice tone="pending" role="status">
           An admin token can do everything this machine can, including the budget and the kill
           switch. Press the button again to mint it, or pick another level.
-        </p>
+        </Notice>
       )}
       {mintToken.isError && <MintError error={mintToken.error} />}
 
@@ -1556,7 +1473,7 @@ function TokensPanel() {
         <SystemListError error={tokens.error} what="the API tokens" />
       )}
       {!tokens.isError && tokens.data === undefined && (
-        <Loading>reading the tokens…</Loading>
+        <Skeleton label="Reading the tokens" />
       )}
       {tokens.data !== undefined && tokens.data.length === 0 && (
         <Quiet says="no token has been minted." />
@@ -1586,7 +1503,7 @@ function MintError({ error }: { error: unknown }) {
     );
   }
   return (
-    <ErrorNote>the token was not minted — the {DAEMON_NAME} is not responding</ErrorNote>
+    <ErrorNote>the token was not minted: the {DAEMON_NAME} is not responding</ErrorNote>
   );
 }
 
@@ -1638,7 +1555,7 @@ function RevokeError({ error }: { error: unknown }) {
   }
   return (
     <ErrorNote>
-      that token was not revoked — the {DAEMON_NAME} is not responding
+      that token was not revoked: the {DAEMON_NAME} is not responding
     </ErrorNote>
   );
 }
@@ -1687,7 +1604,7 @@ function EmailConfigPanel() {
         <SystemListError error={email.error} what="the e-mail configuration" />
       )}
       {!email.isError && email.data === undefined && (
-        <Loading>reading…</Loading>
+        <Skeleton label="Reading the e-mail configuration" />
       )}
       {email.data !== undefined && <EmailConfigFacts config={email.data} />}
     </Panel>
@@ -1751,7 +1668,7 @@ function VoiceConfigPanel() {
         <SystemListError error={voice.error} what="the voice configuration" />
       )}
       {!voice.isError && voice.data === undefined && (
-        <Loading>reading…</Loading>
+        <Skeleton label="Reading the voice configuration" />
       )}
       {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
     </Panel>
@@ -1800,7 +1717,7 @@ function CalendarConfigPanel() {
         />
       )}
       {!calendar.isError && calendar.data === undefined && (
-        <Loading>reading…</Loading>
+        <Skeleton label="Reading the calendar configuration" />
       )}
       {calendar.data !== undefined && (
         <CalendarConfigFacts config={calendar.data} />
@@ -1845,12 +1762,25 @@ function CalendarConfigFacts({ config }: { config: CalendarConfig }) {
  * when somebody is about to mint their first token and most needs the three
  * levels spelled out.
  */
-/** "reading…" as a polite status, so the wait is announced and the layout has one name for it. */
-function Loading({ children }: { children: ReactNode }) {
+/**
+ * A `Callout` with the rhythm of the panel prose around it: `Callout` takes no `className`, and
+ * a panel body has no gap of its own, so the wrapper carries the space under the notice.
+ */
+function Notice({
+  tone,
+  role,
+  children,
+}: {
+  tone: ComponentProps<typeof Callout>["tone"];
+  role?: "status" | "alert";
+  children: ReactNode;
+}) {
   return (
-    <p className="sy-loading" role="status" aria-busy="true">
-      {children}
-    </p>
+    <div className="sy-notice">
+      <Callout tone={tone} role={role}>
+        {children}
+      </Callout>
+    </div>
   );
 }
 
@@ -1863,7 +1793,7 @@ function SystemListError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote>
-      the {DAEMON_NAME} is not responding — nothing is known about {what}
+      the {DAEMON_NAME} is not responding: nothing is known about {what}
     </ErrorNote>
   );
 }

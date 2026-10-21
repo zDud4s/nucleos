@@ -24,6 +24,16 @@ function mount() {
 }
 
 describe("Panel main button", () => {
+  it("the dim over the page is a keyboard-reachable button that takes the wheel", () => {
+    const { sent, deliver } = mount();
+    deliver({ v: 1, kind: "state", mode: "agent", host: "example.org", collapsed: false });
+
+    const pellicle = screen.getByRole("button", { name: /The agent is driving. Take the wheel/ });
+    expect(pellicle.getAttribute("tabindex")).toBe("0");
+    fireEvent.keyDown(pellicle, { key: "Enter" });
+    expect(sent).toContainEqual({ v: 1, kind: "take_wheel" });
+  });
+
   it("Panel main button takes the wheel in agent mode and hands back with the note in person mode", () => {
     const { sent, deliver } = mount();
     deliver({ v: 1, kind: "state", mode: "agent", host: "example.org", collapsed: false });

@@ -1,4 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { XIcon } from "lucide-react";
+import { IconButton } from "../ui";
 import { STATE_TEXT } from "./format";
 import { useNodeEntry } from "./hooks";
 import { identityOf, useParentHarness } from "./identity";
@@ -17,7 +19,6 @@ export function TranscriptPanel({ id, onClose }: { id: string; onClose(): void }
   const entry = useNodeEntry(id);
   const parentHarness = useParentHarness(entry?.node.parent_id ?? null);
   const t = useTranscript(id);
-  const closeButton = useRef<HTMLButtonElement>(null);
   const body = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLElement>(null);
   const stick = useRef(true);
@@ -26,7 +27,7 @@ export function TranscriptPanel({ id, onClose }: { id: string; onClose(): void }
 
   useEffect(() => {
     const opener = document.activeElement;
-    closeButton.current?.focus();
+    panel.current?.querySelector<HTMLButtonElement>(".fleet-panel-title .ui-icon-button")?.focus();
     return () => {
       if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
     };
@@ -69,9 +70,7 @@ export function TranscriptPanel({ id, onClose }: { id: string; onClose(): void }
             {label}
           </span>
           {entry?.node.role != null && <span className="fleet-role">{entry.node.role}</span>}
-          <button ref={closeButton} type="button" className="fleet-act fleet-panel-close" aria-label="Close the transcript" onClick={onClose}>
-            ×
-          </button>
+          <IconButton label="Close the transcript" icon={XIcon} onClick={onClose} />
         </div>
         {entry !== undefined && (
           <div className="fleet-panel-sub">

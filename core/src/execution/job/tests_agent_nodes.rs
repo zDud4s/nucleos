@@ -286,6 +286,7 @@ fn the_retry_is_pinned_to_the_refused_runs_engine_and_model_with_the_report_appe
             runner: RunnerKind::Claude,
             model: Some("m1".into()),
             effort: Some("high".into()),
+            sandbox: None,
         })
     );
     assert!(retry.prompt.starts_with("ORIGINAL\n\n"), "{}", retry.prompt);
@@ -399,6 +400,61 @@ async fn valid_output_reports_pass_after_validation_not_at_run_end() {
     assert_eq!(count(&state.pool, "runs").await, 1);
 }
 
+/// Passes only an answer that BEGINS with "OK", which a raw stream-json line never does.
+struct OpensWithOk;
+
+impl OutputCheck for OpensWithOk {
+    fn check(&self, text: &str) -> Result<(), String> {
+        if text.starts_with("OK") {
+            Ok(())
+        } else {
+            Err("the answer does not open with OK".to_string())
+        }
+    }
+}
+
+struct StrictOpening;
+
+#[async_trait::async_trait]
+impl AgentNodeLauncher for StrictOpening {
+    async fn launch(
+        &self,
+        _ctx: &NodeCtx<'_>,
+        protocol: String,
+    ) -> Result<NodeLaunch, LaunchRefused> {
+        Ok(NodeLaunch {
+            output: Some(Arc::new(OpensWithOk)),
+            ..NodeLaunch::plain(protocol)
+        })
+    }
+
+    async fn output_check(&self, _ctx: &NodeCtx<'_>) -> Option<Arc<dyn OutputCheck>> {
+        Some(Arc::new(OpensWithOk))
+    }
+}
+
+/// Measured on job 30, run 900727, 2026-10-21: the researcher's answer had every section
+/// `output.md` asks for, and the validator was handed the whole `claude -p` stream-json, where
+/// `## Synthesis` sits inside a JSON string and never at the start of a line. The check reads the
+/// run's reply, as `wire::extract_reply` gives it, not the stream.
+#[tokio::test]
+async fn the_output_check_reads_the_runs_reply_not_its_stream_json() {
+    let stream = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"OK: the answer"}"#,
+        "\n",
+    );
+    let (state, job, _run, _dir) = triage_ended("completed", stream, 0).await;
+    engine::land_nodes_with(&StrictOpening, &state, &job)
+        .await
+        .unwrap();
+    assert_eq!(triage_status(&state.pool, job.id).await, "passed");
+    assert_eq!(count(&state.pool, "runs").await, 1, "no retry");
+}
+
 #[tokio::test]
 async fn output_is_validated_before_the_emission_is_read() {
     // An invalid answer beside an emission the facts reader would refuse (a nested value).
@@ -419,20 +475,71 @@ async fn output_is_validated_before_the_emission_is_read() {
         .await
         .expect("the emission of a failed node is not read");
 
-    // The same file behind a VALID answer is read, and refused.
+    // Behind a VALID answer of a checked node the daemon replaces the file with the facts it
+    // derives from the reply (none for `Strict`), so the agent's nested value is gone.
     let (state, job, _run, dir) = triage_ended("completed", "OK", 0).await;
-    std::fs::write(
-        dir.path().join(".nucleos").join("triage.json"),
-        r#"{"size":{"nested":true}}"#,
-    )
-    .unwrap();
+    let emission = dir.path().join(".nucleos").join("triage.json");
+    std::fs::write(&emission, r#"{"size":{"nested":true}}"#).unwrap();
     engine::land_nodes_with(&Strict, &state, &job)
         .await
         .unwrap();
     assert_eq!(triage_status(&state.pool, job.id).await, "passed");
+    assert_eq!(std::fs::read_to_string(&emission).unwrap(), "{}");
     engine::build_facts(&state.pool, &job, dir.path(), &graph)
         .await
-        .expect_err("a passed node's nested emission is refused");
+        .expect("the daemon's emission replaced the agent's nested one");
+}
+
+/// Approves and derives `verdict: approved`, as a reviewer's `## Verdict` one-of would.
+struct EmitsVerdict;
+
+impl OutputCheck for EmitsVerdict {
+    fn check(&self, _text: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn facts(&self, _reply: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut facts = serde_json::Map::new();
+        facts.insert("verdict".into(), "approved".into());
+        facts
+    }
+}
+
+struct EmitsVerdictLauncher;
+
+#[async_trait::async_trait]
+impl AgentNodeLauncher for EmitsVerdictLauncher {
+    async fn launch(
+        &self,
+        _ctx: &NodeCtx<'_>,
+        protocol: String,
+    ) -> Result<NodeLaunch, LaunchRefused> {
+        Ok(NodeLaunch {
+            output: Some(Arc::new(EmitsVerdict)),
+            ..NodeLaunch::plain(protocol)
+        })
+    }
+
+    async fn output_check(&self, _ctx: &NodeCtx<'_>) -> Option<Arc<dyn OutputCheck>> {
+        Some(Arc::new(EmitsVerdict))
+    }
+}
+
+#[tokio::test]
+async fn the_daemon_writes_the_emission_from_the_validated_reply() {
+    let (state, job, _run, dir) = triage_ended("completed", "whatever", 0).await;
+    engine::land_nodes_with(&EmitsVerdictLauncher, &state, &job)
+        .await
+        .unwrap();
+    assert_eq!(triage_status(&state.pool, job.id).await, "passed");
+    let emission = dir.path().join(".nucleos").join("triage.json");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&emission).unwrap()).unwrap();
+    assert_eq!(written, serde_json::json!({"verdict": "approved"}));
+    let facts = engine::build_facts(&state.pool, &job, dir.path(), &graph_of(TRIAGE))
+        .await
+        .unwrap();
+    assert_eq!(facts.get("triage.verdict"), Some("approved"));
 }
 
 #[tokio::test]

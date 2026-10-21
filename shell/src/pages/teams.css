@@ -175,30 +175,38 @@
   margin-left: auto;
 }
 
-.teams-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-sm);
-}
-
-.teams-table thead th {
+/* The shared `Table` supplies the hairlines, the quiet head and the figure columns; what follows is
+   this table's own: a roomier body, a stronger rule under the head, and top-aligned cells. */
+.teams-table-scroller .ui-table thead th {
   padding: 0 var(--space-3) var(--space-2);
   border-bottom: 1px solid var(--border-strong);
-  font-size: var(--text-xs);
-  font-weight: 600;
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  text-align: left;
-  white-space: nowrap;
-  color: var(--text-faint);
 }
 
-.teams-table tbody th,
-.teams-table tbody td {
+.teams-table-scroller .ui-table tbody th,
+.teams-table-scroller .ui-table tbody td {
   padding: var(--space-3);
-  border-bottom: 1px solid var(--border);
-  text-align: left;
   vertical-align: top;
+}
+
+/* The row header is the department's name, not a column title: undo the head's small caps. */
+.teams-table-scroller .ui-table .teams-row-name {
+  font-size: var(--text-sm);
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: normal;
+  color: var(--text);
+}
+
+/* The bars are flushed right inside their svg, so the cell's edge is the right one. */
+.teams-table-scroller .ui-table .teams-row-pulse {
+  text-align: right;
+}
+
+/* Figures line up under each other, which is the whole reason this is a table; the column shrinks
+   to the widest of them. */
+.teams-table-scroller .ui-table-num {
+  width: 1%;
 }
 
 /*
@@ -217,12 +225,12 @@
   font-weight: 400;
 }
 
-.teams-table tbody tr {
+.teams-table-scroller .ui-table tbody tr {
   position: relative;
 }
 
-.teams-table tbody tr:hover > th,
-.teams-table tbody tr:hover > td {
+.teams-table-scroller .ui-table tbody tr:hover > th,
+.teams-table-scroller .ui-table tbody tr:hover > td {
   background: var(--surface);
 }
 
@@ -321,13 +329,6 @@
 
 .teams-sort-glyph {
   font-size: var(--text-xs);
-}
-
-/* Figures line up under each other, which is the whole reason this is a table. */
-.teams-col-num {
-  width: 1%;
-  white-space: nowrap;
-  text-align: right !important;
 }
 
 .teams-figure {
@@ -477,10 +478,6 @@
   min-width: 120px;
   /* The bars are flushed right inside their svg, so the column's edge is the right one. */
   text-align: right;
-}
-
-.teams-col-pulse {
-  text-align: right !important;
 }
 
 /* A department that has run nothing: a plain fact, where the dashed rail read as a broken chart. */
@@ -1771,7 +1768,7 @@
   max-width: 100%;
   height: auto;
   margin-inline: auto;
-  font-size: 13px;
+  font-size: var(--text-sm);
 }
 
 /* The one sentence under the chart belongs to it, so it sits on the panel, centred beneath it. */
@@ -1826,13 +1823,13 @@
 
 .teams-org-said {
   fill: var(--text-muted);
-  font-size: 0.846em;
+  font-size: var(--text-xs);
 }
 
 .teams-org-state {
   fill: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 0.846em;
+  font-size: var(--text-xs);
 }
 
 .teams-org-mark {
@@ -1908,7 +1905,7 @@
 
 .teams-org-fact {
   fill: var(--text-muted);
-  font-size: 0.846em;
+  font-size: var(--text-xs);
 }
 
 /* ====================================================== charter in a dialog == */

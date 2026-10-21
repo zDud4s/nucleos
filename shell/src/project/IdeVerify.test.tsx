@@ -82,7 +82,7 @@ describe("IdeVerifyPanel", () => {
     expect(posts()).toEqual([]);
     await pastTheDwell();
     fireEvent.click(
-      screen.getByRole("button", { name: "Switch on — write into every IDE worktree" }),
+      screen.getByRole("button", { name: "Switch on: write into every IDE worktree" }),
     );
 
     await waitFor(() => expect(posts().length).toBe(1));

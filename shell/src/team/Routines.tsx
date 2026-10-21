@@ -118,7 +118,7 @@ export function Routines({ team, rules }: RoutinesProps) {
         <p className="teams-note">
           Rules can't be edited. Duplicate one to make a changed copy, then delete the original.
         </p>
-        {rules.length === 0 && <Quiet says="No rules yet. Write one below — it stays off until you arm it." />}
+        {rules.length === 0 && <Quiet says="No rules yet. Write one below, and it stays off until you arm it." />}
         {rules.length > 0 && (
           <ul className="teams-rules" aria-label="Rules">
             {rules.map((rule) => (
@@ -306,7 +306,7 @@ function NewRuleForm({
         submit();
       }}
     >
-      <p className="teams-note">Writing never arms — arm the rule once it is written.</p>
+      <p className="teams-note">Writing never arms. Arm the rule once it is written.</p>
       <label className="teams-field">
         <span className="teams-label" data-required="true">
           Name
@@ -425,5 +425,5 @@ function NewRuleForm({
 
 function CreateRefusal({ what, error }: { what: string; error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>Couldn't reach NucleOS — couldn't {what}. Try again.</ErrorNote>;
+  return <ErrorNote>Couldn't reach NucleOS to {what}. Try again.</ErrorNote>;
 }

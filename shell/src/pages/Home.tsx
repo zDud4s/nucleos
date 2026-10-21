@@ -14,6 +14,7 @@ import {
   type SubsystemReadout,
 } from "../data/system";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 import { useWaitingCount } from "../data/waiting";
 import { ErrorNote, Meter, PageHeader, Skeleton, StaleNote, StatCard, Term, ceilingShare, usd } from "../ui";
 
@@ -97,8 +98,8 @@ export function Home() {
   // Nothing has answered yet: hold the grid's shape with card-shaped blocks instead of four
   // cards of em dashes. As soon as any one read lands (or fails) the real cards take over, and
   // each still says "not read" for itself.
-  const firstRead =
-    projects.isPending && budget.isPending && health.isPending && waitingState?.data === undefined && !waitingRead.isError;
+  const waitingPending = waitingState?.data === undefined && !waitingRead.isError;
+  const firstRead = projects.isPending && budget.isPending && health.isPending && waitingPending;
 
   return (
     <>
@@ -128,12 +129,12 @@ export function Home() {
       ) : (
       <div className="app-home-stats">
         <div className="app-home-lead">
-          <Cell stale={waitingStale}>
+          <Cell stale={waitingStale} pending={waitingPending} loading="Loading waiting on you">
             <StatCard
               label="Waiting on you"
               value={waiting}
               to="/waiting"
-              unread={unreadNote(waitingRead)}
+              unread={UNREAD}
               // What the number IS, and what to do about it. With decisions held, the line asks for
               // the answer in the awaiting tone (words carry it, so colour is never the only signal).
               detail={
@@ -160,7 +161,7 @@ export function Home() {
             not System's: System writes a headline for the whole page, this is one card's detail,
             and the names of what is wrong are already in the headline above.
           */}
-          <Cell stale={healthStale} wrong={faulty}>
+          <Cell stale={healthStale} wrong={faulty} pending={health.isPending} loading="Loading subsystem health">
             <StatCard
               label="Subsystems healthy"
               value={
@@ -169,7 +170,7 @@ export function Home() {
                   : `${healthy}/${subsystems.length}`
               }
               to="/system"
-              unread={unreadNote(health)}
+              unread={UNREAD}
               /* One device for one piece of news: the clause that is wrong wears the tone and the
                  figure stays the figure. See the note under `.ui-stat-detail` in `ui.css`. */
               detail={
@@ -187,12 +188,12 @@ export function Home() {
         </div>
 
         <div className="app-home-quiet">
-          <Cell stale={projectsStale}>
+          <Cell stale={projectsStale} pending={projects.isPending} loading="Loading projects">
             <StatCard
               label="Projects"
               value={roster?.length}
               to="/projects"
-              unread={unreadNote(projects)}
+              unread={UNREAD}
               detail={
                 active === undefined || shadow === undefined
                   ? undefined
@@ -200,12 +201,12 @@ export function Home() {
               }
             />
           </Cell>
-          <Cell stale={projectsStale}>
+          <Cell stale={projectsStale} pending={projects.isPending} loading="Loading shadow decisions">
             <StatCard
               label="Shadow decisions pending"
               value={shadowDecisions}
               to="/autopilot"
-              unread={unreadNote(projects)}
+              unread={UNREAD}
               detail={
                 <>
                   what the autopilot would have done in <Term term="shadow">shadow</Term>
@@ -234,28 +235,40 @@ function isStale(read: { isError: boolean; data: unknown }): boolean {
   return read.isError && read.data !== undefined;
 }
 
-/** Why a figure is missing: still reading, or the read failed. */
-function unreadNote(read: { isError: boolean }): string {
-  return read.isError ? "could not read" : "reading…";
-}
+/**
+ * Why a figure is missing once its card is drawn for real: the read failed. A read that has not
+ * answered yet never gets here, `Cell` holds a `Skeleton` for it instead of a dash and "reading…".
+ */
+const UNREAD = "could not read";
 
 /**
  * One grid cell. Stale data gets `.ui-stale` (a dashed edge, never dimmed text) and a fault
  * gets a red edge on top of the glyph and the words, so colour is never the only signal.
+ *
+ * A card whose read has not answered yet is held by a `Skeleton` of the tier's height (see
+ * `.app-home-cell .ui-skeleton` in `app.css`), so the grid keeps its shape when the figure lands.
  */
 function Cell({
   stale,
   wrong = false,
+  pending = false,
+  loading,
   children,
 }: {
   stale: boolean;
   wrong?: boolean;
+  pending?: boolean;
+  loading?: string;
   children: ReactNode;
 }) {
   const classes = ["app-home-cell"];
   if (stale) classes.push("ui-stale");
   if (wrong) classes.push("app-home-cell-wrong");
-  return <div className={classes.join(" ")}>{children}</div>;
+  return (
+    <div className={classes.join(" ")}>
+      {pending && loading !== undefined ? <Skeleton label={loading} /> : children}
+    </div>
+  );
 }
 
 /**
@@ -305,16 +318,20 @@ function SpendRow({
   read,
 }: {
   spend: BudgetView | undefined;
-  read: { isError: boolean };
+  read: { isError: boolean; isPending: boolean };
 }) {
   return (
     <Link to="/system" className="app-home-spend">
       {spend === undefined ? (
-        <span className="app-home-spend-unread">
-          <span className="app-home-spend-title">Spend</span>
-          <span aria-hidden="true">—</span>
-          {unreadNote(read)}
-        </span>
+        read.isPending ? (
+          <Skeleton label="Loading spend" />
+        ) : (
+          <span className="app-home-spend-unread">
+            <span className="app-home-spend-title">Spend</span>
+            <span aria-hidden="true">—</span>
+            {UNREAD}
+          </span>
+        )
       ) : (
         <Meter
           label={`Spend · ${spend.period}`}
@@ -387,7 +404,7 @@ function headline(
   }
 
   if (spend?.paused === true) {
-    return `autonomous work is held — ${spend.reason ?? "a ceiling is holding it"}`;
+    return `autonomous work is held: ${spend.reason ?? "a ceiling is holding it"}`;
   }
 
   // Before the pause, not after: a ceiling that is about to hold work is the moment to say so.
@@ -445,7 +462,7 @@ function wrongClause(readout: HealthReadout | undefined): string | null {
   const parts: string[] = [];
   if (down.length > 0) {
     const named = down.map((row) => displayName(row.name)).join(", ");
-    parts.push(`${String(down.length)} subsystem${down.length === 1 ? "" : "s"} down (${named})`);
+    parts.push(`${plural(down.length, "subsystem")} down (${named})`);
   }
   if (degraded.length > 0) parts.push(`${String(degraded.length)} degraded`);
   return parts.join(", ");

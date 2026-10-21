@@ -14,29 +14,12 @@
 
 /* ================================================================ shared == */
 
-/**
- * The prose standing above a list, and the line that stands in for a panel
- * while it is still being read.
- *
- * Neither is `Quiet`, and that is a decision rather than an oversight. The note
- * says what the dictations below it are for; the loading line is a wait, and a
- * wait wearing the vocabulary of an empty section claims the list is empty when
- * in truth nobody has answered yet. Faint is right for a line about to be
- * replaced by the thing it stands for. This page's one genuine absence —
- * "nothing was heard", the `204` — is a `Quiet` and has no class here at all,
- * and its two teaching empty states are `Teach` blocks and already were.
- */
-.voice-loading,
+/* The prose standing above a list. */
 .voice-note {
   margin: 0;
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
-}
-
-.voice-loading {
-  color: var(--text-faint);
-  font-style: italic;
 }
 
 /* ---------------------------------------------------------------- capture -- */
@@ -666,7 +649,7 @@
     border-top: 1px solid var(--border);
   }
 
-  .voice-room[data-archive="open"][data-live] .voice-archive-body {
+  .voice-room[data-archive="open"][data-live] .ui-drawer-body {
     padding-bottom: 14rem;
   }
 
@@ -692,38 +675,11 @@
 
 /* ----------------------------------------------------------------- archive -- */
 
-.voice-archive {
-  position: absolute;
+/* `Drawer` is fixed, and the room's size containment makes the room its containing block, so it
+   sits on the room's right edge. The viewport-high default is cut to the room, and the drawer
+   stays under the dock's live rise (z-index 6) and over the rest of the room. */
+.voice-room .ui-drawer {
   z-index: 5;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  height: 100%;
   width: min(25rem, 92%);
-  display: flex;
-  flex-direction: column;
-  background: var(--surface);
-  border-left: 1px solid var(--border);
-  box-shadow: var(--shadow-lg);
-}
-
-.voice-archive-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
-  border-bottom: 1px solid var(--border);
-}
-
-.voice-archive-head h2 {
-  flex: 1;
-  margin: 0;
-  font-size: var(--text-md);
-  font-weight: 600;
-}
-
-.voice-archive-body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: var(--space-4);
 }

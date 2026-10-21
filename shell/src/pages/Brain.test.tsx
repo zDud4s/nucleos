@@ -222,7 +222,7 @@ describe("Brain", () => {
 
     const aside = await screen.findByRole("complementary", { name: "For you" });
     expect(await within(aside).findByRole("button", { name: "Retry" })).toBeTruthy();
-    expect(within(aside).queryByText("Nothing open")).toBeNull();
+    expect(within(aside).queryByText(/Nothing open/)).toBeNull();
     expect(screen.getAllByTitle(/could not be read/i)[0]!.textContent).toContain("—");
   });
 

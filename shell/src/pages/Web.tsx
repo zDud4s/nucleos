@@ -30,6 +30,7 @@ import {
 } from "../ui";
 import "./web.css";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 
 /**
  * Web — the local archive, one component serving `/web` and
@@ -134,8 +135,7 @@ export function WebHeader() {
 function headline(rows: Hit[] | undefined): string | undefined {
   if (rows === undefined) return undefined;
   if (rows.length === 0) return "nothing has been read yet";
-  const noun = rows.length === 1 ? "page" : "pages";
-  return `${rows.length} ${noun} in the archive`;
+  return `${plural(rows.length, "page")} in the archive`;
 }
 
 /** The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s pattern. */
@@ -271,7 +271,7 @@ function ReadOutcome({ view }: { view: ReadView }) {
         {/* The daemon sends no such prose — `from_cache` is the fact, and this is this
             shell's own sentence for it. */}
         {view.from_cache ? "Already in the archive" : "Read and stored"}
-        {" — "}
+        {": "}
         <Link to={`/web/pages/${view.id}`}>{view.title ?? view.final_url}</Link>
       </p>
       {view.final_url !== view.requested_url && (
@@ -285,7 +285,7 @@ function ReadRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ ...READ_SENTENCES, ...daemonProse(error) }} />;
   }
-  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was read</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: nothing was read</ErrorNote>;
 }
 
 /* ------------------------------------------------------------------ search -- */
@@ -300,7 +300,7 @@ function SearchOutcome({ query, view }: { query: string; view: SearchView }) {
             not an announcement, and this one arrives after a mutation lands. */}
         {view.provider === "unavailable" && (
           <div role="status">
-            <Quiet says="no search provider is configured on this machine — showing only what is already in the archive" />
+            <Quiet says="no search provider is configured on this machine: showing only what is already in the archive" />
           </div>
         )}
 
@@ -344,7 +344,7 @@ function SearchOutcome({ query, view }: { query: string; view: SearchView }) {
 
 function SearchRefusal({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing was searched</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: nothing was searched</ErrorNote>;
 }
 
 /* --------------------------------------------------------------- the list -- */
@@ -436,7 +436,7 @@ function ReaderError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return <RefusalNote refusal={error} sentences={{ not_found: "there is no page with that number" }} />;
   }
-  return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about this page</ErrorNote>;
+  return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about this page</ErrorNote>;
 }
 
 /**

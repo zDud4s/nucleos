@@ -78,7 +78,7 @@ export function KillSwitchControl() {
       {engaged === true ? (
         <>
           <p className="app-kill-state" role="status">
-            kill switch engaged — nothing autonomous starts
+            kill switch engaged: nothing autonomous starts
           </p>
           {/* The engaged state is alarming, so its release control is the loud one. */}
           <ConfirmButton
@@ -91,13 +91,13 @@ export function KillSwitchControl() {
             confirmLabel={
               <>
                 <Play className="app-kill-icon" strokeWidth={1.5} aria-hidden="true" />
-                Really release — work resumes
+                Really release, work resumes
               </>
             }
             /* The label is a fragment, so there is nothing to interpolate: this control
                announced "armed — press again to confirm", with no object, on the button that
                restarts everything autonomous in the app. */
-            sayAs="Really release — work resumes"
+            sayAs="Really release, work resumes"
             variant="danger-solid"
             onConfirm={() => set.mutate(false)}
             disabled={set.isPending}
@@ -126,7 +126,7 @@ export function KillSwitchControl() {
       {failure === null ? null : isApiRefusal(failure) ? (
         <RefusalNote refusal={failure} />
       ) : (
-        <ErrorNote>the kill switch could not be set — the daemon is not responding</ErrorNote>
+        <ErrorNote>the kill switch could not be set: the daemon is not responding</ErrorNote>
       )}
     </div>
   );

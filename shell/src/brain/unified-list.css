@@ -198,3 +198,17 @@
 .unified-summary[open] > summary {
   margin-bottom: var(--space-3);
 }
+
+/* ------------------------------------------------------------ graph chips -- */
+
+/* The dot beside a node kind is identity (the graph's key), and it dims with its chip so "off"
+   reads in the key as well. */
+.brain-chips .ui-chip[aria-pressed="false"] .unified-mark {
+  opacity: var(--opacity-disabled);
+}
+
+/* Link types are a second, quieter rank under the line: mono, because they are the daemon's words. */
+.brain-chips-link .ui-chip {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}

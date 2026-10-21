@@ -1,6 +1,6 @@
 // §spec workspace-de-projeto
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import {
   daemonFetch,
   daemonState,
@@ -841,7 +841,7 @@ describe("the settings this app authors", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "no ceiling" }));
     await waitFor(() => expect(state.projects[0].wip_limit).toBe(null));
-    expect(await screen.findByText(/no ceiling — 2 proposals waiting on you/)).toBeTruthy();
+    expect(await screen.findByText(/no ceiling: 2 proposals waiting on you/)).toBeTruthy();
   });
 
   /**
@@ -1344,7 +1344,11 @@ describe("what this project can be asked to do", () => {
     expect(forgets.length).toBe(1);
     expect(screen.getByText("the workflow's")).toBeTruthy();
 
+    // Forgetting is behind the interlock: the first activation arms, the second (past the dwell) confirms.
     fireEvent.click(forgets[0]);
+    expect(state.commands.map((row) => row.id)).toEqual([1, 2]);
+    await act(async () => void (await new Promise((r) => setTimeout(r, 350))));
+    fireEvent.click(screen.getByRole("button", { name: "Forget gate" }));
     await waitFor(() => expect(state.commands.map((row) => row.id)).toEqual([2]));
   });
 });
