@@ -269,10 +269,12 @@ async fn land_node(
             facts: &facts,
         };
         if let Some(check) = launcher.output_check(&ctx).await {
-            verdict = validation_verdict(
-                attempts.max(0) as usize,
-                check.check(stdout.as_deref().unwrap_or_default()),
-            );
+            // The reply, not the stream: `runs.stdout` is the CLI's whole stream-json, where a
+            // `## Section` heading never starts a line (job 30, run 900727). A run with no result
+            // event is checked as printed.
+            let stdout = stdout.unwrap_or_default();
+            let reply = crate::execution::runner::extract_reply(&stdout).unwrap_or(stdout);
+            verdict = validation_verdict(attempts.max(0) as usize, check.check(&reply));
             // A row left over from an earlier round cannot be relaunched here: `spawn_node` links
             // the run of the CURRENT round's row.
             if let Landing::Retry(report) = verdict.clone()

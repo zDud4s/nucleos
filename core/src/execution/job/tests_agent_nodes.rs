@@ -399,6 +399,61 @@ async fn valid_output_reports_pass_after_validation_not_at_run_end() {
     assert_eq!(count(&state.pool, "runs").await, 1);
 }
 
+/// Passes only an answer that BEGINS with "OK", which a raw stream-json line never does.
+struct OpensWithOk;
+
+impl OutputCheck for OpensWithOk {
+    fn check(&self, text: &str) -> Result<(), String> {
+        if text.starts_with("OK") {
+            Ok(())
+        } else {
+            Err("the answer does not open with OK".to_string())
+        }
+    }
+}
+
+struct StrictOpening;
+
+#[async_trait::async_trait]
+impl AgentNodeLauncher for StrictOpening {
+    async fn launch(
+        &self,
+        _ctx: &NodeCtx<'_>,
+        protocol: String,
+    ) -> Result<NodeLaunch, LaunchRefused> {
+        Ok(NodeLaunch {
+            output: Some(Arc::new(OpensWithOk)),
+            ..NodeLaunch::plain(protocol)
+        })
+    }
+
+    async fn output_check(&self, _ctx: &NodeCtx<'_>) -> Option<Arc<dyn OutputCheck>> {
+        Some(Arc::new(OpensWithOk))
+    }
+}
+
+/// Measured on job 30, run 900727, 2026-10-21: the researcher's answer had every section
+/// `output.md` asks for, and the validator was handed the whole `claude -p` stream-json, where
+/// `## Synthesis` sits inside a JSON string and never at the start of a line. The check reads the
+/// run's reply, as `wire::extract_reply` gives it, not the stream.
+#[tokio::test]
+async fn the_output_check_reads_the_runs_reply_not_its_stream_json() {
+    let stream = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"OK: the answer"}"#,
+        "\n",
+    );
+    let (state, job, _run, _dir) = triage_ended("completed", stream, 0).await;
+    engine::land_nodes_with(&StrictOpening, &state, &job)
+        .await
+        .unwrap();
+    assert_eq!(triage_status(&state.pool, job.id).await, "passed");
+    assert_eq!(count(&state.pool, "runs").await, 1, "no retry");
+}
+
 #[tokio::test]
 async fn output_is_validated_before_the_emission_is_read() {
     // An invalid answer beside an emission the facts reader would refuse (a nested value).
