@@ -7,6 +7,7 @@ pub mod limits;
 pub mod model;
 pub mod source;
 pub mod tail;
+pub mod work_nodes_edges;
 
 use std::path::PathBuf;
 use std::sync::Arc;
