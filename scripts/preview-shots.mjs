@@ -486,6 +486,14 @@ const SHOTS_TO_TAKE = [
      reached from and the one surface of this pillar nothing had photographed. */
   ["37-roster", { path: "/projects" }],
   ["38-roster-light", { path: "/projects", theme: "light" }],
+  /* Three operate pages nothing had photographed: the runs index (attention regions over a
+     day-grouped grid), the feed, and the waiting queues with their decision/context split. */
+  ["38a-runs", { path: "/runs" }],
+  ["38b-runs-light", { path: "/runs", theme: "light" }],
+  ["38c-feed", { path: "/feed" }],
+  ["38d-feed-light", { path: "/feed", theme: "light" }],
+  ["38e-waiting", { path: "/waiting" }],
+  ["38f-waiting-light", { path: "/waiting", theme: "light" }],
   /* The two other ways into a project: the switcher at the top of the rail, open,
      and the rail's own project rows, which the route opens inside a workspace. */
   ["37a-switcher-open", { path: "/fleet", press: "NucleOS" }],

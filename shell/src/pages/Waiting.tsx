@@ -158,6 +158,10 @@ export function Waiting() {
   const quiet = sections
     .filter((section) => section.rows !== undefined && section.rows.length === 0)
     .map((section) => section.queue);
+  const ordered = [...sections].sort((a, b) => Number(has(b.rows)) - Number(has(a.rows)));
+  const filled = ordered
+    .filter((section) => has(section.rows))
+    .map((section) => ({ queue: section.queue, count: section.rows?.length ?? 0 }));
 
   return (
     <>
@@ -169,13 +173,39 @@ export function Waiting() {
         </p>
       ) : null}
 
+      <WaitingIndex queues={filled} />
+
       <div className="waiting-sections">
-        {[...sections]
-          .sort((a, b) => Number(has(b.rows)) - Number(has(a.rows)))
-          .map((section) => section.node)}
+        {ordered.map((section) => section.node)}
         <NothingWaiting queues={quiet} />
       </div>
     </>
+  );
+}
+
+/**
+ * What is waiting, by kind, as links to where it is.
+ *
+ * The headline says how many decisions there are and nothing about what sort, so the page had to
+ * be scrolled to find out; this is the map. Only the queues with something in them are named
+ * (the ones without are the sentence at the bottom), in the order the sections are on the page,
+ * so the line reads top to bottom as the page does. Plain anchors: the router keeps its location in
+ * memory, so a fragment link only moves the scroll, which is all it is for.
+ */
+function WaitingIndex({ queues }: { queues: { queue: QueueText; count: number }[] }) {
+  if (queues.length === 0) return null;
+  return (
+    <nav className="waiting-index" aria-label="Queues with something waiting">
+      <ul className="waiting-index-list">
+        {queues.map(({ queue, count }) => (
+          <li key={queue.id}>
+            <a className="waiting-index-link" href={`#${queue.id}`}>
+              <span className="waiting-index-count">{count}</span> {queue.index(count)}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </nav>
   );
 }
 

@@ -73,13 +73,17 @@ function group(name: string): HTMLElement {
 function names(name: string): string[] {
   return within(group(name))
     .getAllByRole("link")
-    .map((link) => link.querySelector(".rs-card-name, .rs-quiet-name")?.textContent ?? "");
+    .map((link) => link.querySelector("[data-name]")?.textContent ?? "");
 }
 
-/** The card for one project, inside whichever group holds it. */
+/** The row for one project, inside whichever group holds it (the sidebar's link is not a row). */
 function card(id: string): HTMLElement {
-  const link = document.querySelector(`a.rs-card[href$="/projects/${id}/state"]`);
-  if (link === null) throw new Error(`no card for ${id}`);
+  const link = document.querySelector(
+    ["Needs you", "Working", "Quiet"]
+      .map((name) => `section[aria-label="${name}"] a[href$="/projects/${id}/state"]`)
+      .join(", "),
+  );
+  if (link === null) throw new Error(`no row for ${id}`);
   return link as HTMLElement;
 }
 
@@ -106,7 +110,7 @@ describe("the roster", () => {
     expect(count?.textContent).toBe("4");
   });
 
-  it("orders the quiet group by state and then by name, switched-off projects included whatever their folder says", async () => {
+  it("orders the quiet group by mode and then by name, switched-off projects included whatever their folder says", async () => {
     await openRoster([
       fine("zulu"),
       project({ project_id: "asleep", mode: "off", project_root: null, root_exists: null }),
@@ -117,11 +121,18 @@ describe("the roster", () => {
     await screen.findByRole("region", { name: "Quiet" });
     expect(names("Quiet")).toEqual(["Mike", "zulu", "asleep", "moved"]);
     expect(screen.queryByRole("region", { name: "Needs you" })).toBeNull();
-    // Each state is its own labelled group, so "off" is said once over its projects.
-    const off = within(group("Quiet")).getByRole("group", { name: "off" });
-    expect(within(off).getAllByRole("link").map((link) => link.textContent)).toEqual(["asleep", "moved"]);
-    const shadow = within(group("Quiet")).getByRole("group", { name: "shadow" });
-    expect(within(shadow).getAllByRole("link").map((link) => link.textContent)).toEqual(["Mike", "zulu"]);
+    // One list on shared columns, not a sub-group per mode: the mode is each row's own column.
+    expect(within(group("Quiet")).queryByRole("group")).toBeNull();
+    const modes = within(group("Quiet"))
+      .getAllByRole("link")
+      .map((link) => link.querySelector("[data-mode]")?.textContent);
+    expect(modes).toEqual(["shadow", "shadow", "off", "off"]);
+    // A switched-off project's folder is said in the grey of switched off — never the red of a fault.
+    const unnamed = within(card("asleep")).getByText("no folder named");
+    expect(unnamed.className).toContain("text-tone-off-fg");
+    const gone = within(card("moved")).getByText("folder gone");
+    expect(gone.className).toContain("text-tone-off-fg");
+    expect(gone.className).not.toContain("danger");
   });
 
   /** A group with nothing in it is not drawn — an empty heading is a sentence about nothing. */
@@ -149,14 +160,15 @@ describe("the roster", () => {
     expect(names("Working")).toEqual(["busy"]);
     expect(names("Quiet")).toEqual(["idle"]);
     expect(names("Needs you")).toEqual(["asking"]);
-    expect(within(card("busy")).getByText("1 job and 2 runs in flight")).toBeTruthy();
+    expect(within(card("busy")).getByText("1 job and 2 runs")).toBeTruthy();
+    expect(within(card("busy")).getByText("in flight")).toBeTruthy();
     expect(within(card("busy")).getByText("Open")).toBeTruthy();
-    // A project that needs somebody says its work in flight too, after the reasons it is there.
-    expect(within(card("asking")).getByText("1 run in flight")).toBeTruthy();
+    // A project that needs somebody says its work in flight too, beside the facts that put it there.
+    expect(within(card("asking")).getByText("1 run")).toBeTruthy();
   });
 
-  /** Each card says why it is there, and what opening it is for. */
-  it("gives every card its reasons and the verb for the first thing to do", async () => {
+  /** Each row says why it is there, in its own column, and what opening it is for. */
+  it("gives every row its facts and the verb for the first thing to do", async () => {
     await openRoster([
       fine("asking", { open_review_items: 3, open_proposals: 2, open_shadow_decisions: 1 }),
       fine("broken", { last_gate: "failed", last_gate_at: "2026-09-20T14:05:00Z" }),
@@ -166,51 +178,68 @@ describe("the roster", () => {
     ]);
     await screen.findByRole("region", { name: "Needs you" });
 
-    expect(within(card("asking")).getByText("2 proposals and 1 shadow decision to review")).toBeTruthy();
+    // The count, where the items are waiting, then the word a reader with no column head hears.
+    expect(within(card("asking")).getByText("3")).toBeTruthy();
+    expect(within(card("asking")).getByText("2 proposals and 1 shadow decision")).toBeTruthy();
+    expect(within(card("asking")).getByText("to review")).toBeTruthy();
     expect(within(card("asking")).getByText("Open")).toBeTruthy();
 
-    const failed = within(card("broken")).getByText("gate failed");
-    expect(failed.getAttribute("title")).toMatch(/^last run 20 Sept? 2026/);
-    // Said on the card, not only on hover.
-    expect(within(card("broken")).getByText(/^last run 20 Sept? 2026/)).toBeTruthy();
-    expect(failed.querySelector('[data-mark="fault"]')).not.toBeNull();
+    const failed = within(card("broken")).getByText("failed");
+    expect(failed.getAttribute("data-tone")).toBe("danger");
+    // The last gate run is its own column, said on the row and not only on hover.
+    expect(within(card("broken")).getByText(/^20 Sept? 2026/)).toBeTruthy();
     expect(within(card("broken")).getByText("Open")).toBeTruthy();
 
     // Info and not danger: the gate never measured the code.
-    const unrun = within(card("unrun")).getByText("gate could not run");
-    expect(unrun.querySelector('[data-mark="unmeasured"]')).not.toBeNull();
+    const unrun = within(card("unrun")).getByText("could not run");
+    expect(unrun.getAttribute("data-tone")).toBe("info");
     expect(screen.queryByText("errored")).toBeNull();
 
     const gone = within(card("moved")).getByText("folder gone");
     expect(gone.getAttribute("title")).toBe("C:/Projects/moved is not on this disk");
+    expect(gone.className).toContain("danger");
     expect(within(card("moved")).getByText("C:/Projects/moved is not on this disk")).toBeTruthy();
     expect(within(card("moved")).getByText("Open")).toBeTruthy();
 
+    // For a project that is meant to be running, a folder nobody named is unfinished: amber.
     const unset = within(card("empty")).getByText("no folder named");
-    expect(unset.querySelector('[data-mark="unnamed"]')).not.toBeNull();
+    expect(unset.className).toContain("pending");
+  });
+
+  /** A folder that is fine is the path under the name; a gate that passed is a quiet word. */
+  it("shows the path under the name, and a quiet word for a gate that passed", async () => {
+    await openRoster([fine("calm", { last_gate: "passed" }), fine("bare")]);
+    await screen.findByRole("region", { name: "Quiet" });
+
+    expect(within(card("calm")).getByText("C:/Projects/calm")).toBeTruthy();
+    expect(within(card("calm")).getByText("passed")).toBeTruthy();
+    expect(within(card("bare")).queryByText("passed")).toBeNull();
   });
 
   it("says the bare total to review when the daemon gave no split", async () => {
     await openRoster([fine("asking", { open_review_items: 5 })]);
     await screen.findByRole("region", { name: "Needs you" });
-    expect(within(card("asking")).getByText("5 to review")).toBeTruthy();
+    expect(within(card("asking")).getByText("5")).toBeTruthy();
+    expect(within(card("asking")).getByText("to review")).toBeTruthy();
+    // No split to give: nothing is claimed about proposals or shadow decisions.
+    expect(within(card("asking")).queryByText(/proposal|shadow decision/)).toBeNull();
   });
 
-  /** The mode word on the card is the map's, beside a dot in the rail's recipe. */
-  it("marks every card with its mode, in the map's word", async () => {
+  /** The mode word on the row is the map's, beside a dot in the rail's recipe. */
+  it("marks every row with its mode, in the map's word", async () => {
     await openRoster([fine("acting", { mode: "active", open_review_items: 1 })]);
     await screen.findByRole("region", { name: "Needs you" });
 
-    const acting = card("acting");
-    expect(acting.querySelector(".rs-card-mode")?.textContent).toBe("active");
-    expect(acting.querySelector('.rs-dot[data-mode="active"]')).not.toBeNull();
+    const mark = card("acting").querySelector('[data-mode="active"]');
+    expect(mark?.textContent).toBe("active");
+    expect(mark?.querySelector('span[aria-hidden="true"]')).not.toBeNull();
   });
 
   /**
    * Into the workspace and not back into a file tree: a project is opened on State, the mode that
-   * answers the question somebody arrives with. The whole card is the one link.
+   * answers the question somebody arrives with. The whole row is the one link.
    */
-  it("opens a project on its State mode, from a card or a quiet item", async () => {
+  it("opens a project on its State mode, from a row of any group", async () => {
     const { rendered } = await openRoster([fine("nucleos", { open_review_items: 1 }), fine("calm")]);
     await screen.findByRole("region", { name: "Needs you" });
 
@@ -234,7 +263,7 @@ describe("the roster", () => {
 
   /**
    * **The headline says it once, and nothing says it again in a box.** Only non-zero facts, in the
-   * same words the cards use for the same number.
+   * same words the rows use for the same number.
    */
   it("says the review count in the headline, with no strip of cards repeating it", async () => {
     await openRoster([fine("alpha", { open_review_items: 3 }), fine("beta", { open_review_items: 2 })]);
@@ -252,7 +281,7 @@ describe("the roster", () => {
     expect(screen.queryByText(/to review/)).toBeNull();
   });
 
-  it("says the same thing about folders as its own cards do", async () => {
+  it("says the same thing about folders as its own rows do", async () => {
     await openRoster([fine("here"), fine("moved", { root_exists: false })]);
 
     expect(await screen.findByText(/1 with the folder gone/)).toBeTruthy();
@@ -348,6 +377,23 @@ describe("the roster", () => {
     });
     // The workspace opened: its mode links replace the roster.
     expect(await screen.findByRole("link", { name: "Map" })).toBeTruthy();
+  });
+
+  /** A search that matches nothing says what to do next: clear it, or add the project. */
+  it("offers the way out of a search that matches nothing", async () => {
+    await openRoster([fine("alpha"), fine("beta")]);
+    await screen.findByRole("region", { name: "Quiet" });
+    const box = screen.getByRole("searchbox", { name: "Search projects" }) as HTMLInputElement;
+
+    await act(async () => {
+      fireEvent.change(box, { target: { value: "zzz" } });
+    });
+    expect(screen.getByRole("link", { name: "add a project" }).getAttribute("href")).toBe("/projects/new");
+    await act(async () => {
+      screen.getByRole("button", { name: "clear the search" }).click();
+    });
+    expect(box.value).toBe("");
+    expect(names("Quiet")).toEqual(["alpha", "beta"]);
   });
 
   it("offers a new project from the header", async () => {

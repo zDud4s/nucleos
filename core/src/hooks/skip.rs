@@ -154,6 +154,8 @@ pub(super) async fn skip_the_item(state: AppState, item: SkippedItem) {
             "pretooluse-decision: could not lift the pause off a skipped item's run — the job will park until restart"
         );
     }
+    // The run left `awaiting_approval`: wake the runs topic (a spurious hint is harmless).
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
 
     // (4a) Put the tree back. The item wrote whatever it wrote before it asked, and the next item
     // must not build on a half-done change nobody approved.
@@ -210,5 +212,46 @@ pub(super) async fn skip_the_item(state: AppState, item: SkippedItem) {
         // There the run is stuck `awaiting_approval` with nothing to approve, holding an index that
         // blocks the project. Here the item is `skipped`, the job moves on, and what is lost is the
         // reminder — a worse outcome than having it, and a far better one than a job that stalls.
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// Lifting the pause off a skipped item's run wakes the runs topic.
+    ///
+    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_skip_the_item_bumps_runs() {
+        let state = crate::channels::testkit::state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'awaiting_approval', 'worktree', '2026-10-19T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        let before = *rx.borrow();
+
+        skip_the_item(
+            state.clone(),
+            SkippedItem {
+                run_id,
+                job_id: 1,
+                session_id: None,
+                project_id: None,
+                tool_name: "Bash".to_string(),
+                tool_input: "{}".to_string(),
+                reason: "wake test".to_string(),
+                had_an_item: false,
+            },
+        )
+        .await;
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 }

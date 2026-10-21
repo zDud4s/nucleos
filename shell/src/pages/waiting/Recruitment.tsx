@@ -3,10 +3,10 @@ import type { AgentEngine, AgentRequest, AgentToolPolicy } from "../../data/agen
 import type { Proposal } from "../../data/system";
 import { parseActionPayload, useHireRecruit } from "../../data/teams";
 import { useRejectProposal } from "../../data/waiting";
-import { Button, ConfirmButton, Inset, RelativeTime, Row, Rows } from "../../ui";
+import { Button, ConfirmButton, Field, RelativeTime, Row, Rows } from "../../ui";
 import type { Reading } from "./reading";
 import { DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
-import { DepartmentContext } from "./TeamActions";
+import { DepartmentContext, hasDepartmentContext } from "./TeamActions";
 
 /* ---------------------------------------------------------- 4. recruitment -- */
 
@@ -26,6 +26,7 @@ export function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Queue
+      id={QUEUES.recruits.id}
       title={QUEUES.recruits.title}
       view={view}
       what="the recruitment requests"
@@ -144,163 +145,158 @@ function RecruitmentCard({
   const careful =
     "Engine and tool policy are the two fields a director gets wrong most often — they are also what costs money per turn and what widens what this agent can reach.";
 
+  const context = hasDepartmentContext(proposal);
+
   return (
-    <Row className="waiting-card" dense={dense(count)}>
-      <div className="waiting-card-head">
-        <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>recruit #{proposal.id}</span>
-        <RelativeTime at={proposal.created_at} />
-      </div>
-      <DepartmentContext proposal={proposal} />
-      <Reasoning>
-        {proposal.reasoning.trim() === ""
-          ? "nothing was recorded about why"
-          : proposal.reasoning}
-      </Reasoning>
-      {form === null ? (
-        <p className="waiting-payload-raw">
-          {proposal.tool_input ?? "nothing was proposed"}
-        </p>
-      ) : (
-        // The one card in this queue that is a form. The inset is what says the
-        // fields are a thing standing on the row rather than more of the row.
-        <Inset>
-          {proposalChanged && (
-            <p className="waiting-notice waiting-recruit-changed" role="status">
-              The director changed this proposal after you opened it. The fields below still hold
-              the earlier values.{" "}
-              <Button variant="quiet" onClick={loadChangedProposal}>
-                Load the new proposal
-              </Button>
-            </p>
-          )}
-          <div className="waiting-recruit">
-            <div className="waiting-recruit-form">
-              <div className="waiting-recruit-field">
-                <label className="waiting-recruit-label" htmlFor={idFor("name")}>
-                  Name
-                </label>
-                <input
-                  className="waiting-recruit-input"
-                  id={idFor("name")}
-                  value={form.name}
-                  onChange={(event) => field("name", event.target.value)}
-                />
-              </div>
-              <div className="waiting-recruit-field waiting-recruit-span-2">
-                <label className="waiting-recruit-label" htmlFor={idFor("speciality")}>
-                  Speciality
-                </label>
-                <input
-                  className="waiting-recruit-input"
-                  id={idFor("speciality")}
-                  value={form.speciality}
-                  onChange={(event) => field("speciality", event.target.value)}
-                />
-              </div>
-              <div className="waiting-recruit-field waiting-recruit-span-all">
-                <label className="waiting-recruit-label" htmlFor={idFor("prompt")}>
-                  Prompt
-                </label>
-                <textarea
-                  className="waiting-recruit-textarea"
-                  id={idFor("prompt")}
-                  rows={4}
-                  value={form.prompt}
-                  onChange={(event) => field("prompt", event.target.value)}
-                />
-              </div>
-              <div className="waiting-recruit-field">
-                <label className="waiting-recruit-label" htmlFor={idFor("engine")}>
-                  Engine
-                </label>
-                <select
-                  className="waiting-recruit-input waiting-recruit-input-careful"
-                  id={idFor("engine")}
-                  aria-describedby={carefulId}
-                  value={form.engine}
-                  onChange={(event) => field("engine", event.target.value)}
-                >
-                  <OptionsWith current={form.engine} known={RECRUIT_ENGINES} />
-                </select>
-              </div>
-              <div className="waiting-recruit-field">
-                <label className="waiting-recruit-label" htmlFor={idFor("model")}>
-                  Model
-                </label>
-                <input
-                  className="waiting-recruit-input"
-                  id={idFor("model")}
-                  placeholder="engine default"
-                  value={form.model ?? ""}
-                  onChange={(event) =>
-                    field(
-                      "model",
-                      event.target.value === "" ? null : event.target.value,
-                    )
-                  }
-                />
-              </div>
-              <div className="waiting-recruit-field">
-                <label className="waiting-recruit-label" htmlFor={idFor("tool_policy")}>
-                  Tool policy
-                </label>
-                <select
-                  className="waiting-recruit-input waiting-recruit-input-careful"
-                  id={idFor("tool_policy")}
-                  aria-describedby={carefulId}
-                  value={form.tool_policy}
-                  onChange={(event) => field("tool_policy", event.target.value)}
-                >
-                  <OptionsWith current={form.tool_policy} known={RECRUIT_TOOL_POLICIES} />
-                </select>
-              </div>
-              {/* Visible, not a `title`: this is what costs money per turn, and a tooltip waits,
-                  never shows on touch and is not read by most readers. It is also the two
-                  fields' description. */}
-              <p
-                className={
-                  carefulChanged
-                    ? "waiting-recruit-careful waiting-recruit-careful-changed waiting-recruit-span-all"
-                    : "waiting-recruit-careful waiting-recruit-span-all"
-                }
-                id={carefulId}
-              >
-                {careful}
-                {carefulChanged && " Changed from what the director proposed."}
+    <Row
+      className={context ? "waiting-card waiting-item waiting-item-split" : "waiting-card waiting-item"}
+      dense={dense(count)}
+    >
+      <div className="waiting-item-main">
+        <div className="waiting-card-head">
+          <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>recruit #{proposal.id}</span>
+          <RelativeTime at={proposal.created_at} />
+        </div>
+        <Reasoning>
+          {proposal.reasoning.trim() === ""
+            ? "nothing was recorded about why"
+            : proposal.reasoning}
+        </Reasoning>
+        {form === null ? (
+          <p className="waiting-payload-raw">
+            {proposal.tool_input ?? "nothing was proposed"}
+          </p>
+        ) : (
+          // The one card in this queue that is a form. The fields are the only boxes in it:
+          // wrapping them in a second one would put a frame round a frame.
+          <>
+            {proposalChanged && (
+              <p className="waiting-notice" role="status">
+                The director changed this proposal after you opened it. The fields below still hold
+                the earlier values.{" "}
+                <Button variant="quiet" onClick={loadChangedProposal}>
+                  Load the new proposal
+                </Button>
               </p>
+            )}
+            <div className="waiting-recruit">
+              <div className="waiting-recruit-form">
+                <Field label="Name">
+                  <input
+                    id={idFor("name")}
+                    value={form.name}
+                    onChange={(event) => field("name", event.target.value)}
+                  />
+                </Field>
+                {/* `Field` renders its own wrapper and takes no class, so the grid span rides on
+                    a wrapper of ours. */}
+                <div className="waiting-recruit-span-2">
+                  <Field label="Speciality">
+                    <input
+                      id={idFor("speciality")}
+                      value={form.speciality}
+                      onChange={(event) => field("speciality", event.target.value)}
+                    />
+                  </Field>
+                </div>
+                <div className="waiting-recruit-span-all">
+                  <Field label="Prompt">
+                    <textarea
+                      id={idFor("prompt")}
+                      rows={4}
+                      value={form.prompt}
+                      onChange={(event) => field("prompt", event.target.value)}
+                    />
+                  </Field>
+                </div>
+                <Field label="Engine">
+                  <select
+                    className="waiting-recruit-input-careful"
+                    id={idFor("engine")}
+                    aria-describedby={carefulId}
+                    value={form.engine}
+                    onChange={(event) => field("engine", event.target.value)}
+                  >
+                    <OptionsWith current={form.engine} known={RECRUIT_ENGINES} />
+                  </select>
+                </Field>
+                <Field label="Model">
+                  <input
+                    id={idFor("model")}
+                    placeholder="engine default"
+                    value={form.model ?? ""}
+                    onChange={(event) =>
+                      field(
+                        "model",
+                        event.target.value === "" ? null : event.target.value,
+                      )
+                    }
+                  />
+                </Field>
+                <Field label="Tool policy">
+                  <select
+                    className="waiting-recruit-input-careful"
+                    id={idFor("tool_policy")}
+                    aria-describedby={carefulId}
+                    value={form.tool_policy}
+                    onChange={(event) => field("tool_policy", event.target.value)}
+                  >
+                    <OptionsWith current={form.tool_policy} known={RECRUIT_TOOL_POLICIES} />
+                  </select>
+                </Field>
+                {/* Visible, not a `title`: this is what costs money per turn, and a tooltip waits,
+                    never shows on touch and is not read by most readers. It is also the two
+                    fields' description. */}
+                <p
+                  className={
+                    carefulChanged
+                      ? "waiting-recruit-careful waiting-recruit-careful-changed waiting-recruit-span-all"
+                      : "waiting-recruit-careful waiting-recruit-span-all"
+                  }
+                  id={carefulId}
+                >
+                  {careful}
+                  {carefulChanged && " Changed from what the director proposed."}
+                </p>
+              </div>
             </div>
-          </div>
-        </Inset>
-      )}
-      <div className="waiting-actions-split">
-        <ConfirmButton
-          label="Hire"
-          confirmLabel="Hire and add them to the roster"
-          variant="approve"
-          disabled={hire.isPending || form === null}
-          onArmedChange={onArmedChange}
-          onConfirm={() => {
-            if (form !== null)
-              hire.mutate({ proposalId: proposal.id, hire: form });
-          }}
-        />
-        <ConfirmButton
-          label="Decline"
-          confirmLabel="Decline — the team may ask again"
-          variant="ghost"
-          disabled={reject.isPending}
-          onArmedChange={onArmedChange}
-          onConfirm={() => reject.mutate(proposal.id)}
-        />
+          </>
+        )}
+        <div className="waiting-cluster">
+          <ConfirmButton
+            label="Hire"
+            confirmLabel="Hire and add them to the roster"
+            variant="approve"
+            disabled={hire.isPending || form === null}
+            onArmedChange={onArmedChange}
+            onConfirm={() => {
+              if (form !== null)
+                hire.mutate({ proposalId: proposal.id, hire: form });
+            }}
+          />
+          <ConfirmButton
+            label="Decline"
+            confirmLabel="Decline — the team may ask again"
+            variant="ghost"
+            disabled={reject.isPending}
+            onArmedChange={onArmedChange}
+            onConfirm={() => reject.mutate(proposal.id)}
+          />
+        </div>
+        {hire.isSuccess && hire.data !== undefined && (
+          <p className="waiting-outcome" role="status">
+            agent {hire.data.agent_id} is hired and on the roster
+          </p>
+        )}
+        {hire.isError && <DecisionRefusal error={hire.error} trustProse />}
+        {reject.isError && (
+          <DecisionRefusal error={reject.error} trustProse={false} />
+        )}
       </div>
-      {hire.isSuccess && hire.data !== undefined && (
-        <p className="waiting-outcome" role="status">
-          agent {hire.data.agent_id} is hired and on the roster
-        </p>
-      )}
-      {hire.isError && <DecisionRefusal error={hire.error} trustProse />}
-      {reject.isError && (
-        <DecisionRefusal error={reject.error} trustProse={false} />
+      {context && (
+        <div className="waiting-item-context">
+          <DepartmentContext proposal={proposal} />
+        </div>
       )}
     </Row>
   );

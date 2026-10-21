@@ -47,6 +47,7 @@ export function GitQueuePanel({
 
   return (
     <Queue
+      id={QUEUES.git.id}
       title={QUEUES.git.title}
       view={waiting}
       what="the git queue"
@@ -75,7 +76,7 @@ export function GitQueuePanel({
         <Rows label="Git requests waiting on you" className={dense(owed.length) ? "waiting-dense" : undefined}>
           {owed.map((row) => (
             <VcsRow key={row.id} row={row} count={owed.length} decision>
-              <div className="waiting-actions-split">
+              <div className="waiting-cluster">
                 <ConfirmButton
                   label="Approve"
                   confirmLabel="Approve the map change"
@@ -111,12 +112,12 @@ export function GitQueuePanel({
       {(behind > 0 || rows.length >= VCS_LIST_LIMIT) && (
         <>
           {toRead.length > 0 && (
-            <div className="waiting-recent">
+            <div className="waiting-recent waiting-git-group">
               <Section label="escalated or blocked" level={3}>
                 <Rows label="Git requests to put away">
                   {toRead.map((row) => (
                     <VcsRow key={row.id} row={row} count={toRead.length}>
-                      <div className="waiting-actions">
+                      <div className="waiting-cluster">
                         <ConfirmButton
                           label={`Put ${row.op} #${row.id} away`}
                           confirmLabel="Nobody needs to act"
@@ -134,7 +135,7 @@ export function GitQueuePanel({
             </div>
           )}
           {recent.length > 0 && (
-            <div className="waiting-recent">
+            <div className="waiting-recent waiting-git-group">
               <Section label="recently through the queue" level={3}>
                 <Rows label="Recent git requests">
                   {recent.map((row) => (
@@ -178,57 +179,59 @@ function VcsRow({
   // for the agent that asked ("not yours to fix from here") and the files say it better.
   const reason = conflicts.length === 0 ? row.failure_reason : null;
   return (
-    <Row className={decision === true ? "waiting-card" : undefined} dense={dense(count)}>
-      <div className="waiting-card-head">
-        <span
-          className="waiting-card-id"
-          tabIndex={decision === true ? -1 : undefined}
-          data-waiting-heading={decision === true ? "" : undefined}
-        >
-          {row.op} #{row.id}
-        </span>
-        <StateBadge
-          domain="vcs"
-          state={row.status === "escalated" && next !== null && !next.yours ? "resolving" : row.status}
-        />
-        <span className="waiting-meta">{row.project_id}</span>
-        <RelativeTime at={row.created_at} />
-      </div>
-      {/* Which branches, first: "merge #573" alone does not say what would be merged. */}
-      {row.source != null && row.target != null && (
-        <p className="waiting-git-branches">
-          <code>{row.source}</code> into <code>{row.target}</code>
-        </p>
-      )}
-      <p className="waiting-meta" title={row.repo_key}>
-        {repoLabel(row.repo_key)} — asked from {row.origin}
-      </p>
-      {conflicts.length > 0 && (
-        <div className="waiting-git-conflicts">
-          <span className="waiting-meta">conflicts in</span>
-          <ul aria-label={`Conflicts in ${row.op} #${row.id}`}>
-            {conflicts.map((file) => (
-              <li key={file}>
-                <code>{file}</code>
-              </li>
-            ))}
-          </ul>
+    <Row className={decision === true ? "waiting-card waiting-item" : "waiting-item"} dense={dense(count)}>
+      <div className="waiting-item-main">
+        <div className="waiting-card-head">
+          <span
+            className="waiting-card-id"
+            tabIndex={decision === true ? -1 : undefined}
+            data-waiting-heading={decision === true ? "" : undefined}
+          >
+            {row.op} #{row.id}
+          </span>
+          <StateBadge
+            domain="vcs"
+            state={row.status === "escalated" && next !== null && !next.yours ? "resolving" : row.status}
+          />
+          <span className="waiting-meta">{row.project_id}</span>
+          <RelativeTime at={row.created_at} />
         </div>
-      )}
-      {reason != null && reason !== "" && <Reasoning>{reason}</Reasoning>}
-      {/* And what to do about it is its own line, not a third clause on the faint mono one. */}
-      {next !== null && (
-        <p className={next.yours ? "waiting-hint waiting-hint-yours" : "waiting-hint"}>
-          {next.before}
-          {next.run !== undefined && (
-            <Link className="waiting-row-link" to="/runs/$runId" params={{ runId: String(next.run) }}>
-              run #{next.run}
-            </Link>
-          )}
-          {next.after}
+        {/* Which branches, first: "merge #573" alone does not say what would be merged. */}
+        {row.source != null && row.target != null && (
+          <p className="waiting-git-branches">
+            <code>{row.source}</code> into <code>{row.target}</code>
+          </p>
+        )}
+        <p className="waiting-meta" title={row.repo_key}>
+          {repoLabel(row.repo_key)} — asked from {row.origin}
         </p>
-      )}
-      {children}
+        {conflicts.length > 0 && (
+          <div className="waiting-git-conflicts">
+            <span className="waiting-meta">conflicts in</span>
+            <ul aria-label={`Conflicts in ${row.op} #${row.id}`}>
+              {conflicts.map((file) => (
+                <li key={file}>
+                  <code>{file}</code>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {reason != null && reason !== "" && <Reasoning>{reason}</Reasoning>}
+        {/* And what to do about it is its own line, not a third clause on the faint mono one. */}
+        {next !== null && (
+          <p className={next.yours ? "waiting-hint waiting-hint-yours" : "waiting-hint"}>
+            {next.before}
+            {next.run !== undefined && (
+              <Link className="waiting-row-link" to="/runs/$runId" params={{ runId: String(next.run) }}>
+                run #{next.run}
+              </Link>
+            )}
+            {next.after}
+          </p>
+        )}
+        {children}
+      </div>
     </Row>
   );
 }
