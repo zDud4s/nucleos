@@ -1,7 +1,7 @@
-import { useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Announcer } from "../fleet/Announcer";
 import { FleetStoreContext, useFailedReconnects, useFleetStore, useFleetStream, useLayoutVersion } from "../fleet/hooks";
-import { pathToRoot } from "../fleet/layout";
+import { layoutForest, pathToRoot } from "../fleet/layout";
 import { UNREACHABLE_AFTER } from "../fleet/limits";
 import { FleetStore } from "../fleet/store";
 import { FleetCanvas } from "../fleet/Surface";
@@ -61,10 +61,21 @@ function FleetScreen() {
     [store, selected, version],
   );
 
-  const nothing = useMemo(() => {
+  // A selection or a panel whose node the store has dropped (retention) is closed, not left dangling.
+  useEffect(() => {
+    if (!received) return;
+    if (selected !== null && store.getEntry(selected) === undefined) setSelected(null);
+    if (panel !== null && store.getEntry(panel) === undefined) setPanel(null);
+  }, [store, received, version, selected, panel]);
+
+  // Empty means "the canvas would draw nothing", by the same filters the layout applies.
+  const { nothing, filtered } = useMemo(() => {
     const nodes = store.nodes();
-    return nodes.length === 0 || (onlyActive && !nodes.some((n) => n.state === "busy" || n.state === "idle"));
-  }, [store, version, onlyActive]);
+    if (nodes.length === 0) return { nothing: true, filtered: false };
+    if (project === null && !onlyActive) return { nothing: false, filtered: false };
+    const drawn = layoutForest(nodes, { size: "terminal", onlyActive, project, expanded: NONE });
+    return { nothing: drawn.nodes.length === 0, filtered: project !== null };
+  }, [store, version, onlyActive, project]);
 
   return (
     <FleetUiContext.Provider value={ui}>
@@ -87,7 +98,7 @@ function FleetScreen() {
             )}
           </>
         ) : nothing ? (
-          <p className="fleet-empty">Nothing is running</p>
+          <p className="fleet-empty">{filtered ? "Nothing matches this project" : "Nothing is running"}</p>
         ) : (
           <FleetCanvas project={project} onlyActive={onlyActive} expanded={expanded} follow={follow} fitSignal={fitSignal} />
         )}

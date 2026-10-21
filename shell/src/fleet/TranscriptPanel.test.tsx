@@ -13,6 +13,7 @@ import { FleetStoreContext } from "./hooks";
 import { FleetStore } from "./store";
 import { line, node, snapshot } from "./test-fixtures";
 import { TranscriptPanel } from "./TranscriptPanel";
+import { MAX_ROWS } from "./transcript";
 import type { TranscriptPage } from "./types";
 
 const ID = "cc:a";
@@ -45,6 +46,31 @@ afterEach(() => {
 });
 
 describe("TranscriptPanel", () => {
+  it("leaves an Escape aimed at another control or dialog alone, and closes on one from inside", async () => {
+    daemon.apiFetch.mockResolvedValue(page(["hello"], null));
+    const { onClose } = mount();
+    await screen.findByText("hello");
+    const select = document.body.appendChild(document.createElement("select"));
+    fireEvent.keyDown(select, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByText("hello"), { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    select.remove();
+  });
+
+  it("keeps only the newest rows of the live tail", async () => {
+    daemon.apiFetch.mockResolvedValue(page(["first"], null));
+    const { store } = mount();
+    await screen.findByText("first");
+    const batch = Array.from({ length: MAX_ROWS }, (_, i) => line("text", `live ${i}`));
+    act(() => store.apply({ t: "lines", node_id: ID, lines: batch }));
+    act(() => store.apply({ t: "lines", node_id: ID, lines: [line("text", "newest")] }));
+    expect(await screen.findByText("newest")).toBeDefined();
+    expect(screen.queryByText("first")).toBeNull();
+    expect(screen.queryByText("live 0")).toBeNull();
+    expect(screen.getByText("live 1")).toBeDefined();
+  });
+
   it("reads the latest page and shows it oldest first", async () => {
     daemon.apiFetch.mockResolvedValue(page(["first", "Read x", "last"], null));
     mount();

@@ -6,6 +6,7 @@ import { useTranscript } from "./transcript";
 import type { TranscriptEntry } from "./types";
 
 const NEAR_BOTTOM = 40;
+const OTHER_ESCAPE = "select, input, textarea, [role='dialog'], [role='alertdialog'], [role='listbox'], [role='menu'], [aria-modal='true']";
 
 /**
  * The full transcript of one node, ~480 px on the right: "Load earlier" on top, new lines
@@ -18,6 +19,7 @@ export function TranscriptPanel({ id, onClose }: { id: string; onClose(): void }
   const t = useTranscript(id);
   const closeButton = useRef<HTMLButtonElement>(null);
   const body = useRef<HTMLDivElement>(null);
+  const panel = useRef<HTMLElement>(null);
   const stick = useRef(true);
   const anchor = useRef<number | null>(null);
   const seenPrepends = useRef(0);
@@ -32,7 +34,12 @@ export function TranscriptPanel({ id, onClose }: { id: string; onClose(): void }
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented) onClose();
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      // An Escape meant for a control or dialog elsewhere on the page (the Project select, a modal)
+      // is not ours; one from inside the panel, or from nowhere in particular, closes it.
+      const target = event.target;
+      if (target instanceof Element && !panel.current?.contains(target) && target.closest(OTHER_ESCAPE) !== null) return;
+      onClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -55,7 +62,7 @@ export function TranscriptPanel({ id, onClose }: { id: string; onClose(): void }
   const label = entry?.node.label ?? id;
 
   return (
-    <aside className="fleet-panel" aria-label={`Transcript of ${label}`}>
+    <aside ref={panel} className="fleet-panel" aria-label={`Transcript of ${label}`}>
       <header className="fleet-panel-head">
         <div className="fleet-panel-title">
           <span className="fleet-label" title={label}>

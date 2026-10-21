@@ -113,6 +113,21 @@ describe("FleetNode", () => {
     await waitFor(() => expect(daemon.apiText).toHaveBeenCalledWith("/runs/7/cancel", { method: "POST" }));
   });
 
+  it("cannot arm a second stop while the first is in flight", async () => {
+    let finish!: () => void;
+    daemon.apiText.mockReturnValue(new Promise<string>((resolve) => void (finish = () => resolve(""))));
+    const store = new FleetStore();
+    store.apply(snapshot([node("cc:root", { label: "job", capabilities: ALL, run_id: 7 })]));
+    await show(store, "cc:root");
+    fireEvent.click(screen.getByRole("button", { name: "Stop job" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Stop job" }) as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: "Stop job" }));
+    expect(screen.queryByText("Stop this run?")).toBeNull();
+    await act(async () => finish());
+    await waitFor(() => expect((screen.getByRole("button", { name: "Stop job" }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
   it("Escape disarms the stop confirmation", async () => {
     const store = new FleetStore();
     store.apply(snapshot([node("cc:root", { label: "job", capabilities: ALL, run_id: 7 })]));

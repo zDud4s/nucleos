@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { NdjsonSplitter, parseEvent } from "./ndjson";
+import { node } from "./test-fixtures";
 
 const enc = new TextEncoder();
 
@@ -35,5 +36,24 @@ describe("parseEvent", () => {
     expect(parseEvent("not json")).toBeNull();
     expect(parseEvent('{"t":"from_the_future"}')).toBeNull();
     expect(parseEvent("42")).toBeNull();
+  });
+  it("drops a node without capabilities and any event that lacks what the store reads", () => {
+    const { capabilities: _gone, ...bare } = node("a:1");
+    expect(parseEvent(JSON.stringify({ t: "node", node: bare }))).toBeNull();
+    expect(parseEvent('{"t":"node"}')).toBeNull();
+    expect(parseEvent('{"t":"snapshot"}')).toBeNull();
+    expect(parseEvent('{"t":"metrics"}')).toBeNull();
+    expect(parseEvent('{"t":"lines","node_id":"a"}')).toBeNull();
+    expect(parseEvent('{"t":"removed"}')).toBeNull();
+  });
+  it("normalises a snapshot from a skewed daemon: missing metrics/lines, a bad node, a bad line", () => {
+    const { capabilities: _gone, ...bare } = node("bad");
+    const raw = { t: "snapshot", nodes: [node("a:1"), bare, 7], lines: { "a:1": [{ kind: "text", text: "ok" }, { kind: "text" }], x: "nope" } };
+    expect(parseEvent(JSON.stringify(raw))).toEqual({
+      t: "snapshot",
+      nodes: [node("a:1")],
+      metrics: [],
+      lines: { "a:1": [{ kind: "text", text: "ok" }] },
+    });
   });
 });
