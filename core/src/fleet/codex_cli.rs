@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -755,7 +755,14 @@ impl AgentSource for CodexCli {
         if key.harness != HARNESS {
             return None;
         }
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // A timed-out scan keeps running in its blocking thread and holds this lock across file
+        // IO; waiting for it here would park an async worker. While a scan holds it the node is
+        // reported unknown, and the caller skips it until the next round.
+        let state = match self.state.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
         state.keys.get(key).map(|path| NodeRef {
             key: key.clone(),
             path: Some(path.clone()),

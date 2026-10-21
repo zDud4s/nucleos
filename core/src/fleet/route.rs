@@ -17,7 +17,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio_util::io::ReaderStream;
 
 use super::book::PinError;
-use super::hub::{Subscription, TranscriptError};
+use super::hub::{Line, Subscription, TranscriptError};
+use super::limits::HEARTBEAT;
 use crate::state::AppState;
 
 /// The pipe between the pump and the HTTP body. Small on purpose: a client that cannot keep up
@@ -51,8 +52,31 @@ async fn get_live(State(state): State<AppState>) -> Response {
 
 /// Copies the subscription into the pipe until either side ends. Dropping `subscription` leaves
 /// the hub (the last one out stops it); dropping `out` ends the body.
-async fn pump(mut subscription: Subscription, mut out: tokio::io::DuplexStream) {
-    while let Some(line) = subscription.next().await {
+async fn pump(subscription: Subscription, out: tokio::io::DuplexStream) {
+    pump_idle(subscription, out, HEARTBEAT).await;
+}
+
+/// The wire form of a heartbeat, identical to what the hub publishes.
+const HEARTBEAT_LINE: &str = "{\"t\":\"heartbeat\"}\n";
+
+/// `pump` with a liveness floor: when nothing was written for `idle`, the pump writes a
+/// heartbeat itself. The hub task runs discover and read passes (each bounded by a 10 s source
+/// timeout) in the same loop that publishes its own heartbeat, so a slow adapter could leave the
+/// stream silent past the shell's 30 s dead-link limit; this timer does not depend on the hub.
+/// The timer restarts after every write, so a healthy hub's heartbeat keeps this one quiet.
+async fn pump_idle(
+    mut subscription: Subscription,
+    mut out: tokio::io::DuplexStream,
+    idle: std::time::Duration,
+) {
+    loop {
+        let line: Line = tokio::select! {
+            next = subscription.next() => match next {
+                Some(line) => line,
+                None => break,
+            },
+            () = tokio::time::sleep(idle) => HEARTBEAT_LINE.into(),
+        };
         if out.write_all(line.as_bytes()).await.is_err() {
             break;
         }
@@ -209,6 +233,32 @@ mod tests {
             lines.next_line().await.unwrap().unwrap(),
             r#"{"t":"heartbeat"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn the_pump_heartbeats_on_its_own_when_the_hub_is_silent() {
+        let f = fixture().await;
+        tokio::time::pause();
+        let subscription = f.hub.subscribe().await;
+        let (reader, writer) = tokio::io::duplex(PIPE_BYTES);
+        // One second idle is far below the hub's own 15 s heartbeat, so a heartbeat here is the
+        // pump's.
+        tokio::spawn(pump_idle(
+            subscription,
+            writer,
+            std::time::Duration::from_secs(1),
+        ));
+        let mut lines = BufReader::new(reader).lines();
+
+        let first: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["t"], "snapshot");
+        for _ in 0..2 {
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                r#"{"t":"heartbeat"}"#
+            );
+        }
     }
 
     #[tokio::test]
