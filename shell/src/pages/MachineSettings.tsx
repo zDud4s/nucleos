@@ -9,11 +9,12 @@ import {
   type MachineSecret,
   type MachineSetting,
 } from "../data/machine-config";
-import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, StateBadge } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, Skeleton, StateBadge } from "../ui";
 import { DistillerModel } from "./DistillerModel";
 import { CaptureWait } from "./CaptureWait";
 import { EmbeddingModel } from "./EmbeddingModel";
 import { DAEMON_NAME } from "../copy";
+import { plural } from "../lib/plural";
 
 /**
  * This machine's settings — the files whose author is the daemon rather than
@@ -65,19 +66,23 @@ export function MachineSettings() {
     });
   }, []);
 
-  if (config.isPending) return <p className="sy-loading">reading this machine's settings…</p>;
+  if (config.isPending) return <Skeleton label="Reading this machine's settings" lines={6} />;
   if (config.error) {
     if (isApiRefusal(config.error)) return <RefusalNote refusal={config.error} />;
-    return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about this machine's settings</ErrorNote>;
+    return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about this machine's settings</ErrorNote>;
   }
 
   const area = chosen ?? config.data.settings[0]?.area ?? null;
 
   return (
     <>
-      <DistillerModel />
-      <CaptureWait />
-      <EmbeddingModel />
+      <Panel title="Brain">
+        <div className="sy-machine-prefs">
+          <DistillerModel />
+          <CaptureWait />
+          <EmbeddingModel />
+        </div>
+      </Panel>
 
       {/* The folder, as one line above the files rather than a panel of its own. */}
       <p className="sy-machine-intro">
@@ -95,6 +100,7 @@ export function MachineSettings() {
         at another one.
       */}
       <div className="sy-settings">
+        <div className="sy-settings-nav">
         <ul className="sy-settings-list" aria-label="Settings files">
           {config.data.settings.map((setting) => {
             const own = (secrets.data?.secrets ?? []).filter((row) => row.area === setting.area);
@@ -138,6 +144,16 @@ export function MachineSettings() {
             );
           })}
         </ul>
+        {/* The marks are aria-hidden words-in-waiting; the legend says them to the eye. */}
+        <p className="sy-meta sy-settings-legend" aria-hidden="true">
+          <span className="sy-settings-legend-item">
+            <span className="sy-mark sy-mark-on" /> file written
+          </span>
+          <span className="sy-settings-legend-item">
+            <span className="sy-mark sy-mark-key sy-mark-on" /> credential set
+          </span>
+        </p>
+        </div>
 
         <div className="sy-settings-detail">
           {config.data.settings.map((setting) => (
@@ -160,7 +176,7 @@ function markSummary(setting: MachineSetting, own: MachineSecret[], unsaved: boo
   const missing = own.filter((secret) => secret.present !== true).length;
   const parts = [setting.exists ? "file written" : "file never written"];
   if (own.length > 0) {
-    parts.push(missing === 0 ? "credentials set" : `${missing} credential${missing === 1 ? "" : "s"} not set`);
+    parts.push(missing === 0 ? "credentials set" : `${plural(missing, "credential")} not set`);
   }
   if (unsaved) parts.push("unsaved changes");
   return parts.join(", ");
@@ -243,7 +259,7 @@ function SettingPanel({
         placeholder={
           setting.exists
             ? undefined
-            : "this file does not exist yet — writing anything here creates it"
+            : "this file does not exist yet: writing anything here creates it"
         }
         onChange={(event) => {
           setDraft(event.target.value);
@@ -256,7 +272,7 @@ function SettingPanel({
           disabled={!dirty || write.isPending}
           onClick={save}
         >
-          {write.isPending ? "saving…" : "Save"}
+          {write.isPending ? "Saving…" : "Save"}
         </Button>
         {dirty && !write.isPending && (
           <Button
@@ -269,9 +285,9 @@ function SettingPanel({
             Revert
           </Button>
         )}
-        {dirty && !write.isPending && <span className="sy-meta">unsaved</span>}
+        {dirty && !write.isPending && <span className="sy-meta">unsaved changes</span>}
         <span className="sy-meta" role="status">
-          {saved && !dirty ? <>saved &mdash; {setting.takes_effect}</> : null}
+          {saved && !dirty ? <>saved and takes effect {setting.takes_effect}</> : null}
         </span>
       </div>
 
@@ -290,7 +306,7 @@ function SettingPanel({
           {isApiRefusal(write.error) ? (
             <RefusalNote refusal={write.error} />
           ) : (
-            <ErrorNote>the {DAEMON_NAME} is not responding — nothing was written</ErrorNote>
+            <ErrorNote>the {DAEMON_NAME} is not responding: nothing was written</ErrorNote>
           )}
         </div>
       )}
@@ -363,7 +379,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
             );
           }}
         >
-          {store.isPending ? "storing…" : "Set"}
+          {store.isPending ? "Storing…" : "Set"}
         </Button>
         {secret.present === true && (
           <ConfirmButton
@@ -389,7 +405,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
         (isApiRefusal(store.error) ? (
           <RefusalNote refusal={store.error} />
         ) : (
-          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was stored</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding: nothing was stored</ErrorNote>
         ))}
       {/* The destructive half fails as loudly as the other: a Forget that silently did
           nothing leaves the credential set while the button goes back to normal. */}
@@ -397,7 +413,7 @@ function SecretControl({ secret }: { secret: MachineSecret }) {
         (isApiRefusal(forget.error) ? (
           <RefusalNote refusal={forget.error} />
         ) : (
-          <ErrorNote>the {DAEMON_NAME} is not responding — nothing was forgotten</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding: nothing was forgotten</ErrorNote>
         ))}
     </div>
   );

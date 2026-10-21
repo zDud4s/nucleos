@@ -71,7 +71,7 @@ describe("ChannelsView", () => {
   it("shows a status while reading", async () => {
     daemon.apiFetch.mockReturnValue(new Promise(() => {}));
     await renderWithRouter(<ChannelsView />);
-    expect(screen.getByRole("status").textContent).toContain("reading the channels…");
+    expect(screen.getByRole("status").textContent).toContain("Reading the channels");
   });
 
   it("says so when no adapter is built in", async () => {
@@ -83,7 +83,7 @@ describe("ChannelsView", () => {
   it("explains a refusal", async () => {
     daemon.apiFetch.mockRejectedValue(new ApiRefusal(423, "kill_switch", "kill_switch"));
     await renderWithRouter(<ChannelsView />);
-    await waitFor(() => expect(screen.queryByText("reading the channels…")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("Reading the channels")).toBeNull());
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(document.body.textContent).toMatch(/kill/i);
   });

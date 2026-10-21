@@ -1,12 +1,68 @@
-.identities-sender { margin-bottom: var(--space-3, 0.75rem); }
-.identities-sender-head { display: flex; gap: 0.5rem; align-items: baseline; }
-.identities-sender-name { font-weight: 600; }
-.identities-sender-ref { color: var(--text-muted, inherit); font-variant-numeric: tabular-nums; }
-.identities-conversations { list-style: none; margin: 0.25rem 0 0; padding: 0; }
-.identities-conversation { display: flex; gap: 0.5rem; align-items: center; padding: 0.15rem 0; }
-.identities-conversation-ref { font-variant-numeric: tabular-nums; }
-.identities-projects { list-style: none; margin: 0.25rem 0; padding: 0; }
-.identities-project { display: flex; gap: 0.5rem; }
-.identities-empty { color: var(--text-muted, inherit); }
-.identities-warning { margin: 0 0 0.5rem; }
-.identities-outcome { margin: 0 0 0.5rem; }
+/* Paired identities inside a channel card. Tokens only. */
+.identities-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: 100%;
+  min-width: 0;
+}
+.identities-sender {
+  margin-bottom: var(--space-3);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+.identities-sender:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+.identities-sender-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+.identities-sender-name { font-weight: var(--weight-semibold); overflow-wrap: anywhere; }
+.identities-sender-ref {
+  color: var(--text-faint);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+.identities-conversations {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+}
+.identities-conversation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+  font-size: var(--text-sm);
+}
+.identities-conversation-kind { color: var(--text-muted); }
+.identities-conversation-ref {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+/* Row actions sit at the right edge and wrap as a pair, never one word per line. */
+.identities-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-left: auto;
+  white-space: nowrap;
+}
+.identities-projects {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  list-style: none;
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  font-size: var(--text-sm);
+}
+.identities-project { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: baseline; }
+.identities-warnings { display: flex; flex-direction: column; gap: var(--space-2); margin: 0 0 var(--space-2); }
+.identities-outcome { margin: 0 0 var(--space-2); }

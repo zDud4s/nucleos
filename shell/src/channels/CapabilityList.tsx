@@ -1,4 +1,5 @@
 import type { ChannelCapabilities } from "../data/channels";
+import { Quiet } from "../ui";
 
 type MediaKind = "image" | "file" | "audio";
 const MEDIA_OUT: MediaKind[] = ["image", "file", "audio"];
@@ -36,15 +37,16 @@ function missingOf(c: ChannelCapabilities): Missing[] {
 export function CapabilityList({ capabilities }: { capabilities: ChannelCapabilities | null }) {
   if (capabilities === null) {
     return (
-      <p>
-        Capabilities are not known yet: the adapter has not said hello since the daemon started.
-      </p>
+      <Quiet
+        compact
+        says="Capabilities are not known yet: the adapter has not said hello since the daemon started."
+      />
     );
   }
   const missing = missingOf(capabilities);
-  if (missing.length === 0) return <p>All capabilities present.</p>;
+  if (missing.length === 0) return <Quiet compact says="All capabilities present." />;
   return (
-    <ul>
+    <ul className="ch-caps">
       {missing.map((m) => (
         <li key={m.key}>
           <strong>{m.label}</strong>: {m.text}
