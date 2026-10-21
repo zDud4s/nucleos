@@ -210,8 +210,9 @@ pub(super) async fn create_job(
                 // route's: the catalogue can change between a request being written and it landing,
                 // and the answer has to be read where the row is made.
                 team_id: request.team_id.as_deref(),
-                // Not exposed on `POST /jobs` (D13): the default workflow, `autopilot`.
-                workflow: None,
+                // D13: `None` is `autopilot`. Only a workflow the project pins resolves; any other
+                // name is `NoGraph`, so the caller picks among the owner's pins and nothing else.
+                workflow: request.workflow.as_deref(),
             },
         )
         .await

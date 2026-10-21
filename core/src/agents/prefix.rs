@@ -199,8 +199,10 @@ pub fn sync_codex_prefixes(agents_home: &Path, project_root: &Path, out_dir: &Pa
     match std::fs::read_dir(agents_home) {
         Ok(entries) => {
             for entry in entries.flatten() {
+                // `install.rs` stages under `<home>/.staging`; a dot directory is never a package.
                 if entry.path().is_dir()
                     && let Ok(name) = entry.file_name().into_string()
+                    && !name.starts_with('.')
                 {
                     names.insert(name);
                 }
@@ -670,6 +672,18 @@ mod tests {
             read_json(&out.join("beta.json"))["sandbox"],
             "workspace-write"
         );
+    }
+
+    #[test]
+    fn the_installers_staging_directory_is_not_a_package() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let out = project.path().join("out");
+        write_package(home.path(), "alpha", "1.0.0", "fs.read", "", "A");
+        std::fs::create_dir_all(home.path().join(".staging/alpha/1.0.0")).unwrap();
+        let report = sync_codex_prefixes(home.path(), project.path(), &out);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.written, vec!["alpha"]);
     }
 
     #[test]

@@ -373,6 +373,8 @@ fn load_highest(agents_home: &Path) -> Result<Loaded, String> {
         .filter_map(Result::ok)
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().into_string().ok())
+        // `install.rs` stages under `<home>/.staging`; a dot directory is never a package.
+        .filter(|name| !name.starts_with('.'))
         .collect();
     names.sort();
     let mut loaded = Loaded {
@@ -527,6 +529,18 @@ mod tests {
         std::fs::remove_dir_all(home.join("reviewer")).unwrap();
         let report = sync_installed_into(&home, &d.target, &data).unwrap();
         assert_eq!(report.entries[0].outcome, Outcome::Removed);
+    }
+
+    #[test]
+    fn the_installers_staging_directory_is_not_a_package() {
+        let d = dirs();
+        let home = d._tmp.path().join("agents-home");
+        write_loadable(&home);
+        // `install.rs` stages under `<home>/.staging/<name>/<version>` and leaves the directory.
+        std::fs::create_dir_all(home.join(".staging/reviewer/1.0.0")).unwrap();
+        let loaded = load_highest(&home).unwrap();
+        assert!(loaded.broken.is_empty(), "{:?}", loaded.broken);
+        assert_eq!(loaded.packages.len(), 1);
     }
 
     #[test]

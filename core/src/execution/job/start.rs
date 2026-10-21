@@ -28,6 +28,11 @@ pub struct CreateJobRequest {
     /// `room_for` and again by every item that asks for a checkout.
     #[serde(default)]
     pub team_id: Option<String>,
+    /// The workflow to run, by pin name. `None` is `autopilot`. A name selects one of the
+    /// project's own pins in `workflows.yaml` and never a path: a name the project does not pin is
+    /// [`JobStart::NoGraph`], not a fallback to the embedded autopilot.
+    #[serde(default)]
+    pub workflow: Option<String>,
 }
 
 /// Why a job cannot be started for a project.

@@ -19579,6 +19579,37 @@ mod tests {
         assert_eq!(job_count(&pool).await, 0, "nothing was created to retire");
     }
 
+    /// A caller may name the workflow, but only one the project pins: the name selects a pin and
+    /// never a path, so an unpinned name is the `NoGraph` refusal and not the embedded autopilot.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_asking_for_a_workflow_the_project_does_not_pin_is_refused_and_leaves_no_row() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = seeded_repo("nucleos-http-job-nowf422-");
+        let root = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(root.path());
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        project_in(&pool, "p", "active", &repo.to_string_lossy()).await;
+
+        let response = build_router(state)
+            .oneshot(create_job_request_with(serde_json::json!({
+                "project_id": "p",
+                "prompt": "build the thing",
+                "workflow": "a-workflow-nobody-pinned",
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let said = String::from_utf8_lossy(&body);
+        assert!(said.contains("a-workflow-nobody-pinned"), "{said}");
+        assert_eq!(job_count(&pool).await, 0, "nothing was created to retire");
+    }
+
     /// The two numbers a caller may choose, and the one it may not.
     ///
     /// `max_rounds` and `budget_usd` are how long and how much, which are the caller's to say —
