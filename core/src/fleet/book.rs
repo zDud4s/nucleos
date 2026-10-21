@@ -2,21 +2,21 @@
 //! see, rings of recent lines, metrics, pins, and the retention rules. Every method takes `now`
 //! and returns the events it caused; nothing here waits, reads a file or touches a clock.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use super::event::FleetEvent;
 use super::fuse::{FusedNode, is_live};
-use super::limits::{RETENTION, SNAPSHOT_TREES, TREE_NODES};
-use super::model::{FleetNode, NodeId, NodeKey, NodeMetrics, NodeState, TermLine, Timestamp};
+use super::limits::{RETENTION, RING_LINES, SNAPSHOT_TREES, TREE_NODES};
+use super::model::{
+    FleetNode, NodeId, NodeKey, NodeMetrics, NodeState, TermKind, TermLine, Timestamp,
+};
 use super::source::{Offset, Usage};
 
 /// Rounds a live node may go unsighted before it is declared lost. Two, so a single failed or
 /// racing `discover()` does not flicker a healthy node to `Lost`.
 const MISS_LIMIT: u8 = 2;
 
-// Task 10 reads `path`, `offset`, `needs_read`, `error_checked` and `error_marked`.
-#[allow(dead_code)]
 struct Entry {
     fused: FusedNode,
     /// The node's file, as its adapter reported it; the watcher matches events against it.
@@ -26,9 +26,9 @@ struct Entry {
     last_line: Option<TermLine>,
     misses: u8,
     needs_read: bool,
-    /// Task 10: the hub already asked the daemon source for this finished node's run status.
+    /// The hub already asked the daemon source for this finished node's run status.
     error_checked: bool,
-    /// Task 10: `last_line` is the `Error` line appended from the run status; a later native read
+    /// `last_line` is the `Error` line appended from the run status; a later native read
     /// must not replace it.
     error_marked: bool,
 }
@@ -89,6 +89,184 @@ impl Book {
 
     pub fn lookup(&self, id: &str) -> Option<&FusedNode> {
         self.known.get(id).map(|entry| &entry.fused)
+    }
+}
+
+impl Book {
+    pub fn set_path(&mut self, id: &str, path: Option<PathBuf>) {
+        if let Some(entry) = self.known.get_mut(id) {
+            entry.path = path;
+        }
+    }
+
+    /// Which known nodes the watcher's paths belong to, and whether any path belonged to none
+    /// (a new file, or an empty path meaning the watcher lost events): then discovery must run.
+    pub fn match_paths(&self, paths: &HashSet<PathBuf>) -> (BTreeSet<NodeId>, bool) {
+        let mut ids = BTreeSet::new();
+        let mut unknown = false;
+        for path in paths {
+            let matched: Vec<&NodeId> = self
+                .known
+                .iter()
+                .filter(|(_, e)| e.path.as_deref() == Some(path.as_path()))
+                .map(|(id, _)| id)
+                .collect();
+            if path.as_os_str().is_empty() || matched.is_empty() {
+                unknown = true;
+            }
+            ids.extend(matched.into_iter().cloned());
+        }
+        (ids, unknown)
+    }
+
+    /// The reads to perform now. Only nodes in the view are read: what no client can see is not
+    /// worth a file read. Anything that never had a first read, or just stopped being alive, is
+    /// always included.
+    pub fn read_jobs(&mut self, which: ReadWhich<'_>) -> Vec<ReadJob> {
+        let mut jobs = Vec::new();
+        for (id, entry) in self.known.iter_mut() {
+            if !self.view.contains_key(id) {
+                continue;
+            }
+            let Some(source) = entry.fused.lines_source else {
+                entry.needs_read = false;
+                continue;
+            };
+            let live = is_live(entry.fused.node.state);
+            let asked = match &which {
+                ReadWhich::Pending => false,
+                ReadWhich::AllLive => live,
+                ReadWhich::LiveOf(sources) => live && sources.contains(&source),
+                ReadWhich::Ids(ids) => ids.contains(id),
+            };
+            if entry.needs_read || asked {
+                entry.needs_read = false;
+                jobs.push(ReadJob {
+                    id: id.clone(),
+                    key: entry.fused.key.clone(),
+                    source,
+                    offset: entry.offset,
+                });
+            }
+        }
+        jobs
+    }
+
+    pub fn apply_lines(&mut self, id: &str, read: ReadOutcome, now: Timestamp) {
+        let shown: Vec<TermLine> = {
+            let Some(entry) = self.known.get_mut(id) else {
+                return;
+            };
+            entry.offset = read.offset;
+            entry.ring.extend(read.lines.iter().cloned());
+            while entry.ring.len() > RING_LINES {
+                entry.ring.pop_front();
+            }
+            // The run status line stays the last line of a finished node.
+            if let (Some(last), false) = (read.lines.last(), entry.error_marked) {
+                entry.last_line = Some(last.clone());
+            }
+            if is_live(entry.fused.node.state) {
+                let skip = read.lines.len().saturating_sub(RING_LINES);
+                read.lines[skip..].to_vec()
+            } else if entry.error_marked {
+                Vec::new()
+            } else {
+                read.lines.last().cloned().into_iter().collect()
+            }
+        };
+        if self.view.contains_key(id) && !shown.is_empty() {
+            let pending = self.pending_lines.entry(id.to_owned()).or_default();
+            pending.extend(shown);
+            let excess = pending.len().saturating_sub(RING_LINES);
+            pending.drain(..excess);
+        }
+        if !read.lines.is_empty() || read.last_activity_at.is_some() || read.usage.is_some() {
+            self.note_metrics(id, read.last_activity_at.unwrap_or(now), read.usage.as_ref());
+        }
+    }
+
+    /// The status reads to perform once the native reads of a pass are applied (contract
+    /// amendment 1): finished nodes in the view that a daemon run launched but whose lines come
+    /// from a native adapter. The adapter cannot know how the run ended, so the hub asks the
+    /// daemon source (`ReadJob.source` is its registry index) for its last line, from the start,
+    /// and hands the answer to `apply_error`. Each death is asked once; a node whose closing
+    /// native read is still pending waits, so the status line stays last.
+    pub fn error_jobs(&mut self) -> Vec<ReadJob> {
+        let mut jobs = Vec::new();
+        for (id, entry) in self.known.iter_mut() {
+            let (Some(daemon), Some(lines)) = (entry.fused.daemon_source, entry.fused.lines_source)
+            else {
+                continue;
+            };
+            if lines == daemon
+                || is_live(entry.fused.node.state)
+                || entry.needs_read
+                || entry.error_checked
+                || !self.view.contains_key(id)
+            {
+                continue;
+            }
+            entry.error_checked = true;
+            jobs.push(ReadJob {
+                id: id.clone(),
+                key: entry.fused.key.clone(),
+                source: daemon,
+                offset: Offset::TAIL,
+            });
+        }
+        jobs
+    }
+
+    /// Appends the `Error` lines of a daemon-source answer (and nothing else) to a finished
+    /// node: to its ring and as its last line, and queues them for the next `lines` event.
+    pub fn apply_error(&mut self, id: &str, answer: Vec<TermLine>) {
+        let errors: Vec<TermLine> = answer
+            .into_iter()
+            .filter(|line| line.kind == TermKind::Error)
+            .collect();
+        let Some(entry) = self.known.get_mut(id) else {
+            return;
+        };
+        if errors.is_empty() || is_live(entry.fused.node.state) {
+            return;
+        }
+        entry.ring.extend(errors.iter().cloned());
+        while entry.ring.len() > RING_LINES {
+            entry.ring.pop_front();
+        }
+        entry.last_line = errors.last().cloned();
+        entry.error_marked = true;
+        if self.view.contains_key(id) {
+            self.pending_lines
+                .entry(id.to_owned())
+                .or_default()
+                .extend(errors);
+        }
+    }
+
+    /// The `lines` events queued since the last call, one per node.
+    pub fn flush_lines(&mut self) -> Vec<FleetEvent> {
+        std::mem::take(&mut self.pending_lines)
+            .into_iter()
+            .filter(|(id, lines)| self.view.contains_key(id) && !lines.is_empty())
+            .map(|(node_id, lines)| FleetEvent::Lines { node_id, lines })
+            .collect()
+    }
+
+    /// One `metrics` event with every change since the last call (none if nothing moved).
+    pub fn flush_metrics(&mut self) -> Vec<FleetEvent> {
+        let ids = std::mem::take(&mut self.pending_metrics);
+        let metrics: Vec<NodeMetrics> = ids
+            .iter()
+            .filter(|id| self.view.contains_key(*id))
+            .filter_map(|id| self.metrics.get(id).cloned())
+            .collect();
+        if metrics.is_empty() {
+            Vec::new()
+        } else {
+            vec![FleetEvent::Metrics { metrics }]
+        }
     }
 }
 
@@ -780,5 +958,337 @@ mod tests {
         let FleetEvent::Snapshot { nodes, .. } = &events[0] else { panic!("{events:?}") };
         assert_eq!(nodes.len(), 500);
         assert!(!nodes.iter().any(|n| n.id == "claude-code:d000"));
+    }
+
+    fn outcome(lines: &[&str], offset: u64) -> ReadOutcome {
+        ReadOutcome {
+            lines: lines
+                .iter()
+                .map(|t| TermLine::new(crate::fleet::model::TermKind::Text, t))
+                .collect(),
+            offset: Offset(offset),
+            usage: None,
+            last_activity_at: None,
+        }
+    }
+
+    fn lines_of(events: &[FleetEvent]) -> Vec<(&str, Vec<&str>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                FleetEvent::Lines { node_id, lines } => Some((
+                    node_id.as_str(),
+                    lines.iter().map(|l| l.text.as_str()).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn live_book() -> Book {
+        let mut book = Book::new(BTreeSet::new());
+        book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(1));
+        book.flush_lines();
+        book.flush_metrics();
+        book
+    }
+
+    #[test]
+    fn new_lines_emit_lines_and_metrics_and_never_a_node() {
+        let mut book = live_book();
+        book.apply_lines("claude-code:root", outcome(&["a", "b"], 10), at(5));
+
+        assert!(book.apply_fusion(vec![root_node(R, NodeState::Busy)], at(6)).is_empty(), "no node event");
+        let lines = book.flush_lines();
+        assert_eq!(lines_of(&lines), [("claude-code:root", vec!["a", "b"])]);
+        let metrics = book.flush_metrics();
+        assert!(matches!(&metrics[..], [FleetEvent::Metrics { metrics }] if metrics[0].last_activity_at == at(5)));
+        assert!(book.flush_lines().is_empty() && book.flush_metrics().is_empty(), "drained");
+    }
+
+    #[test]
+    fn several_reads_inside_a_batch_become_one_ordered_lines_event() {
+        let mut book = live_book();
+        book.apply_lines("claude-code:root", outcome(&["a"], 2), at(5));
+        book.apply_lines("claude-code:root", outcome(&["b", "c"], 6), at(5));
+        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:root", vec!["a", "b", "c"])]);
+    }
+
+    #[test]
+    fn a_big_first_read_emits_only_the_last_twelve_and_the_ring_keeps_twelve() {
+        let mut book = live_book();
+        let many: Vec<String> = (0..300).map(|i| format!("l{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        book.apply_lines("claude-code:root", outcome(&refs, 99), at(5));
+
+        let emitted = lines_of(&book.flush_lines());
+        assert_eq!(emitted[0].1.len(), RING_LINES);
+        assert_eq!(emitted[0].1.last(), Some(&"l299"));
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        assert_eq!(lines["claude-code:root"].len(), RING_LINES);
+        assert_eq!(lines["claude-code:root"][0].text, "l288");
+    }
+
+    #[test]
+    fn a_finished_node_carries_only_its_last_line_in_snapshots_and_events() {
+        let mut book = Book::new(BTreeSet::new());
+        let mut kid = child_node(("claude-code", "kid"), R, NodeState::Busy);
+        kid.last_activity_at = at(1);
+        book.apply_fusion(vec![root_node(R, NodeState::Busy), kid], at(1));
+        book.apply_lines("claude-code:kid", outcome(&["one", "two", "three"], 14), at(2));
+        book.flush_lines();
+
+        let mut done = child_node(("claude-code", "kid"), R, NodeState::Done);
+        done.last_activity_at = at(3);
+        book.apply_fusion(vec![root_node(R, NodeState::Busy), done], at(3));
+        book.apply_lines("claude-code:kid", outcome(&["closing"], 22), at(3));
+
+        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:kid", vec!["closing"])]);
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        assert_eq!(lines["claude-code:kid"].len(), 1);
+        assert_eq!(lines["claude-code:kid"][0].text, "closing");
+    }
+
+    #[test]
+    fn lines_for_a_node_the_book_does_not_know_are_ignored() {
+        let mut book = Book::new(BTreeSet::new());
+        book.apply_fusion(vec![done_root(0)], at(10_000)); // beyond its window: never kept
+        book.apply_lines("claude-code:root", outcome(&["x"], 2), at(10_001));
+        assert!(book.flush_lines().is_empty());
+    }
+
+    #[test]
+    fn metrics_merge_and_unchanged_metrics_are_silent() {
+        let mut book = live_book();
+        let mut read = outcome(&["a"], 2);
+        read.usage = Some(Usage { context_tokens: Some(100), cost_usd: None });
+        book.apply_lines("claude-code:root", read, at(5));
+        let mut read = outcome(&[], 2);
+        read.usage = Some(Usage { context_tokens: None, cost_usd: Some(0.25) });
+        book.apply_lines("claude-code:root", read, at(6));
+
+        let FleetEvent::Metrics { metrics } = book.flush_metrics().remove(0) else { panic!() };
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].context_tokens, Some(100), "a missing field never erases a value");
+        assert_eq!(metrics[0].cost_usd, Some(0.25));
+        assert_eq!(metrics[0].last_activity_at, at(6));
+
+        // The same numbers again: nothing to say.
+        let mut read = outcome(&[], 2);
+        read.usage = Some(Usage { context_tokens: Some(100), cost_usd: Some(0.25) });
+        read.last_activity_at = Some(at(6));
+        book.apply_lines("claude-code:root", read, at(7));
+        assert!(book.flush_metrics().is_empty());
+    }
+
+    #[test]
+    fn a_discovery_that_only_moves_activity_is_a_metrics_event_not_a_node_event() {
+        let mut book = live_book();
+        let mut later = root_node(R, NodeState::Busy);
+        later.last_activity_at = at(50);
+        assert!(book.apply_fusion(vec![later], at(51)).is_empty());
+        assert_eq!(book.flush_metrics().len(), 1);
+    }
+
+    #[test]
+    fn a_node_that_becomes_visible_late_gets_its_recent_lines_and_metrics_queued() {
+        // 51 trees: the stalest is hidden. When a fresher tree displaces another, the hidden one
+        // is not shown; but a tree that WAS hidden and rises into the view is announced with its ring.
+        let mut book = Book::new(BTreeSet::new());
+        let trees: Vec<FusedNode> = (0..51)
+            .map(|i| {
+                let mut root = root_node(("claude-code", &format!("t{i:02}")), NodeState::Busy);
+                root.last_activity_at = at(i);
+                root
+            })
+            .collect();
+        book.apply_fusion(trees, at(100));
+        book.apply_lines("claude-code:t00", outcome(&["hidden"], 7), at(101)); // t00 is not visible
+        book.flush_lines();
+        book.flush_metrics();
+
+        let mut risen = root_node(("claude-code", "t00"), NodeState::Busy);
+        risen.last_activity_at = at(500);
+        let events = book.apply_fusion(vec![risen], at(501));
+        assert!(nodes_of(&events).iter().any(|n| n.id == "claude-code:t00"));
+        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:t00", vec!["hidden"])]);
+    }
+
+    #[test]
+    fn a_new_node_is_read_from_the_tail_once_and_then_only_when_asked() {
+        let mut book = live_book();
+        let jobs = book.read_jobs(ReadWhich::Pending);
+        assert_eq!(
+            jobs,
+            vec![ReadJob {
+                id: "claude-code:root".into(),
+                key: NodeKey::new("claude-code", "root"),
+                source: 0,
+                offset: Offset::TAIL,
+            }]
+        );
+        book.apply_lines("claude-code:root", outcome(&["a"], 42), at(5));
+        assert!(book.read_jobs(ReadWhich::Pending).is_empty());
+
+        let again = book.read_jobs(ReadWhich::AllLive);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].offset, Offset(42), "reads continue from the stored offset");
+    }
+
+    #[test]
+    fn a_node_that_stops_being_alive_is_read_one_more_time_and_then_never_by_all_live() {
+        let mut book = live_book();
+        book.read_jobs(ReadWhich::Pending);
+        book.apply_lines("claude-code:root", outcome(&["a"], 2), at(2));
+
+        book.apply_fusion(vec![root_node(R, NodeState::Done)], at(3));
+        assert_eq!(book.read_jobs(ReadWhich::Pending).len(), 1, "the closing read");
+        assert!(book.read_jobs(ReadWhich::AllLive).is_empty());
+    }
+
+    #[test]
+    fn reads_can_be_scoped_to_sources_or_ids_and_skip_sourceless_nodes() {
+        let mut book = Book::new(BTreeSet::new());
+        let mut other = child_node(("claude-code", "other"), R, NodeState::Busy);
+        other.lines_source = Some(1);
+        let mut blind = child_node(("claude-code", "blind"), R, NodeState::Busy);
+        blind.lines_source = None;
+        book.apply_fusion(vec![root_node(R, NodeState::Busy), other, blind], at(1));
+        book.read_jobs(ReadWhich::Pending); // settle the first reads
+
+        let only_one: BTreeSet<usize> = [1].into_iter().collect();
+        let jobs = book.read_jobs(ReadWhich::LiveOf(&only_one));
+        assert_eq!(jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), ["claude-code:other"]);
+
+        let ids: BTreeSet<NodeId> = ["claude-code:root".to_owned()].into_iter().collect();
+        let jobs = book.read_jobs(ReadWhich::Ids(&ids));
+        assert_eq!(jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), ["claude-code:root"]);
+    }
+
+    #[test]
+    fn watcher_paths_are_matched_to_nodes_and_unknown_ones_are_flagged() {
+        let mut book = live_book();
+        book.set_path("claude-code:root", Some(PathBuf::from("/s/a.jsonl")));
+
+        let known: HashSet<PathBuf> = [PathBuf::from("/s/a.jsonl")].into_iter().collect();
+        let (ids, unknown) = book.match_paths(&known);
+        assert_eq!(ids.into_iter().collect::<Vec<_>>(), ["claude-code:root"]);
+        assert!(!unknown);
+
+        let stray: HashSet<PathBuf> = [PathBuf::from("/s/new.jsonl")].into_iter().collect();
+        let (ids, unknown) = book.match_paths(&stray);
+        assert!(ids.is_empty() && unknown);
+
+        let overflow: HashSet<PathBuf> = [PathBuf::new()].into_iter().collect();
+        assert!(book.match_paths(&overflow).1, "an empty path means events were lost");
+    }
+
+    /// A node whose lines come from a native adapter (registry index 1) and that daemon_runs
+    /// (index 0) also sighted: the shape of a Claude Code session the daemon launched.
+    fn native_with_run(state: NodeState) -> FusedNode {
+        let mut node = root_node(R, state);
+        node.lines_source = Some(1);
+        node.daemon_source = Some(0);
+        node
+    }
+
+    #[test]
+    fn a_finished_run_gets_its_error_line_once_after_the_native_closing_line() {
+        // Contract amendment 1 / spec §11: failed, cancelled and timed-out runs end `Done` + Error.
+        let mut book = Book::new(BTreeSet::new());
+        book.apply_fusion(vec![native_with_run(NodeState::Busy)], at(1));
+        book.read_jobs(ReadWhich::Pending);
+        book.apply_lines("claude-code:root", outcome(&["working"], 8), at(2));
+        book.flush_lines();
+        assert!(book.error_jobs().is_empty(), "a live node has no run status to report");
+
+        book.apply_fusion(vec![native_with_run(NodeState::Done)], at(3));
+        assert!(book.error_jobs().is_empty(), "the native closing read comes first");
+        book.read_jobs(ReadWhich::Pending);
+        book.apply_lines("claude-code:root", outcome(&["all done"], 20), at(3));
+
+        let jobs = book.error_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].id.as_str(), jobs[0].source, jobs[0].offset), ("claude-code:root", 0, Offset::TAIL));
+        assert!(book.error_jobs().is_empty(), "asked once");
+
+        // The daemon source answered with its whole last line set; only the Error one is kept.
+        let status = vec![
+            TermLine::new(crate::fleet::model::TermKind::Final, "ignored"),
+            TermLine::new(crate::fleet::model::TermKind::Error, "timed_out"),
+        ];
+        book.apply_error("claude-code:root", status);
+        book.flush_lines();
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        assert_eq!(lines["claude-code:root"].len(), 1);
+        assert_eq!(lines["claude-code:root"][0].text, "timed_out");
+        assert_eq!(lines["claude-code:root"][0].kind, crate::fleet::model::TermKind::Error);
+
+        // A later native read of the dead node does not push the Error line out.
+        book.apply_lines("claude-code:root", outcome(&["late"], 30), at(4));
+        let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
+        assert_eq!(lines["claude-code:root"][0].text, "timed_out");
+    }
+
+    #[test]
+    fn the_error_line_is_queued_in_the_next_lines_event() {
+        let mut book = Book::new(BTreeSet::new());
+        book.apply_fusion(vec![native_with_run(NodeState::Done)], at(1));
+        book.read_jobs(ReadWhich::Pending);
+        book.apply_lines("claude-code:root", outcome(&["bye"], 4), at(1));
+        book.flush_lines();
+        book.error_jobs();
+
+        book.apply_error(
+            "claude-code:root",
+            vec![TermLine::new(crate::fleet::model::TermKind::Error, "cancelled")],
+        );
+        assert_eq!(lines_of(&book.flush_lines()), [("claude-code:root", vec!["cancelled"])]);
+    }
+
+    #[test]
+    fn a_success_a_run_only_node_and_a_live_node_need_no_error_pass() {
+        // Success: daemon_runs answers with `Final`, which is not kept, so nothing is queued.
+        let mut book = Book::new(BTreeSet::new());
+        book.apply_fusion(vec![native_with_run(NodeState::Done)], at(1));
+        book.read_jobs(ReadWhich::Pending);
+        book.flush_lines();
+        assert_eq!(book.error_jobs().len(), 1);
+        book.apply_error(
+            "claude-code:root",
+            vec![TermLine::new(crate::fleet::model::TermKind::Final, "All green")],
+        );
+        assert!(book.flush_lines().is_empty());
+
+        // Run-only: its lines already come from daemon_runs (`Final` / `Error` via read_lines).
+        let mut book = Book::new(BTreeSet::new());
+        let mut only = root_node(R, NodeState::Done);
+        only.lines_source = Some(0);
+        only.daemon_source = Some(0);
+        book.apply_fusion(vec![only], at(1));
+        book.read_jobs(ReadWhich::Pending);
+        assert!(book.error_jobs().is_empty());
+
+        // A native node no run launched.
+        let mut book = Book::new(BTreeSet::new());
+        let mut native = root_node(R, NodeState::Done);
+        native.lines_source = Some(1);
+        native.daemon_source = None;
+        book.apply_fusion(vec![native], at(1));
+        book.read_jobs(ReadWhich::Pending);
+        assert!(book.error_jobs().is_empty());
+    }
+
+    #[test]
+    fn a_node_that_comes_back_to_life_can_report_a_new_error_later() {
+        let mut book = Book::new(BTreeSet::new());
+        book.apply_fusion(vec![native_with_run(NodeState::Done)], at(1));
+        book.read_jobs(ReadWhich::Pending);
+        assert_eq!(book.error_jobs().len(), 1);
+
+        book.apply_fusion(vec![native_with_run(NodeState::Busy)], at(2));
+        book.apply_fusion(vec![native_with_run(NodeState::Done)], at(3));
+        book.read_jobs(ReadWhich::Pending);
+        assert_eq!(book.error_jobs().len(), 1, "the second death asks again");
     }
 }
