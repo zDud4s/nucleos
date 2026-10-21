@@ -52,7 +52,7 @@ import {
  *
  * Two absences, both deliberate:
  *
- * - **`FleetCanvas`** is not here. It is xyflow, and xyflow is already covered by the workflow
+ * - **The fleet canvas (`fleet/Surface.tsx`)** is not here. It is xyflow, and xyflow is already covered by the workflow
  *   canvas; a second surface of the same library buys a second chance to be slow and no new
  *   information.
  * - **Radix Tabs** is not here, and it is the same argument in a different library: Tabs rides the
