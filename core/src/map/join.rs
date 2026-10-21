@@ -1732,7 +1732,7 @@ mod tests {
         // modules: *something claims this* and *here is what claims it* are different facts, and
         // one list would let the second borrow the first's confidence.
         let decisions = [decided(1, SLUGS[0], "## 6.4 Vocabulário de nó", 4)];
-        let foreign = [foreign_at("sidecars/telegram/main.go", &[("6.4", None)])];
+        let foreign = [foreign_at("sidecars/email/main.go", &[("6.4", None)])];
 
         let junction = join(&decisions, &[], &foreign, &slugs(), &unrecorded());
 
@@ -1741,7 +1741,7 @@ mod tests {
             single(&junction).modules.is_empty(),
             "nothing readable claims it"
         );
-        assert_eq!(single(&junction).foreign, ["sidecars/telegram/main.go"]);
+        assert_eq!(single(&junction).foreign, ["sidecars/email/main.go"]);
         assert_eq!(junction.counts.silent, 0, "not a decision with no code");
     }
 

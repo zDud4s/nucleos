@@ -1330,7 +1330,7 @@ mod tests {
         let decision = decision(
             Anchor::Ambiguous,
             &["core/src/map/triage.rs"],
-            &["sidecars/telegram/main.go"],
+            &["sidecars/email/main.go"],
         );
         let prompt = triage_prompt(Evidence {
             decision: &decision,
@@ -1341,7 +1341,7 @@ mod tests {
             .find("core/src/map/triage.rs")
             .expect("the readable module is named");
         let unreadable = prompt
-            .find("sidecars/telegram/main.go")
+            .find("sidecars/email/main.go")
             .expect("the foreign file is named");
         let heading = prompt
             .find("CANNOT read")

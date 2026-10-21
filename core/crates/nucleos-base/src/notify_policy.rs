@@ -5,9 +5,8 @@
 //!
 //! This module GUARDS, VALIDATES and OBSERVES the machine-wide rows. It does not resolve the
 //! policy against a feed row. The núcleo resolves it for the channel hub (`channels::routing`
-//! merges these rows with a channel's own overrides and decides what is announced), and the
-//! Telegram v1 sidecar still resolves it for itself (spec §4, §6). Either way the decision is made
-//! where the message is sent, never here, so a filter bug in one channel cannot silence the feed
+//! merges these rows with a channel's own overrides and decides what is announced, Telegram's
+//! included). The decision is made where the message is sent, never here, so a filter bug in one channel cannot silence the feed
 //! the shell reads.
 
 use std::collections::HashSet;
