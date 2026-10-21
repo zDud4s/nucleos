@@ -463,7 +463,7 @@ class RecordTests(unittest.TestCase):
             node_id="L1", branch="core", nodes=str(nodes_file), report_file=None, owned=None,
             tree="R",
         )
-        with mock.patch.object(sys, "stdin", io.StringIO(self.report("L1", ["a/x.txt"]))):
+        with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(self.report("L1", ["a/x.txt"]).encode("utf-8")), encoding="utf-8")):
             self.assertEqual(tree_record.run_record(args)["verdict"], "accepted")
 
     # -- inputs the record cannot work without ------------------------------------------------
