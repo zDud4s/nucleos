@@ -6,6 +6,9 @@
 //! leaves the session on the person's side. The agent reply carries `chain` and `row_id` so the shell
 //! can ask the keep question through `POST /browser/keep`.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -46,14 +49,94 @@ pub(super) struct Reattached {
     pub row_id: Option<i64>,
 }
 
+type Gates = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+
+/// One gate per session id with a call in flight; an entry lives only while a call holds or awaits it.
+fn gates() -> &'static Gates {
+    static GATES: OnceLock<Gates> = OnceLock::new();
+    GATES.get_or_init(Gates::default)
+}
+
+/// Held for a whole owner change, so two calls on one session never interleave.
+struct OwnerGate {
+    id: String,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl OwnerGate {
+    async fn enter(id: &str) -> Self {
+        let gate = gates()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id.to_string())
+            .or_default()
+            .clone();
+        let guard = gate.clone().lock_owned().await;
+        Self {
+            id: id.to_string(),
+            gate,
+            guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for OwnerGate {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut map = gates().lock().unwrap_or_else(PoisonError::into_inner);
+        // The map and this struct hold one handle each; any more is a call still waiting its turn.
+        if Arc::strong_count(&self.gate) == 2 {
+            map.remove(&self.id);
+        }
+    }
+}
+
+/// The open `browser_sessions` row of a sidecar session, with whether it is a project session
+/// (the only kind whose chain can be recorded).
+async fn open_row(pool: &SqlitePool, id: &str) -> Result<Option<(i64, bool)>, OwnerError> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, profile_kind FROM browser_sessions \
+         WHERE sidecar_id = ? AND closed_at IS NULL LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(OwnerError::Db)?;
+    Ok(row.map(|(row_id, kind)| (row_id, kind == "project")))
+}
+
 /// Flips the owner of an embedded session; idempotent in both directions. `Some` only for the agent.
+/// Calls on one session run one at a time, so the flag always ends as the last call to finish left it.
 pub(super) async fn set_owner(
     pool: &SqlitePool,
     runtime: &BrowserRuntime,
     id: &str,
     owner: Owner,
 ) -> Result<Option<Reattached>, OwnerError> {
+    let _gate = OwnerGate::enter(id).await;
     if !runtime.embedded.is_embedded(id) {
+        // The registry forgot the session (shell silent, daemon restarted) but the sidecar may still
+        // hold it detached. Hand it back to the agent only when its row is open and a project
+        // session; the registry has nothing to unmark. Anything else is a clear 404.
+        if owner == Owner::Agent
+            && let Some((row_id, true)) = open_row(pool, id).await?
+        {
+            let chain = runtime
+                .client
+                .embedded_reattach(id)
+                .await
+                .map_err(OwnerError::Sidecar)?;
+            if !chain.is_empty() {
+                crate::browser::record_chain(pool, row_id, &chain)
+                    .await
+                    .map_err(OwnerError::Db)?;
+            }
+            return Ok(Some(Reattached {
+                chain,
+                row_id: Some(row_id),
+            }));
+        }
         return Err(OwnerError::NotEmbedded);
     }
     match owner {
@@ -70,18 +153,20 @@ pub(super) async fn set_owner(
             Ok(None)
         }
         Owner::Agent => {
-            let chain = runtime
+            let mut chain = runtime
                 .client
                 .embedded_reattach(id)
                 .await
                 .map_err(OwnerError::Sidecar)?;
-            let row_id: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM browser_sessions WHERE sidecar_id = ? AND closed_at IS NULL LIMIT 1",
-            )
-            .bind(id)
-            .fetch_optional(pool)
-            .await
-            .map_err(OwnerError::Db)?;
+            // Contract E4: a row that is not an open project session cannot hold a chain, so the
+            // reply carries none and the shell asks no keep question.
+            let row_id = match open_row(pool, id).await? {
+                Some((row_id, true)) => Some(row_id),
+                _ => {
+                    chain.clear();
+                    None
+                }
+            };
             if let (Some(row_id), false) = (row_id, chain.is_empty()) {
                 // Before the flag is cleared: a database error leaves the session on the person's side.
                 crate::browser::record_chain(pool, row_id, &chain)
@@ -137,13 +222,20 @@ mod tests {
     type Seen = Arc<Mutex<Vec<serde_json::Value>>>;
 
     async fn insert_row(pool: &SqlitePool) -> i64 {
+        insert_row_with(pool, "s1", "project", false).await
+    }
+
+    async fn insert_row_with(pool: &SqlitePool, sidecar_id: &str, kind: &str, closed: bool) -> i64 {
         sqlx::query(
             "INSERT INTO browser_sessions \
                (sidecar_id, project_id, profile_kind, profile_id, requested_url, final_url, \
-                rule, mode, opened_at) \
-             VALUES ('s1', 'acme', 'project', 'acme', 'https://a.example.net/', '', \
-                'rule', 'agent', '2026-01-01T00:00:00Z')",
+                rule, mode, opened_at, closed_at) \
+             VALUES (?, 'acme', ?, 'acme', 'https://a.example.net/', '', \
+                'rule', 'agent', '2026-01-01T00:00:00Z', ?)",
         )
+        .bind(sidecar_id)
+        .bind(kind)
+        .bind(closed.then_some("2026-01-01T00:00:05Z"))
         .execute(pool)
         .await
         .expect("insert")
@@ -153,6 +245,15 @@ mod tests {
     /// A sidecar recording every embedded verb; `reattach` answers 502 when `fail_reattach` is set and
     /// otherwise returns `chain`.
     async fn stub(fail_reattach: bool, chain: Vec<&'static str>) -> (BrowserRuntime, Seen) {
+        stub_slow(fail_reattach, chain, 0).await
+    }
+
+    /// Like `stub`, with `reattach` answering `delay_ms` late.
+    async fn stub_slow(
+        fail_reattach: bool,
+        chain: Vec<&'static str>,
+        delay_ms: u64,
+    ) -> (BrowserRuntime, Seen) {
         use axum::routing::post;
 
         let seen: Seen = Arc::default();
@@ -178,6 +279,7 @@ mod tests {
                                 .into_response();
                         }
                         if verb == "reattach" {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                             return Json(serde_json::json!({ "chain": chain })).into_response();
                         }
                         Json(serde_json::json!({})).into_response()
@@ -342,6 +444,106 @@ mod tests {
             .expect("query")
             .expect("row");
         assert!(row.chain.is_none());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_agent_reattach_cannot_overwrite_a_later_human_call() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_slow(false, vec![], 300).await;
+        let runtime = Arc::new(runtime);
+        // An id of its own: the gate map is shared with the tests running beside this one.
+        runtime.embedded.adopt_for_test("sg", "p");
+        runtime.embedded.set_human("sg", true);
+        let agent = {
+            let (pool, runtime) = (db.pool.clone(), runtime.clone());
+            tokio::spawn(async move { set_owner(&pool, &runtime, "sg", Owner::Agent).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        set_owner(&db.pool, &runtime, "sg", Owner::Human)
+            .await
+            .expect("human");
+        agent.await.unwrap().expect("agent");
+        // The person's call came last, so the session ends on the person's side.
+        assert!(runtime.embedded.is_human("sg"));
+        assert_eq!(
+            verbs(&seen),
+            vec![
+                ("reattach".to_string(), "sg".to_string()),
+                ("detach".to_string(), "sg".to_string())
+            ]
+        );
+        assert!(
+            !gates().lock().unwrap().contains_key("sg"),
+            "the per-session gate is cleaned up"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_call_on_a_forgotten_session_reattaches_through_its_open_project_row() {
+        let db = TempDb::new().await;
+        let id = insert_row_with(&db.pool, "s9", "project", false).await;
+        let (runtime, seen) = stub(false, vec!["https://x.example.net/"]).await;
+        let back = set_owner(&db.pool, &runtime, "s9", Owner::Agent)
+            .await
+            .expect("ok")
+            .expect("agent reply");
+        assert_eq!(back.chain, vec!["https://x.example.net/".to_string()]);
+        assert_eq!(back.row_id, Some(id));
+        assert_eq!(
+            verbs(&seen),
+            vec![("reattach".to_string(), "s9".to_string())]
+        );
+        assert!(!runtime.embedded.is_embedded("s9"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_session_without_an_open_project_row_is_a_404() {
+        let db = TempDb::new().await;
+        insert_row_with(&db.pool, "closed", "project", true).await;
+        insert_row_with(&db.pool, "eph", "ephemeral", false).await;
+        let (runtime, seen) = stub(false, vec![]).await;
+        for ghost in ["closed", "eph", "nothing"] {
+            let outcome = set_owner(&db.pool, &runtime, ghost, Owner::Agent).await;
+            assert!(
+                matches!(outcome, Err(OwnerError::NotEmbedded)),
+                "{ghost}: {outcome:?}"
+            );
+        }
+        let human = set_owner(&db.pool, &runtime, "closed", Owner::Human).await;
+        assert!(matches!(human, Err(OwnerError::NotEmbedded)), "{human:?}");
+        assert!(verbs(&seen).is_empty());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_row_that_is_not_an_open_project_session_replies_an_empty_chain() {
+        let db = TempDb::new().await;
+        let (runtime, _seen) = stub(false, vec!["https://a.example.net/"]).await;
+        for (kind, closed) in [("ephemeral", false), ("project", true)] {
+            sqlx::query("DELETE FROM browser_sessions")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+            let id = insert_row_with(&db.pool, "s1", kind, closed).await;
+            runtime.embedded.set_human("s1", true);
+            let back = set_owner(&db.pool, &runtime, "s1", Owner::Agent)
+                .await
+                .expect("ok")
+                .expect("agent reply");
+            assert!(back.chain.is_empty(), "{kind}/{closed}: {:?}", back.chain);
+            assert_eq!(back.row_id, None);
+            assert!(!runtime.embedded.is_human("s1"));
+            let unset: i64 =
+                sqlx::query_scalar("SELECT chain IS NULL FROM browser_sessions WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(unset, 1);
+        }
         db.close().await;
     }
 

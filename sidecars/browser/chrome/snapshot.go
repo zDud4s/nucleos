@@ -30,7 +30,7 @@ import (
 func (d *Driver) Snapshot(ctx context.Context, id browser.SessionID, req browser.SnapshotRequest) (browser.Snapshot, error) {
 	d.gate.RLock()
 	defer d.gate.RUnlock()
-	entry, err := d.lookup(id)
+	entry, err := d.lookupAttached(id)
 	if err != nil {
 		return browser.Snapshot{}, err
 	}

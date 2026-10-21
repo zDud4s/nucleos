@@ -24,6 +24,7 @@
 //! §5.4's "the url is handed to an ephemeral session", and it is a downgrade rather than a failure.
 
 pub mod embedded;
+mod embedded_close;
 pub mod embedded_owner;
 pub mod live;
 pub mod panel;
@@ -1133,6 +1134,8 @@ pub async fn close_with_reason(
     }
     // An embedded session is closed by the shell, on a queued request; the row closes here as usual.
     if route_embedded::queue_close(runtime, &row.sidecar_id) {
+        // The shell closes the tab, but the sidecar's pool slot is ours to free.
+        embedded_close::release_sidecar_slot(&runtime.client, &row.sidecar_id).await;
         close_row(pool, id, reason, now)
             .await
             .map_err(|error| BrowserError::Failed(error.to_string()))?;
@@ -2776,7 +2779,7 @@ mod tests {
         db.close().await;
     }
 
-    /// Closing an embedded session queues a `close` for the shell and does not call the sidecar.
+    /// Closing an embedded session queues a `close` for the shell and frees the sidecar's slot.
     #[tokio::test]
     async fn closing_an_embedded_session_queues_a_close_request() {
         let db = TempDb::new().await;
@@ -2805,10 +2808,118 @@ mod tests {
         let queued = runtime.embedded.poll();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].session_id.as_deref(), Some("e1"));
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "the sidecar was not asked to close"
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|call| call["verb"].clone())
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!("close")],
+            "the sidecar was asked to free the slot"
         );
+        db.close().await;
+    }
+
+    fn close_calls(seen: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["verb"] == "close")
+            .count()
+    }
+
+    async fn closed_reason(db: &TempDb, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT closed_reason FROM browser_sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// The sidecar pool holds three sessions: more open/close cycles than that only work when every
+    /// close frees the slot, so each cycle must reach the sidecar and close its row.
+    #[tokio::test]
+    async fn embedded_open_close_cycles_free_the_sidecar_slot_every_time() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let first = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let mut ids = vec![first.id];
+        for _ in 0..4 {
+            assert!(
+                close(&db.pool, &runtime, *ids.last().unwrap(), NOW)
+                    .await
+                    .unwrap()
+            );
+            runtime.embedded.poll();
+            let (opened, ()) = tokio::join!(
+                open(
+                    &db.pool,
+                    &runtime,
+                    embedded_ask("https://news.example.net/")
+                ),
+                shell_acks_the_open(&runtime)
+            );
+            let Opened::Session(row) = opened.expect("opens") else {
+                panic!("expected a session");
+            };
+            ids.push(row.id);
+        }
+        assert!(
+            close(&db.pool, &runtime, *ids.last().unwrap(), NOW)
+                .await
+                .unwrap()
+        );
+        assert_eq!(ids.len(), 5);
+        assert_eq!(
+            close_calls(&seen),
+            5,
+            "the sidecar closed one session per cycle"
+        );
+        for id in ids {
+            assert!(
+                session_row(&db.pool, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .closed_at
+                    .is_some()
+            );
+        }
+        db.close().await;
+    }
+
+    /// The shell reports the tab gone: the row closes as `tab-closed` and the sidecar slot is freed,
+    /// once; a second report finds nothing left to do.
+    #[tokio::test]
+    async fn a_tab_the_shell_reports_closed_closes_the_row_and_the_sidecar_session() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let row = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+        seen.lock().unwrap().clear();
+
+        for _ in 0..2 {
+            let response =
+                embedded::post_closed(State(state.clone()), Path("e1".to_string())).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        assert!(!state.browser.embedded.is_embedded("e1"));
+        assert_eq!(
+            closed_reason(&db, row.id).await.as_deref(),
+            Some("tab-closed")
+        );
+        assert_eq!(close_calls(&seen), 1, "the second report is a no-op");
+        db.close().await;
+    }
+
+    /// A stale id from the shell (no row, not embedded) must not make the sidecar close anything.
+    #[tokio::test]
+    async fn a_closed_report_for_an_unknown_session_does_not_touch_the_sidecar() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+        embedded::post_closed(State(state), Path("ghost".to_string())).await;
+        assert_eq!(close_calls(&seen), 0);
         db.close().await;
     }
 

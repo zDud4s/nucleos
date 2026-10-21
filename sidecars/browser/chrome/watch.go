@@ -90,7 +90,7 @@ func (c *screencast) end() { c.doneOnce.Do(func() { close(c.done) }) }
 // screencast only reads the page. It does not take the person gate for that reason, and for another —
 // a stream lasts as long as the viewer does, and a swap would wait on it forever.
 func (d *Driver) Watch(ctx context.Context, id browser.SessionID, sink func(browser.Frame)) error {
-	entry, err := d.lookup(id)
+	entry, err := d.lookupAttached(id)
 	if err != nil {
 		return err
 	}

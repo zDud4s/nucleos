@@ -36,8 +36,12 @@ use crate::state::AppState;
 
 /// How long a registration lives without a `GET /requests` poll.
 pub const REGISTRATION_TTL: Duration = Duration::from_secs(30);
-/// How long an `open` waits for the shell's ack, and how long an ack waits for the attach.
+/// How long an `open` waits for the shell's ack, and the bound on the sidecar's attach after it.
 pub const OPEN_WAIT: Duration = Duration::from_secs(10);
+/// How long the shell's ack waits for the attach to settle. Strictly longer than the attach bound
+/// ([`OPEN_WAIT`]), so a slow attach is reported by the open call itself and the ack never gives up
+/// first, which would leave a sidecar session nobody knows about.
+pub const ACK_RESULT_WAIT: Duration = Duration::from_secs(OPEN_WAIT.as_secs() * 3 / 2);
 /// How long a `close` request waits to be picked up and acked before it is dropped.
 const CLOSE_TTL: Duration = Duration::from_secs(30);
 /// How often the watchdog looks for registrations whose shell stopped polling.
@@ -104,6 +108,23 @@ struct Inner {
     watching: bool,
 }
 
+impl Inner {
+    /// Forgets the embedded sessions (and owner flags) of a project whose shell environment is gone:
+    /// their tabs died with it, and a stale entry would answer for a session nobody can reach.
+    fn forget_sessions_of(&mut self, project: &str) {
+        let gone: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == project)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            self.sessions.remove(&id);
+            self.human.remove(&id);
+        }
+    }
+}
+
 struct Shared {
     state: Mutex<Inner>,
     clock: Clock,
@@ -123,6 +144,15 @@ pub enum AckOutcome {
     Closed(String),
     /// The sidecar could not attach (or took too long).
     Failed(String),
+}
+
+/// How an open ended.
+pub(super) enum OpenEnd {
+    Opened(Session),
+    /// No session: headless fallback.
+    Nothing,
+    /// The sidecar made this session but the ack gave up before it could be handed over.
+    Discarded(String),
 }
 
 /// The shell's registrations, its queued requests and the embedded sessions they produced.
@@ -171,6 +201,11 @@ impl Registry {
         }
     }
 
+    /// How long an ack waits for the attach: strictly more than the attach bound itself.
+    fn ack_result_wait(&self) -> Duration {
+        self.shared.open_wait + self.shared.open_wait / 2
+    }
+
     fn now(&self) -> Instant {
         (self.shared.clock)()
     }
@@ -190,7 +225,16 @@ impl Registry {
     /// Records (or refreshes) a project's registration. Counts as a heartbeat for it.
     pub fn register(&self, project: &str, cdp_http: &str) {
         let now = self.now();
-        self.lock().registrations.insert(
+        let mut inner = self.lock();
+        // A different CDP address means the shell rebuilt its environment: the old tabs are gone.
+        if inner
+            .registrations
+            .get(project)
+            .is_some_and(|reg| reg.cdp_http != cdp_http)
+        {
+            inner.forget_sessions_of(project);
+        }
+        inner.registrations.insert(
             project.to_string(),
             Registration {
                 cdp_http: cdp_http.to_string(),
@@ -235,6 +279,7 @@ impl Registry {
             .collect();
         for project in &dead {
             inner.registrations.remove(project);
+            inner.forget_sessions_of(project);
             // Dropping an open's waiter wakes it with an error, which sends it to the headless path.
             inner
                 .requests
@@ -288,13 +333,23 @@ impl Registry {
         placement: &Placement,
     ) -> Option<Session> {
         let project_name = project.to_string();
-        self.open_with(project, url, |cdp_http, nonce, url| async move {
-            client
-                .embedded_attach(&project_name, &cdp_http, &nonce, &url, placement)
-                .await
-                .map_err(|error| error.to_string())
-        })
-        .await
+        let ended = self
+            .open_ended(project, url, |cdp_http, nonce, url| async move {
+                client
+                    .embedded_attach(&project_name, &cdp_http, &nonce, &url, placement)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        match ended {
+            OpenEnd::Opened(session) => Some(session),
+            OpenEnd::Nothing => None,
+            // The sidecar holds a slot for a session the shell was never told about.
+            OpenEnd::Discarded(id) => {
+                super::embedded_close::release_sidecar_slot(client, &id).await;
+                None
+            }
+        }
     }
 
     /// [`Registry::open`] with the sidecar call injected.
@@ -303,15 +358,30 @@ impl Registry {
         F: FnOnce(String, String, String) -> Fut,
         Fut: Future<Output = Result<Session, String>>,
     {
+        match self.open_ended(project, url, attach).await {
+            OpenEnd::Opened(session) => Some(session),
+            OpenEnd::Nothing | OpenEnd::Discarded(_) => None,
+        }
+    }
+
+    /// [`Registry::open_with`] that also says when the attach produced a session nobody received.
+    pub(super) async fn open_ended<F, Fut>(&self, project: &str, url: &str, attach: F) -> OpenEnd
+    where
+        F: FnOnce(String, String, String) -> Fut,
+        Fut: Future<Output = Result<Session, String>>,
+    {
         if !self.has_live(project) {
-            return None;
+            return OpenEnd::Nothing;
         }
         let (waiter, acked) = oneshot::channel();
         let request_id = new_id();
         let cdp_http = {
             let now = self.now();
             let mut inner = self.lock();
-            let cdp_http = inner.registrations.get(project)?.cdp_http.clone();
+            let Some(registration) = inner.registrations.get(project) else {
+                return OpenEnd::Nothing;
+            };
+            let cdp_http = registration.cdp_http.clone();
             inner.requests.push(Request {
                 wire: PendingRequest {
                     request_id: request_id.clone(),
@@ -333,7 +403,7 @@ impl Registry {
                 self.lock()
                     .requests
                     .retain(|request| request.wire.request_id != request_id);
-                return None;
+                return OpenEnd::Nothing;
             }
         };
         let attached = tokio::time::timeout(
@@ -347,12 +417,20 @@ impl Registry {
                 self.lock()
                     .sessions
                     .insert(session.id.clone(), project.to_string());
-                let _ = acked.done.send(Ok(session.id.clone()));
-                Some(session)
+                if acked.done.send(Ok(session.id.clone())).is_err() {
+                    // The ack stopped listening: the shell never learns this id, so no tab can be
+                    // closed by it. Forget the session here and let the caller free the sidecar.
+                    self.session_closed(&session.id);
+                    return OpenEnd::Discarded(session.id);
+                }
+                OpenEnd::Opened(session)
             }
             Err(error) => {
+                // The shell is answered `Failed`; a close is keyed by a session id and none exists
+                // for this tab, so the shell owns it. A session the sidecar made past its bound is
+                // unknown to us and cannot be released.
                 let _ = acked.done.send(Err(error));
-                None
+                OpenEnd::Nothing
             }
         }
     }
@@ -391,7 +469,7 @@ impl Registry {
                 if waiter.send(acked).is_err() {
                     return AckOutcome::Gone;
                 }
-                match tokio::time::timeout(self.shared.open_wait, result).await {
+                match tokio::time::timeout(self.ack_result_wait(), result).await {
                     Ok(Ok(Ok(session_id))) => AckOutcome::Opened(session_id),
                     Ok(Ok(Err(error))) => AckOutcome::Failed(error),
                     _ => AckOutcome::Failed("the attach did not finish".to_string()),
@@ -676,7 +754,7 @@ pub async fn post_closed(
     if !state.browser.enabled {
         return pillar_off();
     }
-    state.browser.embedded.session_closed(&session_id);
+    super::embedded_close::tab_closed(&state.pool, &state.browser, &session_id).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -988,5 +1066,76 @@ mod tests {
             "the expired request is withdrawn"
         );
         assert!(!registry.is_embedded("never"));
+    }
+
+    #[test]
+    fn expiring_a_registration_forgets_its_sessions_and_owner_flags() {
+        let (registry, clock) = registry(OPEN_WAIT);
+        registry.register("p", "http://127.0.0.1:1");
+        registry.register("q", "http://127.0.0.1:2");
+        registry.adopt_for_test("sp", "p");
+        registry.adopt_for_test("sq", "q");
+        assert!(registry.set_human("sp", true));
+        advance(&clock, 31);
+        registry.register("q", "http://127.0.0.1:2");
+        assert_eq!(registry.expire(), vec!["p".to_string()]);
+        assert!(!registry.is_embedded("sp") && !registry.is_human("sp"));
+        assert!(
+            registry.is_embedded("sq"),
+            "a live project keeps its sessions"
+        );
+    }
+
+    #[test]
+    fn registering_a_different_cdp_address_forgets_the_old_sessions() {
+        let (registry, _clock) = registry(OPEN_WAIT);
+        registry.register("p", "http://127.0.0.1:1");
+        registry.adopt_for_test("sp", "p");
+        registry.adopt_for_test("sq", "q");
+        assert!(registry.set_human("sp", true));
+        registry.register("p", "http://127.0.0.1:1");
+        assert!(
+            registry.is_embedded("sp"),
+            "the same address is a heartbeat"
+        );
+        registry.register("p", "http://127.0.0.1:2");
+        assert!(!registry.is_embedded("sp") && !registry.is_human("sp"));
+        assert!(registry.is_embedded("sq"), "another project is untouched");
+    }
+
+    #[test]
+    fn the_ack_waits_strictly_longer_than_the_attach_bound() {
+        assert!(ACK_RESULT_WAIT > OPEN_WAIT);
+        let (registry, _clock) = registry(Duration::from_millis(40));
+        assert!(registry.ack_result_wait() > Duration::from_millis(40));
+    }
+
+    /// An attach that outlives its bound fails the open and the ack together, in that order: the
+    /// ack still hears the attach's own error rather than giving up on it.
+    #[tokio::test]
+    async fn a_slow_attach_fails_the_ack_with_the_attach_error() {
+        let (registry, _clock) = registry(Duration::from_millis(60));
+        registry.register("p", "http://127.0.0.1:7");
+        let opener = registry.clone();
+        let open = tokio::spawn(async move {
+            opener
+                .open_with("p", "https://x.test", |_, _, _| async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Ok(session("slow"))
+                })
+                .await
+        });
+        let request = loop {
+            if let Some(request) = registry.poll().pop() {
+                break request;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(
+            registry.ack(&request.request_id, "n").await,
+            AckOutcome::Failed("the sidecar did not attach in time".into())
+        );
+        assert!(open.await.unwrap().is_none());
+        assert!(!registry.is_embedded("slow"));
     }
 }

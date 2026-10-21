@@ -48,6 +48,12 @@ func (d *Driver) personHolds(id browser.SessionID) bool {
 // A failed reload leaves the session the person's and not the agent's: the one wrong thing this can
 // do is hand the wheel back to the agent without the fence having been looked at.
 func (d *Driver) BeginPerson(ctx context.Context, id browser.SessionID) error {
+	// An embedded driver is the person's own browser, shared by the whole project: lifting its fence
+	// for one tab would lift it for every page the WebView2 shows. The person drives an embedded tab
+	// through DetachEmbedded instead.
+	if d.embedded {
+		return browser.ErrUnsupported
+	}
 	if d.personHolds(id) {
 		return nil
 	}

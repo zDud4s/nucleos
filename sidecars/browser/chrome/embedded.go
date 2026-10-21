@@ -108,6 +108,14 @@ func (d *Driver) Adopt(ctx context.Context, targetID, url string) (browser.Sessi
 	return d.arm(ctx, targetID, cdpSession, url, detach)
 }
 
+// OnEmbeddedGone registers fn to be called, off the driver's lock, with the id of an adopted session
+// whose tab the person closed (the browser detached our CDP session without a [Driver.DetachEmbedded]).
+func (d *Driver) OnEmbeddedGone(fn func(browser.SessionID)) {
+	d.mu.Lock()
+	d.onGone = fn
+	d.mu.Unlock()
+}
+
 // DetachEmbedded lets go of the CDP session on the shell's tab without closing the tab or touching the
 // fence: the browser-session interception stays on, the session id and its target id stay valid, and
 // [Driver.ReattachEmbedded] picks the tab up again. A second detach is a no-op.
@@ -207,8 +215,26 @@ func (d *Driver) ReattachEmbedded(ctx context.Context, id browser.SessionID) (br
 	visible := d.visible
 	rec := entry.chain
 	d.mu.Unlock()
+	registered := false
 	if rec != nil {
 		rec.stop()
+		// Any failure below leaves the session detached and the person still driving it, so the
+		// recording must go on: a fresh recorder seeded with what the stopped one holds. Requests made
+		// during the failed attempt itself are the agent's and stay out.
+		defer func() {
+			if registered {
+				return
+			}
+			fresh := &chainRecorder{}
+			for _, url := range rec.Chain() {
+				fresh.record(url)
+			}
+			d.mu.Lock()
+			if entry.detached && entry.chain == rec {
+				entry.chain = fresh
+			}
+			d.mu.Unlock()
+		}()
 	}
 	var chain []string
 
@@ -230,7 +256,6 @@ func (d *Driver) ReattachEmbedded(ctx context.Context, id browser.SessionID) (br
 	}
 	cdpSession := attachedTo.SessionID
 
-	registered := false
 	defer func() {
 		if registered {
 			return
@@ -288,6 +313,21 @@ func (d *Driver) ReattachEmbedded(ctx context.Context, id browser.SessionID) (br
 		d.adoptPanelWorlds(cdpSession)
 	}
 	return browser.Returned{Chain: append([]string{}, chain...)}, nil
+}
+
+// lookupAttached is lookup for the page verbs: a detached embedded session is the person's, and its
+// stale CDP session must not be driven (or read) by the agent. Returns [browser.ErrPersonIsDriving].
+func (d *Driver) lookupAttached(id browser.SessionID) (*session, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	entry, ok := d.sessions[id]
+	if !ok {
+		return nil, browser.ErrNoSuchSession
+	}
+	if entry.detached {
+		return nil, browser.ErrPersonIsDriving
+	}
+	return entry, nil
 }
 
 // recordDetachedDocument writes down a main-frame Document request made while the embedded tab is

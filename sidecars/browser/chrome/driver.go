@@ -106,6 +106,8 @@ type Driver struct {
 	// creates a target, so Open is refused and the profile sweep, which needs a scratch page, is
 	// skipped. See ConnectEmbedded.
 	embedded bool
+	// onGone is told which session's tab the person closed (embedded only), guarded by mu.
+	onGone func(browser.SessionID)
 }
 
 type session struct {
@@ -444,13 +446,23 @@ func (d *Driver) onDetached(event cdp.Event) {
 		return
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	var gone func(browser.SessionID)
+	var goneID browser.SessionID
 	if owner, ok := d.cdpToSession[params.SessionID]; ok {
 		if entry, live := d.sessions[owner]; live {
 			delete(entry.frames, params.SessionID)
+			// An attached embedded tab whose own CDP session was detached by the browser: the person
+			// closed it. Our DetachEmbedded sets entry.detached first, so it never lands here.
+			if d.embedded && !entry.detached && entry.cdp == params.SessionID && d.onGone != nil {
+				gone, goneID = d.onGone, owner
+			}
 		}
 	}
 	delete(d.cdpToSession, params.SessionID)
+	d.mu.Unlock()
+	if gone != nil {
+		gone(goneID)
+	}
 }
 
 // Open creates a target, arms it while it is still paused, and only then navigates.
@@ -757,7 +769,7 @@ func (d *Driver) lookup(id browser.SessionID) (*session, error) {
 func (d *Driver) Screenshot(ctx context.Context, id browser.SessionID) ([]byte, error) {
 	d.gate.RLock()
 	defer d.gate.RUnlock()
-	entry, err := d.lookup(id)
+	entry, err := d.lookupAttached(id)
 	if err != nil {
 		return nil, err
 	}
