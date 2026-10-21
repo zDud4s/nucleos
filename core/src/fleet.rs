@@ -3,6 +3,7 @@
 
 pub mod book;
 pub mod claude_code;
+pub mod codex_cli;
 pub mod daemon_runs;
 pub mod event;
 pub mod fuse;
@@ -10,11 +11,13 @@ pub mod hub;
 pub mod limits;
 pub mod model;
 pub mod route;
+pub mod run_launch;
 pub mod source;
 pub mod tail;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod watch;
+pub mod work_nodes_edges;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,11 +48,15 @@ pub fn sources(env: &FleetEnv) -> Sources {
     let mut agents: Vec<Arc<dyn AgentSource>> = Vec::new();
     agents.push(Arc::new(daemon_runs::DaemonRuns::new(env)));
     agents.push(Arc::new(claude_code::ClaudeCode::new(env)));
-    // TODO-C: agents.push(Arc::new(codex_cli::CodexCli::new(env)));
+    agents.push(Arc::new(codex_cli::CodexCli::new(env.home.clone())));
     #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut edges: Vec<Arc<dyn EdgeSource>> = Vec::new();
-    // TODO-C: edges.push(Arc::new(work_nodes_edges::WorkNodesEdges::new(env)));
-    // TODO-C: edges.push(Arc::new(run_launch::RunLaunch::new(env)));
+    edges.push(std::sync::Arc::new(work_nodes_edges::WorkNodesEdges::new(
+        env.pool.clone(),
+    )));
+    edges.push(std::sync::Arc::new(run_launch::RunLaunchEdges::new(
+        env.pool.clone(),
+    )));
     (agents, edges)
 }
 
