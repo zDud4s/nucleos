@@ -9,15 +9,19 @@ use std::path::Path;
 use super::limits::TAIL_BYTES;
 use super::source::Offset;
 
+/// The most an incremental read catches up on; past it the read jumps to the tail window.
+const MAX_CATCH_UP: u64 = 4 * TAIL_BYTES;
+
 /// A single line longer than this ends backwards paging (the page would never fit it).
 const LONGEST_LINE: u64 = 16 * 1024 * 1024;
 
 pub fn read_complete_lines(path: &Path, from: Offset) -> io::Result<(Vec<String>, Offset)> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
-    // `Offset(0)` reads from the start, however big the file: only the sentinel and a file that
-    // shrank below the offset (truncated or rotated) restart at the tail.
-    let as_tail = from == Offset::TAIL || from.0 > len;
+    // `Offset(0)` reads from the start of a file that is not far ahead; the sentinel, a file that
+    // shrank below the offset (truncated or rotated) and an offset more than `MAX_CATCH_UP` behind
+    // (a node that left the view, a suspended daemon) restart at the tail, so one read stays bounded.
+    let as_tail = from == Offset::TAIL || from.0 > len || len - from.0 > MAX_CATCH_UP;
     if !as_tail {
         if from.0 == len {
             return Ok((Vec::new(), from));
@@ -209,6 +213,19 @@ mod tests {
         );
         assert_eq!(lines.last().unwrap(), "line-09999");
         assert!(lines.first().unwrap().as_str() > "line-00000");
+    }
+
+    #[test]
+    fn an_offset_far_behind_the_end_jumps_to_the_tail_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = numbered(40_000); // 440 000 bytes, more than MAX_CATCH_UP past offset 0
+        let path = file_with(&dir, body.as_bytes());
+
+        let (lines, offset) = read_complete_lines(&path, Offset(0)).unwrap();
+        assert_eq!(offset, Offset(body.len() as u64));
+        assert!(lines.len() < 10_000, "{}", lines.len());
+        assert_eq!(lines.last().unwrap(), "line-39999");
+        assert!(lines.iter().all(|l| l.len() == 10), "only whole lines");
     }
 
     #[test]
