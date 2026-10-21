@@ -208,7 +208,18 @@ async fn write_emission(
     let tmp = dir.join(format!(".{node_id}.json.tmp"));
     let body = serde_json::to_vec(facts)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    tokio::fs::write(&tmp, body).await?;
+    // Synced before the rename, so a crash never leaves a partial file under the final name.
+    let written = async {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(&body).await?;
+        file.sync_all().await
+    }
+    .await;
+    if let Err(error) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error);
+    }
     if let Err(error) = tokio::fs::rename(&tmp, &path).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(error);
