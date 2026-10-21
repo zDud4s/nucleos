@@ -424,6 +424,22 @@ class RecordTests(unittest.TestCase):
         self.assertTrue(Path(close["args"]["handoff_path"]).is_file())
         self.assertEqual([r["verdict"] for r in self.manifest["records"]], ["retry", "failed"])
 
+    def test_relaunching_does_not_revert_when_the_leaf_returned_no_report(self):
+        write(self.repo, "a/x.txt", "x1\n")
+        write(self.repo, "a/new.txt", "n\n")
+        out = self.rec("L1", "")  # the leaf came back with no report at all
+        self.assertEqual(out["verdict"], "retry")
+        self.assertEqual(out["reverted"], [])
+        self.assertEqual(out["accepted"], [])
+        self.assertEqual(out["mcp"], [])
+        self.assertEqual(self.manifest["attempts"]["L1"], 1)
+        self.assertEqual(read(self.repo, "a/x.txt"), "x1\n")  # the relaunch keeps the diff
+        self.assertEqual(read(self.repo, "a/new.txt"), "n\n")
+        self.assertEqual(
+            sorted(tree_record.diff_entries(self.repo)),
+            sorted([(" M", "a/x.txt"), ("??", "a/new.txt")]),
+        )
+
     def test_contract_used_must_exist_in_the_contract(self):
         write(self.repo, "a/x.txt", "x1\n")
         out = self.rec("L1", self.report("L1", ["a/x.txt"], used=["A3", "E9"]))

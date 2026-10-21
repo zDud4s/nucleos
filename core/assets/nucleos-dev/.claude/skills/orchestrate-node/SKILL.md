@@ -61,18 +61,12 @@ When your prompt came from `tree.py prompt`, its rules block and these rules bot
 prompt block is the single source; if they differ, the prompt wins.
 
 - **Your report is your handoff.** Write `<state_dir>/nodes/<root_id>/<node_id>.md` (a reviewer
-  without `Write` returns the same text as its final message; the controller stores it). Use
-  `packets/handoff.md` and fill the header lines the controller reads: `Role:`
-  (`leaf|orchestrator|review`), `Outcome:` (`done|split|contract_request|blocked|failed`) and
-  `Contract used:` (ids from `contract.md`, or `none`). `Status:` must agree with `Outcome`
-  (`done|split` = done, `contract_request|blocked` = blocked, `failed` = failed). At most 60 lines.
-  An invalid report costs one retry, a second one fails the node.
+  without `Write` returns the same text as its final message; the controller stores it). The
+  report format and the per-role rules are in the `## Report format` and `## Rules by role` sections of the prompt `tree.py prompt`
+  rendered for you; follow it.
 - **A gap in the contract is a request, not a decision.** Stop, fill `## Contract request` with what
   is missing and the options, and close with `Outcome: contract_request`. Use only contract ids
   that exist in the file.
-- **Contained paths.** Every child's `owned_paths` sit inside yours; the daemon refuses a child
-  outside them, including when yours are empty. If the split needs a path outside yours, it is not
-  a split: send a `contract_request`.
 - **Ownership is by file.** Globs, never line ranges (ranges are reading hints only). Live leaves
   own disjoint files; a file two pieces need goes to one piece, or to two successive waves. A new
   file belongs to the piece that declares it.
