@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::browser_agent::{
-    agent_args, free_loopback_port, generation_dir_name, is_keepalive_tab_id, keepalive_label,
+    agent_args, free_loopback_port, generation_dir_name, is_keepalive_tab_id, keepalive_label_for,
     keepalive_tab_id, rebuild_decision, RebuildDecision,
 };
 use serde::{Deserialize, Serialize};
@@ -231,6 +231,38 @@ fn frame_navigation_allowed(raw: &str, dev_url: Option<&Url>) -> bool {
     }
 }
 
+/// Whether `url` points at this machine: `localhost`, `*.localhost`, 127.0.0.0/8, `::1` (also as an
+/// IPv4-mapped address) or the unspecified address. Chromium never sends loopback through a proxy
+/// unless told to, so the fence proxy cannot see such requests.
+fn is_loopback_url(url: &Url) -> bool {
+    use std::net::IpAddr;
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // `Url` already normalises decimal/hex/octal IPv4 forms; IPv6 comes bracketed.
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+        Err(_) => host == "localhost" || host.ends_with(".localhost"),
+    }
+}
+
+/// [`navigation_allowed`], plus: an agent tab never reaches loopback hosts (user tabs may).
+fn navigation_allowed_for(url: &Url, dev_url: Option<&Url>, agent: bool) -> bool {
+    navigation_allowed(url, dev_url) && !(agent && is_loopback_url(url))
+}
+
 /// A position and size in logical pixels, relative to the main window's client area.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct Bounds {
@@ -390,6 +422,24 @@ impl Registry {
         self.envs.insert(key.clone(), info);
     }
 
+    /// Forgets the environment `key`, so a dead one is never reused.
+    fn remove_env(&mut self, key: &EnvKey) {
+        self.envs.remove(key);
+    }
+
+    /// The ids of the tabs of `key` that are live or still being built. A rebuild closes both: it
+    /// cancels the reservations, so a tab built against the old generation is closed by its creator.
+    fn tabs_and_creating_of(&self, key: &EnvKey) -> Vec<String> {
+        let mut ids = self.tabs_of(key);
+        ids.extend(
+            self.creating
+                .iter()
+                .filter(|(_, (k, _))| k == key)
+                .map(|(id, _)| id.clone()),
+        );
+        ids
+    }
+
     /// The ids of the live tabs of the environment `key`.
     fn tabs_of(&self, key: &EnvKey) -> Vec<String> {
         self.tabs
@@ -399,7 +449,6 @@ impl Registry {
             .collect()
     }
 
-    #[cfg(test)]
     fn env_of(&self, tab_id: &str) -> Option<&EnvKey> {
         self.tabs.get(tab_id)
     }
@@ -682,9 +731,10 @@ fn guard_frames(_webview: &tauri::Webview, _app: &AppHandle) {}
 // -------------------------------------------------------------------------------------------------
 
 /// A URL a tab may navigate to, parsed and checked against [`navigation_allowed`].
-fn checked_url(app: &AppHandle, raw: &str) -> Result<Url, String> {
+/// `agent` tabs are also kept off loopback hosts (see [`navigation_allowed_for`]).
+fn checked_url(app: &AppHandle, raw: &str, agent: bool) -> Result<Url, String> {
     let url = Url::parse(raw).map_err(|_| "invalid_url".to_string())?;
-    if navigation_allowed(&url, app.config().build.dev_url.as_ref()) {
+    if navigation_allowed_for(&url, app.config().build.dev_url.as_ref(), agent) {
         Ok(url)
     } else {
         Err("url_not_allowed".to_string())
@@ -739,7 +789,10 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
         (RebuildDecision::Rebuild, Some(old)) => {
             rebuilt = true;
             // Close every webview of the environment, the keepalive included, before rebuilding.
-            let ids = state.registry().tabs_of(key);
+            let old_keepalive = keepalive_label_for(&key.project, old.generation)?;
+            // Tabs still being built are included: removing them cancels the reservation, so the
+            // creator closes the webview it built against the old generation.
+            let ids = state.registry().tabs_and_creating_of(key);
             for id in ids {
                 let label = label_for(&id);
                 if let Some(webview) = app.get_webview(&label) {
@@ -748,7 +801,7 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
                 }
                 state.registry().remove_tab(&id);
             }
-            if let Some(webview) = app.get_webview(&keepalive_label(&key.project)?) {
+            if let Some(webview) = app.get_webview(&old_keepalive) {
                 let _ = webview.close();
             }
             // Always a fresh directory: WebView2 may refuse the old one with new arguments while
@@ -758,6 +811,34 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
         _ => 0,
     };
 
+    let built = build_agent_env(app, key, proxy_addr, generation);
+    match &built {
+        Ok(env) => state.registry().replace_env(key, env.clone()),
+        // The old webviews are already closed: drop the stale env so it is never reused.
+        Err(_) if rebuilt => state.registry().remove_env(key),
+        Err(_) => {}
+    }
+    if rebuilt {
+        let _ = app.emit_to(
+            MAIN_LABEL,
+            ENV_REBUILT_EVENT,
+            EnvRebuilt {
+                project: key.project.clone(),
+                role: Role::Agent.as_str().to_string(),
+                closed_tab_ids: closed_tab_ids(&closed_labels),
+            },
+        );
+    }
+    built
+}
+
+/// Picks the port, describes the environment of `generation` and starts its keepalive webview.
+fn build_agent_env(
+    app: &AppHandle,
+    key: &EnvKey,
+    proxy_addr: &str,
+    generation: u32,
+) -> Result<EnvInfo, String> {
     let base = app.path().local_data_dir().map_err(|e| e.to_string())?;
     let port = free_loopback_port()?;
     let extra = agent_args(proxy_addr, port);
@@ -770,18 +851,6 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
         generation,
     };
     create_keepalive(app, &key.project, &env)?;
-    state.registry().replace_env(key, env.clone());
-    if rebuilt {
-        let _ = app.emit_to(
-            MAIN_LABEL,
-            ENV_REBUILT_EVENT,
-            EnvRebuilt {
-                project: key.project.clone(),
-                role: Role::Agent.as_str().to_string(),
-                closed_tab_ids: closed_tab_ids(&closed_labels),
-            },
-        );
-    }
     Ok(env)
 }
 
@@ -792,10 +861,13 @@ fn create_keepalive(app: &AppHandle, project: &str, env: &EnvInfo) -> Result<(),
         .get_window(MAIN_LABEL)
         .ok_or_else(|| "no_main_window".to_string())?;
     let blank = Url::parse("about:blank").map_err(|e| e.to_string())?;
-    let builder = WebviewBuilder::new(keepalive_label(project)?, WebviewUrl::External(blank))
-        .data_directory(env.data_dir.clone())
-        .additional_browser_args(&env.args)
-        .disable_drag_drop_handler();
+    let builder = WebviewBuilder::new(
+        keepalive_label_for(project, env.generation)?,
+        WebviewUrl::External(blank),
+    )
+    .data_directory(env.data_dir.clone())
+    .additional_browser_args(&env.args)
+    .disable_drag_drop_handler();
     match window.add_child(
         builder,
         LogicalPosition::new(0.0, 0.0),
@@ -829,6 +901,8 @@ fn build_webview(
     let (load_app, load_id, load_info) = (app.clone(), tab_id.to_string(), info.clone());
     let (title_app, title_id, title_info) = (app.clone(), tab_id.to_string(), info.clone());
     let win_dev_url = dev_url.clone();
+    // Only the agent environment has a proxy.
+    let agent = env.proxy_addr.is_some();
 
     WebviewBuilder::new(label_for(tab_id), WebviewUrl::External(url))
         .data_directory(env.data_dir.clone())
@@ -837,7 +911,7 @@ fn build_webview(
         // the app's `files://dropped`.
         .disable_drag_drop_handler()
         .on_navigation(move |next| {
-            if !navigation_allowed(next, dev_url.as_ref()) {
+            if !navigation_allowed_for(next, dev_url.as_ref(), agent) {
                 return false;
             }
             {
@@ -849,7 +923,7 @@ fn build_webview(
             true
         })
         .on_new_window(move |requested, _features| {
-            if navigation_allowed(&requested, win_dev_url.as_ref()) {
+            if navigation_allowed_for(&requested, win_dev_url.as_ref(), agent) {
                 let payload = NewWindow {
                     from_tab_id: win_id.clone(),
                     url: requested.to_string(),
@@ -880,11 +954,17 @@ fn create_tab(
     url: Url,
     bounds: Bounds,
 ) -> Result<(), String> {
+    let state = app.state::<Browser>();
+    // For an agent tab the env lookup and the reservation happen under `agent_gate`, so they are
+    // atomic with a rebuild: a rebuild either finished before (new generation seen) or starts after
+    // (and cancels this reservation). `ensure_agent_env` never calls this function, so the gate is
+    // never taken twice in one task. The gate is released before the webview is built.
+    let gate = (key.role == Role::Agent)
+        .then(|| state.agent_gate.lock().unwrap_or_else(|e| e.into_inner()));
     let env = ensure_env(app, &key)?;
     // Reserved before `add_child`, so a close that arrives while the webview is being built is seen.
-    app.state::<Browser>()
-        .registry()
-        .reserve_tab(&tab_id, key)?;
+    state.registry().reserve_tab(&tab_id, key)?;
+    drop(gate);
     let result = create_reserved(app, &tab_id, url, bounds, &env);
     if result.is_err() {
         // A no-op once `finish_tab` ran; frees the id when the build failed before it.
@@ -946,6 +1026,34 @@ pub struct EnsureReply {
     cdp_http: Option<String>,
 }
 
+/// Accepts only `host:port` for the agent proxy, since the value is spliced into
+/// `--proxy-server=http://{proxy_addr}`: a hostname/IPv4 of `[A-Za-z0-9.-]` or a bracketed IPv6
+/// literal, then a numeric, nonzero `u16` port. Anything else (spaces, commas, semicolons, slashes,
+/// `=`, `@`, quotes, a scheme) could smuggle extra browser flags or redirect the proxy.
+fn check_proxy_addr(addr: &str) -> Result<(), String> {
+    let bad = || "agent_proxy_invalid".to_string();
+    let (host, port) = addr.rsplit_once(':').ok_or_else(bad)?;
+    let host_ok = if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        !inner.is_empty()
+            && inner
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+    } else {
+        !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    };
+    let port_ok = !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|p| p != 0);
+    if host_ok && port_ok {
+        Ok(())
+    } else {
+        Err(bad())
+    }
+}
+
 /// `async` so tauri runs it off the main thread; the agent build (which calls `add_child`) goes to
 /// `spawn_blocking`. `proxy_addr` is required for the agent environment and refused for the owner.
 #[tauri::command]
@@ -969,6 +1077,7 @@ pub async fn browser_env_ensure(
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
                 .ok_or_else(|| "agent_proxy_required".to_string())?;
+            check_proxy_addr(&proxy)?;
             keepalive_tab_id(&project)?;
             let env =
                 tauri::async_runtime::spawn_blocking(move || ensure_agent_env(&app, &key, &proxy))
@@ -998,7 +1107,7 @@ pub async fn browser_tab_create(
     let key = EnvKey::new(&project, &role)?;
     check_tab_id(&tab_id)?;
     bounds.validate()?;
-    let url = checked_url(&app, &url)?;
+    let url = checked_url(&app, &url, key.role == Role::Agent)?;
     tauri::async_runtime::spawn_blocking(move || create_tab(&app, key, tab_id, url, bounds))
         .await
         .map_err(|e| e.to_string())?
@@ -1006,10 +1115,14 @@ pub async fn browser_tab_create(
 
 #[tauri::command]
 pub fn browser_tab_navigate(app: AppHandle, tab_id: String, url: String) -> Result<(), String> {
-    let url = checked_url(&app, &url)?;
-    webview_of(&app, &tab_id)?
-        .navigate(url)
-        .map_err(|e| e.to_string())
+    let webview = webview_of(&app, &tab_id)?;
+    let agent = app
+        .state::<Browser>()
+        .registry()
+        .env_of(&tab_id)
+        .is_some_and(|k| k.role == Role::Agent);
+    let url = checked_url(&app, &url, agent)?;
+    webview.navigate(url).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1138,6 +1251,41 @@ mod tests {
 
     fn labels(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn check_proxy_addr_accepts_host_port_only() {
+        for good in [
+            "127.0.0.1:8080",
+            "localhost:1",
+            "my-host.local:65535",
+            "[::1]:3128",
+        ] {
+            assert!(check_proxy_addr(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            ":80",
+            "127.0.0.1",
+            "127.0.0.1:",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "127.0.0.1:+80",
+            "127.0.0.1:80 --no-sandbox",
+            "a,b:80",
+            "a;b:80",
+            "a/b:80",
+            "http://127.0.0.1:80",
+            "a=b:80",
+            "u@127.0.0.1:80",
+            "\"x\":80",
+            "::1:80",
+            "[]:80",
+            "[::1:80",
+            "[g::1]:80",
+        ] {
+            assert!(check_proxy_addr(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1432,6 +1580,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_tabs_never_reach_loopback_but_user_tabs_may() {
+        for raw in [
+            "http://127.0.0.1:8080/",
+            "http://127.1.2.3/",
+            "http://2130706433/",
+            "http://[::1]:3000/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+            "http://localhost:3000/",
+            "http://LOCALHOST./",
+            "http://foo.localhost/",
+        ] {
+            assert!(!navigation_allowed_for(&url(raw), None, true), "{raw}");
+        }
+        for raw in [
+            "http://127.0.0.1:8080/",
+            "http://[::1]:3000/",
+            "http://localhost:3000/",
+        ] {
+            assert!(navigation_allowed_for(&url(raw), None, false), "{raw}");
+        }
+        for raw in ["https://example.com/", "http://8.8.8.8/", "about:blank"] {
+            assert!(navigation_allowed_for(&url(raw), None, true), "{raw}");
+        }
+    }
+
+    #[test]
     fn navigation_never_reaches_the_apps_own_origins() {
         assert!(!navigation_allowed(&url("http://tauri.localhost/"), None));
         assert!(!navigation_allowed(&url("https://tauri.localhost/x"), None));
@@ -1556,6 +1731,42 @@ mod tests {
         let k = key("p", Role::Owner);
         reg.ensure_env(&k, || env("--x"));
         (reg, k)
+    }
+
+    #[test]
+    fn remove_env_forgets_the_env_and_blocks_new_reservations() {
+        let (mut reg, k) = registry_with_env();
+        reg.remove_env(&k);
+        assert_eq!(reg.env(&k), None);
+        assert_eq!(reg.reserve_tab("t1", k), Err("unknown_env".to_string()));
+    }
+
+    #[test]
+    fn a_rebuild_cancels_tabs_still_being_built() {
+        let (mut reg, k) = registry_with_env();
+        reg.reserve_tab("live", k.clone()).unwrap();
+        reg.finish_tab("live").unwrap();
+        reg.reserve_tab("building", k.clone()).unwrap();
+        let mut ids = reg.tabs_and_creating_of(&k);
+        ids.sort();
+        assert_eq!(ids, vec!["building", "live"]);
+        for id in ids {
+            reg.remove_tab(&id);
+        }
+        // The build that was in flight can no longer become a live tab.
+        assert_eq!(reg.finish_tab("building"), Err("unknown_tab".to_string()));
+        assert!(!reg.has_tab("live"));
+    }
+
+    #[test]
+    fn keepalive_labels_of_any_generation_are_not_tab_ids() {
+        let label = keepalive_label_for("p", 3).unwrap();
+        assert_eq!(
+            closed_tab_ids(std::slice::from_ref(&label)),
+            Vec::<String>::new()
+        );
+        let id = tab_id_of_label(&label).unwrap();
+        assert_eq!(check_tab_id(id), Err("invalid_tab_id".to_string()));
     }
 
     #[test]

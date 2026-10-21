@@ -56,6 +56,8 @@ export type AgentPollerHandlers = {
   onClose(req: EmbeddedRequest & { session_id: string }): Promise<void> | void;
   /** Bring an agent tab to the front. Fire-and-forget: the daemon needs no ack. */
   onFocus?(req: EmbeddedRequest & { session_id: string }): Promise<void> | void;
+  /** GET /requests failed after having worked (e.g. 404/409/410): re-register the agent env. */
+  onLost?(): Promise<void> | void;
 };
 
 const HANDLED_CAP = 500;
@@ -78,6 +80,19 @@ export function startAgentPoller(
     }
   };
 
+  // Handlers run detached: a slow ack (up to 10 s) must not stall GET /requests, or the
+  // daemon's 30 s registration lapses. A rejection or throw is swallowed per handler.
+  const dispatch = (run: () => Promise<void> | void) => {
+    try {
+      void Promise.resolve(run()).catch(() => {});
+    } catch {
+      // A throwing handler must not stop the rest of the batch.
+    }
+  };
+
+  // True once a GET /requests succeeded; reset when it fails, so onLost fires once per outage.
+  let worked = false;
+
   const tick = async () => {
     if (stopped || busy) return;
     busy = true;
@@ -85,29 +100,31 @@ export function startAgentPoller(
       let reqs: EmbeddedRequest[];
       try {
         reqs = await embeddedRequests();
+        worked = true;
       } catch {
+        // Any failure (network, 404/409/410: registration gone) after a working poll:
+        // ask the owner to prepare/ensure/register again.
+        if (worked && !stopped) {
+          worked = false;
+          dispatch(() => handlers.onLost?.());
+        }
         return;
       }
       for (const req of reqs ?? []) {
         if (stopped) return;
         if (handled.has(req.request_id)) continue;
-        try {
-          if (req.kind === "open" && req.url) {
-            markHandled(req.request_id);
-            await handlers.onOpen(req as EmbeddedRequest & { url: string });
-          } else if (req.kind === "close" && req.session_id) {
-            markHandled(req.request_id);
-            await handlers.onClose(
-              req as EmbeddedRequest & { session_id: string },
-            );
-          } else if (req.kind === "focus" && req.session_id) {
-            markHandled(req.request_id);
-            await handlers.onFocus?.(
-              req as EmbeddedRequest & { session_id: string },
-            );
-          }
-        } catch {
-          // A failing handler must not stop the loop or the rest of the batch.
+        if (req.kind === "open" && req.url) {
+          markHandled(req.request_id);
+          const r = req as EmbeddedRequest & { url: string };
+          dispatch(() => handlers.onOpen(r));
+        } else if (req.kind === "close" && req.session_id) {
+          markHandled(req.request_id);
+          const r = req as EmbeddedRequest & { session_id: string };
+          dispatch(() => handlers.onClose(r));
+        } else if (req.kind === "focus" && req.session_id) {
+          markHandled(req.request_id);
+          const r = req as EmbeddedRequest & { session_id: string };
+          dispatch(() => handlers.onFocus?.(r));
         }
       }
     } finally {

@@ -8,16 +8,23 @@ import {
   addAgentTab,
   findTabById,
   findTabBySessionId,
+  EMPTY_PROJECT_TABS,
+  listenBrowserEvents,
   newTab,
   removeTabById,
   setTabSessionId,
   tabClose,
   tabCreate,
   type Bounds,
+  type NewWindow,
+  type ProcessFailed,
+  type Tab,
   type TabMap,
+  type TabState,
 } from "./browser-tabs";
 import {
   agentTabUrl,
+  ensureAgentEnv,
   mintNonce,
   reportAgentTabClosed,
   startAgentPoller,
@@ -32,12 +39,14 @@ export type BrowserSnapshot = {
   created: ReadonlySet<string>;
   focusIntent: FocusIntent | null;
   agentNotice: Record<string, string>;
+  /** The WebView2 Runtime is not installed. */
+  runtimeMissing: boolean;
 };
 
 const FALLBACK_BOUNDS: Bounds = { x: 0, y: 0, width: 800, height: 600 };
 
 function initial(): BrowserSnapshot {
-  return { tabMap: {}, created: new Set(), focusIntent: null, agentNotice: {} };
+  return { tabMap: {}, created: new Set(), focusIntent: null, agentNotice: {}, runtimeMissing: false };
 }
 
 let state: BrowserSnapshot = initial();
@@ -120,6 +129,7 @@ export function resetBrowserStore(): void {
   boundsProvider = null;
   focusNonce = 0;
   handling.clear();
+  agentProjects.clear();
   for (const listener of listeners) listener();
 }
 
@@ -148,6 +158,26 @@ export async function handleAgentOpen(
     setTabMap((map) => removeTabById(map, tabId).map);
     unmarkCreated(tabId);
     void tabClose(tabId).catch(() => {});
+  } finally {
+    // Trim the de-dupe set once the request is done; the poller's own capped set covers re-delivery.
+    handling.delete(req.request_id);
+  }
+}
+
+// Projects whose agent env the shell has prepared; re-run after the daemon drops the registration.
+const agentProjects = new Set<string>();
+
+/** Prepare (once per call) the agent browser env for a project and surface a failure as a notice. */
+export async function ensureProjectAgent(project: string): Promise<void> {
+  agentProjects.add(project);
+  const result = await ensureAgentEnv(project);
+  if (!result.ok) setAgentNotice(project, result.reason);
+}
+
+/** The daemon lost our registration (requests failed or 404/409/410): redo prepare/ensure/register. */
+export function reregisterAgentProjects(): void {
+  for (const project of agentProjects) {
+    void ensureProjectAgent(project).catch(() => {});
   }
 }
 
@@ -189,27 +219,134 @@ export function handleEnvRebuilt(ev: EnvRebuilt): void {
   }
 }
 
-/** Start the 1 s request poller and the env-rebuilt listener; returns a stop function. */
+/** Merge a patch into the tab with this id, wherever it lives. */
+export function patchTab(tabId: string, patch: Partial<Tab>): void {
+  setTabMap((map) => {
+    const next: TabMap = {};
+    for (const [id, entry] of Object.entries(map)) {
+      next[id] = entry.tabs.some((tab) => tab.id === tabId)
+        ? { ...entry, tabs: entry.tabs.map((tab) => (tab.id === tabId ? { ...tab, ...patch } : tab)) }
+        : entry;
+    }
+    return next;
+  });
+}
+
+/** Drop the daemon session id of a tab (its session was reported closed). */
+function clearTabSessionId(tabId: string): void {
+  setTabMap((map) => {
+    const found = findTabById(map, tabId);
+    if (found === undefined || found.tab.sessionId === undefined) return map;
+    const entry = map[found.project];
+    return {
+      ...map,
+      [found.project]: {
+        ...entry,
+        tabs: entry.tabs.map((tab) => {
+          if (tab.id !== tabId) return tab;
+          const { sessionId: _dropped, ...rest } = tab;
+          return rest;
+        }),
+      },
+    };
+  });
+}
+
+/**
+ * Open an owner tab in a project and create its native webview. A creation failure removes the
+ * tab again and rejects, so the caller can surface the message.
+ */
+export async function openOwnerTab(project: string, url: string): Promise<void> {
+  const id = crypto.randomUUID();
+  setTabMap((map) => {
+    const entry = map[project] ?? EMPTY_PROJECT_TABS;
+    return { ...map, [project]: { tabs: [...entry.tabs, newTab(id, url)], activeId: id } };
+  });
+  try {
+    await tabCreate(project, "owner", id, url, readBounds());
+  } catch (e: unknown) {
+    setTabMap((map) => {
+      const entry = map[project] ?? EMPTY_PROJECT_TABS;
+      const tabs = entry.tabs.filter((tab) => tab.id !== id);
+      return {
+        ...map,
+        [project]: {
+          tabs,
+          activeId: entry.activeId === id ? (tabs[tabs.length - 1]?.id ?? null) : entry.activeId,
+        },
+      };
+    });
+    throw e;
+  }
+  // Skip a tab closed while it was being created.
+  if (findTabById(state.tabMap, id) !== undefined) markCreated(id);
+}
+
+export function handleTabState(s: TabState): void {
+  patchTab(s.tabId, {
+    url: s.url,
+    title: s.title,
+    loading: s.loading,
+    canGoBack: s.canGoBack,
+    canGoForward: s.canGoForward,
+    secure: s.secure,
+  });
+}
+
+export function handleNewWindow(w: NewWindow): void {
+  const found = findTabById(state.tabMap, w.fromTabId);
+  // An agent tab's popups are dropped: the agent owns that tab's navigation.
+  if (found === undefined || found.tab.role === "agent") return;
+  void openOwnerTab(found.project, w.url).catch(() => {});
+}
+
+export function handleProcessFailed(f: ProcessFailed): void {
+  patchTab(f.tabId, { failed: true });
+  const found = findTabById(state.tabMap, f.tabId);
+  if (found?.tab.role === "agent" && found.tab.sessionId !== undefined) {
+    // Once the session is reported closed the tab no longer belongs to it.
+    void reportAgentTabClosed(found.tab.sessionId)
+      .catch(() => {})
+      .then(() => clearTabSessionId(f.tabId));
+  }
+}
+
+export function setRuntimeMissing(): void {
+  if (state.runtimeMissing) return;
+  set({ ...state, runtimeMissing: true });
+}
+
+/**
+ * Start the 1 s request poller and the `browser://` listeners (tab state, new window, process
+ * failure, runtime missing, env rebuilt) for the whole shell session; returns a stop function.
+ */
 export function startBrowserBridge(): () => void {
   const stopPoller = startAgentPoller({
     onOpen: handleAgentOpen,
     onClose: handleAgentClose,
     onFocus: handleAgentFocus,
+    onLost: reregisterAgentProjects,
   });
   let stopped = false;
-  let unlisten: (() => void) | null = null;
+  const unlistens: Array<() => void> = [];
+  const keep = (un: () => void) => {
+    if (stopped) un();
+    else unlistens.push(un);
+  };
   void listen<EnvRebuilt>("browser://env-rebuilt", (e) => handleEnvRebuilt(e.payload)).then(
-    (un) => {
-      if (stopped) un();
-      else unlisten = un;
-    },
+    keep,
     () => {},
   );
+  void listenBrowserEvents({
+    onTabState: handleTabState,
+    onNewWindow: handleNewWindow,
+    onProcessFailed: handleProcessFailed,
+    onRuntimeMissing: setRuntimeMissing,
+  }).then(keep, () => {});
   return () => {
     if (stopped) return;
     stopped = true;
     stopPoller();
-    unlisten?.();
-    unlisten = null;
+    for (const un of unlistens.splice(0)) un();
   };
 }

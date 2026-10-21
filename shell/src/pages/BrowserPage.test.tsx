@@ -8,8 +8,10 @@ import {
   requestFocus,
   resetBrowserStore,
   setTabMap,
+  startBrowserBridge,
 } from "../data/browser-store";
 import { addAgentTab, newTab, setTabSessionId } from "../data/browser-tabs";
+import { resetAgentControlState } from "./AgentControlBar";
 import { BrowserPage } from "./BrowserPage";
 
 const mocks = vi.hoisted(() => ({
@@ -29,6 +31,7 @@ vi.mock("../data/browser-agent", () => ({
   mintNonce: () => "nonce-1",
   agentTabUrl: (n: string) => `about:blank#${n}`,
   reportAgentTabClosed: mocks.reportAgentTabClosed,
+  startAgentPoller: () => () => {},
 }));
 vi.mock("../data/browser-embedded", () => ({
   embeddedAck: mocks.embeddedAck,
@@ -87,6 +90,8 @@ function state(tabId: string, over: Record<string, unknown> = {}) {
   };
 }
 
+let stopBridge: () => void = () => {};
+
 beforeEach(() => {
   vi.stubGlobal("ResizeObserver", FakeResizeObserver);
   mocks.invoke.mockReset();
@@ -97,6 +102,9 @@ beforeEach(() => {
   mocks.ensureAgentEnv.mockReset();
   mocks.ensureAgentEnv.mockResolvedValue({ ok: true, cdpHttp: "http://127.0.0.1:1" });
   resetBrowserStore();
+  resetAgentControlState();
+  // The shell root runs the bridge for the whole session; the page only reads the store.
+  stopBridge = startBrowserBridge();
   mocks.embeddedOwner.mockReset();
   mocks.embeddedOwner.mockResolvedValue(undefined);
   mocks.embeddedKeep.mockReset();
@@ -120,6 +128,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  stopBridge();
   vi.restoreAllMocks();
 });
 
@@ -232,7 +241,7 @@ describe("BrowserPage", () => {
   it("opens a new tab for a new-window event", async () => {
     render(<BrowserPage />);
     const tabId = await openTab();
-    await waitFor(() => expect(mocks.listeners.size).toBe(4));
+    await waitFor(() => expect(mocks.listeners.size).toBe(5));
     emit("new-window", { fromTabId: tabId, url: "https://popup.example/" });
     await waitFor(() => expect(calls("browser_tab_create")).toHaveLength(2));
     expect(calls("browser_tab_create")[1]).toMatchObject({
@@ -254,7 +263,7 @@ describe("BrowserPage", () => {
 
   it("explains a missing WebView2 Runtime", async () => {
     render(<BrowserPage />);
-    await waitFor(() => expect(mocks.listeners.size).toBe(4));
+    await waitFor(() => expect(mocks.listeners.size).toBe(5));
     emit("runtime-missing", {});
     expect(screen.getByText(/WebView2 Runtime is missing/)).toBeTruthy();
   });
@@ -274,7 +283,7 @@ describe("BrowserPage", () => {
     const openReq = { request_id: "r1", project: "alpha", url: "https://a.example/", kind: "embedded" };
 
     async function openAgent(): Promise<string> {
-      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      await waitFor(() => expect(mocks.listeners.size).toBe(5));
       act(() => {
         void handleAgentOpen(openReq);
       });
@@ -344,7 +353,7 @@ describe("BrowserPage", () => {
     it("reports a process failure of an agent tab", async () => {
       render(<BrowserPage />);
       const tabId = await openAgent();
-      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      await waitFor(() => expect(mocks.listeners.size).toBe(5));
       emit("process-failed", { tabId, kind: "crashed" });
       expect(mocks.reportAgentTabClosed).toHaveBeenCalledWith("s1");
     });
@@ -377,7 +386,7 @@ describe("BrowserPage", () => {
     it("opens an agent tab in my tabs as an owner tab", async () => {
       seedAgent("alpha", "a-1", "s9");
       render(<BrowserPage />);
-      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      await waitFor(() => expect(mocks.listeners.size).toBe(5));
       emit("tab-state", state("a-1", { url: "https://deep.example/page" }));
       fireEvent.click(screen.getByRole("button", { name: "Take control" }));
       fireEvent.click(await screen.findByRole("button", { name: "Open in my tabs" }));
@@ -391,19 +400,56 @@ describe("BrowserPage", () => {
       await waitFor(() => expect(last(calls("browser_tabs_show"))?.tabId).toBe(id));
     });
 
+    it("disables the omnibox and navigation while the agent drives, enables them after Take control", async () => {
+      seedAgent("alpha", "a-1", "s-ctl");
+      render(<BrowserPage />);
+      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      emit("tab-state", state("a-1", { canGoBack: true, canGoForward: true }));
+      const disabled = (name: string) => (screen.getByRole("button", { name }) as HTMLButtonElement).disabled;
+      expect((screen.getByRole("textbox", { name: "Address" }) as HTMLInputElement).disabled).toBe(true);
+      expect(disabled("Back")).toBe(true);
+      expect(disabled("Forward")).toBe(true);
+      expect(disabled("Reload")).toBe(true);
+      fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+      await screen.findByText("You are driving");
+      expect((screen.getByRole("textbox", { name: "Address" }) as HTMLInputElement).disabled).toBe(false);
+      expect(disabled("Back")).toBe(false);
+      expect(disabled("Forward")).toBe(false);
+      expect(disabled("Reload")).toBe(false);
+    });
+
+    it("cannot revive a detached agent tab after a process failure", async () => {
+      seedAgent("alpha", "a-1", "s-dead");
+      render(<BrowserPage />);
+      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+      await screen.findByText("You are driving");
+      emit("process-failed", { tabId: "a-1", kind: "crashed" });
+      await waitFor(() => expect(mocks.reportAgentTabClosed).toHaveBeenCalledWith("s-dead"));
+      await screen.findByText("This tab crashed");
+      // The session id is cleared, so the tab is locked again and offers no reload.
+      await waitFor(() =>
+        expect((screen.getByRole("button", { name: "Reload" }) as HTMLButtonElement).disabled).toBe(true),
+      );
+      expect(within(screen.getByRole("alert")).queryByRole("button", { name: "Reload" })).toBeNull();
+      expect(calls("browser_tab_reload")).toHaveLength(0);
+    });
+
     it("drops a new-window event from an agent tab", async () => {
       render(<BrowserPage />);
       const tabId = await openAgent();
-      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      await waitFor(() => expect(mocks.listeners.size).toBe(5));
       emit("new-window", { fromTabId: tabId, url: "https://popup.example/" });
       expect(calls("browser_tab_create")).toHaveLength(1);
     });
   });
 
-  it("unsubscribes from the events on unmount", async () => {
+  it("keeps the event listeners on unmount; stopping the bridge unlistens", async () => {
     const { unmount } = render(<BrowserPage />);
-    await waitFor(() => expect(mocks.listeners.size).toBe(4));
+    await waitFor(() => expect(mocks.listeners.size).toBe(5));
     unmount();
-    await waitFor(() => expect(mocks.unlisten).toHaveBeenCalledTimes(4));
+    expect(mocks.unlisten).not.toHaveBeenCalled();
+    stopBridge();
+    await waitFor(() => expect(mocks.unlisten).toHaveBeenCalledTimes(5));
   });
 });

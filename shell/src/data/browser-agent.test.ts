@@ -107,6 +107,46 @@ describe("startAgentPoller", () => {
     stop();
   });
 
+  it("does not await handlers: a slow open does not block the batch or the next poll", async () => {
+    const h = mk();
+    h.onOpen.mockReturnValue(new Promise(() => {}));
+    emb.embeddedRequests.mockResolvedValue([
+      { request_id: "a", kind: "open", project: "p", url: "u" },
+      { request_id: "b", kind: "close", project: "p", session_id: "s1" },
+    ]);
+    const stop = startAgentPoller(h);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(h.onClose).toHaveBeenCalledTimes(1);
+    expect(emb.embeddedRequests.mock.calls.length).toBeGreaterThanOrEqual(3);
+    stop();
+  });
+
+  it("calls onLost once per outage, only after a poll worked", async () => {
+    const onLost = vi.fn();
+    emb.embeddedRequests
+      .mockRejectedValueOnce(new Error("early"))
+      .mockResolvedValueOnce([])
+      .mockRejectedValueOnce(new Error("404"))
+      .mockRejectedValueOnce(new Error("404"))
+      .mockResolvedValueOnce([])
+      .mockRejectedValue(new Error("410"));
+    const stop = startAgentPoller({ ...mk(), onLost });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onLost).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(onLost).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(onLost).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
+  it("survives a rejecting onLost", async () => {
+    emb.embeddedRequests.mockResolvedValueOnce([]).mockRejectedValue(new Error("x"));
+    const stop = startAgentPoller({ ...mk(), onLost: () => Promise.reject(new Error("boom")) });
+    await vi.advanceTimersByTimeAsync(3000);
+    stop();
+  });
+
   it("survives a throwing handler", async () => {
     const h = mk();
     h.onOpen.mockRejectedValueOnce(new Error("boom"));
