@@ -1056,6 +1056,38 @@ mod tests {
         assert!(channel_instances_exist(&st));
     }
 
+    #[tokio::test]
+    async fn launch_all_skips_spawn_when_sidecars_not_wanted() {
+        let st = state().await;
+        // Whatever the credential store holds, nothing is spawned or marked launched, and the
+        // secrets cache is refreshed for every manifest (a secondary daemon still reports it).
+        launch_all(&st, false).await;
+        for manifest in MANIFESTS {
+            assert!(st.channels.presence.launched_at(manifest.id).is_none());
+            assert!(!st.channels.presence.is_live(manifest.id));
+            assert!(
+                st.channels
+                    .presence
+                    .lock()
+                    .missing
+                    .contains_key(manifest.id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_all_marks_secrets_present_so_channel_instances_exist() {
+        let st = state().await;
+        assert!(!channel_instances_exist(&st));
+        launch_all(&st, false).await;
+        // The cache now mirrors the credential store: an instance exists exactly when some
+        // manifest has no missing required secret.
+        let expected = MANIFESTS
+            .iter()
+            .any(|m| st.channels.presence.lock().missing[m.id].is_empty());
+        assert_eq!(channel_instances_exist(&st), expected);
+    }
+
     #[test]
     fn routing_state_roundtrips_its_fields() {
         let all = [
@@ -1346,6 +1378,28 @@ mod tests {
             ]
         );
         assert_eq!(env_for(&FAKE, "u", "t", &[]).len(), 3);
+    }
+
+    #[test]
+    fn env_for_telegram_has_the_channel_vars_and_no_control_token() {
+        // The retired v1 env handed the sidecar the Control token; the channel env must not.
+        let control_token = "control-token-must-not-leak";
+        let env: std::collections::HashMap<String, String> = env_for(
+            &TELEGRAM,
+            "http://127.0.0.1:8791",
+            "telegram.svc-secret",
+            &[("TELEGRAM_BOT_TOKEN", "bot".to_string())],
+        )
+        .into_iter()
+        .collect();
+
+        assert_eq!(env.len(), 4);
+        assert_eq!(env["NUCLEOS_DAEMON_URL"], "http://127.0.0.1:8791");
+        assert_eq!(env["NUCLEOS_CHANNEL_ID"], "telegram");
+        assert_eq!(env["NUCLEOS_CHANNEL_TOKEN"], "telegram.svc-secret");
+        assert_eq!(env["TELEGRAM_BOT_TOKEN"], "bot");
+        assert!(!env.contains_key("NUCLEOS_DAEMON_TOKEN"));
+        assert!(env.values().all(|v| v != control_token));
     }
 
     #[tokio::test]

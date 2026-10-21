@@ -123,15 +123,38 @@ func TestE2ERateLimitBecomesRetryAfterAndRedelivers(t *testing.T) {
 	// (30 s) after 45 s; the step covers that without caring which of the two happened.
 	g.pending(1)
 	g.clk.Advance(31 * time.Second)
-	g.waitState(id, fakecore.StateDone)
+	// The core records the ack before the kit releases the action's in-flight slot, so a redelivery that
+	// lands in that gap is skipped and the core holds the row leased with no renewal. That cannot be
+	// ordered against the fake clock, so recover instead of waiting: while the row sits leased and nothing
+	// was sent again, let the lease lapse so the core re-leases and redelivers it.
+	for i := 0; ; i++ {
+		deadline := time.Now().Add(100 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if st, _, _ := g.core.Delivery(id); st == fakecore.StateDone {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		st, _, _ := g.core.Delivery(id)
+		if st == fakecore.StateDone {
+			break
+		}
+		if i >= 20 {
+			t.Fatalf("state = %q after %d lease lapses, want done", st, i)
+		}
+		if st == fakecore.StateLeased && g.bot.sendCount() == 1 {
+			g.clk.Advance(fakecore.LeaseTTL + time.Second)
+		}
+	}
 	if n := g.bot.sendCount(); n != 2 {
 		t.Fatalf("sends = %d, want 2", n)
 	}
 	if refs := g.core.PlatformRefs(id); len(refs) != 1 || refs[0] != "9001" {
 		t.Fatalf("platform refs = %v, want [9001]", refs)
 	}
-	if _, attempts, _ := g.core.Delivery(id); attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", attempts)
+	// A skipped redelivery that was re-leased counts as one more delivery attempt but sends nothing.
+	if _, attempts, _ := g.core.Delivery(id); attempts < 2 {
+		t.Fatalf("attempts = %d, want at least 2", attempts)
 	}
 }
 

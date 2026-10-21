@@ -1384,6 +1384,10 @@ mod tests {
             if crate::source_scan::module_path(&path).starts_with("http/") {
                 continue;
             }
+            // An out-of-line `#[cfg(test)] mod x;` is test code from its first line.
+            if crate::source_scan::is_test_only_module(&path) {
+                continue;
+            }
             let source = std::fs::read_to_string(&path).expect("source file must be readable");
             if crate::source_scan::is_top_level(&path) && name == "distill.rs" {
                 assert!(

@@ -4,20 +4,87 @@
 //! The hub keeps identities in `channel_identities` and doctrine plus the project map in
 //! `channels/telegram.yaml`. Every step here is idempotent and never overwrites an owner edit.
 
-// Wired by run() in M6c.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 use sqlx::SqlitePool;
 
+use crate::state::AppState;
+
 const CHANNEL: &str = "telegram";
 
+/// Names the v1 config file's location, ahead of the `%LOCALAPPDATA%\nucleos` default.
+pub const CONFIG_ENV: &str = "NUCLEOS_TELEGRAM_CONFIG";
+
+/// Where the switch reads and writes.
+#[derive(Debug, Clone)]
+pub(crate) struct SwitchPaths {
+    /// The v1 `telegram-config.json`.
+    pub v1_json: PathBuf,
+    /// The old `telegram.yaml` (doctrine), kept in place.
+    pub old_yaml: PathBuf,
+    /// The hub's `channels/telegram.yaml`.
+    pub new_yaml: PathBuf,
+}
+
+/// The v1 JSON location: the env override, else `%LOCALAPPDATA%\nucleos\telegram-config.json`
+/// (the platform local data directory elsewhere).
+fn v1_json_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(CONFIG_ENV).filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let base = match std::env::var_os("LOCALAPPDATA").filter(|p| !p.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => directories::BaseDirs::new()?.data_local_dir().to_path_buf(),
+    };
+    Some(base.join("nucleos").join("telegram-config.json"))
+}
+
+fn paths_of(state: &AppState) -> Option<SwitchPaths> {
+    let root = state.machine_config_root.as_deref()?;
+    Some(SwitchPaths {
+        v1_json: v1_json_path()?,
+        old_yaml: root.join("telegram.yaml"),
+        new_yaml: root.join("channels").join("telegram.yaml"),
+    })
+}
+
+/// Startup entry: carries the v1 state over. Without a v1 config (or a machine-config root) it
+/// does nothing.
+pub async fn run(state: &AppState) -> Result<(), SwitchError> {
+    match paths_of(state) {
+        Some(paths) => run_at(&state.pool, &paths).await,
+        None => Ok(()),
+    }
+}
+
+/// `run` for the caller that must not stop on a failure: the SQL migration already ran, so the
+/// switch is retried on the next start (every step is idempotent and the JSON is only renamed
+/// once the targets are written).
+pub async fn run_or_warn(state: &AppState) {
+    if let Err(error) = run(state).await {
+        tracing::warn!(%error, "telegram switch: the v1 import failed; startup continues");
+    }
+}
+
+pub(crate) async fn run_at(pool: &SqlitePool, paths: &SwitchPaths) -> Result<(), SwitchError> {
+    let Some(v1) = read_v1_config(&paths.v1_json) else {
+        return Ok(());
+    };
+    import_identities(pool, &v1)
+        .await
+        .map_err(|e| io_err("importing identities from", &paths.v1_json, e))?;
+    if let Some(dir) = paths.new_yaml.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| io_err("creating", dir, e))?;
+    }
+    move_doctrine(&paths.old_yaml, &paths.new_yaml)?;
+    import_projects(&v1, &paths.new_yaml, &paths.v1_json)
+}
+
 /// Error of the file steps: carries the path in its message.
-pub(crate) type SwitchError = Box<dyn std::error::Error + Send + Sync>;
+pub type SwitchError = Box<dyn std::error::Error + Send + Sync>;
 
 fn io_err(action: &str, path: &Path, err: impl std::fmt::Display) -> SwitchError {
     format!("{action} {}: {err}", path.display()).into()
@@ -382,6 +449,79 @@ mod tests {
         import_projects(&with_topics(-100, &[("a", 1)]), &good, &json).unwrap();
         assert!(!json.exists());
         assert!(dir.path().join("telegram-config.json.migrated").exists());
+    }
+
+    fn paths_in(dir: &Path) -> SwitchPaths {
+        SwitchPaths {
+            v1_json: dir.join("telegram-config.json"),
+            old_yaml: dir.join("telegram.yaml"),
+            new_yaml: dir.join("channels").join("telegram.yaml"),
+        }
+    }
+
+    const V1_JSON: &str =
+        r#"{"allowed_chat_id":-100,"allowed_user_ids":[1],"project_topics":{"nucleos":5}}"#;
+
+    #[tokio::test]
+    async fn run_switch_is_a_noop_without_a_v1_config() {
+        let st = state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        std::fs::write(&paths.old_yaml, "doctrine: be brief\n").unwrap();
+        run_at(&st.pool, &paths).await.unwrap();
+        assert!(rows(&st.pool).await.is_empty());
+        assert!(!paths.new_yaml.exists());
+        // No machine-config root at all is also a no-op.
+        assert!(st.machine_config_root.is_none());
+        run(&st).await.unwrap();
+        assert!(rows(&st.pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_switch_twice_changes_nothing() {
+        let st = state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        std::fs::write(&paths.v1_json, V1_JSON).unwrap();
+        std::fs::write(&paths.old_yaml, "doctrine: be brief\n").unwrap();
+        run_at(&st.pool, &paths).await.unwrap();
+        let (identities, yaml) = (
+            rows(&st.pool).await,
+            std::fs::read_to_string(&paths.new_yaml).unwrap(),
+        );
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            project(&paths.new_yaml, "nucleos").as_deref(),
+            Some("-100:5")
+        );
+        assert!(!paths.v1_json.exists());
+        // The second pass finds no JSON (it was retired) and leaves everything as it was.
+        run_at(&st.pool, &paths).await.unwrap();
+        assert_eq!(rows(&st.pool).await, identities);
+        assert_eq!(std::fs::read_to_string(&paths.new_yaml).unwrap(), yaml);
+        // Even with the JSON restored, the import neither duplicates nor overlaps.
+        std::fs::write(&paths.v1_json, V1_JSON).unwrap();
+        run_at(&st.pool, &paths).await.unwrap();
+        assert_eq!(rows(&st.pool).await, identities);
+        assert_eq!(std::fs::read_to_string(&paths.new_yaml).unwrap(), yaml);
+    }
+
+    #[tokio::test]
+    async fn run_switch_failure_does_not_stop_the_daemon() {
+        let st = state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        // `channels` is a file, so the target directory cannot be created.
+        std::fs::write(dir.path().join("channels"), "not a dir").unwrap();
+        std::fs::write(&paths.v1_json, V1_JSON).unwrap();
+        assert!(run_at(&st.pool, &paths).await.is_err());
+        // The JSON stays for the next start.
+        assert!(paths.v1_json.exists());
+        // The failure is an `Err` value, never a panic: `run_or_warn` (what `main` calls) logs it
+        // and returns `()`, so startup goes on. Once the obstacle is gone the same call succeeds.
+        std::fs::remove_file(dir.path().join("channels")).unwrap();
+        run_at(&st.pool, &paths).await.unwrap();
+        assert!(!paths.v1_json.exists());
     }
 
     #[test]

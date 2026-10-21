@@ -20,7 +20,7 @@ pub(crate) mod schema;
 pub mod strings;
 #[cfg(test)]
 mod switch_tests;
-mod telegram_switch;
+pub mod telegram_switch;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod tokens;

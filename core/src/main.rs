@@ -943,29 +943,9 @@ async fn main() {
             }
         });
     }
-    match secrets::load_secret(TELEGRAM_TOKEN_KEY) {
-        Ok(Some(bot_token)) => {
-            let telegram_path = sidecar::binary(sidecar::TELEGRAM);
-            let telegram_env =
-                sidecar::telegram_env(&daemon_client::daemon_url(), &state.token.0, &bot_token);
-            if sidecars_wanted {
-                tokio::spawn(sidecar::supervise(
-                    sidecar::TELEGRAM.to_string(),
-                    telegram_path,
-                    telegram_env,
-                ));
-            }
-            tracing::info!("telegram sidecar supervised");
-        }
-        Ok(None) => {
-            tracing::info!(
-                "no telegram-token stored — telegram sidecar not started (set with --set-telegram-token)"
-            );
-        }
-        Err(e) => {
-            tracing::warn!("failed to read telegram-token from the system credential store: {e}");
-        }
-    }
+    // The v1 Telegram supervisor is gone on purpose: the channel registry launches the v2 adapter
+    // (`channels::registry::launch_all`, below). Two supervisors on one bot would both long-poll
+    // `getUpdates` and Telegram answers the loser with a 409.
     tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
     // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
     // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
@@ -1123,9 +1103,17 @@ async fn main() {
     tokio::spawn(integrations::notify::run_flush_loop(state.clone()));
     // Messages a previous daemon left waiting are sent once, here; afterwards every slot release drains.
     tokio::spawn(assistant::drain_waiting_queues(state.clone()));
-    // Channel loops start only when a channel instance exists (a channel with its secrets present),
-    // which never happens in phase 1: the A2 bodies stay unreachable. Seeding runs first so the
-    // turn watermark and the routing cursors exist before the first discover/route_once.
+    // Carry the v1 Telegram state over first (a failure is logged, the SQL migration already ran),
+    // then launch the adapters: that fills the secrets cache `channel_instances_exist` reads.
+    // A secondary daemon (a test run) must not import, and above all must not retire, the
+    // machine's v1 files.
+    if sidecars_wanted {
+        channels::telegram_switch::run_or_warn(&state).await;
+    }
+    channels::registry::launch_all(&state, sidecars_wanted).await;
+    // Channel loops start only when a channel instance exists (a channel with its secrets present).
+    // Seeding runs first so the turn watermark and the routing cursors exist before the first
+    // discover/route_once.
     if !channels::registry::all().is_empty() && channels::registry::channel_instances_exist(&state)
     {
         let cadence = channels::bus::Cadence::default();
