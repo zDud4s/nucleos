@@ -23,7 +23,7 @@ use super::limits::{
     CLIENT_CHANNEL, HEARTBEAT, LINES_BATCH, METRICS_BATCH, RETENTION, SAFETY_NET, WATCH_DEBOUNCE,
 };
 use super::model::{TermLine, Timestamp};
-use super::source::{AgentSource, Edge, EdgeSource, Sighting, SourceError};
+use super::source::{AgentSource, Edge, EdgeSource, Sighting, SourceError, SourceResult};
 use super::watch::{NotifyWatch, WatchFactory, WatchGuard};
 
 /// How often a source that has nothing to watch (`daemon_runs`) is asked again. Hub-local: the spec
@@ -51,6 +51,9 @@ pub struct HubConfig {
     pub unwatched_poll: Duration,
     /// The first snapshot waits at most this long for the first discovery.
     pub warm_up_timeout: Duration,
+    /// Every adapter call (discover, edges, read) is cut after this long; the failure is logged
+    /// once and the source counts as having missed the round.
+    pub source_timeout: Duration,
 }
 
 impl Default for HubConfig {
@@ -58,7 +61,8 @@ impl Default for HubConfig {
         Self {
             client_channel: CLIENT_CHANNEL,
             unwatched_poll: UNWATCHED_POLL,
-            warm_up_timeout: Duration::from_secs(10),
+            warm_up_timeout: Duration::from_secs(15),
+            source_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -297,26 +301,44 @@ impl FleetHub {
 
     // ---- passes -------------------------------------------------------------------------
 
-    async fn discover_one(&self, source: &dyn AgentSource, since: Timestamp) -> Vec<Sighting> {
-        match source.discover(since).await {
-            Ok(sightings) => sightings,
-            Err(error) => {
-                self.log_once(source.name(), &error);
-                Vec::new()
+    /// One adapter call under `source_timeout`. A failure or a timeout is logged once under
+    /// `scope` and yields `None`.
+    async fn bounded<T>(
+        &self,
+        scope: &str,
+        call: impl std::future::Future<Output = SourceResult<T>>,
+    ) -> Option<T> {
+        match tokio::time::timeout(self.config.source_timeout, call).await {
+            Ok(Ok(value)) => Some(value),
+            Ok(Err(error)) => {
+                self.log_once(scope, &error);
+                None
+            }
+            Err(_) => {
+                let cause = SourceError::msg(format!(
+                    "no answer within {} s",
+                    self.config.source_timeout.as_secs()
+                ));
+                self.log_once(scope, &cause);
+                None
             }
         }
+    }
+
+    async fn discover_one(&self, source: &dyn AgentSource, since: Timestamp) -> Vec<Sighting> {
+        self.bounded(source.name(), source.discover(since))
+            .await
+            .unwrap_or_default()
     }
 
     async fn edges_all(&self, since: Timestamp) -> Vec<Vec<Edge>> {
         let mut lists = Vec::with_capacity(self.edge_sources.len());
         for source in &self.edge_sources {
-            lists.push(match source.edges(since).await {
-                Ok(edges) => edges,
-                Err(error) => {
-                    self.log_once(source.name(), &error);
-                    Vec::new()
-                }
-            });
+            lists.push(
+                self.bounded(source.name(), source.edges(since))
+                    .await
+                    .unwrap_or_default(),
+            );
         }
         lists
     }
@@ -380,7 +402,8 @@ impl FleetHub {
         fuse_cached(&self.sources, &sightings, &edges)
     }
 
-    async fn read_pass(&self, which: ReadWhich<'_>) {
+    /// The line reads the book asks for.
+    async fn read_nodes(&self, which: ReadWhich<'_>) {
         let now = self.clock.now();
         let jobs = self.state().book.read_jobs(which);
         for job in jobs {
@@ -390,21 +413,53 @@ impl FleetHub {
             let Some(node) = source.node_ref(&job.key) else {
                 continue;
             };
-            match source.read_lines(&node, job.offset).await {
-                Ok(read) => {
-                    let outcome = ReadOutcome {
-                        lines: read.lines.into_iter().map(redact_line).collect(),
-                        offset: read.offset,
-                        usage: read.usage,
-                        last_activity_at: read.last_activity_at,
-                    };
-                    let mut state = self.state();
-                    state.book.set_path(&job.id, node.path.clone());
-                    state.book.apply_lines(&job.id, outcome, now);
-                }
-                Err(error) => self.log_once(&format!("{} {}", source.name(), job.id), &error),
-            }
+            let scope = format!("{} {}", source.name(), job.id);
+            let Some(read) = self
+                .bounded(&scope, source.read_lines(&node, job.offset))
+                .await
+            else {
+                continue;
+            };
+            let outcome = ReadOutcome {
+                lines: read.lines.into_iter().map(redact_line).collect(),
+                offset: read.offset,
+                usage: read.usage,
+                last_activity_at: read.last_activity_at,
+            };
+            let mut state = self.state();
+            state.book.set_path(&job.id, node.path.clone());
+            state.book.apply_lines(&job.id, outcome, now);
         }
+    }
+
+    /// How finished runs ended. The native adapter of a session a daemon run launched cannot know
+    /// the run's status, so for such a node the daemon source is read from the start and only its
+    /// `Error` line is kept (a success relies on the native `Final`; a run-only node already gets
+    /// `Final` / `Error` from `daemon_runs` as its own line source).
+    async fn read_errors(&self) {
+        let jobs = self.state().book.error_jobs();
+        for job in jobs {
+            let Some(source) = self.sources.get(job.source) else {
+                continue;
+            };
+            let Some(node) = source.node_ref(&job.key) else {
+                continue;
+            };
+            let scope = format!("{} {} status", source.name(), job.id);
+            let Some(read) = self
+                .bounded(&scope, source.read_lines(&node, job.offset))
+                .await
+            else {
+                continue;
+            };
+            let lines = read.lines.into_iter().map(redact_line).collect();
+            self.state().book.apply_error(&job.id, lines);
+        }
+    }
+
+    async fn read_pass(&self, which: ReadWhich<'_>) {
+        self.read_nodes(which).await;
+        self.read_errors().await;
     }
 
     async fn warm_up(&self) {
@@ -451,7 +506,7 @@ impl FleetHub {
         if unwatched.is_empty() {
             return;
         }
-        self.read_pass(ReadWhich::LiveOf(&unwatched)).await;
+        self.read_nodes(ReadWhich::LiveOf(&unwatched)).await;
     }
 
     fn flush_lines(&self) {
@@ -980,5 +1035,128 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             reads
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_gets_a_heartbeat_every_fifteen_seconds() {
+        let h = harness();
+        h.source.set(vec![root("a")]);
+        let mut sub = h.hub.subscribe().await;
+        drain(&mut sub).await;
+
+        tokio::time::sleep(HEARTBEAT + Duration::from_millis(50)).await;
+        let events = drain(&mut sub).await;
+        assert_eq!(kinds(&events).iter().filter(|k| **k == "heartbeat").count(), 1, "{events:?}");
+        tokio::time::sleep(HEARTBEAT).await;
+        assert_eq!(kinds(&drain(&mut sub).await).iter().filter(|k| **k == "heartbeat").count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_safety_net_finds_a_node_the_watcher_never_reported() {
+        let h = harness();
+        h.source.set(vec![root("a")]);
+        let mut sub = h.hub.subscribe().await;
+        drain(&mut sub).await;
+
+        h.source.set(vec![root("a"), root("late")]);
+        tokio::time::sleep(SAFETY_NET + Duration::from_millis(50)).await;
+
+        let events = drain(&mut sub).await;
+        assert!(events.iter().any(|e| e["t"] == "node" && e["node"]["id"] == "claude-code:late"), "{events:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_are_batched_to_one_event_a_second_and_lines_to_a_tenth() {
+        let h = harness();
+        let key = NodeKey::new("claude-code", "a");
+        h.source.set(vec![root("a")]);
+        let mut sub = h.hub.subscribe().await;
+        drain(&mut sub).await;
+
+        for n in 0..5 {
+            h.source.push_line(&key, &format!("line {n}"));
+            h.hub.dirty_pass([h.source.path_of(&key)].into_iter().collect()).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1_050)).await;
+
+        let events = drain(&mut sub).await;
+        let lines: Vec<_> = events.iter().filter(|e| e["t"] == "lines").collect();
+        let metrics = events.iter().filter(|e| e["t"] == "metrics").count();
+        assert_eq!(lines.len(), 1, "five reads inside one batch become one event: {events:?}");
+        assert_eq!(lines[0]["lines"].as_array().unwrap().len(), 5);
+        assert_eq!(metrics, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_source_is_cut_after_the_source_timeout_and_logged_once() {
+        let h = harness_with(
+            HubConfig { source_timeout: Duration::from_secs(1), ..HubConfig::default() },
+            true,
+        );
+        h.source.set(vec![root("a")]);
+        let mut sub = h.hub.subscribe().await;
+        drain(&mut sub).await;
+
+        h.source.hang_discover.store(true, std::sync::atomic::Ordering::SeqCst);
+        h.hub.safety_net().await;
+        h.hub.safety_net().await;
+
+        // The warm-up discovery plus the two hung ones: each came back (cut), none stalled the hub.
+        assert_eq!(h.source.discoveries.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(h.hub.state().logged.len(), 1, "the same timeout is logged once");
+        assert!(h.hub.is_running());
+    }
+
+    /// The first snapshot of a hub whose only node is a Claude Code session that a daemon run
+    /// launched and that has ended with `status`. Registry: 0 = the native adapter, 1 = daemon_runs.
+    async fn snapshot_after_run_ended(status: &str) -> serde_json::Value {
+        use crate::fleet::model::TermKind;
+        let key = NodeKey::new("claude-code", "a");
+        let native = FakeSource::new("native", vec![]);
+        let daemon = FakeSource::new(crate::fleet::fuse::DAEMON_RUNS_SOURCE, vec![]);
+        let mut seen = root("a");
+        seen.state = NodeState::Done;
+        seen.ended_at = Some(at(990));
+        native.set(vec![seen]);
+        native.push_line(&key, "closing words");
+        let mut run = sighting("claude-code", "a");
+        run.state = NodeState::Done;
+        run.ended_at = Some(at(990));
+        run.last_activity_at = at(990);
+        run.run_id = Some(5);
+        daemon.set(vec![run]);
+        // What `daemon_runs` really answers for a finished run (`stream::final_line`).
+        if status == "completed" {
+            daemon.push_line_kind(&key, TermKind::Final, "All green");
+        } else {
+            daemon.push_line_kind(&key, TermKind::Error, status);
+        }
+        let (native, daemon): (Arc<dyn AgentSource>, Arc<dyn AgentSource>) = (native, daemon);
+        let hub = FleetHub::new(
+            vec![native, daemon],
+            vec![],
+            FakeClock::new(at(1_000)),
+            FakeWatch::new(),
+            HubConfig::default(),
+        );
+        let mut sub = hub.subscribe().await;
+        drain(&mut sub).await.remove(0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_did_not_succeed_ends_done_with_an_error_line_and_a_successful_one_does_not() {
+        for status in ["failed", "cancelled", "timed_out"] {
+            let snapshot = snapshot_after_run_ended(status).await;
+            assert_eq!(snapshot["nodes"][0]["state"], "done", "{status}");
+            let lines = snapshot["lines"]["claude-code:a"].as_array().expect("lines");
+            assert_eq!(lines.len(), 1, "a finished node shows only its last line: {status}");
+            assert_eq!(lines[0]["kind"], "error", "{status}");
+            assert_eq!(lines[0]["text"], status);
+        }
+
+        let snapshot = snapshot_after_run_ended("completed").await;
+        let lines = snapshot["lines"]["claude-code:a"].as_array().expect("lines");
+        assert_eq!(lines[0]["kind"], "text", "success keeps the native closing line");
+        assert_eq!(lines[0]["text"], "closing words");
     }
 }
