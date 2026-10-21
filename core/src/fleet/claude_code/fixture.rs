@@ -2,6 +2,36 @@
 
 use serde_json::{json, Value};
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use super::session::{Proc, ProcessProbe};
+
+/// A probe whose answers the test sets; an unknown pid is dead.
+#[derive(Default)]
+pub struct FakeProbe(Mutex<HashMap<u32, Proc>>);
+
+impl FakeProbe {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, pid: u32, proc: Proc) {
+        self.0.lock().unwrap().insert(pid, proc);
+    }
+
+    /// Alive, with the start token the session file will carry.
+    pub fn alive(&self, pid: u32, token: &str) {
+        self.set(pid, Proc::Alive { start_token: Some(token.to_owned()) });
+    }
+}
+
+impl ProcessProbe for FakeProbe {
+    fn probe(&self, pid: u32) -> Proc {
+        self.0.lock().unwrap().get(&pid).cloned().unwrap_or(Proc::Dead)
+    }
+}
+
 pub const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 /// The project directory name Claude Code derives from `c:\work\proj`.
 pub const PROJ: &str = "c--work-proj";

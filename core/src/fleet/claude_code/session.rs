@@ -98,9 +98,101 @@ pub fn parse_meta(text: &str) -> Result<AgentMeta, &'static str> {
     })
 }
 
+/// What the OS says about a pid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Proc {
+    Dead,
+    /// `start_token` is the process creation time in the same encoding as
+    /// `SessionFile::proc_start`, or `None` where it cannot be read or is not compared.
+    Alive { start_token: Option<String> },
+}
+
+pub trait ProcessProbe: Send + Sync {
+    fn probe(&self, pid: u32) -> Proc;
+}
+
+/// Spec §4: a registry entry is live only if its PID is alive AND the process is the one that
+/// wrote it (`procStart` equal), so a recycled pid does not resurrect a dead session.
+pub fn is_same_process(session: &SessionFile, probe: &dyn ProcessProbe) -> bool {
+    match probe.probe(session.pid) {
+        Proc::Dead => false,
+        Proc::Alive { start_token } => match (&session.proc_start, start_token) {
+            (Some(wrote), Some(now)) => *wrote == now,
+            // Nothing to compare: the pid alone decides.
+            _ => true,
+        },
+    }
+}
+
+pub struct OsProbe;
+
+impl ProcessProbe for OsProbe {
+    fn probe(&self, pid: u32) -> Proc {
+        os_probe(pid)
+    }
+}
+
+/// Windows: `procStart` is the creation FILETIME (verified against `Get-Process ... StartTime`).
+#[cfg(windows)]
+fn os_probe(pid: u32) -> Proc {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    // SAFETY: plain Win32 calls on a handle opened and closed in this block; the out-pointers
+    // are valid locals.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Access denied means the process exists but is not ours to inspect.
+            return if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+                Proc::Alive { start_token: None }
+            } else {
+                Proc::Dead
+            };
+        }
+        let mut code = 0u32;
+        let running = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE;
+        let (mut created, mut exited, mut kernel, mut user) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let timed = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        CloseHandle(handle);
+        if !running {
+            return Proc::Dead;
+        }
+        let start_token = timed.then(|| {
+            ((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)).to_string()
+        });
+        Proc::Alive { start_token }
+    }
+}
+
+/// Unix: existence only. How `procStart` is encoded there is unverified (VERIFY on a Linux or
+/// macOS machine before adding a start-time comparison), and a false "dead" is worse than the
+/// rare pid reuse.
+#[cfg(unix)]
+fn os_probe(pid: u32) -> Proc {
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return Proc::Dead;
+    };
+    if raw <= 0 {
+        return Proc::Dead;
+    }
+    // SAFETY: signal 0 performs the existence and permission checks and delivers nothing.
+    let rc = unsafe { libc::kill(raw, 0) };
+    if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+        Proc::Alive { start_token: None }
+    } else {
+        Proc::Dead
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::claude_code::fixture::FakeProbe;
 
     const FULL: &str = r#"{"pid":19996,"sessionId":"cd303e3a-0","cwd":"c:\\Projects\\nucleos",
         "startedAt":1792523514511,"procStart":"134369971128448809","version":"2.1.304",
@@ -161,5 +253,45 @@ mod tests {
     fn a_user_stopped_agent_counts_as_closed_without_a_finished_marker() {
         let m = parse_meta(r#"{"agentType":"general-purpose","stoppedByUser":true}"#).unwrap();
         assert!(!m.finished && m.stopped_by_user && m.is_closed());
+    }
+
+    fn session(pid: u32, proc_start: Option<&str>) -> SessionFile {
+        let mut s = parse_session(&format!(r#"{{"pid":{pid},"sessionId":"abc"}}"#)).unwrap();
+        s.proc_start = proc_start.map(str::to_owned);
+        s
+    }
+
+    #[test]
+    fn the_session_file_is_live_only_for_the_process_that_wrote_it() {
+        let probe = FakeProbe::new();
+        // Dead pid.
+        assert!(!is_same_process(&session(1, Some("777")), &probe));
+        // Alive, same start time.
+        probe.alive(1, "777");
+        assert!(is_same_process(&session(1, Some("777")), &probe));
+        // Alive, but the pid now belongs to a different process (reuse).
+        assert!(!is_same_process(&session(1, Some("999")), &probe));
+        // Alive and nothing to compare (unix probe, or a file without procStart): the pid decides.
+        probe.set(2, Proc::Alive { start_token: None });
+        assert!(is_same_process(&session(2, Some("777")), &probe));
+        assert!(is_same_process(&session(1, None), &probe));
+    }
+
+    #[test]
+    fn the_os_probe_sees_this_process_and_not_an_absurd_pid() {
+        let me = OsProbe.probe(std::process::id());
+        assert!(matches!(me, Proc::Alive { .. }), "got {me:?}");
+        assert_eq!(OsProbe.probe(u32::MAX - 15), Proc::Dead);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_start_token_is_the_creation_filetime() {
+        let Proc::Alive { start_token: Some(token) } = OsProbe.probe(std::process::id()) else {
+            panic!("this process should be alive with a start token");
+        };
+        let ticks: u64 = token.parse().expect("a decimal FILETIME");
+        // 1970-01-01 in FILETIME ticks: any real process started after it.
+        assert!(ticks > 116_444_736_000_000_000);
     }
 }
