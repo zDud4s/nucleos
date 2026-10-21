@@ -456,14 +456,33 @@ impl Inner {
         self.refresh_registry(st);
         self.attach_sources(st, runs, since);
         let mut out = Vec::new();
+        let mut expired = Vec::new();
         let ids: Vec<String> = st.roots.keys().cloned().collect();
         for id in ids {
             let Some(root) = st.roots.get_mut(&id) else { continue };
             self.refresh_root(&id, root, &mut st.stats);
-            let Some(state) = root_state(root) else { continue };
+            let Some(state) = root_state(root) else {
+                expired.push(id);
+                continue;
+            };
+            let alive = matches!(state, NodeState::Busy | NodeState::Idle);
+            // Spec §4: nothing without activity in the retention window, unless it is alive.
+            if !alive && root_activity(root).is_some_and(|at| at < since) {
+                expired.push(id);
+                continue;
+            }
             self.refresh_children(root, &mut st.stats);
             out.push(root_sighting(&id, root, state));
             child_sightings(&id, root, state, &mut out);
+        }
+        for id in expired {
+            if let Some(root) = st.roots.remove(&id) {
+                // A DEAD registry file keeps naming this session on every pass; remember it (with the
+                // file's stamp) so `attach_sources` does not rebuild the root every 5 s.
+                if let (Some((_, false)), Some(stamp)) = (&root.registry, root.registry_stamp) {
+                    st.stale.insert(id, stamp);
+                }
+            }
         }
         out.sort_by(|a, b| a.key.cmp(&b.key));
         out
@@ -1174,6 +1193,176 @@ mod tests {
         assert!(all.iter().any(|s| s.key.id() == child_id("m1")));
         assert!(all.iter().any(|s| s.key.id() == child_id("m2")));
         assert_eq!(cc.warnings(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dead_root_with_no_activity_inside_the_retention_window_is_not_discovered() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        let transcript = home.transcript(fx::SESSION, &fx::closed_turn());
+        fx::age(&transcript, 60);
+        let probe = Arc::new(FakeProbe::new()); // dead
+        let (cc, _db) = setup(&home, &probe).await;
+        assert!(cc.discover(since()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_root_is_discovered_however_old_its_transcript() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "idle", "777");
+        let transcript = home.transcript(fx::SESSION, &fx::closed_turn());
+        fx::age(&transcript, 600);
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(find(&all, &root_id()).state, NodeState::Idle);
+    }
+
+    #[tokio::test]
+    async fn finished_children_of_a_live_root_stay_however_old() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "idle", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let old = home.subagent(fx::SESSION, "a1", json!({"finished":true}), &fx::closed_turn());
+        fx::age(&old, 600);
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        assert_eq!(find(&cc.discover(since()).await.unwrap(), &child_id("a1")).state, NodeState::Done);
+    }
+
+    #[tokio::test]
+    async fn an_expired_cached_root_is_dropped() {
+        let home = Home::new();
+        let entry = home.session_file(100, fx::SESSION, "busy", "777");
+        let transcript = home.transcript(fx::SESSION, &fx::closed_turn());
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        assert_eq!(cc.discover(since()).await.unwrap().len(), 1);
+
+        std::fs::remove_file(entry).unwrap();
+        probe.set(100, session::Proc::Dead);
+        fx::age(&transcript, 60);
+        assert!(cc.discover(since()).await.unwrap().is_empty());
+        assert!(cc.inner.lock().roots.is_empty(), "the cache entry should be evicted");
+    }
+
+    #[tokio::test]
+    async fn an_evicted_stale_session_is_not_rebuilt_until_its_registry_file_changes() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777"); // a leftover: its pid is dead
+        let transcript = home.transcript(fx::SESSION, &fx::closed_turn());
+        fx::age(&transcript, 60);
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, _db) = setup(&home, &probe).await;
+
+        assert!(cc.discover(since()).await.unwrap().is_empty());
+        assert_eq!(cc.stats().tail_reads, 1, "built once, then evicted as outside the window");
+        for _ in 0..3 {
+            assert!(cc.discover(since()).await.unwrap().is_empty());
+        }
+        assert_eq!(cc.stats().tail_reads, 1, "later passes must not re-create the root");
+        assert!(cc.inner.lock().roots.is_empty());
+
+        // The file changes (a longer status word, so the stamp differs on any filesystem):
+        // the session is evaluated afresh.
+        home.session_file(100, fx::SESSION, "waiting", "777");
+        assert!(cc.discover(since()).await.unwrap().is_empty());
+        assert_eq!(cc.stats().tail_reads, 2);
+
+        // And when the file goes away the mark is forgotten.
+        std::fs::remove_file(home.path().join(".claude").join("sessions").join("100.json")).unwrap();
+        cc.discover(since()).await.unwrap();
+        assert!(cc.inner.lock().stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_transcript_is_searched_across_project_dirs_only_when_projects_changes() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        let projects = home.path().join(".claude").join("projects");
+        std::fs::create_dir_all(projects.join("elsewhere")).unwrap();
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+
+        let all = cc.discover(since()).await.unwrap();
+        assert!(!find(&all, &root_id()).has_transcript);
+        assert_eq!(cc.stats().project_scans, 1);
+        cc.discover(since()).await.unwrap();
+        cc.discover(since()).await.unwrap();
+        assert_eq!(cc.stats().project_scans, 1, "nothing changed under projects/: no new search");
+
+        // The session's transcript shows up in a project directory that does not follow the cwd;
+        // creating that directory moves the `projects/` mtime (a short pause keeps the two mtimes
+        // apart on filesystems with coarse timestamps).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let moved = projects.join("moved-project");
+        std::fs::create_dir_all(&moved).unwrap();
+        std::fs::write(
+            moved.join(format!("{}.jsonl", fx::SESSION)),
+            format!("{}\n", fx::user_prompt(fx::TS, "hi")),
+        )
+        .unwrap();
+        let all = cc.discover(since()).await.unwrap();
+        assert!(find(&all, &root_id()).has_transcript);
+        assert_eq!(cc.stats().project_scans, 2);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_pass_re_reads_nothing_and_a_new_child_costs_one_meta() {
+        let (home, probe) = with_children(true);
+        let (cc, _db) = setup(&home, &probe).await;
+        cc.discover(since()).await.unwrap();
+        let first = cc.stats();
+        assert_eq!(first.subagent_listings, 1);
+        assert_eq!(first.meta_parses, 4);
+        assert_eq!(first.session_parses, 1);
+
+        cc.discover(since()).await.unwrap();
+        assert_eq!(cc.stats(), first, "nothing changed on disk, nothing may be re-read");
+
+        // A new subagent changes the directory mtime: one relisting, one more meta, others untouched.
+        home.subagent(fx::SESSION, "a5", json!({"agentType":"Explore","description":"new"}), &fx::open_turn());
+        let all = cc.discover(since()).await.unwrap();
+        let after = cc.stats();
+        assert_eq!(after.subagent_listings, 2);
+        assert_eq!(after.meta_parses, 5);
+        assert!(all.iter().any(|s| s.key.id() == child_id("a5")));
+    }
+
+    #[tokio::test]
+    async fn a_meta_rewritten_in_place_is_noticed_without_relisting_the_directory() {
+        let (home, probe) = with_children(true);
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(find(&all, &child_id("a2")).state, NodeState::Busy);
+        let listings = cc.stats().subagent_listings;
+
+        std::fs::write(
+            home.meta_path(fx::SESSION, "a2"),
+            json!({"agentType":"general-purpose","description":"write code","finished":true}).to_string(),
+        )
+        .unwrap();
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(find(&all, &child_id("a2")).state, NodeState::Done);
+        assert_eq!(cc.stats().subagent_listings, listings);
+    }
+
+    #[tokio::test]
+    async fn a_registry_file_rewritten_in_place_is_re_parsed() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        assert_eq!(find(&cc.discover(since()).await.unwrap(), &root_id()).state, NodeState::Busy);
+        // A longer status word, so the stamp changes even on a coarse-mtime filesystem.
+        home.session_file(100, fx::SESSION, "waiting", "777");
+        assert_eq!(find(&cc.discover(since()).await.unwrap(), &root_id()).state, NodeState::Idle);
     }
 
     #[tokio::test]
