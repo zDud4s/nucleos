@@ -28,7 +28,7 @@ import {
   useBrowserStore,
 } from "../data/browser-store";
 import { AgentControlBar, useHumanDriving } from "./AgentControlBar";
-import { Button, ErrorNote, IconButton } from "../ui";
+import { Button, ErrorNote, IconButton, Select } from "../ui";
 import { useOverlayOpen } from "../ui/overlay";
 import { resolveOmnibox } from "./browser-omnibox";
 import "./browser-page.css";
@@ -212,8 +212,7 @@ export function BrowserPage() {
   return (
     <section className="browser-page">
       <header className="browser-bar">
-        <select
-          className="browser-project"
+        <Select
           aria-label="Project"
           value={project ?? ""}
           onChange={(e) => switchProject(e.target.value)}
@@ -223,7 +222,7 @@ export function BrowserPage() {
               {p.project_id}
             </option>
           ))}
-        </select>
+        </Select>
         <div className="browser-tabs" role="tablist">
           {current.tabs.map((tab) => (
             <div

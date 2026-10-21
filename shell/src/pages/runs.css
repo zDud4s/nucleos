@@ -364,7 +364,7 @@
 /* The field primitive's 14rem floor is for a form; in a strip that wraps it is
    what would push the row past a narrow window. */
 .runs-more .ui-field input,
-.runs-more .ui-field select {
+.runs-more .ui-field .ui-select {
   min-width: 0;
 }
 
@@ -776,7 +776,6 @@
 }
 
 .runs-field input,
-.runs-field select,
 .runs-field textarea {
   width: 100%;
   padding: var(--space-2);
@@ -796,7 +795,6 @@
 }
 
 .runs-field input:focus-visible,
-.runs-field select:focus-visible,
 .runs-field textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;

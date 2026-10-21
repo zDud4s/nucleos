@@ -45,7 +45,9 @@ describe("forced colors", () => {
 
   it("field borders use --border-field, and the token is defined", () => {
     expect(tokens).toContain("--border-field:");
-    for (const control of ["input", "select", "textarea"]) {
+    // A select is dressed by `Select` wherever it sits, not by `.ui-field`.
+    expect(css.search(/\.ui-select\s*\{[^}]*var\(--border-field\)/), ".ui-select border").toBeGreaterThan(-1);
+    for (const control of ["input", "textarea"]) {
       const at = css.search(new RegExp(String.raw`\.ui-field\s+${control}\b[^{]*\{[^}]*var\(--border-field\)`));
       expect(at, `.ui-field ${control} border`).toBeGreaterThan(-1);
     }

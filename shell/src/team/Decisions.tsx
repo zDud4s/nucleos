@@ -27,6 +27,7 @@ import {
   Quiet,
   RefusalNote,
   RelativeTime,
+  Select,
   StateBadge,
   Teach,
 } from "../ui";
@@ -371,14 +372,13 @@ function RecruitCard({ proposal }: { proposal: Proposal }) {
             label="Engine"
             helper="Directors most often get the engine and tool policy wrong: the engine sets what each turn costs, and the tool policy sets what this specialist can reach."
           >
-            <select
-              className="teams-select"
+            <Select
               id={idFor("engine")}
               value={form.engine}
               onChange={(event) => field("engine", event.target.value)}
             >
               <OptionsWith current={form.engine} known={RECRUIT_ENGINES} />
-            </select>
+            </Select>
           </Field>
           <Field label="Model">
             <input

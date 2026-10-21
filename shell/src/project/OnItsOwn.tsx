@@ -28,6 +28,7 @@ import {
   RelativeTime,
   StaleNote,
   StateBadge,
+  Select,
   Table,
   Td,
   Th,
@@ -588,7 +589,7 @@ function reachOf(value: string, route: JudgeRoute | null): number {
  * them and quietly re-enable a judge somebody had turned off.
  *
  * **The menu is a draft, and nothing is written until somebody says so.** It used to write on
- * `change` — and on Windows, Tab onto a closed `<select>` and one press of ↓ fires `change` without
+ * `change` — and on Windows, Tab onto a closed select and one press of ↓ fires `change` without
  * opening the list, so looking at the options was enough to hand approval to a different model.
  * Now the menu only moves a draft; "Use this judge" appears when the draft differs, and a change
  * that WIDENS who answers — from nobody to anybody, or to a hosted model — takes the two-click
@@ -790,9 +791,9 @@ function JudgePanel({
           <label className="pj-field-label" htmlFor="pj-judge">
             Who answers
           </label>
-          <select
+          <Select
             id="pj-judge"
-            className="pj-field-input pj-field-select"
+            block
             value={shown}
             disabled={busy}
             onChange={(event) => {
@@ -817,7 +818,7 @@ function JudgePanel({
                 </optgroup>
               );
             })}
-          </select>
+          </Select>
 
           {differs && (
             <div className="pj-actions">

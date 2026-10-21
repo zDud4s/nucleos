@@ -151,6 +151,7 @@ import {
   Quiet,
   RefusalNote,
   RelativeTime,
+  Select,
   StaleNote,
 } from "../ui";
 import { elapsedText } from "../lib/when";
@@ -3506,7 +3507,7 @@ function ChatHelpers({
               <div className="chats-helper-row">
                 <label className="chats-helper-field">
                   <span>Model</span>
-                  <select
+                  <Select
                     value={helper.model ?? ""}
                     onChange={(event) =>
                       // Changing the model can strip an effort the new one does not take. Cleared
@@ -3525,11 +3526,11 @@ function ChatHelpers({
                         {choice.label}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 </label>
                 <label className="chats-helper-field">
                   <span>Effort</span>
-                  <select
+                  <Select
                     value={helper.effort ?? ""}
                     onChange={(event) =>
                       change(index, {
@@ -3551,7 +3552,7 @@ function ChatHelpers({
                         {level}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 </label>
                 <HelperToolsControl
                   tools={helper.tools}

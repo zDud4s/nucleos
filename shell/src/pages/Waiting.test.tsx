@@ -1620,8 +1620,8 @@ describe("Waiting - the facts a card needs", () => {
       expect(described).not.toBeNull();
       expect(document.getElementById(described ?? "")?.textContent).toMatch(/two fields a director gets wrong most often/);
       expect(field.getAttribute("title")).toBeNull();
-      expect(field.className).toContain("waiting-recruit-input-careful");
     }
+    expect(policy.className).toContain("waiting-recruit-input-careful");
     expect(screen.getByLabelText("Speciality").getAttribute("aria-describedby")).toBeNull();
     expect(document.querySelector(".waiting-recruit-hint")).toBeNull();
   });

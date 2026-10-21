@@ -10,7 +10,7 @@ import {
   type FleetExclusion,
   type Job,
 } from "../data/fleet";
-import { Button, ConfirmButton, ErrorNote, Field, Inset, Panel, Quiet, RefusalNote, RelativeTime } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Field, Inset, Panel, Quiet, RefusalNote, RelativeTime, Select } from "../ui";
 
 /**
  * Which jobs are kept apart, and the way to keep two more apart.
@@ -106,22 +106,22 @@ function KeepApart({ jobs, rules }: { jobs: Job[]; rules: FleetExclusion[] }) {
       }}
     >
       <Field label="Job">
-        <select value={first.id} onChange={(event) => setFirst(Number(event.target.value))}>
+        <Select block value={first.id} onChange={(event) => setFirst(Number(event.target.value))}>
           {candidates.map((job) => (
             <option key={job.id} value={job.id}>
               job {job.id} · {job.project_id}
             </option>
           ))}
-        </select>
+        </Select>
       </Field>
       <Field label="Never at the same time as">
-        <select value={second.id} onChange={(event) => setSecond(Number(event.target.value))}>
+        <Select block value={second.id} onChange={(event) => setSecond(Number(event.target.value))}>
           {partners.map((job) => (
             <option key={job.id} value={job.id}>
               job {job.id}
             </option>
           ))}
-        </select>
+        </Select>
       </Field>
       <Button type="submit" disabled={propose.isPending}>
         Ask

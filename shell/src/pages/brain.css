@@ -449,7 +449,6 @@
   margin-top: var(--space-1);
 }
 
-.brain-panel-form > select,
 .brain-panel-form > input {
   height: 2rem;
   padding: 0 var(--space-2);
@@ -476,7 +475,6 @@
   opacity: 1;
 }
 
-.brain-panel-form > select:focus-visible,
 .brain-panel-form > input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;

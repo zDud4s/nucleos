@@ -61,6 +61,7 @@ import {
   Segmented,
   Skeleton,
   StaleNote,
+  Select,
   StateBadge,
   Teach,
   feedGravityOf,
@@ -713,7 +714,7 @@ function FeedSearchForm({
 
         <div className="feed-filter">
           <label htmlFor={`${fieldId}-project`}>Project</label>
-          <select
+          <Select
             id={`${fieldId}-project`}
             name="project"
             defaultValue={filters.project ?? ""}
@@ -725,7 +726,7 @@ function FeedSearchForm({
                 {project.project_id}
               </option>
             ))}
-          </select>
+          </Select>
         </div>
 
         <div className="feed-filter">

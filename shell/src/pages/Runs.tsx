@@ -53,6 +53,7 @@ import {
   money,
   readState,
   StaleNote,
+  Select,
   StateBadge,
   Switch,
   Teach,
@@ -407,7 +408,7 @@ function RunFilterBar({
       <Disclosure label="More filters" open={more} onOpenChange={setMore}>
         <div className="runs-more">
           <Field label="Project">
-            <select
+            <Select
               value={filters.project ?? ""}
               onChange={(event) => onChange({ project: event.target.value })}
             >
@@ -417,13 +418,13 @@ function RunFilterBar({
                   {project.project_id}
                 </option>
               ))}
-            </select>
+            </Select>
           </Field>
 
           <Field label="Mode">
             {/* `assistant` is offered here and not in the new-run form: the daemon
                 writes that mode, so runs carry it, but nobody may ask for one. */}
-            <select
+            <Select
               value={filters.mode ?? ""}
               onChange={(event) => onChange({ mode: event.target.value })}
             >
@@ -433,14 +434,14 @@ function RunFilterBar({
                   {mode}
                 </option>
               ))}
-            </select>
+            </Select>
           </Field>
 
           <Field label="Other status">
             {/* Only the statuses the segments above do not already offer, in the
                 badge's own words from the one table: choosing "failed" has one
                 place to be done, not two. */}
-            <select
+            <Select
               value={otherStatus ?? ""}
               onChange={(event) => onChange({ status: event.target.value })}
             >
@@ -450,7 +451,7 @@ function RunFilterBar({
                   {readState("run", status)?.label ?? status}
                 </option>
               ))}
-            </select>
+            </Select>
           </Field>
 
           <div className="runs-check">
@@ -1266,7 +1267,7 @@ function NewRunForm({
 
         <div className="runs-new-where">
           <Field label="Project for this run">
-            <select
+            <Select
               value={project}
               onChange={(event) => patch({ project: event.target.value })}
             >
@@ -1276,7 +1277,7 @@ function NewRunForm({
                   {project.project_id}
                 </option>
               ))}
-            </select>
+            </Select>
           </Field>
 
           <Field label="Working directory">

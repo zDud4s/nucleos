@@ -5,7 +5,7 @@ import { Check, Search, X } from "lucide-react";
 import { useAllCaptures } from "../data/captures";
 import { useApproveKnowledge, useKnowledge, useRejectKnowledge, type Known, type KnownLayer } from "../data/knowledge";
 import { useOwnerNotes, useSearchOwnerNotes } from "../data/owner-notes";
-import { Button, ErrorNote, Quiet, RelativeTime, Row, Rows, Teach } from "../ui";
+import { Button, ErrorNote, Quiet, RelativeTime, Row, Rows, Select, Teach } from "../ui";
 import { Segments } from "./Segments";
 import { formatItem } from "./item-ref";
 import { MeasuredSummary } from "./knowledge/MeasuredSummary";
@@ -134,8 +134,10 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
         {type === "knowledge" && (
           <div className="unified-bar-knowledge">
             <Segments label="Layer" value={layer} options={LAYER_FILTERS} onChange={setLayer} />
-            <select
-              className="unified-scope"
+            {/* A scope is a project id or "this machine": the daemon's words, so mono. */}
+            <Select
+              density="sm"
+              mono
               aria-label="Scope"
               value={scope}
               onChange={(event) => setScope(event.target.value)}
@@ -146,7 +148,7 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
                   {option.label}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
         )}
       </div>

@@ -31,6 +31,7 @@ import {
   Panel,
   RefusalNote,
   RelativeTime,
+  Select,
   Skeleton,
   StaleNote,
   Table,
@@ -695,14 +696,15 @@ function AgentFields({ draft, onChange }: { draft: AgentDraft; onChange: (next: 
 
       <label className="agents-field">
         <span>Engine</span>
-        <select
+        <Select
+          block
           value={draft.engine}
           onChange={(event) => onChange({ engine: event.target.value as AgentEngine })}
         >
           <option value="claude">claude</option>
           <option value="codex">codex</option>
           <option value="local">local</option>
-        </select>
+        </Select>
       </label>
 
       <div className="agents-field agents-field-half">

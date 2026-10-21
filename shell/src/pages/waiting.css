@@ -850,8 +850,8 @@
 }
 
 /* `Field` gives its controls a 14rem floor, which three columns in a column of the item cannot
-   honour: they take the width of the track instead. */
-.waiting-recruit-form .ui-field :is(input, select, textarea) {
+   honour: they take the width of the track instead (the engine `Select` is `block` for the same). */
+.waiting-recruit-form .ui-field :is(input, textarea) {
   min-width: 0;
   width: 100%;
 }
@@ -863,7 +863,8 @@
 
 /* The two fields a director gets wrong most often. The caution is their description
    (`aria-describedby` and `title`), not a paragraph between the fields; what marks them on the
-   screen is a firmer edge. The form in the selector is what beats `Field`'s own border. */
+   screen is a firmer edge. The form in the selector is what beats `Field`'s own border. The
+   engine `Select` is the shared control and takes no class, so only the policy group wears it. */
 .waiting-recruit-form .waiting-recruit-input-careful {
   border-color: var(--border-strong);
 }

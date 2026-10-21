@@ -199,8 +199,12 @@
   color: var(--text-muted);
 }
 
-.feed-filter input,
-.feed-filter select {
+.feed-filter .ui-select {
+  height: var(--feed-control-h);
+  min-width: 9rem;
+}
+
+.feed-filter input {
   height: var(--feed-control-h);
   min-width: 9rem;
   padding: var(--space-2);

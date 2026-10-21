@@ -38,8 +38,7 @@
   pointer-events: none;
 }
 
-.unified-search input,
-.unified-scope {
+.unified-search input {
   height: 2rem;
   border: var(--hairline) solid var(--border);
   border-radius: var(--radius-md);
@@ -60,19 +59,11 @@
   opacity: 1;
 }
 
-/* A scope is a project id or "this machine": the daemon's words, so mono. */
-.unified-scope {
-  padding: 0 var(--space-2);
-  font-family: var(--font-mono);
-}
-
-.unified-search input:hover,
-.unified-scope:hover {
+.unified-search input:hover {
   border-color: var(--border-strong);
 }
 
-.unified-search input:focus-visible,
-.unified-scope:focus-visible {
+.unified-search input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }

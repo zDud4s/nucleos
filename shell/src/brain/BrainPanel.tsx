@@ -24,7 +24,7 @@ import {
   type TeachKind,
 } from "../data/owner-notes";
 import { useProjects } from "../data/system";
-import { Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime, Skeleton } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Quiet, RefusalNote, RelativeTime, Select, Skeleton } from "../ui";
 import { ForceGraph } from "./ForceGraph";
 import { Segments } from "./Segments";
 import { backlinks, buildModel, localModel } from "./graph-model";
@@ -368,7 +368,9 @@ function AddLink({ id }: { id: number }) {
         );
       }}
     >
-      <select
+      <Select
+        density="sm"
+        mono
         aria-label="Link type"
         value={type}
         onChange={(event) => setType(event.target.value as LinkType)}
@@ -376,8 +378,10 @@ function AddLink({ id }: { id: number }) {
         {LINK_TYPES.map((value) => (
           <option key={value}>{value}</option>
         ))}
-      </select>
-      <select
+      </Select>
+      <Select
+        density="sm"
+        mono
         aria-label="Target kind"
         value={kind}
         onChange={(event) => setKind(event.target.value as TargetKind)}
@@ -385,7 +389,7 @@ function AddLink({ id }: { id: number }) {
         {TARGET_KINDS.map((value) => (
           <option key={value}>{value}</option>
         ))}
-      </select>
+      </Select>
       <input
         aria-label="Target ref"
         placeholder="id or path"
@@ -410,7 +414,9 @@ function Teach({ id }: { id: number }) {
     <section className="brain-sec" role="group" aria-label="Teach the agent">
       <h4>Make it a lesson</h4>
       <div className="brain-panel-form">
-      <select
+      <Select
+        density="sm"
+        mono
         aria-label="Lesson kind"
         value={kind}
         onChange={(event) => setKind(event.target.value as TeachKind)}
@@ -418,7 +424,7 @@ function Teach({ id }: { id: number }) {
         {TEACH_KINDS.map((value) => (
           <option key={value}>{value}</option>
         ))}
-      </select>
+      </Select>
       <input
         aria-label="Lesson title"
         className="brain-prose-input"

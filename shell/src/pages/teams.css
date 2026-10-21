@@ -676,9 +676,7 @@
   background: var(--surface);
 }
 
-.teams-grant-modes {
-  display: flex;
-  gap: var(--space-2);
+.teams-grant > .ui-select {
   margin-left: auto;
 }
 
@@ -770,50 +768,7 @@
   opacity: 1;
 }
 
-/**
- * A `select` with `multiple` is a listbox, and Chromium paints its interior
- * from the UA sheet unless the appearance is given up. Left alone it is a light
- * grey panel with light inherited text in the middle of a dark form — the same
- * failure the tabs had, from the same cause: `base.css` resets `font` and
- * `color` on controls and never `background`.
- */
-.teams-select[multiple] {
-  appearance: none;
-  min-height: 7rem;
-  padding: var(--space-1);
-  background: var(--surface-sunken);
-  color: var(--text);
-}
-
-.teams-select[multiple] option {
-  padding: var(--space-1) var(--space-2);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-}
-
-/**
- * A chosen option in a native multi-select.
- *
- * The one place in the app where the This-One Rule's *mark* cannot be used. An
- * `option` is rendered by the platform, not by us: it takes a `background` and a
- * `color` and ignores `box-shadow` outright, so there is no leading edge to draw
- * on and no shadow to draw with.
- *
- * What carries instead is the rule's other half — a rung of the neutral ladder
- * rather than the brand hue. `--border` is the one that works on this ground in
- * both themes: the select's own fill is `--surface-sunken`, and `--border` sits
- * clear of it at `#262b35` on `#08090c` in dark and `#dcdfe6` on `#eceef3` in
- * light. It was `--accent-quiet`, which is the Reserved Cyan Rule broken and, at
- * 12% alpha over a sunken ground, very nearly invisible besides.
- */
-.teams-select[multiple] option:checked {
-  background: var(--border);
-  color: var(--text);
-}
-
 .teams-input:focus-visible,
-.teams-select:focus-visible,
 .teams-textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
@@ -1536,35 +1491,6 @@
   font-family: var(--font-body);
   font-size: var(--text-sm);
   color: var(--text);
-}
-
-.teams-select {
-  font-family: inherit;
-}
-
-/* A single-choice select dressed like `.teams-input` beside it. Without this it kept the
-   UA's light, text-sized control in the middle of a dark form — the Director and every
-   grant row. `color-scheme` themes the popup list and the arrow the browser draws. */
-.teams-select:not([multiple]) {
-  padding: var(--space-2);
-  border: 1px solid var(--border-field);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-size: var(--text-sm);
-  text-transform: none;
-  letter-spacing: normal;
-  color-scheme: dark;
-}
-
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) .teams-select:not([multiple]) {
-    color-scheme: light;
-  }
-}
-
-:root[data-theme="light"] .teams-select:not([multiple]) {
-  color-scheme: light;
 }
 
 .teams-act-payload {

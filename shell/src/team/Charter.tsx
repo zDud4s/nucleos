@@ -22,7 +22,7 @@ import {
   type TeamRun,
   type TeamView,
 } from "../data/teams";
-import { Button, ConfirmButton, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote } from "../ui";
+import { Button, ConfirmButton, ErrorNote, Field, Meter, Panel, Quiet, RefusalNote, Select } from "../ui";
 import { detectDrift, snapshotFromView, type Drift, type DriftField } from "./drift";
 import { daemonProse } from "./prose";
 
@@ -512,8 +512,7 @@ function TeamForm({
         note="The director plans each task and hands out the work. Without one, this team cannot start a task."
       >
         <Field label="Director" helper={emptied("directorAgentId", form.directorAgentId, "Choose a director")}>
-          <select
-            className="teams-select"
+          <Select
             aria-required="true"
             value={form.directorAgentId}
             onChange={(event) => edit("directorAgentId", { directorAgentId: event.target.value })}
@@ -524,7 +523,7 @@ function TeamForm({
                 {agent.name}
               </option>
             ))}
-          </select>
+          </Select>
         </Field>
       </Section>
 
@@ -1074,8 +1073,7 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
             <span className="teams-grant-label" title={kind}>
               {POWER_LABEL[kind]}
             </span>
-            <select
-              className="teams-select teams-grant-modes"
+            <Select
               aria-label={`${POWER_LABEL[kind]} grant`}
               value={current}
               onChange={(event) => {
@@ -1090,7 +1088,7 @@ function Grants({ grants, onChange }: { grants: TeamGrant[]; onChange: (grants: 
                   {mode === "propose" ? "Asks first" : "Does it"}
                 </option>
               ))}
-            </select>
+            </Select>
           </li>
         );
       })}

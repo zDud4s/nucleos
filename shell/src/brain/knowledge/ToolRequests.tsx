@@ -6,7 +6,7 @@ import {
   useRejectLoadoutTool,
   type LoadoutTool,
 } from "../../data/loadout-tools";
-import { Button, Count, Panel, RelativeTime, Row, Rows } from "../../ui";
+import { Button, Count, Panel, RelativeTime, Row, Rows, Select } from "../../ui";
 import { ToolRefusal } from "./ScopedTools";
 import "./knowledge.css";
 
@@ -86,7 +86,9 @@ function RequestRow({
       {row.reason !== null && row.reason !== "" && <p className="learned-title">{row.reason}</p>}
       <div className="learned-group-head">
         <span className="learned-scope-chooser">
-          <select
+          <Select
+            density="sm"
+            mono
             aria-label={`Approve ${row.tool} for`}
             value={team}
             onChange={(event) => setTeam(event.target.value)}
@@ -100,7 +102,7 @@ function RequestRow({
                 team {id}
               </option>
             ))}
-          </select>
+          </Select>
         </span>
         <Button
           variant="approve"

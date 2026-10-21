@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useConcurrency } from "../data/fleet";
-import { Button, Field, SlotPips, Switch } from "../ui";
+import { Button, Field, Select, SlotPips, Switch } from "../ui";
 import { useConnection, useFleetStore, useLayoutVersion } from "./hooks";
 import { NO_PROJECT } from "./layout";
 import type { ConnectionState } from "./types";
@@ -38,9 +38,9 @@ export function TopBar({ project, onProject, onlyActive, onOnlyActive, follow, o
 
   return (
     <div className="fleet-bar" role="toolbar" aria-label="Fleet view">
-      {/* `Field` carries the shared field styling (`.ui-field select`); its label is spoken, not drawn. */}
+      {/* `Field` writes the select's id; its label is spoken, not drawn. */}
       <Field label="Project" labelHidden>
-        <select
+        <Select
           value={project ?? ""}
           onChange={(event) => onProject(event.target.value === "" ? null : event.target.value)}
         >
@@ -50,7 +50,7 @@ export function TopBar({ project, onProject, onlyActive, onOnlyActive, follow, o
               {name}
             </option>
           ))}
-        </select>
+        </Select>
       </Field>
       <Switch label="Active only" checked={onlyActive} onChange={onOnlyActive} />
       <span className="fleet-grow" />

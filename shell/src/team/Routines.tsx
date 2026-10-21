@@ -20,6 +20,7 @@ import {
   Quiet,
   RefusalNote,
   RelativeTime,
+  Select,
   StateBadge,
 } from "../ui";
 import { daemonProse } from "./prose";
@@ -321,8 +322,7 @@ function NewRuleForm({
       </label>
       <label className="teams-field">
         <span className="teams-label">Source</span>
-        <select
-          className="teams-select"
+        <Select
           value={draft.source}
           onChange={(event) =>
             onChange({ ...draft, source: event.target.value as (typeof TRIGGER_SOURCES)[number] })
@@ -333,7 +333,7 @@ function NewRuleForm({
               {sourceLabel(kind)}
             </option>
           ))}
-        </select>
+        </Select>
       </label>
       {draft.source === "cron" && (
         <>
@@ -371,8 +371,7 @@ function NewRuleForm({
       {draft.source === "team_finished" && (
         <label className="teams-field">
           <span className="teams-label">From team</span>
-          <select
-            className="teams-select"
+          <Select
             value={draft.fromTeam}
             onChange={(event) => onChange({ ...draft, fromTeam: event.target.value })}
           >
@@ -383,7 +382,7 @@ function NewRuleForm({
                 {t.name}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
       )}
       {draft.source === "email_triaged" && (
