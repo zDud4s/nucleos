@@ -30,6 +30,9 @@ use crate::state::AppState;
 pub const NOTIFICATION_TTL: Duration = Duration::seconds(24 * 60 * 60);
 /// An `answer_action` is only useful while the platform still accepts the callback answer.
 const ANSWER_ACTION_TTL: Duration = Duration::seconds(60);
+/// A progress edit is stale within minutes: undelivered past this it fails `expired` instead of
+/// lingering for hours.
+const PROGRESS_TTL: Duration = Duration::seconds(2 * 60);
 /// Retention of settled rows (`done`/`failed`), and the window of the `failed` count.
 const RETENTION: Duration = Duration::seconds(7 * 24 * 60 * 60);
 
@@ -88,6 +91,10 @@ pub enum Class {
     Notification,
     /// Answer to a command or a queue notice.
     Command,
+    /// Best-effort progress of a live turn (edits of its progress message): expires after
+    /// `PROGRESS_TTL`, is never retried, never becomes a send, and a newer pending progress edit of
+    /// the same run supersedes it.
+    Progress,
 }
 
 impl Class {
@@ -97,6 +104,7 @@ impl Class {
             Self::Approval => "approval",
             Self::Notification => "notification",
             Self::Command => "command",
+            Self::Progress => "progress",
         }
     }
 
@@ -106,6 +114,7 @@ impl Class {
             "approval" => Some(Self::Approval),
             "notification" => Some(Self::Notification),
             "command" => Some(Self::Command),
+            "progress" => Some(Self::Progress),
             _ => None,
         }
     }
@@ -206,9 +215,20 @@ pub async fn enqueue(
             Some(ANSWER_ACTION_TTL),
         ),
     };
-    let ttl: Option<Duration> = ttl.or((class == Class::Notification).then_some(NOTIFICATION_TTL));
+    let ttl: Option<Duration> = ttl.or(match class {
+        Class::Notification => Some(NOTIFICATION_TTL),
+        Class::Progress => Some(PROGRESS_TTL),
+        _ => None,
+    });
     let expires_at: Option<String> = ttl.map(|ttl| stamp(now + ttl));
     let subject: Option<String> = subject.map(|s| s.to_text());
+    if class == Class::Progress
+        && name == "edit"
+        && let Some(subject) = subject.as_deref()
+    {
+        // Only the newest progress edit of a run is worth delivering.
+        settle_pending_progress(conn, key, subject, "superseded", now).await?;
+    }
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class, \
          subject, state, due_at, expires_at, attempts, created_at) \
@@ -227,6 +247,40 @@ pub async fn enqueue(
     .fetch_one(&mut *conn)
     .await?;
     Ok(id)
+}
+
+/// Settles every still-`pending` (never leased) progress edit of this conversation and subject as
+/// `done` without a delivery, annotated with `reason`. Other classes, other subjects and leased
+/// rows are left alone. Returns how many rows it settled.
+async fn settle_pending_progress(
+    conn: &mut SqliteConnection,
+    key: &contract::ConversationKey,
+    subject: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<u64> {
+    let settled = sqlx::query(
+        "UPDATE channel_outbox SET state = 'done', fail_reason = ?, lease_until = NULL,          settled_at = ? WHERE channel = ? AND conversation = ? AND subject = ?          AND class = 'progress' AND action = 'edit' AND state = 'pending'",
+    )
+    .bind(reason)
+    .bind(stamp(now))
+    .bind(key.channel)
+    .bind(&key.reference)
+    .bind(subject)
+    .execute(&mut *conn)
+    .await?;
+    Ok(settled.rows_affected())
+}
+
+/// Drops the pending (not leased) progress edits of a run's progress message, e.g. at turn end,
+/// when the final reply makes them moot. Returns how many were dropped.
+pub async fn cancel_pending_progress(
+    conn: &mut SqliteConnection,
+    key: &contract::ConversationKey,
+    subject: &Subject,
+    now: DateTime<Utc>,
+) -> sqlx::Result<u64> {
+    settle_pending_progress(conn, key, &subject.to_text(), "cancelled", now).await
 }
 
 /// After the caller's commit. Cheap; a no-op for a channel nobody is polling. `lease` arms its
@@ -732,6 +786,166 @@ mod tests {
         assert_eq!(class, "turn");
         assert_eq!(subject, None);
         assert_eq!(expires_at, None);
+    }
+
+    fn progress_edit() -> NewAction {
+        NewAction::Edit {
+            target: 1,
+            parts: vec![text_part("working")],
+            buttons: None,
+        }
+    }
+
+    async fn progress(
+        conn: &mut SqliteConnection,
+        conversation: &str,
+        run: i64,
+        secs: i64,
+    ) -> i64 {
+        enqueue(
+            conn,
+            &key(conversation),
+            progress_edit(),
+            Class::Progress,
+            Some(Subject::Run(run)),
+            at(secs),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn state_and_reason(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
+        sqlx::query_as("SELECT state, fail_reason FROM channel_outbox WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_new_progress_edit_supersedes_the_pending_one() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let mut conn = pool.acquire().await.unwrap();
+        let first = progress(&mut conn, "c1", 7, 0).await;
+        let second = progress(&mut conn, "c1", 7, 1).await;
+        let third = progress(&mut conn, "c1", 7, 2).await;
+        drop(conn);
+
+        for old in [first, second] {
+            let (st, reason) = state_and_reason(pool, old).await;
+            assert_eq!(st, "done");
+            assert_eq!(reason.as_deref(), Some("superseded"));
+        }
+        assert_eq!(state_and_reason(pool, third).await.0, "pending");
+        let (class, expires): (String, Option<String>) =
+            sqlx::query_as("SELECT class, expires_at FROM channel_outbox WHERE id = ?")
+                .bind(third)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(class, "progress");
+        assert_eq!(expires, Some(stamp(at(2) + PROGRESS_TTL)));
+    }
+
+    #[tokio::test]
+    async fn a_leased_progress_edit_is_not_superseded() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let mut conn = pool.acquire().await.unwrap();
+        let first = progress(&mut conn, "c1", 7, 0).await;
+        sqlx::query(
+            "UPDATE channel_outbox SET state = 'leased', lease_until = 'later' WHERE id = ?",
+        )
+            .bind(first)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let second = progress(&mut conn, "c1", 7, 1).await;
+        drop(conn);
+
+        assert_eq!(state_and_reason(pool, first).await.0, "leased");
+        assert_eq!(state_and_reason(pool, second).await.0, "pending");
+    }
+
+    #[tokio::test]
+    async fn superseding_cancels_only_unleased_rows_of_the_same_run() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let mut conn = pool.acquire().await.unwrap();
+        let other_run = progress(&mut conn, "c1", 8, 0).await;
+        let other_conversation = progress(&mut conn, "c2", 7, 0).await;
+        let turn_edit = enqueue(
+            &mut conn,
+            &key("c1"),
+            progress_edit(),
+            Class::Turn,
+            Some(Subject::Run(7)),
+            at(0),
+        )
+        .await
+        .unwrap();
+        let progress_send = enqueue(
+            &mut conn,
+            &key("c1"),
+            plain_send(),
+            Class::Progress,
+            Some(Subject::Run(7)),
+            at(0),
+        )
+        .await
+        .unwrap();
+        let newest = progress(&mut conn, "c1", 7, 1).await;
+        drop(conn);
+
+        for untouched in [other_run, other_conversation, turn_edit, progress_send, newest] {
+            assert_eq!(state_and_reason(pool, untouched).await.0, "pending");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_progress_drops_only_the_pending_progress_edits_of_the_run() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let mut conn = pool.acquire().await.unwrap();
+        let pending = progress(&mut conn, "c1", 7, 0).await;
+        let leased = progress(&mut conn, "c1", 8, 0).await;
+        sqlx::query(
+            "UPDATE channel_outbox SET state = 'leased', lease_until = 'later' WHERE id = ?",
+        )
+            .bind(leased)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let leased_same_run = progress(&mut conn, "c1", 7, 1).await;
+        sqlx::query(
+            "UPDATE channel_outbox SET state = 'leased', lease_until = 'later' WHERE id = ?",
+        )
+            .bind(leased_same_run)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let waiting = progress(&mut conn, "c1", 7, 2).await;
+        let other_run = progress(&mut conn, "c1", 9, 2).await;
+        let reply = enqueue(&mut conn, &key("c1"), plain_send(), Class::Turn, None, at(2))
+            .await
+            .unwrap();
+
+        let dropped = cancel_pending_progress(&mut conn, &key("c1"), &Subject::Run(7), at(3))
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(dropped, 1);
+        let (st, reason) = state_and_reason(pool, waiting).await;
+        assert_eq!((st.as_str(), reason.as_deref()), ("done", Some("cancelled")));
+        assert_eq!(state_and_reason(pool, pending).await.1.as_deref(), Some("superseded"));
+        for untouched in [leased, leased_same_run] {
+            assert_eq!(state_and_reason(pool, untouched).await.0, "leased");
+        }
+        for untouched in [other_run, reply] {
+            assert_eq!(state_and_reason(pool, untouched).await.0, "pending");
+        }
     }
 
     #[tokio::test]

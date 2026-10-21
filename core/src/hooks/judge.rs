@@ -681,7 +681,6 @@ mod tests {
             startup_config: Default::default(),
             token: Token("test-token".into()),
             pool: crate::testdb::fresh_pool().await,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,

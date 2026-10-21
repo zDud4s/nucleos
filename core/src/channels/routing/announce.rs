@@ -326,6 +326,7 @@ mod tests {
             ChannelConfig {
                 doctrine: None,
                 projects: map,
+                stream_edits: None,
             },
         );
         state.channels = Arc::new(ChannelsRuntime::with_configs(configs));

@@ -363,7 +363,6 @@ mod tests {
             startup_config: Default::default(),
             token: Token("t".into()),
             pool: test_pool().await,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
@@ -497,7 +496,7 @@ mod tests {
             &state,
             "tg-taint-survives",
             "que mail chegou?",
-            Origin::Telegram,
+            Origin::Channel("telegram"),
         )
         .await
         .unwrap();
@@ -655,8 +654,11 @@ mod tests {
     }
 
     #[test]
-    fn only_an_explicit_telegram_origin_is_telegram() {
-        assert_eq!(Origin::from_wire(Some("telegram")), Origin::Telegram);
+    fn only_an_explicit_telegram_origin_is_the_telegram_channel() {
+        let telegram = Origin::from_wire(Some("telegram"));
+        assert_eq!(telegram, Origin::Channel("telegram"));
+        assert!(telegram.is_remote());
+        assert_ne!(telegram, Origin::Shell);
         // Everything else is the shell, which is what makes this ship dark: a client that has not
         // been taught the field keeps the behaviour it has today.
         for value in [None, Some("shell"), Some("Telegram"), Some(""), Some("tg")] {
@@ -756,7 +758,7 @@ mod tests {
                 .is_err()
         );
 
-        let id = send_message(&state, "tg-no-local", "hello", Origin::Telegram)
+        let id = send_message(&state, "tg-no-local", "hello", Origin::Channel("telegram"))
             .await
             .unwrap();
         let (status, reply) = settled_turn(&state.pool, id).await;
@@ -775,9 +777,14 @@ mod tests {
             "três corridas a andar",
         )));
 
-        let id = send_message(&state, "tg-local", "o que está a correr?", Origin::Telegram)
-            .await
-            .unwrap();
+        let id = send_message(
+            &state,
+            "tg-local",
+            "o que está a correr?",
+            Origin::Channel("telegram"),
+        )
+        .await
+        .unwrap();
         let (status, reply) = settled_turn(&state.pool, id).await;
         assert_eq!(status, "completed");
         assert_eq!(reply.as_deref(), Some("três corridas a andar"));
@@ -829,9 +836,14 @@ mod tests {
         let mut state = test_state().await;
         state.assistants = Arc::new(FixedAssistants(fake_local_assistant("aqui mesmo")));
 
-        let id = send_message(&state, "tg-who-answered", "olá", Origin::Telegram)
-            .await
-            .unwrap();
+        let id = send_message(
+            &state,
+            "tg-who-answered",
+            "olá",
+            Origin::Channel("telegram"),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(answered_by(&state.pool, id).await.as_deref(), Some("local"));
     }
@@ -862,7 +874,7 @@ mod tests {
             .await
             .unwrap();
 
-        let turn = send_message(&state, &id, "olá", Origin::Telegram)
+        let turn = send_message(&state, &id, "olá", Origin::Channel("telegram"))
             .await
             .unwrap();
 
@@ -910,9 +922,10 @@ mod tests {
         state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
         let telegram_chat = a_chat("-100200300");
 
-        let from_telegram = send_message(&state, &telegram_chat, "olá", Origin::Telegram)
-            .await
-            .unwrap();
+        let from_telegram =
+            send_message(&state, &telegram_chat, "olá", Origin::Channel("telegram"))
+                .await
+                .unwrap();
         let from_shell = send_message(&state, "no-row-shell", "olá", Origin::Shell)
             .await
             .unwrap();
@@ -957,7 +970,7 @@ mod tests {
     async fn a_telegram_conversation_with_no_local_model_still_falls_through_to_the_cloud() {
         let state = test_state().await;
 
-        let turn = send_message(&state, "-100200301", "olá", Origin::Telegram)
+        let turn = send_message(&state, "-100200301", "olá", Origin::Channel("telegram"))
             .await
             .unwrap();
 
@@ -1020,9 +1033,14 @@ mod tests {
             ),
         )));
 
-        let run_id = send_message(&state, "local-declares", "remember that", Origin::Telegram)
-            .await
-            .unwrap();
+        let run_id = send_message(
+            &state,
+            "local-declares",
+            "remember that",
+            Origin::Channel("telegram"),
+        )
+        .await
+        .unwrap();
         settled_turn(&state.pool, run_id).await;
 
         type KnowledgeRow = (Option<i64>, String, Option<i64>, String, String);
@@ -1052,12 +1070,12 @@ mod tests {
         let mut state = test_state().await;
         state.assistants = Arc::new(FixedAssistants(fake_local_assistant("done")));
 
-        let first = send_message(&state, "tg-slot", "one", Origin::Telegram)
+        let first = send_message(&state, "tg-slot", "one", Origin::Channel("telegram"))
             .await
             .unwrap();
         settled_turn(&state.pool, first).await;
 
-        let second = send_message(&state, "tg-slot", "two", Origin::Telegram).await;
+        let second = send_message(&state, "tg-slot", "two", Origin::Channel("telegram")).await;
         assert!(second.is_ok(), "the slot was not released: {second:?}");
     }
 
@@ -1195,11 +1213,11 @@ mod tests {
             ),
         )));
 
-        let first = send_message(&state, "tg-memory", "primeira", Origin::Telegram)
+        let first = send_message(&state, "tg-memory", "primeira", Origin::Channel("telegram"))
             .await
             .unwrap();
         settled_turn(&state.pool, first).await;
-        let second = send_message(&state, "tg-memory", "segunda", Origin::Telegram)
+        let second = send_message(&state, "tg-memory", "segunda", Origin::Channel("telegram"))
             .await
             .unwrap();
         settled_turn(&state.pool, second).await;
@@ -1971,7 +1989,7 @@ mod tests {
     ///
     /// Written down rather than only acted on, which is what 0119 changed. `Origin` was a parameter
     /// that routed a turn and was then dropped, so `runs` could say a great deal about a turn and
-    /// nothing about where it came from — and `relay::admit`'s `TelegramOrigin` brake, whose whole
+    /// nothing about where it came from — and `relay::admit`'s `RemoteOrigin` brake, whose whole
     /// job is to read exactly that, had no fact to read. It was reachable only by a caller willing
     /// to state an origin it had no way to know, which is to say it was not reachable at all.
     ///
@@ -1985,9 +2003,10 @@ mod tests {
         let pool = state.pool.clone();
         let telegram_chat = a_chat("-100200300");
 
-        let from_telegram = send_message(&state, &telegram_chat, "olá", Origin::Telegram)
-            .await
-            .unwrap();
+        let from_telegram =
+            send_message(&state, &telegram_chat, "olá", Origin::Channel("telegram"))
+                .await
+                .unwrap();
         let from_shell = send_message(&state, "a-shell-chat", "hello", Origin::Shell)
             .await
             .unwrap();
@@ -2002,7 +2021,10 @@ mod tests {
                     .unwrap()
             }
         };
-        assert_eq!(origin_of(from_telegram).await.as_deref(), Some("telegram"));
+        assert_eq!(
+            origin_of(from_telegram).await.as_deref(),
+            Some("channel:telegram")
+        );
         assert_eq!(origin_of(from_shell).await.as_deref(), Some("shell"));
 
         // The local path writes its own INSERT — see `spawn_local_turn` — so the column is wired
@@ -2321,7 +2343,7 @@ mod tests {
         let mut state = test_state().await;
         state.assistants = Arc::new(FixedAssistants(fake_local_assistant("na máquina")));
 
-        let id = send_message(&state, "-100200300:5", "olá", Origin::Telegram)
+        let id = send_message(&state, "-100200300:5", "olá", Origin::Channel("telegram"))
             .await
             .unwrap();
 
@@ -2670,13 +2692,21 @@ mod tests {
         );
     }
 
-    /// A state carrying the configured Telegram doctrine, with the fake runner still typed — the
-    /// same shape `files_root_state` returns, minus the file root neither new test below needs.
+    /// A state whose Telegram channel carries the given doctrine in its registry config, with the
+    /// fake runner still typed — the same shape `files_root_state` returns, minus the file root
+    /// neither new test below needs.
     async fn state_with_doctrine(doctrine: Option<&str>) -> (AppState, Arc<FakeCommandRunner>) {
         let runner = Arc::new(FakeCommandRunner::default());
+        let configs = std::collections::HashMap::from([(
+            "telegram",
+            crate::channels::registry::ChannelConfig {
+                doctrine: doctrine.map(str::to_string),
+                ..Default::default()
+            },
+        )]);
         let state = AppState {
             runner: runner.clone(),
-            telegram_doctrine: doctrine.map(str::to_string),
+            channels: Arc::new(crate::channels::ChannelsRuntime::with_configs(configs)),
             ..test_state().await
         };
         (state, runner)
@@ -2785,7 +2815,7 @@ mod tests {
             .await
             .unwrap();
 
-        let turn = send_message(&state, &id, "olá", Origin::Telegram)
+        let turn = send_message(&state, &id, "olá", Origin::Channel("telegram"))
             .await
             .unwrap();
         settled_turn(&state.pool, turn).await;
@@ -2800,7 +2830,7 @@ mod tests {
 
     /// The doctrine is a fallback for a channel that said nothing, never a replacement for
     /// something a person actually wrote. Two independent reasons the same configured doctrine must
-    /// NOT reach the launch: (a) the origin is not Telegram at all, and (b) the chat has its own
+    /// NOT reach the launch: (a) the origin is not a channel at all, and (b) the chat has its own
     /// `system_prompt`, which — like `a_conversations_instructions_and_denials_reach_the_launch`
     /// already pins for the shell — must survive untouched.
     #[tokio::test]
@@ -2842,9 +2872,14 @@ mod tests {
         .await
         .unwrap();
 
-        let person_turn = send_message(&person_state, &person_id, "olá", Origin::Telegram)
-            .await
-            .unwrap();
+        let person_turn = send_message(
+            &person_state,
+            &person_id,
+            "olá",
+            Origin::Channel("telegram"),
+        )
+        .await
+        .unwrap();
         settled_turn(&person_state.pool, person_turn).await;
 
         assert_eq!(
@@ -3008,14 +3043,14 @@ mod tests {
             ),
             (
                 root,
-                Origin::Telegram,
+                Origin::Channel("telegram"),
                 true,
                 ToolPolicy::McpOnly,
                 "over the network",
             ),
             (
                 root,
-                Origin::Telegram,
+                Origin::Channel("telegram"),
                 false,
                 ToolPolicy::McpOnly,
                 "neither",
@@ -3030,14 +3065,14 @@ mod tests {
             ),
             (
                 None,
-                Origin::Telegram,
+                Origin::Channel("telegram"),
                 true,
                 ToolPolicy::McpOnly,
                 "no root, over the network",
             ),
             (
                 None,
-                Origin::Telegram,
+                Origin::Channel("telegram"),
                 false,
                 ToolPolicy::McpOnly,
                 "nothing at all",
@@ -3066,7 +3101,7 @@ mod tests {
     #[test]
     fn only_the_first_clean_hop_of_a_relay_keeps_the_tools() {
         for cwd in [None, Some("C:/repo")] {
-            for origin in [Origin::Shell, Origin::Telegram] {
+            for origin in [Origin::Shell, Origin::Channel("telegram")] {
                 for wired in [true, false] {
                     assert_eq!(
                         tool_policy_for(cwd, origin, wired, crate::relay::Handover::Withheld),
@@ -3108,7 +3143,7 @@ mod tests {
     /// whatever else changes here, none of them may pick up the filesystem by accident.
     #[test]
     fn a_conversation_with_no_directory_keeps_exactly_the_policy_it_always_had() {
-        for origin in [Origin::Shell, Origin::Telegram, Origin::Voice] {
+        for origin in [Origin::Shell, Origin::Channel("telegram"), Origin::Voice] {
             for wired in [true, false] {
                 assert_eq!(
                     tool_policy_for(None, origin, wired, crate::relay::Handover::Typed),
@@ -3170,7 +3205,7 @@ mod tests {
         assert_eq!(
             tool_policy_for(
                 Some("C:/Projects/nucleos"),
-                Origin::Telegram,
+                Origin::Channel("telegram"),
                 true,
                 crate::relay::Handover::Typed
             ),
@@ -3436,7 +3471,8 @@ mod tests {
             .await
             .unwrap();
 
-        let refused = send_message(&state, chat_id, "e os testes", Origin::Telegram).await;
+        let refused =
+            send_message(&state, chat_id, "e os testes", Origin::Channel("telegram")).await;
 
         assert_eq!(refused, Err(TURN_IN_PROGRESS.to_string()));
         assert!(
@@ -6328,7 +6364,7 @@ mod tests {
         crate::chats::set_permission_mode(&state.pool, &chat, crate::chats::PermissionMode::Bypass)
             .await
             .unwrap();
-        let one_shot = send_message(&state, &chat, "de fora", Origin::Telegram)
+        let one_shot = send_message(&state, &chat, "de fora", Origin::Channel("telegram"))
             .await
             .unwrap();
         settled_turn(&state.pool, one_shot).await;
@@ -7133,7 +7169,7 @@ mod tests {
     /// shell's and is answered into the wrong place.
     #[test]
     fn an_origin_written_down_reads_back_as_itself() {
-        for origin in [Origin::Shell, Origin::Telegram] {
+        for origin in [Origin::Shell, Origin::Channel("telegram")] {
             assert_eq!(Origin::from_wire(Some(origin.as_wire())), origin);
         }
     }

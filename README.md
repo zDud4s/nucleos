@@ -48,7 +48,7 @@ trail.
 | **Worktree isolation** | Each run works in its own git worktree. A queue merges one branch at a time, and a failed merge leaves no conflicted state behind. |
 | **Shadow mode** | A project can be set to propose only, so you can watch what NucleOS would do before it acts. |
 | **Budgets and kill switch** | Spend is capped per window, and one switch stops all activity. |
-| **Isolated integrations** | Email, Telegram, web fetch, a fenced browser and quota tracking each run as a separate Go sidecar that can fail and restart on its own. |
+| **Isolated integrations** | Email, web fetch, a fenced browser and quota tracking each run as a separate Go sidecar that can fail and restart on its own. Messaging channels (Telegram first) are channel adapters: a Go sidecar built on `channelkit` that the núcleo's `channels/` module supervises and routes. |
 | **Desktop shell** | A tray app shows what ran, what is waiting on you, and whether anything needs attention. |
 
 ## Architecture
@@ -65,7 +65,7 @@ trail.
        │ spawns                │ supervises
 ┌──────▼───────────┐   ┌───────▼──────────────────────────────────┐
 │ agent runner     │   │ sidecars/  (Go)                          │
-│ Claude Code,     │   │ email · telegram · web · browser · quota │
+│ Claude Code,     │   │ email · web · browser · quota · channels │
 │ Codex, local …   │   └──────────────────────────────────────────┘
 │ one per run, in  │
 │ its own worktree │

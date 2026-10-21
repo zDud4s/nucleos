@@ -2958,23 +2958,6 @@ resolve_effort: \"  \"
         assert_eq!(rules.repo_triggers[0].prompt, "review new commits on main");
     }
 
-    /// Absent, unreadable or malformed → defaults, the same asymmetry `load_web_config` and
-    /// `load_browser_config` both take: a typo in a per-developer YAML must cost fidelity (no
-    /// doctrine to prepend) and never stop the daemon, and never invent a doctrine nobody wrote.
-    #[test]
-    fn um_telegram_yaml_malformado_cai_no_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("telegram.yaml");
-        std::fs::write(&path, "doctrine: [this is not a string\n").unwrap();
-
-        let config = load_telegram_config(&path);
-
-        assert_eq!(
-            config.doctrine, None,
-            "a malformed telegram.yaml must fall back to the default, not invent a doctrine"
-        );
-    }
-
     // ---------------------------------------------------------------------------------------
     // `marked_with` — each local choice marked by what its model was found to declare
     // ---------------------------------------------------------------------------------------

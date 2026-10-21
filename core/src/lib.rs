@@ -129,3 +129,12 @@ mod module_map;
 #[cfg(test)]
 #[path = "../tests/file_size.rs"]
 mod file_size;
+
+// The phase-4 guards only read files too: no v1 Telegram plumbing left, shared routes still used.
+#[cfg(test)]
+#[path = "../tests/no_legacy_telegram.rs"]
+mod no_legacy_telegram;
+
+#[cfg(test)]
+#[path = "../tests/routes_still_used.rs"]
+mod routes_still_used;

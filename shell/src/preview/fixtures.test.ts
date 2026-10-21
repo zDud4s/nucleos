@@ -249,7 +249,7 @@ describe("the preview fixtures", () => {
 describe("the channel management fixtures", () => {
   const put = (body: unknown): RequestInit => ({ method: "PUT", body: JSON.stringify(body) });
   const CHANNEL_WHAT =
-    "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too";
+    "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in, and `stream_edits` (a live progress preview made by editing the acknowledgement; on by default, `false` turns it off); the bot token is stored here too";
 
   it("the readout has telegram online and homed on a thread, and discord offline", () => {
     expect(CHANNELS.primary).toBe("telegram");
@@ -326,7 +326,7 @@ describe("the channel management fixtures", () => {
     const area = config.settings.find((row) => row.area === "channels/telegram");
     expect(area?.path).toBe("channels/telegram.yaml");
     expect(area?.what).toBe(CHANNEL_WHAT);
-    expect(config.settings.some((row) => row.area === "telegram")).toBe(true);
+    expect(config.settings.some((row) => row.area === "telegram")).toBe(false);
     const secrets = answer("/config/secrets") as { secrets: { key: string; area: string }[] };
     expect(secrets.secrets.find((row) => row.key === "telegram-token")?.area).toBe("channels/telegram");
     const health = answer("/health/readout") as { subsystems: { name: string; status: string; reason?: string }[] };

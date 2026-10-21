@@ -13,13 +13,12 @@
 use sqlx::SqlitePool;
 
 /// Where a note was written from. Checked before the insert.
-pub const ORIGINS: [&str; 2] = ["shell", "telegram"];
+pub const ORIGINS: [&str; 1] = ["shell"];
 
-/// Whether a note may carry this origin: the shell, the v1 `telegram`, or `channel:<id>` for a
-/// channel whose manifest is compiled in.
+/// Whether a note may carry this origin: the shell, or `channel:<id>` for a channel whose manifest
+/// is compiled in. The bare v1 `telegram` is no longer accepted (migration 0235 rewrote it).
 pub fn origin_allowed(origin: &str) -> bool {
     origin == "shell"
-        || origin == "telegram"
         || origin
             .strip_prefix("channel:")
             .is_some_and(|id| crate::channels::registry::by_id(id).is_some())
@@ -899,14 +898,14 @@ mod tests {
     #[tokio::test]
     async fn a_note_is_created_active_with_its_origin_and_a_created_event() {
         let pool = test_pool().await;
-        let id = create(&pool, "  remember the milk  ", "telegram")
+        let id = create(&pool, "  remember the milk  ", "channel:telegram")
             .await
             .unwrap();
 
         let note = get(&pool, id).await.unwrap();
         assert_eq!(note.id, id);
         assert_eq!(note.note_text, "remember the milk", "the text is trimmed");
-        assert_eq!(note.origin, "telegram");
+        assert_eq!(note.origin, "channel:telegram");
         assert_eq!(note.state, "active");
         assert!(!note.created_at.is_empty());
         assert_eq!(note.created_at, note.updated_at);
@@ -1499,7 +1498,12 @@ mod tests {
     fn note_origin_accepts_channel_id_of_a_compiled_manifest() {
         assert!(origin_allowed("channel:telegram"));
         assert!(origin_allowed("shell"));
-        assert!(origin_allowed("telegram"));
+    }
+
+    #[test]
+    fn note_origin_rejects_the_bare_legacy_telegram() {
+        assert!(origin_allowed("channel:telegram"));
+        assert!(!origin_allowed("telegram"));
     }
 
     #[test]

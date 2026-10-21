@@ -13,7 +13,6 @@ pub(crate) async fn state() -> AppState {
         startup_config: Default::default(),
         token: Token("test-token".to_string()),
         pool,
-        telegram_doctrine: None,
         channels: Default::default(),
         runner: Arc::new(FakeCommandRunner::default()),
         triage_runner: None,
@@ -41,6 +40,26 @@ pub(crate) async fn state() -> AppState {
         progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
     }
+}
+
+/// A state whose `telegram` has a routing row and said hello with the given capabilities.
+pub(crate) async fn hello_state(typing: bool, edit: bool) -> AppState {
+    let state = state().await;
+    let mut conn = state.pool.acquire().await.unwrap();
+    crate::channels::routing::seed(&mut conn, "telegram")
+        .await
+        .unwrap();
+    drop(conn);
+    let hello: crate::channels::contract::Hello = serde_json::from_value(serde_json::json!({
+        "kind": crate::channels::registry::by_id("telegram").unwrap().kind,
+        "version": "1.0.0",
+        "capabilities": { "max_text": 4096, "typing": typing, "edit": edit },
+    }))
+    .unwrap();
+    crate::channels::registry::record_hello(&state, "telegram", &hello, chrono::Utc::now())
+        .await
+        .unwrap();
+    state
 }
 
 #[cfg(test)]

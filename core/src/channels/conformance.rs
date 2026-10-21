@@ -933,4 +933,182 @@ mod tests {
             }
         }
     }
+
+    /// An owner paired on `fake:c1` whose adapter said hello with the given `typing` and `edit`
+    /// capabilities, and whose first message started a running turn. Returns the turn's run id.
+    ///
+    /// Each call uses a conversation of its own: the chat slot (`is_busy`) is process-global, so a
+    /// shared `fake:c1` would queue the message behind another test's live turn and start no run.
+    async fn streaming_turn(typing: bool, edit: bool) -> (AppState, FakeAdapter, i64, String) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let conversation = format!(
+            "stream{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let st = state().await;
+        let adapter = FakeAdapter::new(&st, "fake").await;
+        let hello = adapter
+            .hello(json!({"max_text": 4096, "typing": typing, "edit": edit}))
+            .await;
+        assert_eq!(hello.status, StatusCode::OK);
+        seed_owner(&st.pool, "u1", &conversation).await;
+        let event = FakeAdapter::message_event("e1", &conversation, "u1", "hi");
+        assert_eq!(
+            adapter.post_event(&event).await.status,
+            StatusCode::ACCEPTED
+        );
+        let chat_id = ConversationKey::new("fake", conversation.as_str()).chat_id();
+        let run_id: i64 = sqlx::query_scalar("SELECT id FROM runs WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        // The message started a real background turn over the fake runner, which finishes at once,
+        // marks the run done, removes its tail and answers the turn by itself. Stop it and wait until
+        // it is gone, then put the turn back as it was right after its ack: running, unanswered,
+        // with the "working" send as the only outbox row.
+        if let Some(handle) = st.run_handles.lock().unwrap().get(&run_id) {
+            handle.abort();
+        }
+        for _ in 0..200 {
+            if !st.run_handles.lock().unwrap().contains_key(&run_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        sqlx::query("UPDATE runs SET status = 'running', completed_at = NULL WHERE id = ?")
+            .bind(run_id)
+            .execute(&st.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE channel_turn_replies SET replied_at = NULL WHERE run_id = ?")
+            .bind(run_id)
+            .execute(&st.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM channel_outbox WHERE id > \
+             (SELECT MIN(id) FROM channel_outbox WHERE subject = ? AND action = 'send')",
+        )
+        .bind(format!("run:{run_id}"))
+        .execute(&st.pool)
+        .await
+        .unwrap();
+        st.run_tails.lock().unwrap().remove(&run_id);
+        (st, adapter, run_id, conversation)
+    }
+
+    /// Polls once, acknowledges every delivered action and returns `(type, first text part)` of each.
+    async fn deliver(adapter: &FakeAdapter) -> Vec<(String, String)> {
+        let body = adapter.poll(Duration::ZERO).await.json();
+        let mut seen = Vec::new();
+        for action in body["actions"].as_array().expect("an actions array") {
+            let kind = action["type"].as_str().unwrap().to_string();
+            let text = action["parts"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let acked = adapter.ack_ok(action["id"].as_i64().unwrap()).await;
+            assert_eq!(acked.status, StatusCode::OK);
+            seen.push((kind, text));
+        }
+        seen
+    }
+
+    /// Puts `text` in the live stream tail of `run_id` and runs one streaming tick.
+    async fn stream_tick(st: &AppState, run_id: i64, text: &str) {
+        let line = json!({
+            "type": "assistant",
+            "message": { "content": [{ "type": "text", "text": text }] },
+        });
+        let buffer = Arc::new(std::sync::Mutex::new(line.to_string()));
+        st.run_tails.lock().unwrap().insert(run_id, buffer);
+        crate::channels::streaming::stream_progress(
+            st,
+            &mut crate::channels::streaming::Throttle::default(),
+            tokio::time::Instant::now(),
+            Duration::from_secs(5),
+            Utc::now(),
+        )
+        .await;
+    }
+
+    async fn complete_turn(st: &AppState, run_id: i64, stdout: &str) {
+        sqlx::query("UPDATE runs SET status = 'completed', stdout = ? WHERE id = ?")
+            .bind(stdout)
+            .bind(run_id)
+            .execute(&st.pool)
+            .await
+            .unwrap();
+        crate::channels::replies::reply_now(st, run_id).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_with_edit_capability_emits_progress_edits() {
+        let (st, adapter, run_id, _) = streaming_turn(true, true).await;
+        let mut wire = deliver(&adapter).await;
+        stream_tick(&st, run_id, "halfway there").await;
+        wire.extend(deliver(&adapter).await);
+        complete_turn(&st, run_id, "All done.").await;
+        // The ordered lane hands out one action per conversation per poll: the "finished" edit
+        // first, the final send on the next poll.
+        wire.extend(deliver(&adapter).await);
+        wire.extend(deliver(&adapter).await);
+
+        let kinds: Vec<&str> = wire.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(kinds, ["send", "edit", "edit", "send"]);
+        assert_eq!(
+            wire[0].1,
+            strings::render(&Text::Working { turn: run_id })
+        );
+        assert_eq!(
+            wire[1].1,
+            strings::render(&Text::Progress {
+                turn: run_id,
+                snippet: "halfway there".into(),
+            })
+        );
+        assert_eq!(wire[2].1, strings::render(&Text::Finished { turn: run_id }));
+        assert_eq!(wire[3].1, "All done.");
+        let classes: Vec<String> = sqlx::query_scalar(
+            "SELECT class FROM channel_outbox WHERE action = 'edit' ORDER BY id",
+        )
+        .fetch_all(&st.pool)
+        .await
+        .unwrap();
+        assert_eq!(classes, ["progress", "progress"]);
+    }
+
+    #[tokio::test]
+    async fn streaming_without_edit_capability_emits_no_edit() {
+        let (st, adapter, run_id, _) = streaming_turn(true, false).await;
+        let mut wire = deliver(&adapter).await;
+        stream_tick(&st, run_id, "halfway there").await;
+        wire.extend(deliver(&adapter).await);
+        complete_turn(&st, run_id, "All done.").await;
+        wire.extend(deliver(&adapter).await);
+
+        let kinds: Vec<&str> = wire.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(kinds, ["send", "send"]);
+        assert_eq!(wire[1].1, "All done.");
+        assert_eq!(
+            count(&st.pool, "SELECT COUNT(*) FROM channel_outbox WHERE action = 'edit'").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_refreshes_only_with_the_capability() {
+        // A turn starting announces "typing" on the ephemeral lane of the next poll, once, and only
+        // for an adapter that declared the capability.
+        let (_st, with, _, conversation) = streaming_turn(true, true).await;
+        let polled = with.poll(Duration::ZERO).await.json();
+        assert_eq!(
+            polled["ephemeral"],
+            json!([{"type": "typing", "conversation": conversation}])
+        );
+        let (_st, without, _, _) = streaming_turn(false, true).await;
+        let polled = without.poll(Duration::ZERO).await.json();
+        assert_eq!(polled["ephemeral"], json!([]));
+    }
 }

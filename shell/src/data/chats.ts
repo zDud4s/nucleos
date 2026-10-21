@@ -778,7 +778,7 @@ export const CHAT_OPEN_HEADER = "X-Nucleos-Chat-Open";
  * id, well before the next scheduled fetch.
  *
  * Cadence is 1.5 s while any turn is live and 5 s once the conversation has
- * settled — never off, because a turn can land from Telegram while this
+ * settled — never off, because a turn can land from a channel while this
  * window is simply sitting open on the conversation.
  *
  * Most polls are incremental: the page asks only for the turns past its
@@ -869,7 +869,7 @@ export function useChatTranscript(chatId: string | null) {
 /**
  * The open conversation's poll cadence: `POLL.turn` while a turn is live, `POLL.queue` once it has
  * settled. Never off, because nothing else tells an open conversation about a turn that arrives from
- * outside the shell (IDE, Telegram, the autopilot) — the list poll only refreshes the list, it does
+ * outside the shell (IDE, a messaging channel, the autopilot) — the list poll only refreshes the list, it does
  * not invalidate this query — but a settled conversation does not need the 3 s `POLL.fast`.
  */
 export function conversationInterval(turnLive: boolean): number {
@@ -1303,7 +1303,7 @@ export function useSendMessage(chatId: string) {
     mutationFn: ({ text, images }: { text: string; images: Attachment[] }) =>
       // `wait_if_busy` is what turns the old 409 into a place in the queue. A person looking at the
       // window would rather their words were kept than be told no and handed back an empty box —
-      // the Telegram sidecar, which gives up on a turn after a timeout, would rather be refused,
+      // a channel sidecar, which gives up on a turn after a timeout, would rather be refused,
       // and so it does not ask.
       apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
         method: "POST",

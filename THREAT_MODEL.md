@@ -39,7 +39,7 @@ Spec §9 requires a tool allowlist derived from trigger confidence: externally s
 | cron (scheduled) | Owner configuration | Trusted | `ToolPolicy::Unrestricted` | When `classifier.rs` returns `pending_approval` |
 | repo (branch SHA moved) | Owner repository configuration and branch state | Trusted | `ToolPolicy::Unrestricted` | When `classifier.rs` returns `pending_approval` |
 | email (triage) | Email content chosen by a stranger | Untrusted | `ToolPolicy::None` — no tools at all | No — no tool can be invoked |
-| telegram / assistant | Paired owner over a network | Semi-trusted | `ToolPolicy::McpOnly` — NucleOS MCP tools only; built-ins denied | No — `hooks.rs` allows only sanctioned NucleOS MCP tools and bypasses the classifier |
+| channel:telegram / assistant (Telegram is a channel: a channelkit adapter sidecar, `sidecars/telegram`, routed by `core/src/channels/`) | Paired owner over a network | Semi-trusted | `ToolPolicy::McpOnly` — NucleOS MCP tools only; built-ins denied | No — `hooks.rs` allows only sanctioned NucleOS MCP tools and bypasses the classifier |
 | manual (`POST /runs`) | Owner action | Trusted | `ToolPolicy::Unrestricted` for `real`, `shadow`, and `worktree`; `ToolPolicy::None` when the submitted mode is `email_triage` | For unrestricted modes, when `classifier.rs` returns `pending_approval`; no for `email_triage`, which has no tools |
 | council (`POST /council`) | The owner's question in phase 1; other models' answers in phases 2 and 3 | Trusted at the door, model-generated thereafter | Phase 1: `ToolPolicy::McpOnly` narrowed to `mcp_tools::COUNCIL_TOOLS`. Phases 2 and 3: `ToolPolicy::None` | No — nothing on that list acts, and the classifier never sees a seat |
 

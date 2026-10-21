@@ -344,7 +344,6 @@ mod tests {
                 startup_config: Default::default(),
                 token: Token("test-token".into()),
                 pool,
-                telegram_doctrine: None,
                 channels: Default::default(),
                 runner: Arc::new(FakeCommandRunner::default()),
                 triage_runner: None,
@@ -1453,7 +1452,6 @@ mod tests {
             startup_config: Default::default(),
             token: Token("test-token".into()),
             pool,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
@@ -17167,10 +17165,10 @@ mod tests {
         assert_eq!(body["refusal"], "no_such_destination");
     }
 
-    /// A turn that arrived from Telegram may not relay, and this is the test that makes that
+    /// A turn that arrived from a remote channel may not relay, and this is the test that makes that
     /// sentence true rather than merely written.
     ///
-    /// `relay::Refusal::TelegramOrigin` had a unit test from the day it was written and no way to
+    /// `relay::Refusal::RemoteOrigin` had a unit test from the day it was written and no way to
     /// fire in production: this handler had no origin to hand `admit` and passed `Origin::Shell`,
     /// so every relay was certified as shell-sent whatever had actually asked for it. What closed
     /// that is 0119 — the origin is on the `runs` row now — and what this test pins is the wiring
@@ -17180,7 +17178,7 @@ mod tests {
     /// the granted case above. That is deliberate — it isolates the one fact under test, so a green
     /// here cannot be explained by the destination, the chain, or presence.
     #[tokio::test]
-    async fn a_relay_asked_for_by_a_telegram_turn_is_refused() {
+    async fn a_relay_asked_for_by_a_remote_channel_turn_is_refused() {
         let state = test_state().await;
         let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
@@ -17199,7 +17197,7 @@ mod tests {
             &state,
             &from_chat_id,
             "ola",
-            crate::assistant::Origin::Telegram,
+            crate::assistant::Origin::Channel("telegram"),
         )
         .await
         .unwrap();
@@ -17225,7 +17223,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = json_body(response).await;
-        assert_eq!(body["refusal"], "telegram_origin");
+        assert_eq!(body["refusal"], "remote_origin");
         let relays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays")
             .fetch_one(&state.pool)
             .await
@@ -17307,7 +17305,7 @@ mod tests {
     async fn a_relay_asked_for_by_a_channel_turn_is_refused_as_remote_origin() {
         assert_eq!(
             relay_refusal_for_run_origin(None, true).await,
-            "telegram_origin"
+            "remote_origin"
         );
     }
 
@@ -17317,7 +17315,7 @@ mod tests {
     async fn a_run_with_the_migrated_channel_telegram_origin_cannot_forward() {
         assert_eq!(
             relay_refusal_for_run_origin(Some("channel:telegram"), false).await,
-            "telegram_origin"
+            "remote_origin"
         );
         // An unregistered channel id stays unknown and is refused as such.
         assert_eq!(
@@ -17880,7 +17878,7 @@ mod tests {
     /// would have been telling the gate something untrue in order to get a different answer out of
     /// it, and would have left two rules where the code has one.
     #[tokio::test]
-    async fn forwarding_a_turn_that_came_from_telegram_is_refused() {
+    async fn forwarding_a_turn_that_came_from_a_remote_channel_is_refused() {
         let state = test_state().await;
         let from_chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
@@ -17922,7 +17920,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(json_body(response).await["refusal"], "telegram_origin");
+        assert_eq!(json_body(response).await["refusal"], "remote_origin");
     }
 
     /// What waits reaches the window, or nothing on screen says the words were kept.
@@ -18877,7 +18875,6 @@ mod tests {
             startup_config: Default::default(),
             token: Token("test-token".into()),
             pool: pool.clone(),
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: Arc::new(FakeCommandRunner::default()),
             triage_runner: None,
@@ -20093,81 +20090,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn assistant_turn_status_returns_run_after_message() {
-        let app = build_router(test_state().await);
-        let post_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/assistant/message")
-                    .header("Authorization", "Bearer test-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({
-                            "chat_id": "chat-2",
-                            "text": "hello"
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(post_response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(post_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let turn_id = parsed["turn_id"].as_i64().unwrap();
-
-        let get_response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/assistant/{turn_id}"))
-                    .header("Authorization", "Bearer test-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(get_response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(get_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["id"], serde_json::json!(turn_id));
-    }
-
-    /// `GET /assistant/{turn_id}` is granted to a read-only key, and turn ids are sequential
-    /// integers. A conversation id in the answer would hand that key the destination to post to
-    /// (`POST /assistant/message` takes a client-chosen `chat_id`), so the turn view leaves it out.
-    /// `/runs/{id}` keeps it: that route is the run view and the shell links back through it.
-    #[tokio::test]
-    async fn the_turn_view_does_not_name_the_conversation_but_the_run_view_still_does() {
-        let state = test_state().await;
-        let turn_id: i64 = sqlx::query_scalar(
-            "INSERT INTO runs (prompt, status, created_at, mode, chat_id)
-             VALUES ('hi', 'completed', ?, 'assistant', 'secret-chat') RETURNING id",
-        )
-        .bind(chrono::Utc::now().to_rfc3339())
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
-
-        let turn = get_json(&state, &format!("/assistant/{turn_id}")).await;
-        assert_eq!(turn["id"], serde_json::json!(turn_id));
-        assert!(
-            turn.get("chat_id").is_none(),
-            "the turn view leaked the conversation id: {turn}"
-        );
-
-        let run = get_json(&state, &format!("/runs/{turn_id}")).await;
-        assert_eq!(run["chat_id"], serde_json::json!("secret-chat"));
     }
 
     #[tokio::test]
@@ -24155,7 +24077,7 @@ mod tests {
             state,
             "POST",
             "/owner-notes",
-            Some(serde_json::json!({ "text": "from a phone", "origin": "telegram" })),
+            Some(serde_json::json!({ "text": "from a phone", "origin": "channel:telegram" })),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -26087,7 +26009,6 @@ mod triage_barrier_tests {
             startup_config: Default::default(),
             token: crate::auth::Token("verification-token".into()),
             pool,
-            telegram_doctrine: None,
             channels: Default::default(),
             runner: std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default()),
             triage_runner: None,

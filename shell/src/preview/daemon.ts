@@ -3083,7 +3083,7 @@ const STORAGE: StorageReport = {
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
 const CHANNEL_TELEGRAM_WHAT =
-  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too";
+  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in, and `stream_edits` (a live progress preview made by editing the acknowledgement; on by default, `false` turns it off); the bot token is stored here too";
 
 const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["email", "Which mailbox the e-mail pillar reads, and how often.", "host: imap.example.com\nusername: me@example.com\nmailbox: INBOX\npoll_interval_secs: 120\n"],
@@ -3091,7 +3091,6 @@ const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["calendar", "Working hours and the default timezone.", 'default_tz: Europe/Lisbon\nworking_hours_start: "09:00"\nworking_hours_end: "18:00"\n'],
   ["web", "The search provider and how many results a query returns.", null],
   ["browser", "Which browser driver the browser pillar starts.", "driver: chrome\n"],
-  ["telegram", "The bot and the chat notifications are sent to.", null],
   ["channels/telegram", CHANNEL_TELEGRAM_WHAT, null],
   ["github", "Which account `gh` acts as.", null],
   ["council", "Who sits on the council and how votes are counted.", null],

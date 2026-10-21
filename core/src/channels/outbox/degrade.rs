@@ -174,14 +174,24 @@ async fn degrade_buttons(
     Ok(None)
 }
 
+/// Whether the row is a best-effort progress row (`class = 'progress'`).
+async fn is_progress(conn: &mut SqliteConnection, row_id: i64) -> sqlx::Result<bool> {
+    let class: Option<String> = sqlx::query_scalar("SELECT class FROM channel_outbox WHERE id = ?")
+        .bind(row_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(class.as_deref() == Some("progress"))
+}
+
 /// Rewrites `action` so it only uses what `caps` supports, and joins the platform refs the adapter
-/// needs to address earlier messages.
+/// needs to address earlier messages. `None` = the action is dropped: a progress edit that cannot
+/// be applied in place is never turned into a send (the caller settles the row without delivery).
 pub(super) async fn degrade(
     conn: &mut SqliteConnection,
     channel: &str,
     caps: &Capabilities,
     action: OutAction,
-) -> sqlx::Result<OutAction> {
+) -> sqlx::Result<Option<OutAction>> {
     match action {
         OutAction::Send {
             id,
@@ -203,7 +213,7 @@ pub(super) async fn degrade(
                     _ => reply_to = None,
                 }
             }
-            Ok(OutAction::Send {
+            Ok(Some(OutAction::Send {
                 id,
                 conversation,
                 reply_to,
@@ -211,7 +221,7 @@ pub(super) async fn degrade(
                 parts,
                 buttons,
                 silent,
-            })
+            }))
         }
         OutAction::Edit {
             id,
@@ -229,18 +239,21 @@ pub(super) async fn degrade(
                     .as_ref()
                     .is_some_and(|t| t.addressable() && t.replaced_by.is_none());
             if editable && let Some(t) = found {
-                return Ok(OutAction::Edit {
+                return Ok(Some(OutAction::Edit {
                     id,
                     conversation,
                     target: target_id,
                     target_platform_refs: t.refs,
                     parts,
                     buttons,
-                });
+                }));
+            }
+            if is_progress(conn, id).await? {
+                return Ok(None);
             }
             let conversation =
                 substitute_conversation(conn, channel, found.as_ref(), conversation).await?;
-            Ok(OutAction::Send {
+            Ok(Some(OutAction::Send {
                 id,
                 conversation,
                 reply_to: None,
@@ -248,9 +261,9 @@ pub(super) async fn degrade(
                 parts,
                 buttons,
                 silent: false,
-            })
+            }))
         }
-        answer @ OutAction::AnswerAction { .. } => Ok(answer),
+        answer @ OutAction::AnswerAction { .. } => Ok(Some(answer)),
     }
 }
 
@@ -332,8 +345,69 @@ mod tests {
 
     async fn run(pool: &SqlitePool, caps: &Capabilities, action: OutAction) -> Value {
         let mut conn = pool.acquire().await.unwrap();
-        let got = degrade(&mut conn, "fake", caps, action).await.unwrap();
+        let got = degrade(&mut conn, "fake", caps, action)
+            .await
+            .unwrap()
+            .expect("the action is not dropped");
         serde_json::to_value(got).unwrap()
+    }
+
+    /// Like [`insert`], but a `progress` row (an edit).
+    async fn insert_progress(pool: &SqlitePool, target: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class,              subject, state, due_at, attempts, created_at)              VALUES ('fake', 'c1', 'ordered', 'edit', ?, 'progress', 'run:1', 'leased',              '2026-10-19T09:00:00Z', 1, '2026-10-19T09:00:00Z') RETURNING id",
+        )
+        .bind(json!({"parts": [], "target": target}).to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn dropped(pool: &SqlitePool, caps: &Capabilities, action: OutAction) -> bool {
+        let mut conn = pool.acquire().await.unwrap();
+        degrade(&mut conn, "fake", caps, action)
+            .await
+            .unwrap()
+            .is_none()
+    }
+
+    #[tokio::test]
+    async fn progress_edit_with_unaddressable_target_is_dropped_not_sent() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let failed = insert(pool, "c1", "failed", None, None, None).await;
+        let unsent = insert(pool, "c1", "pending", None, None, None).await;
+        let replaced = insert(pool, "c1", "done", Some(r#"["p1"]"#), Some(failed), None).await;
+        let missing = 9_999;
+        for target in [failed, unsent, replaced, missing] {
+            let id = insert_progress(pool, target).await;
+            assert!(
+                dropped(pool, &full_caps(), edit(id, target)).await,
+                "target {target}"
+            );
+        }
+        // The same edit of an addressable target is delivered as an edit.
+        let live = insert(pool, "c1", "done", Some(r#"["p2"]"#), None, None).await;
+        let id = insert_progress(pool, live).await;
+        let got = run(pool, &full_caps(), edit(id, live)).await;
+        assert_eq!(got["type"], "edit", "{got}");
+    }
+
+    #[tokio::test]
+    async fn progress_edit_without_edit_capability_is_dropped() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let live = insert(pool, "c1", "done", Some(r#"["p1"]"#), None, None).await;
+        let id = insert_progress(pool, live).await;
+        let caps = Capabilities {
+            edit: false,
+            ..full_caps()
+        };
+        assert!(dropped(pool, &caps, edit(id, live)).await);
+        // A non-progress edit still degrades to a send.
+        let turn = insert(pool, "c1", "pending", None, None, None).await;
+        let got = run(pool, &caps, edit(turn, live)).await;
+        assert_eq!(got["type"], "send", "{got}");
     }
 
     fn texts(value: &Value) -> Vec<String> {

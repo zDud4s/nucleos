@@ -173,10 +173,10 @@ pub enum Refusal {
     /// an archived row as gone (`archived_at IS NULL`), so a relay follows the same rule rather than
     /// inventing a second meaning of "absent" that only this module believes.
     NoSuchDestination { to_chat_id: String },
-    /// The sending turn's `origin` is remote (`Origin::is_remote`: Telegram or any channel). Named on its own rather than left to fall
+    /// The sending turn's `origin` is remote (`Origin::is_remote`: any channel). Named on its own rather than left to fall
     /// out of some other rule, because a boundary that only holds by accident of what else happens
     /// to be configured is not one a reader can trust — see this module's header.
-    TelegramOrigin,
+    RemoteOrigin,
     /// The chain itself refuses the hop. Carried whole, not re-decomposed into new variants:
     /// `Verdict` already names `Itself`, `Cycle { at }` and `TooDeep` as specifically as they can be
     /// named, and repeating that shape here would be a second definition of the same fact, free to
@@ -281,7 +281,7 @@ pub async fn admit(
     // is configured — a local model wired in tomorrow could quietly let one through — and a security
     // boundary nobody can point at is not one anybody can trust.
     if origin.is_remote() {
-        return Err(Refusal::TelegramOrigin);
+        return Err(Refusal::RemoteOrigin);
     }
 
     // The chain is the only brake below that needs more than the row already in hand: `chain_of`
@@ -762,9 +762,9 @@ mod tests {
     }
 
     /// Refused outright, even with a live destination, an admitting chain and a present owner —
-    /// this brake does not wait to be reached by elimination, see the header on `Refusal::TelegramOrigin`.
+    /// this brake does not wait to be reached by elimination, see the header on `Refusal::RemoteOrigin`.
     #[tokio::test]
-    async fn a_turn_from_telegram_may_not_relay_even_when_everything_else_would_allow_it() {
+    async fn a_turn_from_a_remote_channel_may_not_relay_even_when_everything_else_would_allow_it() {
         let pool = test_pool().await;
         let now = timestamp("2026-08-22T00:00:00Z");
         seed_chat(&pool, "A", false).await;
@@ -777,13 +777,13 @@ mod tests {
             "A",
             "B",
             run_id,
-            Origin::Telegram,
+            Origin::Channel("telegram"),
             "relayed words",
             now,
         )
         .await
-        .expect_err("a Telegram-origin turn must be refused");
-        assert_eq!(refusal, Refusal::TelegramOrigin);
+        .expect_err("a remote-origin turn must be refused");
+        assert_eq!(refusal, Refusal::RemoteOrigin);
     }
 
     /// A channel-origin turn is remote exactly like Telegram; a Shell turn on the same chats is not.
@@ -807,7 +807,7 @@ mod tests {
         )
         .await
         .expect_err("a channel-origin turn must be refused");
-        assert_eq!(refusal, Refusal::TelegramOrigin);
+        assert_eq!(refusal, Refusal::RemoteOrigin);
 
         admit(&pool, "A", "B", run_id, Origin::Shell, "relayed words", now)
             .await

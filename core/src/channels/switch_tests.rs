@@ -655,7 +655,10 @@ async fn chat_said_now_origin_telegram_is_read_as_before() {
             .unwrap();
     assert_eq!(origin, "telegram");
     // ...and that spelling stays valid on the wire.
-    assert_eq!(Origin::from_wire(Some(&origin)), Origin::Telegram);
+    assert_eq!(
+        Origin::from_wire(Some(&origin)),
+        Origin::Channel("telegram")
+    );
 }
 
 /// 0236, verbatim, so a test can apply it a second time on an already migrated database.

@@ -403,7 +403,7 @@ function DesktopSwitch() {
       />
       <p className="sy-note sy-notify-lead">
         Waiting approvals, conversations that answered, and the feed lines the choices below allow
-        (the same ones Telegram gets).
+        (the same ones your channels get).
       </p>
     </Panel>
   );

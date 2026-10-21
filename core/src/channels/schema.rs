@@ -1,9 +1,10 @@
-//! Schema checks of the channel tables (test-only): migrations 0220-0227 and 0230 create what D.17 says,
+//! Schema checks of the channel tables (test-only): migrations 0220-0227, 0230 and 0237 create what
+//! D.17 says,
 //! with the indexes and CHECKs the rest of the hub leans on.
 
 use sqlx::SqlitePool;
 
-use crate::testdb::fresh_pool;
+use crate::testdb::{apply_migrations_after, fresh_pool, pool_migrated_through};
 
 async fn columns(pool: &SqlitePool, table: &str) -> Vec<String> {
     sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info(?)")
@@ -278,4 +279,111 @@ async fn outbox_checks_reject_unknown_values() {
         )
         .await
     );
+}
+
+/// The last migration before the `progress` class.
+const BEFORE_PROGRESS: i64 = 236;
+
+/// `(id, conversation, action, class, state, subject, due_at, attempts, replaced_by, settled_at)`.
+type OutboxSnapshot = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    i64,
+    Option<i64>,
+    Option<String>,
+);
+
+#[tokio::test]
+async fn migration_0237_accepts_progress_class() {
+    let pool = fresh_pool().await;
+    assert!(
+        ok(
+            &pool,
+            &outbox_insert("ordered", "edit", "pending", "progress")
+        )
+        .await
+    );
+    assert!(
+        ok(
+            &pool,
+            &outbox_insert("ordered", "send", "pending", "progress")
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn migration_0237_still_rejects_unknown_class() {
+    let pool = fresh_pool().await;
+    assert!(!ok(&pool, &outbox_insert("ordered", "send", "pending", "spam")).await);
+    assert!(!ok(&pool, &outbox_insert("ordered", "send", "pending", "")).await);
+    // The other CHECKs survived the rebuild.
+    assert!(!ok(&pool, &outbox_insert("fast", "send", "pending", "progress")).await);
+    assert!(!ok(&pool, &outbox_insert("ordered", "delete", "pending", "progress")).await);
+    assert!(!ok(&pool, &outbox_insert("ordered", "send", "queued", "progress")).await);
+}
+
+#[tokio::test]
+async fn migration_0237_keeps_existing_rows_and_indexes() {
+    let pool = pool_migrated_through(BEFORE_PROGRESS).await;
+    for sql in [
+        // Row 1 is the target of row 2's `replaced_by`; row 3 is settled.
+        "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class,          subject, state, due_at, attempts, platform_refs, fail_reason, created_at, settled_at)          VALUES ('c', 'conv', 'ordered', 'send', '{\"a\":1}', 'notification', 'run:7', 'failed',          't1', 3, '[\"r1\"]', 'thread_not_found', 'k1', 's1')",
+        "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class,          state, due_at, replaced_by, created_at)          VALUES ('c', 'home', 'ordered', 'send', '{}', 'turn', 'pending', 't2', 1, 'k2')",
+        "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class,          state, due_at, created_at, settled_at)          VALUES ('c', 'conv', 'immediate', 'answer_action', '{}', 'command', 'done', 't3', 'k3', 's3')",
+    ] {
+        assert!(ok(&pool, sql).await, "{sql}");
+    }
+    let snapshot = || async {
+        sqlx::query_as::<_, OutboxSnapshot>(
+            "SELECT id, conversation, action, class, state, subject, due_at, attempts,              replaced_by, settled_at FROM channel_outbox ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let before = snapshot().await;
+    assert_eq!(before.len(), 3);
+
+    apply_migrations_after(&pool, BEFORE_PROGRESS).await;
+
+    assert_eq!(snapshot().await, before);
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'channel_outbox'          AND name LIKE 'channel_outbox_%' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(names, ["channel_outbox_due", "channel_outbox_settled"]);
+    let due = index_sql(&pool, "channel_outbox_due").await.unwrap();
+    assert!(due.contains("WHERE state IN ('pending', 'leased')"), "{due}");
+    let settled = index_sql(&pool, "channel_outbox_settled").await.unwrap();
+    assert!(settled.contains("settled_at IS NOT NULL"), "{settled}");
+
+    // The self-reference is intact: no violation, and a dangling `replaced_by` is still refused.
+    let violations = sqlx::query("PRAGMA foreign_key_check(channel_outbox)")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(violations.is_empty());
+    assert!(
+        !ok(
+            &pool,
+            "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class,              state, due_at, replaced_by, created_at)              VALUES ('c', 'x', 'ordered', 'send', '{}', 'turn', 'pending', 't', 999, 'k')"
+        )
+        .await
+    );
+    // Ids keep counting from the old high-water mark.
+    let next: i64 = sqlx::query_scalar(
+        "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class,          state, due_at, created_at)          VALUES ('c', 'x', 'ordered', 'send', '{}', 'progress', 'pending', 't', 'k') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(next, 4);
 }

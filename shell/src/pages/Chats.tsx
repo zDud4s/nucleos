@@ -5439,9 +5439,6 @@ const MESSAGE_SENTENCES: Record<string, string> = {
     "nothing is handed over while nobody is at the machine to see it arrive",
   remote_origin:
     "a turn that arrived from a messaging channel cannot be handed to another conversation",
-  // Kept until phase 4 retires the Telegram-specific refusal.
-  telegram_origin:
-    "a turn that arrived from Telegram cannot be handed to another conversation",
   unknown_origin:
     "this turn does not record where it came from, so it cannot be handed on",
   unknown_sender: "the turn being handed over could not be found",

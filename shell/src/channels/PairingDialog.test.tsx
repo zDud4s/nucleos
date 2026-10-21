@@ -24,7 +24,7 @@ const CODE = {
 function channel(over: Partial<Channel> = {}): Channel {
   return {
     id: "telegram", kind: "telegram", label: "Telegram", health_row: "telegram", configured: true,
-    missing_secrets: [], settings_area: "telegram", state: "online", since: null,
+    missing_secrets: [], settings_area: "channels/telegram", state: "online", since: null,
     adapter: { contract_version: "1" }, capabilities: null, home: null,
     identities: { senders: 0, conversations: 0 }, pairing: null,
     outbox: { pending: 0, leased: 0, failed: 0, oldest_due_at: null },

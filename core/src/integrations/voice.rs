@@ -2120,7 +2120,6 @@ mod tests {
             assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
             // A doctrine is a Telegram channel's standing instruction. A conversation held at this
             // machine has none by definition, so `None` here is the value under test, not a stub.
-            telegram_doctrine: None,
             channels: Default::default(),
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

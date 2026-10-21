@@ -1,4 +1,4 @@
-//! Configuration for the email, calendar, verification, web, browser, Telegram, and GitHub pillars.
+//! Configuration for the email, calendar, verification, web, browser, and GitHub pillars.
 
 use super::*;
 
@@ -467,22 +467,6 @@ pub fn load_browser_config(path: &Path) -> BrowserConfig {
     }
 }
 
-/// `~/.nucleos/telegram.yaml`. Per-developer, gitignored, and read for exactly one thing: the standing
-/// doctrine a Telegram turn falls back on when the chat itself gave no instructions.
-///
-/// Ships with no field this widens into a capability, unlike `GithubConfig` below — the whole
-/// content is a paragraph of text that becomes `append_system_prompt` when nothing else would have.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct TelegramConfig {
-    /// The standing instructions a Telegram turn is launched with when the chat has none of its
-    /// own. `None` — absent, blank, or whitespace-only — means every turn is launched exactly as it
-    /// was before this file existed: see `chats.rs`'s identical treatment of a blank `instructions`
-    /// column.
-    #[serde(default, deserialize_with = "deserialize_blank_as_none")]
-    pub doctrine: Option<String>,
-}
-
 /// A blank or whitespace-only string reads as `None`, mirroring `chats.rs`'s
 /// `instructions.filter(|text| !text.trim().is_empty())` for the same reason: a doctrine of empty
 /// spaces would spend an argv slot saying nothing.
@@ -491,38 +475,6 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<String>::deserialize(deserializer)?.filter(|text| !text.trim().is_empty()))
-}
-
-/// `~/.nucleos/telegram.yaml`'s grammar, and the only place that decides what a valid one is.
-///
-/// Split out of [`load_telegram_config`] because a write route needs a parser that can REFUSE, and
-/// the loader by design cannot: it answers a malformed file with defaults precisely so that
-/// a typo never invents a doctrine nobody wrote. Two questions, one grammar — the loader
-/// calls this and then decides what to do with the `Err`, which is what keeps the file the door
-/// accepts and the file the daemon reads the same file. See `machine_config.rs` for the door.
-pub fn parse_telegram_config(contents: &str) -> Result<TelegramConfig, String> {
-    serde_yaml::from_str::<TelegramConfig>(contents).map_err(|error| error.to_string())
-}
-
-/// Reads `~/.nucleos/telegram.yaml`. Absent, unreadable or malformed → default (`doctrine: None`), with a
-/// warning — the same asymmetry `load_web_config` and `load_browser_config` both take: a typo in a
-/// per-developer file must cost fidelity (no doctrine prepended) and never stop the daemon, and
-/// never invent a doctrine nobody wrote.
-pub fn load_telegram_config(path: &Path) -> TelegramConfig {
-    if !path.exists() {
-        return TelegramConfig::default();
-    }
-    match std::fs::read_to_string(path).map(|text| parse_telegram_config(&text)) {
-        Ok(Ok(config)) => config,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, path = %path.display(), "telegram config: could not be parsed; every turn is launched exactly as before");
-            TelegramConfig::default()
-        }
-        Err(error) => {
-            tracing::warn!(%error, path = %path.display(), "telegram config: could not be read; every turn is launched exactly as before");
-            TelegramConfig::default()
-        }
-    }
 }
 
 /// `~/.nucleos/github.yaml`. The GitHub pillar's switch and the two lists that decide what runs without

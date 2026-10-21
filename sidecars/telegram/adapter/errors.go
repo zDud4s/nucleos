@@ -36,6 +36,10 @@ func Classify(err error) error {
 		return kit.Retryable("telegram_5xx", 0)
 	case strings.Contains(desc, "message thread not found"):
 		return kit.Permanent("thread_not_found")
+	case strings.Contains(desc, "message to edit not found"), strings.Contains(desc, "message_id_invalid"):
+		// The edit target was deleted (or never existed): no retry can help, and the core drops a
+		// best-effort progress edit on this reason.
+		return kit.Permanent("edit_target_gone")
 	case strings.Contains(desc, "chat not found"), strings.Contains(desc, "bot was kicked"):
 		return kit.Permanent("conversation_not_found")
 	case apiErr.StatusCode == 401:

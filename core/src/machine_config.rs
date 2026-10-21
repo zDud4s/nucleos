@@ -83,7 +83,6 @@ pub const VOICE_FILE: &str = "voice.yaml";
 pub const CALENDAR_FILE: &str = "calendar.yaml";
 pub const WEB_FILE: &str = "web.yaml";
 pub const BROWSER_FILE: &str = "browser.yaml";
-pub const TELEGRAM_FILE: &str = "telegram.yaml";
 /// The Telegram channel's own settings, under the `channels/` subdirectory of [`root`].
 pub const CHANNEL_TELEGRAM_FILE: &str = "channels/telegram.yaml";
 pub const GITHUB_FILE: &str = "github.yaml";
@@ -134,10 +133,6 @@ fn validate_web(contents: &str) -> Result<(), String> {
 
 fn validate_browser(contents: &str) -> Result<(), String> {
     crate::config::parse_browser_config(contents).map(|_| ())
-}
-
-fn validate_telegram(contents: &str) -> Result<(), String> {
-    crate::config::parse_telegram_config(contents).map(|_| ())
 }
 
 /// The per-channel file: the same grammar `registry::load_config` reads, but strict. The loader
@@ -192,7 +187,7 @@ fn validate_verify(contents: &str) -> Result<(), String> {
     crate::config::parse_verify_config(contents).map(|_| ())
 }
 
-/// This machine's settings files. Twelve rows, and the count is asserted in the tests for the same
+/// This machine's settings files. Eleven rows, and the count is asserted in the tests for the same
 /// reason the project registry asserts two: a row added without reading the header above is a row
 /// that has not answered the membership rule.
 pub static SETTINGS: &[Setting] = &[
@@ -232,16 +227,9 @@ pub static SETTINGS: &[Setting] = &[
         validate: validate_browser,
     },
     Setting {
-        path: TELEGRAM_FILE,
-        area: "telegram",
-        what: "the standing instructions a Telegram turn is launched with when the chat has none of its own",
-        takes_effect: "when the daemon restarts",
-        validate: validate_telegram,
-    },
-    Setting {
         path: CHANNEL_TELEGRAM_FILE,
         area: "channels/telegram",
-        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too",
+        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in, and `stream_edits` (a live progress preview made by editing the acknowledgement; on by default, `false` turns it off); the bot token is stored here too",
         takes_effect: "when the daemon restarts",
         validate: validate_channel_config,
     },
@@ -484,6 +472,27 @@ pub fn secret_for(key: &str) -> Option<&'static Secret> {
 mod tests {
     use super::*;
 
+    /// The Telegram row names `stream_edits`, so the settings page tells the owner it exists.
+    #[test]
+    fn settings_row_channels_telegram_mentions_stream_edits() {
+        let setting = setting_for(CHANNEL_TELEGRAM_FILE).expect("the telegram row exists");
+        assert!(setting.what.contains("stream_edits"), "{}", setting.what);
+    }
+
+    /// The door accepts `stream_edits: false`, refuses a non-bool, and absent means on.
+    #[test]
+    fn channel_config_stream_edits_defaults_to_true_and_parses_false() {
+        let setting = setting_for(CHANNEL_TELEGRAM_FILE).expect("the telegram row exists");
+        assert!((setting.validate)("stream_edits: false\n").is_ok());
+        assert!((setting.validate)("stream_edits: maybe\n").is_err());
+        let off: crate::channels::registry::ChannelConfig =
+            serde_yaml::from_str("stream_edits: false\n").unwrap();
+        assert!(!off.stream_edits());
+        let unset: crate::channels::registry::ChannelConfig =
+            serde_yaml::from_str("doctrine: x\n").unwrap();
+        assert!(unset.stream_edits());
+    }
+
     /// The membership rule, asserted rather than trusted: every row can say no, and says both of
     /// the sentences the page needs.
     ///
@@ -494,7 +503,7 @@ mod tests {
     fn every_setting_can_refuse_and_says_what_it_changes() {
         assert_eq!(
             SETTINGS.len(),
-            12,
+            11,
             "see the module header before adding a row"
         );
         for setting in SETTINGS {
@@ -516,11 +525,11 @@ mod tests {
         }
     }
 
-    /// The table has the twelve rows the header counts; the pin above names the guard, this one
+    /// The table has the eleven rows the header counts; the pin above names the guard, this one
     /// names the count.
     #[test]
-    fn the_settings_table_has_twelve_rows() {
-        assert_eq!(SETTINGS.len(), 12);
+    fn the_settings_table_has_eleven_rows() {
+        assert_eq!(SETTINGS.len(), 11);
     }
 
     /// Every production channel manifest has exactly one row, keyed by its `settings_area` and
