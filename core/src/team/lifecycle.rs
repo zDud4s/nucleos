@@ -135,7 +135,7 @@ pub async fn start_with(
         && let Some(local) = members
             .iter()
             .chain(std::iter::once(&director))
-            .find(|agent| agent.engine == "local")
+            .find(|agent| agent.engine.as_deref() == Some("local"))
     {
         return Err(StartError::Invalid(format!(
             "{} runs on a local model and this machine has none available",

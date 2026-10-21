@@ -34,7 +34,8 @@
 description: >-
   The nucleos-dev workflow: triage, plan, execute, review and maintain phases, their packet
   schemas, their Claude Code and Codex cockpits, and the scripts that gate and run them
-  (evidence and review gates, speed resolution, prompt assembly, spec loops, parallel waves).
+  (evidence and review gates, speed resolution, prompt assembly, spec loops, parallel waves),
+  plus user agent pipelines and their synthesis.
 origin: nucleos
 
 # The managed block at the top of a project's AGENTS.md (between the `AI WORKFLOW MANAGED BLOCK`
@@ -53,12 +54,15 @@ owns:
   - .claude/skills/executor/
   - .claude/skills/maintenance/
   - .claude/skills/orchestrate/
+  - .claude/skills/orchestrate-agents/
   - .claude/skills/orchestrate-node/
   - .claude/skills/orchestrate-tdd/
   - .claude/skills/planner/
   - .claude/skills/rescue/
   - .claude/skills/reviewer/
+  - .claude/skills/run-pipeline/
   - .claude/skills/skill-authoring/
+  - .claude/skills/synthesizer/
 
   # ---- the phase cockpits: explicit files, not a blanket .claude/agents/ (a project may have
   # agents of its own under the same directory) ---------------------------------------------------
@@ -69,6 +73,7 @@ owns:
   - .claude/agents/wf-planner.md
   - .claude/agents/wf-rescue.md
   - .claude/agents/wf-reviewer.md
+  - .claude/agents/wf-synthesizer.md
 
   # ---- the Codex-controller mirror of the skills above, one directory per skill -----------------
   - .agents/skills/bootstrap/
@@ -77,12 +82,15 @@ owns:
   - .agents/skills/executor/
   - .agents/skills/maintenance/
   - .agents/skills/orchestrate/
+  - .agents/skills/orchestrate-agents/
   - .agents/skills/orchestrate-node/
   - .agents/skills/orchestrate-tdd/
   - .agents/skills/planner/
   - .agents/skills/rescue/
   - .agents/skills/reviewer/
+  - .agents/skills/run-pipeline/
   - .agents/skills/skill-authoring/
+  - .agents/skills/synthesizer/
 
 hooks:
   # A spec session ends when its checklist does (workflow.md, "Spec sessions"). Both entry points

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { AgentEngine, AgentRequest, AgentToolPolicy } from "../../data/agents";
+import { AGENT_CAPABILITIES, proposedCapabilities, sameCapabilities, type AgentEngine, type AgentRequest } from "../../data/agents";
 import type { Proposal } from "../../data/system";
 import { parseActionPayload, useHireRecruit } from "../../data/teams";
 import { useRejectProposal } from "../../data/waiting";
@@ -47,9 +47,8 @@ export function RecruitmentSection({ view }: { view: Reading<Proposal> }) {
   );
 }
 
-/** What the catalogue accepts for `engine` and `tool_policy` — the same lists `Agents.tsx` offers. */
+/** What the catalogue accepts for `engine` — the same lists `Agents.tsx` offers. */
 const RECRUIT_ENGINES: AgentEngine[] = ["claude", "codex", "local"];
-const RECRUIT_TOOL_POLICIES: AgentToolPolicy[] = ["mcp_only", "none"];
 
 /**
  * A select's options, keeping whatever the director proposed even when it is not one of them.
@@ -88,7 +87,7 @@ function seedRecruitForm(raw: string | null): AgentRequest | null {
     prompt: text(parsed.prompt),
     engine: text(parsed.engine),
     model: typeof parsed.model === "string" ? parsed.model : null,
-    tool_policy: text(parsed.tool_policy),
+    capabilities: proposedCapabilities(parsed),
   };
 }
 
@@ -141,9 +140,9 @@ function RecruitmentCard({
   const carefulChanged =
     form !== null &&
     proposed !== null &&
-    (form.engine !== proposed.engine || form.tool_policy !== proposed.tool_policy);
+    (form.engine !== proposed.engine || !sameCapabilities(form.capabilities, proposed.capabilities));
   const careful =
-    "Engine and tool policy are the two fields a director gets wrong most often — they are also what costs money per turn and what widens what this agent can reach.";
+    "Engine and capabilities are the two fields a director gets wrong most often — they are also what costs money per turn and what widens what this agent can reach.";
 
   const context = hasDepartmentContext(proposal);
 
@@ -233,17 +232,36 @@ function RecruitmentCard({
                     }
                   />
                 </Field>
-                <Field label="Tool policy">
-                  <select
-                    className="waiting-recruit-input-careful"
-                    id={idFor("tool_policy")}
-                    aria-describedby={carefulId}
-                    value={form.tool_policy}
-                    onChange={(event) => field("tool_policy", event.target.value)}
-                  >
-                    <OptionsWith current={form.tool_policy} known={RECRUIT_TOOL_POLICIES} />
-                  </select>
-                </Field>
+                <div className="ui-field">
+  <span className="ui-field-label" id={idFor("capabilities-label")}>
+    Capabilities
+  </span>
+  <div
+    className="waiting-recruit-input-careful"
+    id={idFor("capabilities")}
+    role="group"
+    aria-labelledby={idFor("capabilities-label")}
+    aria-describedby={carefulId}
+  >
+    {[...AGENT_CAPABILITIES, ...form.capabilities.filter((held) => !(AGENT_CAPABILITIES as readonly string[]).includes(held))].map((capability) => (
+      <label key={capability} style={{ display: "inline-flex", gap: 4, marginRight: 12 }}>
+        <input
+          type="checkbox"
+          checked={form.capabilities.includes(capability)}
+          onChange={(event) =>
+            field(
+              "capabilities",
+              event.target.checked
+                ? [...form.capabilities, capability]
+                : form.capabilities.filter((held) => held !== capability),
+            )
+          }
+        />
+        <span>{capability}</span>
+      </label>
+    ))}
+  </div>
+</div>
                 {/* Visible, not a `title`: this is what costs money per turn, and a tooltip waits,
                     never shows on touch and is not read by most readers. It is also the two
                     fields' description. */}

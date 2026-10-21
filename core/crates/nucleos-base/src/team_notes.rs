@@ -263,9 +263,9 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         for (id, speciality) in [("scout", "reads the web"), ("writer", "writes it up")] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, ?, 'x', 'cloud', 'mcp_only', ?, ?)",
+                 VALUES (?, ?, ?, 'x', 'cloud', '[\"mcp.nucleos\"]', ?, ?)",
             )
             .bind(id)
             .bind(id)

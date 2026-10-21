@@ -75,6 +75,13 @@ phases:
     allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
     required: [phase_skill, packet_schema, project_yaml, objective]
 
+  # The final fold of a user agent-pipeline's outputs (`run-pipeline`, sink kind `synthesize`).
+  synthesize:
+    # No `project_yaml`: assemble_prompt.py attaches it whenever it is allowed, and a fold of
+    # node outputs does not need the project configuration.
+    allowed: [phase_skill, objective, prior_artifacts]
+    required: [phase_skill, objective, prior_artifacts]
+
   # The three orchestrate-tdd dispatches are `execute` under different objectives and
   # boundaries, and get the executor's cockpit and the executor's sections.
   red:
@@ -113,6 +120,8 @@ never_fingerprints:
     - "You are the orchestrator."
     - "## Fast path - single-call execution"
     - "### Auto-select handoff"
+    - "You are the pipeline executor."
+    - "You are the pipeline draft helper."
   bridge_skill:
     - "# Claude Skill Guide"
     - "### Agent mode — the normal one here"

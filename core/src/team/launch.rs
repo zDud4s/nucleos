@@ -317,14 +317,43 @@ pub(super) async fn spawn_agent(
             return;
         }
     };
-    let with_tools = agent.tool_policy == "mcp_only";
+    let with_tools = agent.tool_policy() == "mcp_only";
     let pool = state.pool.clone();
 
-    if agent.engine == "local" {
-        let Some(model) = agent.model.clone() else {
+    // Spec 2026-10-08 section 6: see `resolve_node_loadout`. Resolved before the engine is known,
+    // because the engine decides how the prompt is run and never what the node is shown, so every
+    // engine holds the same tools.
+    let (run_tools, block) =
+        resolve_node_loadout(state, run, agent, run_id, with_tools, &prompt).await;
+
+    // Spec 2026-10-20 sections 6 and 8: the effective engine launches. `resolve_agent_launch` reads
+    // the pin from the agent's own row (a team pins nothing of its own) and, with none, says which
+    // runners the router may choose from; it does no HTTP.
+    let launch = match crate::agents::launch::resolve_agent_launch(
+        state,
+        agent,
+        crate::agents::launch::Pins::default(),
+        &prompt,
+        &block,
+        None,
+    )
+    .await
+    {
+        Ok(launch) => launch,
+        Err(error) => {
+            // Nothing was spawned, so nothing else would ever close the row `open_run` wrote.
+            fail_run(&pool, run_id, &error.to_string()).await;
+            return;
+        }
+    };
+    let prompt = launch.prompt.clone();
+
+    if let Some((crate::agents::capabilities::Engine::Local, model)) = &launch.pin {
+        if model.is_empty() {
             fail_run(&pool, run_id, "a local agent with no model").await;
             return;
-        };
+        }
+        let model = model.clone();
         // The FACTORY's chat, where this built its own `runner::OllamaChat` against
         // `runner::OLLAMA_BASE_URL`. This was the last reader in the daemon still doing so: the
         // chat route and the council seat both ask `assistants::Assistants::local_chat`, which is
@@ -347,15 +376,12 @@ pub(super) async fn spawn_agent(
         // The TEAM's box, never `LocalToolBox::new`: `LOCAL_TOOLS` carries `create_run` and
         // `create_job`, and the local path never passes through `hooks.rs` at all.
         //
-        // And resolved the way the Claude path resolves it, BEFORE the loop starts: the loadout row
-        // is what the daemon's routes admit `request_tool` and `read_context` by, and the same
-        // tools then decide which of those two this box offers. A member without tools holds none
-        // (`NoTools` below) and its row is recorded empty, like any other loadout. The block is
-        // appended for the reason it is on the Claude path -- it is what lists the context files
+        // Its loadout was resolved above, BEFORE the loop starts: the loadout row is what the
+        // daemon's routes admit `request_tool` and `read_context` by, and the same tools then
+        // decide which of those two this box offers. A member without tools holds none
+        // (`NoTools` below) and its row is recorded empty, like any other loadout. The block is in
+        // `prompt` for the reason it is on the Claude path -- it is what lists the context files
         // `read_context` can open.
-        let (run_tools, block) =
-            resolve_node_loadout(state, run, agent, run_id, with_tools, &prompt).await;
-        let prompt = format!("{prompt}{block}");
         let tools =
             crate::mcp_tools::LocalToolBox::for_team(daemon_url(), token, pool.clone(), run_id)
                 .with_loadout(&run_tools.tools);
@@ -427,12 +453,6 @@ pub(super) async fn spawn_agent(
         crate::speed::Capacity::solo()
     });
 
-    // Spec 2026-10-08 section 6: see `resolve_node_loadout`. Resolved here for the Claude engine and
-    // before the local loop starts for the local one, so both engines hold the same tools.
-    let (run_tools, block) =
-        resolve_node_loadout(state, run, agent, run_id, with_tools, &prompt).await;
-    let prompt = format!("{prompt}{block}");
-
     // The run's money, held to the seat as well as between seats. Only for a runner that enforces
     // it: `CodexCliRunner` refuses any request carrying a ceiling, so on a Codex daemon a seat with
     // one would never launch at all.
@@ -442,59 +462,93 @@ pub(super) async fn spawn_agent(
         None
     };
 
-    let request = crate::execution::runner::RunRequest {
-        prompt,
-        // The RUN's own key, never `state.token`. `auth::TEAM_ROUTES` is what it reaches.
-        env: crate::execution::runs::run_env(&token, run_id, None, capacity),
-        // No working directory, exactly as a council seat has none — which is also why the
-        // `PreToolUse` hook may never fire and why the route table has to hold alone.
-        cwd: None,
-        permission: crate::execution::runner::Permission::Default,
-        resume_session_id: None,
-        mcp_config,
-        mcp_job: None,
-        // The node's own run id, the one `TeamNodeMcp::write` put on `--run`; priced as the Team box.
-        mcp_team_run: mcp_guard.as_ref().map(|_| run_id),
-        // A member with tools is offered the Team box (`--box team --run <node>`), which serves
-        // only what its loadout row lists plus the box's base. `allowed_mcp_tools` below is that
-        // same set handed to the CLI as `--allowedTools`.
-        tool_policy: if with_tools {
-            crate::execution::runner::ToolPolicy::McpOnly
-        } else {
-            crate::execution::runner::ToolPolicy::None
-        },
-        progress_timeout: None,
-        max_turns: Some(crate::execution::runner::DEFAULT_MAX_TURNS),
-        session_id: Some(session_id),
-        fork_session: false,
-        include_partial_messages: false,
-        // `steerable` with no `messages`, for the reason `council.rs` documents at length: it is the
-        // only way to keep the prompt off the command line, and a director's prompt carries the
-        // whole folder index. Windows caps a command line at 32 767 characters, and the first real
-        // council died exactly there.
-        images: Vec::new(),
-        steerable: true,
-        classifier_governs_tools: false,
-        messages: None,
-        request_tx: None,
-        ambient_mcp: false,
-        model: agent.model.clone(),
-        effort: None,
-        fallback_model: Vec::new(),
-        add_dirs: Vec::new(),
-        max_budget_usd,
-        agents: Vec::new(),
-        append_system_prompt: None,
-        denied_tools: Vec::new(),
-        session_name: None,
-        context_window: None,
-        // The loadout's effective set: the box's base plus what the owner approved for this agent
-        // or its team. Empty for a member without tools.
-        allowed_mcp_tools: Some(run_tools.tools.clone()),
-        background_tasks: false,
-    };
+    let mcp_team_run = mcp_guard.as_ref().map(|_| run_id);
+    // A closure, because the same request is built twice when an answer fails its output shape:
+    // `RunRequest` owns channel ends and is not `Clone`.
+    let build =
+        move |prompt: String,
+              session_id: String,
+              model: Option<String>,
+              effort: Option<String>,
+              tool_policy: crate::execution::runner::ToolPolicy,
+              max_budget_usd: Option<f64>| crate::execution::runner::RunRequest {
+            prompt,
+            // The RUN's own key, never `state.token`. `auth::TEAM_ROUTES` is what it reaches.
+            env: crate::execution::runs::run_env(&token, run_id, None, capacity),
+            // No working directory, exactly as a council seat has none — which is also why the
+            // `PreToolUse` hook may never fire and why the route table has to hold alone.
+            cwd: None,
+            permission: crate::execution::runner::Permission::Default,
+            resume_session_id: None,
+            mcp_config: mcp_config.clone(),
+            mcp_job: None,
+            // The node's own run id, the one `TeamNodeMcp::write` put on `--run`; priced as the Team box.
+            mcp_team_run,
+            // A member with tools is offered the Team box (`--box team --run <node>`), which serves
+            // only what its loadout row lists plus the box's base. `allowed_mcp_tools` below is that
+            // same set handed to the CLI as `--allowedTools`.
+            tool_policy,
+            progress_timeout: None,
+            max_turns: Some(crate::execution::runner::DEFAULT_MAX_TURNS),
+            session_id: Some(session_id),
+            fork_session: false,
+            include_partial_messages: false,
+            // `steerable` with no `messages`, for the reason `council.rs` documents at length: it is the
+            // only way to keep the prompt off the command line, and a director's prompt carries the
+            // whole folder index. Windows caps a command line at 32 767 characters, and the first real
+            // council died exactly there.
+            images: Vec::new(),
+            steerable: true,
+            classifier_governs_tools: false,
+            messages: None,
+            request_tx: None,
+            ambient_mcp: false,
+            model,
+            effort,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
+            // The loadout's effective set: the box's base plus what the owner approved for this agent
+            // or its team. Empty for a member without tools.
+            allowed_mcp_tools: Some(run_tools.tools.clone()),
+            background_tasks: false,
+        };
 
-    let runner = state.runner.clone();
+    // The model the row pins, else the one the agent names beside no engine (which the router may
+    // still replace under `apply`). Spec 2026-10-20 section 6: a model alone pins no engine.
+    let pinned_model = launch
+        .pin
+        .as_ref()
+        .map(|(_, model)| model.clone())
+        .filter(|model| !model.is_empty())
+        .or_else(|| agent.model.clone());
+    let pin_kind = launch
+        .pin
+        .as_ref()
+        .and_then(|(engine, _)| runner_kind_of(*engine));
+    let runners = launch.runners.clone();
+    // Only a package agent has an output shape its answer is held to; a user agent's is free.
+    let shape = agent.is_package().then_some(launch.output);
+    let first_policy = if with_tools {
+        crate::execution::runner::ToolPolicy::McpOnly
+    } else {
+        crate::execution::runner::ToolPolicy::None
+    };
+    let request = build(
+        prompt,
+        session_id,
+        pinned_model,
+        None,
+        first_policy,
+        max_budget_usd,
+    );
+
+    let seat_state = state.clone();
     let timeout = state.run_timeout;
     crate::execution::runs::spawn_registered(state, run_id, async move {
         // Moved in so the node's config file is removed when the task ends — normally, by timeout,
@@ -505,13 +559,27 @@ pub(super) async fn spawn_agent(
         // Its outcome is reported by `ingest_landed_items`, against the `route_decision_id` this
         // writes on the run's row, once the item lands.
         let mut request = request;
-        let _decision = crate::models::seat_advice::route_team_seat(
-            &pool,
-            runner.router(),
-            run_id,
-            &mut request,
-        )
-        .await;
+        let seat = match pick_seat(&seat_state, run_id, pin_kind, &runners, &mut request).await {
+            Ok(seat) => seat,
+            Err(why) => {
+                fail_run(&pool, run_id, &why).await;
+                return;
+            }
+        };
+        let runner = seat.runner;
+        // `codex exec` refuses `ToolPolicy::None`, which it cannot express; `McpOnly` is the
+        // strictest it can, and a team node has no working directory for anything wider.
+        if seat.kind == Some(crate::models::route_advice::RunnerKind::Codex) {
+            request.tool_policy = crate::execution::runner::ToolPolicy::McpOnly;
+        }
+        // A ceiling the chosen runner would refuse is dropped, as the unrouted path never sets it.
+        if !runner.honours_max_budget() {
+            request.max_budget_usd = None;
+        }
+        // What a retry must repeat: the same engine and model, and the same everything else.
+        let (model, effort) = (request.model.clone(), request.effort.clone());
+        let (policy, budget) = (request.tool_policy, request.max_budget_usd);
+        let original_prompt = request.prompt.clone();
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         // How much window this agent is holding, mirrored into the row while it runs.
@@ -528,16 +596,60 @@ pub(super) async fn spawn_agent(
             run_id,
             std::sync::Arc::clone(&context_fill),
         );
-        let outcome = tokio::time::timeout(
-            timeout,
-            runner.run_prompt_with_context_fill(
-                request,
-                session_tx,
-                transcript.clone(),
-                std::sync::Arc::clone(&context_fill),
-            ),
-        )
-        .await;
+        let run_once = |request: crate::execution::runner::RunRequest| {
+            tokio::time::timeout(
+                timeout,
+                runner.run_prompt_with_context_fill(
+                    request,
+                    session_tx.clone(),
+                    transcript.clone(),
+                    std::sync::Arc::clone(&context_fill),
+                ),
+            )
+        };
+        let mut outcome = run_once(request).await;
+        // Spec 2026-10-20 section 7: a package agent's answer that does not fit its output shape is
+        // asked for ONCE more, on the same engine and model, with the validator's report appended.
+        let mut unshaped = None;
+        if let Some(shape) = &shape
+            && let Ok(Ok(first)) = &outcome
+            && first.exit_code == 0
+            && let Err(report) = crate::agents::output::validate(shape, &first.stdout)
+        {
+            // A fresh session id: the first one is spent, and a CLI refuses to reopen it.
+            let retry = build(
+                crate::agents::output::retry_prompt(&original_prompt, &report),
+                crate::auth::generate_uuid_v4(),
+                model,
+                effort,
+                policy,
+                budget,
+            );
+            outcome = run_once(retry).await;
+            if let Ok(Ok(second)) = &outcome
+                && second.exit_code == 0
+                && let Err(report) = crate::agents::output::validate(shape, &second.stdout)
+            {
+                unshaped = Some(report);
+            }
+        }
+        if let Some(report) = unshaped {
+            fail_run(
+                &pool,
+                run_id,
+                &format!("the answer does not follow the required output format: {report}"),
+            )
+            .await;
+            // Reported only when the seat was routed: the router learns its choice did not work.
+            if let (Some(router), Some(decision)) = (seat.router, seat.decision) {
+                crate::models::route_advice::report_detached(
+                    router,
+                    decision,
+                    crate::models::route_advice::Outcome::Fail,
+                );
+            }
+            return;
+        }
         let completed_at = chrono::Utc::now().to_rfc3339();
         match outcome {
             Err(_) => {
@@ -625,6 +737,84 @@ pub(super) async fn spawn_agent(
         }
     });
     stop_if_the_run_ended(state, &run.id, run_id).await;
+}
+
+/// The runner kind a CLI engine launches on; the local engine has none.
+fn runner_kind_of(
+    engine: crate::agents::capabilities::Engine,
+) -> Option<crate::models::route_advice::RunnerKind> {
+    use crate::agents::capabilities::Engine;
+    use crate::models::route_advice::RunnerKind;
+    match engine {
+        Engine::Claude => Some(RunnerKind::Claude),
+        Engine::Codex => Some(RunnerKind::Codex),
+        Engine::Local => None,
+    }
+}
+
+/// Where one cloud team node runs: the runner, its kind when known, and the router decision (with
+/// the router, to report the outcome to) when the seat was routed.
+struct Seat {
+    runner: std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+    kind: Option<crate::models::route_advice::RunnerKind>,
+    decision: Option<String>,
+    router: Option<std::sync::Arc<crate::models::route_advice::Router>>,
+}
+
+/// Spec 2026-10-20 section 8: the effective engine launches, where a `codex` member used to run on
+/// the daemon's own runner. A pinned engine is used as pinned; with none, the router chooses among
+/// `runners`. Without a router there is nothing to choose with and the daemon's runner launches, as
+/// it always did. May rewrite `request.model` and `request.effort` (see the two seat routers).
+async fn pick_seat(
+    state: &AppState,
+    run_id: i64,
+    pin: Option<crate::models::route_advice::RunnerKind>,
+    runners: &[crate::models::route_advice::RunnerKind],
+    request: &mut crate::execution::runner::RunRequest,
+) -> Result<Seat, String> {
+    use crate::models::seat_advice::{route_agent_seat, route_team_seat};
+    let router = state.runner.router();
+    let (kind, decision) = match (&router, pin) {
+        (None, pin) => (pin, None),
+        (Some(router), Some(kind)) => {
+            // A seat pinned to the primary's CLI is routed within it, as a seat always was; a
+            // pin to another CLI is not narrowed, and is not advised.
+            let decision = if kind == router.primary.kind {
+                route_team_seat(&state.pool, Some(router.clone()), run_id, request).await
+            } else {
+                None
+            };
+            (Some(kind), decision)
+        }
+        (Some(router), None) => {
+            let (kind, decision) = route_agent_seat(&state.pool, router, run_id, request, runners)
+                .await
+                .map_err(|error| error.to_string())?;
+            (Some(kind), decision)
+        }
+    };
+    let runner = match (&router, kind) {
+        (Some(router), Some(kind)) if kind != router.primary.kind => router
+            .available(kind)
+            .map(|available| available.runner.clone())
+            .ok_or_else(|| format!("the {} engine is not available to this daemon", kind.as_str()))?,
+        // No router: the only runner the daemon can name for Codex is the chat one. Anything else
+        // runs on the daemon's own, which is what launched every member before this.
+        (None, Some(crate::models::route_advice::RunnerKind::Codex)) => state
+            .assistants
+            .cli_runner("codex", request.model.as_deref())
+            .unwrap_or_else(|| {
+                tracing::warn!(run_id, "a codex team member and no codex runner configured; launching on the daemon's own");
+                state.runner.clone()
+            }),
+        _ => state.runner.clone(),
+    };
+    Ok(Seat {
+        runner,
+        kind,
+        decision,
+        router,
+    })
 }
 
 /// Stops a node whose team run ended while the tick that launched it was on its way here.

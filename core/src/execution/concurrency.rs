@@ -341,16 +341,14 @@ const ORPHANED_SLOTS_SQL: &str = "DELETE FROM project_slots
         OR (owner_kind = 'job'
             AND NOT EXISTS (SELECT 1 FROM jobs
                             WHERE jobs.id = project_slots.owner_id
-                              AND jobs.status IN ('planning','implementing','gating','reviewing',
-                                                  'awaiting_approval','waiting')))
+                              AND jobs.status IN ('running','awaiting_approval','waiting')))
         OR (owner_kind = 'item'
-            AND NOT EXISTS (SELECT 1 FROM job_items
-                            JOIN jobs ON jobs.id = job_items.job_id
-                            WHERE job_items.id = project_slots.owner_id
-                              AND job_items.status IN ('pending','running','implemented','merging',
+            AND NOT EXISTS (SELECT 1 FROM job_nodes
+                            JOIN jobs ON jobs.id = job_nodes.job_id
+                            WHERE job_nodes.id = project_slots.owner_id
+                              AND job_nodes.status IN ('pending','running','implemented','merging',
                                                        'conflicted','reverted','gate_failed')
-                              AND jobs.status IN ('planning','implementing','gating','reviewing',
-                                                  'awaiting_approval','waiting')))
+                              AND jobs.status IN ('running','awaiting_approval','waiting')))
         OR (owner_kind = 'wave'
             AND NOT EXISTS (SELECT 1 FROM wave_workers
                             JOIN waves ON waves.id = wave_workers.wave_id
@@ -371,7 +369,7 @@ pub struct HeldSlot {
     /// The job an ITEM belongs to, and `None` for every other kind of owner.
     ///
     /// **This and the two below are what let a screen describe an item at all.** `owner_id` is
-    /// `job_items.id` — a number from a sequence nobody reads, which the fleet card could only
+    /// `job_nodes.id` — a number from a sequence nobody reads, which the fleet card could only
     /// print raw. There is no listing of items by id anywhere in the API to look it up in, and
     /// there should not be: an item is a step of a job, and the way to reach one is through the job
     /// that owns it. So the join happens here, once, beside the row that needs it.
@@ -410,12 +408,12 @@ pub async fn held_slots(pool: &SqlitePool) -> sqlx::Result<Vec<HeldSlot>> {
     sqlx::query_as(
         "SELECT project_slots.project_id, project_slots.slot, project_slots.owner_kind,
                 project_slots.owner_id, project_slots.claimed_at,
-                job_items.job_id AS job_id, job_items.ordinal AS ordinal,
-                job_items.status AS item_status,
+                job_nodes.job_id AS job_id, job_nodes.ordinal AS ordinal,
+                job_nodes.status AS item_status,
                 wave_workers.wave_id AS wave_id, waves.renewed_at AS lease_renewed_at
          FROM project_slots
-         LEFT JOIN job_items
-           ON project_slots.owner_kind = 'item' AND job_items.id = project_slots.owner_id
+         LEFT JOIN job_nodes
+           ON project_slots.owner_kind = 'item' AND job_nodes.id = project_slots.owner_id
          LEFT JOIN wave_workers
            ON project_slots.owner_kind = 'wave' AND wave_workers.id = project_slots.owner_id
          LEFT JOIN waves ON waves.id = wave_workers.wave_id
@@ -630,15 +628,15 @@ mod tests {
     /// failure looks like an empty fleet screen, not like a missing field.
     ///
     /// The pair is what makes an item describable at all. `owner_id` for an item is
-    /// `job_items.id`, a number no route lists and no reader recognises, and the screen could only
+    /// `job_nodes.id`, a number no route lists and no reader recognises, and the screen could only
     /// ever print it raw.
     #[tokio::test]
     async fn a_slot_held_by_an_item_says_which_job_and_which_item_it_is() {
         let pool = test_pool().await;
-        let job = seed_job(&pool, "project-a", "implementing").await;
+        let job = seed_job(&pool, "project-a", "running").await;
         let item: i64 = sqlx::query_scalar(
-            "INSERT INTO job_items (job_id, ordinal, description, status)
-             VALUES (?, 2, 'an item', 'running') RETURNING id",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status)
+             VALUES (?, 'implement', 2, 'an item', 'running') RETURNING id",
         )
         .bind(job)
         .fetch_one(&pool)
@@ -704,7 +702,7 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(wave, worker, "the fixture must tell a wave from its worker");
-        let job = seed_job(&pool, "project-a", "implementing").await;
+        let job = seed_job(&pool, "project-a", "running").await;
         claim(&pool, "project-a", Owner::Wave(worker))
             .await
             .unwrap();
@@ -859,7 +857,7 @@ mod tests {
         set_limits(&pool, 5, 9).await;
         let live_run = seed_run(&pool, "project-a", "running").await;
         let dead_run = seed_run(&pool, "project-a", "interrupted").await;
-        let live_job = seed_job(&pool, "project-a", "implementing").await;
+        let live_job = seed_job(&pool, "project-a", "running").await;
         let dead_job = seed_job(&pool, "project-b", "completed").await;
         for owner in [
             Owner::Run(live_run),
@@ -926,8 +924,8 @@ mod tests {
             .unwrap()
             .last_insert_rowid();
             sqlx::query(
-                "INSERT INTO job_items (job_id, ordinal, description, status)
-                 VALUES (?, 0, 'an item', ?)",
+                "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status)
+                 VALUES (?, 'implement', 0, 'an item', ?)",
             )
             .bind(job_id)
             .bind(item_status)
@@ -938,10 +936,10 @@ mod tests {
         }
 
         for (job_status, item_status, survives) in [
-            ("implementing", "running", true),
-            ("implementing", "gate_failed", true),
-            ("implementing", "passed", false),
-            ("implementing", "orphaned", false),
+            ("running", "running", true),
+            ("running", "gate_failed", true),
+            ("running", "passed", false),
+            ("running", "orphaned", false),
             ("completed", "running", false),
             ("completed", "gate_failed", false),
         ] {
@@ -1075,7 +1073,7 @@ mod tests {
         set_limits(&pool, 2, 9).await;
         seed_project(&pool, "project-a").await;
         seed_project(&pool, "project-quiet").await;
-        let job = seed_job(&pool, "project-a", "implementing").await;
+        let job = seed_job(&pool, "project-a", "running").await;
         claim(&pool, "project-a", Owner::Job(job)).await.unwrap();
 
         let readout = readout(&pool).await.unwrap();

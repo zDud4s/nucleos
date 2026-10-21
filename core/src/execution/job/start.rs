@@ -123,6 +123,13 @@ pub enum JobStart {
     /// only symptom would be that the parallelism somebody configured never seemed to happen — the
     /// exact failure this design has already walked into twice.
     NoTeam(String),
+    /// The workflow the job runs has no usable graph: a pin whose `graph.yaml` does not parse, or
+    /// a workflow the project does not pin.
+    ///
+    /// **Refused rather than replaced by the embedded autopilot**, for the reason `NoTeam` is
+    /// refused rather than run without a team: a fallback would run a different workflow from the
+    /// one the project pinned and report `completed`. A 422, the caller's to fix.
+    NoGraph(String),
     Failed,
 }
 
@@ -154,6 +161,147 @@ pub struct StartRequest<'a> {
     /// job in this repository has been until now, and it stays the default in both callers. A team
     /// is asked for, per request and per rule, and never acquired.
     pub team_id: Option<&'a str>,
+    /// The workflow this job runs, by pin name. `None` is [`crate::seed::NAME`] (`autopilot`),
+    /// which is what every job has run until now (D13). Resolved to a graph and frozen on the row
+    /// at start by [`resolve_job_graph`]; never re-resolved afterwards.
+    pub workflow: Option<&'a str>,
+}
+
+/// A job's graph as resolved at start, before it is frozen into the row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedGraph {
+    pub effective: crate::workflows::effective::EffectiveGraph,
+    /// `<name>@<version>`.
+    pub bundle_ref: Option<String>,
+    /// The pin's hash for a pinned bundle (that hash IS the bundle hash), `seed::digest()` for the
+    /// embedded autopilot.
+    pub bundle_hash: Option<String>,
+    /// True when the embedded autopilot was used rather than a pinned bundle.
+    pub builtin: bool,
+}
+
+/// The embedded autopilot, with `overlay` painted in.
+fn embedded_graph(
+    overlay: &std::collections::BTreeMap<String, crate::workflows::NodeOverlay>,
+) -> Result<ResolvedGraph, String> {
+    let graph = crate::workflows::graph::parse(crate::seed::graph_yaml())
+        .map_err(|error| format!("the embedded autopilot graph does not parse: {error}"))?;
+    Ok(ResolvedGraph {
+        effective: crate::workflows::effective::effective(&graph, overlay),
+        bundle_ref: Some(format!("{}@{}", crate::seed::NAME, crate::seed::VERSION)),
+        bundle_hash: Some(crate::seed::digest()),
+        builtin: true,
+    })
+}
+
+/// Where a pin's `graph.yaml` is read from, or `None` when no trustworthy source exists.
+///
+/// The project's own copy (adopted or ejected) wins, as it does in `materialize::source_of`; the
+/// library is used only while it still hashes to the pin, because a drifted bundle is bytes nobody
+/// pinned.
+fn pinned_graph_dir(
+    project_root: &Path,
+    library_root: Option<&Path>,
+    pin: &crate::workflows::Pin,
+) -> Option<PathBuf> {
+    if (pin.path.is_some() || pin.ejected_at.is_some())
+        && let Some(copy) =
+            crate::workflows::copy_path(project_root, pin).filter(|dir| dir.is_dir())
+    {
+        return Some(copy);
+    }
+    let dir = library_root?.join(&pin.name).join(&pin.version);
+    let bundle = crate::workflows::read_bundle(&dir, &pin.name, &pin.version)
+        .ok()
+        .flatten()?;
+    (bundle.hash == pin.hash).then_some(dir)
+}
+
+/// PURE (reads files, touches no database): the graph `workflow` resolves to for a project.
+///
+/// Pins file -> pin named `workflow` -> project copy else library bundle -> `graph::parse` ->
+/// `effective(graph, pin.nodes)`. No pins file, no such pin, or an unavailable source resolves to
+/// the embedded autopilot, but ONLY for the `autopilot` workflow: asking for any other name that
+/// the project does not pin is a refusal, not a different workflow. A source that is present but
+/// does not parse is always a refusal.
+pub fn resolve_graph_from(
+    machine_root: Option<&Path>,
+    library_root: Option<&Path>,
+    project_id: &str,
+    project_root: &Path,
+    workflow: &str,
+) -> Result<ResolvedGraph, String> {
+    let pins_file = machine_root
+        .and_then(|root| crate::project::state::dir(root, project_id))
+        .map(|dir| dir.join(crate::project::state::PINS_FILE))
+        .filter(|file| file.is_file());
+    let pin = pins_file.and_then(|file| match crate::workflows::read_pins(&file) {
+        Ok(pins) => pins.workflows.into_iter().find(|pin| pin.name == workflow),
+        Err(error) => {
+            tracing::warn!(project_id, %error, "unreadable workflows.yaml; the job starts unpinned");
+            None
+        }
+    });
+    let Some(pin) = pin else {
+        return if workflow == crate::seed::NAME {
+            embedded_graph(&std::collections::BTreeMap::new())
+        } else {
+            Err(format!(
+                "project {project_id} does not pin a workflow named `{workflow}`"
+            ))
+        };
+    };
+
+    let text = pinned_graph_dir(project_root, library_root, &pin).and_then(|dir| {
+        std::fs::read_to_string(dir.join(crate::workflows::graph::GRAPH_FILE)).ok()
+    });
+    match text {
+        Some(text) => {
+            let graph = crate::workflows::graph::parse(&text).map_err(|error| {
+                format!(
+                    "workflow {}@{} has a graph that does not parse: {error}",
+                    pin.name, pin.version
+                )
+            })?;
+            Ok(ResolvedGraph {
+                effective: crate::workflows::effective::effective(&graph, &pin.nodes),
+                bundle_ref: Some(format!("{}@{}", pin.name, pin.version)),
+                bundle_hash: Some(pin.hash.clone()),
+                builtin: false,
+            })
+        }
+        None if workflow == crate::seed::NAME => embedded_graph(&pin.nodes),
+        None => Err(format!(
+            "workflow {}@{} is pinned but its graph.yaml cannot be read from the project's copy or \
+             from an unchanged library bundle",
+            pin.name, pin.version
+        )),
+    }
+}
+
+/// The graph a job starting now runs, resolved off the daemon's own pins and library.
+pub async fn resolve_job_graph(
+    state: &AppState,
+    project_id: &str,
+    project_root: &str,
+    workflow: &str,
+) -> Result<ResolvedGraph, String> {
+    let machine_root = state.machine_config_root.clone();
+    let library = state.workflow_library.clone();
+    let project_id = project_id.to_string();
+    let project_root = PathBuf::from(project_root);
+    let workflow = workflow.to_string();
+    tokio::task::spawn_blocking(move || {
+        resolve_graph_from(
+            machine_root.as_deref(),
+            library.as_deref(),
+            &project_id,
+            &project_root,
+            &workflow,
+        )
+    })
+    .await
+    .map_err(|error| format!("the graph resolution did not finish: {error}"))?
 }
 
 /// Creates a job and provisions the worktree it will live in.
@@ -195,6 +343,32 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
         }
     }
 
+    // The workflow's graph, resolved ONCE here and frozen on the row (spec 5). Before the row for the
+    // same reason as the team: a refusal costs nothing now and a retired row later. Body files are
+    // not re-read after start; `into_worktree` below materialises them.
+    let resolved = match resolve_job_graph(
+        state,
+        request.project_id,
+        request.project_root,
+        request.workflow.unwrap_or(crate::seed::NAME),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(reason) => return JobStart::NoGraph(reason),
+    };
+    let snapshot = match snapshot_of_effective(
+        &resolved.effective,
+        resolved.bundle_ref.as_deref(),
+        resolved.bundle_hash.as_deref(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(project_id = request.project_id, %error, "could not freeze a job's graph");
+            return JobStart::Failed;
+        }
+    };
+
     // Asked before the row exists, and it is not the decision — `claim` below is. A job cannot claim
     // until it has an id, so the authoritative answer costs a row, and a scheduler firing at a full
     // project every half hour would leave a retired job behind every time. This turns that into the
@@ -227,6 +401,7 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
             max_rounds: request.max_rounds,
             budget_usd: request.budget_usd,
             team_id: request.team_id,
+            graph: Some(snapshot),
         },
     )
     .await

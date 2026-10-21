@@ -89,7 +89,7 @@ pub async fn enqueue_item_verdict_in(
         "INSERT OR IGNORE INTO distill_queue
              (cause, project_id, job_id, item_id, run_id, status, attempts, created_at)
          SELECT ?, j.project_id, j.id, i.id, i.run_id, 'pending', 0, ?
-           FROM job_items i JOIN jobs j ON j.id = i.job_id
+           FROM job_nodes i JOIN jobs j ON j.id = i.job_id
           WHERE i.job_id = ? AND i.ordinal = ?
             AND i.gate_status = 'passed' AND i.gate_attempts >= 1",
     )
@@ -103,7 +103,7 @@ pub async fn enqueue_item_verdict_in(
         "INSERT OR IGNORE INTO distill_queue
              (cause, project_id, job_id, item_id, run_id, status, attempts, created_at)
          SELECT ?, j.project_id, j.id, i.id, i.run_id, 'pending', 0, ?
-           FROM job_items i JOIN jobs j ON j.id = i.job_id
+           FROM job_nodes i JOIN jobs j ON j.id = i.job_id
           WHERE i.job_id = ? AND i.ordinal = ?
             AND i.status IN ('gate_failed', 'revert_failed')
             AND i.gate_attempts > j.gate_retries",
@@ -311,7 +311,7 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
         .collect();
 
     let item_rows: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT ordinal, description, status FROM job_items WHERE job_id = ? ORDER BY ordinal",
+        "SELECT ordinal, description, status FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
     )
     .bind(job_id)
     .fetch_all(pool)
@@ -330,7 +330,7 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
     let recovery = if cause == Cause::GateRecovered {
         let failed_output: Option<Option<String>> = match row.item_id {
             Some(item_id) => {
-                sqlx::query_scalar("SELECT gate_output FROM job_items WHERE id = ?")
+                sqlx::query_scalar("SELECT gate_output FROM job_nodes WHERE id = ?")
                     .bind(item_id)
                     .fetch_optional(pool)
                     .await?
@@ -802,8 +802,8 @@ mod tests {
         gate_attempts: i64,
     ) -> i64 {
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, gate_status, gate_attempts)
-             VALUES (?, ?, 'do the thing', ?, ?, ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, gate_status, gate_attempts)
+             VALUES (?, 'implement', ?, 'do the thing', ?, ?, ?)",
         )
         .bind(job_id)
         .bind(ordinal)

@@ -481,8 +481,8 @@ mod tests {
     async fn seed_agent(pool: &SqlitePool, name: &str) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents (id, name, speciality, prompt, engine,
-                                           tool_policy, created_at, updated_at)
-             VALUES (?, ?, 'a speciality', 'a prompt', 'claude', 'unrestricted',
+                                           capabilities, created_at, updated_at)
+             VALUES (?, ?, 'a speciality', 'a prompt', 'claude', '[\"shell\"]',
                      '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
         )
         .bind(name)

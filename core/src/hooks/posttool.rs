@@ -198,10 +198,10 @@ pub(super) async fn a_park_here_would_only_destroy(
          JOIN jobs ON jobs.id = runs.job_id
          WHERE runs.id = ?
            AND jobs.rule_name IS NULL
-           AND (EXISTS (SELECT 1 FROM job_items
-                        WHERE job_items.job_id = jobs.id
-                          AND job_items.run_id = runs.id
-                          AND job_items.status = 'running')
+           AND (EXISTS (SELECT 1 FROM job_nodes
+                        WHERE job_nodes.job_id = jobs.id
+                          AND job_nodes.run_id = runs.id
+                          AND job_nodes.status = 'running')
                 OR runs.stage IN ('review', 'replan'))",
     )
     .bind(run_id)

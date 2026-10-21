@@ -31,13 +31,16 @@ export class ApiRefusal extends Error {
   readonly code: string;
   /** Whatever prose the daemon sent, for the cases where it wrote a better sentence than we would. */
   readonly detail: string;
+  /** The parsed JSON body, when the refusal carried one: `consent_required` ships the listing in it. */
+  readonly body: unknown;
 
-  constructor(status: number, code: string, detail: string) {
+  constructor(status: number, code: string, detail: string, body?: unknown) {
     super(detail || `${status} ${code}`);
     this.name = "ApiRefusal";
     this.status = status;
     this.code = code;
     this.detail = detail;
+    this.body = body;
   }
 }
 
@@ -184,7 +187,7 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
       // detail the name is still the sentence, which is what every route that
       // sends only a name has always got.
       const detail = typeof body.detail === "string" && body.detail !== "" ? body.detail : body.refusal;
-      return new ApiRefusal(res.status, body.refusal, detail);
+      return new ApiRefusal(res.status, body.refusal, detail, body);
     }
     const prose = [body.error, body.message, body.reason].find((v) => typeof v === "string" && v !== "");
     if (typeof prose === "string") return new ApiRefusal(res.status, fallback, prose);

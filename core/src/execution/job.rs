@@ -27,24 +27,52 @@ use crate::state::AppState;
 /// first use because `macro_rules!` is scoped by position in the file.
 macro_rules! live_statuses_sql {
     () => {
-        "('planning','implementing','gating','reviewing','awaiting_approval','waiting')"
+        "('running','awaiting_approval','waiting')"
     };
 }
 
+mod agent_launcher;
 mod brakes;
+mod bridge;
+mod command_node;
 mod decide;
+mod dispatch;
 mod drive;
+mod engine;
 mod gate;
 mod ingest;
+mod landing;
 mod plan;
 mod prompts;
 mod spawn;
 mod start;
 mod store;
+#[cfg(test)]
+mod tests_agent_launcher;
+#[cfg(test)]
+mod tests_agent_nodes;
+#[cfg(test)]
+mod tests_command_nodes;
+#[cfg(test)]
+mod tests_graph_walk;
+#[cfg(test)]
+mod tests_job_support;
+#[cfg(test)]
+mod tests_plan_landing;
+#[cfg(test)]
+mod tests_start_snapshot;
+#[cfg(test)]
+mod tests_walk_state_parity;
 mod views;
 
+pub use self::agent_launcher::CatalogAgentLauncher;
 use self::brakes::*;
 pub use self::decide::*;
+pub(crate) use self::decide::{Halt, batch_over, failed_ending_of, never_lands, queue_halt};
+pub use self::dispatch::{
+    AgentNodeLauncher, EnginePin, LaunchRefused, NodeCtx, NodeLaunch, OutputCheck, ProtocolAndBody,
+    composed_protocol, install_launcher, launcher, read_body, retry_prompt,
+};
 pub use self::drive::*;
 pub use self::gate::*;
 pub use self::ingest::*;
@@ -66,7 +94,7 @@ mod tests {
 
     use super::*;
 
-    async fn test_pool() -> sqlx::SqlitePool {
+    pub(super) async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await
     }
 
@@ -111,7 +139,7 @@ mod tests {
         assert_eq!(run, "cancelled");
     }
 
-    async fn test_state(pool: sqlx::SqlitePool) -> AppState {
+    pub(super) async fn test_state(pool: sqlx::SqlitePool) -> AppState {
         test_state_with_runner(pool).await.0
     }
 
@@ -181,7 +209,11 @@ mod tests {
     /// The reconciler reads `plan.json` off the disk and looks the path up in `worktrees`; neither
     /// step cares whether git ever made the directory, so the tests that exercise the state machine
     /// do not have to build a repository to do it.
-    async fn seed_worktree(pool: &sqlx::SqlitePool, job_id: i64, path: &std::path::Path) {
+    pub(super) async fn seed_worktree(
+        pool: &sqlx::SqlitePool,
+        job_id: i64,
+        path: &std::path::Path,
+    ) {
         crate::execution::worktree::record(
             pool,
             crate::execution::worktree::Owner::Job(job_id),
@@ -197,7 +229,7 @@ mod tests {
             .expect("create the handoff directory");
     }
 
-    async fn write_plan(worktree: &std::path::Path, contents: &str) {
+    pub(super) async fn write_plan(worktree: &std::path::Path, contents: &str) {
         std::fs::write(
             worktree
                 .join(crate::execution::worktree::ARTIFACTS_DIR)
@@ -208,7 +240,12 @@ mod tests {
     }
 
     /// Adds a node run for a job, in whatever status the test needs it to have landed in.
-    async fn seed_node(pool: &sqlx::SqlitePool, job_id: i64, stage: &str, status: &str) -> i64 {
+    pub(super) async fn seed_node(
+        pool: &sqlx::SqlitePool,
+        job_id: i64,
+        stage: &str,
+        status: &str,
+    ) -> i64 {
         // The job's own project, not a literal: two `awaiting_approval` worktree runs sharing one
         // project id used to collide on `one_open_worktree_run_per_project`; that index is gone
         // (0053), and the shared id stays because these nodes do belong to one job's project.
@@ -232,7 +269,7 @@ mod tests {
         .last_insert_rowid()
     }
 
-    async fn job_status(pool: &sqlx::SqlitePool, job_id: i64) -> String {
+    pub(super) async fn job_status(pool: &sqlx::SqlitePool, job_id: i64) -> String {
         sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(pool)
@@ -241,7 +278,7 @@ mod tests {
     }
 
     async fn item_statuses(pool: &sqlx::SqlitePool, job_id: i64) -> Vec<String> {
-        sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+        sqlx::query_scalar("SELECT status FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal")
             .bind(job_id)
             .fetch_all(pool)
             .await
@@ -262,6 +299,41 @@ mod tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    /// The autopilot graph the walker is differentiated against, parsed once.
+    fn autopilot_graph() -> &'static crate::workflows::graph::Graph {
+        static GRAPH: std::sync::OnceLock<crate::workflows::graph::Graph> =
+            std::sync::OnceLock::new();
+        GRAPH.get_or_init(|| {
+            crate::workflows::graph::parse(include_str!("../../assets/autopilot/1.0.0/graph.yaml"))
+                .expect("the seeded autopilot graph parses")
+        })
+    }
+
+    /// The walker's answer for a view, phrased as the old decision would have, or `None` where it
+    /// has no such phrasing (`Stuck`).
+    fn walker_answer(job: &JobView) -> Option<Next> {
+        let graph = autopilot_graph();
+        let (state, facts) = bridge::walk_state_of(graph, job);
+        bridge::step_as_next(
+            &crate::workflows::walk::next_step(graph, &state, &facts),
+            graph,
+        )
+    }
+
+    /// `next_step`, with the walker held to the same answer (spec 12.1).
+    ///
+    /// Every table in this module goes through here, so the old expectations stay byte-identical
+    /// and each one is also a differential test of the walker. Returns the OLD decision.
+    fn both(job: &JobView) -> Next {
+        let old = next_step(job);
+        assert_eq!(
+            Some(old.clone()),
+            walker_answer(job),
+            "walker diverges from next_step on {job:?}"
+        );
+        old
     }
 
     /// A job of one round, which is what every test written before rounds existed is about.
@@ -366,7 +438,7 @@ mod tests {
         );
 
         assert_eq!(
-            next_step(&shared),
+            both(&shared),
             Next::SpawnImplement(vec![0, 2]),
             "item 1 shares job.rs with item 0 and waits; item 2 shares nothing and goes"
         );
@@ -390,7 +462,7 @@ mod tests {
             3,
         );
 
-        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0]));
+        assert_eq!(both(&job), Next::SpawnImplement(vec![0]));
     }
 
     /// A `Conflicted` item is work, and it does not block itself.
@@ -404,7 +476,7 @@ mod tests {
         use ItemState::*;
         let job = view_with_parallel(&[item(Conflicted, &[], &["a.rs"])], 2);
 
-        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0]));
+        assert_eq!(both(&job), Next::SpawnImplement(vec![0]));
     }
 
     /// But it does block a SIBLING that declares the same file, because its tree holds that work.
@@ -420,7 +492,7 @@ mod tests {
             3,
         );
 
-        assert_eq!(next_step(&job), Next::SpawnImplement(vec![0, 2]));
+        assert_eq!(both(&job), Next::SpawnImplement(vec![0, 2]));
     }
 
     /// An item still running holds its paths, and does not stop the queue.
@@ -441,14 +513,14 @@ mod tests {
             3,
         );
 
-        assert_eq!(next_step(&job), Next::SpawnImplement(vec![2]));
+        assert_eq!(both(&job), Next::SpawnImplement(vec![2]));
 
         // And without a team the same queue waits, exactly as it always did.
         let sequential = JobView {
             has_team: false,
             ..job
         };
-        assert_eq!(next_step(&sequential), Next::Wait);
+        assert_eq!(both(&sequential), Next::Wait);
     }
 
     /// The ceiling counts what is running as well as what is being started.
@@ -468,7 +540,7 @@ mod tests {
             2,
         );
         assert_eq!(
-            next_step(&running_one),
+            both(&running_one),
             Next::SpawnImplement(vec![1]),
             "one running plus one started is the ceiling of two"
         );
@@ -481,7 +553,7 @@ mod tests {
             ],
             2,
         );
-        assert_eq!(next_step(&idle), Next::SpawnImplement(vec![0, 1]));
+        assert_eq!(both(&idle), Next::SpawnImplement(vec![0, 1]));
     }
 
     /// A dependency that has not PASSED holds its dependent back, whatever else it has done.
@@ -520,13 +592,13 @@ mod tests {
             ],
             3,
         );
-        assert_eq!(next_step(&to_merge), Next::MergeItem { ordinal: 0 });
+        assert_eq!(both(&to_merge), Next::MergeItem { ordinal: 0 });
 
         let to_gate = view_with_parallel(
             &[item(Merging, &[], &["a.rs"]), item(Pending, &[], &["b.rs"])],
             3,
         );
-        assert_eq!(next_step(&to_gate), Next::RunGate { ordinal: 0 });
+        assert_eq!(both(&to_gate), Next::RunGate { ordinal: 0 });
     }
 
     /// `Implemented` and `Merging` hold their paths too, and this is asked of the fold directly.
@@ -576,7 +648,7 @@ mod tests {
         );
 
         assert!(batch_of(&stuck).is_empty(), "the fold cannot select it");
-        assert_eq!(next_step(&stuck), Next::Finish(Outcome::Stopped));
+        assert_eq!(both(&stuck), Next::Finish(Outcome::Stopped));
     }
 
     /// And the same shape with something in flight WAITS, because the thing that lands next is what
@@ -593,14 +665,14 @@ mod tests {
         );
 
         assert!(batch_of(&job).is_empty());
-        assert_eq!(next_step(&job), Next::Wait);
+        assert_eq!(both(&job), Next::Wait);
     }
 
     /// Seeds a job in a given status.
     ///
-    /// It always starts `planning` and is moved afterwards, because that is the only status
+    /// It always starts `running` and is moved afterwards, because that is the only status
     /// `insert_job` writes — a caller that could pick one could start a job mid-queue with no queue.
-    async fn seed_job(
+    pub(super) async fn seed_job(
         pool: &sqlx::SqlitePool,
         project_id: &str,
         status: &str,
@@ -630,10 +702,11 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: None,
+                graph: None,
             },
         )
         .await?;
-        if status != "planning" {
+        if status != STATUS_RUNNING {
             sqlx::query("UPDATE jobs SET status = ? WHERE id = ?")
                 .bind(status)
                 .bind(job_id)
@@ -641,6 +714,20 @@ mod tests {
                 .await?;
         }
         Ok(job_id)
+    }
+
+    /// Records the plan node as done without adding a queue: the job is past planning, as a job
+    /// that ingested a plan of zero items is. `status` is not a phase any more, so this row is the
+    /// only thing that says so.
+    async fn seed_plan_row(pool: &sqlx::SqlitePool, job_id: i64) {
+        sqlx::query(
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, round)
+             VALUES (?, 'plan', NULL, 'plan', 'passed', 0)",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("insert the plan row");
     }
 
     /// A job with nothing done at all: no brief, no queue, no node in flight.
@@ -669,14 +756,14 @@ mod tests {
     #[test]
     fn a_job_writes_a_brief_before_it_plans() {
         let fresh = unspecced_view();
-        assert_eq!(next_step(&fresh), Next::SpawnSpec);
+        assert_eq!(both(&fresh), Next::SpawnSpec);
 
         let writing = JobView {
             speccing: true,
             ..unspecced_view()
         };
         assert_eq!(
-            next_step(&writing),
+            both(&writing),
             Next::Wait,
             "a second spec node must not start on top of the first"
         );
@@ -685,7 +772,7 @@ mod tests {
             specced: true,
             ..unspecced_view()
         };
-        assert_eq!(next_step(&written), Next::SpawnPlan);
+        assert_eq!(both(&written), Next::SpawnPlan);
     }
 
     /// The property that makes this node safe to add to a machine with jobs already running.
@@ -702,7 +789,7 @@ mod tests {
             ..view(true, &[ItemState::Pending], ReviewState::Pending)
         };
         assert_eq!(
-            next_step(&midway),
+            both(&midway),
             Next::SpawnImplement(vec![0]),
             "a job with a queue is past the moment a brief would have helped"
         );
@@ -766,33 +853,33 @@ mod tests {
         let mut items = vec![ItemState::Pending, ItemState::Pending];
 
         assert_eq!(
-            next_step(&view(false, &[], ReviewState::Pending)),
+            both(&view(false, &[], ReviewState::Pending)),
             Next::SpawnPlan
         );
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::Pending)),
+            both(&view(true, &items, ReviewState::Pending)),
             Next::SpawnImplement(vec![0])
         );
 
         items[0] = ItemState::Implemented;
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::Pending)),
+            both(&view(true, &items, ReviewState::Pending)),
             Next::RunGate { ordinal: 0 }
         );
 
         items[0] = ItemState::Passed;
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::Pending)),
+            both(&view(true, &items, ReviewState::Pending)),
             Next::SpawnImplement(vec![1])
         );
 
         items[1] = ItemState::Passed;
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::Pending)),
+            both(&view(true, &items, ReviewState::Pending)),
             Next::SpawnReview
         );
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::Done)),
+            both(&view(true, &items, ReviewState::Done)),
             Next::Finish(Outcome::Completed)
         );
     }
@@ -802,7 +889,7 @@ mod tests {
         // A planner that found no work had a successful night. Only an absent plan.json is a
         // failure, and that distinction is made before this function ever sees the job.
         assert_eq!(
-            next_step(&view(true, &[], ReviewState::Pending)),
+            both(&view(true, &[], ReviewState::Pending)),
             Next::Finish(Outcome::Completed)
         );
     }
@@ -811,7 +898,7 @@ mod tests {
     fn a_failed_item_stops_the_chain_instead_of_moving_on() {
         let items = [ItemState::Failed, ItemState::Pending];
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::Pending)),
+            both(&view(true, &items, ReviewState::Pending)),
             Next::Finish(Outcome::Failed)
         );
     }
@@ -827,12 +914,12 @@ mod tests {
     #[test]
     fn a_failed_gate_and_an_errored_gate_end_the_job_differently() {
         assert_eq!(
-            next_step(&view(true, &[ItemState::GateErrored], ReviewState::Pending)),
+            both(&view(true, &[ItemState::GateErrored], ReviewState::Pending)),
             Next::Finish(Outcome::GateErrored),
             "a gate that would not run has to stop the chain where it is"
         );
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::GateErrored, ItemState::Pending],
                 ReviewState::Pending
@@ -842,12 +929,12 @@ mod tests {
         );
 
         assert_eq!(
-            next_step(&view(true, &[ItemState::GateFailed], ReviewState::Pending)),
+            both(&view(true, &[ItemState::GateFailed], ReviewState::Pending)),
             Next::SpawnReview,
             "a red gate is no longer where the job stops"
         );
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::GateFailed, ItemState::Pending],
                 ReviewState::Pending
@@ -865,7 +952,7 @@ mod tests {
     #[test]
     fn one_red_gate_makes_the_whole_job_gate_failed_however_it_ends() {
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::Passed, ItemState::GateFailed, ItemState::Passed],
                 ReviewState::Done
@@ -873,7 +960,7 @@ mod tests {
             Next::Finish(Outcome::GateFailed)
         );
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::GateFailed, ItemState::Passed],
                 ReviewState::NotWanted
@@ -882,7 +969,7 @@ mod tests {
             "a job that wanted no review reaches the same verdict by the other door"
         );
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::Passed, ItemState::Passed],
                 ReviewState::Done
@@ -901,16 +988,16 @@ mod tests {
     fn an_implemented_item_is_merged_first_only_when_a_team_wrote_it_elsewhere() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view(true, &[Implemented], ReviewState::NotWanted)),
+            both(&view(true, &[Implemented], ReviewState::NotWanted)),
             Next::RunGate { ordinal: 0 }
         );
         assert_eq!(
-            next_step(&view_with_team(&[Implemented], ReviewState::NotWanted)),
+            both(&view_with_team(&[Implemented], ReviewState::NotWanted)),
             Next::MergeItem { ordinal: 0 }
         );
         // And once it has landed, the gate measures the branch it landed on.
         assert_eq!(
-            next_step(&view_with_team(&[Merging], ReviewState::NotWanted)),
+            both(&view_with_team(&[Merging], ReviewState::NotWanted)),
             Next::RunGate { ordinal: 0 }
         );
     }
@@ -936,7 +1023,7 @@ mod tests {
                 ..view_with_team(&[], ReviewState::NotWanted)
             };
             assert_eq!(
-                next_step(&job),
+                both(&job),
                 Next::Orphan { ordinal: 1 },
                 "a dependency in {blocker:?} still lets its dependent be started"
             );
@@ -948,7 +1035,7 @@ mod tests {
             items: vec![ItemView::plain(Skipped), ItemView::plain(Orphaned)],
             ..view_with_team(&[], ReviewState::NotWanted)
         };
-        assert_eq!(next_step(&done), Next::Finish(Outcome::Failed));
+        assert_eq!(both(&done), Next::Finish(Outcome::Failed));
     }
 
     /// A dependency that merely has not finished yet is not a reason to put anything down.
@@ -969,7 +1056,7 @@ mod tests {
                 ..view_with_team(&[], ReviewState::NotWanted)
             };
             assert_ne!(
-                next_step(&job),
+                both(&job),
                 Next::Orphan { ordinal: 1 },
                 "a dependency in {blocker:?} orphaned its dependent"
             );
@@ -984,7 +1071,7 @@ mod tests {
     fn a_skipped_item_nothing_waited_for_still_completes_the_job() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view(true, &[Passed, Skipped], ReviewState::Done)),
+            both(&view(true, &[Passed, Skipped], ReviewState::Done)),
             Next::Finish(Outcome::Completed)
         );
     }
@@ -994,7 +1081,7 @@ mod tests {
     fn without_a_team_a_failure_still_stops_the_job_rather_than_orphaning_anything() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view(true, &[Failed, Pending], ReviewState::NotWanted)),
+            both(&view(true, &[Failed, Pending], ReviewState::NotWanted)),
             Next::Finish(Outcome::Failed)
         );
     }
@@ -1010,13 +1097,13 @@ mod tests {
     fn a_conflicted_item_is_started_again_rather_than_given_up_on() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view_with_team(&[Conflicted], ReviewState::NotWanted)),
+            both(&view_with_team(&[Conflicted], ReviewState::NotWanted)),
             Next::SpawnImplement(vec![0])
         );
         // And it does not jump the queue: the same positional search means an earlier item still
         // goes first.
         assert_eq!(
-            next_step(&view_with_team(
+            both(&view_with_team(
                 &[Pending, Conflicted],
                 ReviewState::NotWanted
             )),
@@ -1033,7 +1120,7 @@ mod tests {
     fn a_landed_merge_is_gated_before_another_item_is_brought_in() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view_with_team(
+            both(&view_with_team(
                 &[Implemented, Merging],
                 ReviewState::NotWanted
             )),
@@ -1093,7 +1180,7 @@ mod tests {
             (Skipped, Next::SpawnReview),
         ] {
             assert_eq!(
-                next_step(&view(true, &[state], ReviewState::Pending)),
+                both(&view(true, &[state], ReviewState::Pending)),
                 expected,
                 "{state:?} without a team"
             );
@@ -1110,18 +1197,18 @@ mod tests {
     fn with_a_team_a_broken_item_does_not_stop_the_queue_but_a_cancelled_one_does() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view_with_team(&[Failed, Pending], ReviewState::NotWanted)),
+            both(&view_with_team(&[Failed, Pending], ReviewState::NotWanted)),
             Next::SpawnImplement(vec![1])
         );
         assert_eq!(
-            next_step(&view_with_team(
+            both(&view_with_team(
                 &[GateErrored, Pending],
                 ReviewState::NotWanted
             )),
             Next::SpawnImplement(vec![1])
         );
         assert_eq!(
-            next_step(&view_with_team(
+            both(&view_with_team(
                 &[Cancelled, Pending],
                 ReviewState::NotWanted
             )),
@@ -1139,7 +1226,7 @@ mod tests {
     fn with_a_team_the_broken_item_still_decides_the_ending() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view_with_team(&[Failed, Passed], ReviewState::NotWanted)),
+            both(&view_with_team(&[Failed, Passed], ReviewState::NotWanted)),
             Next::Finish(Outcome::Failed),
             "through ending()"
         );
@@ -1156,7 +1243,7 @@ mod tests {
             )
         };
         assert_eq!(
-            next_step(&with_rounds),
+            both(&with_rounds),
             Next::Finish(Outcome::Failed),
             "and through close_the_round(), which must not open another round over it"
         );
@@ -1174,7 +1261,7 @@ mod tests {
     fn a_reverted_item_is_settled_before_anything_else_moves() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view_with_team(
+            both(&view_with_team(
                 &[Reverted, Pending],
                 ReviewState::NotWanted
             )),
@@ -1182,7 +1269,7 @@ mod tests {
             "Reverted must be settled, not waited for and not walked past"
         );
         assert_eq!(
-            next_step(&view(true, &[Reverted, Cancelled], ReviewState::NotWanted)),
+            both(&view(true, &[Reverted, Cancelled], ReviewState::NotWanted)),
             Next::SettleRevert { ordinal: 0 },
             "the settle comes before the short-circuit on a cancelled item"
         );
@@ -1197,7 +1284,7 @@ mod tests {
     fn a_revert_failed_item_ends_the_job_with_or_without_a_team() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[RevertFailed, Pending],
                 ReviewState::NotWanted
@@ -1206,7 +1293,7 @@ mod tests {
             "a job with no team keeps going onto a tree that was not put back"
         );
         assert_eq!(
-            next_step(&view_with_team(
+            both(&view_with_team(
                 &[RevertFailed, Pending],
                 ReviewState::NotWanted
             )),
@@ -1426,7 +1513,7 @@ mod tests {
     #[test]
     fn a_retriable_item_reruns_the_same_ordinal() {
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::Passed, ItemState::GateRetriable],
                 ReviewState::Pending
@@ -1445,7 +1532,7 @@ mod tests {
     #[test]
     fn a_retriable_item_is_taken_before_a_later_pending_one() {
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::GateRetriable, ItemState::Pending],
                 ReviewState::Pending
@@ -1464,7 +1551,7 @@ mod tests {
     #[test]
     fn an_item_out_of_retries_lets_the_queue_carry_on() {
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::GateFailed, ItemState::Pending],
                 ReviewState::Pending
@@ -1482,7 +1569,7 @@ mod tests {
     #[test]
     fn a_job_ending_on_a_red_gate_still_reports_gate_failed() {
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::GateFailed, ItemState::Passed],
                 ReviewState::Done
@@ -1501,7 +1588,7 @@ mod tests {
     #[test]
     fn a_gate_that_could_not_run_still_ends_the_job() {
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::GateErrored, ItemState::Pending],
                 ReviewState::Pending
@@ -1529,7 +1616,7 @@ mod tests {
     #[test]
     fn a_skipped_item_neither_blocks_the_queue_nor_colours_the_ending() {
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::Skipped, ItemState::Pending],
                 ReviewState::Pending
@@ -1538,7 +1625,7 @@ mod tests {
             "the queue has to move past it"
         );
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::Skipped, ItemState::Skipped],
                 ReviewState::Done
@@ -1547,7 +1634,7 @@ mod tests {
             "a job whose every item was skipped still did what it was allowed to do"
         );
         assert_eq!(
-            next_step(&view(
+            both(&view(
                 true,
                 &[ItemState::Skipped, ItemState::GateFailed],
                 ReviewState::Done
@@ -1559,11 +1646,11 @@ mod tests {
 
     #[test]
     fn work_resumes_at_the_first_unfinished_item_not_the_first_item() {
-        // What `stage_cursor` exists for. Resuming at zero would redo work the gate already passed,
+        // What the retired `stage_cursor` column existed for. Resuming at zero would redo work the gate already passed,
         // on a worktree that still holds it.
         let items = [ItemState::Passed, ItemState::Passed, ItemState::Pending];
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::Pending)),
+            both(&view(true, &items, ReviewState::Pending)),
             Next::SpawnImplement(vec![2])
         );
     }
@@ -1571,17 +1658,14 @@ mod tests {
     #[test]
     fn a_running_node_is_waited_for_rather_than_raced() {
         let items = [ItemState::Running, ItemState::Pending];
-        assert_eq!(
-            next_step(&view(true, &items, ReviewState::Pending)),
-            Next::Wait
-        );
+        assert_eq!(both(&view(true, &items, ReviewState::Pending)), Next::Wait);
     }
 
     #[test]
     fn a_job_without_review_completes_at_the_last_item() {
         let items = [ItemState::Passed];
         assert_eq!(
-            next_step(&view(true, &items, ReviewState::NotWanted)),
+            both(&view(true, &items, ReviewState::NotWanted)),
             Next::Finish(Outcome::Completed)
         );
     }
@@ -2005,8 +2089,8 @@ mod tests {
         let pool = test_pool().await;
         seed_agent(&pool, "dir", "directing", "lead").await;
         seed_crew(&pool, "crew", "dir", &[]).await;
-        let alone = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        let directed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let alone = seed_job(&pool, "project-a", "running").await.unwrap();
+        let directed = seed_job(&pool, "project-b", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(directed)
             .execute(&pool)
@@ -2048,7 +2132,7 @@ mod tests {
         seed_agent(&pool, "dir", "directing", "lead").await;
         seed_agent(&pool, "ana", "the database layer", "you are careful").await;
         seed_crew(&pool, "crew", "dir", &["ana"]).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -2056,7 +2140,7 @@ mod tests {
             .unwrap();
         seed_items(&pool, job_id, &["passed", "running"]).await;
         sqlx::query(
-            "UPDATE job_items SET agent_id = 'ana', depends_on = '[]', files = '[\"a.rs\"]'
+            "UPDATE job_nodes SET agent_id = 'ana', depends_on = '[]', files = '[\"a.rs\"]'
              WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
@@ -2064,7 +2148,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "UPDATE job_items SET agent_id = 'dir', depends_on = '[0]', files = '[\"b.rs\",\"c.rs\"]'
+            "UPDATE job_nodes SET agent_id = 'dir', depends_on = '[0]', files = '[\"b.rs\",\"c.rs\"]'
              WHERE job_id = ? AND ordinal = 1",
         )
         .bind(job_id)
@@ -2089,7 +2173,7 @@ mod tests {
 
         // The LEFT of the other join. Every item of every job without a team has a NULL `agent_id`,
         // and an inner join would have returned an empty queue for all of them.
-        let plain_job = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let plain_job = seed_job(&pool, "project-b", "running").await.unwrap();
         seed_items(&pool, plain_job, &["pending"]).await;
         let plain = detail(&pool, plain_job).await.unwrap().expect("it exists");
         assert_eq!(plain.items.len(), 1);
@@ -2102,8 +2186,8 @@ mod tests {
     async fn seed_items(pool: &sqlx::SqlitePool, job_id: i64, statuses: &[&str]) {
         for (ordinal, status) in statuses.iter().enumerate() {
             sqlx::query(
-                "INSERT INTO job_items (job_id, ordinal, description, status)
-                 VALUES (?, ?, 'an item', ?)",
+                "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status)
+                 VALUES (?, 'implement', ?, 'an item', ?)",
             )
             .bind(job_id)
             .bind(ordinal as i64)
@@ -2136,7 +2220,7 @@ mod tests {
     ) -> i64 {
         let knowledge_id = seed_active_knowledge(pool, "the cursor helper lives in ui").await;
         let item_id: i64 =
-            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = ?")
                 .bind(job_id)
                 .bind(ordinal)
                 .fetch_one(pool)
@@ -2197,14 +2281,15 @@ mod tests {
     #[tokio::test]
     async fn a_skipped_node_is_undone_in_the_tree_it_wrote_in() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running", "running"]).await;
-        let items: Vec<i64> =
-            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
-                .bind(job_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let items: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
 
         // The job's own tree and a checkpoint to fall back to, which is what a node without an item
         // of its own is answered with.
@@ -2269,11 +2354,11 @@ mod tests {
             "an item is put back to where its own tree began"
         );
 
-        // Today's link between a node and its item is `job_items.run_id`, and it is what
+        // Today's link between a node and its item is `job_nodes.run_id`, and it is what
         // `footing_for_run` walks. The run below carries no `item_id` precisely because that is
         // every node that exists before this slice.
         let no_item = run(&pool, job_id, None).await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE id = ?")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE id = ?")
             .bind(no_item)
             .bind(items[0])
             .execute(&pool)
@@ -2296,7 +2381,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_still_planning_has_no_queue_yet() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
 
         let view = load_view(&pool, job_id).await.unwrap();
 
@@ -2304,7 +2389,7 @@ mod tests {
         // The queue is what this test is about, and it still does not exist. What comes FIRST
         // changed: a job with nothing at all writes its brief before it plans, so the queue is now
         // two nodes away rather than one.
-        assert_eq!(next_step(&view), Next::SpawnSpec);
+        assert_eq!(both(&view), Next::SpawnSpec);
     }
 
     #[tokio::test]
@@ -2312,12 +2397,13 @@ mod tests {
         let pool = test_pool().await;
         // Past the plan node with an empty queue: the honest "there was no work" night. Reading
         // this as still-planning would spawn a second planner every tick, forever.
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_plan_row(&pool, job_id).await;
 
         let view = load_view(&pool, job_id).await.unwrap();
 
         assert!(view.planned);
-        assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+        assert_eq!(both(&view), Next::Finish(Outcome::Completed));
     }
 
     /// The column reaches `next_step`, or everything decided about teams is a decision no real job
@@ -2332,9 +2418,9 @@ mod tests {
         let pool = test_pool().await;
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(&now)
         .bind(&now)
@@ -2352,8 +2438,8 @@ mod tests {
         .await
         .unwrap();
 
-        let alone = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        let directed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let alone = seed_job(&pool, "project-a", "running").await.unwrap();
+        let directed = seed_job(&pool, "project-b", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(directed)
             .execute(&pool)
@@ -2368,9 +2454,9 @@ mod tests {
     async fn seed_agent(pool: &sqlx::SqlitePool, id: &str, speciality: &str, prompt: &str) {
         let now = "2026-08-20T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'claude', 'inherit', ?, ?)",
+             VALUES (?, ?, ?, ?, 'claude', '[]', ?, ?)",
         )
         .bind(id)
         .bind(format!("Agent {id}"))
@@ -2461,7 +2547,7 @@ mod tests {
         seed_agent(&pool, "dir", "directing", "lead").await;
         seed_agent(&pool, "ana", "migrations and schema work", "careful").await;
         seed_crew(&pool, "crew", "dir", &["ana"]).await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -2550,9 +2636,9 @@ mod tests {
         let pool = test_pool().await;
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(&now)
         .bind(&now)
@@ -2570,9 +2656,9 @@ mod tests {
         .await
         .unwrap();
 
-        let alone = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let alone = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, alone, &["failed", "pending"]).await;
-        let directed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let directed = seed_job(&pool, "project-b", "running").await.unwrap();
         seed_items(&pool, directed, &["failed", "pending"]).await;
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(directed)
@@ -2581,11 +2667,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            next_step(&load_view(&pool, alone).await.unwrap()),
+            both(&load_view(&pool, alone).await.unwrap()),
             Next::Finish(Outcome::Failed)
         );
         assert_eq!(
-            next_step(&load_view(&pool, directed).await.unwrap()),
+            both(&load_view(&pool, directed).await.unwrap()),
             Next::SpawnImplement(vec![1])
         );
     }
@@ -2593,12 +2679,12 @@ mod tests {
     #[tokio::test]
     async fn a_loaded_view_resumes_at_the_first_unfinished_item() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed", "passed", "pending"]).await;
 
         let view = load_view(&pool, job_id).await.unwrap();
 
-        assert_eq!(next_step(&view), Next::SpawnImplement(vec![2]));
+        assert_eq!(both(&view), Next::SpawnImplement(vec![2]));
     }
 
     // ---- rounds (Chunk 3) ------------------------------------------------------------------------
@@ -2619,7 +2705,7 @@ mod tests {
             (vec![ItemState::Skipped], Outcome::Completed),
         ] {
             assert_eq!(
-                next_step(&view(true, &items, ReviewState::Done)),
+                both(&view(true, &items, ReviewState::Done)),
                 Next::Finish(expected),
                 "{items:?}"
             );
@@ -2642,7 +2728,7 @@ mod tests {
         // (1) The replan said so. Ahead of everything: the node that just looked at the work is the
         // one saying the work is over.
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &[ItemState::Passed],
                 ReviewState::Done,
                 rounds(1, 0, Replan::Done)
@@ -2652,7 +2738,7 @@ mod tests {
 
         // (3) It dried up. `completed`, because there was nothing left to do.
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &[ItemState::Passed],
                 ReviewState::Done,
                 rounds(1, DRY_ROUNDS_TO_STOP, Replan::NotYet)
@@ -2662,7 +2748,7 @@ mod tests {
 
         // (4) Out of rounds. `stopped`, because there may well have been more.
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &[ItemState::Passed],
                 ReviewState::Done,
                 rounds(4, 0, Replan::NotYet)
@@ -2672,7 +2758,7 @@ mod tests {
 
         // None of them: ask again.
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &[ItemState::Passed],
                 ReviewState::Done,
                 rounds(1, 1, Replan::NotYet)
@@ -2689,7 +2775,7 @@ mod tests {
     #[test]
     fn a_red_gate_ends_a_job_that_had_rounds_left() {
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &[ItemState::Passed, ItemState::GateFailed],
                 ReviewState::Done,
                 RoundState {
@@ -2858,12 +2944,12 @@ mod tests {
         };
 
         assert_eq!(
-            next_step(&view_in_round(&queue, ReviewState::Done, rounds(false))),
+            both(&view_in_round(&queue, ReviewState::Done, rounds(false))),
             Next::Finish(Outcome::Failed),
             "a job nobody asked for ends exactly where it always did"
         );
         assert_ne!(
-            next_step(&view_in_round(&queue, ReviewState::Done, rounds(true))),
+            both(&view_in_round(&queue, ReviewState::Done, rounds(true))),
             Next::Finish(Outcome::Failed),
             "and one the owner commissioned reaches the item that was never tried"
         );
@@ -2895,19 +2981,19 @@ mod tests {
         let red = [ItemState::Passed, ItemState::GateFailed];
 
         // The change itself: rounds left, so the job asks for another plan rather than giving up.
-        assert_eq!(next_step(&commissioned(0, 0, &red)), Next::SpawnReplan);
+        assert_eq!(both(&commissioned(0, 0, &red)), Next::SpawnReplan);
 
         // Out of rounds. The ending is NOT softened — the failed item still decides what the job is
         // reported as, and `gate_failed` is what a person reads in the morning.
         assert_eq!(
-            next_step(&commissioned(3, 0, &red)),
+            both(&commissioned(3, 0, &red)),
             Next::Finish(Outcome::GateFailed)
         );
 
         // Dried up: two rounds that added nothing stop it, exactly as they stop a happy job. Without
         // this arm a red item the replan cannot fix would spin against `max_rounds` spending money.
         assert_eq!(
-            next_step(&commissioned(0, DRY_ROUNDS_TO_STOP, &red)),
+            both(&commissioned(0, DRY_ROUNDS_TO_STOP, &red)),
             Next::Finish(Outcome::GateFailed)
         );
 
@@ -2916,7 +3002,7 @@ mod tests {
         // `record_gate` does for a red gate, so the unmeasured edits are gone by the time this
         // reads the state.
         assert_eq!(
-            next_step(&commissioned(0, 0, &[ItemState::Passed, ItemState::Failed])),
+            both(&commissioned(0, 0, &[ItemState::Passed, ItemState::Failed])),
             Next::SpawnReplan
         );
 
@@ -2936,14 +3022,14 @@ mod tests {
         // Cancelled is a person having stopped this. No revert makes that stale, and carrying on
         // would be answering them.
         assert_eq!(
-            next_step(&commissioned(0, 0, &[ItemState::Cancelled])),
+            both(&commissioned(0, 0, &[ItemState::Cancelled])),
             Next::Finish(Outcome::Cancelled)
         );
 
         // A replan already in flight is waited on, not spawned twice — the same trap the happy path
         // has its own guard for.
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &red,
                 ReviewState::Done,
                 RoundState {
@@ -2963,7 +3049,7 @@ mod tests {
     #[test]
     fn a_replan_in_flight_is_waited_on_rather_than_spawned_again() {
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &[ItemState::Passed],
                 ReviewState::Done,
                 RoundState {
@@ -2982,7 +3068,7 @@ mod tests {
     fn an_empty_queue_is_a_planner_that_looked_and_found_nothing() {
         // Round 0: the planner looked and found nothing. Done, as it always was.
         assert_eq!(
-            next_step(&view_in_round(
+            both(&view_in_round(
                 &[],
                 ReviewState::Pending,
                 RoundState {
@@ -3008,11 +3094,11 @@ mod tests {
     #[tokio::test]
     async fn a_new_rounds_item_is_found_past_the_finished_ones_and_keeps_its_real_ordinal() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed", "skipped"]).await;
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, round)
-             VALUES (?, 2, 'what round 1 asked for', 'pending', 1)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, round)
+             VALUES (?, 'implement', 2, 'what round 1 asked for', 'pending', 1)",
         )
         .bind(job_id)
         .execute(&pool)
@@ -3032,8 +3118,8 @@ mod tests {
         );
         assert_eq!(view.rounds.round, 1);
         // 2, not 0. This is the number `advance` binds into
-        // `SELECT description FROM job_items WHERE job_id = ? AND ordinal = ?`.
-        assert_eq!(next_step(&view), Next::SpawnImplement(vec![2]));
+        // `SELECT description FROM job_nodes WHERE job_id = ? AND ordinal = ?`.
+        assert_eq!(both(&view), Next::SpawnImplement(vec![2]));
     }
 
     /// A NULL `max_rounds` is "nobody asked for rounds", not "use the daemon's ceiling". Resolving it
@@ -3041,7 +3127,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_with_no_round_ceiling_is_a_job_of_one_round() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed"]).await;
 
         let view = load_view(&pool, job_id).await.unwrap();
@@ -3053,20 +3139,20 @@ mod tests {
     #[tokio::test]
     async fn an_unrecognised_item_status_is_unfinished_rather_than_done() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed", "something-new"]).await;
 
         let view = load_view(&pool, job_id).await.unwrap();
 
         // Erring toward "not finished" costs a repeated item. Erring the other way skips work the
         // job exists to do and reports it complete, which is the failure nobody sees.
-        assert_eq!(next_step(&view), Next::SpawnImplement(vec![1]));
+        assert_eq!(both(&view), Next::SpawnImplement(vec![1]));
     }
 
     #[tokio::test]
     async fn losing_the_slot_parks_the_job_instead_of_failing_it() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
 
         wait(&pool, job_id, "slot").await.unwrap();
 
@@ -3091,7 +3177,7 @@ mod tests {
     #[tokio::test]
     async fn resuming_a_job_takes_the_pause_note_with_it() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
 
         wait(&pool, job_id, "budget").await.unwrap();
         resume(&pool, job_id).await.unwrap();
@@ -3102,16 +3188,16 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(status, "implementing", "the stage it was parked at");
+        assert_eq!(status, "running", "a resumed job is simply running");
         assert_eq!(reason, None, "nothing is waiting, so nothing is the reason");
     }
 
     #[tokio::test]
     async fn a_finished_job_records_which_kind_of_ending_it_had() {
         let pool = test_pool().await;
-        let broken = seed_job(&pool, "project-a", "gating").await.unwrap();
+        let broken = seed_job(&pool, "project-a", "running").await.unwrap();
         finish(&pool, broken, Outcome::GateFailed).await.unwrap();
-        let unmeasured = seed_job(&pool, "project-b", "gating").await.unwrap();
+        let unmeasured = seed_job(&pool, "project-b", "running").await.unwrap();
         finish(&pool, unmeasured, Outcome::GateErrored)
             .await
             .unwrap();
@@ -3135,11 +3221,11 @@ mod tests {
     #[tokio::test]
     async fn a_second_live_job_for_a_project_is_no_longer_refused_by_the_row() {
         let pool = test_pool().await;
-        seed_job(&pool, "project-a", "planning")
+        seed_job(&pool, "project-a", "running")
             .await
             .expect("the first job starts");
 
-        let second = seed_job(&pool, "project-a", "planning").await;
+        let second = seed_job(&pool, "project-a", "running").await;
 
         assert!(
             second.is_ok(),
@@ -3154,7 +3240,7 @@ mod tests {
     #[tokio::test]
     async fn um_no_de_spec_em_voo_e_visto_como_em_voo_e_depois_como_feito() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "planning")
+        let job_id = seed_job(&pool, "project-a", "running")
             .await
             .expect("a job that has not planned yet");
 
@@ -3163,7 +3249,7 @@ mod tests {
             !fresh.specced && !fresh.speccing,
             "a job with no spec run has no brief and none in flight"
         );
-        assert_eq!(next_step(&fresh), Next::SpawnSpec);
+        assert_eq!(both(&fresh), Next::SpawnSpec);
 
         let run_id = seed_node(&pool, job_id, "spec", "running").await;
         let running = load_view(&pool, job_id).await.unwrap();
@@ -3171,7 +3257,7 @@ mod tests {
             running.speccing && !running.specced,
             "a spec node in flight is speccing and not yet specced"
         );
-        assert_eq!(next_step(&running), Next::Wait);
+        assert_eq!(both(&running), Next::Wait);
 
         sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
             .bind(run_id)
@@ -3184,7 +3270,7 @@ mod tests {
             "a spec node that finished leaves the job specced"
         );
         assert_eq!(
-            next_step(&done),
+            both(&done),
             Next::SpawnPlan,
             "the queue is what comes after the brief"
         );
@@ -3200,7 +3286,7 @@ mod tests {
         // The partial index covers live statuses only. Without that, a project would be wedged
         // forever by its own first job — a worse failure than the race the index exists to stop,
         // because nothing would ever clear it.
-        seed_job(&pool, "project-a", "planning")
+        seed_job(&pool, "project-a", "running")
             .await
             .expect("a new job may start once the last one is done");
     }
@@ -3288,10 +3374,10 @@ mod tests {
     async fn a_job_whose_node_stopped_to_ask_says_so_on_the_job() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "awaiting_approval").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ?")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -3322,7 +3408,7 @@ mod tests {
     async fn a_plan_node_stopping_to_ask_does_not_cost_the_job_its_queue() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         let run_id = seed_node(&pool, job_id, "plan", "awaiting_approval").await;
 
         job_tick(&state, Utc::now()).await;
@@ -3336,7 +3422,7 @@ mod tests {
             .unwrap();
         resume(&pool, job_id).await.unwrap();
 
-        assert_eq!(job_status(&pool, job_id).await, "planning");
+        assert_eq!(job_status(&pool, job_id).await, "running");
     }
 
     /// Both levels of cancellation end the job, because a stopped node leaves the tree holding
@@ -3346,10 +3432,10 @@ mod tests {
     async fn cancelling_a_node_ends_its_job_cancelled_rather_than_failed() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running", "pending"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "cancelled").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ? AND ordinal = 0")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -3364,7 +3450,7 @@ mod tests {
             vec!["cancelled", "pending"]
         );
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::Finish(Outcome::Cancelled)
         );
     }
@@ -3376,7 +3462,7 @@ mod tests {
     async fn a_parked_job_can_be_cancelled_even_though_it_has_no_node_running() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed", "pending"]).await;
         wait(&pool, job_id, "budget").await.unwrap();
 
@@ -3414,7 +3500,7 @@ mod tests {
     async fn cancelling_a_job_ends_the_node_parked_on_an_approval_and_shuts_its_door() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed"]).await;
         let run_id = seed_node(&pool, job_id, "review", "awaiting_approval").await;
         let proposal_id = crate::proposals::create_action_approval(
@@ -3466,7 +3552,7 @@ mod tests {
     async fn the_tick_puts_a_live_job_back_on_a_slot_it_lost() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         let owner = crate::execution::worktree::Owner::Job(job_id);
         assert_eq!(
             crate::execution::concurrency::slot_of(&pool, owner)
@@ -3505,7 +3591,7 @@ mod tests {
     #[tokio::test]
     async fn retiring_a_job_gives_its_concurrency_slot_back() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         let owner = crate::execution::worktree::Owner::Job(job_id);
         crate::execution::concurrency::claim(&pool, "project-a", owner)
             .await
@@ -3544,10 +3630,10 @@ mod tests {
     async fn a_jobs_detail_carries_its_queue_and_says_which_items_were_measured() {
         let pool = test_pool().await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_items(&pool, job_id, &["passed", "passed"]).await;
-        sqlx::query("UPDATE job_items SET gate_status = 'passed' WHERE job_id = ? AND ordinal = 1")
+        sqlx::query("UPDATE job_nodes SET gate_status = 'passed' WHERE job_id = ? AND ordinal = 1")
             .bind(job_id)
             .execute(&pool)
             .await
@@ -3558,7 +3644,7 @@ mod tests {
             .unwrap()
             .expect("the job exists");
 
-        assert_eq!(detail.job.status, "implementing");
+        assert_eq!(detail.job.status, "running");
         assert_eq!(detail.items.len(), 2);
         assert_eq!(detail.items[0].gate_status, None);
         assert_eq!(detail.items[1].gate_status.as_deref(), Some("passed"));
@@ -3575,9 +3661,9 @@ mod tests {
     #[tokio::test]
     async fn a_jobs_detail_says_which_round_each_item_came_from() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed", "passed", "pending"]).await;
-        sqlx::query("UPDATE job_items SET round = 1 WHERE job_id = ? AND ordinal = 2")
+        sqlx::query("UPDATE job_nodes SET round = 1 WHERE job_id = ? AND ordinal = 2")
             .bind(job_id)
             .execute(&pool)
             .await
@@ -3605,7 +3691,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_without_rounds_lists_as_a_single_round() {
         let pool = test_pool().await;
-        seed_job(&pool, "project-a", "implementing").await.unwrap();
+        seed_job(&pool, "project-a", "running").await.unwrap();
 
         let listed = list(&pool, Some("project-a"), 20).await.unwrap();
 
@@ -3619,8 +3705,8 @@ mod tests {
     async fn the_listing_keeps_the_jobs_that_already_ended() {
         let pool = test_pool().await;
         let old = seed_job(&pool, "project-a", "completed").await.unwrap();
-        let live = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let live = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_job(&pool, "project-b", "running").await.unwrap();
 
         let mine = list(&pool, Some("project-a"), 20).await.unwrap();
         assert_eq!(
@@ -3637,7 +3723,7 @@ mod tests {
     #[tokio::test]
     async fn a_jobs_summary_carries_the_slot_it_holds_and_drops_it_when_it_ends() {
         let pool = test_pool().await;
-        let live = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let live = seed_job(&pool, "project-a", "running").await.unwrap();
         let done = seed_job(&pool, "project-a", "completed").await.unwrap();
         crate::execution::concurrency::claim(
             &pool,
@@ -3660,7 +3746,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_does_not_borrow_the_slot_of_the_run_with_its_number() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         crate::execution::concurrency::claim(
             &pool,
             "project-a",
@@ -3682,7 +3768,7 @@ mod tests {
     #[tokio::test]
     async fn the_live_listing_reaches_a_live_job_the_recent_window_would_hide() {
         let pool = test_pool().await;
-        let old_live = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let old_live = seed_job(&pool, "project-a", "running").await.unwrap();
         for _ in 0..25 {
             seed_job(&pool, "project-b", "completed").await.unwrap();
         }
@@ -3805,7 +3891,10 @@ mod tests {
     /// A repository with a real gate, so a walk measures something rather than waving items
     /// through. The commands used are `git`, which runs everywhere this daemon does and answers in
     /// milliseconds.
-    fn walkable_repo(prefix: &str, gate: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    pub(super) fn walkable_repo(
+        prefix: &str,
+        gate: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let base = std::env::current_dir().expect("resolve current directory");
         assert!(
             !base.to_string_lossy().contains(' '),
@@ -3843,10 +3932,10 @@ mod tests {
     }
 
     /// The stand-in for `~/.nucleos` inside a [`walkable_repo`]'s container.
-    const WALK_HOME: &str = "nucleos-home";
+    pub(super) const WALK_HOME: &str = "nucleos-home";
 
     /// `state`, reading project state from the stand-in home [`walkable_repo`] wrote the gate into.
-    fn with_home(mut state: AppState, container: &tempfile::TempDir) -> AppState {
+    pub(super) fn with_home(mut state: AppState, container: &tempfile::TempDir) -> AppState {
         state.machine_config_root = Some(container.path().join(WALK_HOME));
         state
     }
@@ -3876,15 +3965,9 @@ mod tests {
         let trees = tempfile::tempdir().expect("worktree root");
         let _env = WorktreeRootEnv::set(trees.path());
         let pool = test_pool().await;
-        let job_id = seed_job_in(
-            &pool,
-            "nucleos",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "nucleos", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         let job_tree = crate::execution::worktree::create(
             &repo,
             crate::execution::worktree::Owner::Job(job_id),
@@ -3903,7 +3986,7 @@ mod tests {
         .await
         .unwrap();
         seed_items(&pool, job_id, &["implemented"]).await;
-        let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ?")
+        let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ?")
             .bind(job_id)
             .fetch_one(&pool)
             .await
@@ -3932,7 +4015,7 @@ mod tests {
         std::fs::write(tree.path.join("work.txt"), "work\n").expect("write the item's work");
 
         sqlx::query(
-            "CREATE TRIGGER refuse_item_status BEFORE UPDATE OF status ON job_items
+            "CREATE TRIGGER refuse_item_status BEFORE UPDATE OF status ON job_nodes
              BEGIN SELECT RAISE(ABORT, 'status writes refused'); END",
         )
         .execute(&pool)
@@ -3943,10 +4026,10 @@ mod tests {
         let state = with_home(state, &_container);
         assert_eq!(
             merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
-            Step::Stopped,
+            Pass::Stopped,
             "a merge whose status was not recorded must not let the job carry on"
         );
-        let status: String = sqlx::query_scalar("SELECT status FROM job_items WHERE id = ?")
+        let status: String = sqlx::query_scalar("SELECT status FROM job_nodes WHERE id = ?")
             .bind(item_id)
             .fetch_one(&pool)
             .await
@@ -3972,15 +4055,9 @@ mod tests {
         let trees = tempfile::tempdir().expect("worktree root");
         let _env = WorktreeRootEnv::set(trees.path());
         let pool = test_pool().await;
-        let job_id = seed_job_in(
-            &pool,
-            "nucleos",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "nucleos", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
 
         // The job's own checkout, on the job's branch. This is what the merges land in.
         let job_tree = crate::execution::worktree::create(
@@ -4003,12 +4080,13 @@ mod tests {
 
         // Ordinal 0 is the one that will go red, ordinal 1 the one that must survive it.
         seed_items(&pool, job_id, &["implemented", "implemented"]).await;
-        let items: Vec<i64> =
-            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
-                .bind(job_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let items: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
 
         // Each item works in a checkout of its own, born where the job's branch stands, writes one
         // file there — and LEAVES IT UNCOMMITTED, which is what an implement node is told to do
@@ -4049,14 +4127,14 @@ mod tests {
         let state = with_home(state, &_container);
         assert_eq!(
             merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 1).await,
-            Step::Continued
+            Pass::Continued
         );
         assert!(job_tree.path.join("green.txt").exists());
 
         // Then the red one lands, on top of it.
         assert_eq!(
             merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
-            Step::Continued
+            Pass::Continued
         );
         assert!(job_tree.path.join("red.txt").exists());
 
@@ -4101,15 +4179,9 @@ mod tests {
         let trees = tempfile::tempdir().expect("worktree root");
         let env = WorktreeRootEnv::set(trees.path());
         let pool = test_pool().await;
-        let job_id = seed_job_in(
-            &pool,
-            "nucleos",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "nucleos", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
 
         // The job's own checkout, on the job's branch. This is what the merges land in.
         let job_tree = crate::execution::worktree::create(
@@ -4131,12 +4203,13 @@ mod tests {
         .unwrap();
 
         seed_items(&pool, job_id, &["implemented", "implemented"]).await;
-        let items: Vec<i64> =
-            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? ORDER BY ordinal")
-                .bind(job_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let items: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
 
         // Each item's work is left uncommitted in a checkout of its own, as an implement node
         // leaves it.
@@ -4171,7 +4244,7 @@ mod tests {
         for ordinal in [1, 0] {
             assert_eq!(
                 merge_item(&state, &load_job(&pool, job_id).await.unwrap(), ordinal).await,
-                Step::Continued
+                Pass::Continued
             );
         }
         assert!(job_tree.path.join("green.txt").exists());
@@ -4221,10 +4294,10 @@ mod tests {
 
         let step = record_gate(&job.state, &row, 0, red_gate()).await;
 
-        assert_eq!(step, Step::Continued);
+        assert_eq!(step, Pass::Continued);
         assert_only_the_red_merge_was_taken_back(&job.tree);
         let (status, attempts): (String, i64) = sqlx::query_as(
-            "SELECT status, gate_attempts FROM job_items WHERE job_id = ? AND ordinal = 0",
+            "SELECT status, gate_attempts FROM job_nodes WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job.job_id)
         .fetch_one(&job.pool)
@@ -4233,13 +4306,13 @@ mod tests {
         assert_eq!((status.as_str(), attempts), ("gate_failed", 1));
 
         // Item 1 has been gated green in the meantime, as the queue would have done.
-        sqlx::query("UPDATE job_items SET status = 'passed' WHERE job_id = ? AND ordinal = 1")
+        sqlx::query("UPDATE job_nodes SET status = 'passed' WHERE job_id = ? AND ordinal = 1")
             .bind(job.job_id)
             .execute(&job.pool)
             .await
             .unwrap();
         assert_eq!(
-            next_step(&load_view(&job.pool, job.job_id).await.unwrap()),
+            both(&load_view(&job.pool, job.job_id).await.unwrap()),
             Next::SpawnImplement(vec![0]),
             "the queue has to come back to the same item"
         );
@@ -4264,10 +4337,10 @@ mod tests {
 
         let step = record_gate(&job.state, &row, 0, red_gate()).await;
 
-        assert_eq!(step, Step::Continued);
+        assert_eq!(step, Pass::Continued);
         assert_only_the_red_merge_was_taken_back(&job.tree);
         let (status, attempts): (String, i64) = sqlx::query_as(
-            "SELECT status, gate_attempts FROM job_items WHERE job_id = ? AND ordinal = 0",
+            "SELECT status, gate_attempts FROM job_nodes WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job.job_id)
         .fetch_one(&job.pool)
@@ -4300,7 +4373,7 @@ mod tests {
         let _lock = crate::execution::worktree::test_env_lock();
         let job = a_job_with_two_merged_items().await;
         sqlx::query(
-            "UPDATE job_items SET status = 'reverted', gate_status = 'failed', gate_attempts = 1
+            "UPDATE job_nodes SET status = 'reverted', gate_status = 'failed', gate_attempts = 1
              WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job.job_id)
@@ -4321,13 +4394,13 @@ mod tests {
 
         assert_eq!(
             step,
-            Step::Continued,
+            Pass::Continued,
             "a restart must not stall on the item"
         );
         assert_only_the_red_merge_was_taken_back(&job.tree);
         assert_eq!(item_statuses(&job.pool, job.job_id).await[0], "gate_failed");
         assert_ne!(
-            next_step(&load_view(&job.pool, job.job_id).await.unwrap()),
+            both(&load_view(&job.pool, job.job_id).await.unwrap()),
             Next::SettleRevert { ordinal: 0 },
             "settled once is settled"
         );
@@ -4365,6 +4438,7 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: None,
+                workflow: None,
             },
         )
         .await;
@@ -4417,12 +4491,12 @@ mod tests {
     ///
     /// Both variables come back as they were on drop. Callers hold `test_env_lock`, which is what
     /// makes a process-wide variable safe to set at all.
-    struct WorktreeRootEnv {
+    pub(super) struct WorktreeRootEnv {
         root: Option<std::ffi::OsString>,
         floor: Option<std::ffi::OsString>,
     }
     impl WorktreeRootEnv {
-        fn set(path: &std::path::Path) -> Self {
+        pub(super) fn set(path: &std::path::Path) -> Self {
             let root = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
             let floor = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
             unsafe {
@@ -4661,6 +4735,7 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: Some("crew"),
+                workflow: None,
             },
         )
         .await;
@@ -5383,6 +5458,7 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: None,
+                graph: None,
             },
         )
         .await
@@ -5446,6 +5522,7 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: None,
+                workflow: None,
             },
         )
         .await
@@ -5467,7 +5544,7 @@ mod tests {
     /// Nothing here reaches around the machinery. The queue is written by the node into the handoff
     /// directory it learned about through its environment, and read back off disk by the daemon —
     /// so this covers the env plumbing, `prepare_artifacts`, the file contract of §5.2, the gate,
-    /// and every transition between them. Seeding `job_items` directly would have exercised the
+    /// and every transition between them. Seeding `job_nodes` directly would have exercised the
     /// parts and left the joins between them as the only place a bug could still live.
     #[tokio::test(flavor = "current_thread")]
     async fn one_trigger_becomes_a_sequence_of_runs_over_one_worktree() {
@@ -5522,7 +5599,7 @@ mod tests {
 
         // The queue came off disk, in order, and every item was actually measured.
         let items: Vec<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT description, status, gate_status FROM job_items WHERE job_id = ? ORDER BY ordinal",
+            "SELECT description, status, gate_status FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
         )
         .bind(job_id)
         .fetch_all(&pool)
@@ -5564,7 +5641,7 @@ mod tests {
         walk(&state, job_id).await;
 
         let gated: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND gate_status IS NOT NULL",
+            "SELECT COUNT(*) FROM job_nodes WHERE job_id = ? AND gate_status IS NOT NULL",
         )
         .bind(job_id)
         .fetch_one(&pool)
@@ -5630,7 +5707,7 @@ mod tests {
         );
 
         let items: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT status, gate_status FROM job_items WHERE job_id = ? ORDER BY ordinal",
+            "SELECT status, gate_status FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
         )
         .bind(job_id)
         .fetch_all(&pool)
@@ -5671,13 +5748,13 @@ mod tests {
     #[tokio::test]
     async fn a_planner_still_running_is_waited_for_rather_than_started_again() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_node(&pool, job_id, "plan", "running").await;
 
         let view = load_view(&pool, job_id).await.unwrap();
 
         assert!(view.planning);
-        assert_eq!(next_step(&view), Next::Wait);
+        assert_eq!(both(&view), Next::Wait);
     }
 
     /// A node paused for approval has not finished. Reading it as finished would let the job walk
@@ -5686,20 +5763,17 @@ mod tests {
     #[tokio::test]
     async fn a_node_paused_for_approval_is_still_in_flight() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_node(&pool, job_id, "plan", "awaiting_approval").await;
 
-        assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
-            Next::Wait
-        );
+        assert_eq!(both(&load_view(&pool, job_id).await.unwrap()), Next::Wait);
 
-        let reviewing = seed_job(&pool, "project-b", "reviewing").await.unwrap();
+        let reviewing = seed_job(&pool, "project-b", "running").await.unwrap();
         seed_items(&pool, reviewing, &["passed"]).await;
         seed_node(&pool, reviewing, "review", "awaiting_approval").await;
 
         assert_eq!(
-            next_step(&load_view(&pool, reviewing).await.unwrap()),
+            both(&load_view(&pool, reviewing).await.unwrap()),
             Next::Wait
         );
     }
@@ -5714,7 +5788,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_parked_while_planning_still_plans_when_it_comes_back() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
 
         wait(&pool, job_id, "budget").await.unwrap();
         // Even parked, before anything unparks it, the queue does not exist yet.
@@ -5722,12 +5796,12 @@ mod tests {
 
         resume(&pool, job_id).await.unwrap();
 
-        assert_eq!(job_status(&pool, job_id).await, "planning");
+        assert_eq!(job_status(&pool, job_id).await, "running");
         // Still the property this test is named for: it came back knowing it has NOT planned, which
         // is the whole of what `resume_status` protects. This job was parked before it had done
         // anything at all, so what it comes back to is the brief rather than the queue.
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::SpawnSpec
         );
     }
@@ -5738,13 +5812,13 @@ mod tests {
     #[tokio::test]
     async fn parking_a_parked_job_does_not_lose_where_it_was() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
 
         wait(&pool, job_id, "budget").await.unwrap();
         wait(&pool, job_id, "attention").await.unwrap();
         resume(&pool, job_id).await.unwrap();
 
-        assert_eq!(job_status(&pool, job_id).await, "implementing");
+        assert_eq!(job_status(&pool, job_id).await, "running");
     }
 
     // ---- folding a finished node back into the job ---------------------------------------------
@@ -5753,10 +5827,10 @@ mod tests {
     async fn a_node_still_in_flight_is_not_reconciled() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "awaiting_approval").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ?")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -5777,10 +5851,10 @@ mod tests {
     async fn a_node_whose_task_is_still_registered_is_not_reconciled() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "completed").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ?")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -5819,12 +5893,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            !set_live_status(&pool, job_id, "implementing")
-                .await
-                .unwrap()
-        );
-        assert!(!set_live_status(&pool, job_id, "gating").await.unwrap());
+        assert!(!set_live_status(&pool, job_id, "running").await.unwrap());
+        assert!(!set_live_status(&pool, job_id, "running").await.unwrap());
         assert!(!retire(&pool, job_id, "gate_failed").await.unwrap());
         pause(&pool, job_id, "waiting", "budget").await.unwrap();
 
@@ -5841,8 +5911,8 @@ mod tests {
         assert_eq!(resume_status, None);
 
         // The live path is unchanged: a job still running moves, and the first ending wins it.
-        let live = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        assert!(set_live_status(&pool, live, "gating").await.unwrap());
+        let live = seed_job(&pool, "project-a", "running").await.unwrap();
+        assert!(set_live_status(&pool, live, "running").await.unwrap());
         assert!(retire(&pool, live, STATUS_CANCELLED).await.unwrap());
         assert!(!retire(&pool, live, "completed").await.unwrap());
     }
@@ -5853,6 +5923,12 @@ mod tests {
     #[test]
     fn the_status_guard_names_every_live_status() {
         let guard = live_statuses_sql!();
+        for word in ["planning", "implementing", "gating", "reviewing"] {
+            assert!(
+                !guard.contains(&format!("'{word}'")),
+                "a phase word re-entered the status guard: `{word}`"
+            );
+        }
         for status in LIVE_STATUSES {
             assert!(
                 guard.contains(&format!("'{status}'")),
@@ -5879,10 +5955,10 @@ mod tests {
     async fn a_node_that_did_not_complete_stops_the_chain_at_its_item() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running", "pending"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "timed_out").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ? AND ordinal = 0")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -5897,7 +5973,7 @@ mod tests {
             vec!["failed", "pending"]
         );
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::Finish(Outcome::Failed)
         );
         assert!(
@@ -5911,10 +5987,10 @@ mod tests {
     async fn a_finished_node_hands_its_item_to_the_gate() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "completed").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ?")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -5926,7 +6002,7 @@ mod tests {
 
         assert_eq!(item_statuses(&pool, job_id).await, vec!["implemented"]);
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::RunGate { ordinal: 0 }
         );
     }
@@ -5941,7 +6017,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_node(&pool, job_id, "plan", "completed").await;
 
@@ -5962,7 +6038,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_node(&pool, job_id, "plan", "completed").await;
         write_plan(worktree.path(), r#"{"items": []}"#).await;
@@ -5970,9 +6046,9 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         reconcile_nodes(&state, &job).await.unwrap();
 
-        assert_eq!(job_status(&pool, job_id).await, "implementing");
+        assert_eq!(job_status(&pool, job_id).await, "running");
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::Finish(Outcome::Completed)
         );
     }
@@ -5985,7 +6061,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_node(&pool, job_id, "plan", "completed").await;
         write_plan(
@@ -5995,7 +6071,7 @@ mod tests {
         .await;
         // The crash, stood in for by the second insert failing.
         sqlx::query(
-            "CREATE TRIGGER die_mid_ingest BEFORE INSERT ON job_items
+            "CREATE TRIGGER die_mid_ingest BEFORE INSERT ON job_nodes
              WHEN NEW.description = 'boom'
              BEGIN SELECT RAISE(ABORT, 'simulated crash'); END",
         )
@@ -6005,13 +6081,15 @@ mod tests {
 
         let job = load_job(&pool, job_id).await.unwrap();
         assert!(reconcile_nodes(&state, &job).await.is_err());
-        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ?")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(items, 0, "half a queue survived the failed ingest");
-        assert_eq!(job_status(&pool, job_id).await, "planning");
+        assert_eq!(job_status(&pool, job_id).await, "running");
 
         sqlx::query("DROP TRIGGER die_mid_ingest")
             .execute(&pool)
@@ -6019,25 +6097,27 @@ mod tests {
             .unwrap();
         let job = load_job(&pool, job_id).await.unwrap();
         reconcile_nodes(&state, &job).await.unwrap();
-        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ?")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(items, 2);
-        assert_eq!(job_status(&pool, job_id).await, "implementing");
+        assert_eq!(job_status(&pool, job_id).await, "running");
     }
 
     // ---- the replan node (Chunk 3, task 11) ------------------------------------------------------
 
     /// Seeds a job at the end of a round, with a landed replan node and the answer it wrote.
-    async fn seed_closed_round(
+    pub(super) async fn seed_closed_round(
         pool: &sqlx::SqlitePool,
         worktree: &std::path::Path,
         run_status: &str,
         answer: Option<&str>,
     ) -> i64 {
-        let job_id = seed_job(pool, "project-a", "reviewing").await.unwrap();
+        let job_id = seed_job(pool, "project-a", "running").await.unwrap();
         seed_worktree(pool, job_id, worktree).await;
         seed_items(pool, job_id, &["passed", "passed"]).await;
         sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
@@ -6073,7 +6153,7 @@ mod tests {
     #[tokio::test]
     async fn a_replan_in_flight_does_not_make_this_rounds_review_look_unrun() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed", "passed"]).await;
         sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
             .bind(job_id)
@@ -6085,7 +6165,7 @@ mod tests {
         // The round's review has landed, so the round closes into a replan.
         let before = load_view(&pool, job_id).await.unwrap();
         assert_eq!(before.review, ReviewState::Done);
-        assert_eq!(next_step(&before), Next::SpawnReplan);
+        assert_eq!(both(&before), Next::SpawnReplan);
 
         // ...and now that node exists and is thinking. Nothing about the round changed.
         seed_node(&pool, job_id, "replan", "running").await;
@@ -6097,7 +6177,7 @@ mod tests {
             "the review this round already had was still had"
         );
         assert_eq!(
-            next_step(&during),
+            both(&during),
             Next::Wait,
             "waiting for the replan, not paying for a second review of the same queue"
         );
@@ -6111,7 +6191,7 @@ mod tests {
         items: &[&str],
         review: bool,
     ) -> i64 {
-        let job_id = seed_job(pool, "project-a", "gating").await.unwrap();
+        let job_id = seed_job(pool, "project-a", "running").await.unwrap();
         sqlx::query(
             "UPDATE jobs SET project_root = ?, rule_name = NULL, budget_usd = 25.0, max_rounds = 5,
                              review = ?
@@ -6133,7 +6213,7 @@ mod tests {
     /// retries each one reads `GateFailed` and not `GateRetriable` — an item over, not one to redo.
     async fn spend_the_red_items_gates(pool: &sqlx::SqlitePool, job_id: i64) {
         sqlx::query(
-            "UPDATE job_items SET gate_attempts = 1 WHERE job_id = ? AND status = 'gate_failed'",
+            "UPDATE job_nodes SET gate_attempts = 1 WHERE job_id = ? AND status = 'gate_failed'",
         )
         .bind(job_id)
         .execute(pool)
@@ -6161,7 +6241,7 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
         assert_eq!(view.review, ReviewState::Skipped);
-        assert_eq!(next_step(&view), Next::SpawnReplan);
+        assert_eq!(both(&view), Next::SpawnReplan);
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
@@ -6191,14 +6271,14 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "gating").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_items(&pool, job_id, &["gate_failed"]).await;
         spend_the_red_items_gates(&pool, job_id).await;
 
         let view = load_view(&pool, job_id).await.unwrap();
         assert_eq!(view.review, ReviewState::Skipped);
-        assert_eq!(next_step(&view), Next::Finish(Outcome::GateFailed));
+        assert_eq!(both(&view), Next::Finish(Outcome::GateFailed));
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
@@ -6224,7 +6304,7 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
         assert_eq!(view.review, ReviewState::Pending);
-        assert_eq!(next_step(&view), Next::SpawnReview);
+        assert_eq!(both(&view), Next::SpawnReview);
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
@@ -6244,7 +6324,7 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
         assert_eq!(view.review, ReviewState::NotWanted);
-        assert_eq!(next_step(&view), Next::SpawnReplan);
+        assert_eq!(both(&view), Next::SpawnReplan);
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
@@ -6259,7 +6339,7 @@ mod tests {
     fn a_skipped_review_decides_only_once_the_round_has_nothing_left_to_run() {
         use ItemState::*;
         assert_eq!(
-            next_step(&view(true, &[GateFailed], ReviewState::Skipped)),
+            both(&view(true, &[GateFailed], ReviewState::Skipped)),
             Next::Finish(Outcome::GateFailed)
         );
         assert!(the_skip_decided(&view(
@@ -6314,7 +6394,7 @@ mod tests {
 
         let view = load_view(&pool, job_id).await.unwrap();
         assert_eq!(view.review, ReviewState::Retry);
-        assert_eq!(next_step(&view), Next::SpawnReview);
+        assert_eq!(both(&view), Next::SpawnReview);
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
@@ -6332,7 +6412,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_review_that_fails_the_same_way_closes_the_round() {
         let pool = test_pool().await;
-        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["passed", "passed"]).await;
         for _ in 0..2 {
             seed_review(
@@ -6350,7 +6430,7 @@ mod tests {
             ReviewState::Done,
             "the round already had its one retry"
         );
-        assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+        assert_eq!(both(&view), Next::Finish(Outcome::Completed));
     }
 
     /// Every other way a review can end is a review that happened, as it always was: a failure the
@@ -6369,7 +6449,7 @@ mod tests {
             ("cancelled", transient),
         ] {
             let pool = test_pool().await;
-            let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+            let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
             seed_items(&pool, job_id, &["passed"]).await;
             seed_review(&pool, job_id, status, stdout).await;
 
@@ -6379,7 +6459,7 @@ mod tests {
                 ReviewState::Done,
                 "a review that ended {status}: {stdout}"
             );
-            assert_eq!(next_step(&view), Next::Finish(Outcome::Completed));
+            assert_eq!(both(&view), Next::Finish(Outcome::Completed));
         }
     }
 
@@ -6403,7 +6483,7 @@ mod tests {
 
         assert_eq!(round_counters(&pool, job_id).await.2, 1, "replan_done");
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::Finish(Outcome::Completed)
         );
         assert!(
@@ -6413,7 +6493,7 @@ mod tests {
         );
     }
 
-    /// Ordinals CONTINUE across rounds. They are half `job_items`'s primary key, and the position in
+    /// Ordinals CONTINUE across rounds. They are half `job_nodes`'s primary key, and the position in
     /// the loaded queue is the number `advance` binds into its lookups — restarting them per round
     /// would collide on the first insert and mislead on every one after.
     #[tokio::test]
@@ -6438,10 +6518,10 @@ mod tests {
             (1, 0, 0),
             "a round that added work is not dry"
         );
-        assert_eq!(job_status(&pool, job_id).await, "implementing");
+        assert_eq!(job_status(&pool, job_id).await, "running");
 
         let placed: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT ordinal, round FROM job_items WHERE job_id = ? ORDER BY ordinal",
+            "SELECT ordinal, round FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
         )
         .bind(job_id)
         .fetch_all(&pool)
@@ -6449,7 +6529,7 @@ mod tests {
         .unwrap();
         assert_eq!(placed, vec![(0, 0), (1, 0), (2, 1)]);
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::SpawnImplement(vec![2])
         );
     }
@@ -6480,11 +6560,13 @@ mod tests {
 
         let job = load_job(&pool, job_id).await.unwrap();
         assert!(reconcile_nodes(&state, &job).await.is_err());
-        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ?")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             items, 2,
             "the new round's items outlived the round that failed to open"
@@ -6497,7 +6579,7 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         reconcile_nodes(&state, &job).await.unwrap();
         let placed: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT ordinal, round FROM job_items WHERE job_id = ? ORDER BY ordinal",
+            "SELECT ordinal, round FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
         )
         .bind(job_id)
         .fetch_all(&pool)
@@ -6544,7 +6626,7 @@ mod tests {
         );
         // One short of the brake, so the job asks again rather than ending.
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::SpawnReplan
         );
     }
@@ -6607,18 +6689,18 @@ mod tests {
 
         // The replan confirmed the task is met: completed, which the failure used to forbid.
         assert_eq!(
-            next_step(&closing(&taken_over, Replan::Done, 3)),
+            both(&closing(&taken_over, Replan::Done, 3)),
             Next::Finish(Outcome::Completed)
         );
         // Out of rounds with nobody confirming: stopped, the honest reading of green work that was
         // never declared finished - and no longer `failed`, which is what job 26 was told.
         assert_eq!(
-            next_step(&closing(&taken_over, Replan::NotYet, 2)),
+            both(&closing(&taken_over, Replan::NotYet, 2)),
             Next::Finish(Outcome::Stopped)
         );
         // A failure nothing took over still decides, exactly as before.
         assert_eq!(
-            next_step(&closing(&not_taken_over, Replan::NotYet, 2)),
+            both(&closing(&not_taken_over, Replan::NotYet, 2)),
             Next::Finish(Outcome::Failed)
         );
     }
@@ -6630,7 +6712,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "reviewing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_items(&pool, job_id, &["failed", "passed", "gate_failed"]).await;
         sqlx::query("UPDATE jobs SET max_rounds = 5 WHERE id = ?")
@@ -6649,7 +6731,7 @@ mod tests {
         reconcile_nodes(&state, &job).await.unwrap();
 
         let statuses: Vec<String> =
-            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+            sqlx::query_scalar("SELECT status FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal")
                 .bind(job_id)
                 .fetch_all(&pool)
                 .await
@@ -6740,7 +6822,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_node(&pool, job_id, "plan", "completed").await;
         let seven: Vec<String> = (0..7)
@@ -6778,7 +6860,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_worktree(&pool, job_id, worktree.path()).await;
         seed_node(&pool, job_id, "plan", "completed").await;
         write_plan(
@@ -6791,12 +6873,13 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         reconcile_nodes(&state, &job).await.unwrap();
 
-        let stored: Vec<Option<String>> =
-            sqlx::query_scalar("SELECT files FROM job_items WHERE job_id = ? ORDER BY ordinal")
-                .bind(job_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let stored: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT files FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
+        )
+        .bind(job_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
 
         let hinted: Vec<String> =
             serde_json::from_str(stored[0].as_deref().expect("a hinted item keeps its hint"))
@@ -6842,7 +6925,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         set_budget(&pool, None, None).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_job_run(&pool, job_id, 4.5).await;
 
         // The house limit is off, so anything that fires here is the job's own.
@@ -6874,7 +6957,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         set_budget(&pool, None, None).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_job_run(&pool, job_id, 500.0).await;
 
         let job = load_job(&pool, job_id).await.unwrap();
@@ -6894,7 +6977,7 @@ mod tests {
             let pool = test_pool().await;
             let state = test_state(pool.clone()).await;
             set_budget(&pool, Some(5.0), None).await;
-            let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+            let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
             seed_job_run(&pool, job_id, 50.0).await;
             sqlx::query("UPDATE jobs SET rule_name = ?, budget_usd = ? WHERE id = ?")
                 .bind(rule)
@@ -6969,8 +7052,8 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         set_budget(&pool, None, None).await;
-        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let low = seed_job(&pool, "project-a", "running").await.unwrap();
+        let high = seed_job(&pool, "project-a", "running").await.unwrap();
 
         // 1. Somebody draws the edge. Nothing about scheduling changes yet.
         let proposal = crate::governance::exclusion::propose(&pool, high, low, &[])
@@ -7039,8 +7122,8 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         set_budget(&pool, None, None).await;
-        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let low = seed_job(&pool, "project-a", "running").await.unwrap();
+        let high = seed_job(&pool, "project-a", "running").await.unwrap();
         exclude(&pool, "project-a", low, high).await;
         crate::execution::concurrency::claim(
             &pool,
@@ -7082,8 +7165,8 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         set_budget(&pool, None, None).await;
-        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let low = seed_job(&pool, "project-a", "running").await.unwrap();
+        let high = seed_job(&pool, "project-a", "running").await.unwrap();
         exclude(&pool, "project-a", low, high).await;
         for job in [low, high] {
             crate::execution::concurrency::claim(
@@ -7142,8 +7225,8 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         set_budget(&pool, None, None).await;
-        let low = seed_job(&pool, "project-a", "implementing").await.unwrap();
-        let high = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let low = seed_job(&pool, "project-a", "running").await.unwrap();
+        let high = seed_job(&pool, "project-a", "running").await.unwrap();
         exclude(&pool, "project-a", low, high).await;
         crate::execution::concurrency::claim(
             &pool,
@@ -7195,12 +7278,12 @@ mod tests {
     async fn an_hourly_brake_parks_a_job_and_a_spent_window_ends_it() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["pending"]).await;
         set_budget(&pool, None, Some(0.0)).await;
 
         let job = load_job(&pool, job_id).await.unwrap();
-        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Stopped);
+        assert_eq!(advance(&state, &job, Utc::now()).await, Pass::Stopped);
         assert_eq!(job_status(&pool, job_id).await, "waiting");
         let reason: Option<String> =
             sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
@@ -7224,11 +7307,11 @@ mod tests {
         let pool = test_pool().await;
         let reset = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         let state = quota_state(pool.clone(), Some(&reset)).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["pending"]).await;
 
         let job = load_job(&pool, job_id).await.unwrap();
-        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Stopped);
+        assert_eq!(advance(&state, &job, Utc::now()).await, Pass::Stopped);
         assert_eq!(job_status(&pool, job_id).await, "waiting");
         let reason: Option<String> =
             sqlx::query_scalar("SELECT wait_reason FROM jobs WHERE id = ?")
@@ -7247,7 +7330,7 @@ mod tests {
         ] {
             let pool = test_pool().await;
             let state = quota_state(pool.clone(), reset.as_deref()).await;
-            let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+            let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
             seed_items(&pool, job_id, &["pending"]).await;
 
             let job = load_job(&pool, job_id).await.unwrap();
@@ -7262,7 +7345,7 @@ mod tests {
         let pool = test_pool().await;
         let reset = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         let state = quota_state(pool.clone(), Some(&reset)).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET budget_usd = 10.0 WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -7290,7 +7373,7 @@ mod tests {
     async fn a_stopped_job_counts_a_retriable_item_among_the_unfinished() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -7301,7 +7384,7 @@ mod tests {
         // that makes the item retriable rather than finished with.
         seed_items(&pool, job_id, &["gate_failed", "pending"]).await;
         sqlx::query(
-            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1
+            "UPDATE job_nodes SET gate_status = 'failed', gate_attempts = 1
              WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
@@ -7333,7 +7416,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         // `project_root` is the tempdir so the gate configuration below is genuinely absent rather
         // than unreadable — this test is about the brake, not about gate configuration.
         sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
@@ -7356,7 +7439,7 @@ mod tests {
         // to measure would leave the tree holding edits nothing verified, which is the state
         // decision 10 exists to avoid.
         let job = load_job(&pool, job_id).await.unwrap();
-        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Continued);
+        assert_eq!(advance(&state, &job, Utc::now()).await, Pass::Continued);
         assert_eq!(item_statuses(&pool, job_id).await[0], "passed");
 
         // The next item, though, does not start.
@@ -7375,7 +7458,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         crate::project::state::write_for_test(
             worktree.path(),
             "project-a",
@@ -7403,7 +7486,7 @@ mod tests {
         .unwrap();
 
         let job = load_job(&pool, job_id).await.unwrap();
-        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Continued);
+        assert_eq!(advance(&state, &job, Utc::now()).await, Pass::Continued);
 
         let job = load_job(&pool, job_id).await.unwrap();
         advance(&state, &job, Utc::now()).await;
@@ -7434,7 +7517,7 @@ mod tests {
     async fn the_life_ceiling_retires_a_job_that_is_still_parked() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["pending"]).await;
         wait(&pool, job_id, "slot").await.unwrap();
         let started = Utc::now() - MAX_JOB_LIFETIME - chrono::Duration::minutes(1);
@@ -7460,10 +7543,10 @@ mod tests {
     async fn the_life_ceiling_stops_the_node_in_flight() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["running"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "running").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ?")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -7520,7 +7603,7 @@ mod tests {
         async fn tick_at(age: chrono::Duration) -> (sqlx::SqlitePool, i64) {
             let pool = test_pool().await;
             let state = test_state(pool.clone()).await;
-            let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+            let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
             seed_items(&pool, job_id, &["pending"]).await;
             seed_job_run(&pool, job_id, 50.0).await;
             sqlx::query(
@@ -7570,7 +7653,7 @@ mod tests {
     async fn the_kill_switch_stops_the_chain_without_destroying_it() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["pending"]).await;
         sqlx::query("UPDATE autopilot_global SET kill_switch = 1")
             .execute(&pool)
@@ -7579,7 +7662,7 @@ mod tests {
 
         job_tick(&state, Utc::now()).await;
 
-        assert_eq!(job_status(&pool, job_id).await, "implementing");
+        assert_eq!(job_status(&pool, job_id).await, "running");
         assert_eq!(item_statuses(&pool, job_id).await, vec!["pending"]);
         assert!(feed_kinds(&pool).await.is_empty());
     }
@@ -7594,7 +7677,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
 
-        let broken = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let broken = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, broken, &["implemented"]).await;
         // A real place to put the red item's work back to: a checkout on record and the job's
         // footing at its HEAD. Without one the red gate ends `revert_failed`/`stopped`, which is a
@@ -7630,11 +7713,11 @@ mod tests {
                 },
             )
             .await,
-            Step::Continued,
+            Pass::Continued,
             "the premise: the red item was taken off the branch"
         );
 
-        let unmeasured = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let unmeasured = seed_job(&pool, "project-b", "running").await.unwrap();
         seed_items(&pool, unmeasured, &["implemented"]).await;
         let row = load_job(&pool, unmeasured).await.unwrap();
         record_gate(
@@ -7659,11 +7742,11 @@ mod tests {
         // verdict with a review in front of it is pinned purely in
         // `one_red_gate_makes_the_whole_job_gate_failed_however_it_ends`.
         assert_eq!(
-            next_step(&load_view(&pool, broken).await.unwrap()),
+            both(&load_view(&pool, broken).await.unwrap()),
             Next::Finish(Outcome::GateFailed)
         );
         assert_eq!(
-            next_step(&load_view(&pool, unmeasured).await.unwrap()),
+            both(&load_view(&pool, unmeasured).await.unwrap()),
             Next::Finish(Outcome::GateErrored)
         );
     }
@@ -7702,6 +7785,7 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: None,
+                graph: None,
             },
         )
         .await
@@ -7735,7 +7819,7 @@ mod tests {
     async fn a_red_gate_with_a_retry_left_keeps_the_tree() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         // Set on the row rather than asked for at creation: `NewJob` carries no retry budget yet,
         // and a job is what the column says it is whatever wrote it.
         sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
@@ -7760,7 +7844,7 @@ mod tests {
         .await;
 
         let (attempts, output): (i64, Option<String>) = sqlx::query_as(
-            "SELECT gate_attempts, gate_output FROM job_items WHERE job_id = ? AND ordinal = 0",
+            "SELECT gate_attempts, gate_output FROM job_nodes WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
         .fetch_one(&pool)
@@ -7777,7 +7861,7 @@ mod tests {
         );
 
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::SpawnImplement(vec![0]),
             "the queue has to come back to the same item, not stop and not step over it"
         );
@@ -7832,15 +7916,9 @@ mod tests {
             .await
             .unwrap();
 
-        let job_id = seed_job_in(
-            &pool,
-            "project-a",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -7865,9 +7943,9 @@ mod tests {
         // The queue a director's plan produces: three items, and item 1 sharing a file with item 0.
         for (ordinal, files) in [(0, r#"["a.rs"]"#), (1, r#"["a.rs"]"#), (2, r#"["b.rs"]"#)] {
             sqlx::query(
-                "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
-                                        agent_id)
-                 VALUES (?, ?, 'an item', 'pending', ?, '[]', 'ana')",
+                "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, files,
+                                        depends_on, agent_id)
+                 VALUES (?, 'implement', ?, 'an item', 'pending', ?, '[]', 'ana')",
             )
             .bind(job_id)
             .bind(ordinal as i64)
@@ -7932,15 +8010,9 @@ mod tests {
         seed_agent(&pool, "bob", "frontend", "bold").await;
         seed_crew(&pool, "other-crew", "bob", &[]).await;
 
-        let job_id = seed_job_in(
-            &pool,
-            "project-a",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -7963,9 +8035,9 @@ mod tests {
         .expect("record the job's worktree");
 
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
-                                    agent_id)
-             VALUES (?, 0, 'zanzibar quokka item', 'pending', '[\"src/a.rs\"]', '[]', 'ana')",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, files,
+                                    depends_on, agent_id)
+             VALUES (?, 'implement', 0, 'zanzibar quokka item', 'pending', '[\"src/a.rs\"]', '[]', 'ana')",
         )
         .bind(job_id)
         .execute(&pool)
@@ -8007,7 +8079,7 @@ mod tests {
         advance(&state, &job, Utc::now()).await;
 
         let run_id: Option<i64> =
-            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+            sqlx::query_scalar("SELECT run_id FROM job_nodes WHERE job_id = ? AND ordinal = 0")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
@@ -8055,15 +8127,9 @@ mod tests {
 
     /// A team job in `repo` with its worktree recorded: the setup the loadout tests below share.
     async fn loadout_team_job(pool: &sqlx::SqlitePool, repo: &std::path::Path) -> i64 {
-        let job_id = seed_job_in(
-            pool,
-            "project-a",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         sqlx::query("UPDATE jobs SET team_id = 'crew' WHERE id = ?")
             .bind(job_id)
             .execute(pool)
@@ -8096,9 +8162,9 @@ mod tests {
         files: &str,
     ) {
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
-                                    agent_id)
-             VALUES (?, ?, 'a loadout item', 'pending', ?, '[]', ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, files,
+                                    depends_on, agent_id)
+             VALUES (?, 'implement', ?, 'a loadout item', 'pending', ?, '[]', ?)",
         )
         .bind(job_id)
         .bind(ordinal)
@@ -8112,7 +8178,7 @@ mod tests {
     /// The run the item at `ordinal` started, once the pass that claims it has been made.
     async fn loadout_item_run(pool: &sqlx::SqlitePool, job_id: i64, ordinal: i64) -> i64 {
         let run_id: Option<i64> =
-            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = ?")
+            sqlx::query_scalar("SELECT run_id FROM job_nodes WHERE job_id = ? AND ordinal = ?")
                 .bind(job_id)
                 .bind(ordinal)
                 .fetch_one(pool)
@@ -8322,15 +8388,9 @@ mod tests {
         let (state, _runner) = test_state_with_runner(pool.clone()).await;
         let state = with_home(state, &_container);
 
-        let job_id = seed_job_in(
-            &pool,
-            "project-a",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         let owner = crate::execution::worktree::Owner::Job(job_id);
         let info = crate::execution::worktree::create(&repo, owner)
             .await
@@ -8356,7 +8416,7 @@ mod tests {
         // makes it retriable. Seeded rather than gated so that what fails here can only be the claim.
         seed_items(&pool, job_id, &["gate_failed"]).await;
         sqlx::query(
-            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1, gate_output = ?
+            "UPDATE job_nodes SET gate_status = 'failed', gate_attempts = 1, gate_output = ?
              WHERE job_id = ? AND ordinal = 0",
         )
         .bind("FAILED tests/test_cursor.py::test_guard")
@@ -8374,7 +8434,7 @@ mod tests {
             "the retry was asked for and never claimed, so the job stopped on an unreverted tree"
         );
         let run_id: Option<i64> =
-            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+            sqlx::query_scalar("SELECT run_id FROM job_nodes WHERE job_id = ? AND ordinal = 0")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
@@ -8402,15 +8462,9 @@ mod tests {
         let pool = test_pool().await;
         let (state, _runner) = test_state_with_runner(pool.clone()).await;
 
-        let job_id = seed_job_in(
-            &pool,
-            "project-a",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         let owner = crate::execution::worktree::Owner::Job(job_id);
         let info = crate::execution::worktree::create(&repo, owner)
             .await
@@ -8433,7 +8487,7 @@ mod tests {
             .unwrap();
         seed_items(&pool, job_id, &["gate_failed"]).await;
         sqlx::query(
-            "UPDATE job_items SET gate_status = 'failed', gate_attempts = 1
+            "UPDATE job_nodes SET gate_status = 'failed', gate_attempts = 1
              WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
@@ -8445,7 +8499,7 @@ mod tests {
         advance(&state, &job, Utc::now()).await;
 
         let (status, gate_status, run_id): (String, Option<String>, Option<i64>) = sqlx::query_as(
-            "SELECT status, gate_status, run_id FROM job_items
+            "SELECT status, gate_status, run_id FROM job_nodes
                  WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
@@ -8483,7 +8537,7 @@ mod tests {
         assert_eq!(item_statuses(&pool, job_id).await, vec!["failed"]);
 
         let (status, gate_status, gate_attempts): (String, Option<String>, i64) = sqlx::query_as(
-            "SELECT status, gate_status, gate_attempts FROM job_items
+            "SELECT status, gate_status, gate_attempts FROM job_nodes
                  WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
@@ -8526,10 +8580,10 @@ mod tests {
     #[tokio::test]
     async fn a_released_retry_claim_keeps_its_red_gate() {
         let pool = test_pool().await;
-        let retry_job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let retry_job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, retry_job_id, &["running"]).await;
         sqlx::query(
-            "UPDATE job_items SET gate_status = NULL, gate_attempts = 1
+            "UPDATE job_nodes SET gate_status = NULL, gate_attempts = 1
              WHERE job_id = ? AND ordinal = 0",
         )
         .bind(retry_job_id)
@@ -8549,7 +8603,7 @@ mod tests {
         .await;
 
         let retry: (String, Option<String>) = sqlx::query_as(
-            "SELECT status, gate_status FROM job_items WHERE job_id = ? AND ordinal = 0",
+            "SELECT status, gate_status FROM job_nodes WHERE job_id = ? AND ordinal = 0",
         )
         .bind(retry_job_id)
         .fetch_one(&pool)
@@ -8557,7 +8611,7 @@ mod tests {
         .unwrap();
         assert_eq!(retry, ("gate_failed".into(), Some("failed".into())));
 
-        let pending_job_id = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let pending_job_id = seed_job(&pool, "project-b", "running").await.unwrap();
         seed_items(&pool, pending_job_id, &["running"]).await;
         let pending_job = load_job(&pool, pending_job_id).await.unwrap();
 
@@ -8572,7 +8626,7 @@ mod tests {
         .await;
 
         let pending: (String, Option<String>) = sqlx::query_as(
-            "SELECT status, gate_status FROM job_items WHERE job_id = ? AND ordinal = 0",
+            "SELECT status, gate_status FROM job_nodes WHERE job_id = ? AND ordinal = 0",
         )
         .bind(pending_job_id)
         .fetch_one(&pool)
@@ -8587,10 +8641,10 @@ mod tests {
     /// rejected and taken off the branch", and here it was rejected and is still ON it. The job
     /// stops, because every later item would build on work a gate has just called broken. The red
     /// gate is counted anyway, and the feed line says in words that the branch was not restored.
-    async fn assert_reverts_nothing_and_stops(pool: &sqlx::SqlitePool, job_id: i64, step: Step) {
+    async fn assert_reverts_nothing_and_stops(pool: &sqlx::SqlitePool, job_id: i64, step: Pass) {
         assert_eq!(
             step,
-            Step::Stopped,
+            Pass::Stopped,
             "a tree that could not be put back still ends the pass"
         );
         assert_eq!(
@@ -8600,7 +8654,7 @@ mod tests {
         );
         assert_eq!(job_status(pool, job_id).await, "stopped");
         let attempts: i64 = sqlx::query_scalar(
-            "SELECT gate_attempts FROM job_items WHERE job_id = ? AND ordinal = 0",
+            "SELECT gate_attempts FROM job_nodes WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
         .fetch_one(pool)
@@ -8631,7 +8685,7 @@ mod tests {
     /// `gate_retries = 0` is every job written before migration 0068, so this is the regression the
     /// retry is most likely to break: with no budget the first red gate is final.
     async fn a_job_with_one_item_about_to_go_red(pool: &sqlx::SqlitePool) -> i64 {
-        let job_id = seed_job(pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(pool, "project-a", "running").await.unwrap();
         // Said out loud rather than left to the column default, because it is the premise: this is
         // a job with nothing to spend.
         sqlx::query("UPDATE jobs SET gate_retries = 0 WHERE id = ?")
@@ -8723,7 +8777,7 @@ mod tests {
     async fn the_last_red_gate_of_an_item_credits_its_briefing_and_a_retriable_one_does_not() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET gate_retries = 1 WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -8731,7 +8785,7 @@ mod tests {
             .unwrap();
         seed_items(&pool, job_id, &["implemented"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "completed").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ? AND ordinal = 0")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -8777,10 +8831,10 @@ mod tests {
     async fn a_green_gate_credits_the_items_briefing_green() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["implemented"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "completed").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ? AND ordinal = 0")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -8809,12 +8863,12 @@ mod tests {
     #[tokio::test]
     async fn a_job_that_does_not_complete_is_queued_for_distillation_once() {
         let pool = test_pool().await;
-        let failed = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let failed = seed_job(&pool, "project-a", "running").await.unwrap();
 
         assert!(retire(&pool, failed, "failed").await.unwrap());
         assert!(!retire(&pool, failed, "failed").await.unwrap());
 
-        let completed = seed_job(&pool, "project-b", "implementing").await.unwrap();
+        let completed = seed_job(&pool, "project-b", "running").await.unwrap();
         assert!(retire(&pool, completed, "completed").await.unwrap());
 
         assert_eq!(
@@ -8834,10 +8888,10 @@ mod tests {
     async fn a_gate_that_passes_after_a_red_queues_a_recovery() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         seed_items(&pool, job_id, &["implemented"]).await;
         sqlx::query(
-            "UPDATE job_items SET gate_attempts = 1, gate_status = 'failed'
+            "UPDATE job_nodes SET gate_attempts = 1, gate_status = 'failed'
              WHERE job_id = ? AND ordinal = 0",
         )
         .bind(job_id)
@@ -8845,7 +8899,7 @@ mod tests {
         .await
         .unwrap();
         let item_id: i64 =
-            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = 0")
+            sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = 0")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
@@ -8871,7 +8925,7 @@ mod tests {
     async fn an_item_out_of_gate_retries_queues_its_exhaustion() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET gate_retries = 0 WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -8879,7 +8933,7 @@ mod tests {
             .unwrap();
         seed_items(&pool, job_id, &["implemented"]).await;
         let item_id: i64 =
-            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = 0")
+            sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = 0")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
@@ -8922,7 +8976,7 @@ mod tests {
         // `Continued`, not the `Stopped` this asserted when its fixture had no revert point: the
         // item was reverted and the job carries on to its ending, rather than stopping on a branch
         // it could not put back.
-        assert_eq!(step, Step::Continued);
+        assert_eq!(step, Pass::Continued);
         assert_eq!(item_statuses(&pool, job_id).await, vec!["gate_failed"]);
         assert_eq!(
             distill_rows(&pool).await,
@@ -8943,7 +8997,7 @@ mod tests {
         let state = test_state(pool.clone()).await;
         let job_id = a_job_with_one_item_about_to_go_red(&pool).await;
         let item_id: i64 =
-            sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = 0")
+            sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = 0")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
@@ -8973,7 +9027,7 @@ mod tests {
     async fn an_item_passed_without_a_gate_is_credited_by_its_run() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET gate_each = 0 WHERE id = ?")
             .bind(job_id)
             .execute(&pool)
@@ -8981,7 +9035,7 @@ mod tests {
             .unwrap();
         seed_items(&pool, job_id, &["implemented", "implemented"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "completed").await;
-        sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ? AND ordinal = 0")
             .bind(run_id)
             .bind(job_id)
             .execute(&pool)
@@ -9003,7 +9057,7 @@ mod tests {
         seed_items(&pool, job_id, &["gate_failed"]).await;
         let run_id = seed_node(&pool, job_id, "implement", "completed").await;
         sqlx::query(
-            "UPDATE job_items
+            "UPDATE job_nodes
                 SET run_id = ?, gate_status = 'failed', gate_attempts = 1
               WHERE job_id = ? AND ordinal = 0",
         )
@@ -9026,7 +9080,7 @@ mod tests {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         crate::project::state::write_for_test(
             worktree.path(),
             "project-a",
@@ -9052,7 +9106,7 @@ mod tests {
         // the final gate that is still to come.
         assert_eq!(item_statuses(&pool, job_id).await[0], "passed");
         let verdicts: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT gate_status FROM job_items WHERE job_id = ? ORDER BY ordinal",
+            "SELECT gate_status FROM job_nodes WHERE job_id = ? AND ordinal IS NOT NULL ORDER BY ordinal",
         )
         .bind(job_id)
         .fetch_all(&pool)
@@ -9218,7 +9272,7 @@ tests:
 
         // No git repository at that path at all, so HEAD cannot be read: not the same as knowing it
         // stayed put, and the safe direction is to stop. What the job finished is on its branch.
-        let unreadable = seed_job_in(&pool, "project-a", "implementing", &root, Some("abc123"))
+        let unreadable = seed_job_in(&pool, "project-a", "running", &root, Some("abc123"))
             .await
             .unwrap();
         assert_eq!(reconcile_orphaned_jobs(&pool).await.unwrap(), 1);
@@ -9230,7 +9284,7 @@ tests:
         );
 
         // A job that never recorded a HEAD cannot prove anything either.
-        let unrecorded = seed_job_in(&pool, "project-b", "implementing", &root, None)
+        let unrecorded = seed_job_in(&pool, "project-b", "running", &root, None)
             .await
             .unwrap();
         reconcile_orphaned_jobs(&pool).await.unwrap();
@@ -9244,6 +9298,562 @@ tests:
 
         assert_eq!(reconcile_orphaned_jobs(&pool).await.unwrap(), 0);
         assert_eq!(job_status(&pool, done).await, "completed");
+    }
+
+    // ---- a phase is not a status; the job is a graph walk (M2 data model) ----------------------
+
+    /// Fan items of one node, for the tests below that care about the queue and not the plan row.
+    async fn seed_fan_items(pool: &sqlx::SqlitePool, job_id: i64, node_id: &str, count: i64) {
+        for ordinal in 0..count {
+            insert_fan_item(
+                pool,
+                &NewFanItem {
+                    job_id,
+                    node_id,
+                    ordinal,
+                    round: 0,
+                    description: "an item",
+                    files: None,
+                    depends_on: None,
+                    agent_id: None,
+                },
+            )
+            .await
+            .expect("insert a fan item");
+        }
+    }
+
+    const PHASE_WORDS: [&str; 4] = ["planning", "implementing", "gating", "reviewing"];
+
+    #[test]
+    fn a_phase_is_never_a_job_status() {
+        assert_eq!(
+            LIVE_STATUSES,
+            ["running", "awaiting_approval", "waiting"],
+            "three live statuses: what the job is doing is the current node, not a status"
+        );
+        let sql_lists = [
+            ("live_statuses_sql!", live_statuses_sql!()),
+            ("LIVE_JOBS_SQL", LIVE_JOBS_SQL),
+            ("LIVE_WHERE_SQL", LIVE_WHERE_SQL),
+            (
+                "analytics_pipeline::jobs::LIVE_ITEMS_SQL",
+                crate::analytics_pipeline::jobs::LIVE_ITEMS_SQL,
+            ),
+        ];
+        for (name, sql) in sql_lists {
+            for word in PHASE_WORDS {
+                assert!(
+                    !sql.contains(word),
+                    "{name} names the phase word `{word}`: {sql}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_starts_running_and_records_its_plan_atomically() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_node(&pool, job_id, "plan", "completed").await;
+        write_plan(
+            worktree.path(),
+            r#"{"items": [{"description": "first"}, {"description": "boom"}]}"#,
+        )
+        .await;
+        assert_eq!(job_status(&pool, job_id).await, "running");
+        assert!(!plan_is_recorded(&pool, job_id).await.unwrap());
+
+        // A write that dies part-way leaves neither a queue nor a plan row.
+        sqlx::query(
+            "CREATE TRIGGER die_mid_plan BEFORE INSERT ON job_nodes
+             WHEN NEW.description = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'simulated crash'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        let _ = reconcile_nodes(&state, &job).await;
+        assert!(
+            nodes_of(&pool, job_id).await.unwrap().is_empty(),
+            "nothing partial: the queue and the plan row are one transaction"
+        );
+        assert!(!plan_is_recorded(&pool, job_id).await.unwrap());
+
+        sqlx::query("DROP TRIGGER die_mid_plan")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(job_status(&pool, job_id).await, "running");
+        let rows = nodes_of(&pool, job_id).await.unwrap();
+        let fan: Vec<_> = rows.iter().filter(|r| r.ordinal.is_some()).collect();
+        assert_eq!(fan.len(), 2);
+        assert!(fan.iter().all(|r| r.node_id == "implement"));
+        assert_eq!(
+            singleton_status(&pool, job_id, "plan", 0).await.unwrap(),
+            Some("passed".to_owned())
+        );
+        assert!(plan_is_recorded(&pool, job_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_landing_during_plan_ingest_leaves_the_queue_and_no_active_job() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_node(&pool, job_id, "plan", "completed").await;
+        write_plan(worktree.path(), r#"{"items": [{"description": "first"}]}"#).await;
+
+        // The pass read the job live; the cancel lands before it writes.
+        let job = load_job(&pool, job_id).await.unwrap();
+        retire(&pool, job_id, STATUS_CANCELLED).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(job_status(&pool, job_id).await, STATUS_CANCELLED);
+        assert_eq!(item_statuses(&pool, job_id).await, vec!["pending"]);
+        assert!(
+            !feed_kinds(&pool).await.contains(&"job_planned".to_owned()),
+            "a cancelled job is not announced as about to do its queue"
+        );
+        assert!(!job_is_live(&pool, job_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_round_trip_through_running() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+
+        pause(&pool, job_id, "waiting", "budget").await.unwrap();
+        assert_eq!(job_status(&pool, job_id).await, "waiting");
+        let resume_status: Option<String> =
+            sqlx::query_scalar("SELECT resume_status FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(resume_status.as_deref(), Some("running"));
+
+        resume(&pool, job_id).await.unwrap();
+        let (status, resume_status, reason): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, resume_status, wait_reason FROM jobs WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(resume_status, None);
+        assert_eq!(reason, None);
+    }
+
+    /// The replacement for the `effective_status` trick: planned-ness is read off the plan row, so
+    /// a park before the plan existed cannot come back as planned-with-an-empty-queue.
+    #[tokio::test]
+    async fn a_job_parked_while_planning_does_not_come_back_planned() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+
+        pause(&pool, job_id, "waiting", "budget").await.unwrap();
+        resume(&pool, job_id).await.unwrap();
+
+        assert!(!load_view(&pool, job_id).await.unwrap().planned);
+    }
+
+    #[tokio::test]
+    async fn a_job_parked_after_planning_with_no_items_stays_planned() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_plan_row(&pool, job_id).await;
+
+        pause(&pool, job_id, "waiting", "budget").await.unwrap();
+        resume(&pool, job_id).await.unwrap();
+
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert!(view.planned);
+        assert!(view.items.is_empty());
+    }
+
+    /// A singleton node that is `running` is stopped by a cancel too: the item-only filter that the
+    /// queue reads use is deliberately absent from the cancel path.
+    #[tokio::test]
+    async fn cancel_stops_a_running_singleton_node_too() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        insert_singleton_node(&pool, job_id, "review", 0, "running")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            cancel(&state, job_id).await.unwrap(),
+            CancelOutcome::Cancelled
+        ));
+
+        assert_eq!(
+            singleton_status(&pool, job_id, "review", 0).await.unwrap(),
+            Some("cancelled".to_owned())
+        );
+    }
+
+    // ---- resume guard and snapshot --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn reconcile_orphaned_jobs_ignores_stage_and_snapshot() {
+        let pool = test_pool().await;
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@x"],
+            vec!["config", "user.name", "test"],
+        ] {
+            assert!(git_ok(root, &args));
+        }
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", "one"]] {
+            assert!(git_ok(root, &args));
+        }
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let root_str = root.to_string_lossy().into_owned();
+
+        let snapshot = snapshot_of(
+            &crate::workflows::graph::Graph::default(),
+            Some("autopilot/1.0.0"),
+            Some("sha256:aa"),
+        )
+        .unwrap();
+        let with = seed_job_in(&pool, "project-a", "running", &root_str, Some(&head))
+            .await
+            .unwrap();
+        let without = seed_job_in(&pool, "project-b", "running", &root_str, Some(&head))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE jobs SET graph_snapshot = ?, graph_bundle_ref = ?, graph_bundle_hash = ?
+             WHERE id = ?",
+        )
+        .bind(&snapshot.graph_json)
+        .bind(&snapshot.bundle_ref)
+        .bind(&snapshot.bundle_hash)
+        .bind(with)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(reconcile_orphaned_jobs(&pool).await.unwrap(), 0);
+        assert!(job_is_live(&pool, with).await.unwrap());
+        assert!(job_is_live(&pool, without).await.unwrap());
+
+        std::fs::write(root.join("a.txt"), "b\n").unwrap();
+        assert!(git_ok(root, &["commit", "-q", "-am", "two"]));
+
+        assert_eq!(reconcile_orphaned_jobs(&pool).await.unwrap(), 2);
+        assert_eq!(job_status(&pool, with).await, STATUS_INTERRUPTED);
+        assert_eq!(job_status(&pool, without).await, STATUS_INTERRUPTED);
+    }
+
+    #[tokio::test]
+    async fn a_job_with_a_null_snapshot_still_loads() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+
+        assert_eq!(load_graph_snapshot(&pool, job_id).await.unwrap(), None);
+        let view = load_view(&pool, job_id).await.unwrap();
+        assert!(!view.planned);
+        load_job(&pool, job_id).await.unwrap();
+    }
+
+    async fn insert_job_with_snapshot(
+        pool: &sqlx::SqlitePool,
+        project_id: &str,
+        snapshot: Option<GraphSnapshot>,
+    ) -> i64 {
+        insert_job(
+            pool,
+            &NewJob {
+                project_id,
+                project_root: "/project/a",
+                rule_name: None,
+                prompt: "p",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+                graph: snapshot,
+            },
+        )
+        .await
+        .expect("insert a job")
+    }
+
+    #[tokio::test]
+    async fn a_graph_snapshot_round_trips_and_is_written_once() {
+        let pool = test_pool().await;
+        let graph = crate::workflows::graph::Graph::default();
+        let snapshot = snapshot_of(&graph, Some("autopilot/1.0.0"), Some("sha256:aa")).unwrap();
+        let job_id = insert_job_with_snapshot(&pool, "project-a", Some(snapshot.clone())).await;
+
+        let loaded = load_graph_snapshot(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the snapshot was written with the job");
+        assert_eq!(loaded, snapshot);
+        assert_eq!(graph_from_snapshot(&loaded).unwrap(), graph);
+        assert_eq!(loaded.bundle_ref.as_deref(), Some("autopilot/1.0.0"));
+        assert_eq!(loaded.bundle_hash.as_deref(), Some("sha256:aa"));
+    }
+
+    /// M2's half of "a bundle edited mid-job does not change the job". No bundle fixture exists
+    /// at this layer, so the installed bundle changing is stood in for by asking about a different
+    /// installed hash: the stored snapshot is the only thing that could answer, and it does not move.
+    #[tokio::test]
+    async fn the_snapshot_is_never_reread_from_the_bundle() {
+        let pool = test_pool().await;
+        let graph = crate::workflows::graph::Graph::default();
+        let snapshot = snapshot_of(&graph, Some("autopilot/1.0.0"), Some("sha256:aa")).unwrap();
+        let pinned = insert_job_with_snapshot(&pool, "project-a", Some(snapshot.clone())).await;
+        let legacy = insert_job_with_snapshot(&pool, "project-a", None).await;
+
+        assert_eq!(
+            jobs_on_a_different_bundle(&pool, "project-a", "sha256:bb")
+                .await
+                .unwrap(),
+            vec![pinned],
+            "a job with a NULL hash is not compared"
+        );
+        assert!(
+            jobs_on_a_different_bundle(&pool, "project-a", "sha256:aa")
+                .await
+                .unwrap()
+                .is_empty(),
+            "an equal hash is not drift"
+        );
+        assert!(
+            jobs_on_a_different_bundle(&pool, "project-b", "sha256:bb")
+                .await
+                .unwrap()
+                .is_empty(),
+            "another project's jobs are not this project's"
+        );
+        assert_eq!(
+            load_graph_snapshot(&pool, pinned).await.unwrap(),
+            Some(snapshot),
+            "asking about drift never rewrites the snapshot"
+        );
+        assert_eq!(load_graph_snapshot(&pool, legacy).await.unwrap(), None);
+    }
+
+    // ---- job_nodes store fns --------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn insert_singleton_node_is_idempotent_per_round() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+
+        let first = insert_singleton_node(&pool, job_id, "plan", 0, "running")
+            .await
+            .unwrap();
+        let again = insert_singleton_node(&pool, job_id, "plan", 0, "passed")
+            .await
+            .unwrap();
+
+        assert_eq!(first, again, "a second call returns the existing row");
+        assert_eq!(
+            singleton_status(&pool, job_id, "plan", 0).await.unwrap(),
+            Some("running".to_owned()),
+            "and does not rewrite it"
+        );
+        assert_eq!(
+            singleton_status(&pool, job_id, "plan", 1).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_revisited_in_a_new_round_gets_a_new_row() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+
+        let r0 = insert_singleton_node(&pool, job_id, "plan", 0, "passed")
+            .await
+            .unwrap();
+        let r1 = insert_singleton_node(&pool, job_id, "plan", 1, "running")
+            .await
+            .unwrap();
+
+        assert_ne!(r0, r1);
+        assert_eq!(nodes_of(&pool, job_id).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_singleton_status_is_a_compare_and_set() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        insert_singleton_node(&pool, job_id, "review", 0, "pending")
+            .await
+            .unwrap();
+
+        assert!(
+            !set_singleton_status(&pool, job_id, "review", 0, &["running"], "passed")
+                .await
+                .unwrap(),
+            "the row is not in the `from` set"
+        );
+        assert!(
+            set_singleton_status(&pool, job_id, "review", 0, &["pending"], "running")
+                .await
+                .unwrap()
+        );
+        assert!(
+            set_singleton_status(&pool, job_id, "review", 0, &[], "passed")
+                .await
+                .unwrap(),
+            "an empty `from` means any status"
+        );
+        assert_eq!(
+            singleton_status(&pool, job_id, "review", 0).await.unwrap(),
+            Some("passed".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn next_ordinal_counts_one_fan_not_the_job() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+
+        assert_eq!(next_ordinal(&pool, job_id, "implement").await.unwrap(), 0);
+        seed_fan_items(&pool, job_id, "implement", 3).await;
+        seed_fan_items(&pool, job_id, "review", 1).await;
+
+        assert_eq!(next_ordinal(&pool, job_id, "implement").await.unwrap(), 3);
+        assert_eq!(next_ordinal(&pool, job_id, "review").await.unwrap(), 1);
+        assert_eq!(next_ordinal(&pool, job_id, "other").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn plan_is_recorded_reads_the_plan_row_or_a_queue() {
+        let pool = test_pool().await;
+        let bare = seed_job(&pool, "project-a", "running").await.unwrap();
+        let planned = seed_job(&pool, "project-b", "running").await.unwrap();
+        let queued = seed_job(&pool, "project-c", "running").await.unwrap();
+        let running_plan = seed_job(&pool, "project-d", "running").await.unwrap();
+        insert_singleton_node(&pool, planned, "plan", 0, "passed")
+            .await
+            .unwrap();
+        seed_fan_items(&pool, queued, "implement", 1).await;
+        insert_singleton_node(&pool, running_plan, "plan", 0, "running")
+            .await
+            .unwrap();
+
+        assert!(!plan_is_recorded(&pool, bare).await.unwrap());
+        assert!(plan_is_recorded(&pool, planned).await.unwrap());
+        assert!(plan_is_recorded(&pool, queued).await.unwrap());
+        assert!(
+            !plan_is_recorded(&pool, running_plan).await.unwrap(),
+            "a plan node still running has not finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_node_names_the_running_stage_and_item() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_fan_items(&pool, job_id, "implement", 3).await;
+        let item_two: i64 =
+            sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = 1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let run_id = seed_node(&pool, job_id, "implement", "running").await;
+        sqlx::query("UPDATE runs SET item_id = ? WHERE id = ?")
+            .bind(item_two)
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            current_node(&pool, job_id).await.unwrap(),
+            Some(CurrentNode {
+                node_id: "implement".to_owned(),
+                ordinal: Some(1),
+                of: Some(3),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn current_node_says_gate_for_an_implemented_item() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_fan_items(&pool, job_id, "implement", 2).await;
+        sqlx::query("UPDATE job_nodes SET status = 'implemented' WHERE job_id = ? AND ordinal = 0")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            current_node(&pool, job_id).await.unwrap(),
+            Some(CurrentNode {
+                node_id: "gate".to_owned(),
+                ordinal: Some(0),
+                of: Some(2),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn current_node_is_none_for_a_terminal_job() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "completed").await.unwrap();
+        seed_fan_items(&pool, job_id, "implement", 1).await;
+
+        assert_eq!(current_node(&pool, job_id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_queue_view_ignores_singleton_rows() {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_fan_items(&pool, job_id, "implement", 2).await;
+        let before = load_view(&pool, job_id).await.unwrap();
+
+        insert_singleton_node(&pool, job_id, "plan", 0, "passed")
+            .await
+            .unwrap();
+        insert_singleton_node(&pool, job_id, "review", 0, "pending")
+            .await
+            .unwrap();
+        let after = load_view(&pool, job_id).await.unwrap();
+
+        assert_eq!(after.items.len(), 2);
+        assert_eq!(after.items.len(), before.items.len());
+        assert_eq!(after.rounds, before.rounds);
     }
 
     // ---- what each node is told ----------------------------------------------------------------
@@ -9625,7 +10235,7 @@ tests:
 
     /// A job with everything done but its review, and a directory to hand work through.
     async fn job_ready_to_review(pool: &sqlx::SqlitePool, worktree: &std::path::Path) -> i64 {
-        let job_id = seed_job(pool, "project-a", "reviewing").await.unwrap();
+        let job_id = seed_job(pool, "project-a", "running").await.unwrap();
         sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
             .bind(worktree.to_string_lossy().into_owned())
             .bind(job_id)
@@ -9678,7 +10288,7 @@ tests:
         let job_id = job_ready_to_review(&pool, worktree.path()).await;
 
         assert_eq!(
-            next_step(&load_view(&pool, job_id).await.unwrap()),
+            both(&load_view(&pool, job_id).await.unwrap()),
             Next::SpawnReview
         );
         let job = load_job(&pool, job_id).await.unwrap();
@@ -9871,15 +10481,9 @@ tests:
         let pool = test_pool().await;
         let (state, runner) = test_state_with_runner(pool.clone()).await;
 
-        let job_id = seed_job_in(
-            &pool,
-            "project-a",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         let owner = crate::execution::worktree::Owner::Job(job_id);
         let info = crate::execution::worktree::create(&repo, owner)
             .await
@@ -9896,7 +10500,7 @@ tests:
         .await
         .expect("record the job's worktree");
         seed_items(&pool, job_id, &["pending"]).await;
-        sqlx::query("UPDATE job_items SET description = ? WHERE job_id = ? AND ordinal = 0")
+        sqlx::query("UPDATE job_nodes SET description = ? WHERE job_id = ? AND ordinal = 0")
             .bind(AN_ITEM)
             .bind(job_id)
             .execute(&pool)
@@ -9908,7 +10512,7 @@ tests:
         advance(&state, &job, Utc::now()).await;
 
         let (item_id, run_id): (i64, Option<i64>) =
-            sqlx::query_as("SELECT id, run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+            sqlx::query_as("SELECT id, run_id FROM job_nodes WHERE job_id = ? AND ordinal = 0")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
@@ -9996,15 +10600,9 @@ tests:
         let (state, _runner) = test_state_with_runner(pool.clone()).await;
         let state = with_home(state, &_container);
 
-        let job_id = seed_job_in(
-            &pool,
-            "project-a",
-            "implementing",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         let owner = crate::execution::worktree::Owner::Job(job_id);
         let info = crate::execution::worktree::create(&repo, owner)
             .await
@@ -10021,7 +10619,7 @@ tests:
         .await
         .expect("record the job's worktree");
         seed_items(&pool, job_id, &["pending"]).await;
-        sqlx::query("UPDATE job_items SET description = ? WHERE job_id = ? AND ordinal = 0")
+        sqlx::query("UPDATE job_nodes SET description = ? WHERE job_id = ? AND ordinal = 0")
             .bind(AN_ITEM)
             .bind(job_id)
             .execute(&pool)
@@ -10036,7 +10634,7 @@ tests:
         advance(&state, &job, Utc::now()).await;
 
         let run_id: Option<i64> =
-            sqlx::query_scalar("SELECT run_id FROM job_items WHERE job_id = ? AND ordinal = 0")
+            sqlx::query_scalar("SELECT run_id FROM job_nodes WHERE job_id = ? AND ordinal = 0")
                 .bind(job_id)
                 .fetch_one(&pool)
                 .await
@@ -10092,7 +10690,7 @@ tests:
     async fn a_note_is_not_consumed_by_a_node_that_failed_to_start() {
         let pool = test_pool().await;
         let (state, _runner) = test_state_with_runner(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         // The race the compare-and-swap exists to lose: another pass claimed this item first, so its
         // row already says `running` and the claim below — which expects `pending`, the status the
         // caller last saw — matches nothing.
@@ -10106,12 +10704,16 @@ tests:
         let step = spawn_node(
             &state,
             &job,
-            "implement",
-            "the brief this node would have been given".to_owned(),
-            Some(ItemClaim {
-                ordinal: 0,
-                held: "pending",
-            }),
+            NodeSpec {
+                node_id: "implement",
+                claim: Some(ItemClaim {
+                    ordinal: 0,
+                    held: "pending",
+                }),
+                launch: dispatch::NodeLaunch::plain(
+                    "the brief this node would have been given".to_owned(),
+                ),
+            },
             (PathBuf::from("/project/a/worktree"), "nucleos/job".into()),
             NoRoom::Park,
         )
@@ -10119,7 +10721,7 @@ tests:
 
         assert_eq!(
             step,
-            Step::Stopped,
+            Pass::Stopped,
             "an item that could not be claimed has to end the pass"
         );
         let started: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE job_id = ?")
@@ -10163,15 +10765,9 @@ tests:
         *runner.delay.lock().unwrap() = Some(std::time::Duration::from_secs(60));
         let state = with_home(state, &_container);
 
-        let job_id = seed_job_in(
-            &pool,
-            "project-a",
-            "planning",
-            &repo.to_string_lossy(),
-            None,
-        )
-        .await
-        .unwrap();
+        let job_id = seed_job_in(&pool, "project-a", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
         let owner = crate::execution::worktree::Owner::Job(job_id);
         let info = crate::execution::worktree::create(&repo, owner)
             .await
@@ -10200,9 +10796,11 @@ tests:
         spawn_node(
             &state,
             &job,
-            "plan",
-            "plan the job".to_owned(),
-            None,
+            NodeSpec {
+                node_id: "plan",
+                claim: None,
+                launch: dispatch::NodeLaunch::plain("plan the job".to_owned()),
+            },
             (info.path.clone(), info.branch.clone()),
             NoRoom::Park,
         )
@@ -10294,7 +10892,7 @@ tests:
             machine_config_root: Some(machine.path().to_path_buf()),
             ..test_state(pool.clone()).await
         };
-        let job_id = seed_job(&pool, "project-a", "implementing").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         let root_text = root.to_string_lossy().into_owned();
         sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
             .bind(&root_text)
@@ -10535,7 +11133,7 @@ tests:
         assert_eq!(full_gate_rows(&f.pool).await, 0);
         assert_eq!(item_statuses(&f.pool, f.job.id).await[1], "passed");
         let checkpoint: Option<String> = sqlx::query_scalar(
-            "SELECT checkpoint_sha FROM job_items WHERE job_id = ? AND ordinal = 1",
+            "SELECT checkpoint_sha FROM job_nodes WHERE job_id = ? AND ordinal = 1",
         )
         .bind(f.job.id)
         .fetch_one(&f.pool)
@@ -10547,7 +11145,7 @@ tests:
             "a trusted nothing-ran last item checkpoints the tree"
         );
         let gate_status: Option<String> = sqlx::query_scalar(
-            "SELECT gate_status FROM job_items WHERE job_id = ? AND ordinal = 1",
+            "SELECT gate_status FROM job_nodes WHERE job_id = ? AND ordinal = 1",
         )
         .bind(f.job.id)
         .fetch_one(&f.pool)
@@ -10567,14 +11165,14 @@ tests:
     async fn a_job_still_being_provisioned_is_not_failed_for_having_no_worktree() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
 
         let job = load_job(&pool, job_id).await.unwrap();
-        assert_eq!(advance(&state, &job, Utc::now()).await, Step::Stopped);
+        assert_eq!(advance(&state, &job, Utc::now()).await, Pass::Stopped);
 
         assert_eq!(
             job_status(&pool, job_id).await,
-            "planning",
+            "running",
             "a tick inside `start`'s window failed a job whose worktree was still being made"
         );
         assert!(!feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
@@ -10587,11 +11185,11 @@ tests:
     async fn a_job_with_no_worktree_past_the_provisioning_grace_is_failed() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
 
         let job = load_job(&pool, job_id).await.unwrap();
         let later = Utc::now() + PROVISIONING_GRACE + chrono::Duration::minutes(1);
-        assert_eq!(advance(&state, &job, later).await, Step::Stopped);
+        assert_eq!(advance(&state, &job, later).await, Pass::Stopped);
 
         assert_eq!(job_status(&pool, job_id).await, "failed");
         assert!(feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
@@ -10604,7 +11202,7 @@ tests:
     async fn a_worktree_that_cannot_be_read_skips_the_pass_rather_than_failing_the_job() {
         let pool = test_pool().await;
         let state = test_state(pool.clone()).await;
-        let job_id = seed_job(&pool, "project-a", "planning").await.unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         // Nothing REFERENCES worktrees (migrations 0044, 0096), so this drops no other row; every
         // read of it from here on is an error.
         sqlx::query("DROP TABLE worktrees")
@@ -10614,11 +11212,11 @@ tests:
 
         let job = load_job(&pool, job_id).await.unwrap();
         let later = Utc::now() + PROVISIONING_GRACE + chrono::Duration::minutes(1);
-        assert_eq!(advance(&state, &job, later).await, Step::Stopped);
+        assert_eq!(advance(&state, &job, later).await, Pass::Stopped);
 
         assert_eq!(
             job_status(&pool, job_id).await,
-            "planning",
+            "running",
             "a failed read of the worktree table failed the job"
         );
         assert!(!feed_kinds(&pool).await.contains(&"job_failed".to_owned()));
@@ -10636,5 +11234,183 @@ tests:
             created + PROVISIONING_GRACE + chrono::Duration::seconds(1)
         ));
         assert!(!still_provisioning("not a timestamp", created));
+    }
+
+    // ---- Differential sweeps (spec 12.1): the walker against `next_step` ----
+
+    const EVERY_REVIEW: [ReviewState; 6] = [
+        ReviewState::NotWanted,
+        ReviewState::Pending,
+        ReviewState::Running,
+        ReviewState::Done,
+        ReviewState::Skipped,
+        ReviewState::Retry,
+    ];
+
+    /// (specced, speccing, planned, planning): the five stages a job passes through.
+    const STAGES: [(bool, bool, bool, bool); 5] = [
+        (false, false, false, false),
+        (false, true, false, false),
+        (true, false, false, false),
+        (true, false, false, true),
+        (true, false, true, false),
+    ];
+
+    /// The round states worth crossing with everything else.
+    fn round_variants() -> Vec<RoundState> {
+        let base = RoundState::default();
+        let mut variants = vec![base];
+        for max_rounds in [1, 3] {
+            for dry_rounds in [0, 2] {
+                for licensed in [false, true] {
+                    variants.push(RoundState {
+                        max_rounds,
+                        dry_rounds,
+                        a_broken_item_may_go_round_again: licensed,
+                        ..base
+                    });
+                }
+            }
+        }
+        for replanning in [false, true] {
+            variants.push(RoundState {
+                max_rounds: 3,
+                replanning,
+                ..base
+            });
+        }
+        variants.push(RoundState {
+            max_rounds: 3,
+            replanned: Replan::Done,
+            ..base
+        });
+        variants.push(RoundState {
+            max_rounds: 3,
+            round_added_nothing: true,
+            ..base
+        });
+        variants.push(RoundState {
+            max_rounds: 3,
+            round: 2,
+            ..base
+        });
+        variants
+    }
+
+    /// The loader's invariants: no `planned` without `specced`, no items before `planned`,
+    /// `replanning` only once planned.
+    fn reachable(job: &JobView) -> bool {
+        (!job.planned || job.specced)
+            && (job.planned || job.items.is_empty())
+            && (job.planned || !job.rounds.replanning)
+    }
+
+    /// Walks every item combination of `width` items through every stage, review, team and round
+    /// variant, calling `check` on each reachable view.
+    fn for_every_view(width: usize, rounds: &[RoundState], mut check: impl FnMut(&JobView)) {
+        let combinations = EVERY_ITEM_STATE.len().pow(width as u32);
+        for code in 0..combinations {
+            let mut rest = code;
+            let mut items = Vec::new();
+            for _ in 0..width {
+                items.push(ItemView::plain(
+                    EVERY_ITEM_STATE[rest % EVERY_ITEM_STATE.len()],
+                ));
+                rest /= EVERY_ITEM_STATE.len();
+            }
+            for (specced, speccing, planned, planning) in STAGES {
+                for review in EVERY_REVIEW {
+                    for has_team in [false, true] {
+                        for round in rounds {
+                            let job = JobView {
+                                specced,
+                                speccing,
+                                planned,
+                                planning,
+                                items: items.clone(),
+                                review,
+                                rounds: *round,
+                                has_team,
+                                max_parallel: if has_team { 2 } else { 1 },
+                            };
+                            if reachable(&job) {
+                                check(&job);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn walker_agrees_with_next_step_on_every_reachable_two_item_view() {
+        let rounds = round_variants();
+        for_every_view(2, &rounds, |job| {
+            both(job);
+        });
+    }
+
+    #[test]
+    fn walker_agrees_with_next_step_on_every_three_item_view_without_rounds() {
+        for_every_view(3, &[RoundState::default()], |job| {
+            both(job);
+        });
+    }
+
+    #[test]
+    fn walker_agrees_on_dependency_and_file_clash_cases() {
+        use ItemState::*;
+        let states = [
+            Pending,
+            Running,
+            Implemented,
+            Passed,
+            Failed,
+            Skipped,
+            GateRetriable,
+        ];
+        for max_parallel in 1..=3 {
+            for a in states {
+                for b in states {
+                    for c in states {
+                        let tables = [
+                            // A chain: 1 waits for 0, 2 for 1.
+                            vec![item(a, &[], &[]), item(b, &[0], &[]), item(c, &[1], &[])],
+                            // Two items waiting on one dependency.
+                            vec![item(a, &[], &[]), item(b, &[0], &[]), item(c, &[0], &[])],
+                            // Two items naming one path, and a third free of it.
+                            vec![
+                                item(a, &[], &["x.rs"]),
+                                item(b, &[], &["x.rs"]),
+                                item(c, &[], &["y.rs"]),
+                            ],
+                            // A dependency and a clash together.
+                            vec![
+                                item(a, &[], &["x.rs"]),
+                                item(b, &[0], &["x.rs"]),
+                                item(c, &[], &["x.rs", "y.rs"]),
+                            ],
+                            // A dependency that points at nothing.
+                            vec![item(a, &[9], &[]), item(b, &[], &[]), item(c, &[], &[])],
+                        ];
+                        for items in tables {
+                            both(&view_with_parallel(&items, max_parallel));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_view_never_makes_the_walker_stuck() {
+        let rounds = round_variants();
+        for_every_view(2, &rounds, |job| {
+            assert!(
+                walker_answer(job).is_some(),
+                "the walker got stuck on {job:?}: the bridge always publishes `plan.done`"
+            );
+        });
     }
 }

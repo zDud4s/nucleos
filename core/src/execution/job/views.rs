@@ -56,6 +56,13 @@ pub struct JobSummary {
     /// at the moment the job is looked at rather than copied onto `jobs` when it started. A ceiling
     /// raised this morning applies to the job running now, and `job_view` already reads it that way.
     pub team_max_parallel: Option<i64>,
+    /// The workflow bundle this job's graph snapshot came from (`graph_bundle_ref`), so a page can
+    /// say which version the job runs. `None` for a job that predates the engine.
+    pub bundle: Option<String>,
+    /// What the job is doing right now, derived from `runs` and `job_nodes` after the row is loaded
+    /// (see [`current_node`]); not a column, hence `skip`.
+    #[sqlx(skip)]
+    pub node: Option<CurrentNode>,
 }
 
 /// One item of a job's queue, as the shell shows it.
@@ -128,7 +135,7 @@ pub struct JobDetail {
 /// struct BY NAME at run time — so a field added to three of the four does not fail to compile. It
 /// fails on whichever route was forgotten, the first time somebody calls it, with a
 /// `ColumnNotFound`. Adding `team_id` would have made that four copies of fourteen columns; this
-/// makes it one of fourteen.
+/// makes it one of them.
 ///
 /// Both joins are LEFT and both predicates belong in the `ON` clause. In a `WHERE` the first would
 /// turn into an inner join and drop every job holding no slot — most of them — and the second would
@@ -137,7 +144,8 @@ pub(super) const SUMMARY_SQL: &str =
     "SELECT jobs.id, jobs.project_id, jobs.rule_name, jobs.status, jobs.wait_reason,
             jobs.max_items, jobs.round, jobs.max_rounds, jobs.created_at, jobs.completed_at,
             project_slots.slot AS slot,
-            jobs.team_id, teams.name AS team_name, teams.max_parallel AS team_max_parallel
+            jobs.team_id, teams.name AS team_name, teams.max_parallel AS team_max_parallel,
+            jobs.graph_bundle_ref AS bundle
      FROM jobs
      LEFT JOIN project_slots
        ON project_slots.owner_kind = 'job' AND project_slots.owner_id = jobs.id
@@ -159,7 +167,7 @@ pub async fn list(
     project_id: Option<&str>,
     limit: i64,
 ) -> sqlx::Result<Vec<JobSummary>> {
-    match project_id {
+    let jobs = match project_id {
         Some(project_id) => {
             sqlx::query_as(summary_query(
                 "WHERE jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?",
@@ -167,15 +175,24 @@ pub async fn list(
             .bind(project_id)
             .bind(limit)
             .fetch_all(pool)
-            .await
+            .await?
         }
         None => {
             sqlx::query_as(summary_query("ORDER BY jobs.id DESC LIMIT ?"))
                 .bind(limit)
                 .fetch_all(pool)
-                .await
+                .await?
         }
+    };
+    with_nodes(pool, jobs).await
+}
+
+/// Fills [`JobSummary::node`] for each job: one extra indexed read per job, bounded by the callers' `limit`.
+async fn with_nodes(pool: &SqlitePool, mut jobs: Vec<JobSummary>) -> sqlx::Result<Vec<JobSummary>> {
+    for job in &mut jobs {
+        job.node = current_node(pool, job.id).await?;
     }
+    Ok(jobs)
 }
 
 /// Spelled out rather than assembled from `LIVE_STATUSES`, because sqlx refuses SQL built at
@@ -186,8 +203,7 @@ pub async fn list(
 /// along: it used to count quoted words in the whole statement and carry a `+1` for the `'job'` in
 /// the slot join, which is a test that had to know about a join it was not about.
 pub(super) const LIVE_WHERE_SQL: &str =
-    "WHERE jobs.status IN ('planning','implementing','gating','reviewing',
-                                                    'awaiting_approval','waiting')";
+    "WHERE jobs.status IN ('running','awaiting_approval','waiting')";
 
 /// The live jobs, optionally filtered to one project.
 ///
@@ -200,7 +216,7 @@ pub async fn list_live(
     project_id: Option<&str>,
     limit: i64,
 ) -> sqlx::Result<Vec<JobSummary>> {
-    match project_id {
+    let jobs = match project_id {
         Some(project_id) => {
             sqlx::query_as(summary_query(&format!(
                 "{LIVE_WHERE_SQL} AND jobs.project_id = ? ORDER BY jobs.id DESC LIMIT ?"
@@ -208,7 +224,7 @@ pub async fn list_live(
             .bind(project_id)
             .bind(limit)
             .fetch_all(pool)
-            .await
+            .await?
         }
         None => {
             sqlx::query_as(summary_query(&format!(
@@ -216,19 +232,21 @@ pub async fn list_live(
             )))
             .bind(limit)
             .fetch_all(pool)
-            .await
+            .await?
         }
-    }
+    };
+    with_nodes(pool, jobs).await
 }
 
 pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDetail>> {
-    let Some(job): Option<JobSummary> = sqlx::query_as(summary_query("WHERE jobs.id = ?"))
+    let Some(mut job): Option<JobSummary> = sqlx::query_as(summary_query("WHERE jobs.id = ?"))
         .bind(job_id)
         .fetch_optional(pool)
         .await?
     else {
         return Ok(None);
     };
+    job.node = current_node(pool, job_id).await?;
 
     // LEFT JOIN, because `agent_id` is NULL for every item of every job without a team and an inner
     // join would return an empty queue for all of them — the whole listing gone, not one column.
@@ -245,12 +263,14 @@ pub async fn detail(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<JobDe
         Option<String>,
         Option<String>,
     )> = sqlx::query_as(
-        "SELECT job_items.ordinal, job_items.description, job_items.status, job_items.round,
-                job_items.run_id, job_items.gate_status, job_items.agent_id, agents.name,
-                job_items.depends_on, job_items.files
-         FROM job_items
-         LEFT JOIN agents ON agents.id = job_items.agent_id
-         WHERE job_items.job_id = ? ORDER BY job_items.ordinal",
+        "SELECT job_nodes.ordinal, job_nodes.description, job_nodes.status, job_nodes.round,
+                job_nodes.run_id, job_nodes.gate_status, job_nodes.agent_id, agents.name,
+                job_nodes.depends_on, job_nodes.files
+         FROM job_nodes
+         LEFT JOIN agents ON agents.id = job_nodes.agent_id
+         WHERE job_nodes.job_id = ? AND job_nodes.node_id = 'implement'
+           AND job_nodes.ordinal IS NOT NULL
+         ORDER BY job_nodes.ordinal",
     )
     .bind(job_id)
     .fetch_all(pool)

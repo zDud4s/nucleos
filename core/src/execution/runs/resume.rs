@@ -433,6 +433,10 @@ pub async fn resume_for_correction(
             stage: None,
             item: None,
             resume: true,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
         }),
         // No job MCP: `after_gate_failed` only ever corrects a run outside jobs.
         None,
@@ -926,7 +930,7 @@ pub(super) async fn continue_paused_run(
     // The item follows its node. Left pointing at the run just marked `superseded`, the job's next
     // pass would read a terminal node that did not complete and stop the whole chain — turning an
     // approval into a failure, and throwing away the work the user just authorised.
-    sqlx::query("UPDATE job_items SET run_id = ? WHERE run_id = ?")
+    sqlx::query("UPDATE job_nodes SET run_id = ? WHERE run_id = ?")
         .bind(resume_id)
         .bind(original_run_id)
         .execute(&mut *tx)
@@ -1176,6 +1180,10 @@ pub(super) async fn continue_paused_run(
             stage: stage.clone(),
             item: None,
             resume: true,
+            restrict_runners: None,
+            pin: None,
+            judged_later: false,
+            effort: None,
         }),
         JobNodeMcp::for_run(resume_id, job_id),
         max_turns,

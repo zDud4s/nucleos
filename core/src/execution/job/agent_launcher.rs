@@ -1,0 +1,283 @@
+//! B2 of the agent packages (spec agentes-agnosticos sections 6, 7 and 13): the launcher that gives
+//! a node with `agent:` its catalogue agent.
+//!
+//! The prompt of such a node has the agent's own layers (body, knowledge, context, output shape)
+//! first, in the cache-friendly order of the agent spec, then the engine's protocol and the node's
+//! `body` as the task. The engine pin and the model follow section 6's order (node pin, agent pin,
+//! router restricted to the runners the agent can be translated for). This module only translates
+//! `resolve_agent_launch`'s answer into the dispatcher's vocabulary; it decides nothing of its own,
+//! so a team member and a graph node cannot disagree about how an agent launches.
+//!
+//! A node WITHOUT `agent:` goes to [`ProtocolAndBody`], untouched.
+use std::sync::Arc;
+
+use crate::agents::capabilities::Engine;
+use crate::agents::launch::{self, AgentLaunch, LaunchError, Pins};
+use crate::agents::output::{self, OutputShape};
+use crate::models::route_advice::RunnerKind;
+
+use super::dispatch::{
+    AgentNodeLauncher, EnginePin, LaunchRefused, NodeCtx, NodeLaunch, OutputCheck, ProtocolAndBody,
+    read_body,
+};
+
+/// The launcher `main` installs: catalogue agents for nodes that name one, today's behaviour for
+/// the rest.
+pub struct CatalogAgentLauncher;
+
+/// The deterministic check of an agent's `output.md` (spec section 7).
+struct ShapeCheck(OutputShape);
+
+impl OutputCheck for ShapeCheck {
+    fn check(&self, text: &str) -> Result<(), String> {
+        output::validate(&self.0, text).map_err(|report| report.to_string())
+    }
+}
+
+/// The caller-side pin of a node: its `tool` and `model`. An empty string pins nothing.
+fn pins_of(node: &crate::workflows::graph::Node) -> Pins {
+    let non_empty = |value: &Option<String>| value.clone().filter(|text| !text.is_empty());
+    Pins {
+        engine: non_empty(&node.tool),
+        model: non_empty(&node.model),
+    }
+}
+
+fn runner_of(engine: Engine) -> Option<RunnerKind> {
+    match engine {
+        Engine::Claude => Some(RunnerKind::Claude),
+        Engine::Codex => Some(RunnerKind::Codex),
+        Engine::Local => None,
+    }
+}
+
+/// The dispatcher's pin for the launch's `(engine, model)`. The local engine is not a runner a
+/// graph node can run on.
+fn pin_of(
+    pin: Option<(Engine, String)>,
+    effort: Option<&str>,
+    label: &str,
+) -> Result<Option<EnginePin>, LaunchRefused> {
+    let Some((engine, model)) = pin else {
+        return Ok(None);
+    };
+    let Some(runner) = runner_of(engine) else {
+        return Err(LaunchRefused::Unavailable(format!(
+            "{label} is pinned to the local engine, which a workflow node cannot run on"
+        )));
+    };
+    Ok(Some(EnginePin {
+        runner,
+        model: Some(model).filter(|model| !model.is_empty()),
+        effort: effort
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_owned),
+    }))
+}
+
+fn refused(error: LaunchError) -> LaunchRefused {
+    match error {
+        LaunchError::PackageMissing(why) => LaunchRefused::Invalid(why),
+        other => LaunchRefused::Unavailable(other.to_string()),
+    }
+}
+
+/// `None` for a shape that validates nothing (a free-text contract, a user agent).
+fn check_of(shape: OutputShape) -> Option<Arc<dyn OutputCheck>> {
+    if shape.sections.is_empty() && shape.alt.is_none() {
+        return None;
+    }
+    Some(Arc::new(ShapeCheck(shape)))
+}
+
+fn node_launch(
+    launch: AgentLaunch,
+    effort: Option<&str>,
+    label: &str,
+) -> Result<NodeLaunch, LaunchRefused> {
+    let pin = pin_of(launch.pin, effort, label)?;
+    Ok(NodeLaunch {
+        prompt: launch.prompt,
+        // A pin bypasses the router, so there is nothing to restrict then.
+        restrict_runners: pin.is_none().then_some(launch.runners),
+        // A pin carries the effort itself; unpinned, the router picks engine and model and the
+        // node's effort still has to reach the launch.
+        effort: effort
+            .filter(|effort| !effort.is_empty() && pin.is_none())
+            .map(str::to_owned),
+        pin,
+        output: check_of(launch.output),
+    })
+}
+
+/// Looks the package up in the catalogue and asks the shared resolver. `protocol` and the node's
+/// `body` are the task: the agent's layers come before them in the prompt.
+async fn resolve(
+    ctx: &NodeCtx<'_>,
+    reference: &str,
+    protocol: String,
+) -> Result<AgentLaunch, LaunchRefused> {
+    let agents = crate::agent::list(&ctx.state.pool).await.map_err(|error| {
+        LaunchRefused::Invalid(format!("the agent catalogue cannot be read: {error}"))
+    })?;
+    let agent = agents
+        .into_iter()
+        .find(|agent| agent.package_ref.as_deref() == Some(reference))
+        .ok_or_else(|| {
+            LaunchRefused::Invalid(format!(
+                "node `{}`: agent `{reference}` is not in the catalogue",
+                ctx.node.id
+            ))
+        })?;
+    let task = match read_body(ctx.worktree, ctx.node).await? {
+        Some(body) => format!("{protocol}\n\n{body}"),
+        None => protocol,
+    };
+    launch::resolve_agent_launch(
+        ctx.state,
+        &agent,
+        pins_of(ctx.node),
+        &task,
+        "",
+        ctx.node.contract.as_deref(),
+    )
+    .await
+    .map_err(refused)
+}
+
+#[async_trait::async_trait]
+impl AgentNodeLauncher for CatalogAgentLauncher {
+    async fn launch(
+        &self,
+        ctx: &NodeCtx<'_>,
+        protocol: String,
+    ) -> Result<NodeLaunch, LaunchRefused> {
+        let Some(reference) = ctx.node.agent.as_deref() else {
+            return ProtocolAndBody.launch(ctx, protocol).await;
+        };
+        let launch = resolve(ctx, reference, protocol).await?;
+        node_launch(launch, ctx.node.effort.as_deref(), reference)
+    }
+
+    async fn output_check(&self, ctx: &NodeCtx<'_>) -> Option<Arc<dyn OutputCheck>> {
+        let reference = ctx.node.agent.as_deref()?;
+        match resolve(ctx, reference, String::new()).await {
+            Ok(launch) => check_of(launch.output),
+            Err(error) => {
+                tracing::warn!(
+                    node = %ctx.node.id,
+                    reason = error.reason(),
+                    "the output check of an agent node cannot be rebuilt"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(yaml: &str) -> crate::workflows::graph::Node {
+        serde_yaml::from_str(yaml).expect("a node")
+    }
+
+    #[test]
+    fn a_node_pin_is_its_tool_and_model_and_empty_strings_pin_nothing() {
+        let pins = pins_of(&node("id: a\ntype: agent\ntool: codex\nmodel: gpt-5\n"));
+        assert_eq!(pins.engine.as_deref(), Some("codex"));
+        assert_eq!(pins.model.as_deref(), Some("gpt-5"));
+        let none = pins_of(&node("id: a\ntype: agent\ntool: \"\"\n"));
+        assert_eq!(none, Pins::default());
+    }
+
+    #[test]
+    fn a_cli_pin_maps_to_its_runner_with_the_nodes_effort() {
+        let pin = pin_of(
+            Some((Engine::Codex, "gpt-5".to_owned())),
+            Some("high"),
+            "r@1.0.0",
+        )
+        .unwrap()
+        .expect("a pin");
+        assert_eq!(pin.runner, RunnerKind::Codex);
+        assert_eq!(pin.model.as_deref(), Some("gpt-5"));
+        assert_eq!(pin.effort.as_deref(), Some("high"));
+        let bare = pin_of(Some((Engine::Claude, String::new())), None, "r@1.0.0")
+            .unwrap()
+            .expect("a pin");
+        assert_eq!(bare.runner, RunnerKind::Claude);
+        assert_eq!((bare.model, bare.effort), (None, None));
+        assert!(pin_of(None, Some("high"), "r@1.0.0").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unpinned_node_keeps_its_effort_for_the_router_and_a_pinned_one_carries_it_in_the_pin() {
+        let launch = |pin: Option<(Engine, String)>| AgentLaunch {
+            prompt: "p".to_owned(),
+            runners: vec![RunnerKind::Claude],
+            pin,
+            output: OutputShape::free("anything"),
+            tool_policy: crate::execution::runner::ToolPolicy::McpOnly,
+            tools: None,
+        };
+        let unpinned = node_launch(launch(None), Some("high"), "r@1.0.0").unwrap();
+        assert!(unpinned.pin.is_none());
+        assert_eq!(unpinned.effort.as_deref(), Some("high"));
+        let empty = node_launch(launch(None), Some(""), "r@1.0.0").unwrap();
+        assert_eq!(empty.effort, None);
+        let pinned = node_launch(
+            launch(Some((Engine::Claude, "m".to_owned()))),
+            Some("high"),
+            "r@1.0.0",
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.pin.and_then(|pin| pin.effort).as_deref(),
+            Some("high")
+        );
+        assert_eq!(pinned.effort, None);
+    }
+
+    #[test]
+    fn a_local_pin_is_unavailable_for_a_node() {
+        let Err(LaunchRefused::Unavailable(why)) =
+            pin_of(Some((Engine::Local, "m".to_owned())), None, "r@1.0.0")
+        else {
+            panic!("a local pin is Unavailable");
+        };
+        assert!(why.contains("r@1.0.0") && why.contains("local"), "{why}");
+    }
+
+    #[test]
+    fn a_missing_package_is_invalid_and_every_other_refusal_is_unavailable() {
+        assert_eq!(
+            refused(LaunchError::PackageMissing("gone".to_owned())),
+            LaunchRefused::Invalid("gone".to_owned())
+        );
+        assert_eq!(
+            refused(LaunchError::NoRunner("none".to_owned())),
+            LaunchRefused::Unavailable("none".to_owned())
+        );
+        assert_eq!(
+            refused(LaunchError::Router("down".to_owned())),
+            LaunchRefused::Unavailable("down".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_free_shape_has_no_check_and_a_declared_one_does() {
+        assert!(check_of(OutputShape::free("anything")).is_none());
+        let shape =
+            output::parse_output_md("Say a verdict.\n\n## Verdict\none-of: approved | changes\n")
+                .expect("a shape");
+        let check = check_of(shape).expect("sections declared, so a check");
+        assert!(check.check("## Verdict\napproved\n").is_ok());
+        let report = check
+            .check("## Verdict\nmaybe\n")
+            .expect_err("not in the set");
+        assert!(report.contains("Verdict"), "{report}");
+        assert!(check.check("no headings at all").is_err());
+    }
+}

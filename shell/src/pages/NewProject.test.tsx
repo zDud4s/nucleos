@@ -138,6 +138,45 @@ describe("adding a project", () => {
     );
   });
 
+  /** The daemon wants the folder's commands agreed to; the wizard shows them and re-sends with the digest. */
+  it("shows the commands the daemon asks consent for, and adopts with its digest once agreed", async () => {
+    const { state } = await openWizard({
+      detected: detected({
+        root: "C:/Projects/nucleos",
+        harnesses: [{ path: ".ai", what: "a written-down pipeline", files: 42 }],
+      }),
+      requireConsentDigest: "digest-adopt",
+      workflowConsent: {
+        version: "adopted",
+        baseline: null,
+        commands: [
+          {
+            node: "test",
+            label: "test",
+            command: "cargo test --workspace",
+            cwd: null,
+            timeout: null,
+            change: "new",
+            disabled: false,
+          },
+        ],
+        removed: [],
+      },
+    });
+    await look("C:/Projects/nucleos");
+    fireEvent.click(await screen.findByRole("button", { name: "Add it, in shadow" }));
+
+    const ask = await screen.findByRole("group", { name: "Commands to agree to" });
+    expect(within(ask).getByText("cargo test --workspace")).toBeTruthy();
+    expect(state.adopted).toEqual([]);
+
+    fireEvent.click(within(ask).getByRole("button", { name: "agree and record the workflow" }));
+    await waitFor(() =>
+      expect(state.adopted).toEqual([{ name: "harness", path: ".ai", consent_digest: "digest-adopt" }]),
+    );
+    expect(state.consentRefused).toBe(1);
+  });
+
   /**
    * One folder under two names is the mistake nothing else can catch: neither name looks wrong on
    * its own, and the folder cannot say it has been claimed.
