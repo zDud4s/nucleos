@@ -64,11 +64,45 @@ pub fn parse_session(text: &str) -> Result<SessionFile, &'static str> {
     })
 }
 
+/// `agent-<id>.meta.json` beside a subagent transcript.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentMeta {
+    pub agent_type: Option<String>,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub parent_agent_id: Option<String>,
+    /// Written in place when the agent ends.
+    pub finished: bool,
+    /// Written INSTEAD of `finished` when the owner stopped the agent.
+    pub stopped_by_user: bool,
+}
+
+impl AgentMeta {
+    /// The harness's own "ended cleanly" marker (spec §3, children).
+    pub fn is_closed(&self) -> bool {
+        self.finished || self.stopped_by_user
+    }
+}
+
+pub fn parse_meta(text: &str) -> Result<AgentMeta, &'static str> {
+    let v: Value = serde_json::from_str(text).map_err(|_| "agent meta file is not valid JSON")?;
+    let string = |key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
+    let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
+    Ok(AgentMeta {
+        agent_type: string("agentType"),
+        description: string("description"),
+        model: string("model"),
+        parent_agent_id: string("parentAgentId"),
+        finished: flag("finished"),
+        stopped_by_user: flag("stoppedByUser"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const FULL: &str = r#"{"pid":19996,"sessionId":"cd303e3a-0","cwd":"c:\Projects\nucleos",
+    const FULL: &str = r#"{"pid":19996,"sessionId":"cd303e3a-0","cwd":"c:\\Projects\\nucleos",
         "startedAt":1792523514511,"procStart":"134369971128448809","version":"2.1.304",
         "kind":"interactive","entrypoint":"claude-vscode","name":"nucleos-12","status":"idle",
         "updatedAt":1792524140337,"waitingFor":"input needed"}"#;
@@ -78,7 +112,7 @@ mod tests {
         let s = parse_session(FULL).unwrap();
         assert_eq!(s.pid, 19996);
         assert_eq!(s.session_id, "cd303e3a-0");
-        assert_eq!(s.cwd.as_deref(), Some("c:\Projects\nucleos"));
+        assert_eq!(s.cwd.as_deref(), Some("c:\\Projects\\nucleos"));
         assert_eq!(s.proc_start.as_deref(), Some("134369971128448809"));
         assert_eq!(s.name.as_deref(), Some("nucleos-12"));
         assert_eq!(s.status.as_deref(), Some("idle"));
@@ -102,5 +136,30 @@ mod tests {
     fn proc_start_may_be_a_number() {
         let s = parse_session(r#"{"pid":7,"sessionId":"abc","procStart":12345}"#).unwrap();
         assert_eq!(s.proc_start.as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn a_meta_file_parses_and_an_empty_one_degrades() {
+        let m = parse_meta(
+            r#"{"agentType":"Explore","description":"Read specs","model":"sonnet",
+                "parentAgentId":"ae69","spawnDepth":2,"finished":true}"#,
+        )
+        .unwrap();
+        assert_eq!(m.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(m.description.as_deref(), Some("Read specs"));
+        assert_eq!(m.model.as_deref(), Some("sonnet"));
+        assert_eq!(m.parent_agent_id.as_deref(), Some("ae69"));
+        assert!(m.finished && m.is_closed());
+
+        let empty = parse_meta("{}").unwrap();
+        assert_eq!(empty, AgentMeta::default());
+        assert!(!empty.is_closed());
+        assert_eq!(parse_meta("{\"agentTy"), Err("agent meta file is not valid JSON"));
+    }
+
+    #[test]
+    fn a_user_stopped_agent_counts_as_closed_without_a_finished_marker() {
+        let m = parse_meta(r#"{"agentType":"general-purpose","stoppedByUser":true}"#).unwrap();
+        assert!(!m.finished && m.stopped_by_user && m.is_closed());
     }
 }
