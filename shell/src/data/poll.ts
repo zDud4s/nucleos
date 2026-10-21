@@ -1,11 +1,13 @@
 /**
  * Poll cadences, in one place.
  *
- * The núcleo exposes no SSE and no WebSocket — polling is the contract, not a
- * stopgap. That makes the interval a product decision rather than an
- * implementation detail, and product decisions belong somewhere a person can
- * read them all at once. Pages never name a number: they ask a hook, and the
- * hook fixes the cadence.
+ * The núcleo has no SSE and no WebSocket, but it does stream in two places —
+ * the browser live view (`/browser/sessions/{id}/live`) and the fleet tree
+ * (`/fleet/live`, NDJSON) — and both are read through `openStream`, not here.
+ * For every other read polling is the contract, not a stopgap. That makes the
+ * interval a product decision rather than an implementation detail, and
+ * product decisions belong somewhere a person can read them all at once.
+ * Pages never name a number: they ask a hook, and the hook fixes the cadence.
  */
 export const POLL = {
   /** A chat turn in flight. The fastest thing in the app, because it is the one you watch. */
