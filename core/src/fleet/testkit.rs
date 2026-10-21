@@ -12,6 +12,7 @@ use chrono::DateTime;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::fuse::FusedNode;
+use super::hub::Clock;
 use super::model::{
     Capabilities, Cursor, FleetNode, NodeKey, NodeState, TermKind, TermLine, Timestamp,
     TranscriptPage,
@@ -256,6 +257,25 @@ impl WatchFactory for FakeWatch {
         self.started.fetch_add(1, Ordering::SeqCst);
         *self.tx.lock().unwrap() = Some(tx);
         Box::new(Alive(self.live.clone()))
+    }
+}
+
+/// A clock the test moves by hand.
+pub(crate) struct FakeClock(Mutex<Timestamp>);
+
+impl FakeClock {
+    pub(crate) fn new(now: Timestamp) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(now)))
+    }
+    pub(crate) fn advance(&self, secs: i64) {
+        let mut now = self.0.lock().unwrap();
+        *now += chrono::Duration::seconds(secs);
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> Timestamp {
+        *self.0.lock().unwrap()
     }
 }
 

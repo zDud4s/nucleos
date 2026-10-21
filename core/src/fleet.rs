@@ -5,6 +5,7 @@ pub mod book;
 pub mod daemon_runs;
 pub mod event;
 pub mod fuse;
+pub mod hub;
 pub mod limits;
 pub mod model;
 pub mod source;
