@@ -34,6 +34,10 @@ pub enum Text {
         turn: i64,
     },
     Budget(BudgetSnapshot),
+    /// Budget alert: new runs just became paused. Carries no figures (H4: no `snapshot` read).
+    BudgetPaused,
+    /// Budget alert: new runs are allowed again.
+    BudgetResumed,
     NoProposals,
     NoteUsage,
     Noted {
@@ -135,6 +139,8 @@ pub fn render(text: &Text) -> String {
         Text::NothingToCancel => "Nothing to stop.".to_string(),
         Text::Cancelled { turn } => format!("Cancelled turn {turn}."),
         Text::Budget(b) => render_budget(b),
+        Text::BudgetPaused => "Budget limit reached. New runs are paused.".to_string(),
+        Text::BudgetResumed => "Budget is back within its limit. New runs are allowed.".to_string(),
         Text::NoProposals => "No open proposals.".to_string(),
         Text::NoteUsage => "Usage: /note <text>".to_string(),
         Text::Noted { id } => format!("Noted (#{id})."),
@@ -359,6 +365,8 @@ mod tests {
             Text::NothingToCancel,
             Text::Cancelled { turn: 3 },
             Text::Budget(budget()),
+            Text::BudgetPaused,
+            Text::BudgetResumed,
             Text::NoProposals,
             Text::NoteUsage,
             Text::Noted { id: 7 },

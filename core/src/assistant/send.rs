@@ -148,6 +148,8 @@ pub async fn send_or_queue(
     check_images(images)?;
     // A person sending again is what ends a hold (after Stop, or after a failed send).
     release_queue(chat_id);
+    // The same moment re-arms the "queue paused" announcement for a channel conversation.
+    crate::channels::replies::clear_queue_pause(state, chat_id).await;
     // Serialised here rather than at the drain, because this is the only moment the bytes are in
     // hand. A message that waits with its pictures is the whole of what was sent; one that waits
     // without them is half of it, silently.
@@ -336,6 +338,12 @@ async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold
         .ok()
         .flatten();
         if latest.as_deref() == Some("cancelled") {
+            // The queue stays put after a Stop; a channel conversation is told once.
+            if let Err(error) =
+                crate::channels::replies::announce_queue_paused(state, chat_id).await
+            {
+                tracing::warn!(%error, chat_id, "could not announce the paused queue");
+            }
             return;
         }
     }
@@ -517,8 +525,8 @@ async fn put_back_refused(
         return;
     }
     hold_queue(chat_id);
-    if let Err(error) = crate::chats::notices::post_system(
-        &state.pool,
+    if let Err(error) = crate::channels::replies::post_notice(
+        state,
         chat_id,
         "queue",
         0,
@@ -529,6 +537,9 @@ async fn put_back_refused(
     .await
     {
         tracing::warn!(%error, chat_id, "could not post the notice about a waiting message");
+    }
+    if let Err(error) = crate::channels::replies::announce_queue_paused(state, chat_id).await {
+        tracing::warn!(%error, chat_id, "could not announce the paused queue");
     }
 }
 
@@ -989,6 +1000,8 @@ pub(super) async fn send_message_inner(
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
     crate::chats::stamp_project(&state.pool, id, chat_id).await;
+    // A channel conversation sees "working" as soon as its turn exists. A no-op for any other chat.
+    crate::channels::replies::turn_started(state, id, chat_id).await;
 
     // The relay learns which turn answered it, now that the turn has an id to learn.
     //
@@ -1616,6 +1629,106 @@ mod tests {
         panic!("turn {id} never settled");
     }
 
+    /// A state whose `telegram` channel has a routing row and was launched, so its turns are acked.
+    async fn live_channel_state() -> AppState {
+        let state = crate::channels::testkit::state().await;
+        {
+            // Dropped before anything else uses the pool: the test pool has a single connection.
+            let mut conn = state.pool.acquire().await.unwrap();
+            crate::channels::routing::seed(&mut conn, "telegram")
+                .await
+                .unwrap();
+        }
+        state
+            .channels
+            .presence
+            .set_launched("telegram", chrono::Utc::now());
+        state
+    }
+
+    /// `(run_id, acked)` of every registered turn, oldest first.
+    async fn acked_turns(pool: &SqlitePool) -> Vec<(i64, bool)> {
+        sqlx::query_as::<_, (i64, bool)>(
+            "SELECT run_id, acked_at IS NOT NULL FROM channel_turn_replies ORDER BY run_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn outbox_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_outbox")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The ack is written by the time `send_message` returns, i.e. before the turn body has had a
+    /// chance to do anything.
+    #[tokio::test]
+    async fn a_channel_turn_is_acked_before_the_body_runs() {
+        let state = live_channel_state().await;
+        let chat = a_chat("telegram");
+
+        let id = send_message(&state, &chat, "hello", Origin::Shell)
+            .await
+            .unwrap();
+
+        assert_eq!(acked_turns(&state.pool).await, vec![(id, true)]);
+        let subject: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT subject FROM channel_outbox ORDER BY id")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(subject, vec![Some(format!("run:{id}"))]);
+    }
+
+    #[tokio::test]
+    async fn a_telegram_turn_without_a_live_channel_writes_nothing_to_the_hub() {
+        // Routing row seeded but the channel never launched: not live.
+        let state = crate::channels::testkit::state().await;
+        {
+            let mut conn = state.pool.acquire().await.unwrap();
+            crate::channels::routing::seed(&mut conn, "telegram")
+                .await
+                .unwrap();
+        }
+        let chat = a_chat("telegram");
+        send_message(&state, &chat, "hello", Origin::Shell)
+            .await
+            .unwrap();
+        // The v1 Telegram spelling has no `telegram:` prefix and is never a channel conversation.
+        send_message(&state, &a_chat("-100200"), "hello", Origin::Telegram)
+            .await
+            .unwrap();
+
+        assert!(acked_turns(&state.pool).await.is_empty());
+        assert_eq!(outbox_count(&state.pool).await, 0);
+    }
+
+    /// A queued turn that leaves the queue through `drain_inner` reaches `send_message` and gets
+    /// exactly one ack.
+    #[tokio::test]
+    async fn a_drained_channel_turn_is_acked_once() {
+        let state = live_channel_state().await;
+        let chat = a_chat("telegram");
+        crate::chats::enqueue(&state.pool, &chat, "waited", "shell", "[]")
+            .await
+            .unwrap();
+
+        drain_queued(&state, &chat).await;
+
+        let runs: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM runs WHERE chat_id = ? AND mode = 'assistant'")
+                .bind(&chat)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(runs.len(), 1, "the queued message was not sent");
+        assert_eq!(acked_turns(&state.pool).await, vec![(runs[0], true)]);
+        assert_eq!(outbox_count(&state.pool).await, 1);
+    }
+
     /// Any released slot that was armed sends what waited, in a task of its own.
     #[tokio::test]
     async fn a_released_slot_sends_what_waited_in_its_own_task() {
@@ -1820,6 +1933,280 @@ mod tests {
         );
         assert_eq!(prompts_of(&state.pool, &chat, 1).await.len(), 1);
         assert!(queue_is_held(&chat));
+        release_queue(&chat);
+    }
+
+    /// `(id, subject, text)` of every outbox row, oldest first.
+    async fn outbox_lines(pool: &SqlitePool) -> Vec<(i64, Option<String>, String)> {
+        let rows: Vec<(i64, Option<String>, String)> =
+            sqlx::query_as("SELECT id, subject, payload FROM channel_outbox ORDER BY id")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.into_iter()
+            .map(|(id, subject, payload)| {
+                let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                let text = payload["parts"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                (id, subject, text)
+            })
+            .collect()
+    }
+
+    async fn pause_marks(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_queue_pause_marks")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A live channel conversation with a slow turn running in it, as `(state, chat, turn)`.
+    async fn slow_channel_turn() -> (AppState, String, i64) {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = live_channel_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("telegram");
+        // No directory of its own keeps no process, so Stop takes the kill path.
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(&chat)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        *fake.delay.lock().unwrap() = Some(Duration::from_secs(30));
+        let turn = send_message(&state, &chat, "slow one", Origin::Shell)
+            .await
+            .unwrap();
+        for _ in 0..300 {
+            if state.run_handles.lock().unwrap().contains_key(&turn) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (state, chat, turn)
+    }
+
+    /// The text a pause announcement carries for the messages now waiting in `chat`.
+    async fn pause_text(state: &AppState, chat: &str) -> String {
+        crate::channels::replies::queue_paused_text(&state.pool, chat)
+            .await
+            .unwrap()
+            .expect("something should be waiting")
+    }
+
+    /// A cancelled assistant turn, so the drain reads the conversation as stopped.
+    async fn cancelled_turn_in(pool: &SqlitePool, chat: &str) {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('stopped', 'cancelled', 'assistant', ?, '2026-08-09T00:00:00Z')",
+        )
+        .bind(chat)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_back_refused_posts_notice_and_announces_pause_for_channel_chats() {
+        let state = live_channel_state().await;
+        let chat = a_chat("telegram");
+        let queued = crate::chats::Queued {
+            id: 7001,
+            text: "cannot go".to_string(),
+            origin: Some("shell".to_string()),
+            images: Some("[]".to_string()),
+            relay_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        put_back_refused(&state, &chat, &queued, "no model", true).await;
+
+        let lines = outbox_lines(&state.pool).await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].2.contains("could not be sent"), "{lines:?}");
+        assert!(lines[0].2.contains("no model"), "{lines:?}");
+        assert_eq!(lines[1].2, pause_text(&state, &chat).await);
+        assert!(lines.iter().all(|line| line.1.is_none()), "{lines:?}");
+        let notices = crate::chats::notices::for_chat(&state.pool, &chat)
+            .await
+            .unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.body.contains("could not be sent")),
+            "{notices:?}"
+        );
+        assert!(queue_is_held(&chat));
+        release_queue(&chat);
+
+        // A chat outside any channel keeps the plain notice and writes nothing to the hub.
+        let plain = a_chat("plain");
+        let before = outbox_count(&state.pool).await;
+        let other = crate::chats::Queued { id: 7003, ..queued };
+        put_back_refused(&state, &plain, &other, "no model", true).await;
+        assert_eq!(outbox_count(&state.pool).await, before);
+        assert!(
+            !crate::chats::notices::for_chat(&state.pool, &plain)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        release_queue(&plain);
+    }
+
+    #[tokio::test]
+    async fn stop_turn_announces_pause_when_messages_wait() {
+        let (state, chat, turn) = slow_channel_turn().await;
+        let outcome = send_or_queue(&state, &chat, "behind the slow one", &[], Origin::Shell).await;
+        assert_eq!(outcome, Ok(Sent::Queued));
+
+        let stopped = stop_turn_within(&state, turn, Duration::from_millis(50)).await;
+
+        assert_eq!(stopped, Stopped::Killed);
+        let lines = outbox_lines(&state.pool).await;
+        let expected = pause_text(&state, &chat).await;
+        assert_eq!(
+            lines.iter().filter(|line| line.2 == expected).count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(pause_marks(&state.pool).await, 1);
+        release_queue(&chat);
+    }
+
+    #[tokio::test]
+    async fn stop_turn_announces_pause_after_the_final_reply() {
+        let (state, chat, turn) = slow_channel_turn().await;
+        send_or_queue(&state, &chat, "behind the slow one", &[], Origin::Shell)
+            .await
+            .unwrap();
+
+        stop_turn_within(&state, turn, Duration::from_millis(50)).await;
+
+        // The ack, then the turn's final reply, then the pause notice.
+        let lines = outbox_lines(&state.pool).await;
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let run = Some(format!("run:{turn}"));
+        assert_eq!(lines[0].1, run);
+        assert_eq!(lines[1].1, run, "the final reply comes first: {lines:?}");
+        assert_eq!(lines[2].1, None, "the pause notice comes last: {lines:?}");
+        assert!(lines[1].0 < lines[2].0);
+        assert_eq!(lines[2].2, pause_text(&state, &chat).await);
+        release_queue(&chat);
+    }
+
+    #[tokio::test]
+    async fn stop_from_the_shell_in_a_channel_chat_announces_the_pause() {
+        let (state, chat, turn) = slow_channel_turn().await;
+        send_or_queue(&state, &chat, "behind the slow one", &[], Origin::Shell)
+            .await
+            .unwrap();
+
+        // The door the shell's Stop button uses.
+        let stopped = stop_turn(&state, turn).await;
+
+        assert_eq!(stopped, Stopped::Killed);
+        let lines = outbox_lines(&state.pool).await;
+        assert_eq!(
+            lines.last().map(|line| line.2.clone()),
+            Some(pause_text(&state, &chat).await),
+            "{lines:?}"
+        );
+        assert_eq!(pause_marks(&state.pool).await, 1);
+        release_queue(&chat);
+    }
+
+    #[tokio::test]
+    async fn stop_turn_for_a_chat_with_nothing_waiting_announces_nothing() {
+        let (state, chat, turn) = slow_channel_turn().await;
+
+        let stopped = stop_turn_within(&state, turn, Duration::from_millis(50)).await;
+
+        assert_eq!(stopped, Stopped::Killed);
+        // Only the ack and the final reply: no pause notice, no mark.
+        let lines = outbox_lines(&state.pool).await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|line| line.1.is_some()), "{lines:?}");
+        assert_eq!(pause_marks(&state.pool).await, 0);
+        release_queue(&chat);
+    }
+
+    #[tokio::test]
+    async fn drain_stops_on_cancelled_and_announces_pause() {
+        let state = live_channel_state().await;
+        let chat = a_chat("telegram");
+        cancelled_turn_in(&state.pool, &chat).await;
+        crate::chats::enqueue(&state.pool, &chat, "waiting", "shell", "[]")
+            .await
+            .unwrap();
+
+        drain_queued(&state, &chat).await;
+        drain_queued(&state, &chat).await;
+
+        assert_eq!(
+            waiting_texts(&state.pool, &chat).await,
+            vec!["waiting".to_string()]
+        );
+        let lines = outbox_lines(&state.pool).await;
+        assert_eq!(lines.len(), 1, "announced once per pause: {lines:?}");
+        assert_eq!(lines[0].2, pause_text(&state, &chat).await);
+    }
+
+    #[tokio::test]
+    async fn a_person_sending_again_rearms_the_pause_announcement() {
+        let state = live_channel_state().await;
+        let chat = a_chat("telegram");
+        cancelled_turn_in(&state.pool, &chat).await;
+        crate::chats::enqueue(&state.pool, &chat, "waiting", "shell", "[]")
+            .await
+            .unwrap();
+        // Busy, so what the owner sends waits behind and nothing is started.
+        let slot = ChatSlot::acquire(&chat).expect("the chat should be free");
+
+        drain_queued(&state, &chat).await;
+        assert_eq!(outbox_count(&state.pool).await, 1);
+        assert_eq!(pause_marks(&state.pool).await, 1);
+
+        let outcome = send_or_queue(&state, &chat, "me again", &[], Origin::Shell).await;
+        assert_eq!(outcome, Ok(Sent::Queued));
+        assert_eq!(pause_marks(&state.pool).await, 0, "writing ends the pause");
+
+        drain_queued(&state, &chat).await;
+        let lines = outbox_lines(&state.pool).await;
+        assert_eq!(lines.len(), 2, "the second pause is announced: {lines:?}");
+        assert_eq!(lines[1].2, pause_text(&state, &chat).await);
+        drop(slot);
+    }
+
+    /// The v1 Telegram spelling is not a channel conversation: none of the queue paths writes to
+    /// the hub for it, live channel or not.
+    #[tokio::test]
+    async fn queue_paths_write_nothing_to_the_hub_for_a_telegram_chat() {
+        let state = live_channel_state().await;
+        let chat = a_chat("-100200");
+        let queued = crate::chats::Queued {
+            id: 7002,
+            text: "cannot go".to_string(),
+            origin: Some("telegram".to_string()),
+            images: Some("[]".to_string()),
+            relay_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        put_back_refused(&state, &chat, &queued, "no model", true).await;
+        release_queue(&chat);
+        cancelled_turn_in(&state.pool, &chat).await;
+        drain_queued(&state, &chat).await;
+        let slot = ChatSlot::acquire(&chat).expect("the chat should be free");
+        send_or_queue(&state, &chat, "again", &[], Origin::Telegram)
+            .await
+            .unwrap();
+        drop(slot);
+
+        assert_eq!(outbox_count(&state.pool).await, 0);
+        assert_eq!(pause_marks(&state.pool).await, 0);
         release_queue(&chat);
     }
 

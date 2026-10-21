@@ -1,5 +1,5 @@
-//! Turn cycle and queue notices (flow G, Anexo D D.11). P0 skeleton: A2 owns the `todo!()` bodies.
-#![allow(dead_code, unused_variables)] // P0 skeleton: A2 removes this with the real body
+//! Turn cycle and queue notices (flow G, Anexo D D.11).
+#![allow(dead_code)] // `post_notice`, `announce_queue_paused` and `reply_now` wait for their callers (X10, Rp6)
 
 use std::time::Duration;
 
@@ -39,8 +39,9 @@ impl Pings {
         self.0.clear();
         let base = Instant::now();
         for turn in running.iter().filter(|turn| !turn.pinged) {
+            // A `created_at` slightly in the future (clock step) has waited zero, not forever.
             let elapsed = parse_stored(&turn.created_at)
-                .and_then(|created| (now - created).to_std().ok())
+                .map(|created| (now - created).to_std().unwrap_or(Duration::ZERO))
                 .unwrap_or(ping_after);
             let remaining = ping_after.saturating_sub(elapsed);
             self.0.insert((base + remaining, turn.run_id), ());
@@ -215,9 +216,45 @@ pub async fn turn_started(state: &AppState, run_id: i64, chat_id: &str) {
     }
 }
 
-/// Spawned once from `main.rs` when a channel instance exists. A2.
-pub async fn run_replies_loop(state: AppState, bus: ChannelsBus, cadence: Cadence) {
-    todo!()
+/// Resolves when `rx` changed. A closed topic never resolves, so the loop does not spin on it.
+async fn runs_changed(rx: &mut tokio::sync::watch::Receiver<u64>) {
+    if rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// One sweep, its failure only logged: the next signal or safety sweep repeats it.
+async fn sweep_logged(state: &AppState, cadence: &Cadence, pings: &mut Pings) {
+    if let Err(error) = sweep_once(state, Utc::now(), cadence, pings).await {
+        tracing::warn!(%error, "a replies sweep failed");
+    }
+}
+
+/// Spawned once from `main.rs` when a channel instance exists.
+///
+/// Wakes on a `runs` signal (no settle: a late reply is cheap to repeat and idempotent), on the
+/// earliest ping deadline, or on the safety sweep. The sweep's first tick is the startup sweep.
+/// Every sweep rebuilds the ping deadlines from the database, so a missed signal loses nothing.
+pub async fn run_replies_loop(state: AppState, mut bus: ChannelsBus, cadence: Cadence) {
+    let mut pings = Pings::default();
+    let mut sweep = tokio::time::interval(cadence.safety_sweep);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let next_ping = pings.first();
+        // Without a deadline the arm is disabled; the placeholder instant is never awaited.
+        let deadline = next_ping.unwrap_or_else(Instant::now);
+        tokio::select! {
+            _ = sweep.tick() => sweep_logged(&state, &cadence, &mut pings).await,
+            _ = runs_changed(&mut bus.runs) => sweep_logged(&state, &cadence, &mut pings).await,
+            _ = tokio::time::sleep_until(deadline), if next_ping.is_some() => {
+                for run_id in pings.pop_due(Instant::now()) {
+                    if let Err(error) = fire_ping(&state, run_id, Utc::now()).await {
+                        tracing::warn!(%error, run_id, "could not send the still-working ping");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl SweepReport {
@@ -515,7 +552,32 @@ pub async fn prune(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
     Ok(removed)
 }
 
-/// Posts a system notice and mirrors `queue` notices to the channel. A2.
+/// A free-standing line for the conversation (not tied to a turn), as a `Class::Command` send.
+async fn enqueue_notice(
+    conn: &mut SqliteConnection,
+    key: &contract::ConversationKey,
+    text: String,
+    now: DateTime<Utc>,
+) -> sqlx::Result<i64> {
+    outbox::enqueue(
+        conn,
+        key,
+        NewAction::Send {
+            reply_to: None,
+            parts: vec![contract::OutPart::Text { text }],
+            buttons: None,
+            silent: false,
+        },
+        Class::Command,
+        None,
+        now,
+    )
+    .await
+}
+
+/// Posts a system notice. Only `kind == "queue"` in a conversation of a live channel is also
+/// enqueued for that channel, in the same transaction as the note; everything else is exactly
+/// `post_system`.
 pub async fn post_notice(
     state: &AppState,
     chat_id: &str,
@@ -523,22 +585,74 @@ pub async fn post_notice(
     from_run_id: i64,
     body: &str,
 ) -> sqlx::Result<i64> {
-    todo!()
+    let Some(key) = live_key(state, chat_id).filter(|_| kind == "queue") else {
+        return crate::chats::notices::post_system(&state.pool, chat_id, kind, from_run_id, body)
+            .await;
+    };
+    let mut tx = state.pool.begin().await?;
+    let id =
+        crate::chats::notices::post_system_in(&mut tx, chat_id, kind, from_run_id, body).await?;
+    enqueue_notice(&mut tx, &key, body.to_owned(), Utc::now()).await?;
+    tx.commit().await?;
+    outbox::wake(state, key.channel);
+    Ok(id)
 }
 
-/// "Queue paused (N messages) - write to continue", or `None` when nothing waits. A2.
+/// "The queue is paused; N message(s) waiting.", or `None` when nothing waits.
 pub async fn queue_paused_text(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<String>> {
-    todo!()
+    let waiting = crate::chats::queued(pool, chat_id).await?.len();
+    Ok((waiting > 0).then(|| strings::render(&Text::QueuePaused { waiting })))
 }
 
-/// Announces "queue paused (N)" once per pause. A2.
+/// Announces "queue paused (N)" once per pause: the mark and the enqueue share a transaction, and
+/// the text is enqueued only if this call inserted the mark. `true` when it announced. Does nothing
+/// for a chat outside a live channel or with nothing waiting.
 pub async fn announce_queue_paused(state: &AppState, chat_id: &str) -> sqlx::Result<bool> {
-    todo!()
+    let Some(key) = live_key(state, chat_id) else {
+        return Ok(false);
+    };
+    // Read before the transaction opens: the test pool has one connection.
+    let Some(text) = queue_paused_text(&state.pool, chat_id).await? else {
+        return Ok(false);
+    };
+    let now = Utc::now();
+    let mut tx = state.pool.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO channel_queue_pause_marks (channel, conversation, announced_at) \
+         VALUES (?, ?, ?) ON CONFLICT (channel, conversation) DO NOTHING",
+    )
+    .bind(key.channel)
+    .bind(&key.reference)
+    .bind(stamp(now))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if inserted {
+        enqueue_notice(&mut tx, &key, text, now).await?;
+    }
+    tx.commit().await?;
+    if inserted {
+        outbox::wake(state, key.channel);
+    }
+    Ok(inserted)
 }
 
-/// Clears the pause mark when the owner writes again. Real no-op placeholder that A2 replaces.
-pub async fn clear_queue_pause(_pool: &SqlitePool, _chat_id: &str) -> sqlx::Result<()> {
-    Ok(())
+/// Clears the pause mark when the owner writes again, so the next pause is announced again. Never
+/// fails the send: an error is logged (a stale mark only costs one missed announcement).
+pub async fn clear_queue_pause(state: &AppState, chat_id: &str) {
+    let Some(key) = contract::ConversationKey::parse(chat_id) else {
+        return;
+    };
+    if let Err(error) =
+        sqlx::query("DELETE FROM channel_queue_pause_marks WHERE channel = ? AND conversation = ?")
+            .bind(key.channel)
+            .bind(&key.reference)
+            .execute(&state.pool)
+            .await
+    {
+        tracing::warn!(%error, chat_id, "channels: could not clear the queue pause mark");
+    }
 }
 
 #[cfg(test)]
@@ -613,6 +727,113 @@ mod tests {
                 (action, class, subject, text)
             })
             .collect()
+    }
+
+    fn loop_cadence(sweep_ms: u64, ping_after_ms: u64) -> Cadence {
+        Cadence {
+            safety_sweep: Duration::from_millis(sweep_ms),
+            settle: Duration::from_millis(5),
+            second_look: Duration::from_millis(150),
+            budget_min_gap: Duration::ZERO,
+            ping_after: Duration::from_millis(ping_after_ms),
+        }
+    }
+
+    /// The senders stay with the test: a dropped sender closes its topic.
+    fn private_bus() -> (Vec<tokio::sync::watch::Sender<u64>>, ChannelsBus) {
+        let (tx, rx): (Vec<_>, Vec<_>) = (0..5).map(|_| tokio::sync::watch::channel(0u64)).unzip();
+        let mut rx = rx.into_iter();
+        let mut next = || rx.next().expect("five receivers");
+        let bus = ChannelsBus::from_receivers(next(), next(), next(), next(), next());
+        (tx, bus)
+    }
+
+    /// Polls until the outbox holds `n` rows (or 3 s pass) and returns what it holds.
+    async fn wait_outbox(
+        pool: &SqlitePool,
+        n: usize,
+    ) -> Vec<(String, String, Option<String>, String)> {
+        for _ in 0..300 {
+            let rows = outbox_rows(pool).await;
+            if rows.len() >= n {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        outbox_rows(pool).await
+    }
+
+    #[tokio::test]
+    async fn run_replies_loop_replies_on_runs_signal() {
+        let state = live_state().await;
+        let (tx, bus) = private_bus();
+        let task = tokio::spawn(run_replies_loop(
+            state.clone(),
+            bus,
+            loop_cadence(60_000, 600_000),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        insert_run(
+            &state.pool,
+            "telegram:77",
+            "completed",
+            None,
+            Some("All done."),
+        )
+        .await;
+        tx[4].send_modify(|n| *n += 1);
+        let rows = wait_outbox(&state.pool, 1).await;
+        task.abort();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].3, "All done.");
+    }
+
+    #[tokio::test]
+    async fn run_replies_loop_pings_at_the_deadline() {
+        let state = live_state().await;
+        let run = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        sqlx::query("UPDATE runs SET created_at = ? WHERE id = ?")
+            .bind(stamp(Utc::now()))
+            .bind(run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        turn_started(&state, run, "telegram:77").await;
+        let (_tx, bus) = private_bus();
+        // The deadline (between 0.2 and 1.2 s away) falls well before the 60 s safety sweep.
+        let task = tokio::spawn(run_replies_loop(
+            state.clone(),
+            bus,
+            loop_cadence(60_000, 1_200),
+        ));
+        let rows = wait_outbox(&state.pool, 2).await;
+        task.abort();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1].3, strings::render(&Text::StillWorking));
+    }
+
+    #[tokio::test]
+    async fn run_replies_loop_sweeps_without_any_signal() {
+        let state = live_state().await;
+        let (_tx, bus) = private_bus();
+        let task = tokio::spawn(run_replies_loop(
+            state.clone(),
+            bus,
+            loop_cadence(40, 600_000),
+        ));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        insert_run(
+            &state.pool,
+            "telegram:77",
+            "completed",
+            None,
+            Some("Swept."),
+        )
+        .await;
+        let rows = wait_outbox(&state.pool, 1).await;
+        task.abort();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].3, "Swept.");
     }
 
     #[tokio::test]
@@ -1089,5 +1310,152 @@ mod tests {
 
         let left: Vec<i64> = reply_rows(&state.pool).await.iter().map(|r| r.0).collect();
         assert_eq!(left, vec![open, recent, edge]);
+    }
+
+    async fn wait_message(pool: &SqlitePool, chat_id: &str, text: &str) {
+        crate::chats::enqueue(pool, chat_id, text, "channel", "[]")
+            .await
+            .unwrap();
+    }
+
+    async fn notice_bodies(pool: &SqlitePool, chat_id: &str) -> Vec<(String, String)> {
+        crate::chats::notices::for_chat(pool, chat_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|notice| (notice.kind, notice.body))
+            .collect()
+    }
+
+    async fn mark_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_queue_pause_marks")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_notice_mirrors_queue_kind_in_one_transaction() {
+        let state = live_state().await;
+
+        let id = post_notice(&state, "telegram:77", "queue", 5, "Not sent: busy.")
+            .await
+            .unwrap();
+
+        assert!(id > 0);
+        assert_eq!(
+            notice_bodies(&state.pool, "telegram:77").await,
+            vec![("queue".to_owned(), "Not sent: busy.".to_owned())]
+        );
+        let sent = outbox_rows(&state.pool).await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "send");
+        assert_eq!(sent[0].1, "command");
+        assert_eq!(sent[0].3, "Not sent: busy.");
+
+        // Both writes share one transaction: when the enqueue cannot happen, the note rolls back.
+        sqlx::query("DROP TABLE channel_outbox")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(
+            post_notice(&state, "telegram:77", "queue", 6, "again")
+                .await
+                .is_err()
+        );
+        assert_eq!(notice_bodies(&state.pool, "telegram:77").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_notice_is_post_system_for_other_chats_and_for_a_channel_not_live() {
+        let state = live_state().await;
+        post_notice(&state, "8d3f-shell-chat", "queue", 1, "shell")
+            .await
+            .unwrap();
+        // Another kind in a live channel chat is a plain note too.
+        post_notice(&state, "telegram:77", "restart", 2, "restarted")
+            .await
+            .unwrap();
+        assert_eq!(notice_bodies(&state.pool, "8d3f-shell-chat").await.len(), 1);
+        assert_eq!(
+            notice_bodies(&state.pool, "telegram:77").await,
+            vec![("restart".to_owned(), "restarted".to_owned())]
+        );
+
+        let cold = testkit::state().await;
+        post_notice(&cold, "telegram:77", "queue", 3, "cold")
+            .await
+            .unwrap();
+        assert_eq!(notice_bodies(&cold.pool, "telegram:77").await.len(), 1);
+
+        assert!(outbox_rows(&state.pool).await.is_empty());
+        assert!(outbox_rows(&cold.pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn announce_queue_paused_once_per_pause() {
+        let state = live_state().await;
+        wait_message(&state.pool, "telegram:77", "one").await;
+        wait_message(&state.pool, "telegram:77", "two").await;
+
+        assert!(announce_queue_paused(&state, "telegram:77").await.unwrap());
+        assert!(!announce_queue_paused(&state, "telegram:77").await.unwrap());
+
+        let sent = outbox_rows(&state.pool).await;
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1, "command");
+        assert_eq!(
+            sent[0].3,
+            strings::render(&Text::QueuePaused { waiting: 2 })
+        );
+        assert_eq!(mark_count(&state.pool).await, 1);
+
+        // No-ops: a shell chat, and a channel that is not live (nothing written, no mark).
+        wait_message(&state.pool, "8d3f-shell-chat", "x").await;
+        assert!(
+            !announce_queue_paused(&state, "8d3f-shell-chat")
+                .await
+                .unwrap()
+        );
+        let cold = testkit::state().await;
+        wait_message(&cold.pool, "telegram:77", "x").await;
+        assert!(!announce_queue_paused(&cold, "telegram:77").await.unwrap());
+        assert!(outbox_rows(&cold.pool).await.is_empty());
+        assert_eq!(mark_count(&cold.pool).await, 0);
+        assert_eq!(outbox_rows(&state.pool).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clear_queue_pause_rearms_the_announcement() {
+        let state = live_state().await;
+        wait_message(&state.pool, "telegram:77", "one").await;
+        assert!(announce_queue_paused(&state, "telegram:77").await.unwrap());
+
+        clear_queue_pause(&state, "telegram:77").await;
+        assert_eq!(mark_count(&state.pool).await, 0);
+        // Clearing a chat that is not a channel's, or has no mark, is harmless.
+        clear_queue_pause(&state, "8d3f-shell-chat").await;
+        clear_queue_pause(&state, "telegram:77").await;
+
+        assert!(announce_queue_paused(&state, "telegram:77").await.unwrap());
+        assert_eq!(outbox_rows(&state.pool).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_paused_text_is_none_when_nothing_waits() {
+        let state = live_state().await;
+        assert_eq!(
+            queue_paused_text(&state.pool, "telegram:77").await.unwrap(),
+            None
+        );
+        // Nothing waits, so nothing is announced and no mark is left behind.
+        assert!(!announce_queue_paused(&state, "telegram:77").await.unwrap());
+        assert_eq!(mark_count(&state.pool).await, 0);
+
+        wait_message(&state.pool, "telegram:77", "one").await;
+        assert_eq!(
+            queue_paused_text(&state.pool, "telegram:77").await.unwrap(),
+            Some(strings::render(&Text::QueuePaused { waiting: 1 }))
+        );
     }
 }

@@ -9,7 +9,7 @@ use super::seed::budget_paused;
 use crate::channels::outbox::{self, Class, NewAction};
 use crate::channels::strings::{self, Text};
 use crate::channels::{access, contract};
-use crate::governance::{autopilot, budget};
+use crate::governance::autopilot;
 use crate::state::AppState;
 
 /// Spaces out the spend-driven budget evaluations (`Cadence::budget_min_gap`). A configuration
@@ -126,8 +126,7 @@ pub(super) async fn announce_kill(
 
 /// Announces a budget pause or resume against `last_budget_paused` and records the new value. The
 /// evaluation is `seed::budget_paused` (no-limit shortcut, otherwise only
-/// `budget_permits_new_run`); the full snapshot is read only once a change is certain, to give the
-/// line the same figures `/budget` shows.
+/// `budget_permits_new_run`); the line carries no figures, so `budget::snapshot` is never read.
 pub(super) async fn announce_budget(
     state: &AppState,
     now: DateTime<Utc>,
@@ -146,11 +145,11 @@ pub(super) async fn announce_budget(
         return Ok(false);
     }
     let home = alert_home(state, primary, destination_ok).await?;
-    let text = if home.is_some() {
-        strings::render(&Text::Budget(budget::snapshot(pool, now).await?))
+    let text = strings::render(&if paused {
+        Text::BudgetPaused
     } else {
-        String::new()
-    };
+        Text::BudgetResumed
+    });
     let mut tx = pool.begin().await?;
     let announced = enqueue_alert(&mut tx, primary, &home, text, now).await?;
     sqlx::query("UPDATE channel_routing_state SET last_budget_paused = ? WHERE channel = ?")

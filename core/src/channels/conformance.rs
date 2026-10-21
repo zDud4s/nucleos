@@ -134,6 +134,28 @@ mod tests {
             .unwrap();
         assert_eq!(runs, 1);
 
+        // Starting the turn queued its "working" acknowledgement: it is delivered first.
+        let run_id: i64 = sqlx::query_scalar("SELECT id FROM runs WHERE chat_id = ?")
+            .bind("fake:c1")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        let first = adapter.poll(Duration::ZERO).await;
+        assert_eq!(first.status, StatusCode::OK);
+        let first_body = first.json();
+        assert_eq!(first_body["actions"].as_array().unwrap().len(), 1);
+        assert_eq!(first_body["actions"][0]["type"], "send");
+        assert_eq!(first_body["actions"][0]["conversation"], "c1");
+        assert_eq!(
+            first_body["actions"][0]["parts"][0]["text"],
+            strings::render(&Text::Working { turn: run_id })
+        );
+        let ack_id = first_body["actions"][0]["id"].as_i64().unwrap();
+        assert_eq!(
+            adapter.ack_ok(ack_id).await.json(),
+            json!({"state": "done"})
+        );
+
         // The long-poll is already open when the turn's reply is queued, and the wake ends it.
         let (polled, id) = tokio::join!(adapter.poll(Duration::from_secs(5)), async {
             tokio::time::sleep(Duration::from_millis(100)).await;

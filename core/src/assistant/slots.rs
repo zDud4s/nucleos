@@ -232,6 +232,38 @@ pub(super) async fn stop_turn_within(
     turn_id: i64,
     grace: std::time::Duration,
 ) -> Stopped {
+    let outcome = stop_turn_within_inner(state, turn_id, grace).await;
+    // The final reply goes out first and the pause notice after it, so the outbox reads in the order
+    // the person should. `reply_now` is the same compare-and-set the replies loop uses, so it does
+    // not answer twice. `NotRunning` stopped nothing and announces nothing.
+    if matches!(outcome, Stopped::Interrupted | Stopped::Killed) {
+        if let Some(chat) = stopped_chat(state, turn_id).await {
+            crate::channels::replies::reply_now(state, turn_id).await;
+            if let Err(error) = crate::channels::replies::announce_queue_paused(state, &chat).await
+            {
+                tracing::warn!(%error, chat, "could not announce the paused queue");
+            }
+        }
+    }
+    outcome
+}
+
+/// The conversation a turn belongs to, if it has one.
+async fn stopped_chat(state: &crate::state::AppState, turn_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
+        .bind(turn_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+async fn stop_turn_within_inner(
+    state: &crate::state::AppState,
+    turn_id: i64,
+    grace: std::time::Duration,
+) -> Stopped {
     let Ok(Some((chat_id, status))) = sqlx::query_as::<_, (Option<String>, String)>(
         "SELECT chat_id, status FROM runs WHERE id = ? AND mode = 'assistant'",
     )

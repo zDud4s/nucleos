@@ -449,7 +449,7 @@ async fn on_message(
     }
 
     let chat_id = key.chat_id();
-    replies::clear_queue_pause(&state.pool, &chat_id).await?;
+    replies::clear_queue_pause(state, &chat_id).await;
     match crate::assistant::send_or_queue(
         state,
         &chat_id,
