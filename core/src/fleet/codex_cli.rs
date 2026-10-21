@@ -803,7 +803,7 @@ mod tests {
         let line = rec(
             "response_item",
             json!({"type": "function_call", "name": "shell_command", "call_id": "c1",
-                   "arguments": "{\"command\":\"Get-ChildItem -Recurse\nSelect-Object -First 3\",\"workdir\":\"C:\\x\"}"}),
+                   "arguments": "{\"command\":\"Get-ChildItem -Recurse\\nSelect-Object -First 3\",\"workdir\":\"C:\\\\x\"}"}),
         );
         let got = mapped(&line);
         assert_eq!(got.len(), 1);
