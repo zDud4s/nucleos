@@ -79,3 +79,18 @@ func TestClassifyIsParseEntities(t *testing.T) {
 		t.Fatal("unrelated error recognised as parse-entities")
 	}
 }
+
+func TestClassifyEditTargetGone(t *testing.T) {
+	for _, desc := range []string{
+		"Bad Request: message to edit not found",
+		"Bad Request: MESSAGE_ID_INVALID",
+	} {
+		var ee *kit.ExecError
+		if !errors.As(Classify(&telegram.APIError{Method: "editMessageText", StatusCode: 400, Description: desc}), &ee) {
+			t.Fatalf("%q: not an *ExecError", desc)
+		}
+		if ee.Retryable || ee.Reason != "edit_target_gone" {
+			t.Fatalf("%q: got retryable=%v reason=%q", desc, ee.Retryable, ee.Reason)
+		}
+	}
+}

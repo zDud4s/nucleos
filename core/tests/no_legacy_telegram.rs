@@ -23,7 +23,10 @@ fn sources() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     collect(&root.join("src"), &mut files);
-    collect(&root.join("crates").join("nucleos-base").join("src"), &mut files);
+    collect(
+        &root.join("crates").join("nucleos-base").join("src"),
+        &mut files,
+    );
     files
 }
 

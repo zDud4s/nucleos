@@ -12,6 +12,15 @@ pub enum Text {
         turn: i64,
     },
     StillWorking,
+    /// Mid-turn progress: the latest assistant text, cut to `SNIPPET_MAX_CHARS`.
+    Progress {
+        turn: i64,
+        snippet: String,
+    },
+    /// A turn completed and its answer was delivered.
+    Finished {
+        turn: i64,
+    },
     /// Final answer when the turn produced no stdout: failed / timeout / cancelled / interrupted.
     TurnEnded {
         turn: i64,
@@ -88,6 +97,18 @@ pub enum Text {
     },
 }
 
+/// Longest progress snippet, in chars; keeps the whole message far below any channel's piece limit.
+const SNIPPET_MAX_CHARS: usize = 600;
+
+/// Trim, then cut to `SNIPPET_MAX_CHARS` chars (never inside a char), marking a cut with an ellipsis.
+fn truncate_snippet(s: &str) -> String {
+    let s = s.trim();
+    match s.char_indices().nth(SNIPPET_MAX_CHARS) {
+        None => s.to_string(),
+        Some((end, _)) => format!("{}…", s[..end].trim_end()),
+    }
+}
+
 fn usd(v: f64) -> String {
     format!("${v:.2}")
 }
@@ -132,6 +153,10 @@ pub fn render(text: &Text) -> String {
         Text::StillWorking => {
             "Still working on it - I'll reply here when the turn finishes.".to_string()
         }
+        Text::Progress { turn, snippet } => {
+            format!("Working on it (turn {turn}): {}", truncate_snippet(snippet))
+        }
+        Text::Finished { turn } => format!("Turn {turn} finished."),
         Text::TurnEnded { turn, status } => format!("Turn {turn} ended: {status}."),
         Text::Queued { position } => format!("Queued (position {position})."),
         Text::QueuePaused { waiting } => {
@@ -356,6 +381,11 @@ mod tests {
             Text::Help,
             Text::Working { turn: 3 },
             Text::StillWorking,
+            Text::Progress {
+                turn: 3,
+                snippet: "reading the file".into(),
+            },
+            Text::Finished { turn: 3 },
             Text::TurnEnded {
                 turn: 3,
                 status: "failed".into(),
@@ -418,6 +448,36 @@ mod tests {
                 assert!(!s.contains(pt), "{t:?} is not English: {s}");
             }
         }
+    }
+
+    #[test]
+    fn progress_renders_turn_and_snippet() {
+        let s = render(&Text::Progress {
+            turn: 4,
+            snippet: "  reading *the* file\n".into(),
+        });
+        assert_eq!(s, "Working on it (turn 4): reading *the* file");
+    }
+
+    #[test]
+    fn progress_truncates_on_a_char_boundary_and_stays_one_piece() {
+        let long = "é".repeat(5000);
+        let s = render(&Text::Progress {
+            turn: 1,
+            snippet: long,
+        });
+        let prefix = "Working on it (turn 1): ";
+        let body = s.strip_prefix(prefix).expect("prefix");
+        assert_eq!(body.chars().count(), SNIPPET_MAX_CHARS + 1, "{s}");
+        assert!(body.ends_with('…'), "{s}");
+        assert!(s.chars().count() < 1000, "one piece");
+        let exact = "x".repeat(SNIPPET_MAX_CHARS);
+        assert_eq!(truncate_snippet(&exact), exact);
+    }
+
+    #[test]
+    fn finished_renders_turn() {
+        assert_eq!(render(&Text::Finished { turn: 7 }), "Turn 7 finished.");
     }
 
     #[test]

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"nucleoschannelkit/contract"
 	"nucleoschannelkit/contract/fixtures"
@@ -162,6 +163,25 @@ func TestExecuteEditNotModified(t *testing.T) {
 	}
 	if len(refs) != 1 || refs[0] != "993" {
 		t.Fatalf("refs = %v", refs)
+	}
+}
+
+func TestExecuteEditTargetGone(t *testing.T) {
+	bot := &fakeMiscBot{editErrs: map[int]error{0: apiErr(400, "Bad Request: message to edit not found")}}
+	_, err := New(bot, nil).Execute(context.Background(), editWith("x", "993"))
+	if ee := execError(t, err); ee.Retryable || ee.Reason != "edit_target_gone" {
+		t.Fatalf("err = %#v", ee)
+	}
+	if len(bot.edits) != 1 {
+		t.Fatalf("edits = %+v", bot.edits)
+	}
+}
+
+func TestExecuteEditRateLimitedKeepsRetryAfter(t *testing.T) {
+	bot := &fakeMiscBot{editErrs: map[int]error{0: &telegram.APIError{Method: "editMessageText", StatusCode: 429, Description: "Too Many Requests: retry after 7", RetryAfter: 7 * time.Second}}}
+	_, err := New(bot, nil).Execute(context.Background(), editWith("x", "993"))
+	if ee := execError(t, err); !ee.Retryable || ee.Reason != "rate_limited" || ee.RetryAfter != 7*time.Second {
+		t.Fatalf("err = %#v", ee)
 	}
 }
 

@@ -230,6 +230,74 @@ async fn sweep_logged(state: &AppState, cadence: &Cadence, pings: &mut Pings) {
     }
 }
 
+/// Telegram drops the "typing" indicator after about 5 s, so a running turn re-emits it this often.
+const TYPING_EVERY: Duration = Duration::from_secs(4);
+
+/// A turn stops getting typing refreshes this long after it was first seen running.
+const TYPING_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// Per running turn: when it was first seen, and when its next refresh is due.
+struct TypingEntry {
+    started: Instant,
+    next: Instant,
+}
+
+/// Which running turns are due a typing refresh. Pure: the caller hands in the running set and the
+/// clock, so the cadence and the cap are testable without sleeping.
+#[derive(Default)]
+struct TypingRefresh(std::collections::BTreeMap<i64, TypingEntry>);
+
+impl TypingRefresh {
+    /// The runs of `running` due a refresh at `now`. A run that left `running` is forgotten (and
+    /// starts a fresh cap if it ever comes back); a run past the cap stays tracked but silent.
+    fn due(&mut self, running: &[i64], now: Instant) -> Vec<i64> {
+        self.0.retain(|run_id, _| running.contains(run_id));
+        let mut due = Vec::new();
+        for run_id in running {
+            let entry = self.0.entry(*run_id).or_insert(TypingEntry {
+                started: now,
+                next: now,
+            });
+            if now.saturating_duration_since(entry.started) >= TYPING_CAP || now < entry.next {
+                continue;
+            }
+            entry.next = now + TYPING_EVERY;
+            due.push(*run_id);
+        }
+        due
+    }
+}
+
+/// Re-emits "typing" for every acknowledged, unanswered turn that is still `running`. The status is
+/// read each time, so a turn that finished (or whose reply, and any pause notice after it, went out)
+/// stops at once. `outbox::typing` is a no-op for a channel that does not declare the capability.
+async fn refresh_typing(state: &AppState, tracker: &mut TypingRefresh, now: Instant) {
+    let rows: sqlx::Result<Vec<(i64, String, String)>> = sqlx::query_as(
+        "SELECT t.run_id, t.channel, t.conversation \
+         FROM channel_turn_replies t JOIN runs r ON r.id = t.run_id \
+         WHERE t.replied_at IS NULL AND r.status = 'running' ORDER BY t.run_id",
+    )
+    .fetch_all(&state.pool)
+    .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "channels: could not read the running turns for typing");
+            return;
+        }
+    };
+    let ids: Vec<i64> = rows.iter().map(|(run_id, _, _)| *run_id).collect();
+    let due = tracker.due(&ids, now);
+    for (run_id, channel, conversation) in rows {
+        if !due.contains(&run_id) {
+            continue;
+        }
+        if let Some(key) = key_of(&channel, &conversation) {
+            outbox::typing(state, &key);
+        }
+    }
+}
+
 /// Spawned once from `main.rs` when a channel instance exists.
 ///
 /// Wakes on a `runs` signal (no settle: a late reply is cheap to repeat and idempotent), on the
@@ -239,6 +307,9 @@ pub async fn run_replies_loop(state: AppState, mut bus: ChannelsBus, cadence: Ca
     let mut pings = Pings::default();
     let mut sweep = tokio::time::interval(cadence.safety_sweep);
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut typing_tick = tokio::time::interval(TYPING_EVERY);
+    typing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut typing = TypingRefresh::default();
     loop {
         let next_ping = pings.first();
         // Without a deadline the arm is disabled; the placeholder instant is never awaited.
@@ -246,6 +317,7 @@ pub async fn run_replies_loop(state: AppState, mut bus: ChannelsBus, cadence: Ca
         tokio::select! {
             _ = sweep.tick() => sweep_logged(&state, &cadence, &mut pings).await,
             _ = runs_changed(&mut bus.runs) => sweep_logged(&state, &cadence, &mut pings).await,
+            _ = typing_tick.tick() => refresh_typing(&state, &mut typing, Instant::now()).await,
             _ = tokio::time::sleep_until(deadline), if next_ping.is_some() => {
                 for run_id in pings.pop_due(Instant::now()) {
                     if let Err(error) = fire_ping(&state, run_id, Utc::now()).await {
@@ -834,6 +906,114 @@ mod tests {
         task.abort();
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].3, "Swept.");
+    }
+
+    /// A state whose `telegram` said hello, with or without the `typing` capability.
+    async fn hello_state(typing: bool) -> AppState {
+        let state = testkit::state().await;
+        seed_routing(&state).await;
+        let hello: contract::Hello = serde_json::from_value(serde_json::json!({
+            "kind": registry::by_id("telegram").unwrap().kind,
+            "version": "1.0.0",
+            "capabilities": { "max_text": 4096, "typing": typing },
+        }))
+        .unwrap();
+        registry::record_hello(&state, "telegram", &hello, now())
+            .await
+            .unwrap();
+        state
+    }
+
+    /// An acknowledged running turn of `telegram:77`, with the ack's typing already drained.
+    async fn typing_turn(state: &AppState) -> i64 {
+        let run = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(state, run, "telegram:77").await;
+        state.channels.outbox.take_typing("telegram");
+        run
+    }
+
+    #[tokio::test]
+    async fn typing_is_refreshed_every_four_seconds_while_running() {
+        let state = hello_state(true).await;
+        typing_turn(&state).await;
+        let mut tracker = TypingRefresh::default();
+        let t0 = Instant::now();
+        let mut emitted = Vec::new();
+        for second in 0..=12u64 {
+            refresh_typing(&state, &mut tracker, t0 + Duration::from_secs(second)).await;
+            if !state.channels.outbox.take_typing("telegram").is_empty() {
+                emitted.push(second);
+            }
+        }
+        assert_eq!(emitted, vec![0, 4, 8, 12]);
+    }
+
+    #[tokio::test]
+    async fn typing_stops_when_the_run_is_terminal() {
+        let state = hello_state(true).await;
+        let run = typing_turn(&state).await;
+        let mut tracker = TypingRefresh::default();
+        let t0 = Instant::now();
+        refresh_typing(&state, &mut tracker, t0).await;
+        assert_eq!(state.channels.outbox.take_typing("telegram"), ["77"]);
+
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        refresh_typing(&state, &mut tracker, t0 + Duration::from_secs(4)).await;
+        assert!(state.channels.outbox.take_typing("telegram").is_empty());
+    }
+
+    #[tokio::test]
+    async fn typing_stops_after_a_pause_notice() {
+        let state = hello_state(true).await;
+        let run = typing_turn(&state).await;
+        let mut tracker = TypingRefresh::default();
+        let t0 = Instant::now();
+        refresh_typing(&state, &mut tracker, t0).await;
+        assert_eq!(state.channels.outbox.take_typing("telegram"), ["77"]);
+
+        // The turn ends, its reply goes out ahead of the notice, then the pause is announced.
+        sqlx::query("UPDATE runs SET status = 'completed', stdout = 'Done.' WHERE id = ?")
+            .bind(run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        reply_now(&state, run).await;
+        state.channels.outbox.take_typing("telegram");
+        refresh_typing(&state, &mut tracker, t0 + Duration::from_secs(4)).await;
+        refresh_typing(&state, &mut tracker, t0 + Duration::from_secs(8)).await;
+        assert!(state.channels.outbox.take_typing("telegram").is_empty());
+    }
+
+    #[tokio::test]
+    async fn typing_is_not_refreshed_without_the_capability() {
+        let state = hello_state(false).await;
+        typing_turn(&state).await;
+        let mut tracker = TypingRefresh::default();
+        let t0 = Instant::now();
+        for second in [0, 4, 8] {
+            refresh_typing(&state, &mut tracker, t0 + Duration::from_secs(second)).await;
+        }
+        assert!(state.channels.outbox.take_typing("telegram").is_empty());
+    }
+
+    #[test]
+    fn typing_stops_after_the_fifteen_minute_cap() {
+        let mut tracker = TypingRefresh::default();
+        let t0 = Instant::now();
+        assert_eq!(tracker.due(&[1], t0), vec![1]);
+        let before_cap = t0 + TYPING_CAP - Duration::from_secs(1);
+        assert_eq!(tracker.due(&[1], before_cap), vec![1]);
+        assert!(tracker.due(&[1], t0 + TYPING_CAP).is_empty());
+        assert!(tracker.due(&[1], t0 + TYPING_CAP + TYPING_EVERY).is_empty());
+        // A second run seen late gets its own cap.
+        assert_eq!(
+            tracker.due(&[1, 2], t0 + TYPING_CAP + TYPING_EVERY),
+            vec![2]
+        );
     }
 
     #[tokio::test]
