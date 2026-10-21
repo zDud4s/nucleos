@@ -4,37 +4,30 @@ import { ArrowLeft, ArrowRight, Bot, Lock, LockOpen, Plus, RotateCw, Square, X }
 import { useProjects } from "../data/system";
 import {
   EMPTY_PROJECT_TABS as EMPTY,
-  findTabById,
   findTabBySessionId,
-  listenBrowserEvents,
-  newTab,
   tabBack,
   tabClose,
-  tabCreate,
   tabForward,
   tabNavigate,
   tabReload,
   tabStop,
   tabsShow,
   type Bounds,
-  type NewWindow,
-  type ProcessFailed,
   type Tab,
-  type TabMap,
-  type TabState,
 } from "../data/browser-tabs";
-import { ensureAgentEnv, reportAgentTabClosed } from "../data/browser-agent";
+import { reportAgentTabClosed } from "../data/browser-agent";
 import {
   consumeFocus,
   getBrowserState,
-  markCreated,
-  setAgentNotice,
+  openOwnerTab,
+  patchTab,
+  ensureProjectAgent,
   setBoundsProvider,
   setTabMap,
   unmarkCreated,
   useBrowserStore,
 } from "../data/browser-store";
-import { AgentControlBar } from "./AgentControlBar";
+import { AgentControlBar, useHumanDriving } from "./AgentControlBar";
 import { Button, ErrorNote, IconButton } from "../ui";
 import { useOverlayOpen } from "../ui/overlay";
 import { resolveOmnibox } from "./browser-omnibox";
@@ -57,9 +50,8 @@ export function BrowserPage() {
   const [picked, setPicked] = useState<string | null>(null);
   const project = picked ?? projects[0]?.project_id ?? null;
 
-  const { tabMap, created, focusIntent, agentNotice } = useBrowserStore();
+  const { tabMap, created, focusIntent, agentNotice, runtimeMissing } = useBrowserStore();
   const [highlightControl, setHighlightControl] = useState(false);
-  const [runtimeMissing, setRuntimeMissing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
@@ -74,6 +66,10 @@ export function BrowserPage() {
   const shownId = overlayOpen || runtimeMissing || !activeReady ? null : (active?.id ?? null);
   const tabCount = current.tabs.length;
   const failedActive = active?.failed ?? false;
+  // An agent tab belongs to the agent until the person presses [Take control]; a detached one
+  // (no session id, e.g. after a process failure) never becomes drivable again.
+  const humanDriving = useHumanDriving(active?.sessionId);
+  const agentLocked = active?.role === "agent" && !humanDriving;
 
   const readBounds = useCallback((): Bounds => {
     const el = placeholder.current;
@@ -155,96 +151,9 @@ export function BrowserPage() {
     setDraft(active?.url ?? "");
   }, [active?.id, active?.url]);
 
-  const patchTab = useCallback((tabId: string, patch: Partial<Tab>) => {
-    setTabMap((map) => {
-      const next: TabMap = {};
-      for (const [id, entry] of Object.entries(map)) {
-        next[id] = entry.tabs.some((tab) => tab.id === tabId)
-          ? { ...entry, tabs: entry.tabs.map((tab) => (tab.id === tabId ? { ...tab, ...patch } : tab)) }
-          : entry;
-      }
-      return next;
-    });
-  }, []);
-
-  const openTab = useCallback(
-    (projectId: string, url: string) => {
-      const id = crypto.randomUUID();
-      setTabMap((map) => {
-        const entry = map[projectId] ?? EMPTY;
-        return { ...map, [projectId]: { tabs: [...entry.tabs, newTab(id, url)], activeId: id } };
-      });
-      tabCreate(projectId, "owner", id, url, readBounds()).then(
-        () => {
-          // Skip a tab closed while it was being created.
-          const open = Object.values(getBrowserState().tabMap).some((entry) =>
-            entry.tabs.some((tab) => tab.id === id),
-          );
-          if (open) markCreated(id);
-        },
-        (e: unknown) => {
-        setError(message(e));
-        setTabMap((map) => {
-          const entry = map[projectId] ?? EMPTY;
-          const tabs = entry.tabs.filter((tab) => tab.id !== id);
-          return {
-            ...map,
-            [projectId]: {
-              tabs,
-              activeId: entry.activeId === id ? (tabs[tabs.length - 1]?.id ?? null) : entry.activeId,
-            },
-          };
-        });
-        },
-      );
-    },
-    [readBounds],
-  );
-
-  // The handlers read through a ref so one subscription lives as long as the page.
-  const handlers = useRef({ openTab, patchTab });
-  handlers.current = { openTab, patchTab };
-
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let gone = false;
-    listenBrowserEvents({
-      onTabState: (s: TabState) =>
-        handlers.current.patchTab(s.tabId, {
-          url: s.url,
-          title: s.title,
-          loading: s.loading,
-          canGoBack: s.canGoBack,
-          canGoForward: s.canGoForward,
-          secure: s.secure,
-        }),
-      onNewWindow: (w: NewWindow) => {
-        // An agent tab's popups are dropped: the agent owns that tab's navigation.
-        if (findTabById(getBrowserState().tabMap, w.fromTabId)?.tab.role === "agent") return;
-        const owner = Object.entries(getBrowserState().tabMap).find(([, entry]) =>
-          entry.tabs.some((tab) => tab.id === w.fromTabId),
-        );
-        if (owner !== undefined) handlers.current.openTab(owner[0], w.url);
-      },
-      onProcessFailed: (f: ProcessFailed) => {
-        handlers.current.patchTab(f.tabId, { failed: true });
-        const found = findTabById(getBrowserState().tabMap, f.tabId);
-        if (found?.tab.role === "agent" && found.tab.sessionId !== undefined) {
-          void reportAgentTabClosed(found.tab.sessionId);
-        }
-      },
-      onRuntimeMissing: () => setRuntimeMissing(true),
-    }).then(
-      (un) => {
-        if (gone) un();
-        else unlisten = un;
-      },
-      (e: unknown) => setError(message(e)),
-    );
-    return () => {
-      gone = true;
-      unlisten?.();
-    };
+  // The `browser://` listeners live in the store's bridge, so they run on every route.
+  const openTab = useCallback((projectId: string, url: string) => {
+    openOwnerTab(projectId, url).catch((e: unknown) => setError(message(e)));
   }, []);
 
   // Prepare the agent browser environment once per project; never blocks the owner's tabs.
@@ -253,9 +162,7 @@ export function BrowserPage() {
     if (project === null || ensured.current.has(project)) return;
     ensured.current.add(project);
     const target = project;
-    void ensureAgentEnv(target).then((result) => {
-      if (!result.ok) setAgentNotice(target, result.reason);
-    });
+    void ensureProjectAgent(target);
   }, [project]);
 
   function switchProject(next: string) {
@@ -359,22 +266,27 @@ export function BrowserPage() {
         <IconButton
           label="Back"
           icon={ArrowLeft}
-          disabled={active === null || !active.canGoBack}
+          disabled={active === null || agentLocked || !active.canGoBack}
           onClick={() => active && guard(tabBack(active.id))}
         />
         <IconButton
           label="Forward"
           icon={ArrowRight}
-          disabled={active === null || !active.canGoForward}
+          disabled={active === null || agentLocked || !active.canGoForward}
           onClick={() => active && guard(tabForward(active.id))}
         />
         {active?.loading ? (
-          <IconButton label="Stop" icon={Square} onClick={() => guard(tabStop(active.id))} />
+          <IconButton
+            label="Stop"
+            icon={Square}
+            disabled={agentLocked}
+            onClick={() => guard(tabStop(active.id))}
+          />
         ) : (
           <IconButton
             label="Reload"
             icon={RotateCw}
-            disabled={active === null}
+            disabled={active === null || agentLocked}
             onClick={() => active && guard(tabReload(active.id))}
           />
         )}
@@ -389,7 +301,7 @@ export function BrowserPage() {
             aria-label="Address"
             placeholder="Search or enter address"
             value={draft}
-            disabled={active === null}
+            disabled={active === null || agentLocked}
             onChange={(e) => setDraft(e.target.value)}
           />
         </form>
@@ -399,9 +311,12 @@ export function BrowserPage() {
       {active?.failed ? (
         <p className="browser-crashed" role="alert">
           <span>This tab crashed</span>
-          <Button type="button" onClick={() => reloadFailed(active.id)}>
-            Reload
-          </Button>
+          {active.role === "agent" ? null : (
+            // A crashed agent tab was reported closed: its session is gone, so it cannot be revived.
+            <Button type="button" onClick={() => reloadFailed(active.id)}>
+              Reload
+            </Button>
+          )}
         </p>
       ) : null}
       {active?.role === "agent" ? (

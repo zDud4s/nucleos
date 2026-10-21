@@ -14,6 +14,9 @@ const MAX_TAB_ID_LEN: usize = 64;
 pub(crate) fn agent_args(proxy_addr: &str, port: u16) -> Vec<String> {
     vec![
         format!("--proxy-server=http://{proxy_addr}"),
+        // Chromium bypasses the proxy for loopback by default; `<-loopback>` removes that implicit
+        // rule so an agent tab cannot reach local services outside the fence.
+        "--proxy-bypass-list=<-loopback>".to_string(),
         format!("--remote-debugging-port={port}"),
         "--remote-allow-origins=http://127.0.0.1:1".to_string(),
     ]
@@ -69,6 +72,13 @@ pub(crate) fn keepalive_label(project: &str) -> Result<String, String> {
     Ok(format!("browser-{}", keepalive_tab_id(project)?))
 }
 
+/// The keepalive webview label of a project for one environment generation. Each generation gets
+/// its own label, so a rebuild never collides with the label of a webview that is still closing.
+/// Still starts with the `browser-agent-keepalive-` form, so [`is_keepalive_tab_id`] matches it.
+pub(crate) fn keepalive_label_for(project: &str, generation: u32) -> Result<String, String> {
+    Ok(format!("{}-{generation}", keepalive_label(project)?))
+}
+
 /// Whether a tab id names a keepalive tab.
 pub(crate) fn is_keepalive_tab_id(tab_id: &str) -> bool {
     tab_id.starts_with(KEEPALIVE_TAB_PREFIX)
@@ -93,6 +103,7 @@ mod tests {
             agent_args("127.0.0.1:8080", 9222),
             vec![
                 "--proxy-server=http://127.0.0.1:8080".to_string(),
+                "--proxy-bypass-list=<-loopback>".to_string(),
                 "--remote-debugging-port=9222".to_string(),
                 "--remote-allow-origins=http://127.0.0.1:1".to_string(),
             ]
@@ -119,6 +130,19 @@ mod tests {
     fn keepalive_id_and_label() {
         assert_eq!(keepalive_tab_id("p1").unwrap(), "agent-keepalive-p1");
         assert_eq!(keepalive_label("p1").unwrap(), "browser-agent-keepalive-p1");
+    }
+
+    #[test]
+    fn keepalive_label_carries_the_generation() {
+        let g0 = keepalive_label_for("p1", 0).unwrap();
+        let g1 = keepalive_label_for("p1", 1).unwrap();
+        assert_eq!(g0, "browser-agent-keepalive-p1-0");
+        assert_ne!(g0, g1);
+        assert!(is_keepalive_tab_id(g1.strip_prefix("browser-").unwrap()));
+        assert_eq!(
+            keepalive_label_for("a b", 0),
+            Err("invalid_project".to_string())
+        );
     }
 
     #[test]

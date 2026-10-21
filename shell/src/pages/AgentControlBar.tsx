@@ -1,5 +1,5 @@
 // §spec pilar-de-browser
-import { useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import { isApiRefusal } from "../data/client";
 import { embeddedKeep, embeddedOwner } from "../data/browser-embedded";
 import type { Tab } from "../data/browser-tabs";
@@ -13,10 +13,33 @@ type Mode =
 // Per-session control state, kept at module level so it survives the bar being unmounted when the
 // person switches tabs or leaves the page. Keyed by session id.
 const modes = new Map<string, Mode>();
+const modeListeners = new Set<() => void>();
+
+function storeMode(sessionId: string, next: Mode): void {
+  modes.set(sessionId, next);
+  for (const listener of [...modeListeners]) listener();
+}
 
 /** Test hook: forget every remembered session state. */
 export function resetAgentControlState(): void {
   modes.clear();
+  for (const listener of [...modeListeners]) listener();
+}
+
+function subscribeModes(listener: () => void): () => void {
+  modeListeners.add(listener);
+  return () => modeListeners.delete(listener);
+}
+
+/**
+ * True while the person drives the session (after "Take control", before "Give back"). The page
+ * uses it to enable the address bar and navigation buttons, which stay disabled while the agent
+ * drives.
+ */
+export function useHumanDriving(sessionId: string | undefined): boolean {
+  return useSyncExternalStore(subscribeModes, () =>
+    sessionId === undefined ? false : modes.get(sessionId)?.kind === "human",
+  );
 }
 
 function hostsOf(chain: string[]): string[] {
@@ -63,7 +86,7 @@ export function AgentControlBar({ tab, highlight, onOpenInMyTabs }: Props) {
   const [notice, setNotice] = useState<string | null>(null);
 
   function setMode(next: Mode) {
-    if (sessionId !== undefined) modes.set(sessionId, next);
+    if (sessionId !== undefined) storeMode(sessionId, next);
     setModeState(next);
   }
 
