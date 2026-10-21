@@ -1229,7 +1229,7 @@ pub async fn require_token(
     // Any admitted request of a channel key is a sign of life for that adapter, not only the
     // long-poll (E.9). Refusals above never reach this line.
     if let Scope::Service(Service::Channel(id)) = &scope {
-        state.channels.presence.touch_poll(*id, chrono::Utc::now());
+        state.channels.presence.touch_poll(id, chrono::Utc::now());
     }
 
     // Handlers that care WHICH run is calling read this rather than believing the request body;

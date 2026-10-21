@@ -66,6 +66,7 @@ pub async fn install_from(
     let mut report = InstallReport::default();
 
     // Group by the first two path segments; the rest is the path inside the package.
+    #[allow(clippy::type_complexity)]
     let mut groups: BTreeMap<(String, String), Vec<(String, Vec<u8>)>> = BTreeMap::new();
     for (path, bytes) in files {
         let mut parts = path.splitn(3, '/');
@@ -84,6 +85,7 @@ pub async fn install_from(
     }
 
     // Validated references, in (name, version) order so the highest version upserts last.
+    #[allow(clippy::type_complexity)]
     let mut packages: Vec<(PackageRef, Vec<(String, Vec<u8>)>)> = Vec::new();
     for ((name, version), pkg_files) in groups {
         match PackageRef::parse(&format!("{name}@{version}")) {

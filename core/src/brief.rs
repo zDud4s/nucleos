@@ -700,7 +700,7 @@ async fn credit_item_by_id(pool: &SqlitePool, item_id: i64) -> sqlx::Result<u64>
     let item: Option<ItemCreditRow> = sqlx::query_as(
         "SELECT i.status, i.gate_status, i.gate_attempts, i.run_id,
                 j.gate_retries, j.status
-           FROM job_items i
+           FROM job_nodes i
            JOIN jobs j ON j.id = i.job_id
           WHERE i.id = ?",
     )
@@ -738,7 +738,7 @@ async fn credit_item_by_id(pool: &SqlitePool, item_id: i64) -> sqlx::Result<u64>
 /// Credit one job item once its item-level verdict is final.
 pub async fn credit_item(pool: &SqlitePool, job_id: i64, ordinal: i64) -> sqlx::Result<u64> {
     let item_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+        sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = ?")
             .bind(job_id)
             .bind(ordinal)
             .fetch_optional(pool)
@@ -789,7 +789,7 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
     let mut item_query = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT DISTINCT rk.item_id
            FROM run_knowledge rk
-           JOIN job_items i ON i.id = rk.item_id
+           JOIN job_nodes i ON i.id = rk.item_id
            JOIN jobs j ON j.id = i.job_id
           WHERE rk.credited_at IS NULL
             AND rk.item_id IS NOT NULL
@@ -983,9 +983,9 @@ mod tests {
         run_id: Option<i64>,
     ) -> sqlx::Result<i64> {
         let result = sqlx::query(
-            "INSERT INTO job_items
-               (job_id, ordinal, description, status, gate_status, gate_attempts, run_id)
-             VALUES (?, 0, 'item', ?, ?, ?, ?)",
+            "INSERT INTO job_nodes
+               (job_id, node_id, ordinal, description, status, gate_status, gate_attempts, run_id)
+             VALUES (?, 'implement', 0, 'item', ?, ?, ?, ?)",
         )
         .bind(job_id)
         .bind(status)
@@ -1877,7 +1877,7 @@ mod tests {
                 .await?;
         assert!(stamp.is_none());
 
-        sqlx::query("UPDATE job_items SET gate_attempts = 2 WHERE id = ?")
+        sqlx::query("UPDATE job_nodes SET gate_attempts = 2 WHERE id = ?")
             .bind(item_id)
             .execute(&pool)
             .await?;
@@ -1911,7 +1911,7 @@ mod tests {
                 record(&pool, run_id, Some(item_id), &[scored(knowledge_id, true)]).await?;
 
                 if superseded_first {
-                    sqlx::query("UPDATE job_items SET status = 'superseded' WHERE id = ?")
+                    sqlx::query("UPDATE job_nodes SET status = 'superseded' WHERE id = ?")
                         .bind(item_id)
                         .execute(&pool)
                         .await?;

@@ -7,7 +7,7 @@
 //! work is touching*, and the answer is a best-effort warning with three states. Putting them
 //! together would give a reader the impression that collision is as hard as a slot, and it is not.
 //!
-//! **Two sources, never merged.** The declared one (`job_items.files`) is intent and arrives in
+//! **Two sources, never merged.** The declared one (`job_nodes.files`) is intent and arrives in
 //! time for you to stop; the observed one is fact and arrives after execution has started. A
 //! warning that only comes once both worktrees have written to the same file comes late — hence
 //! both — and an intention presented as fact would be a lie — hence separate.
@@ -310,7 +310,7 @@ pub async fn measure(pool: &sqlx::SqlitePool) {
                       AND j.status IN ('completed','failed','gate_failed','gate_errored',
                                        'expired','stopped','cancelled','interrupted'))
                   WHEN 'item' THEN NOT EXISTS (
-                    SELECT 1 FROM job_items i JOIN jobs j ON j.id = i.job_id
+                    SELECT 1 FROM job_nodes i JOIN jobs j ON j.id = i.job_id
                      WHERE i.id = w.owner_id
                       AND j.status IN ('completed','failed','gate_failed','gate_errored',
                                        'expired','stopped','cancelled','interrupted'))
@@ -546,9 +546,9 @@ async fn item_families(
     project_id: &str,
 ) -> sqlx::Result<BTreeMap<i64, i64>> {
     let rows: Vec<(i64, i64)> = sqlx::query_as(
-        "SELECT job_items.id, job_items.job_id
-         FROM job_items
-         JOIN worktrees ON worktrees.owner_kind = 'item' AND worktrees.owner_id = job_items.id
+        "SELECT job_nodes.id, job_nodes.job_id
+         FROM job_nodes
+         JOIN worktrees ON worktrees.owner_kind = 'item' AND worktrees.owner_id = job_nodes.id
          WHERE worktrees.project_id = ? AND worktrees.removed_at IS NULL",
     )
     .bind(project_id)
@@ -634,7 +634,7 @@ async fn observed_sets(
 
 /// The predicted sets, and whether anybody predicted anything.
 ///
-/// Joined at read time and copied nowhere: `job_items.files` is already in SQLite, and holding it
+/// Joined at read time and copied nowhere: `job_nodes.files` is already in SQLite, and holding it
 /// here would give it a staleness window it does not have.
 ///
 /// Found through `'job'` worktrees: a run has no items, so it declares nothing. `files` is nullable
@@ -719,19 +719,19 @@ async fn declared_sets(
 /// `superseded` leaves for the same reason: a later round took its work over, and it never runs
 /// again. `revert_failed` is terminal too: a red gate whose branch could not be put back stops the
 /// job, so the item never writes again.
-const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_items.id, jobs.team_id,
-            job_items.files
+const DECLARED_SETS_SQL: &str = "SELECT worktrees.owner_id, job_nodes.id, jobs.team_id,
+            job_nodes.files
      FROM worktrees
-     JOIN job_items ON job_items.job_id = worktrees.owner_id
-     JOIN jobs ON jobs.id = job_items.job_id
+     JOIN job_nodes ON job_nodes.job_id = worktrees.owner_id
+     JOIN jobs ON jobs.id = job_nodes.job_id
      WHERE worktrees.project_id = ?
        AND worktrees.removed_at IS NULL
        AND worktrees.owner_kind = 'job'
-       AND job_items.status NOT IN ('implemented','passed','failed','cancelled',
+       AND job_nodes.status NOT IN ('implemented','passed','failed','cancelled',
                                     'gate_failed','gate_errored','skipped',
                                     'merging','conflicted','reverted','orphaned',
                                     'superseded','revert_failed')
-     ORDER BY worktrees.owner_id, job_items.id";
+     ORDER BY worktrees.owner_id, job_nodes.id";
 
 #[cfg(test)]
 mod tests {
@@ -829,7 +829,7 @@ mod tests {
     ) {
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at, team_id)
-             VALUES (?, ?, 'C:/somewhere', 'implementing', 5, '2026-08-08T00:00:00Z', ?)",
+             VALUES (?, ?, 'C:/somewhere', 'running', 5, '2026-08-08T00:00:00Z', ?)",
         )
         .bind(id)
         .bind(project_id)
@@ -879,8 +879,8 @@ mod tests {
         files: Option<&[&str]>,
     ) -> i64 {
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, files)
-             VALUES (?, ?, 'an item', ?, ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, files)
+             VALUES (?, 'implement', ?, 'an item', ?, ?)",
         )
         .bind(job_id)
         .bind(ordinal)

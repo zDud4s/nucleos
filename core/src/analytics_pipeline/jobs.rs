@@ -23,17 +23,17 @@ pub(crate) const JOB_ROWS_SQL: &str =
 /// `job::LIVE_STATUSES` spelled out (sqlx refuses SQL built at run time);
 /// `the_live_list_here_is_job_live_statuses` holds the two together.
 #[cfg(test)]
-const LIVE_SQL_LIST: &str =
-    "('planning','implementing','gating','reviewing','awaiting_approval','waiting')";
+const LIVE_SQL_LIST: &str = "('running','awaiting_approval','waiting')";
 pub(crate) const LIVE_JOBS_SQL: &str =
     "SELECT id, project_id, rule_name, budget_usd, status, wait_reason,
         round, max_rounds, dry_rounds, gate_retries, created_at FROM jobs
-  WHERE status IN ('planning','implementing','gating','reviewing','awaiting_approval','waiting')
+  WHERE status IN ('running','awaiting_approval','waiting')
     AND (?1 IS NULL OR project_id = ?1) ORDER BY id";
 pub(crate) const LIVE_ITEMS_SQL: &str =
-    "SELECT ji.job_id, ji.status, ji.gate_attempts FROM job_items ji
+    "SELECT ji.job_id, ji.status, ji.gate_attempts FROM job_nodes ji
   JOIN jobs j ON j.id = ji.job_id
-  WHERE j.status IN ('planning','implementing','gating','reviewing','awaiting_approval','waiting')
+  WHERE j.status IN ('running','awaiting_approval','waiting')
+    AND ji.ordinal IS NOT NULL
     AND (?1 IS NULL OR j.project_id = ?1)";
 
 /// At most this many ids in `stuck.jobs`.
@@ -389,8 +389,8 @@ mod tests {
 
     async fn item(pool: &SqlitePool, job_id: i64, ordinal: i64, status: &str, attempts: i64) {
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, gate_attempts)
-             VALUES (?, ?, 'work', ?, ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, gate_attempts)
+             VALUES (?, 'implement', ?, 'work', ?, ?)",
         )
         .bind(job_id)
         .bind(ordinal)
@@ -415,31 +415,31 @@ mod tests {
         // The commissioned lifetime is longer than the scheduled one, so the same age is fine.
         assert!(past_four_hours < COMMISSIONED_JOB_LIFETIME);
 
-        let old = insert(&pool, aged("a", "implementing", past_four_hours)).await;
+        let old = insert(&pool, aged("a", "running", past_four_hours)).await;
         let commissioned = Job {
             rule_name: None,
             budget_usd: Some(5.0),
-            ..aged("b", "implementing", past_four_hours)
+            ..aged("b", "running", past_four_hours)
         };
         insert(&pool, commissioned).await;
         let dry = Job {
             dry_rounds: DRY_ROUNDS_TO_STOP,
-            ..aged("c", "implementing", hour)
+            ..aged("c", "running", hour)
         };
         let dry = insert(&pool, dry).await;
         let exhausted = Job {
             round: 3,
             max_rounds: Some(3),
-            ..aged("d", "implementing", hour)
+            ..aged("d", "running", hour)
         };
         let exhausted = insert(&pool, exhausted).await;
         let retrying = Job {
             gate_retries: 1,
-            ..aged("e", "gating", hour)
+            ..aged("e", "running", hour)
         };
         let retrying = insert(&pool, retrying).await;
         item(&pool, retrying, 1, "gate_failed", 1).await;
-        let conflicted = insert(&pool, aged("f", "implementing", hour)).await;
+        let conflicted = insert(&pool, aged("f", "running", hour)).await;
         item(&pool, conflicted, 1, "conflicted", 0).await;
 
         // Everything above at once, but finished: not live, so nothing counts.
@@ -569,7 +569,7 @@ mod tests {
             finished("failed", "2026-10-14T10:00:00+00:00", None),
             finished("gate_errored", "2026-10-13T10:00:00+00:00", None),
             finished("expired", "2026-10-12T10:00:00+00:00", None),
-            job("q", "implementing", "2026-10-17T09:00:00+00:00"),
+            job("q", "running", "2026-10-17T09:00:00+00:00"),
             // The window before.
             finished("completed", "2026-10-08T10:00:00+00:00", None),
             finished("failed", "2026-10-09T10:00:00+00:00", None),
@@ -599,5 +599,28 @@ mod tests {
         assert_eq!(LIVE_SQL_LIST, list);
         assert!(LIVE_JOBS_SQL.contains(&list));
         assert!(LIVE_ITEMS_SQL.contains(&list));
+    }
+
+    /// A singleton node (the plan row) has no ordinal and is not a fan item: the per-job item
+    /// counts must not see it.
+    #[tokio::test]
+    async fn live_items_sql_ignores_singleton_rows() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = insert(&pool, aged("a", "running", Duration::hours(1))).await;
+        item(&pool, id, 0, "running", 0).await;
+        sqlx::query(
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status)
+             VALUES (?, 'plan', NULL, 'plan', 'passed')",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows: Vec<(i64, String, i64)> = sqlx::query_as(LIVE_ITEMS_SQL)
+            .bind(Option::<&str>::None)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, [(id, "running".to_owned(), 0)]);
     }
 }

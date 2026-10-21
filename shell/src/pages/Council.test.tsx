@@ -775,6 +775,7 @@ function agentRow(overrides: Record<string, unknown> = {}) {
     prompt: "be sceptical",
     engine: "claude",
     model: "claude-opus-5",
+    capabilities: ["mcp.nucleos"],
     tool_policy: "mcp_only",
     created_at: "2026-09-01T10:00:00Z",
     updated_at: "2026-09-01T10:00:00Z",

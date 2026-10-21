@@ -156,12 +156,7 @@ pub(super) async fn graph_rules(pool: &SqlitePool, job: &JobRow) -> Option<Graph
 
     // The same expression `ingest_replan` uses to hand out ordinals, asked here so the number the
     // plan is checked against is the number the plan will be given.
-    let first_ordinal: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(ordinal) + 1, 0) FROM job_items WHERE job_id = ?")
-            .bind(job.id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+    let first_ordinal: i64 = next_ordinal(pool, job.id, "implement").await.unwrap_or(0);
     Some(Graph {
         first_ordinal: first_ordinal.max(0) as usize,
         roster: roster_of(pool, &team).await,

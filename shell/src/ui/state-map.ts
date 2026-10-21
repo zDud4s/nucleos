@@ -176,6 +176,16 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     job_item_orphaned: { tone: "off", label: "job item never attempted" },
     job_gate_failed: { tone: "danger", label: "job gate failed" },
     job_gate_scoped: { tone: "info", label: "job gated by scope" },
+    // The graph walker's own lines (`execution/job/drive.rs`, `engine.rs`): a node that failed, a
+    // graph that cannot move or cannot be read, and the shadow check that the walker and the legacy
+    // driver disagreed — a fact for the owner, not a failure of the job.
+    job_node_failed: { tone: "danger", label: "job node failed" },
+    job_node_refused: { tone: "danger", label: "job node refused" },
+    job_node_retried: { tone: "info", label: "job node retried" },
+    job_node_invalid_output: { tone: "danger", label: "job node output invalid" },
+    job_graph_stuck: { tone: "danger", label: "job graph stuck" },
+    job_graph_unreadable: { tone: "danger", label: "job graph unreadable" },
+    job_walker_diverged: { tone: "info", label: "job walker diverged" },
     // A post-merge gate went red and was bisected to a merge (`verify/postgate.rs`). Nothing was
     // reverted, so it is a failure the owner must look at, not a recovered state.
     // A round in which no item passed has nothing for a review to judge, so none runs (job 27,
@@ -352,13 +362,11 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * fact, while Acting Green is work happening now.
    */
   job: {
-    // The six live statuses (`core/src/execution/job.rs`, `LIVE_STATUSES`). A job that is running is not
+    // The three live statuses (`core/src/execution/job/store.rs`, `LIVE_STATUSES`). A job that is running is not
     // an unknown word — firing the unmapped badge on the one job actually working teaches the
     // reader to ignore the device that exists to admit ignorance.
-    planning: { tone: "active", label: "planning" },
-    implementing: { tone: "active", label: "implementing" },
-    gating: { tone: "active", label: "running the gate" },
-    reviewing: { tone: "active", label: "reviewing" },
+    // What it is doing is a node (`job.node`), not a status word.
+    running: { tone: "active", label: "running" },
     awaiting_approval: { tone: "pending", label: "awaiting approval" },
     // Held by a brake — budget, a slot, or an exclusion. `wait_reason` says which.
     waiting: { tone: "paused", label: "held" },

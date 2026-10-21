@@ -488,7 +488,7 @@ mod tests {
     async fn add_job(pool: &SqlitePool, project_id: &str) -> i64 {
         sqlx::query(
             "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
-             VALUES (?, ?, 'implementing', 5, '2026-08-15T00:00:00Z')",
+             VALUES (?, ?, 'running', 5, '2026-08-15T00:00:00Z')",
         )
         .bind(project_id)
         .bind(format!("C:/projects/{project_id}"))

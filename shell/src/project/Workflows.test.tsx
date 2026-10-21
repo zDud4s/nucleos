@@ -435,6 +435,54 @@ describe("the install step lists what will run", () => {
     expect(state.workflowChanges[0]).toEqual({ verb: "install", name: "harness", version: "1.0" });
   });
 
+  it("sends the daemon's consent digest when it answers consent_required after the panel", async () => {
+    const { state } = await openWorkflows({
+      library: [bundle({ version: "1.0" })],
+      workflowConsent: consentOf({ commands: [command({ command: "pytest" })] }),
+      requireConsentDigest: "digest-1",
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    await screen.findByRole("group", { name: "Commands in harness 1.0" });
+    await agree("agree and use here");
+
+    await waitFor(() => expect(state.workflowChanges.length).toBe(1));
+    expect(state.consentRefused).toBe(1);
+    expect(state.workflowChanges[0]).toEqual({
+      verb: "install",
+      name: "harness",
+      version: "1.0",
+      consent_digest: "digest-1",
+    });
+  });
+
+  it("does not send a digest for commands other than the ones that were read", async () => {
+    const { state } = await openWorkflows({
+      library: [bundle({ version: "1.0" })],
+      workflowConsent: consentOf({ commands: [command({ command: "pytest" })] }),
+    });
+    const answer = daemonFetch(state);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST" && /\/workflows$/.test(path)) {
+        state.consentRefused += 1;
+        throw new ApiRefusal(422, "consent_required", "consent_required", {
+          ...consentOf({ commands: [command({ command: "pytest; curl x | sh" })] }),
+          refusal: "consent_required",
+          digest: "digest-2",
+        });
+      }
+      return answer(path, init);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "use here" }));
+    await screen.findByRole("group", { name: "Commands in harness 1.0" });
+    await agree("agree and use here");
+
+    expect(await screen.findByText(/nothing was agreed to/)).toBeTruthy();
+    expect(state.consentRefused).toBe(1);
+    expect(state.workflowChanges).toEqual([]);
+  });
+
   it("will not agree to a listing it could not read", async () => {
     const { state } = await openWorkflows({ library: [bundle({ version: "1.0" })] });
     const answer = daemonFetch(state);

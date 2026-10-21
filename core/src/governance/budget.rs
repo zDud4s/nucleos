@@ -1964,7 +1964,7 @@ mod tests {
         // `runs.job_id` references `jobs(id)` and the pool runs with foreign keys on.
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES (3, 'p', 'C:/work/repo', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+             VALUES (3, 'p', 'C:/work/repo', 'x', 'running', 5, 1, 1, '2026-09-27T00:00:00Z')",
         )
         .execute(&pool)
         .await
@@ -1998,7 +1998,7 @@ mod tests {
         // `runs.job_id` references `jobs(id)` and the pool runs with foreign keys on.
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES (4, 'p', 'C:/work/repo', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+             VALUES (4, 'p', 'C:/work/repo', 'x', 'running', 5, 1, 1, '2026-09-27T00:00:00Z')",
         )
         .execute(&pool)
         .await

@@ -534,7 +534,7 @@ mod tests {
     async fn node_run(pool: &sqlx::SqlitePool) -> i64 {
         let job = sqlx::query(
             "INSERT INTO jobs (project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES ('p', 'C:/work/repo', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+             VALUES ('p', 'C:/work/repo', 'x', 'running', 5, 1, 1, '2026-09-27T00:00:00Z')",
         )
         .execute(pool)
         .await

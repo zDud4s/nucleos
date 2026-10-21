@@ -13,6 +13,8 @@ use sqlx::SqlitePool;
 use crate::gate::GateOutcome;
 
 pub const ORIGIN_JOB_ITEM: &str = "job_item";
+/// A command node of a workflow graph that is not a fan item's gate; `origin_id` is the job id.
+pub const ORIGIN_JOB_NODE: &str = "job_node";
 pub const ORIGIN_RUN: &str = "run";
 pub const ORIGIN_MERGE: &str = "merge";
 /// A unit asked for through `verify`; `origin_id` is the `verify_requests` id (spec section 7).

@@ -174,7 +174,7 @@ async fn fact_for(conn: &mut SqliteConnection, row: &AskingRow) -> sqlx::Result<
     match row.cause.as_str() {
         "run_exhausted" => {
             let item: Option<(i64, String, i64, Option<String>)> = sqlx::query_as(
-                "SELECT ordinal, description, gate_attempts, gate_output FROM job_items WHERE id = ?",
+                "SELECT ordinal, description, gate_attempts, gate_output FROM job_nodes WHERE id = ?",
             )
             .bind(row.item_id)
             .fetch_optional(&mut *conn)
@@ -752,8 +752,8 @@ mod tests {
         let pool = pool().await;
         job(&pool, 7, "failed").await;
         let item: i64 = sqlx::query_scalar(
-            "INSERT INTO job_items (job_id, ordinal, description, status, gate_attempts, gate_output)
-             VALUES (7, 2, 'build the thing', 'gate_failed', 3, ?) RETURNING id",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, gate_attempts, gate_output)
+             VALUES (7, 'implement', 2, 'build the thing', 'gate_failed', 3, ?) RETURNING id",
         )
         .bind("error[E0425]: cannot find value `x` in this scope\n --> src/a.rs:1:1\nlots of raw lines")
         .fetch_one(&pool)
@@ -823,8 +823,8 @@ mod tests {
         let pool = pool().await;
         job(&pool, 7, "failed").await;
         let item: i64 = sqlx::query_scalar(
-            "INSERT INTO job_items (job_id, ordinal, description, status, gate_attempts)
-             VALUES (7, 1, ?, 'gate_failed', 2) RETURNING id",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, gate_attempts)
+             VALUES (7, 'implement', 1, ?, 'gate_failed', 2) RETURNING id",
         )
         .bind(format!("use {SECRET}"))
         .fetch_one(&pool)

@@ -248,10 +248,10 @@ fn validate(request: &AgentRequest) -> Result<(), AgentError> {
             "speciality must not be empty — it is what a director reads to delegate",
         ));
     }
-    if let Some(engine) = &request.engine {
-        if !ENGINES.contains(&engine.as_str()) {
-            return Err(AgentError::Invalid("engine must be claude, codex or local"));
-        }
+    if let Some(engine) = &request.engine
+        && !ENGINES.contains(&engine.as_str())
+    {
+        return Err(AgentError::Invalid("engine must be claude, codex or local"));
     }
     let mut caps = Vec::with_capacity(request.capabilities.len());
     for text in &request.capabilities {
@@ -457,7 +457,7 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError>
         "SELECT EXISTS (SELECT 1 FROM teams WHERE director_agent_id = ?)
              OR EXISTS (SELECT 1 FROM team_members WHERE agent_id = ?)
              OR EXISTS (SELECT 1 FROM team_items WHERE agent_id = ?)
-             OR EXISTS (SELECT 1 FROM job_items WHERE agent_id = ?)",
+             OR EXISTS (SELECT 1 FROM job_nodes WHERE agent_id = ?)",
     )
     .bind(id)
     .bind(id)
@@ -720,8 +720,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, agent_id)
-             VALUES (1, 0, 'an item', 'pending', ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, agent_id)
+             VALUES (1, 'implement', 0, 'an item', 'pending', ?)",
         )
         .bind(&member.id)
         .execute(&pool)

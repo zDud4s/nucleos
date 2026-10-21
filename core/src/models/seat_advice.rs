@@ -37,6 +37,10 @@ fn seat_query(prompt: &str) -> RouteQuery {
         stage: None,
         item: None,
         resume: false,
+        restrict_runners: None,
+        pin: None,
+        judged_later: false,
+        effort: None,
     }
 }
 

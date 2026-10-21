@@ -832,6 +832,15 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
                         %reason,
                         "a scheduled job asked for a team that does not exist and was not started"
                     ),
+                    // The project's pinned workflow has no usable graph. Nothing was created, and
+                    // retrying next tick would fail identically until somebody fixes the pin, so
+                    // the window stays spent and the reason is said out loud.
+                    crate::execution::job::JobStart::NoGraph(reason) => tracing::warn!(
+                        project_id = %project_id,
+                        rule_name = %rule.name,
+                        %reason,
+                        "a scheduled job's workflow has no usable graph and was not started"
+                    ),
                     // Past the INSERT: the job row exists and this cannot tell how far provisioning
                     // got. The window stays spent, because re-firing on a maybe is the duplicate
                     // the whole claim-first ordering exists to prevent.
@@ -1190,6 +1199,7 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: None,
+                graph: None,
             },
         )
         .await
@@ -1246,6 +1256,7 @@ mod tests {
                 max_rounds: None,
                 budget_usd: None,
                 team_id: None,
+                graph: None,
             },
         )
         .await
@@ -1356,7 +1367,7 @@ mod tests {
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(status, "planning");
+        assert_eq!(status, "running");
         assert_eq!(max_items, 3);
         // The rule's prompt is copied onto the job, not re-read at the plan node: the file can be
         // edited between now and then, and a job that changed shape mid-flight would plan something

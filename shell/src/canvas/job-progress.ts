@@ -190,11 +190,17 @@ export function readingOf(status: string): string {
  * The plan node's own state, read off the job rather than off any item.
  *
  * There is no item for it: `plan` is a node of the job's sequence, and what it produced is the
- * queue. `planning` is the only status that means it is in flight; once items exist it is done,
- * and a job that ended with no items at all never got one.
+ * queue. It is in flight while the job's current node is `plan`; a running job with no node and no
+ * items yet is the same thing seen before the node is recorded. Once items exist it is done, and a
+ * job that ended with no items at all never got one.
  */
+function isPlanning(job: Job, items: JobItem[]): boolean {
+  if (job.node) return job.node.node_id === PLAN_ID;
+  return job.status === "running" && items.length === 0;
+}
+
 function planNode(job: Job, items: JobItem[]): ProgressNode {
-  const running = job.status === "planning";
+  const running = isPlanning(job, items);
   const lifecycle: Lifecycle = running ? "running" : items.length > 0 ? "done" : "todo";
   return {
     id: PLAN_ID,
@@ -298,7 +304,12 @@ export function tallyOf(nodes: ProgressNode[]): Tally {
 }
 
 function readingFor(job: Job, items: JobItem[]): string {
-  if (job.status === "planning") return "working out what to do";
+  if (isPlanning(job, items)) return "working out what to do";
+  if (job.node && job.status === "running") {
+    const { node_id, ordinal, of } = job.node;
+    const where = ordinal !== null && of !== null ? `, item ${ordinal + 1} of ${of}` : "";
+    return `running ${node_id}${where}`;
+  }
   if (items.length === 0) return "its planner looked and found no work";
 
   const tally = tallyOf(items.map(itemNode));

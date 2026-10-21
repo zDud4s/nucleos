@@ -135,6 +135,39 @@ class AssemblePrompt(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("project.yaml", r.stderr)
 
+    def _synth_skill(self):
+        # A stub: the real synthesizer skill is authored beside this script, not needed to test it.
+        skill = self.root / ".claude" / "skills" / "synthesizer"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: synthesizer\n---\nFold the outputs.\n", encoding="utf-8")
+
+    def _prior(self):
+        prior = Path(self._tmp.name) / "prior.md"
+        prior.write_text("node outputs\n", encoding="utf-8")
+        return str(prior)
+
+    def test_synthesize_carries_exactly_skill_objective_and_prior_artifacts(self):
+        self._synth_skill()
+        r = self.run_script("--prior-artifacts", self._prior(), phase="synthesize")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        manifest = json.loads(
+            (self.state / "prompts" / "t1-synthesize-1.manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["prompt_sections"], ["phase_skill", "objective", "prior_artifacts"])
+        self.assertIn("wf-synthesizer", r.stdout)
+
+    def test_synthesize_rejects_a_packet(self):
+        self._synth_skill()
+        r = self.run_script("--packet", ".nucleos/workflow/packets/execute.md",
+                            "--prior-artifacts", self._prior(), phase="synthesize")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not allowed", r.stderr)
+
+    def test_synthesize_requires_prior_artifacts(self):
+        self._synth_skill()
+        r = self.run_script(phase="synthesize")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("requires `prior_artifacts`", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

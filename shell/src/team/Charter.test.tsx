@@ -67,9 +67,9 @@ async function renderCharter(
   daemon.apiFetch.mockImplementation(async (path: string) => {
     if (path === "/agents") {
       return [
-        { id: "controller", name: "controller", speciality: "", prompt: "", engine: "claude", model: null, tool_policy: "", created_at: "", updated_at: "" },
-        { id: "auditor", name: "auditor", speciality: "", prompt: "", engine: "claude", model: null, tool_policy: "", created_at: "", updated_at: "" },
-        { id: "tax-analyst", name: "tax-analyst", speciality: "", prompt: "", engine: "claude", model: null, tool_policy: "", created_at: "", updated_at: "" },
+        { id: "controller", name: "controller", speciality: "", prompt: "", engine: "claude", model: null, capabilities: [], tool_policy: "", created_at: "", updated_at: "" },
+        { id: "auditor", name: "auditor", speciality: "", prompt: "", engine: "claude", model: null, capabilities: [], tool_policy: "", created_at: "", updated_at: "" },
+        { id: "tax-analyst", name: "tax-analyst", speciality: "", prompt: "", engine: "claude", model: null, capabilities: [], tool_policy: "", created_at: "", updated_at: "" },
       ];
     }
     if (path === "/teams") return [state.team, ...(opts.others ?? [])];

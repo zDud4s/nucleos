@@ -42,6 +42,8 @@ function job(over: Partial<Job> = {}): Job {
     project_id: "nucleos",
     rule_name: null,
     status: "running",
+    node: null,
+    bundle: null,
     wait_reason: null,
     max_items: 8,
     created_at: "2026-09-01T00:00:00Z",
@@ -204,9 +206,19 @@ describe("job-progress — the graph", () => {
 });
 
 describe("job-progress — the plan node", () => {
-  it("is running while the job is planning", () => {
-    const progress = buildProgress(job({ status: "planning" }), []);
+  it("is running while the job's current node is plan", () => {
+    const progress = buildProgress(job({ node: { node_id: "plan", ordinal: null, of: null } }), []);
     expect(progress.nodes[0].lifecycle).toBe("running");
+  });
+
+  it("is running for a running job with no node and no items yet", () => {
+    const progress = buildProgress(job({ status: "running", node: null }), []);
+    expect(progress.nodes[0].lifecycle).toBe("running");
+  });
+
+  it("is not running once the job is on another node", () => {
+    const progress = buildProgress(job({ node: { node_id: "implement", ordinal: 0, of: 2 } }), []);
+    expect(progress.nodes[0].lifecycle).not.toBe("running");
   });
 
   it("is done once items exist", () => {
@@ -239,7 +251,13 @@ describe("job-progress — the tally", () => {
 
 describe("job-progress — the one-line reading", () => {
   it("says what a planning job is doing", () => {
-    expect(buildProgress(job({ status: "planning" }), []).reading).toBe("working out what to do");
+    const planning = job({ node: { node_id: "plan", ordinal: null, of: null } });
+    expect(buildProgress(planning, []).reading).toBe("working out what to do");
+  });
+
+  it("names the node and the item a running job is on", () => {
+    const working = job({ node: { node_id: "implement", ordinal: 1, of: 5 } });
+    expect(buildProgress(working, [item({ ordinal: 1 })]).reading).toBe("running implement, item 2 of 5");
   });
 
   it("says when the planner found nothing, which is not a failure", () => {

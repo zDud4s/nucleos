@@ -181,10 +181,11 @@ pub(super) async fn reconcile_after_restart(pool: &sqlx::SqlitePool) {
 ///
 /// Never stops the daemon: a package that cannot install is an agent that is unavailable, said out
 /// loud here, while the others install.
-pub(super) async fn install_agents(pool: &sqlx::SqlitePool) {
-    let Some(home) = machine_config::root().map(|root| root.join("agents")) else {
+pub(super) async fn install_agents(pool: &sqlx::SqlitePool, is_primary: bool) {
+    let Some(root) = machine_config::root() else {
         return;
     };
+    let home = root.join("agents");
     let report = agents::install::install_all(pool, &home).await;
     for error in &report.errors {
         tracing::warn!(package = %error.reference, "agent unavailable: {}", error.message);
@@ -194,5 +195,27 @@ pub(super) async fn install_agents(pool: &sqlx::SqlitePool) {
             installed = report.installed.len(),
             "installed agent packages"
         );
+    }
+    if !is_primary {
+        return;
+    }
+    // The harness record lives at `<root>/agents/harness-claude.json`, so `~/.nucleos` is the data dir.
+    match agents::harness::sync_installed(&home, &root) {
+        Ok(report) => {
+            for entry in &report.entries {
+                use agents::harness::Outcome;
+                if matches!(
+                    entry.outcome,
+                    Outcome::Edited | Outcome::EditedOrphan | Outcome::Collision
+                ) {
+                    tracing::warn!(
+                        file = %entry.file, package = ?entry.package_ref, outcome = ?entry.outcome,
+                        "agent harness file left untouched"
+                    );
+                }
+            }
+            tracing::info!("agent harness: {}", report.summary());
+        }
+        Err(error) => tracing::warn!(%error, "agent harness sync failed"),
     }
 }

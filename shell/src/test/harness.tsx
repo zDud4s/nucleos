@@ -203,7 +203,14 @@ export interface DaemonState {
   /** Every version the shell asked the consent route about, in order. */
   consentAsked: { name: string; version: string }[];
   /** Every pin change the shell asked for, as it asked for it. */
-  workflowChanges: { verb: string; name: string; version?: string }[];
+  workflowChanges: { verb: string; name: string; version?: string; consent_digest?: string }[];
+  /**
+   * When set, install, update and adopt answer `422 consent_required` (with this digest and
+   * `workflowConsent`) until the body carries `consent_digest` equal to it, like the daemon does.
+   */
+  requireConsentDigest: string | null;
+  /** Every `consent_required` refusal the fake sent, so a test can tell a retry from a first try. */
+  consentRefused: number;
   /** What every workflow-changing route refuses with, or `null` to accept. */
   workflowRefusal: { status: number; code: string; detail: string } | null;
   /**
@@ -231,7 +238,7 @@ export interface DaemonState {
    */
   detected: Detected | null;
   /** Every workflow adopted from a folder, as it was sent. */
-  adopted: { name: string; path: string }[];
+  adopted: { name: string; path: string; consent_digest?: string }[];
   /**
    * Every onboarding the shell asked for, as it asked for it. What `GET /projects/{id}/onboard`
    * answers is derived from this and from `detected`: a project in here reads as onboarded.
@@ -420,6 +427,8 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     workflowConsent: null,
     consentAsked: [],
     workflowChanges: [],
+    requireConsentDigest: null,
+    consentRefused: 0,
     workflowRefusal: null,
     pinsError: null,
     graph: null,
@@ -1280,12 +1289,36 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       }
       // The four pin changes, recorded as sent. One branch because they differ only in the verb,
       // and four near-copies is four places for one of them to stop matching the route.
+      const consentVerb = path.endsWith("/workflows/adopt")
+        ? "adopt"
+        : /\/workflows$/.test(path)
+          ? "install"
+          : path.endsWith("/update") && path.includes("/workflows/")
+            ? "update"
+            : null;
+      if (consentVerb !== null && state.requireConsentDigest !== null && typeof init.body === "string") {
+        const sent = JSON.parse(init.body) as { consent_digest?: string };
+        if (sent.consent_digest !== state.requireConsentDigest) {
+          state.consentRefused += 1;
+          const listing = state.workflowConsent ?? {
+            version: "1.0",
+            baseline: null,
+            commands: [],
+            removed: [],
+          };
+          throw new ApiRefusal(422, "consent_required", "consent_required", {
+            ...listing,
+            refusal: "consent_required",
+            digest: state.requireConsentDigest,
+          });
+        }
+      }
       if (path.endsWith("/workflows/adopt") && typeof init.body === "string") {
         if (state.workflowRefusal !== null) {
           const { status, code, detail } = state.workflowRefusal;
           throw new ApiRefusal(status, code, detail);
         }
-        state.adopted.push(JSON.parse(init.body) as { name: string; path: string });
+        state.adopted.push(JSON.parse(init.body) as { name: string; path: string; consent_digest?: string });
         return undefined;
       }
       // A node override is a workflow change too, but it names a node as well, so it is recorded
@@ -1318,6 +1351,9 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
           verb,
           name: (segments[at + 1] ?? body.name) as string,
           ...(body.version === undefined ? {} : { version: body.version as string }),
+          ...(body.consent_digest === undefined
+            ? {}
+            : { consent_digest: body.consent_digest as string }),
         });
         return undefined;
       }

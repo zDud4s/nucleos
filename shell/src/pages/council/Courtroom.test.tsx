@@ -428,8 +428,8 @@ describe("Dossier", () => {
     daemon.apiFetch.mockImplementation(async (path: string) => {
       if (path === "/agents") {
         return [
-          { id: "ag-1", name: "the sceptic", speciality: "", prompt: "", engine: "claude", model: "claude-opus-5", tool_policy: "mcp_only", created_at: "", updated_at: "" },
-          { id: "ag-2", name: "the mute", speciality: "", prompt: "", engine: "claude", model: null, tool_policy: "mcp_only", created_at: "", updated_at: "" },
+          { id: "ag-1", name: "the sceptic", speciality: "", prompt: "", engine: "claude", model: "claude-opus-5", capabilities: ["mcp.nucleos"], tool_policy: "mcp_only", created_at: "", updated_at: "" },
+          { id: "ag-2", name: "the mute", speciality: "", prompt: "", engine: "claude", model: null, capabilities: ["mcp.nucleos"], tool_policy: "mcp_only", created_at: "", updated_at: "" },
         ];
       }
       if (path === "/assistant/models") {

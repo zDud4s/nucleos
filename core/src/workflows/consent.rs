@@ -168,10 +168,114 @@ pub fn consent(
     }
 }
 
+/// A fingerprint of what a person is being asked to agree to: the ordered `(node, command, cwd,
+/// change)` tuples. Hex sha256.
+///
+/// The shell sends back the digest of the listing it displayed; the daemon recomputes it at POST
+/// time, so a bundle edited between the listing and the install no longer matches and the person is
+/// asked again. Every field is length-prefixed, so no two different listings share an encoding.
+pub fn digest(consent: &Consent) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    for line in &consent.commands {
+        field(&mut hasher, line.node.as_bytes());
+        field(&mut hasher, line.command.as_bytes());
+        // `None` and `Some("")` must differ: a leading marker byte says which.
+        match &line.cwd {
+            None => hasher.update([0u8]),
+            Some(cwd) => {
+                hasher.update([1u8]);
+                field(&mut hasher, cwd.as_bytes());
+            }
+        }
+        let change: &[u8] = match line.change {
+            CommandChange::New => b"new",
+            CommandChange::Unchanged => b"unchanged",
+            CommandChange::Changed => b"changed",
+        };
+        field(&mut hasher, change);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Whether a person has anything to agree to: some command node is new or changed.
+///
+/// `project:<name>` references are listed verbatim but run the project's own definition, so they
+/// are never a reason to ask: they are `Unchanged` whenever the reference is the same, and a new
+/// one is excluded here.
+pub fn needs_ack(consent: &Consent) -> bool {
+    consent.commands.iter().any(|line| {
+        line.change != CommandChange::Unchanged
+            && !matches!(
+                super::graph::command_source(&line.command),
+                super::graph::CommandSource::Project(_)
+            )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workflows::graph;
+
+    #[test]
+    fn the_digest_follows_the_commands_and_nothing_else() {
+        let a = consent(
+            "1.0",
+            &graph_of("nodes:\n  - {id: t, type: command, command: pytest}\n"),
+            None,
+            &BTreeMap::new(),
+        );
+        let same = consent(
+            "9.9",
+            &graph_of("nodes:\n  - {id: t, type: command, command: pytest, label: Other}\n"),
+            None,
+            &BTreeMap::new(),
+        );
+        let edited = consent(
+            "1.0",
+            &graph_of("nodes:\n  - {id: t, type: command, command: \"pytest; id\"}\n"),
+            None,
+            &BTreeMap::new(),
+        );
+        let elsewhere = consent(
+            "1.0",
+            &graph_of("nodes:\n  - {id: t, type: command, command: pytest, cwd: sub}\n"),
+            None,
+            &BTreeMap::new(),
+        );
+        assert_eq!(digest(&a), digest(&same));
+        assert_ne!(digest(&a), digest(&edited));
+        assert_ne!(digest(&a), digest(&elsewhere));
+        assert_eq!(digest(&a).len(), 64);
+    }
+
+    #[test]
+    fn the_digest_tells_a_new_command_from_an_unchanged_one() {
+        let old = graph_of("nodes:\n  - {id: t, type: command, command: pytest}\n");
+        let first = consent("1.0", &old, None, &BTreeMap::new());
+        let update = consent(
+            "1.0",
+            &old,
+            Some(("1.0", "library", &old)),
+            &BTreeMap::new(),
+        );
+        assert_ne!(digest(&first), digest(&update));
+        assert!(needs_ack(&first));
+        assert!(!needs_ack(&update));
+    }
+
+    #[test]
+    fn a_project_reference_alone_needs_no_ack() {
+        let target = graph_of("nodes:\n  - {id: g, type: command, command: \"project:gate\"}\n");
+        assert!(!needs_ack(&consent("1.0", &target, None, &BTreeMap::new())));
+    }
 
     fn graph_of(yaml: &str) -> Graph {
         graph::parse(yaml).expect("the test graph parses")

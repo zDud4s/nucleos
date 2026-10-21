@@ -677,6 +677,357 @@ mod tests {
         assert_eq!(next, 4);
     }
 
+    /// Every stored value of `table`, quoted and joined, keyed by `id` — a byte-level snapshot of
+    /// the named columns.
+    async fn rows_of(pool: &SqlitePool, table: &str, columns: &[&str]) -> Vec<(i64, String)> {
+        let quoted = columns
+            .iter()
+            .map(|c| format!("quote({c})"))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT id, {quoted} FROM {table} ORDER BY id"
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The constraints `0229` promises, whichever way the table was filled.
+    async fn assert_job_nodes_keys(pool: &SqlitePool) {
+        let insert = |node: &'static str, ordinal: Option<i64>, round: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, round) \
+                     VALUES (1, ?, ?, 'x', 'pending', ?)",
+                )
+                .bind(node)
+                .bind(ordinal)
+                .bind(round)
+                .execute(&pool)
+                .await
+            }
+        };
+        // An item ordinal is unique per (job, node), not per job.
+        assert!(insert("implement", Some(0), 0).await.is_err());
+        insert("review", Some(0), 0).await.unwrap();
+        // A node outside a fan-out is unique per (job, node, round).
+        insert("plan", None, 0).await.unwrap();
+        assert!(insert("plan", None, 0).await.is_err());
+        insert("plan", None, 1).await.unwrap();
+    }
+
+    /// Migration `0229` renames `job_items` to `job_nodes`, adds `node_id` and makes `ordinal`
+    /// nullable. Other tables hold the row ids and name the table in `REFERENCES`: every id must
+    /// survive, and the references must follow the rename.
+    #[tokio::test]
+    async fn migration_0229_renames_job_items_and_keeps_every_id_and_reference() {
+        let pool = crate::testdb::pool_migrated_through(228).await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO agents (id, name, speciality, prompt, created_at, updated_at) \
+             VALUES ('a1', 'a1', 's', 'p', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO jobs (project_id, project_root, status, max_items, created_at) \
+                 VALUES ('p', 'C:/work', 'implementing', 5, '2026-10-01T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Ids 1..4; `full` rows have every column non-NULL.
+        for (job, ordinal, full) in [
+            (1_i64, 0_i64, false),
+            (1, 1, true),
+            (1, 2, false),
+            (2, 0, true),
+        ] {
+            sqlx::query(
+                "INSERT INTO job_items (job_id, ordinal, description, status, run_id, gate_status, \
+                 checkpoint_sha, round, files, gate_attempts, gate_output, merge_base_sha, \
+                 depends_on, agent_id) \
+                 VALUES (?, ?, 'item', 'passed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(job)
+            .bind(ordinal)
+            .bind(full.then_some(1_i64))
+            .bind(full.then_some("passed"))
+            .bind(full.then_some("abc123"))
+            .bind(if full { 1_i64 } else { 0 })
+            .bind(full.then_some("[\"a\"]"))
+            .bind(if full { 2_i64 } else { 0 })
+            .bind(full.then_some("gate said no"))
+            .bind(full.then_some("def456"))
+            .bind(full.then_some("[0]"))
+            .bind(full.then_some("a1"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at, item_id) \
+             VALUES (1, 'q', 'completed', 'now', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let known: i64 = sqlx::query_scalar(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, \
+             created_at) VALUES ('semantic', 'project', 'p', 'run', 'memory', 't', 'b', 'active', \
+             '2026-10-01T00:00:00Z') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO run_knowledge (run_id, knowledge_id, shown, s_fts, s_scope, s_structure, \
+             s_recency, s_use, at, item_id) \
+             VALUES (1, ?, 1, 0.0, 1.0, 0.0, 0.0, 0.0, '2026-10-01T00:00:00Z', 3)",
+        )
+        .bind(known)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO project_slots (project_id, slot, owner_kind, owner_id, claimed_at) \
+             VALUES ('p', 0, 'item', 2, '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, \
+             created_at) VALUES ('item', 2, 'p', 'C:/work', 'C:/wt/2', 'wt/2', '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        const COLUMNS: [&str; 14] = [
+            "job_id",
+            "ordinal",
+            "description",
+            "status",
+            "run_id",
+            "gate_status",
+            "checkpoint_sha",
+            "round",
+            "files",
+            "gate_attempts",
+            "gate_output",
+            "merge_base_sha",
+            "depends_on",
+            "agent_id",
+        ];
+        let before = rows_of(&pool, "job_items", &COLUMNS).await;
+        assert_eq!(before.len(), 4);
+
+        crate::testdb::apply_migration(&pool, 229).await;
+
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('job_items', 'job_nodes')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, ["job_nodes"]);
+        assert_eq!(rows_of(&pool, "job_nodes", &COLUMNS).await, before);
+        let node_ids: Vec<String> = sqlx::query_scalar("SELECT node_id FROM job_nodes ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(node_ids, ["implement"; 4]);
+
+        let violations: Vec<String> =
+            sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        // The rename-first trick: the children now name the new table.
+        for child in ["runs", "run_knowledge"] {
+            let parent: String = sqlx::query_scalar(
+                "SELECT \"table\" FROM pragma_foreign_key_list(?) WHERE \"from\" = 'item_id'",
+            )
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(parent, "job_nodes", "{child}.item_id");
+        }
+        for (table, owner) in [("project_slots", 2_i64), ("worktrees", 2)] {
+            let resolved: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} t JOIN job_nodes n ON n.id = t.owner_id \
+                 WHERE t.owner_kind = 'item' AND n.id = {owner}"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(resolved, 1, "{table}");
+        }
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+
+        assert_job_nodes_keys(&pool).await;
+    }
+
+    /// The same migration on a database with no rows builds the same keys.
+    #[tokio::test]
+    async fn migration_0229_on_an_empty_database_builds_the_same_schema() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at) \
+             VALUES ('p', 'C:/work', 'running', 5, '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status) \
+             VALUES (1, 'implement', 0, 'item', 'pending')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_job_nodes_keys(&pool).await;
+        let old: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = 'job_items'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(old, 0);
+    }
+
+    /// Migration `0230` takes the phase names out of `jobs.status`, gives every live job already
+    /// past planning a passed `plan` node row, drops the write-only `stage_cursor` and adds the
+    /// graph snapshot columns.
+    #[tokio::test]
+    async fn migration_0230_rewrites_phases_backfills_plan_rows_and_drops_stage_cursor() {
+        let pool = crate::testdb::pool_migrated_through(229).await;
+        // (status, resume_status, items, expected status, expected resume, plan row expected)
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, Option<&str>, i64, &str, Option<&str>, bool); 11] = [
+            ("planning", None, 0, "running", None, false),
+            ("implementing", None, 2, "running", None, true),
+            ("implementing", None, 0, "running", None, true),
+            ("gating", None, 1, "running", None, true),
+            ("reviewing", None, 1, "running", None, true),
+            (
+                "waiting",
+                Some("planning"),
+                0,
+                "waiting",
+                Some("running"),
+                false,
+            ),
+            (
+                "waiting",
+                Some("implementing"),
+                1,
+                "waiting",
+                Some("running"),
+                true,
+            ),
+            (
+                "awaiting_approval",
+                Some("gating"),
+                1,
+                "awaiting_approval",
+                Some("running"),
+                true,
+            ),
+            ("completed", None, 1, "completed", None, false),
+            ("cancelled", None, 0, "cancelled", None, false),
+            ("interrupted", None, 1, "interrupted", None, false),
+        ];
+        for (index, (status, resume, items, ..)) in cases.iter().enumerate() {
+            let job = index as i64 + 1;
+            sqlx::query(
+                "INSERT INTO jobs (id, project_id, project_root, prompt, status, resume_status, \
+                 max_items, head_sha, stage_cursor, created_at) \
+                 VALUES (?, 'p', 'C:/work', 'do it', ?, ?, 5, 'sha1', ?, '2026-10-01T00:00:00Z')",
+            )
+            .bind(job)
+            .bind(status)
+            .bind(resume)
+            .bind(if index == 1 { 3_i64 } else { 0 })
+            .execute(&pool)
+            .await
+            .unwrap();
+            for ordinal in 0..*items {
+                sqlx::query(
+                    "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status) \
+                     VALUES (?, 'implement', ?, 'item', 'pending')",
+                )
+                .bind(job)
+                .bind(ordinal)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        crate::testdb::apply_migration(&pool, 230).await;
+
+        for (index, (status, _, _, want_status, want_resume, want_plan)) in cases.iter().enumerate()
+        {
+            let job = index as i64 + 1;
+            let (got_status, got_resume, prompt, head): (String, Option<String>, String, String) =
+                sqlx::query_as(
+                    "SELECT status, resume_status, prompt, head_sha FROM jobs WHERE id = ?",
+                )
+                .bind(job)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(got_status, *want_status, "job {job} ({status})");
+            assert_eq!(got_resume.as_deref(), *want_resume, "job {job} resume");
+            assert_eq!((prompt.as_str(), head.as_str()), ("do it", "sha1"));
+            let plan_rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM job_nodes WHERE job_id = ? AND node_id = 'plan' \
+                 AND ordinal IS NULL AND status = 'passed' AND round = 0",
+            )
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                plan_rows,
+                i64::from(*want_plan),
+                "job {job} ({status}) plan row"
+            );
+        }
+
+        let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('jobs')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(!columns.contains(&"stage_cursor".to_owned()));
+        for added in ["graph_snapshot", "graph_bundle_ref", "graph_bundle_hash"] {
+            assert!(columns.contains(&added.to_owned()), "{added}");
+        }
+        let filled: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM jobs WHERE graph_snapshot IS NOT NULL \
+             OR graph_bundle_ref IS NOT NULL OR graph_bundle_hash IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(filled, 0);
+    }
+
     /// Migrations `0198` and `0202` index the `runs` lookups that were full scans of a 229 MB table.
     #[tokio::test]
     async fn the_runs_lookups_by_job_status_and_project_use_an_index() {
