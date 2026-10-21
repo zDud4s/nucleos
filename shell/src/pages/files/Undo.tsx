@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef } from "react";
 import { TRASH_RETENTION_DAYS, fileName, parentPath, trashDaysLeft, useTrash, type Trashed } from "../../data/files";
 import { Button, Count, Quiet, RelativeTime, Row, Rows, StaleNote } from "../../ui";
-import { RefusalOrError, TRASH_SENTENCES, type Undo } from "./shared";
+import { RefusalOrError, TRASH_SENTENCES, onEscape, type Undo } from "./shared";
 
 /* -------------------------------------------------------------- delete -- */
 
@@ -43,9 +43,7 @@ export function NotEmptyNote({
       className="fi-ask"
       role="group"
       aria-labelledby={headingId}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") onCancel();
-      }}
+      onKeyDown={onEscape(onCancel)}
     >
       <p id={headingId}>{one ? "This folder still has things inside:" : "These folders still have things inside:"}</p>
       <ul className="fi-ask-list">

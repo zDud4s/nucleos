@@ -370,19 +370,6 @@
   color: var(--text-muted);
 }
 
-/* A warning that changes what a button does ("approving resumes nothing"): the awaiting tone of
-   the system, not the muted help-line a hint gets. Its first word is a fact, so colour is not
-   the only signal. */
-.waiting-notice {
-  margin: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--tone-awaiting-border);
-  border-radius: var(--radius-md);
-  background: var(--tone-awaiting-bg);
-  color: var(--tone-awaiting-fg);
-  font-size: var(--text-sm);
-}
-
 /* The line that asks the reader to act, against the ones that say somebody else is acting. */
 .waiting-hint-yours {
   color: var(--text);

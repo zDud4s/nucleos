@@ -30,7 +30,7 @@ export function WheelRequestSection({ view }: { view: Reading<WheelRequest> }) {
         <>
           {approve.isSuccess && approve.variables?.seat === "shell" && (
             <p className="waiting-outcome" role="status">
-              the shell has the wheel — <Link to="/web">drive it on Web</Link>
+              the shell has the wheel: <Link to="/web">drive it on Web</Link>
             </p>
           )}
           <DecisionNotes

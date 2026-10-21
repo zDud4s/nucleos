@@ -10,6 +10,7 @@ import {
 } from "../data/project-readings";
 import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
+import { clockText } from "../lib/when";
 import { ErrorNote, Section, StaleNote, StatCard } from "../ui";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
@@ -307,16 +308,11 @@ function Readings({ projectId }: { projectId: string }) {
         <StaleNote dataUpdatedAt={readings.dataUpdatedAt} />
       ) : (
         <p className="text-xs text-text-faint">
-          Last {data.window_days} days, read at {clockOf(readings.dataUpdatedAt)}.
+          Last {data.window_days} days, read at {clockText(readings.dataUpdatedAt)}.
         </p>
       )}
     </div>
   );
-}
-
-/** Local wall-clock, 24-hour — the same reading `StaleNote` gives, so the two lines agree. */
-function clockOf(at: number): string {
-  return new Date(at).toTimeString().slice(0, 5);
 }
 
 /**

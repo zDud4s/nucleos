@@ -1,6 +1,7 @@
 // §spec mapa-do-projeto
 import { useMemo, type ReactNode } from "react";
 import { DAEMON_NAME } from "../copy";
+import { pluralWord } from "../lib/plural";
 import type { ForeignFile, MapImport, MapModule, Seam } from "../data/project-map";
 import { buildSides, isBlindSpot, type Sides, type Unread } from "./map-sides";
 import { Button, Quiet, Row, Rows, StatCard } from "../ui";
@@ -85,8 +86,6 @@ interface Finding {
   action?: ReactNode;
 }
 
-const plural = (count: number, one: string, many: string) => (count === 1 ? one : many);
-
 export function Boundary({
   modules,
   imports,
@@ -125,7 +124,7 @@ export function Boundary({
           {/* Only the count wears the tone. The rows below already say each fault in red. */}
           {wrong > 0 ? (
             <>
-              <span className="ui-wrong">{wrong}</span> {plural(wrong, "finding", "findings")} on
+              <span className="ui-wrong">{wrong}</span> {pluralWord(wrong, "finding", "findings")} on
               this reading
             </>
           ) : (
@@ -134,7 +133,7 @@ export function Boundary({
           {limits > 0 ? (
             <span className="font-normal text-text-muted">
               {" "}
-              · {limits} {plural(limits, "limit", "limits")} on what it could see
+              · {limits} {pluralWord(limits, "limit", "limits")} on what it could see
             </span>
           ) : null}
         </p>
@@ -178,7 +177,7 @@ function collect(
       weight: "wrong",
       line: (
         <span className="ui-wrong">
-          {sides.crossing} {plural(sides.crossing, "import crosses", "imports cross")} between sides
+          {sides.crossing} {pluralWord(sides.crossing, "import crosses", "imports cross")} between sides
         </span>
       ),
       detail: (
@@ -186,7 +185,7 @@ function collect(
           <p className="m-0">
             Nothing should be able to: a Rust file cannot import a TypeScript module, and the {DAEMON_NAME}
             resolves an import only inside the file&apos;s own folder. So the map&apos;s rule for
-            what a side is is wrong for these files, not your code — report it with this list.
+            what a side is is wrong for these files, not your code. Report it with this list.
           </p>
           <ImportList lines={sides.crossings} label="Imports that cross between sides" />
         </>
@@ -200,7 +199,7 @@ function collect(
       weight: "wrong",
       line: (
         <span className="ui-wrong">
-          {sides.loose} {plural(sides.loose, "import ends", "imports end")} on no file this map
+          {sides.loose} {pluralWord(sides.loose, "import ends", "imports end")} on no file this map
           lists
         </span>
       ),
@@ -222,7 +221,7 @@ function collect(
       weight: "wrong",
       line: (
         <span className="ui-wrong">
-          {seam.unmatched.length} {plural(seam.unmatched.length, "call", "calls")} ask for a route
+          {seam.unmatched.length} {pluralWord(seam.unmatched.length, "call", "calls")} ask for a route
           this daemon does not serve
         </span>
       ),
@@ -238,7 +237,7 @@ function collect(
           >
             {seam.unmatched.map((call) => (
               <li key={`${call.file}:${call.line}:${call.path}`}>
-                {call.path} — {call.file}:{call.line}
+                {call.path} · {call.file}:{call.line}
               </li>
             ))}
           </ul>
@@ -291,7 +290,7 @@ function collect(
             : "They sit behind the side that is about this folder. "}
           {folder.citing === 0
             ? "None of them names a section, so nothing can be said about what they were asked to do."
-            : `${folder.citing} of them ${plural(folder.citing, "names", "name")} a section, and ${folder.declared} ${plural(folder.declared, "says", "say")} which document.`}
+            : `${folder.citing} of them ${pluralWord(folder.citing, "names", "name")} a section, and ${folder.declared} ${pluralWord(folder.declared, "says", "say")} which document.`}
         </p>
       ),
     });
@@ -386,7 +385,7 @@ function SidesLine({ sides, seam }: { sides: Sides; seam: Seam | undefined }) {
     sides.crossing === 0 && sides.sides.length > 1 ? "These sides share no source." : null,
     served === null
       ? null
-      : `What passes between them is HTTP: ${served.served.length} ${plural(served.served.length, "route", "routes")}, and ${served.matched} of the shell's ${served.calls} ${plural(served.calls, "call", "calls")} match one exactly.` +
+      : `What passes between them is HTTP: ${served.served.length} ${pluralWord(served.served.length, "route", "routes")}, and ${served.matched} of the shell's ${served.calls} ${pluralWord(served.calls, "call", "calls")} match one exactly.` +
         (served.unmatched.length === 0 ? " Nothing asks for a route that does not exist." : ""),
   ]
     .filter((part) => part !== null)
@@ -407,13 +406,13 @@ function SidesLine({ sides, seam }: { sides: Sides; seam: Seam | undefined }) {
               value={
                 <>
                   {side.files}
-                  <span className="ws-unit">{plural(side.files, "file", "files")}</span>
+                  <span className="ws-unit">{pluralWord(side.files, "file", "files")}</span>
                 </>
               }
               detail={
                 <>
                   <span>{side.reader}</span> · {side.tested} tested · {side.imports}{" "}
-                  {plural(side.imports, "import", "imports")} inside ·{" "}
+                  {pluralWord(side.imports, "import", "imports")} inside ·{" "}
                   <span title="Of the files naming a section, the ones whose header says which document it belongs to.">
                     {side.citing === 0
                       ? "nothing here cites a section"
@@ -446,7 +445,7 @@ function SeamWhy({ sides, seam }: { sides: Sides; seam: Seam | null }) {
     <>
       {sides.crossing === 0 && sides.sides.length > 1 ? (
         <p className="m-0">
-          No import crosses between them, and none could — a Rust file cannot import a TypeScript
+          No import crosses between them, and none could: a Rust file cannot import a TypeScript
           module, and the {DAEMON_NAME} resolves an import only inside the file&apos;s own folder. So this
           says these sides share no source; it does not say they are independent.
         </p>
@@ -460,8 +459,8 @@ function SeamWhy({ sides, seam }: { sides: Sides; seam: Seam | null }) {
           </p>
           {seam.computed.length > 0 ? (
             <SiteList
-              intro={`${seam.computed.length} ${plural(seam.computed.length, "call builds", "calls build")} part of the path at run time, so what they reach is a candidate and not a fact:`}
-              items={seam.computed.map((call) => `${call.path} — ${call.file}:${call.line}`)}
+              intro={`${seam.computed.length} ${pluralWord(seam.computed.length, "call builds", "calls build")} part of the path at run time, so what they reach is a candidate and not a fact:`}
+              items={seam.computed.map((call) => `${call.path} · ${call.file}:${call.line}`)}
             />
           ) : null}
           {seam.opaque.length > 0 ? (
@@ -471,7 +470,7 @@ function SeamWhy({ sides, seam }: { sides: Sides; seam: Seam | null }) {
             />
           ) : null}
           <SiteList
-            intro={`${seam.uncalled.length} ${plural(seam.uncalled.length, "route", "routes")} no screen calls — agents and sidecars reach this daemon over the same HTTP, which this map does not read, so that is not a list of dead code:`}
+            intro={`${seam.uncalled.length} ${pluralWord(seam.uncalled.length, "route", "routes")} no screen calls: agents and sidecars reach this daemon over the same HTTP, which this map does not read, so that is not a list of dead code:`}
             items={seam.uncalled}
           />
         </>

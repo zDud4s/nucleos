@@ -106,7 +106,7 @@ describe("convening from the court", () => {
     expect(draft.conveneBlocked(false, false, config({ configured: false }), d)).toMatch(/No roster in ~\/\.nucleos\/council\.yaml/);
     expect(draft.conveneBlocked(false, false, c, d)).toBeNull(); // untouched: the ref-less seat is the file's business
     const touched = draft.seatAt(d, 5, { seat: { agent: "x" }, name: "x" });
-    expect(draft.conveneBlocked(false, false, c, touched)).toBe("Seat 3 keeps the file's default model — choose who sits there.");
+    expect(draft.conveneBlocked(false, false, c, touched)).toBe("Seat 3 keeps the file's default model. Choose who sits there.");
     const empty = [0, 1, 2].reduce((acc, i) => draft.release(acc, i), d);
     expect(draft.conveneBlocked(false, false, c, empty)).toBe("Seat at least one member.");
     const judgeless = { ...draft.seatAt(empty, 0, { seat: { agent: "x" }, name: "x" }), chairman: null };

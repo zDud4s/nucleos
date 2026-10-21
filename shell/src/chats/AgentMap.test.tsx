@@ -157,7 +157,7 @@ describe("AgentMapBody", () => {
     ];
     render(<AgentMapBody turns={settled} tasks={rows} chatTitle="My chat" now={Date.parse("2026-10-03T10:23:50Z")} />);
     expect(screen.getByText(/4\.2k tokens/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: /explore — completed/ }));
+    fireEvent.click(screen.getByRole("button", { name: /explore: completed/ }));
     expect(screen.getByText("the callers are in parser.rs")).toBeTruthy();
   });
 

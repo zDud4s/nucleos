@@ -36,6 +36,8 @@ export type StateDomain =
   | "council_seat"
   | "email_class"
   | "voice_cleanup"
+  | "voice_conversation"
+  | "voice_phase"
   | "web_trust"
   | "web_extract"
   | "browser_refusal"
@@ -706,6 +708,34 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     cleaned: { tone: "active", label: "cleaned up" },
     raw: { tone: "off", label: "raw — no cleanup model armed" },
     shrunk: { tone: "paused", label: "cleanup refused by a guard — raw kept" },
+  },
+
+  /**
+   * The hands-free conversation's phase (`ConversationPhase`, `shell/src/lib/conversation.ts`).
+   *
+   * A shell derivation, allowed by this docstring: the núcleo never writes it, this shell's own
+   * state machine does. `hearing` is Awaiting-You Amber because it is somebody's turn being
+   * recorded; `thinking` and `speaking` are the núcleo's turn and stay Stated Blue.
+   */
+  voice_conversation: {
+    off: { tone: "off", label: "off" },
+    listening: { tone: "active", label: "listening" },
+    hearing: { tone: "pending", label: "hearing you" },
+    thinking: { tone: "info", label: "thinking" },
+    speaking: { tone: "info", label: "answering" },
+  },
+
+  /**
+   * The capture phase of dictation and memos (`VoicePhase`, `shell/src/data/voice.ts`). A shell
+   * derivation, allowed by this docstring: this page's reducer invents it, the daemon never sends
+   * it. `hotkeys_failed` is `idle` while the global hotkeys did not register — two readings of one
+   * moment, so it has its own row rather than a tone chosen at the call site.
+   */
+  voice_phase: {
+    idle: { tone: "off", label: "idle" },
+    recording: { tone: "pending", label: "recording" },
+    transcribing: { tone: "info", label: "transcribing" },
+    hotkeys_failed: { tone: "danger", label: "hotkeys failed" },
   },
 
   /**

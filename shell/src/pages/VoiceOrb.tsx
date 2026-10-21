@@ -170,9 +170,8 @@ const TAU = Math.PI * 2;
 const HARMONICS = 5;
 /** The outline's points: enough that five low harmonics read as a smooth blob. */
 const BLOB_POINTS = 144;
-/** The dark ball's colour where the theme has no `--surface-sunken`; jsdom answers "" for every property. */
-const BALL_DARK = "#08090c";
-const BALL_LIGHT = "#eceef3";
+/** The dark ball's colour where the theme has no `--surface-sunken` (jsdom answers "" for every property): plain black, not a copy of the token's hex. */
+const BALL_FALLBACK = "#000";
 
 /** What one orb carries from frame to frame. */
 interface Frame {
@@ -228,9 +227,7 @@ function paint(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, state: 
   // One style read per frame: the colour is animated by a CSS transition, so it cannot be cached.
   const style = getComputedStyle(canvas);
   const shellColor = style.color;
-  const back =
-    style.getPropertyValue("--surface-sunken").trim() ||
-    (window.matchMedia("(prefers-color-scheme: light)").matches ? BALL_LIGHT : BALL_DARK);
+  const back = style.getPropertyValue("--surface-sunken").trim() || BALL_FALLBACK;
   const lw = BASE.lineWidth * dpr * Math.max(0.8, Math.min(1.4, width / (300 * dpr)));
   ctx.strokeStyle = shellColor;
   ctx.lineWidth = lw;

@@ -804,8 +804,8 @@ describe("RunDetail — the prompt budget", () => {
     // Both readings, both labelled `estimate` and neither labelled `tokens` —
     // it is four characters to the token and there is no tokenizer in this
     // product to make it anything better.
-    expect(await screen.findByText(/10,500 estimate — what we wrote/)).toBeDefined();
-    expect(screen.getByText(/18,700 estimate — the CLI's own/)).toBeDefined();
+    expect(await screen.findByText(/10,500 estimate: what we wrote/)).toBeDefined();
+    expect(screen.getByText(/18,700 estimate: the CLI's own/)).toBeDefined();
   });
 
   it("names the rest unknown when the run reported no tokens", async () => {
@@ -817,9 +817,9 @@ describe("RunDetail — the prompt budget", () => {
 
     // A residual of zero would read as *the CLI added nothing*, which is the
     // opposite of the truth about a run that simply never reported its usage.
-    expect(await screen.findByText(/10,500 estimate — what we wrote/)).toBeDefined();
+    expect(await screen.findByText(/10,500 estimate: what we wrote/)).toBeDefined();
     expect(screen.getByText("the rest is unknown")).toBeDefined();
-    expect(screen.queryByText(/estimate — the CLI's own/)).toBeNull();
+    expect(screen.queryByText(/estimate: the CLI's own/)).toBeNull();
   });
 
   it("says nothing was recorded for a run whose prompt it did not write", async () => {
@@ -830,7 +830,7 @@ describe("RunDetail — the prompt budget", () => {
     await renderApp({ initialPath: "/runs/5" });
 
     expect(await screen.findByText("This run did not record what went into its prompt.")).toBeDefined();
-    expect(screen.queryByText(/estimate — what we wrote/)).toBeNull();
+    expect(screen.queryByText(/estimate: what we wrote/)).toBeNull();
   });
 });
 

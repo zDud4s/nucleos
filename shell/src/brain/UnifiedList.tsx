@@ -116,7 +116,7 @@ export function UnifiedList({ onSelect, selected }: UnifiedListProps) {
   return (
     <>
       {(allNotes.isError || knowledge.isError || captureRows.isError) && (
-        <ErrorNote>the {DAEMON_NAME} is not responding — part of what is known is missing</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} is not responding: part of what is known is missing</ErrorNote>
       )}
       <div className="unified-bar">
         <Segments label="Type" value={type} options={TYPE_FILTERS} onChange={setType} />

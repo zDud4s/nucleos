@@ -332,7 +332,7 @@ describe("Files — uploading", () => {
     fireEvent.change(screen.getByLabelText("Upload"), { target: { files } });
 
     expect(await screen.findByText(/1 of 3 files from that upload stayed behind/)).toBeDefined();
-    expect(screen.getByText(/second\.txt — the background service could not write that file to disk/)).toBeDefined();
+    expect(screen.getByText(/second\.txt: the background service could not write that file to disk/)).toBeDefined();
     expect(screen.getByText("first.txt")).toBeDefined();
     expect(screen.getByText("third.txt")).toBeDefined();
   });
@@ -396,7 +396,7 @@ describe("Files — opening in the default app", () => {
     renderWithQuery(<Files />);
     fireEvent.doubleClick(await screen.findByText("notes.xyz"));
 
-    expect(await screen.findByText("Could not open it — no application is associated")).toBeDefined();
+    expect(await screen.findByText("Could not open it: no application is associated")).toBeDefined();
   });
 
   it("opens nothing on one mouse click on a file — only a folder opens on one", async () => {
@@ -805,7 +805,7 @@ describe("Files — reachable without a mouse", () => {
     renderWithQuery(<Files />);
     fireEvent.click(await screen.findByRole("checkbox", { name: "Select report.docx" }));
     fireEvent.keyDown(document.body, { key: "x", ctrlKey: true });
-    expect(await screen.findByText(/report\.docx cut — open the folder it goes to/)).toBeDefined();
+    expect(await screen.findByText(/report\.docx cut: open the folder it goes to/)).toBeDefined();
     // Pasting where it already is moves nothing.
     fireEvent.keyDown(document.body, { key: "v", ctrlKey: true });
     expect(moved).toEqual([]);

@@ -96,7 +96,7 @@ export function WorkflowGraph({ projectId, name, originPath, ejected }: Workflow
       it simply has no order declared in it yet, and `Teach` would answer that with a poster.
     */
     return (
-      <Quiet says="This bundle has no sequence in it yet — skills and scripts and nothing saying in what order." />
+      <Quiet says="This bundle has no sequence in it yet: skills and scripts and nothing saying in what order." />
     );
   }
 
@@ -251,7 +251,7 @@ function WorkflowKey({ nodes, edges }: { nodes: GraphNode[]; edges: GraphEdge[] 
         <li key={shape} className="flex items-center gap-1">
           <ShapeIcon shape={shape} />
           <span className="text-text">{shape}</span>
-          <span>— {nodeMeaning(shape === "gate" ? "command" : shape, shape === "gate" ? "gate" : "plain")}</span>
+          <span>({nodeMeaning(shape === "gate" ? "command" : shape, shape === "gate" ? "gate" : "plain")})</span>
         </li>
       ))}
       {marks.map((mark) => (
@@ -296,7 +296,7 @@ function Inspector({
     return (
       <aside aria-label="Node inspector" className={INSPECTOR}>
         <p className="text-sm text-text-muted">
-          Pick a node to see what it is and what this project has changed about it — click it, or
+          Pick a node to see what it is and what this project has changed about it. Click it, or
           Tab to it and press Enter.
         </p>
       </aside>
@@ -454,7 +454,7 @@ function Inspector({
       <div className="border-t border-border pt-3">
         {node.fields.find((field) => field.name === "body") === undefined ? (
           <p className="text-xs text-text-muted">
-            This node has no instructions file — there is nothing to open.
+            This node has no instructions file: there is nothing to open.
           </p>
         ) : ejected || source === "project" ? (
           <Button
@@ -622,7 +622,7 @@ export function WorkflowChain({
       {inSequence(graph.data.nodes, graph.data.edges).map((node) => (
         <li
           key={node.id}
-          title={`${node.label} — ${nodeMeaning(node.type, node.role)}`}
+          title={`${node.label}: ${nodeMeaning(node.type, node.role)}`}
           // Neutral, with the kind as the canvas's own icon: the tone this carried per kind was the
           // canvas's violet-and-amber, and it is gone from both for the same reason. The 3px rung,
           // because a pill is what a badge looks like. A gate keeps its heavier edge.

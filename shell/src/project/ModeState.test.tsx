@@ -124,7 +124,7 @@ describe("the open-proposal ceiling", () => {
     expect(clear.getAttribute("aria-disabled")).toBe("true");
 
     const reading = document.getElementById(clear.getAttribute("aria-describedby") ?? "");
-    expect(reading?.textContent).toBe("no ceiling — 2 proposals waiting on you");
+    expect(reading?.textContent).toBe("no ceiling: 2 proposals waiting on you");
     expect(reading?.getAttribute("aria-live")).toBe("polite");
 
     fireEvent.click(clear);
@@ -194,7 +194,7 @@ describe("the action classes", () => {
     expect(headers).toEqual(["Class", "Decided", "Reviewed", "Disagreed"]);
 
     const id = within(table).getByRole("rowheader", { name: "read-local" });
-    expect(id.className).toContain("font-mono");
+    expect(id.querySelector(".font-mono")).not.toBeNull();
     const cells = within(id.closest("tr") as HTMLElement)
       .getAllByRole("cell")
       .map((cell) => cell.textContent);

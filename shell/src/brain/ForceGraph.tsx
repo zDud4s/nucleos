@@ -193,7 +193,9 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
       // never asks the style engine twice for the same colour.
       const style = getComputedStyle(canvas!);
       const cache = new Map<string, string>();
-      const colour = (token: string, fallback: string) => {
+      // A token this theme lacks (jsdom answers "" for every one) paints as the canvas's own text
+      // colour rather than as a hex copied out of `tokens.css`.
+      const colour = (token: string, fallback = "currentColor") => {
         let value = cache.get(token);
         if (value === undefined) {
           value = style.getPropertyValue(token).trim() || fallback;
@@ -212,7 +214,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
       const focus = hovered ?? sel;
       const strong: SimLink[] = [];
       c.globalAlpha = lit ? 0.15 : 1;
-      c.strokeStyle = colour("--brain-edge", "rgba(152, 161, 178, 0.3)");
+      c.strokeStyle = colour("--brain-edge");
       c.lineWidth = 1 / k;
       c.beginPath();
       for (const l of links) {
@@ -228,7 +230,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
       }
       c.stroke();
       c.globalAlpha = 1;
-      c.strokeStyle = colour("--brain-edge-strong", "rgba(231, 234, 240, 0.75)");
+      c.strokeStyle = colour("--brain-edge-strong");
       c.lineWidth = 1.5 / k;
       c.beginPath();
       for (const l of strong) {
@@ -244,13 +246,13 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         const x = n.x ?? 0;
         const y = n.y ?? 0;
         const r = nodeRadius(n.degree);
-        const fill = colour(colorToken(n), "#8b94a3");
+        const fill = colour(colorToken(n));
         c.globalAlpha = lit && !lit.has(n.id) ? 0.15 : 1;
         // The node's silhouette is its identity (`marks.tsx`); one neutral fill serves them all.
         const shape = markPath(n);
         if (n.missing) {
           c.setLineDash([3 / k, 2 / k]);
-          c.strokeStyle = colour("--brain-missing", "#808a9a");
+          c.strokeStyle = colour("--brain-missing");
           c.lineWidth = 1.5 / k;
           strokeShape(c, shape, x, y, r);
           c.setLineDash([]);
@@ -265,7 +267,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         if (n.id === sel) {
           c.beginPath();
           c.arc(x, y, r + 3 / k, 0, Math.PI * 2);
-          c.strokeStyle = colour("--brain-ring", "#4fd1e0");
+          c.strokeStyle = colour("--brain-ring");
           c.lineWidth = 2 / k;
           c.stroke();
         }
@@ -282,8 +284,8 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         c.globalAlpha = lit && !lit.has(n.id) ? 0.15 : 1;
         c.fillStyle =
           isHovered || isSelected
-            ? colour("--brain-label-strong", "#e7eaf0")
-            : colour("--brain-label", "#98a1b2");
+            ? colour("--brain-label-strong")
+            : colour("--brain-label");
         const max = small ? LOCAL_LABEL_MAX : LABEL_MAX;
         const text = n.label.length > max ? `${n.label.slice(0, max - 1)}…` : n.label;
         c.fillText(text, (n.x ?? 0) + nodeRadius(n.degree) + 4 / k, n.y ?? 0);

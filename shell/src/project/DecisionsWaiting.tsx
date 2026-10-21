@@ -2,7 +2,7 @@
 import { isApiRefusal } from "../data/client";
 import { useDecideMapLine, useMapDecisions, type MapDecision } from "../data/project-map";
 import { useState } from "react";
-import { ErrorNote, Quiet, SectionTitle } from "../ui";
+import { Button, ErrorNote, Quiet, SectionTitle } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -73,7 +73,7 @@ export function DecisionsWaiting({ projectId }: DecisionsWaitingProps) {
     <section aria-label="Decisions waiting" className="flex flex-col gap-2">
       <SectionTitle level={2}>Waiting on you</SectionTitle>
       <p className="m-0 text-sm text-text-muted">
-        {count} {count === 1 ? "line" : "lines"} from the specs, answered one at a time — none is in
+        {count} {count === 1 ? "line" : "lines"} from the specs, answered one at a time; none is in
         the map yet.
       </p>
 
@@ -116,7 +116,7 @@ const FIRST = 5;
 const KIND_MEANING: Record<string, string> = {
   countable:
     "Names a number, a set or a coverage claim, so something can later count the code and disagree with it.",
-  character: "About what a thing is or is not. No count decides that — only your stamp does.",
+  character: "About what a thing is or is not. No count decides that: only your stamp does.",
 };
 
 /**
@@ -147,29 +147,25 @@ function Line({ projectId, row, number }: { projectId: string; row: MapDecision;
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
-        <button
-          type="button"
+        <Button
           aria-label={`approve line ${number}`}
           disabled={decide.isPending}
           onClick={() => decide.mutate({ id: row.id, approved: true })}
-          className="rounded-md border border-border px-3 py-1 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
           approve
-        </button>
+        </Button>
         {/*
           Beside approve and never smaller than it. A rejected line is not a mistake being cleaned
           up — it is the owner saying the model read the document wrong, which is the answer this
           surface most needs to be easy to give.
         */}
-        <button
-          type="button"
+        <Button
           aria-label={`reject line ${number}`}
           disabled={decide.isPending}
           onClick={() => decide.mutate({ id: row.id, approved: false })}
-          className="rounded-md border border-border px-3 py-1 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
         >
           reject
-        </button>
+        </Button>
       </div>
 
       {decide.isError ? (
@@ -196,7 +192,7 @@ function Refused({ error }: { error: unknown }) {
   return (
     <ErrorNote>
       {error.status === 404
-        ? "That line is not yours to answer now — it has been answered already, or it is gone."
+        ? "That line is not yours to answer now: it has been answered already, or it is gone."
         : error.detail}
     </ErrorNote>
   );

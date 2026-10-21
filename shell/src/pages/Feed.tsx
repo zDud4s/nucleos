@@ -1,5 +1,7 @@
 // §spec novo-frontend
 
+import { AnimatePresence, motion } from "motion/react";
+import { rowMotion } from "../lib/motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { ChevronDown, ChevronRight } from "lucide-react";
@@ -7,6 +9,8 @@ import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type Re
 import { isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import { UI_LOCALE } from "../lib/locale";
+import { plural, pluralWord } from "../lib/plural";
+import { useNow } from "../lib/useNow";
 import {
   FEED_KIND_NAMES,
   FEED_LIMIT_MAX,
@@ -29,10 +33,10 @@ import {
   type FeedSeen,
 } from "../data/feed";
 import { buildSequences, type FeedSequence } from "../lib/sequences";
+import { clockText } from "../lib/when";
 import {
   QUIET_GAP,
   buildFeedDays,
-  clock,
   dayHeading,
   lookedAtOf,
   resolveWindow,
@@ -54,6 +58,7 @@ import {
   PageHeader,
   Quiet,
   RefusalNote,
+  Segmented,
   Skeleton,
   StaleNote,
   StateBadge,
@@ -142,10 +147,10 @@ function searchLimit(value: unknown): string | undefined {
   return text === undefined ? undefined : clampFeedLimit(text);
 }
 
-const PRESETS: { id: FeedPreset; label: string }[] = [
-  { id: "seen", label: "Since you looked" },
-  { id: "day", label: "24 h" },
-  { id: "week", label: "7 days" },
+const PRESETS: { value: FeedPreset; label: string }[] = [
+  { value: "seen", label: "Since you looked" },
+  { value: "day", label: "24 h" },
+  { value: "week", label: "7 days" },
 ];
 
 /** The words for each exceptional gravity, singular and plural. Words only — the tone is the map's. */
@@ -308,10 +313,10 @@ export function Feed() {
       setSnapshot(answer);
       if (preset === "seen") setRange(resolveWindow("seen", Date.now(), answer));
       setUndo({ before, count });
-      setSaid(`${count === 1 ? "1 line" : `${count} lines`} marked seen`);
+      setSaid(`${plural(count, "line")} marked seen`);
     } catch {
       posted.current = null;
-      setSaid(`the ${DAEMON_NAME} did not take the mark — nothing changed`);
+      setSaid(`the ${DAEMON_NAME} did not take the mark: nothing changed`);
     }
   }
 
@@ -375,14 +380,14 @@ export function Feed() {
     }
     if (newest !== null && (last.id === null || newest > last.id)) {
       const fresh = entries.filter((entry) => last.id === null || entry.id > last.id).length;
-      setSaid(fresh === 1 ? "1 new line" : `${fresh} new lines`);
+      setSaid(plural(fresh, "new line"));
       announcedThrough.current = { start: range.start, id: newest };
     }
   }, [entries, range, searching, timeline.data]);
 
   /* ------------------------------------------------------------- render -- */
 
-  const now = useNow(searching ? found.data : timeline.data);
+  const now = useFeedNow(searching ? found.data : timeline.data);
   const lookedAt = lookedAtOf(snapshot);
   const counts = gravityCounts(entries);
 
@@ -412,19 +417,15 @@ export function Feed() {
       <PageHeader title="Feed" headline={headline} />
 
       <div className="feed-tools">
-        <div className="ui-switch" role="group" aria-label="Window">
-          {PRESETS.map((row) => (
-            <button
-              key={row.id}
-              type="button"
-              className="ui-switch-seg"
-              aria-pressed={!searching && preset === row.id}
-              onClick={() => choosePreset(row.id)}
-            >
-              {row.label}
-            </button>
-          ))}
-        </div>
+        {/* No segment is pressed while a search is showing: the window does not apply to it. */}
+        <Segmented<FeedPreset | "">
+          label="Window"
+          value={searching ? "" : preset}
+          options={PRESETS}
+          onChange={(next) => {
+            if (next !== "") choosePreset(next);
+          }}
+        />
         {unseenExists && (
           <Button variant="quiet" onClick={() => void markEverythingSeen()}>
             Mark everything seen
@@ -432,7 +433,7 @@ export function Feed() {
         )}
         {undo !== null && (
           <span className="feed-undo">
-            Marked {undo.count === 1 ? "1 line" : `${undo.count} lines`} seen.
+            Marked {plural(undo.count, "line")} seen.
             <Button variant="quiet" onClick={undoMarkSeen} title="Restores the shading for this visit; the stored marker stays put">
               Undo
             </Button>
@@ -585,7 +586,7 @@ function searchHeadline(rows: FeedEntry[] | undefined, filters: FeedFilters): st
   if (rows === undefined) return undefined;
   const what = filters.q !== undefined ? ` matching “${filters.q}”` : "";
   if (rows.length === 0) return `Search · nothing${what}`;
-  return `Search · ${rows.length} ${rows.length === 1 ? "line" : "lines"}${what}`;
+  return `Search · ${plural(rows.length, "line")}${what}`;
 }
 
 /* ------------------------------------------------------------------ search -- */
@@ -818,7 +819,7 @@ function SearchResults({
       )}
       {rows === undefined && !query.isError && <Skeleton label="Searching the feed…" lines={3} />}
       {rows !== undefined && rows.length === 0 && (
-        <Quiet says={`Nothing matches this search. The ${DAEMON_NAME} has lines — none of them match; clear a filter to widen it.`} />
+        <Quiet says={`Nothing matches this search. The ${DAEMON_NAME} has lines, but none of them match. Clear a filter to widen it.`} />
       )}
       {rows !== undefined && rows.length > 0 && (
         <>
@@ -827,7 +828,7 @@ function SearchResults({
             {rows.length === 1 ? "That is the one line" : `That is all ${rows.length} lines`} this search
             returned
             {filters.limit === undefined && rows.length >= FEED_LIST_LIMIT
-              ? ` — a search stops at ${FEED_LIST_LIMIT} unless it is given a limit, up to ${FEED_LIMIT_MAX}`
+              ? ` (a search stops at ${FEED_LIST_LIMIT} unless it is given a limit, up to ${FEED_LIMIT_MAX})`
               : ""}
             .
           </p>
@@ -902,8 +903,8 @@ function LiveView(props: LiveViewProps) {
       >
         <p>
           Every autonomous thing the {DAEMON_NAME} does writes a line here: a job starting, a gate failing, a
-          worktree released, an urgent e-mail. A feed line <em>is</em> the notification — nothing pops
-          up anywhere else — and this page replays them on the time they happened.
+          worktree released, an urgent e-mail. A feed line <em>is</em> the notification (nothing pops
+          up anywhere else), and this page replays them on the time they happened.
         </p>
       </Teach>
     );
@@ -920,7 +921,7 @@ function LiveView(props: LiveViewProps) {
       {data.truncated && (
         <p className="feed-truncated" role="status">
           This window holds more than {FEED_TIMELINE_CAP.toLocaleString(UI_LOCALE)} lines, so only the
-          newest {FEED_TIMELINE_CAP.toLocaleString(UI_LOCALE)} are drawn. A narrower window shows the rest —
+          newest {FEED_TIMELINE_CAP.toLocaleString(UI_LOCALE)} are drawn. A narrower window shows the rest:
           24 h, or a search between two dates.
         </p>
       )}
@@ -929,7 +930,7 @@ function LiveView(props: LiveViewProps) {
         <p className="feed-narrowed">
           <span className="feed-narrowed-what">
             Showing only {owner ?? "one owner"} · <span className="feed-narrowed-n">{entries.length}</span>{" "}
-            {entries.length === 1 ? "line" : "lines"}
+            {pluralWord(entries.length, "line")}
           </span>
           <Button variant="quiet" onClick={props.onEveryScope}>
             Show every scope
@@ -942,7 +943,7 @@ function LiveView(props: LiveViewProps) {
           says={
             ownerFiltered
               ? `Nothing from ${owner ?? "this owner"} in this window.`
-              : `The machine was quiet in this window — nothing wrote a line.${
+              : `The machine was quiet in this window: nothing wrote a line.${
                   newestElsewhere !== undefined
                     ? ` The last line was written ${stamp(Date.parse(newestElsewhere.created_at), now)}.`
                     : ""
@@ -1034,7 +1035,7 @@ function SequenceDetail({ sequence, time, now }: { sequence: FeedSequence; time:
           <KindBadge kind={newest.kind} />
         </h2>
         <p className="feed-detail-sub">
-          {lane} · {n} {n === 1 ? "line" : "lines"} · {stamp(sequence.start, now)}
+          {lane} · {plural(n, "line")} · {stamp(sequence.start, now)}
           {until}
         </p>
         <ol className="feed-detail-lines">
@@ -1044,7 +1045,7 @@ function SequenceDetail({ sequence, time, now }: { sequence: FeedSequence; time:
             return (
               <li key={line.id} className={written > time ? "feed-detail-line feed-detail-later" : "feed-detail-line"}>
                 <time className="feed-detail-time" dateTime={line.created_at}>
-                  {clock(written)}
+                  {clockText(written)}
                 </time>
                 <span className="feed-detail-kind">
                   {routine ? (
@@ -1132,7 +1133,12 @@ function FeedDays({
               <span className="feed-day-title">{heading.title}</span>
               <span className="feed-day-date">{heading.date}</span>
             </Heading>
+            {/* Enter only: a line that arrives with a poll fades in, and the first mount stays still
+                (`initial={false}`). No exit and no layout: a filter change swaps the whole list, and
+                holding every old line for an exit would double it on screen, and a layout pass
+                over a list this long is not cheap. */}
             <ol className="feed-day-lines">
+              <AnimatePresence initial={false}>
               {day.items.map((item) => {
                 switch (item.type) {
                   case "line":
@@ -1146,7 +1152,7 @@ function FeedDays({
                   case "gap":
                     return (
                       <li key={`gap-${item.from}`} className="feed-gap">
-                        quiet for {spokenSpan(item.to - item.from)} · {clock(item.from)} → {clock(item.to)}
+                        quiet for {spokenSpan(item.to - item.from)} · {clockText(item.from)} → {clockText(item.to)}
                       </li>
                     );
                   case "seen":
@@ -1159,6 +1165,7 @@ function FeedDays({
                     );
                 }
               })}
+              </AnimatePresence>
             </ol>
           </section>
         );
@@ -1189,7 +1196,7 @@ function RoutineFold({
   return (
     <li className="feed-routine">
       <time className="feed-line-time" dateTime={entries[0].created_at}>
-        {clock(newest)}
+        {clockText(newest)}
       </time>
       <button
         type="button"
@@ -1228,9 +1235,13 @@ const FeedLine = memo(function FeedLine({
   const efficiency = entry.kind === "token_efficiency" ? readEfficiencySignal(entry.summary) : null;
   const routine = feedGravityOf(entry.kind) === "routine";
   return (
-    <li className={routine ? "feed-line feed-line-routine" : "feed-line"}>
+    <motion.li
+      className={routine ? "feed-line feed-line-routine" : "feed-line"}
+      initial={rowMotion.initial}
+      animate={rowMotion.animate}
+    >
       <time className="feed-line-time" dateTime={entry.created_at}>
-        {clock(Date.parse(entry.created_at))}
+        {clockText(Date.parse(entry.created_at))}
       </time>
       <div className="feed-line-kind">
         <KindBadge kind={entry.kind} />
@@ -1252,7 +1263,7 @@ const FeedLine = memo(function FeedLine({
           </p>
         )}
       </div>
-    </li>
+    </motion.li>
   );
 });
 
@@ -1369,13 +1380,13 @@ function FeedError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
         refusal={error}
         sentences={{
           bad_request:
-            `the ${DAEMON_NAME} would not accept that question — a date bound must be a full timestamp, a limit a number, and a window at most 31 days`,
-          internal: `the ${DAEMON_NAME} could not read the feed — its database, not your search`,
+            `the ${DAEMON_NAME} would not accept that question: a date bound must be a full timestamp, a limit a number, and a window at most 31 days`,
+          internal: `the ${DAEMON_NAME} could not read the feed: its database, not your search`,
         }}
       />
     );
   }
-  return <ErrorNote onRetry={onRetry}>the {DAEMON_NAME} is not responding — nothing is known about the feed</ErrorNote>;
+  return <ErrorNote onRetry={onRetry}>the {DAEMON_NAME} is not responding: nothing is known about the feed</ErrorNote>;
 }
 
 /* ----------------------------------------------------------------- helpers -- */
@@ -1404,13 +1415,8 @@ function gravityCounts(entries: FeedEntry[]): Record<FeedGravity, number> {
  * nothing — and a "now" rule frozen at the moment the page opened would draw the silence since as
  * not having happened yet.
  */
-function useNow(pulse: unknown): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
-  }, []);
+function useFeedNow(pulse: unknown): number {
+  const tick = useNow(30_000);
   // And whenever new data lands, so a mark written a second ago is never drawn right of "now".
-  useEffect(() => setNow(Date.now()), [pulse]);
-  return now;
+  return useMemo(() => Math.max(tick, Date.now()), [tick, pulse]);
 }

@@ -20,6 +20,16 @@ export interface QuietProps {
    * which is the wrapper a primitive exists to remove.
    */
   announce?: boolean;
+  /**
+   * One plain muted line, for the empty `<p>` a list or a cell draws where there is no heading
+   * to share a row with.
+   *
+   * Drawn as a `<p class="ui-quiet-compact">` and NOT as `.ui-quiet`, which is what
+   * `.ui-section:has(> .ui-quiet)` keys on to pull a section's heading onto the line: a compact
+   * line inside a section must not reflow the section. There is no "why?" disclosure — `children`
+   * follow `says` in the same paragraph, and `action` sits after them, all inline. Off by default.
+   */
+  compact?: boolean;
 }
 
 /**
@@ -52,7 +62,7 @@ export const QuietTips = createContext(false);
  * anybody is looking at an empty section, and hiding the only gesture behind a question about why
  * the section is empty is the drawer this app keeps refusing to build.
  */
-export function Quiet({ says, children, action, announce }: QuietProps) {
+export function Quiet({ says, children, action, announce, compact }: QuietProps) {
   const [why, setWhy] = useState(false);
   const tips = useContext(QuietTips);
   // Seven `why?` buttons on `03-waiting` whose accessible name was "why?" and nothing else.
@@ -74,6 +84,16 @@ export function Quiet({ says, children, action, announce }: QuietProps) {
         {why ? "less" : "why?"}
       </button>
     );
+
+  if (compact === true) {
+    return (
+      <p className="ui-quiet-compact" role={announce === true ? "status" : undefined}>
+        {says}
+        {children === undefined ? null : <> {children}</>}
+        {action === undefined ? null : <span className="ui-quiet-action">{action}</span>}
+      </p>
+    );
+  }
 
   if (tips && children !== undefined) {
     return (

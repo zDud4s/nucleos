@@ -186,7 +186,7 @@ describe("SessionColumn", () => {
 
   it("toggles the active filter and searches", async () => {
     await renderColumn();
-    const chip = await screen.findByRole("button", { name: /^Active · 2$/ });
+    const chip = await screen.findByRole("button", { name: "Active 2" });
     fireEvent.click(chip);
     await waitFor(() => expect(screen.queryByText("finished one")).toBeNull());
     expect(screen.getByText("busy one")).toBeDefined();
@@ -231,6 +231,25 @@ describe("SessionColumn", () => {
     await waitFor(() =>
       expect(posts).toContainEqual({
         path: "/assistant/chats/c-old/restore",
+        method: "POST",
+        body: undefined,
+      }),
+    );
+  });
+
+  it("archives from the row menu with an Undo that restores it", async () => {
+    await renderColumn();
+    openMenu(await screen.findByRole("button", { name: "Session actions for busy one" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Archive" }));
+    await waitFor(() =>
+      expect(posts).toContainEqual({ path: "/assistant/chats/c-busy", method: "DELETE", body: undefined }),
+    );
+
+    expect(await screen.findByText("Archived busy one")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() =>
+      expect(posts).toContainEqual({
+        path: "/assistant/chats/c-busy/restore",
         method: "POST",
         body: undefined,
       }),

@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { DAEMON_NAME } from "../../copy";
 import { formatBytes, joinPath, type Entry } from "../../data/files";
+import { plural } from "../../lib/plural";
 import { Button, Teach } from "../../ui";
 import { type PathFailure, RefusalOrError } from "./shared";
 
@@ -103,19 +104,19 @@ export function pageHeadline(rootUnavailable: boolean, entries: Entry[] | undefi
   if (entries === undefined) return undefined;
   // The headline is the first thing read, so it may not state as current a
   // count the panel below then calls stale.
-  const asOf = failing ? " — as last read" : "";
+  const asOf = failing ? " (as last read)" : "";
   if (entries.length === 0) return `this folder is empty${asOf}`;
   const dirs = entries.filter((entry) => entry.is_dir).length;
   const files = entries.length - dirs;
   const totalBytes = entries.reduce((sum, entry) => sum + entry.size_bytes, 0);
   const parts = [
-    dirs > 0 ? `${dirs} folder${dirs === 1 ? "" : "s"}` : null,
+    dirs > 0 ? plural(dirs, "folder") : null,
     // "totalling" ties the bytes to the files: a folder is never measured, and
     // "2 folders, 1 file, 2.0 KB" read as the size of everything here.
     //
     // The value and its unit are joined by a no-break space so "3.4 MB" never
     // wraps between them at narrow widths (testing-library collapses it to a space).
-    files > 0 ? `${files} file${files === 1 ? "" : "s"} totalling ${formatBytes(totalBytes).replace(" ", "\u00a0")}` : null,
+    files > 0 ? `${plural(files, "file")} totalling ${formatBytes(totalBytes).replace(" ", "\u00a0")}` : null,
   ].filter((part): part is string => part !== null);
   return parts.join(", ") + asOf;
 }
@@ -151,7 +152,7 @@ export function FilesUnavailableTeach() {
         </Button>
       </p>
       <p>
-        The {DAEMON_NAME} keeps one folder for everything this page holds — your uploads, drops from your file manager,
+        The {DAEMON_NAME} keeps one folder for everything this page holds: your uploads, drops from your file manager,
         filed mail and team workspaces. It could not create or open that folder when it started; its log names
         the error it hit.
       </p>

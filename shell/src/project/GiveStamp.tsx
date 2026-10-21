@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useGiveStamp, type Anchored } from "../data/project-map";
-import { ErrorNote } from "../ui";
+import { Button, ErrorNote } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -69,33 +69,27 @@ export function GiveStamp({ projectId, row }: GiveStampProps) {
         className="rounded-md border border-border bg-surface-sunken px-2 py-1 text-xs text-text placeholder:text-text-faint"
       />
       <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
+        <Button
           aria-label={`stamp ${name} as what you want`}
           disabled={giveStamp.isPending}
           onClick={() => send("settled")}
-          className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
           as I want it
-        </button>
-        <button
-          type="button"
+        </Button>
+        <Button
           aria-label={`stamp ${name} as part-way`}
           disabled={giveStamp.isPending || written === ""}
           onClick={() => send("partial")}
-          className="rounded-md border border-border px-3 py-1.5 text-xs text-text enabled:hover:border-border-strong disabled:opacity-40"
         >
           part-way, and I know
-        </button>
-        <button
-          type="button"
+        </Button>
+        <Button
           aria-label={`stamp ${name} as changed your mind`}
           disabled={giveStamp.isPending}
           onClick={() => send("withdrawn")}
-          className="rounded-md border border-border px-3 py-1.5 text-xs text-text-muted enabled:hover:border-border-strong disabled:opacity-40"
         >
           changed my mind
-        </button>
+        </Button>
       </div>
       {giveStamp.isError ? <Refused error={giveStamp.error} /> : null}
     </div>
@@ -121,14 +115,14 @@ function Refused({ error }: { error: unknown }) {
     return (
       <ErrorNote>
         Git would not say what this decision is anchored to just now, so the green was not
-        recorded. Nothing you asked for was wrong — try again in a moment.
+        recorded. Nothing you asked for was wrong. Try again in a moment.
       </ErrorNote>
     );
   }
   if (error.status === 404) {
     return (
       <ErrorNote>
-        That decision is not yours to stamp now — it belongs to another project, or nobody approved
+        That decision is not yours to stamp now: it belongs to another project, or nobody approved
         it.
       </ErrorNote>
     );

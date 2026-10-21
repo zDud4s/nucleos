@@ -55,4 +55,18 @@ describe("state tones", () => {
     }
     expect(readState("department", "waiting")?.label).not.toContain("on you");
   });
+
+  it("the voice phases are shell derivations: every phase the reducers can hold has a reading", () => {
+    for (const [domain, state, tone, label] of [
+      ["voice_conversation", "off", "off", "off"], ["voice_conversation", "listening", "active", "listening"],
+      ["voice_conversation", "hearing", "pending", "hearing you"], ["voice_conversation", "thinking", "info", "thinking"],
+      ["voice_conversation", "speaking", "info", "answering"],
+      ["voice_phase", "idle", "off", "idle"], ["voice_phase", "recording", "pending", "recording"],
+      ["voice_phase", "transcribing", "info", "transcribing"], ["voice_phase", "hotkeys_failed", "danger", "hotkeys failed"],
+    ] as const) {
+      const reading = readState(domain, state);
+      expect(reading?.tone, `${domain}.${state}`).toBe(tone);
+      expect(reading?.label, `${domain}.${state}`).toBe(label);
+    }
+  });
 });

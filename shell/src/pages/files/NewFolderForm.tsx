@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { joinPath, useCreateFolder } from "../../data/files";
 import { Button, Field } from "../../ui";
-import { CREATE_FOLDER_SENTENCES, RefusalOrError } from "./shared";
+import { CREATE_FOLDER_SENTENCES, RefusalOrError, onEscape } from "./shared";
 
 /* ----------------------------------------------------------- new folder -- */
 
@@ -44,9 +44,7 @@ export function NewFolderForm({ path, create }: { path: string; create: ReturnTy
         if (trimmed === "" || create.isPending) return;
         create.mutate(joinPath(path, trimmed), { onSuccess: close });
       }}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") close();
-      }}
+      onKeyDown={onEscape(close)}
     >
       <div className="fi-new-folder-row">
         <Field label="New folder name">

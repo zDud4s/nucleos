@@ -42,13 +42,13 @@ export const MODE_MEANING: Record<AutopilotMode, string> = {
  */
 export function promotionBlocker(project: ProjectSummary, withheld: number): string {
   if (project.classes_total === 0) {
-    return "nothing has been recorded in shadow yet — no evidence is not the same as good evidence";
+    return "nothing has been recorded in shadow yet: no evidence is not the same as good evidence";
   }
   if (project.classes_ready < project.classes_total) {
     return `${project.classes_total - project.classes_ready} of ${project.classes_total} action classes are still short of the bar`;
   }
   if (withheld === 0) {
-    return "every class it has exercised is one the classifier allowed — nothing yet shows it holds back, and restraint is what it needs to prove";
+    return "every class it has exercised is one the classifier allowed: nothing yet shows it holds back, and restraint is what it needs to prove";
   }
   return `the ${DAEMON_NAME} is not offering this project for promotion`;
 }
@@ -81,7 +81,7 @@ export function promotionConsequence(project: ProjectSummary): string {
     project.wip_limit === null
       ? "no ceiling on proposals"
       : `${String(project.open_review_items)} of its ${String(project.wip_limit)} proposal slots already in use`;
-  return `${project.project_id} acts on its own — ${ceiling}, no approval`;
+  return `${project.project_id} acts on its own: ${ceiling}, no approval`;
 }
 
 /**
@@ -157,7 +157,7 @@ export const MODE_SENTENCES: {
     plus: { text: "to act, a folder that is a git repository" },
   },
   not_onboarded:
-    "this project has not been onboarded — onboard it, confirming the command that decides whether it is green, and try again",
+    "this project has not been onboarded: onboard it, confirming the command that decides whether it is green, and try again",
   bad_request: "that is not one of the three settings",
   internal: `the ${DAEMON_NAME} hit an error of its own while changing this`,
 };
@@ -172,7 +172,7 @@ function prerequisiteProse(list: PrerequisiteList): string {
   const leading = list.items.slice(0, -1).map(prerequisiteText).join(", ");
   const last = list.items[list.items.length - 1];
   const final = last === undefined ? "" : prerequisiteText(last);
-  return `${list.lead} ${leading}, and ${final} — plus, ${prerequisiteText(list.plus)}.`;
+  return `${list.lead} ${leading}, and ${final}. Plus, ${prerequisiteText(list.plus)}.`;
 }
 
 /**
@@ -195,7 +195,7 @@ export const MODE_REFUSAL_PROSE: Record<string, string> = {
  * cards — and two copies of a sentence about restraint would eventually say two different things.
  */
 export const PROMOTION_EARNED =
-  "every class it has exercised clears the bar, and at least one is a class the classifier withheld — it has earned this";
+  "every class it has exercised clears the bar, and at least one is a class the classifier withheld, so it has earned this";
 
 /** What stands where the gate was, once a project acts: how to stop it, not the gate it passed. */
-export const PROMOTION_ACTING = "acting on its own — “Turn off” stops it at once";
+export const PROMOTION_ACTING = "acting on its own: “Turn off” stops it at once";

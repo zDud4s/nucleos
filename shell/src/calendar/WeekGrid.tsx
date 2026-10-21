@@ -19,6 +19,7 @@ import {
   weekOf,
   workingStartFraction,
 } from "../lib/calendar-grid";
+import { percentText } from "../lib/format";
 import { UI_LOCALE } from "../lib/locale";
 import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot } from "./slot";
 
@@ -397,7 +398,7 @@ export function NowRule({ day, now }: { day: Date; now: Date }) {
     <span
       className="calendar-now-rule"
       role="img"
-      aria-label={`now, ${Math.round(fraction * 100)}% through today`}
+      aria-label={`now, ${percentText(fraction)} through today`}
       style={{ top: `${fraction * 100}%` }}
     />
   );

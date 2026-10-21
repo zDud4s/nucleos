@@ -115,7 +115,7 @@ export function ModeCode({ projectId, run, onPickRun }: ModeCodeProps) {
       <Teach title="Nothing to review">
         <p>
           This mode reads a run&rsquo;s worktree. When one is working here, its changed files appear
-          on the left — and the whole repository stays where it is, in the editor.
+          on the left, and the whole repository stays where it is, in the editor.
         </p>
         <InspectorLink projectId={projectId} />
       </Teach>
@@ -348,16 +348,16 @@ function InspectorLink({ projectId }: { projectId: string }) {
         params={{ projectId, view: "browse" }}
       >
         Browse, search and diff the folder itself
-      </Link>{" "}
-      — the project as it is on disk, with no run in the way. Or{" "}
+      </Link>:
+      the project as it is on disk, with no run in the way. Or{" "}
       <Link
         className="underline underline-offset-2"
         to="/projects/$projectId/inspect/$view"
         params={{ projectId, view: "rules" }}
       >
         what it does on its own
-      </Link>{" "}
-      — its schedules, its repo triggers, its gate and its ceiling.
+      </Link>:
+      its schedules, its repo triggers, its gate and its ceiling.
     </p>
   );
 }
@@ -445,7 +445,7 @@ function ChangedFiles({
       </div>
       <p className="text-xs text-text-muted">
         {read === null ? "Not read yet." : `Read at ${read}.`} Read when you open this and again when
-        you ask — never on a timer, because every read walks the worktree with git.
+        you ask, never on a timer, because every read walks the worktree with git.
       </p>
       <ChangedBody changed={changed} path={path} onPick={onPick} />
       {/*
@@ -483,7 +483,7 @@ function ChangedBody({
         error={changed.error}
         says={{
           422: "This worktree has no recorded branch point, so what it changed cannot be measured.",
-          404: "That worktree is gone — the run may have finished and given its slot back. Its own page says how it ended.",
+          404: "That worktree is gone: the run may have finished and given its slot back. Its own page says how it ended.",
         }}
         otherwise={`The ${DAEMON_NAME} could not read this worktree.`}
       />
@@ -863,7 +863,7 @@ function ViewRefusal({ what, error }: { what: string; error: unknown }) {
     <Refusal
       error={error}
       says={{
-        404: `No ${what} — that path is not in this run's worktree, or the worktree is gone. A file this run deleted has no ${what} to read; its diff says what it held.`,
+        404: `No ${what}: that path is not in this run's worktree, or the worktree is gone. A file this run deleted has no ${what} to read; its diff says what it held.`,
         400: "That path was refused.",
       }}
       otherwise={`The ${DAEMON_NAME} could not read the ${what}.`}

@@ -8,7 +8,9 @@ import {
   type EventOccurrence,
 } from "../data/calendar";
 import { monthMatrix, nowFraction, sameDay, weekdayLabels } from "../lib/calendar-grid";
+import { percentText } from "../lib/format";
 import { UI_LOCALE } from "../lib/locale";
+import { plural } from "../lib/plural";
 import { dateKeyOf, groupByLocalDay, placementOf, type DragHandlers, type Slot } from "./slot";
 
 /**
@@ -271,7 +273,7 @@ function DayCell({ day, inMonth, occurrences, now, working, selected, onSelect, 
     working ? null : "not a working day",
     hours.short ? `short day, ${hours.hours} hours` : null,
     hours.long ? `long day, ${hours.hours} hours` : null,
-    occurrences.length === 1 ? "1 occurrence" : `${occurrences.length} occurrences`,
+    plural(occurrences.length, "occurrence"),
   ]
     .filter((part) => part !== null)
     .join(", ");
@@ -410,10 +412,10 @@ function Chip({ occurrence, drag }: { occurrence: EventOccurrence; drag: DragHan
 export function NowLine({ day, now }: { day: Date; now: Date }) {
   const fraction = nowFraction(now, day);
   if (fraction === null) return null;
-  const percent = Math.round(fraction * 100);
+  const percent = percentText(fraction);
   return (
-    <span className="calendar-now-line" role="img" aria-label={`${percent}% through today`}>
-      <span className="calendar-now-line-fill" style={{ width: `${percent}%` }} />
+    <span className="calendar-now-line" role="img" aria-label={`${percent} through today`}>
+      <span className="calendar-now-line-fill" style={{ width: percent }} />
     </span>
   );
 }

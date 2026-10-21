@@ -84,6 +84,24 @@ describe("Quiet", () => {
     expect(section?.querySelector(":scope > .ui-quiet")).toBeTruthy();
   });
 
+  it("compact is one inline line that does not claim its section's heading row", () => {
+    const { container } = render(
+      <Section label="Commands">
+        <Quiet compact says="none declared" action={<button type="button">declare</button>}>
+          Declaration rather than detection.
+        </Quiet>
+      </Section>,
+    );
+
+    // Not `.ui-quiet`: `.ui-section:has(> .ui-quiet)` would reflow the section around it.
+    expect(container.querySelector(".ui-quiet")).toBeNull();
+    const line = container.querySelector("p.ui-quiet-compact");
+    expect(line?.textContent).toContain("none declared Declaration rather than detection.");
+    // No disclosure: the reasoning is inline, so the only button is the action.
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "declare" })).toBeTruthy();
+  });
+
   it("announces only when it is the answer to something you just did", () => {
     const { rerender } = render(<Quiet says="nothing came back" />);
     // A page opening with seven quiet panels must not announce seven absences.

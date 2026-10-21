@@ -209,33 +209,12 @@
   outline-offset: 1px;
 }
 
-.brain-aside-empty {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-6) var(--space-2);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal);
-  color: var(--text-muted);
-  text-align: center;
-}
-
 /* The graph's own empty answer is a `Quiet` line from `BrainPanel`; in the aside it takes the
    same weight as the list's empty state rather than sitting in the corner. */
-.brain-aside > .ui-quiet {
+.brain-aside > .ui-quiet,
+.brain-aside > .ui-quiet-compact {
   padding: var(--space-6) var(--space-2);
   text-align: center;
-}
-
-.brain-aside-empty p {
-  margin: 0;
-}
-
-.brain-aside-empty-title {
-  font-family: var(--font-display);
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-  color: var(--text);
 }
 
 @media (max-width: 60rem) {
@@ -291,60 +270,10 @@
   gap: var(--space-1);
 }
 
-.brain-bar-end .brain-chip {
-  font-family: var(--font-body);
-}
-
 .brain-chips {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-1);
-}
-
-/**
- * A toggle chip: on is one rung up and the full text colour, off is the panel showing through
- * and the label muted. A rung, never a hue — the dot beside a node kind is identity (the graph's
- * key), not the chip's state, and it dims with the chip so "off" reads in the key as well.
- */
-.brain-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 0.22rem var(--space-3);
-  border: var(--hairline) solid var(--border);
-  border-radius: var(--radius-pill);
-  background: none;
-  color: var(--text-muted);
-  font-size: var(--text-sm);
-  line-height: 1.4;
-  white-space: nowrap;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-quick) var(--ease),
-    border-color var(--dur-quick) var(--ease),
-    color var(--dur-quick) var(--ease);
-}
-
-.brain-chip:hover {
-  border-color: var(--text-faint);
-  color: var(--text);
-}
-
-.brain-chip[aria-pressed="true"] {
-  border-color: var(--border-strong);
-  background: var(--surface-raised);
-  color: var(--text);
-}
-
-.brain-chip[aria-pressed="false"] .unified-mark {
-  opacity: var(--opacity-disabled);
-}
-
-/* Link types are a second, quieter rank under the line: mono, because they are the daemon's words. */
-.brain-chip-link {
-  padding: 0.12rem var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
 }
 
 /* ------------------------------------------------------------ item panel -- */

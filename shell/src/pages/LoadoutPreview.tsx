@@ -130,7 +130,7 @@ function PreviewResult({ answer }: { answer: LoadoutPreviewAnswer }) {
                 <code>{ref.path}</code>
                 <span className="loadout-preview-muted">
                   {ref.kind}, {ref.owner_kind}
-                  {ref.note ? ` — ${ref.note}` : ""}
+                  {ref.note ? `: ${ref.note}` : ""}
                 </span>
                 {ref.state === "missing" && <span className="loadout-preview-missing">missing</span>}
               </li>

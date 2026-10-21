@@ -64,7 +64,7 @@ export function RouteError({ error }: RouteErrorProps) {
     <div className="app-route-error">
       <PageHeader
         title="This page could not be drawn"
-        headline="Everything around this page is still working — the rail, the connection line and the kill switch are where you left them. What follows is what the page itself threw."
+        headline="Everything around this page is still working: the rail, the connection line and the kill switch are where you left them. What follows is what the page itself threw."
       />
       <ErrorNote>{message}</ErrorNote>
       {stack === "" ? null : <pre className="app-route-error-stack">{stack}</pre>}
@@ -79,7 +79,7 @@ export function RouteError({ error }: RouteErrorProps) {
              `CopyOnce` swaps its button for this same sentence for this same
              reason, and the class is the one that already styles it. */
           <p className="ui-copy-once-fallback">
-            Select the report above and copy it — this window cannot copy for you.
+            Select the report above and copy it. This window cannot copy for you.
           </p>
         )}
       </div>

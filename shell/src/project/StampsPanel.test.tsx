@@ -542,7 +542,7 @@ describe("the owner's verdict, and what became of it", () => {
 
     fireEvent.click(screen.getByLabelText(`stamp ${row.spec_slug} ${row.section} as what you want`));
 
-    const said = await screen.findByText(/try again in a moment/);
+    const said = await screen.findByText(/Try again in a moment/);
     expect(said.textContent ?? "").toMatch(/nothing you asked for was wrong/i);
     expect(said.textContent ?? "").not.toMatch(/failed/i);
   });

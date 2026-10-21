@@ -61,7 +61,7 @@ describe("the judge's panel", () => {
       initialPath: "/autopilot",
     });
 
-    expect(await screen.findByText(/rules cannot be read — the judge has no effect/)).toBeDefined();
+    expect(await screen.findByText(/rules cannot be read, so the judge has no effect/)).toBeDefined();
     expect(screen.getByText(/runs already working keep the setting they started with/)).toBeDefined();
   });
 
@@ -166,7 +166,7 @@ describe("what the judge said, beside a decision and on a run", () => {
       </dl>,
       { initialPath: "/autopilot" },
     );
-    expect(screen.getByText(/no answer — deadline/)).toBeDefined();
+    expect(screen.getByText(/no answer: deadline/)).toBeDefined();
   });
 
   it("lists a run's verdicts from the núcleo", async () => {

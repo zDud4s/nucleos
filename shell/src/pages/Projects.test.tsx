@@ -1008,10 +1008,10 @@ describe("Projects - a change says what it replaced", () => {
       daemon.apiFetch.mock.calls.filter(([path]) => String(path) === "/projects/alpha/wip-limit");
     expect(sent()).toHaveLength(0);
 
-    fireEvent.click(screen.getByRole("button", { name: /Set 0 — nothing new starts here/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Set 0: nothing new starts here/ }));
     await waitFor(() => expect(sent()).toHaveLength(1));
     expect(JSON.parse(String((sent()[0][1] as RequestInit).body))).toEqual({ limit: 0 });
-    expect(await screen.findByText(/Ceiling set to 0 — it was 3/)).toBeDefined();
+    expect(await screen.findByText(/Ceiling set to 0. It was 3/)).toBeDefined();
   });
 
   /* Neither button is `approve`: that is the one affirmative fill in the system, and a search or a

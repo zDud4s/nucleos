@@ -147,7 +147,7 @@ export function DepartmentContext({ proposal }: { proposal: Proposal }) {
             , working on <q>{proposal.asked_for}</q>
           </>
         ) : null}
-        {" — "}
+        {" in "}
         {runId !== null ? (
           <Link className="waiting-row-link" to="/team-runs/$runId" params={{ runId }}>
             {team ?? "a department"}

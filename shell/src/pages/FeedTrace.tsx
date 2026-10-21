@@ -9,7 +9,9 @@ import {
   type FeedSequence,
   type SequenceState,
 } from "../lib/sequences";
-import { HOUR, MINUTE, clock, quietGaps, span, stamp, timeTicks } from "../lib/timeline";
+import { HOUR, MINUTE, quietGaps, span, stamp, timeTicks } from "../lib/timeline";
+import { plural, pluralWord } from "../lib/plural";
+import { clockText } from "../lib/when";
 import { feedGravityOf, feedMarkTone, type FeedGravity, type FeedLane } from "../ui";
 
 /**
@@ -208,7 +210,7 @@ export function FeedTrace({ sequences, start, now, title, at, onAt, selected, on
             type="button"
             className="feed-trace-label"
             aria-expanded={open}
-            aria-label={`${lane.label}, ${lane.lines} ${lane.lines === 1 ? "line" : "lines"}`}
+            aria-label={`${lane.label}, ${plural(lane.lines, "line")}`}
             onClick={() => setCollapsed(toggle(collapsed, lane.lane))}
           >
             <ChevronRight className="feed-trace-chevron" size={14} aria-hidden="true" />
@@ -246,7 +248,7 @@ export function FeedTrace({ sequences, start, now, title, at, onAt, selected, on
             type="button"
             className="feed-trace-label"
             aria-expanded={unfold}
-            aria-label={`${n} routine ${n === 1 ? "sequence" : "sequences"} in ${lane.label}`}
+            aria-label={`${n} routine ${pluralWord(n, "sequence")} in ${lane.label}`}
             onClick={() => setUnfolded(toggle(unfolded, lane.lane))}
           >
             <ChevronRight className="feed-trace-chevron" size={14} aria-hidden="true" />
@@ -353,7 +355,7 @@ export function FeedTrace({ sequences, start, now, title, at, onAt, selected, on
             </span>
           </div>
           <span className="feed-trace-clock">
-            {stamp(time, now)} / {clock(now)}
+            {stamp(time, now)} / {clockText(now)}
           </span>
           <button
             type="button"
@@ -552,7 +554,7 @@ function Marks({
 /** `44 min` for something that took time, `at 23:48` for a single moment, `8 lines` for a series. */
 export function duration(sequence: FeedSequence, now: number): string {
   if (sequence.family === "series") return `${sequence.lines.length} lines`;
-  if (!sequence.open && sequence.lines.length === 1) return `at ${clock(sequence.start)}`;
+  if (!sequence.open && sequence.lines.length === 1) return `at ${clockText(sequence.start)}`;
   return span((sequence.open ? now : sequence.last) - sequence.start);
 }
 

@@ -453,7 +453,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     expect(optionOrder()).toEqual(["bravo", "alpha", "delta", "charlie"]);
     expect(selectedOption().textContent?.startsWith("alpha")).toBe(true);
 
-    const said = `alpha is now off — ${MODE_MEANING.off}`;
+    const said = `alpha is now off: ${MODE_MEANING.off}`;
     await waitFor(() => {
       const regions = Array.from(document.querySelectorAll('[aria-live="polite"]'));
       expect(regions.map((region) => region.textContent)).toContain(said);
@@ -982,7 +982,7 @@ describe("Autopilot - the ledger line names what it counts", () => {
     await renderCockpit();
 
     expect(await screen.findByRole("link", { name: "1 to review across the roster" })).toBeDefined();
-    expect(document.querySelector(".ap-ledger")?.textContent).toContain("— 1 project's queue full");
+    expect(document.querySelector(".ap-ledger")?.textContent).toContain(", 1 project's queue full");
   });
 
   it("the ledger names several full queues in the plural", async () => {
@@ -999,7 +999,7 @@ describe("Autopilot - the ledger line names what it counts", () => {
 
     expect(await screen.findByRole("link", { name: "1 to review across the roster" })).toBeDefined();
     const ledger = document.querySelector(".ap-ledger")?.textContent;
-    expect(ledger).toContain("— 2 projects' queues full");
+    expect(ledger).toContain(", 2 projects' queues full");
     expect(ledger).not.toContain("project queue full");
   });
 });

@@ -37,7 +37,17 @@ import {
   type ChatSummary,
   type IdeSession,
 } from "../data/chats";
-import { ConfirmButton, ErrorNote, RelativeTime, Teach, relativeText } from "../ui";
+import {
+  Chip,
+  ConfirmButton,
+  ErrorNote,
+  Quiet,
+  RelativeTime,
+  Skeleton,
+  Teach,
+  relativeText,
+  useUndoToast,
+} from "../ui";
 import { stillGoing } from "../lib/editor";
 import { BAND_TITLE, inBands } from "../lib/when";
 import {
@@ -243,6 +253,22 @@ export function SessionColumn({
     });
   }
 
+  // A menu item cannot press-and-hold the way the open conversation's Archive does, so the archive
+  // here is undone instead of confirmed. It lives in the column and not in the row: archiving
+  // removes the row from the list, and a toast held by the row would go with it.
+  const archive = useArchiveChat();
+  const restore = useRestoreChat();
+  const undo = useUndoToast();
+  function archiveWithUndo(chatId: string, name: string) {
+    archive.mutate(chatId, {
+      onSuccess: () =>
+        undo.show({
+          message: `Archived ${name}`,
+          onUndo: () => restore.mutate(chatId),
+        }),
+    });
+  }
+
   const renderRow = (entry: ListRow) =>
     entry.kind === "chat" ? (
       <SessionRow
@@ -253,6 +279,7 @@ export function SessionColumn({
         tabOpen={openTabs.includes(entry.chat.chat_id)}
         groups={groups}
         onOpen={onOpenChat}
+        onArchive={archiveWithUndo}
       />
     ) : (
       <EditorRow
@@ -342,16 +369,15 @@ export function SessionColumn({
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <button
-          type="button"
-          className="chats-session-chip"
-          aria-pressed={activeOnly}
-          onClick={() =>
+        <Chip
+          pressed={activeOnly}
+          count={counts.active}
+          onToggle={() =>
             setStatuses(activeOnly ? new Set() : new Set<SessionStatus>(["needs_input", "working"]))
           }
         >
-          {`Active · ${counts.active}`}
-        </button>
+          Active
+        </Chip>
 
         <label className="chats-session-search">
           <Search className="chats-rail-icon" aria-hidden="true" />
@@ -387,12 +413,12 @@ export function SessionColumn({
       )}
 
       <div className="chats-rail-scroll">
-        {!answered && <p className="chats-loading">reading your conversations…</p>}
+        {!answered && <Skeleton label="Reading your conversations…" lines={3} />}
         {answered && rows.length === 0 && editors.length === 0 && groups.length === 0 && (
           <Teach title="No conversations yet">
             <p>Say something to start one: press New conversation above and write in the box.</p>
             <p>
-              Telegram&apos;s own conversations do not show up here — only the ones you start from
+              Telegram&apos;s own conversations do not show up here, only the ones you start from
               this app do.
             </p>
           </Teach>
@@ -432,6 +458,7 @@ export function SessionColumn({
         </details>
 
         <ArchivedSection />
+        {undo.toast}
       </div>
     </>
   );
@@ -538,7 +565,7 @@ function ArchivedSection() {
       </summary>
       {open && archived.isError && <ErrorNote>archived conversations could not be read</ErrorNote>}
       {open && archived.data !== undefined && list.length === 0 && (
-        <p className="chats-group-empty">Nothing archived.</p>
+        <Quiet compact says="Nothing archived." />
       )}
       {open && list.length > 0 && (
         <ul className="chats-list" aria-label="Archived conversations">
@@ -571,6 +598,7 @@ function SessionRow({
   tabOpen,
   groups,
   onOpen,
+  onArchive,
 }: {
   row: ChatSummary;
   active: boolean;
@@ -579,8 +607,9 @@ function SessionRow({
   groups: ChatGroup[];
   /** See `openingAChat`. Pressing a row is one of the three ways a conversation gets opened. */
   onOpen: () => void;
+  /** Archives the conversation and opens the column's undo window; the column owns both because the row unmounts. */
+  onArchive: (chatId: string, name: string) => void;
 }) {
-  const archive = useArchiveChat();
   const setGroup = useSetChatGroup();
   // A conversation with no name AND nothing said in it has no name to show; saying what is true of
   // it makes the empty ones one visibly different kind of row you can skim past.
@@ -665,7 +694,7 @@ function SessionRow({
               </DropdownMenuRadioGroup>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
-          <DropdownMenuItem onSelect={() => archive.mutate(row.chat_id)}>
+          <DropdownMenuItem onSelect={() => onArchive(row.chat_id, name)}>
             <Archive aria-hidden="true" />
             Archive
           </DropdownMenuItem>

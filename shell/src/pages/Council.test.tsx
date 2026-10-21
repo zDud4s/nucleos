@@ -334,7 +334,7 @@ describe("Council - an expired answer", () => {
     await renderCouncil("/council/c-1");
     await openTheRecord();
 
-    expect(await screen.findByText("answered — the text has expired")).toBeDefined();
+    expect(await screen.findByText("answered, but the text has expired")).toBeDefined();
   });
 });
 
@@ -1163,7 +1163,7 @@ describe("Council - the lectern", () => {
     fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
 
     const button = await screen.findByRole("button", { name: "Convene" });
-    const reason = "No roster in ~/.nucleos/council.yaml — add one and restart the background service.";
+    const reason = "No roster in ~/.nucleos/council.yaml. Add one and restart the background service.";
     // The id is stable, so the description is read once it holds the reason.
     const describedBy = () => document.getElementById(button.getAttribute("aria-describedby") ?? "")?.textContent;
     await waitFor(() => expect(describedBy()).toBe(reason));
@@ -2349,7 +2349,7 @@ describe("Council - review rework", () => {
     );
 
     await renderCouncil("/council");
-    await screen.findAllByText("No roster in ~/.nucleos/council.yaml — add one and restart the background service.");
+    await screen.findAllByText("No roster in ~/.nucleos/council.yaml. Add one and restart the background service.");
 
     expect(screen.getAllByRole("button", { name: /^Seat \d, empty$/ })).toHaveLength(8);
     expect(screen.getByRole("button", { name: "Chairman, empty" })).toBeDefined();

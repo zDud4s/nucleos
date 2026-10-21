@@ -152,7 +152,7 @@ export function ModeMap({ projectId }: ModeMapProps) {
           {map.data !== undefined && map.data.junction.counts.decisions === 0 ? (
             // One quiet line: the empty state is not the news here, the spec to read is.
             <p className="m-0 text-sm text-text-muted">
-              Nothing decided yet — only what you approve from a spec enters the map.
+              Nothing decided yet. Only what you approve from a spec enters the map.
             </p>
           ) : null}
           <ExtractSpec projectId={projectId} />
@@ -162,7 +162,7 @@ export function ModeMap({ projectId }: ModeMapProps) {
         <StatesView projectId={projectId} />
       ) : map.isError && map.data === undefined ? (
         <ErrorNote>
-          The {DAEMON_NAME} could not read this project&rsquo;s map — its folder may have moved.{" "}
+          The {DAEMON_NAME} could not read this project&rsquo;s map: its folder may have moved.{" "}
           <Button variant="quiet" onClick={readAgain} disabled={map.isFetching}>
             {map.isFetching ? "reading…" : "read it again"}
           </Button>
@@ -189,7 +189,7 @@ export function ModeMap({ projectId }: ModeMapProps) {
       */}
       {view === "architecture" || view === "layers" ? null : (
         <p className="ws-foot">
-          Not on this map yet: evidence — nothing here reads a test run or a gate.
+          Not on this map yet: evidence: nothing here reads a test run or a gate.
         </p>
       )}
     </div>
@@ -252,7 +252,7 @@ function Decisions({ data, onOpen }: { data: ProjectMap; onOpen: (view: MapView)
     // One quiet line: the empty state is not the news here, the spec to read below it is.
     return (
       <p className="m-0 text-sm text-text-muted">
-        Nothing decided yet — only what you approve from a spec enters the map.
+        Nothing decided yet. Only what you approve from a spec enters the map.
       </p>
     );
   }

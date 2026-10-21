@@ -19,6 +19,7 @@ import { isHeld, usePendingNotifications, type PendingNotification } from "../da
 import { dayBounds, monthMatrix, weekOf } from "../lib/calendar-grid";
 import { DAEMON_NAME } from "../copy";
 import { UI_LOCALE } from "../lib/locale";
+import { plural } from "../lib/plural";
 import {
   Badge,
   Button,
@@ -169,9 +170,8 @@ export function headline(
     view === "week"
       ? rows
       : rows.filter((row) => placementOf(row).day.getMonth() === anchor.getMonth());
-  const noun = inPeriod.length === 1 ? "occurrence" : "occurrences";
   const period = view === "week" ? "this week" : "this month";
-  return `${inPeriod.length} ${noun} ${period} — working hours ${config.working_hours_start}–${config.working_hours_end}, ${config.default_tz}`;
+  return `${plural(inPeriod.length, "occurrence")} ${period} · working hours ${config.working_hours_start}–${config.working_hours_end}, ${config.default_tz}`;
 }
 
 export function Calendar() {
@@ -443,7 +443,7 @@ function EventsError({ error, onRetry }: { error: unknown; onRetry: () => void }
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
     <ErrorNote onRetry={onRetry}>
-      Could not reach the {DAEMON_NAME} — nothing is known about this period
+      Could not reach the {DAEMON_NAME}: nothing is known about this period
     </ErrorNote>
   );
 }
@@ -463,7 +463,7 @@ function MoveError({ error, onDismiss }: { error: unknown; onDismiss: () => void
       {isApiRefusal(error) ? (
         <RefusalNote refusal={error} />
       ) : (
-        <ErrorNote>Could not reach the {DAEMON_NAME} — nothing was moved</ErrorNote>
+        <ErrorNote>Could not reach the {DAEMON_NAME}: nothing was moved</ErrorNote>
       )}
       <Button type="button" onClick={onDismiss}>
         Dismiss
@@ -539,7 +539,7 @@ export function HeldNotifications() {
 
 function NotificationsError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about held notifications</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME}: nothing is known about held notifications</ErrorNote>;
 }
 
 function NotificationRow({ row }: { row: PendingNotification }) {

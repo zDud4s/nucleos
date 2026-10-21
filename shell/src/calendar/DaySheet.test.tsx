@@ -398,7 +398,7 @@ describe("the sheet itself", () => {
     // The day is the dialog's name, so a screen reader hears which day opened.
     expect(screen.getByRole("dialog", { name: /25/ })).toBeDefined();
     // 25 October 2026 is Lisbon's long day AND a Sunday — two facts, said separately.
-    expect(screen.getByText("25h — long day")).toBeDefined();
+    expect(screen.getByText("25h, long day")).toBeDefined();
     expect(screen.getByText("not a working day")).toBeDefined();
     expect(screen.getByText("nothing on this day.")).toBeDefined();
   });
@@ -417,7 +417,7 @@ describe("the sheet itself", () => {
 
     // Closed, the day is a column of times and names — no controls yet.
     expect(screen.getByText("Retro")).toBeDefined();
-    expect(screen.getAllByText("30 min", { selector: ".calendar-occurrence-length" })).toHaveLength(2);
+    expect(screen.getAllByText("30m", { selector: ".calendar-occurrence-length" })).toHaveLength(2);
     expect(screen.queryByRole("button", { name: "Skip this occurrence" })).toBeNull();
 
     const [first, second] = screen.getAllByRole("button", { expanded: false });

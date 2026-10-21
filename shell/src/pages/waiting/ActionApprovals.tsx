@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Proposal } from "../../data/system";
 import { useApproveProposal, useDeclineAction, useRejectProposal } from "../../data/waiting";
-import { Button, ConfirmButton, RelativeTime, Row, Rows } from "../../ui";
+import { Button, Callout, ConfirmButton, RelativeTime, Row, Rows } from "../../ui";
 import type { Reading } from "./reading";
 import { DecisionNotes, DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
 import { ReadFrom, ToolInput, readEntries } from "./ToolInput";
@@ -329,9 +329,9 @@ function ApprovalDecision({ proposal }: { proposal: Proposal }) {
       </div>
       <ToolInput raw={proposal.tool_input} />
       {status !== null && status !== "awaiting_approval" && (
-        <p className="waiting-notice" role="status">
-          The run is {status.replace(/_/g, " ")}, not waiting on this — approving resumes nothing.
-        </p>
+        <Callout tone="pending" role="status">
+          The run is {status.replace(/_/g, " ")}, not waiting on this, so approving resumes nothing.
+        </Callout>
       )}
     </>
   );

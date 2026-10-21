@@ -66,7 +66,7 @@ describe("the resolver's readiness, queue and enforce", () => {
     await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
 
     expect(await screen.findByText(RESOLVE_ENFORCE_RISK)).toBeTruthy();
-    expect(screen.getByText("10 reviewed, 10 agree — ready")).toBeTruthy();
+    expect(screen.getByText("10 reviewed, 10 agree, ready")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Let the resolver decide" }));
     await waitPastTheDwell();
     fireEvent.click(screen.getByRole("button", { name: /I accept the risk above/ }));
@@ -92,7 +92,7 @@ describe("the resolver's readiness, queue and enforce", () => {
         : observing({ reviewed: 10, agree: 8, less_cautious: 0, ready: false }),
     );
     await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
-    expect(await screen.findByText("8 of 10 agree — under 90%")).toBeTruthy();
+    expect(await screen.findByText("8 of 10 agree, under 90%")).toBeTruthy();
     expect((screen.getByRole("button", { name: "Let the resolver decide" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
@@ -132,7 +132,7 @@ describe("the resolver's readiness, queue and enforce", () => {
     expect(screen.queryByRole("button", { name: "carry on without it" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "hand it to me" }));
     await waitPastTheDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Yes — hand it to me" }));
+    fireEvent.click(screen.getByRole("button", { name: "Yes, hand it to me" }));
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/judge-resolutions/7/outcome", {
         method: "POST",

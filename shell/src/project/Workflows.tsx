@@ -1,6 +1,6 @@
 // §spec motor-de-workflows
 import { DAEMON_NAME } from "../copy";
-import { useEffect, useId, useState } from "react";
+import { useId, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
@@ -25,7 +25,9 @@ import {
   type Installed,
   type WorkflowConsent,
 } from "../data/workflows";
+import { useNow } from "../lib/useNow";
 import { openInVscode } from "../lib/vscode";
+import { clockText } from "../lib/when";
 import {
   Button,
   ConfirmButton,
@@ -63,21 +65,14 @@ export interface WorkflowsProps {
 }
 
 /**
- * The clock, re-read once a minute.
+ * How often the clock is re-read: once a minute.
  *
  * The standing sentences are computed against "now", and a page left open over a weekend used to go
  * on saying "receiving no updates for 3 days" because `Date.now()` was only read at render. The
  * sentence is coarse — days at the finest — so a minute is far finer than it can show and costs
  * nothing.
  */
-function useNow(every = 60_000): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const tick = window.setInterval(() => setNow(Date.now()), every);
-    return () => window.clearInterval(tick);
-  }, [every]);
-  return now;
-}
+const NOW_EVERY_MS = 60_000;
 
 /** An error's own words after a colon, or a full stop when it has none. */
 function said(error: unknown): string {
@@ -88,7 +83,7 @@ export function Workflows({ projectId }: WorkflowsProps) {
   const installed = useProjectWorkflows(projectId);
   const library = useWorkflowLibrary();
   const queryClient = useQueryClient();
-  const now = useNow();
+  const now = useNow(NOW_EVERY_MS);
   const [openDiff, setOpenDiff] = useState<string | null>(null);
 
   // Everything this page read, read again: the pins with their diffs and graphs under the project
@@ -218,7 +213,7 @@ function ReadAt({ at, onReread }: { at: number; onReread: () => void }) {
       <span>
         Read at{" "}
         <time className="font-mono tabular-nums" dateTime={when.toISOString()}>
-          {when.toTimeString().slice(0, 5)}
+          {clockText(at)}
         </time>
         , and again after each change made here or when this window regains focus.
       </span>
@@ -365,7 +360,7 @@ function InstalledRow({
       {row.standing === "missing" ? (
         <p className="max-w-prose text-sm text-text-muted">
           The pin travelled with this repository and the bundle did not. It came from{" "}
-          <span className="font-mono">{row.origin}</span> — which is what the pin records so that a
+          <span className="font-mono">{row.origin}</span>, which is what the pin records so that a
           new machine can be told what it is missing rather than quietly having no workflow.
         </p>
       ) : null}
@@ -439,8 +434,8 @@ function InstalledRow({
             label="stop using it"
             confirmLabel={
               overrides > 0
-                ? `stop — ${overrides} ${overrides === 1 ? "override goes" : "overrides go"} with the pin`
-                : "stop — remove the pin"
+                ? `stop: ${overrides} ${overrides === 1 ? "override goes" : "overrides go"} with the pin`
+                : "stop: remove the pin"
             }
             disabled={forget.isPending}
             onConfirm={() => forget.mutate({ projectId, name: row.name })}
@@ -458,9 +453,9 @@ function InstalledRow({
               ? `agree and update to ${review.version}`
               : review.kind === "follow"
                 ? "agree and follow the library again"
-                : "replace — this copy's edits are lost"
+                : "replace: this copy's edits are lost"
           }
-          holdLabel={review.kind === "replace" ? "replace — this copy's edits are lost" : undefined}
+          holdLabel={review.kind === "replace" ? "replace: this copy's edits are lost" : undefined}
           pending={update.isPending}
           sentences={REFUSALS}
           onCancel={() => setReview(null)}
@@ -532,11 +527,11 @@ const REFUSALS: Record<string, string> = {
   no_library: "this machine has no workflow library.",
   no_such_bundle: "the library has no bundle at that version.",
   not_installed: "this project does not use that workflow.",
-  already_ejected: "this project already has its own copy — the diff is the thing to look at.",
+  already_ejected: "this project already has its own copy: the diff is the thing to look at.",
   bad_name: "that is not a usable workflow name.",
   invalid_graph: "this version's graph does not parse, so its commands cannot be listed.",
   consent_required:
-    "the commands changed since they were listed, so nothing was agreed to — open the step again and read them.",
+    "the commands changed since they were listed, so nothing was agreed to: open the step again and read them.",
   internal: `the ${DAEMON_NAME} hit an error of its own.`,
 };
 
@@ -659,7 +654,7 @@ function Diff({ projectId, name }: { projectId: string; name: string }) {
   if (diff.data.changes.length === 0) {
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        Identical to {diff.data.origin_version} in the library, file for file — but still frozen: an
+        Identical to {diff.data.origin_version} in the library, file for file, but still frozen: an
         ejected copy receives nothing new whether or not it has been edited.
       </p>
     );
@@ -679,7 +674,7 @@ function Diff({ projectId, name }: { projectId: string; name: string }) {
   return (
     <Well as="div" reads>
       <p className="text-xs text-text-muted">
-        Against {diff.data.origin_version} in the library. File by file — the line-by-line answer is
+        Against {diff.data.origin_version} in the library. File by file: the line-by-line answer is
         the editor, one click away.
       </p>
       <ul className="mt-2 flex flex-col gap-0.5">
@@ -855,7 +850,7 @@ function LibraryRow({
  */
 export function WorkflowSummary({ projectId }: { projectId: string }) {
   const installed = useProjectWorkflows(projectId);
-  const now = useNow();
+  const now = useNow(NOW_EVERY_MS);
 
   if (installed.isError || installed.data === undefined) {
     return (

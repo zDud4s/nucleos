@@ -1,6 +1,6 @@
 import { Handle, Position, useStore, type Node, type NodeProps } from "@xyflow/react";
 import { usd } from "../ui";
-import { useNow } from "./clock";
+import { useNow } from "../lib/useNow";
 import { elapsed, STATE_TEXT, tokens } from "./format";
 import { useNodeEntry } from "./hooks";
 import { identityOf, useParentHarness } from "./identity";
@@ -22,7 +22,7 @@ export function FleetNode({ data }: NodeProps<FlowAgent>) {
   const parentHarness = useParentHarness(entry?.node.parent_id ?? null);
   const card = useStore(selectCard);
   const ticking = entry !== undefined && (entry.node.state === "busy" || entry.node.state === "idle");
-  const now = useNow(ticking);
+  const now = useNow(1000, ticking);
   if (entry === undefined) return null;
 
   const { node, lines, metrics } = entry;

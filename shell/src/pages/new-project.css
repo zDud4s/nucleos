@@ -227,24 +227,6 @@
   text-align: center;
 }
 
-/* The one promise about trust, said once and quietly. */
-.np-callout {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  margin: 0;
-  padding: var(--space-3) var(--space-4);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
-  color: var(--text);
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-}
-
-.np-callout > :first-child {
-  flex: none;
-}
-
 /* What pressing the button will write, read before signing it. */
 .np-receipt {
   padding: var(--space-3) var(--space-4);

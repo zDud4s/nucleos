@@ -510,14 +510,14 @@ describe("Waiting - git requests", () => {
     const files = within(card).getByRole("list", { name: "Conflicts in merge #573" });
     expect(within(files).getByText("shell/src/preview/daemon.ts")).toBeDefined();
     expect(within(card).getByRole("link", { name: "run #900623" })).toBeDefined();
-    expect(within(card).getByText(/is resolving it — nothing to do yet/)).toBeDefined();
+    expect(within(card).getByText(/is resolving it, so there is nothing to do yet/)).toBeDefined();
     // The badge agrees with the hint: the next move is the agent's, not the reader's.
     expect(within(card).getByText("with an agent")).toBeDefined();
     expect(within(card).queryByText("escalated to you")).toBeNull();
     // The files say it better than the reason written for the agent that asked.
     expect(within(card).queryByText(/nothing was published/)).toBeNull();
     // Git's verbatim prefix is not something a person needs to read.
-    expect(within(card).getByText(/^C:\\Projects\\nucleos\\\.git — asked from shell$/)).toBeDefined();
+    expect(within(card).getByText(/^C:\\Projects\\nucleos\\\.git, asked from shell$/)).toBeDefined();
   });
 
   it("arming a git control holds the order of the requests still", async () => {
@@ -602,7 +602,8 @@ describe("Waiting - a section with nothing in it", () => {
     expect(trigger.getAttribute("aria-describedby")).toBe(tip.id);
     expect(tip.textContent).toMatch(/asking for the window/);
     expect(line.querySelector("details")).toBeNull();
-    expect(within(line).queryByRole("button")).toBeNull();
+    // The tip trigger is a `role="button"` span; what must be absent is a real `<button>` (`why?`).
+    expect(line.querySelector("button")).toBeNull();
   });
 
   it("a queue's reasoning opens on a press and Escape closes it", async () => {
@@ -837,7 +838,7 @@ describe("Waiting - batch action approvals", () => {
     expect(failedRow).not.toBeNull();
     expect(
       await within(failedRow as HTMLElement).findByText(
-        "this one was already answered — the list clears it on the next read, and nothing further is needed",
+        "this one was already answered. The list clears it on the next read, and nothing further is needed",
       ),
     ).toBeDefined();
     const approveCalls = daemon.apiFetch.mock.calls
@@ -866,7 +867,7 @@ describe("Waiting - batch action approvals", () => {
     fireEvent.click(approveAll);
 
     await screen.findByText(
-      "this one was already answered — the list clears it on the next read, and nothing further is needed",
+      "this one was already answered. The list clears it on the next read, and nothing further is needed",
     );
     expect((screen.getByRole("checkbox", { name: "Select approval #1" }) as HTMLInputElement).checked).toBe(true);
     expect((screen.getByRole("checkbox", { name: "Select approval #2" }) as HTMLInputElement).checked).toBe(false);
@@ -883,7 +884,7 @@ describe("Waiting - batch action approvals", () => {
 
     // The rows are the ticked boxes on the cards; the button would only have to grow to list them.
     expect(within(bulkBar()).getByRole("button", { name: "Approve the selected" })).toBeDefined();
-    const said = screen.getByText("armed: Approve the selected — press again to confirm");
+    const said = screen.getByText("armed: Approve the selected. Press again to confirm");
     expect(said.getAttribute("role")).toBe("status");
   });
 
@@ -925,7 +926,7 @@ describe("Waiting - the ordering freeze", () => {
     // its button changed and the other card's did not.
     const armed = within(first).getByRole("button", { name: "Approve and let this action happen" });
     expect(within(cardOf("approval #2")).getByRole("button", { name: "Approve" })).toBeDefined();
-    const said = screen.getByText("armed: Approve and let this action happen — press again to confirm");
+    const said = screen.getByText("armed: Approve and let this action happen. Press again to confirm");
     expect(said.getAttribute("role")).toBe("status");
 
     // The rest label is still here, holding the width it had a click ago — hidden from the eye
@@ -1484,7 +1485,7 @@ describe("Waiting - one verb pair", () => {
 
     // The form is left as typed, and a status line says it is behind.
     const said = await screen.findByText(/The director changed this proposal/);
-    expect(said.getAttribute("role")).toBe("status");
+    expect(said.closest(".ui-callout")?.getAttribute("role")).toBe("status");
     expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Typed by hand");
 
     fireEvent.click(screen.getByRole("button", { name: "Load the new proposal" }));
@@ -1508,7 +1509,7 @@ describe("Waiting - one verb pair", () => {
     expect(daemon.apiFetch).not.toHaveBeenCalledWith("/proposals/301/reject", { method: "POST" });
 
     await afterDwell();
-    fireEvent.click(screen.getByRole("button", { name: "Decline — the team may ask again" }));
+    fireEvent.click(screen.getByRole("button", { name: "Decline: the team may ask again" }));
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/proposals/301/reject", { method: "POST" }),
     );
@@ -1540,7 +1541,7 @@ describe("Waiting - one verb pair", () => {
     await renderWaiting();
 
     const said = await screen.findByText(
-      /the background service is not responding — nothing is known about the suggested merges/,
+      /the background service is not responding, so nothing is known about the suggested merges/,
     );
     expect(said.textContent).not.toContain("núcleo");
   });
@@ -1713,8 +1714,8 @@ describe("Waiting - an approval says what the run was doing", () => {
     await renderWaiting();
 
     const notice = await screen.findByText(/The run is cancelled, not waiting on this/);
-    expect(notice.getAttribute("role")).toBe("status");
-    expect(notice.className).toBe("waiting-notice");
+    const callout = notice.closest(".ui-callout");
+    expect(callout?.getAttribute("role")).toBe("status");
   });
 });
 

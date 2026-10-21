@@ -2,7 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import { useRecentFeed, type FeedEntry } from "../data/feed";
-import { ErrorNote, Panel, RefusalNote, RelativeTime } from "../ui";
+import { ErrorNote, Panel, Quiet, RefusalNote, RelativeTime } from "../ui";
 import { KindBadge } from "../pages/Feed";
 /*
   The rules this block is drawn with are `ap-` and live in `pages/autopilot.css`, where
@@ -51,7 +51,7 @@ export function FeedEmbed({ lines = EMBED_LINES }: FeedEmbedProps) {
     >
       {feed.isError && feed.data === undefined && <FeedError error={feed.error} />}
       {feed.data !== undefined && rows.length === 0 && (
-        <p className="ap-empty">the {DAEMON_NAME} has not written a line yet.</p>
+        <Quiet compact says={`the ${DAEMON_NAME} has not written a line yet.`} />
       )}
       {rows.length > 0 && (
         <ul className="ap-feed" aria-label="Recent feed lines">
@@ -102,5 +102,5 @@ function FeedLine({ entry }: { entry: FeedEntry }) {
 
 function FeedError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
-  return <ErrorNote>Could not reach the {DAEMON_NAME} — nothing is known about the feed.</ErrorNote>;
+  return <ErrorNote>Could not reach the {DAEMON_NAME}. Nothing is known about the feed.</ErrorNote>;
 }

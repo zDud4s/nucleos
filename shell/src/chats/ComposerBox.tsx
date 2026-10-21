@@ -97,7 +97,7 @@ export function ComposerBox({
             type="button"
             className="chats-send chats-send-stop"
             aria-label="Stop"
-            title="stop the turn — the conversation stays warm for the next message"
+            title="stop the turn (the conversation stays warm for the next message)"
             disabled={stop.pending}
             onClick={stop.onStop}
           >

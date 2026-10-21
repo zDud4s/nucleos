@@ -1,4 +1,6 @@
 import type { DevtimeDay, DevtimeQuality, LeverWaste, RuleView, RuleWaste } from "../data/devtime";
+import { percentText } from "../lib/format";
+import { plural } from "../lib/plural";
 import type { ChartDatum, ChartKey, ShareItem } from "../ui";
 
 /** The devtime blocks as chart props and the words around them. Pure, tested without rendering. */
@@ -100,12 +102,12 @@ export function versusPoints(now: number | null, before: number | null, days: nu
   const points = Math.round((now - before) * 100);
   if (points === 0) return `level with ${window}`;
   const n = Math.abs(points);
-  return `${n} ${n === 1 ? "point" : "points"} ${points > 0 ? "more" : "less"} than ${window}`;
+  return `${plural(n, "point")} ${points > 0 ? "more" : "less"} than ${window}`;
 }
 
 /** "83% in 12 cases" or "few cases (3)" — `n` always shown (spec risk 4); global in a project's view. */
 export function precisionText(rule: RuleView, inProject: boolean): string {
-  const text = rule.precision === null ? `few cases (${rule.n_cases})` : `${Math.round(rule.precision * 100)}% in ${rule.n_cases} cases`;
+  const text = rule.precision === null ? `few cases (${rule.n_cases})` : `${percentText(rule.precision)} in ${rule.n_cases} cases`;
   return inProject ? `${text} · global, all projects` : text;
 }
 
@@ -122,9 +124,9 @@ export function qualityLine(quality: DevtimeQuality, now: number): { clauses: st
   const clauses = [
     read === null ? "Never read" : `Last read ${ago(now - read)}`,
     (quality.unmapped_sessions_last_cycle ?? 0) > 0
-      ? `${quality.unmapped_sessions_last_cycle} ${quality.unmapped_sessions_last_cycle === 1 ? "session" : "sessions"} without a project in the last cycle` : "",
+      ? `${plural(quality.unmapped_sessions_last_cycle ?? 0, "session")} without a project in the last cycle` : "",
     (quality.skipped_daemon_sessions_last_cycle ?? 0) > 0
-      ? `${quality.skipped_daemon_sessions_last_cycle} daemon ${quality.skipped_daemon_sessions_last_cycle === 1 ? "session" : "sessions"} skipped in the last cycle` : "",
+      ? `${plural(quality.skipped_daemon_sessions_last_cycle ?? 0, "daemon session")} skipped in the last cycle` : "",
     quality.dirty_sessions > 0 ? `${quality.dirty_sessions} dirty` : "",
     quality.unruled_sessions > 0 ? `${quality.unruled_sessions} not yet classified` : "",
   ].filter((clause) => clause !== "");

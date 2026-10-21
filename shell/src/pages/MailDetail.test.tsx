@@ -131,7 +131,7 @@ describe("MailDetail — the standing decision about a sender", () => {
 
     // The page could not say this at all before: `EmailDetail` carried no verdict, so a sender
     // the queue had just shown as pinned opened onto three buttons with nothing marked.
-    expect(await screen.findByText(/is pinned — their mail keeps being surfaced/)).toBeDefined();
+    expect(await screen.findByText(/is pinned: their mail keeps being surfaced/)).toBeDefined();
     expect(screen.getByRole("button", { name: "Pin" }).getAttribute("aria-pressed")).toBe("true");
     // Clear is the way back out, and exists only when there is something to clear.
     expect(screen.getByRole("button", { name: "Clear" })).toBeDefined();
@@ -171,7 +171,7 @@ describe("MailDetail — the standing decision about a sender", () => {
     await waitFor(() => expect(posted).toHaveLength(1));
     expect(posted[0]).toEqual({ address: "ana@example.com", verdict: "mute" });
     // And the outcome names what was recorded, rather than the bare word "recorded".
-    expect(await screen.findByText("recorded — this sender is muted")).toBeDefined();
+    expect(await screen.findByText("recorded: this sender is muted")).toBeDefined();
   });
 });
 

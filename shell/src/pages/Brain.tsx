@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { pluralWord } from "../lib/plural";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { X } from "lucide-react";
 import { BrainPanel } from "../brain/BrainPanel";
@@ -22,7 +23,7 @@ import { useKnowledge, type Known } from "../data/knowledge";
 import { useLoadoutTools } from "../data/loadout-tools";
 import { useNotesGraph, useCreateNote, useOwnerNotes } from "../data/owner-notes";
 import { useProjects } from "../data/system";
-import { Button, ErrorNote, PageHeader, Quiet } from "../ui";
+import { Button, ErrorNote, PageHeader, Quiet, Skeleton } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import "./brain.css";
 
@@ -115,7 +116,7 @@ function Tally() {
       ) : (
         open > 0 && (
           <span className="brain-tally-asks">
-            <b>{open}</b> {open === 1 ? "question" : "questions"}
+            <b>{open}</b> {pluralWord(open, "question")}
           </span>
         )
       )}
@@ -215,7 +216,7 @@ function Capture() {
         ref={areaRef}
         className="brain-compose-input"
         rows={2}
-        placeholder="Write it down — a fact, a reminder, a loose end. No agent reads it until you teach it."
+        placeholder="Write it down: a fact, a reminder, a loose end. No agent reads it until you teach it."
         value={text}
         aria-describedby="brain-capture-hint"
         onChange={(event) => {
@@ -231,7 +232,7 @@ function Capture() {
       />
       <div className="brain-compose-foot">
         {create.isError ? (
-          <ErrorNote>the {DAEMON_NAME} is not responding — the note was not saved. Your text is still here: press Save to retry.</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} is not responding: the note was not saved. Your text is still here: press Save to retry.</ErrorNote>
         ) : (
           <span className="brain-compose-hint" id="brain-capture-hint">
             <kbd>{IS_MAC ? "⌘" : "Ctrl"}</kbd> <kbd>{IS_MAC ? "Return" : "Enter"}</kbd> saves
@@ -260,10 +261,10 @@ function missingSentence(
   projects: { isError: boolean; data: unknown },
 ): string | null {
   const parts: string[] = [];
-  if (knowledge.isError) parts.push("knowledge is not responding — its rows are not drawn");
-  else if (knowledge.data === undefined) parts.push("knowledge is still loading — its rows are not drawn yet");
-  if (projects.isError) parts.push("the project roster is not responding — projects show their ids");
-  else if (projects.data === undefined) parts.push("the project roster is still loading — projects show their ids");
+  if (knowledge.isError) parts.push("knowledge is not responding, so its rows are not drawn");
+  else if (knowledge.data === undefined) parts.push("knowledge is still loading, so its rows are not drawn yet");
+  if (projects.isError) parts.push("the project roster is not responding, so projects show their ids");
+  else if (projects.data === undefined) parts.push("the project roster is still loading, so projects show their ids");
   if (parts.length === 0) return null;
   const sentence = parts.join("; ");
   return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
@@ -306,8 +307,8 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
   };
 
   if (graph.isError)
-    return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding — the graph is not known</ErrorNote>;
-  if (graph.data === undefined || model === null) return <Quiet says="Loading the graph…" />;
+    return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding: the graph is not known</ErrorNote>;
+  if (graph.data === undefined || model === null) return <Skeleton label="Loading the graph" variant="cards" count={4} />;
   const missing = missingSentence(knowledge, projects);
 
   return (
@@ -407,10 +408,9 @@ export function BrainListView({
             Part of what is asked of you could not be read, so an empty queue is not certain.
           </ErrorNote>
         ) : (
-          <div className="brain-aside-empty">
-            <p className="brain-aside-empty-title">Nothing open</p>
-            <p>Pick a row to read it whole, see what it links to, or teach it to the agent.</p>
-          </div>
+          <Quiet compact says="Nothing open.">
+            Pick a row to read it whole, see what it links to, or teach it to the agent.
+          </Quiet>
         )}
       </aside>
     </div>
@@ -451,7 +451,7 @@ function ItemPanel({ item, onItem }: { item: ItemRef; onItem: (item: string) => 
   if (item.kind === "capture") return <CapturePanel key={item.id} id={item.id} onSelect={onItem} />;
   if (item.kind === "knowledge") return <KnowledgePanel key={item.id} id={item.id} onSelect={select} />;
   if (graph.isError)
-    return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding — the note is not known</ErrorNote>;
-  if (graph.data === undefined || model === null) return <Quiet says="Loading…" />;
+    return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding: the note is not known</ErrorNote>;
+  if (graph.data === undefined || model === null) return <Skeleton label="Loading the note" lines={4} />;
   return <BrainPanel nodeId={nodeIdOf(item)} graph={graph.data} model={model} onSelect={select} />;
 }

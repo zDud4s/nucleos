@@ -43,7 +43,6 @@
  * hole in the component layer, and until there is one, collecting the selector
  * is as far as a page can take it.
  */
-.agents-table thead th,
 .agents-field {
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wide);
@@ -101,34 +100,21 @@
   color: var(--text-faint);
 }
 
-.agents-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-sm);
-}
-
-/* The type is the label group above; what is left here is the rule under the
-   heads and the room they stand in. */
-.agents-table thead th {
-  padding: 0 var(--space-3) var(--space-2);
-  border-bottom: 1px solid var(--border-strong);
-  font-weight: var(--weight-semibold);
-  text-align: left;
-  white-space: nowrap;
-}
-
-.agents-table tbody th,
-.agents-table tbody td {
+/* The shared `.ui-table` draws the rules and the heads; the catalogue's rows are roomier, top-aligned,
+   and their leading cell is a name rather than a head, so it undoes the head's small caps. */
+.ui-table .agents-row > th,
+.ui-table .agents-row > td {
   padding: var(--space-3);
-  border-bottom: 1px solid var(--border);
-  text-align: left;
   vertical-align: top;
 }
 
-/* Counting columns line up under each other, so the eye compares without a bar. */
-.agents-table thead th.agents-col-num,
-.agents-table tbody td.agents-col-num {
-  text-align: right;
+.ui-table .agents-who {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: normal;
+  color: inherit;
 }
 
 .agents-row:hover {
@@ -425,37 +411,6 @@
   font-size: var(--text-xs);
   line-height: var(--leading-normal);
   color: var(--text-muted);
-}
-
-/* The editor's sections: one tablist above the panel, so the dialog holds one task at a time. */
-.agents-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-  padding: 0 var(--space-5);
-  border-bottom: 1px solid var(--border);
-}
-
-.agents-tab {
-  min-height: var(--hit-min);
-  padding: var(--space-2) var(--space-3);
-  border: 0;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: var(--text-sm);
-  cursor: pointer;
-}
-
-.agents-tab[aria-selected="true"] {
-  border-bottom-color: var(--text);
-  color: var(--text);
-}
-
-.agents-tab:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
 }
 
 /* Why Save is off, or that it worked: pushed to the footer's left edge, beside the buttons. */

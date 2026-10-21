@@ -313,7 +313,7 @@ describe("Decisions - actions", () => {
     });
 
     const panel = await panelFor("Actions it wants to take");
-    expect(await within(panel).findByText("granted — nobody decides")).toBeDefined();
+    expect(await within(panel).findByText("granted: nobody decides")).toBeDefined();
     expect(within(panel).queryByRole("button", { name: "Approve" })).toBeNull();
   });
 

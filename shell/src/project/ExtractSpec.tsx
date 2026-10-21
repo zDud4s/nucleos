@@ -2,7 +2,7 @@
 import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map";
-import { Button, ErrorNote } from "../ui";
+import { Button, ErrorNote, Segmented } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -57,7 +57,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
   if (specs.isError) {
     return (
       <ErrorNote>
-        The {DAEMON_NAME} could not say which specs this project keeps — its folder may have moved.
+        The {DAEMON_NAME} could not say which specs this project keeps: its folder may have moved.
       </ErrorNote>
     );
   }
@@ -75,7 +75,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
     return (
       <section aria-label="Read a spec" className="flex flex-col gap-2">
         <p className="max-w-prose text-sm text-text-muted">
-          This project keeps no specs, so there is no intention layer to make — the structure above
+          This project keeps no specs, so there is no intention layer to make: the structure above
           is the whole map it can have, and it is not wrong, only thin.
         </p>
         <p className="max-w-prose text-xs text-text-faint">
@@ -115,24 +115,16 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
             </option>
           ))}
         </select>
-        <div role="group" aria-label="Which brain reads it" className="ui-switch">
-          {BRAINS.map((candidate) => (
-            <button
-              key={candidate}
-              type="button"
-              aria-pressed={candidate === brain}
-              disabled={extract.isPending}
-              onClick={() => setBrain(candidate)}
-              className={
-                candidate === brain
-                  ? "ui-switch-seg bg-surface-raised! text-text!"
-                  : "ui-switch-seg"
-              }
-            >
-              {candidate}
-            </button>
-          ))}
-        </div>
+        <Segmented
+          label="Which brain reads it"
+          value={brain}
+          options={BRAINS.map((candidate) => ({
+            value: candidate,
+            label: candidate,
+            disabled: extract.isPending,
+          }))}
+          onChange={setBrain}
+        />
         {/*
           The label names the brain, the expensive half and the half the owner asked to control —
           a button reading "extract" would leave it visible only in a pressed state beside it. Its
@@ -163,7 +155,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
       {extract.isPending ? (
         <p className="max-w-prose text-xs text-text-muted">
           Reading {chosen} with the {brain} brain. This is a whole document going through a model in
-          one request, and the answer arrives only when it has finished — a cloud read can take a
+          one request, and the answer arrives only when it has finished. A cloud read can take a
           minute.
         </p>
       ) : null}
@@ -178,7 +170,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
       {extract.isSuccess && extract.data !== undefined ? (
         <p className="max-w-prose text-xs text-text-muted">
           {extract.data.length === 0
-            ? "Read — and nothing is waiting below. The model pointed at no decision it could name a section for, which is a real answer and not a failure."
+            ? "Read, and nothing is waiting below. The model pointed at no decision it could name a section for, which is a real answer and not a failure."
             : `Read. ${extract.data.length} ${extract.data.length === 1 ? "line is" : "lines are"} waiting below, this document's among them, and not one of them is in the map until you answer it.`}
         </p>
       ) : null}
@@ -209,7 +201,7 @@ function Failed({ error }: { error: unknown }) {
 
   const sentence =
     error.status === 503
-      ? `This machine has no local model configured, so the local brain has nothing to read with. The ${DAEMON_NAME} refuses rather than sending the document to a cloud you did not ask for — which is the whole reason the choice is yours to make.`
+      ? `This machine has no local model configured, so the local brain has nothing to read with. The ${DAEMON_NAME} refuses rather than sending the document to a cloud you did not ask for, which is the whole reason the choice is yours to make.`
       : error.status === 502
         ? "A model was reached and the read failed. Nothing was recorded: an empty list would have claimed this document decides nothing, and nobody is in a position to claim that when nobody read it."
         : error.status === 404

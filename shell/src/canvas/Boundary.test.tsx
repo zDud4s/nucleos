@@ -129,7 +129,7 @@ describe("the boundary between the two sides", () => {
       },
     });
     expect(screen.getByText(/1 call ask/)).toBeTruthy();
-    expect(screen.getByText("/thingz — shell/src/data/things.ts:12")).toBeTruthy();
+    expect(screen.getByText("/thingz · shell/src/data/things.ts:12")).toBeTruthy();
     expect(screen.queryByText(/Nothing asks for a route that does not exist/)).toBeNull();
   });
 
@@ -185,7 +185,7 @@ describe("an alarm with its proof", () => {
     expect(within(list).getAllByRole("listitem").map((item) => item.textContent)).toEqual([
       "core/src/a.rs → shell/src/x.ts",
     ]);
-    expect(screen.getByText(/report it with this list/)).toBeTruthy();
+    expect(screen.getByText(/Report it with this list/)).toBeTruthy();
   });
 
   it("leads with a verdict that counts only what must be zero and is not", () => {

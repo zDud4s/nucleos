@@ -50,15 +50,16 @@ const SHORT = 66;
 
 /**
  * Where each line sits inside its box, from the box's top. Three lines and, in the agent box, the
- * working dots under them: each baseline is far enough below the last that the 14px title's
- * descenders clear the 10px line under it, which they did not at 56 units tall.
+ * working dots under them: each baseline is far enough below the last that the title's
+ * descenders (`--text-sm`, 13px) clear the `--text-xs` (11px) line under it, which they did not at
+ * 56 units tall.
  */
 const LINES = {
   short: { kind: 19, title: 40, sub: 56 },
   tall: { kind: 20, title: 43, sub: 60, dots: 76 },
 };
 
-/** Roughly how wide a character of the title is at 14px — enough to cut a long name before the edge. */
+/** Roughly how wide a character of the title is at `--text-sm` (13px, medium) — enough to cut a long name before the edge. */
 const TITLE_CHAR = 7.2;
 
 /** The title cut to its box, from the end, with an ellipsis — the full one is in the aria-label. */

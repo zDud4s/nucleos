@@ -1,4 +1,5 @@
 import type { Dist } from "../../data/analytics-pipeline";
+import { percentText } from "../../lib/format";
 
 /**
  * The words the Pipeline section writes numbers in (spec analytics-pipeline §8). Pure, so a card's
@@ -28,7 +29,7 @@ export function humanSeconds(seconds: number): string {
 
 /** A fraction as a whole percent, or `no data` when it was not measured. */
 export function percentOr(fraction: number | null): string {
-  return fraction === null ? NO_DATA : `${Math.round(fraction * 100)}%`;
+  return percentText(fraction, NO_DATA);
 }
 
 /**

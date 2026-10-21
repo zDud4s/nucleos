@@ -4,6 +4,7 @@ import { isApiRefusal } from "../data/client";
 import { useDeleteProjectFolder, useProjectFolder } from "../data/projects";
 import { heldBy } from "../data/roster";
 import { Button } from "../ui/Button";
+import { Field } from "../ui/Field";
 import { Modal } from "../ui/Modal";
 import { RefusalNote } from "../ui/RefusalNote";
 import { DAEMON_NAME } from "../copy";
@@ -148,7 +149,7 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
 
             {folder.isError ? (
               <p className="text-xs text-text-faint">
-                the {DAEMON_NAME} did not say what is in that folder — nothing has been deleted
+                the {DAEMON_NAME} did not say what is in that folder: nothing has been deleted
               </p>
             ) : reading === undefined ? (
               <p className="text-xs text-text-faint">reading what is in that folder…</p>
@@ -181,32 +182,37 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
                 <RefusalNote
                   refusal={deletion.error}
                   sentences={{
-                    kill_switch: "the kill switch is engaged — nothing was deleted",
-                    in_flight: "work is still in flight here — nothing was deleted",
+                    kill_switch: "the kill switch is engaged: nothing was deleted",
+                    in_flight: "work is still in flight here: nothing was deleted",
                     not_registered: `${projectId} is already off the roster, and its folder was not touched`,
                     not_found: `${projectId} is already off the roster, and its folder was not touched`,
                   }}
                 />
               ) : (
                 <p className="text-xs text-text-faint">
-                  the {DAEMON_NAME} gave no reply — nothing was deleted
+                  the {DAEMON_NAME} gave no reply: nothing was deleted
                 </p>
               ))}
 
-            <label className="flex flex-col gap-1.5 text-sm text-text-muted">
-              <span>
+            {/*
+              The instruction is drawn here, in the ink the id needs, and the field's own label is
+              hidden: `Field` sets its label in capitals, and the id has to be typed exactly.
+            */}
+            <div className="flex flex-col gap-1.5 text-sm text-text-muted">
+              <span aria-hidden="true">
                 Type <code className="font-mono text-xs text-text">{projectId}</code> to confirm
               </span>
-              <input
-                type="text"
-                value={typed}
-                spellCheck={false}
-                autoComplete="off"
-                aria-label={`Type ${projectId} to confirm`}
-                onChange={(event) => setTyped(event.target.value)}
-                className="rounded-md border border-border bg-surface-sunken px-2.5 py-1.5 font-mono text-sm text-text"
-              />
-            </label>
+              <Field label={`Type ${projectId} to confirm`} labelHidden>
+                <input
+                  type="text"
+                  value={typed}
+                  spellCheck={false}
+                  autoComplete="off"
+                  onChange={(event) => setTyped(event.target.value)}
+                  className="font-mono!"
+                />
+              </Field>
+            </div>
 
             {/* The modal's answer row: bottom edge, right-aligned, the act last. */}
             <div className="ws-dialog-actions">
@@ -277,7 +283,7 @@ function Standing({
       )}
       {held !== null && (
         <p className="ws-dialog-note">
-          Work is still in flight here — {held}. Nothing is deleted while it runs.
+          Work is still in flight here: {held}. Nothing is deleted while it runs.
         </p>
       )}
     </div>

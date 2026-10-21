@@ -3,7 +3,7 @@ import { AGENT_CAPABILITIES, proposedCapabilities, sameCapabilities, type AgentE
 import type { Proposal } from "../../data/system";
 import { parseActionPayload, useHireRecruit } from "../../data/teams";
 import { useRejectProposal } from "../../data/waiting";
-import { Button, ConfirmButton, Field, RelativeTime, Row, Rows } from "../../ui";
+import { Button, Callout, ConfirmButton, Field, RelativeTime, Row, Rows } from "../../ui";
 import type { Reading } from "./reading";
 import { DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
 import { DepartmentContext, hasDepartmentContext } from "./TeamActions";
@@ -142,7 +142,7 @@ function RecruitmentCard({
     proposed !== null &&
     (form.engine !== proposed.engine || !sameCapabilities(form.capabilities, proposed.capabilities));
   const careful =
-    "Engine and capabilities are the two fields a director gets wrong most often — they are also what costs money per turn and what widens what this agent can reach.";
+    "Engine and capabilities are the two fields a director gets wrong most often. They are also what costs money per turn and what widens what this agent can reach.";
 
   const context = hasDepartmentContext(proposal);
 
@@ -170,13 +170,13 @@ function RecruitmentCard({
           // wrapping them in a second one would put a frame round a frame.
           <>
             {proposalChanged && (
-              <p className="waiting-notice" role="status">
+              <Callout tone="pending" role="status">
                 The director changed this proposal after you opened it. The fields below still hold
                 the earlier values.{" "}
                 <Button variant="quiet" onClick={loadChangedProposal}>
                   Load the new proposal
                 </Button>
-              </p>
+              </Callout>
             )}
             <div className="waiting-recruit">
               <div className="waiting-recruit-form">
@@ -294,7 +294,7 @@ function RecruitmentCard({
           />
           <ConfirmButton
             label="Decline"
-            confirmLabel="Decline — the team may ask again"
+            confirmLabel="Decline: the team may ask again"
             variant="ghost"
             disabled={reject.isPending}
             onArmedChange={onArmedChange}

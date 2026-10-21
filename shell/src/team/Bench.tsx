@@ -1,6 +1,7 @@
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
+import { plural } from "../lib/plural";
 import {
   TEAM_RUN_LIST_LIMIT,
   teamRunIsAlive,
@@ -216,12 +217,12 @@ function BenchHead({
         )}
         {waiting > 0 && (
           <Button type="button" onClick={onReview}>
-            {waiting === 1 ? "Up to 1 decision is waiting" : `Up to ${waiting} decisions are waiting`} — review
+            {`Up to ${plural(waiting, "decision")} ${waiting === 1 ? "is" : "are"} waiting: review`}
           </Button>
         )}
       </div>
       {team.mission.trim() === "" ? (
-        <Quiet says="No description yet — the Charter tab holds the mission." />
+        <Quiet says="No description yet. The Charter tab holds the mission." />
       ) : (
         <p className="teams-bench-remit">{team.mission}</p>
       )}

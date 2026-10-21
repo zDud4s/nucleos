@@ -1,6 +1,7 @@
 // §spec mapa-do-projeto
 import type { Anchored, Junction, MapModule } from "../data/project-map";
 import { OrphanCheck } from "./OrphanCheck";
+import { pluralWord } from "../lib/plural";
 import { Inset, SectionTitle } from "../ui";
 
 /**
@@ -72,10 +73,6 @@ const ROWS = 12;
 /** The first `limit` of a pile, and how many were left out. */
 function capped<T>(all: T[], limit = ROWS): { shown: T[]; hidden: number } {
   return { shown: all.slice(0, limit), hidden: Math.max(0, all.length - limit) };
-}
-
-function plural(count: number, one: string, many: string): string {
-  return count === 1 ? one : many;
 }
 
 export function JunctionPanel({ junction, projectId, modules }: JunctionPanelProps) {
@@ -179,7 +176,7 @@ function Silent({ rows, projectId }: { rows: Anchored[]; projectId: string }) {
   if (rows.length === 0) {
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        No approved decision is declared with no code right now — every section that could be looked
+        No approved decision is declared with no code right now: every section that could be looked
         for was named by something. That is not a pass: how firmly it is named is below, and none of
         it has read a line of code against what a decision actually says.
       </p>
@@ -193,7 +190,7 @@ function Silent({ rows, projectId }: { rows: Anchored[]; projectId: string }) {
       <p className="font-display text-3xl text-text">
         {rows.length}
         <span className="ml-2 text-sm text-text-faint">
-          approved {plural(rows.length, "decision", "decisions")} that nothing in this project names
+          approved {pluralWord(rows.length, "decision", "decisions")} that nothing in this project names
         </span>
       </p>
       <p className="max-w-prose text-xs text-text-muted">
@@ -237,14 +234,14 @@ function LostTheComment({ rows }: { rows: Anchored[] }) {
   return (
     <div className="flex flex-col gap-2">
       <p className="max-w-prose text-sm text-text">
-        {rows.length} {plural(rows.length, "decision", "decisions")}{" "}
-        {plural(rows.length, "has", "have")} files written down and no comment naming them any more.
+        {rows.length} {pluralWord(rows.length, "decision", "decisions")}{" "}
+        {pluralWord(rows.length, "has", "have")} files written down and no comment naming them any more.
       </p>
       <p className="max-w-prose text-xs text-text-muted">
         The § that anchored each of these is gone from the code. The files are still here because
         somebody wrote them down, which is the only reason these rows are not sitting above looking
         like decisions nobody ever implemented. Whether the comment went on purpose is for you to
-        say — nothing here read a line of code.
+        say. Nothing here read a line of code.
       </p>
       <ul aria-label="Decisions whose comment is gone" className="flex flex-col gap-2">
         {shown.map((row) => (
@@ -270,9 +267,9 @@ function Unnumbered({ rows }: { rows: Anchored[] }) {
   return (
     <div className="flex flex-col gap-2">
       <p className="max-w-prose text-xs text-text-muted">
-        {rows.length} approved {plural(rows.length, "line", "lines")} came from a heading with no
+        {rows.length} approved {pluralWord(rows.length, "line", "lines")} came from a heading with no
         number, so there was nothing to look for. They are counted apart from the pile above rather
-        than folded into it — calling them code-less would report a search that never ran.
+        than folded into it: calling them code-less would report a search that never ran.
       </p>
       <ul aria-label="Decisions whose heading carried no number" className="flex flex-col gap-2">
         {shown.map((row) => (
@@ -304,10 +301,10 @@ function Unclaimed({ paths, uncited }: { paths: string[]; uncited: number | null
         <p className="max-w-prose text-sm text-text-muted">
           <span className="ui-wrong">
             The junction lists no module nobody asked for, yet {uncited}{" "}
-            {plural(uncited, "module names", "modules name")} no section at all.
+            {pluralWord(uncited, "module names", "modules name")} no section at all.
           </span>{" "}
           Both are read off the same answer and must agree, so this is a fault in the reading and
-          not a fact about your code — report it.
+          not a fact about your code: report it.
         </p>
       );
     }
@@ -326,7 +323,7 @@ function Unclaimed({ paths, uncited }: { paths: string[]; uncited: number | null
       <p className="font-display text-3xl text-text">
         {paths.length}
         <span className="ml-2 text-sm text-text-faint">
-          {plural(paths.length, "module", "modules")} nobody asked for
+          {pluralWord(paths.length, "module", "modules")} nobody asked for
         </span>
       </p>
       <p className="max-w-prose text-xs text-text-muted">
@@ -370,7 +367,7 @@ function Plausible({
   if (total === 0) {
     return (
       <p className="max-w-prose text-sm text-text-muted">
-        Nothing here is joined to code on a guess right now — no approved decision is named by code
+        Nothing here is joined to code on a guess right now: no approved decision is named by code
         this map could not tie to it.
       </p>
     );
@@ -384,7 +381,7 @@ function Plausible({
       <p className="font-display text-3xl text-text">
         {total}
         <span className="ml-2 text-sm text-text-faint">
-          {plural(total, "join that is", "joins that are")} only plausible
+          {pluralWord(total, "join that is", "joins that are")} only plausible
         </span>
       </p>
 
@@ -394,7 +391,7 @@ function Plausible({
             Code names the section, and never says which document the section belongs to. A § in a
             file is a number and nothing else, so it may just as easily be another document&rsquo;s
             section of the same number. Until a citation carries a document slug, each of these is a
-            guess — shown because it might be the join, and never counted as one.
+            guess, shown because it might be the join, and never counted as one.
           </p>
           <ul aria-label="Joins whose citation names no document" className="flex flex-col gap-2">
             {named.shown.map((row) => (
@@ -408,7 +405,7 @@ function Plausible({
       {abroad.length > 0 ? (
         <div className="flex flex-col gap-2">
           <p className="max-w-prose text-xs text-text-muted">
-            Named only by code this map cannot read yet — the Go sidecars. Something in there points
+            Named only by code this map cannot read yet: the Go sidecars. Something in there points
             at the section; nothing here can open the file and say what it does with it. That is a
             different amount of not-knowing from the one above, and it is deliberately not the same
             sentence.
@@ -448,20 +445,20 @@ function Missing({ declared, decisions }: { declared: number; decisions: number 
     <div className="flex flex-col gap-2 border-t border-border pt-4">
       <SectionTitle>What this panel cannot see</SectionTitle>
       <p className="max-w-prose text-xs text-text-muted">
-        The map derives four states for a decision and this panel draws two of them. The other two —
-        waiting on you, and silenced — both mean a triager looked at a node and formed an opinion
+        The map derives four states for a decision and this panel draws two of them. The other two
+        (waiting on you, and silenced) both mean a triager looked at a node and formed an opinion
         about it, and they are behind the Triage door. Nothing on this panel says whether anybody
         looked.
       </p>
       {decisions === 0 ? null : declared === 0 ? (
         <p className="max-w-prose text-xs text-text-muted">
           No decision here is confirmed either. That state needs a citation that names its own
-          document, and nothing this map read carries one yet — so every join above is a guess,
+          document, and nothing this map read carries one yet, so every join above is a guess,
           while every decision with no code is sound.
         </p>
       ) : (
         <p className="max-w-prose text-xs text-text-muted">
-          {declared} {plural(declared, "decision is", "decisions are")} confirmed: a readable module
+          {declared} {pluralWord(declared, "decision is", "decisions are")} confirmed: a readable module
           names the section and names the document. Those are the only ones here that are certain,
           and everything else above is a guess or an absence.
         </p>

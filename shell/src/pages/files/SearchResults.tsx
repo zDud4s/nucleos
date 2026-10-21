@@ -39,7 +39,7 @@ export function SearchResults({
       {result.data !== undefined && hits.length === 0 && <Quiet says="nothing under this folder matches." />}
       {result.data?.truncated === true && (
         <p className="fi-truncated" role="status">
-          stopped early — this search hit the daemon's own ceiling before finishing the whole tree. Narrow it to
+          stopped early: this search hit the daemon's own ceiling before finishing the whole tree. Narrow it to
           see everything.
         </p>
       )}

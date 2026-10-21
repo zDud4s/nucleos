@@ -55,11 +55,11 @@ function FlowSection({ flow, root }: { flow: FlowCheck; root: string }) {
       <h3 className="m-0 text-base">{flow.name}</h3>
       {flow.stale && broken !== undefined && flow.broken_step !== null ? (
         <p className="m-0 text-sm" style={{ color: DANGER }}>
-          {`Stale — step ${flow.broken_step + 1} (${broken.fn}) broke: ${broken.reason ?? "unknown"}`}
+          {`Stale: step ${flow.broken_step + 1} (${broken.fn}) broke: ${broken.reason ?? "unknown"}`}
         </p>
       ) : flow.stale ? (
         <p className="m-0 text-sm" style={{ color: DANGER }}>
-          Stale — the flow no longer matches the code.
+          Stale: the flow no longer matches the code.
         </p>
       ) : (
         <p className="m-0 text-sm text-text-faint">Verified against the code</p>
@@ -121,7 +121,7 @@ function FlowSection({ flow, root }: { flow: FlowCheck; root: string }) {
           const self = arrow.from === arrow.to;
           return (
             <g key={arrow.step} data-step={arrow.step} opacity={arrow.unchecked ? 0.4 : 1}>
-              <title>{`${step.fn} — ${step.path}:${step.line ?? "?"}`}</title>
+              <title>{`${step.fn} (${step.path}:${step.line ?? "?"})`}</title>
               {self ? (
                 <path
                   d={`M ${x1} ${y} h 28 v 12 h -28`}
@@ -173,7 +173,7 @@ function FlowSection({ flow, root }: { flow: FlowCheck; root: string }) {
                   {step.line === null ? step.path : `${step.path}:${step.line}`}
                 </a>
               )}
-              {showReason ? <span style={{ color: DANGER }}>{` — ${step.reason}`}</span> : null}
+              {showReason ? <span style={{ color: DANGER }}>{` (${step.reason})`}</span> : null}
             </li>
           );
         })}

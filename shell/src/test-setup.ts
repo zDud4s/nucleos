@@ -65,3 +65,12 @@ class NoLayoutResizeObserver {
 }
 const withObserver = globalThis as { ResizeObserver?: typeof ResizeObserver };
 withObserver.ResizeObserver ??= NoLayoutResizeObserver as unknown as typeof ResizeObserver;
+
+// `motion` animates through the Web Animations API, and happy-dom's `Animation.cancel()` rejects
+// the animation's `finished` promise with an AbortError that nothing awaits, which vitest reports as
+// an unhandled rejection whenever a polled row's animation is interrupted (or the test ends mid-
+// flight). Removing `animate` makes motion fall back to its own JS-driven animation, which has no
+// such promise; the animations are never inspected here, only the DOM they leave behind.
+if (typeof Element !== "undefined") {
+  delete (Element.prototype as { animate?: unknown }).animate;
+}

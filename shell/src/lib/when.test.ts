@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { bandOf, elapsedText, inBands } from "./when";
+import { bandOf, clockText, elapsedText, formatSpan, inBands } from "./when";
 
 /** A local time, built the way a person means one — never a UTC string with a Z on it. */
 function local(y: number, m: number, d: number, h: number, min = 0): number {
@@ -99,5 +99,42 @@ describe("elapsedText", () => {
 
   it("never runs backwards when the daemon's clock is ahead of this window's", () => {
     expect(elapsedText(started, started - 5_000)).toBe("0:00");
+  });
+});
+
+describe("formatSpan", () => {
+  const MIN = 60_000;
+  const HOUR = 60 * MIN;
+
+  it("steps the unit with the size", () => {
+    expect(formatSpan(12_000)).toBe("12s");
+    expect(formatSpan(4 * MIN)).toBe("4m");
+    expect(formatSpan(HOUR + 5 * MIN)).toBe("1h 05m");
+    expect(formatSpan(2 * HOUR)).toBe("2h");
+  });
+
+  it("drops the unit below the one drawn rather than rounding it in", () => {
+    expect(formatSpan(4 * MIN + 59_000)).toBe("4m");
+    expect(formatSpan(999)).toBe("0s");
+  });
+
+  it("rounds a partial unit up when asked, so time left never reads as none", () => {
+    expect(formatSpan(4 * MIN + 1_000, { round: "ceil" })).toBe("5m");
+    expect(formatSpan(1, { round: "ceil" })).toBe("1s");
+    expect(formatSpan(59_500, { round: "ceil" })).toBe("1m");
+    expect(formatSpan(HOUR + 5 * MIN + 1, { round: "ceil" })).toBe("1h 06m");
+  });
+
+  it("is never negative", () => {
+    expect(formatSpan(-5_000)).toBe("0s");
+  });
+});
+
+describe("clockText", () => {
+  it("is a fixed 24-hour HH:MM in local time", () => {
+    expect(clockText(local(2026, 8, 24, 7, 5))).toBe("07:05");
+    expect(clockText(local(2026, 8, 24, 0, 0))).toBe("00:00");
+    expect(clockText(local(2026, 8, 24, 23, 59))).toBe("23:59");
+    expect(clockText(local(2026, 8, 24, 14, 30))).toBe("14:30");
   });
 });

@@ -200,7 +200,7 @@ describe("Web — search", () => {
 
     expect(
       await screen.findByText(
-        "no search provider is configured on this machine — showing only what is already in the archive",
+        "no search provider is configured on this machine: showing only what is already in the archive",
       ),
     ).toBeDefined();
 

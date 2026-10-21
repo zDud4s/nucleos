@@ -175,11 +175,11 @@ describe("NotificationsDrawer - opening it", () => {
     renderDrawer({ pending: [], feed: [] });
 
     fireEvent.click(await screen.findByRole("button", { name: "Notifications, nothing held" }));
-    expect(await screen.findByRole("complementary", { name: "Notifications" })).toBeDefined();
+    expect(await screen.findByRole("dialog", { name: "Notifications" })).toBeDefined();
 
-    fireEvent.click(screen.getByRole("button", { name: "Close notifications" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
     await waitFor(() => {
-      expect(screen.queryByRole("complementary", { name: "Notifications" })).toBeNull();
+      expect(screen.queryByRole("dialog", { name: "Notifications" })).toBeNull();
     });
   });
 });
@@ -207,6 +207,6 @@ describe("NotificationsDrawer - the control in the rail", () => {
     expect(trigger.closest(".nav-footer")).not.toBeNull();
 
     fireEvent.click(trigger);
-    expect(await screen.findByRole("complementary", { name: "Notifications" })).toBeDefined();
+    expect(await screen.findByRole("dialog", { name: "Notifications" })).toBeDefined();
   });
 });

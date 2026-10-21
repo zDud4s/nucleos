@@ -17,6 +17,7 @@ import {
 import { DAEMON_NAME } from "../copy";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
+import { formatSpan } from "../lib/when";
 import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, TimeField } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
@@ -84,8 +85,8 @@ export function DaySheet({ slot, occurrences, now, config, open, onOpenChange }:
           <span className="calendar-sheet-marks">
             {today && <Badge tone="info">today</Badge>}
             {!working && <Badge tone="off">not a working day</Badge>}
-            {hours.short && <Badge tone="paused">{hours.hours}h — short day</Badge>}
-            {hours.long && <Badge tone="paused">{hours.hours}h — long day</Badge>}
+            {hours.short && <Badge tone="paused">{hours.hours}h, short day</Badge>}
+            {hours.long && <Badge tone="paused">{hours.hours}h, long day</Badge>}
           </span>
         ) : undefined
       }
@@ -282,7 +283,7 @@ export function DraftEventForm({
 
 function DraftError({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
-  return <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME} — nothing was added</ErrorNote>;
+  return <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME}, so nothing was added</ErrorNote>;
 }
 
 /**
@@ -299,12 +300,9 @@ export function daemonProse(error: { code: string; detail: string }): Record<str
 
 /* --------------------------------------------------------- occurrences -- */
 
-/** `15` → `"15 min"`, `90` → `"1 h 30"`, `120` → `"2 h"`. */
+/** `15` → `"15m"`, `90` → `"1h 30m"`, `120` → `"2h"`. */
 function lengthOf(minutes: number): string {
-  if (minutes < 60) return `${minutes} min`;
-  const hours = Math.floor(minutes / 60);
-  const rest = minutes % 60;
-  return rest === 0 ? `${hours} h` : `${hours} h ${String(rest).padStart(2, "0")}`;
+  return formatSpan(minutes * 60_000);
 }
 
 /**
@@ -439,7 +437,7 @@ export function OccurrenceActions({ occurrence }: { occurrence: EventOccurrence 
         title="Delete the whole series?"
         description={
           <>
-            Every occurrence of <strong>{occurrence.title}</strong> goes with it — past and future,
+            Every occurrence of <strong>{occurrence.title}</strong> goes with it, past and future,
             moved or not. Skipping only this one is the other button.
           </>
         }
@@ -475,7 +473,7 @@ function OccurrenceError({ error, what }: { error: unknown; what: string }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return (
     <ErrorNote>
-      Could not reach the {DAEMON_NAME} — {what}
+      Could not reach the {DAEMON_NAME}: {what}
     </ErrorNote>
   );
 }

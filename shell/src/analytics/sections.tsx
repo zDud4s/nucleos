@@ -4,6 +4,8 @@ import { TriangleAlert } from "lucide-react";
 import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
 import { compactTokens, humanMinutes } from "../data/project-readings";
 import { DAEMON_NAME } from "../copy";
+import { percentText } from "../lib/format";
+import { plural } from "../lib/plural";
 import { AreaChart, ErrorNote, ShareBar, Skeleton, StaleNote, StepLine, usd, type ChartDatum, type ChartKey } from "../ui";
 import {
   DELIVERED_KEYS,
@@ -42,7 +44,6 @@ export type MetricKey = "cost" | "runs" | "delivered" | "tokens";
 const EMPTY = "No runs in this window";
 const DETAIL_HEIGHT = 220;
 const count = (value: number) => String(Math.round(value));
-const percent = (fraction: number) => `${Math.round(fraction * 100)}%`;
 
 /**
  * One sentence for a screen reader: the charts are `role="img"`, and their tooltip only speaks to
@@ -62,10 +63,6 @@ export function summary(data: ChartDatum[], format: (value: number) => string, a
   const peak = days.reduce((best, entry) => (entry.total > best.total ? entry : best), days[0]);
   const head = estimated > 0 ? `Total ${format(total)} measured; ${format(estimated)} estimated from run time` : `Total ${format(total)}`;
   return <p className="sr-only">{`${head}; peak ${format(peak.total)} on ${peak.day}.`}</p>;
-}
-
-export function plural(n: number, one: string, many: string): string {
-  return `${n} ${n === 1 ? one : many}`;
 }
 
 /** The clauses of a line, the empty ones dropped. */
@@ -127,7 +124,7 @@ export function metrics(report: AnalyticsReport): Metric[] {
       label: "Runs",
       value: throughput.total.runs_completed,
       sub: joined([
-        rate === null ? "nothing judged" : `${percent(rate)} passed the gate`,
+        rate === null ? "nothing judged" : `${percentText(rate)} passed the gate`,
         throughput.in_flight > 0 ? `${throughput.in_flight} running` : "",
       ]),
       spark: { data: gateBars(throughput), keys: GATE_KEYS, tone: "ui-chart-runs", format: count },
@@ -145,10 +142,10 @@ export function metrics(report: AnalyticsReport): Metric[] {
       value: tokensNow === null ? undefined : compactTokens(tokensNow),
       sub:
         ratio !== null
-          ? `${percent(ratio)} from cache`
+          ? `${percentText(ratio)} from cache`
           : tokensNow === null
             ? "no session reported usage"
-            : plural(tokens.total.measured_sessions, "session", "sessions"),
+            : plural(tokens.total.measured_sessions, "session"),
       spark: { data: tokenBars(tokens), keys: TOKEN_KEYS, tone: "ui-chart-tokens", format: compactTokens },
     },
   ];
@@ -361,8 +358,8 @@ function tokensPanel({ tokens, days }: AnalyticsReport): PanelContent {
   return {
     title: "Tokens per day",
     aside: joined([
-      ratio === null ? "" : `${percent(ratio)} served from cache`,
-      tokens.total.unmeasured_runs > 0 ? `${plural(tokens.total.unmeasured_runs, "run", "runs")} not measured` : "",
+      ratio === null ? "" : `${percentText(ratio)} served from cache`,
+      tokens.total.unmeasured_runs > 0 ? `${plural(tokens.total.unmeasured_runs, "run")} not measured` : "",
     ]),
     body: (
       <>
@@ -523,7 +520,7 @@ function QuotaBody({ report, history, failed, staleSince, onRetry }: QuotaSectio
         from={from}
         to={Date.parse(report.now)}
         label={`Quota used, 5h and 7d windows, last ${report.days} days`}
-        format={percent}
+        format={(value) => percentText(value)}
         empty={since === null ? "No quota history yet" : `History started on ${since}; nothing recorded in this window`}
       />
     </>

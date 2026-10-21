@@ -146,9 +146,12 @@ async function openEditor(name: string): Promise<HTMLElement> {
   return screen.findByRole("dialog", { name: `Editing ${name}` });
 }
 
-/** The editor holds one section at a time; the Remove, Memory and Tools ones sit behind a tab. */
+/**
+ * The editor holds one section at a time; the Remove, Memory and Tools ones sit behind a tab.
+ * Tabs are Radix, so they are selected by `mouseDown` and not by `click`.
+ */
 function openTab(editor: HTMLElement, name: string) {
-  fireEvent.click(within(editor).getByRole("tab", { name }));
+  fireEvent.mouseDown(within(editor).getByRole("tab", { name }));
 }
 
 /* ------------------------------------------------------------ the shape -- */

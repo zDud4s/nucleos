@@ -219,7 +219,7 @@ function TreeNode({
             className={fault === "unread" ? "fi-tree-fault fi-tree-fault-unread" : "fi-tree-fault"}
             title={
               fault === "unread"
-                ? `the ${DAEMON_NAME} could not list this folder — open it to see why`
+                ? `the ${DAEMON_NAME} could not list this folder: open it to see why`
                 : "this branch is the last listing that loaded; the latest one failed"
             }
           >

@@ -20,7 +20,8 @@ import type { ChannelIdentities, ChannelsReadout, PairingCode, PairingStatus } f
 import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
-import type { AnalyticsReport, QuotaHistory } from "../data/analytics";
+import type { AnalyticsDays, AnalyticsReport, QuotaHistory } from "../data/analytics";
+import type { DevtimeDay, DevtimeOverview, ModelTokens } from "../data/devtime";
 import type { PipelineReport } from "../data/analytics-pipeline";
 import type {
   ApiTokenSummary,
@@ -40,6 +41,7 @@ import type { NoteDetail, NoteLink, NotesGraph, OwnerNote } from "../data/owner-
 import type { CaptureRequest } from "../data/captures";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
+import { currentRunsStep, liveRuns } from "./runs-live";
 import type { EmailConfigView, EmailDetail, QueuedEmail } from "../data/mail";
 import type { VcsRequestSummary } from "../data/waiting";
 import type { QuotaReport } from "../data/quota";
@@ -431,6 +433,139 @@ export function previewQuotaHistory(rawDays: string | null): QuotaHistory {
         })),
       },
     ],
+  };
+}
+
+/**
+ * `GET /analytics/devtime` (projectId null) and `GET /projects/{id}/analytics/devtime`: the owner's own
+ * Claude Code sessions, filled in. Weekends are quiet, the last day is partial, and the findings
+ * disclosure stays closed so `/findings` is never asked. Rates sit in 0..1 and the previous period is a
+ * little worse than this one, so every delta renders.
+ */
+export function previewDevtime(projectId: string | null, rawDays: string | null): DevtimeOverview {
+  const days = windowDays(rawDays);
+  const both = previewDays(days * 2);
+  const list = both.slice(days);
+  const last = days - 1;
+  const round = (value: number) => Math.round(value);
+  const series: DevtimeDay[] = list.map((day, index) => {
+    const weekday = new Date(`${day}T00:00:00Z`).getUTCDay();
+    const quiet = weekday === 0 || weekday === 6;
+    const partial = index === last;
+    const active = round((quiet ? 25 * MINUTE : 150 * MINUTE + ((index * 37) % 11) * 9 * MINUTE) * (partial ? 0.45 : 1));
+    const rework = round(active * (0.06 + (index % 4) * 0.015));
+    const avoidable = round(active * (0.03 + (index % 3) * 0.01));
+    const turns = round(active / (3.5 * MINUTE));
+    return {
+      day,
+      partial,
+      active_ms: active,
+      wasted_ms: rework + avoidable,
+      by_kind: {
+        model: round(active * 0.42),
+        tool: round(active * 0.28),
+        subagent: round(active * 0.2),
+        wait_background: round(active * 0.06),
+        wait_machine: active - round(active * 0.42) - round(active * 0.28) - round(active * 0.2) - round(active * 0.06),
+      },
+      by_waste: { useful: active - rework - avoidable, rework, avoidable },
+      turns,
+      interrupted: round(turns * 0.07),
+      corrections: round(turns * 0.12),
+      cost_usd: cents(active / HOUR * 5.4),
+    };
+  });
+  const sum = (pick: (point: DevtimeDay) => number) => series.reduce((total, point) => total + pick(point), 0);
+  const active = sum((point) => point.active_ms);
+  const wasted = sum((point) => point.wasted_ms);
+  const turns = sum((point) => point.turns);
+  const cost = cents(sum((point) => point.cost_usd ?? 0));
+  const previousActive = round(active * 0.88);
+  const previousWasted = round(wasted * 1.25);
+  const previousTotals = {
+    active_ms: previousActive,
+    wasted_ms: previousWasted,
+    waste_ratio: cents(previousWasted / previousActive),
+    interruption_rate: 0.09,
+    correction_rate: 0.15,
+  };
+  const model = (name: string, effort: string, share: number, price: number): ModelTokens => {
+    const messages = round(turns * share * 3.2);
+    const costUsd = cents(cost * share * price);
+    return {
+      model: name,
+      effort,
+      input: round(messages * 410),
+      cache_read: round(messages * 52_000),
+      cache_creation: round(messages * 3_100),
+      output: round(messages * 640),
+      messages,
+      cost_usd: costUsd,
+      cost_low: cents(costUsd * 0.93),
+      cost_high: costUsd,
+    };
+  };
+  const byModel = [
+    model("claude-opus-4-7", "high", 0.55, 1.1),
+    model("claude-sonnet-5-5", "medium", 0.35, 0.8),
+    model("claude-haiku-4-5", "low", 0.1, 0.5),
+  ];
+  const tokenCost = cents(byModel.reduce((total, row) => total + (row.cost_usd ?? 0), 0));
+  const ruleMs = [
+    { rule_id: "A1", level: "base", waste: "rework", lever: "spec_gap", share: 0.34, findings: 9 },
+    { rule_id: "B4", level: "base", waste: "avoidable", lever: "tooling", share: 0.22, findings: 6 },
+    { rule_id: "C2", level: "cross", waste: "rework", lever: "context", share: 0.14, findings: 3 },
+  ];
+  return {
+    scope: projectId === null ? "global" : "project",
+    project_id: projectId,
+    days: days as AnalyticsDays,
+    timezone: "UTC",
+    now: new Date(NOW).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    window: { from: list[0], to: list[last] },
+    previous: { from: both[0], to: both[days - 1] },
+    quality: {
+      ingest_enabled: true,
+      last_cycle_at: new Date(NOW - 6 * MINUTE).toISOString().replace(/\.\d{3}Z$/, "Z"),
+      unmapped_sessions_last_cycle: 1,
+      skipped_daemon_sessions_last_cycle: 4,
+      sessions: round(days * 2.6),
+      dirty_sessions: 2,
+      unruled_sessions: 3,
+    },
+    days_series: series,
+    totals: {
+      active_ms: active,
+      wasted_ms: wasted,
+      waste_ratio: cents(wasted / active),
+      interruption_rate: 0.07,
+      correction_rate: 0.12,
+      wait_human_ms: round(active * 0.31),
+      idle_ms: round(active * 0.47),
+      inferred_waste_ms: round(wasted * 0.4),
+      turns,
+      correction_coverage: 0.86,
+      previous: previousTotals,
+    },
+    waste_by_rule: ruleMs.map(({ share, ...rule }) => ({ ...rule, ms: round(wasted * share) })),
+    waste_by_lever: [
+      { lever: "spec_gap", ms: round(wasted * 0.34) },
+      { lever: "tooling", ms: round(wasted * 0.22) },
+      { lever: "context", ms: round(wasted * 0.14) },
+    ],
+    tokens: {
+      by_model: byModel,
+      cache_hit_ratio: 0.94,
+      cost_usd: tokenCost,
+      cost_low: cents(tokenCost * 0.93),
+      cost_high: tokenCost,
+      cost_estimated: true,
+      prices_as_of: "2026-08-20",
+      unpriced_models: [],
+      dropped_prices: [],
+      price_refresh: { at: new Date(NOW - 3 * HOUR).toISOString().replace(/\.\d{3}Z$/, "Z"), ok: true, prices_as_of: "2026-08-20", problems: [] },
+      previous: { cost_usd: cents(tokenCost * 0.9), cache_hit_ratio: 0.92 },
+    },
   };
 }
 
@@ -3378,7 +3513,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (/^\/runs\/\d+\/tail/.test(path)) return RUN_TAIL;
   if ((path === "/runs" || path.startsWith("/runs?")) && init?.method === undefined) {
     const [, query] = splitQuery(path);
-    let runs = RUN_INDEX;
+    let runs = liveRuns(RUN_INDEX, currentRunsStep());
     if (query.get("live") === "true") {
       runs = runs.filter((run) => ["running", "awaiting_approval"].includes(run.status));
     }
@@ -3793,6 +3928,11 @@ export function answer(path: string, init?: RequestInit): unknown {
   const projectPipeline = /^\/projects\/([^/]+)\/analytics\/pipeline$/.exec(route);
   if (projectPipeline !== null) {
     return previewPipeline(decodeURIComponent(projectPipeline[1]), analyticsDaysParam);
+  }
+  if (route === "/analytics/devtime") return previewDevtime(null, analyticsDaysParam);
+  const projectDevtime = /^\/projects\/([^/]+)\/analytics\/devtime$/.exec(route);
+  if (projectDevtime !== null) {
+    return previewDevtime(decodeURIComponent(projectDevtime[1]), analyticsDaysParam);
   }
   if (route === "/analytics") return previewAnalytics(null, analyticsDaysParam);
   const projectAnalytics = /^\/projects\/([^/]+)\/analytics$/.exec(route);

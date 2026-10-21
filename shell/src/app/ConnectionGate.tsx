@@ -96,7 +96,7 @@ export function ConnectionGate({ children }: ConnectionGateProps) {
         <div className="app-takeover-card">
           <h1 className="app-takeover-title">daemon unreachable</h1>
           <p className="app-takeover-body">
-            The {DAEMON_NAME} is not responding on {DAEMON_URL}. Nothing here is lost — the shell keeps asking, and
+            The {DAEMON_NAME} is not responding on {DAEMON_URL}. Nothing here is lost. The shell keeps asking, and
             this window comes back on its own the moment the daemon does.
           </p>
           <p className="app-takeover-hint">retrying every {POLL.fast / 1000} seconds</p>
@@ -109,7 +109,7 @@ export function ConnectionGate({ children }: ConnectionGateProps) {
     return (
       <div className="app-takeover" role="alert">
         <div className="app-takeover-card">
-          <h1 className="app-takeover-title">reachable — not authorised</h1>
+          <h1 className="app-takeover-title">reachable, not authorised</h1>
           <p className="app-takeover-body">
             The {DAEMON_NAME} replied and refused this window's credential. The daemon token is rotated when the
             daemon restarts, and this window is still holding the one it read at startup.

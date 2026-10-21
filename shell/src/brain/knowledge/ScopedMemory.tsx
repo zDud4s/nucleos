@@ -22,7 +22,7 @@ export function ScopedMemory({ scopeKind, scopeId }: ScopedMemoryProps) {
   let body: ReactNode;
   if (knowledge.isError) {
     body = (
-      <ErrorNote onRetry={() => void knowledge.refetch()}>the {DAEMON_NAME} is not responding — this memory is unknown</ErrorNote>
+      <ErrorNote onRetry={() => void knowledge.refetch()}>the {DAEMON_NAME} is not responding: this memory is unknown</ErrorNote>
     );
   } else if (knowledge.data === undefined) {
     body = <Skeleton label="Loading memory…" lines={2} />;

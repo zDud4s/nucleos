@@ -10,7 +10,7 @@ import {
 } from "../data/feed";
 import { KindBadge } from "../pages/Feed";
 import { DAEMON_NAME } from "../copy";
-import { ErrorNote, RelativeTime } from "../ui";
+import { Drawer, ErrorNote, Quiet, RelativeTime, Skeleton } from "../ui";
 
 /**
  * The notifications drawer: what the calendar is holding, and the last lines of
@@ -106,72 +106,61 @@ export function NotificationsDrawer() {
       </button>
 
       {open && (
-        <aside className="app-drawer" aria-label="Notifications">
-          <div className="app-drawer-head">
-            <h2 className="app-drawer-title">Notifications</h2>
-            <button type="button" className="app-drawer-close" onClick={close} aria-label="Close notifications">
-              <span aria-hidden="true">×</span>
-            </button>
-          </div>
+        <Drawer title="Notifications" onClose={close}>
+          {pending.isError && (
+            <ErrorNote>the {DAEMON_NAME} is not responding: what is held is not known</ErrorNote>
+          )}
 
-          <div className="app-drawer-body">
-            {pending.isError && (
-              <ErrorNote>the {DAEMON_NAME} is not responding — what is held is not known</ErrorNote>
+          <section className="app-drawer-section">
+            <h3 className="app-drawer-heading">Held by the calendar</h3>
+            {held.length === 0 ? (
+              <Quiet compact says="Nothing is being held.">
+                A notification waits here only while the calendar says you are in something.
+              </Quiet>
+            ) : (
+              <ul className="app-drawer-list" aria-label="Held notifications">
+                {held.map((notification) => (
+                  <NotificationRow key={notification.id} notification={notification} />
+                ))}
+              </ul>
             )}
+          </section>
 
-            <section className="app-drawer-section">
-              <h3 className="app-drawer-heading">Held by the calendar</h3>
-              {held.length === 0 ? (
-                <p className="app-drawer-empty">
-                  Nothing is being held. A notification waits here only while the calendar says you
-                  are in something.
-                </p>
-              ) : (
-                <ul className="app-drawer-list" aria-label="Held notifications">
-                  {held.map((notification) => (
-                    <NotificationRow key={notification.id} notification={notification} />
-                  ))}
-                </ul>
-              )}
-            </section>
+          <section className="app-drawer-section">
+            <h3 className="app-drawer-heading">Held, then delivered</h3>
+            {delivered.length === 0 ? (
+              <Quiet compact says="Nothing has been held and let through yet.">
+                These are kept so that “did it ever arrive?” stays answerable.
+              </Quiet>
+            ) : (
+              <ul className="app-drawer-list" aria-label="Delivered notifications">
+                {delivered.map((notification) => (
+                  <NotificationRow key={notification.id} notification={notification} />
+                ))}
+              </ul>
+            )}
+          </section>
 
-            <section className="app-drawer-section">
-              <h3 className="app-drawer-heading">Held, then delivered</h3>
-              {delivered.length === 0 ? (
-                <p className="app-drawer-empty">
-                  Nothing has been held and let through yet. These are kept so that “did it ever
-                  arrive?” stays answerable.
-                </p>
-              ) : (
-                <ul className="app-drawer-list" aria-label="Delivered notifications">
-                  {delivered.map((notification) => (
-                    <NotificationRow key={notification.id} notification={notification} />
-                  ))}
-                </ul>
-              )}
-            </section>
-
-            <section className="app-drawer-section">
-              <h3 className="app-drawer-heading">Latest feed</h3>
-              {recent.isError && (
-                <ErrorNote>the {DAEMON_NAME} is not responding — the feed could not be read</ErrorNote>
-              )}
-              {recent.data === undefined && !recent.isError && (
-                <p className="app-drawer-empty">reading the feed…</p>
-              )}
-              {recent.data !== undefined && recent.data.length === 0 && (
-                <p className="app-drawer-empty">The feed is empty.</p>
-              )}
-              {recent.data !== undefined && recent.data.length > 0 && (
-                <ul className="app-drawer-list" aria-label="Latest feed">
-                  {recent.data.map((entry) => (
-                    <FeedLine key={entry.id} entry={entry} />
-                  ))}
-                </ul>
-              )}
-            </section>
-          </div>
-        </aside>
+          <section className="app-drawer-section">
+            <h3 className="app-drawer-heading">Latest feed</h3>
+            {recent.isError && (
+              <ErrorNote>the {DAEMON_NAME} is not responding: the feed could not be read</ErrorNote>
+            )}
+            {recent.data === undefined && !recent.isError && (
+              <Skeleton label="Reading the feed" lines={3} />
+            )}
+            {recent.data !== undefined && recent.data.length === 0 && (
+              <Quiet compact says="The feed is empty." />
+            )}
+            {recent.data !== undefined && recent.data.length > 0 && (
+              <ul className="app-drawer-list" aria-label="Latest feed">
+                {recent.data.map((entry) => (
+                  <FeedLine key={entry.id} entry={entry} />
+                ))}
+              </ul>
+            )}
+          </section>
+        </Drawer>
       )}
     </>
   );

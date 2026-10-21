@@ -126,7 +126,7 @@
 .council-early {
   padding: 0 var(--space-2);
   border: 1px solid var(--tone-awaiting-border);
-  border-radius: var(--radius-sm, 4px);
+  border-radius: var(--radius-sm);
   background: var(--tone-awaiting-bg);
   color: var(--tone-awaiting-fg);
   font-size: var(--text-xs);
@@ -732,19 +732,19 @@
 }
 
 .council-court-svg .council-court-small {
-  font-size: 12px;
+  font-size: var(--text-xs);
   fill: var(--text-faint);
   letter-spacing: var(--tracking-wide);
 }
 
 .council-court-svg .council-court-wing-title {
-  font-size: 12px;
+  font-size: var(--text-xs);
   fill: var(--text);
   letter-spacing: var(--tracking-wide);
 }
 
 .council-court-svg .council-court-balance-label {
-  font-size: 12px;
+  font-size: var(--text-xs);
   fill: var(--text-muted);
 }
 
@@ -763,7 +763,7 @@
   min-height: var(--hit-min);
   padding: 0;
   border: 0;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   background: transparent;
   cursor: pointer;
 }
@@ -793,7 +793,7 @@
 
 .council-court-svg .council-court-judge-label {
   font-family: var(--font-display);
-  font-size: 11px;
+  font-size: var(--text-xs);
   fill: var(--text);
 }
 
@@ -911,7 +911,7 @@
 
 .council-court-svg .council-court-lectern-text {
   font-family: var(--font-display);
-  font-size: 12px;
+  font-size: var(--text-xs);
 }
 
 .council-court-svg .council-court-link {
@@ -966,20 +966,20 @@
 }
 
 .council-court-svg .council-court-seat-name {
-  font-size: 12px;
+  font-size: var(--text-xs);
   fill: var(--text);
 }
 
 .council-court-svg .council-court-letter {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   fill: var(--tone-shadow-fg);
 }
 
 /* A masked chair shows its letter, and its name only while it is pointed at. */
 .council-court-svg .council-court-reveal {
-  font-size: 12px;
+  font-size: var(--text-xs);
   display: none;
 }
 
@@ -992,12 +992,12 @@
 }
 
 .council-court-svg .council-court-role {
-  font-size: 12px;
+  font-size: var(--text-xs);
   fill: var(--tone-shadow-fg);
 }
 
 .council-court-svg .council-court-rank {
-  font-size: 12px;
+  font-size: var(--text-xs);
   fill: var(--text-muted);
 }
 
@@ -1006,7 +1006,7 @@
 }
 
 .council-court-svg .council-court-tick {
-  font-size: 12px;
+  font-size: var(--text-xs);
   fill: var(--text-muted);
 }
 
@@ -1179,36 +1179,6 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
-}
-
-.council-dossier-chip {
-  min-height: var(--hit-min);
-  padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-pill);
-  background: var(--surface-raised);
-  color: var(--text);
-  font-size: var(--text-sm);
-  cursor: pointer;
-}
-
-.council-dossier-chip:hover {
-  border-color: var(--text-muted);
-}
-
-.council-dossier-chip:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
-.council-dossier-chip-role {
-  color: var(--tone-shadow-fg);
-}
-
-.council-dossier-chip[aria-pressed="true"] {
-  border-color: var(--tone-shadow-border);
-  background: var(--tone-shadow-bg);
-  color: var(--tone-shadow-fg);
 }
 
 .council-dossier-ballot {

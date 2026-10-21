@@ -14,8 +14,10 @@ import {
   type ProjectRules,
 } from "../data/projects";
 import { useAssistantModels, type ModelChoice } from "../data/chats";
+import { clockText } from "../lib/when";
 import {
   Button,
+  Callout,
   ConfirmButton,
   Count,
   ErrorNote,
@@ -26,6 +28,9 @@ import {
   RelativeTime,
   StaleNote,
   StateBadge,
+  Table,
+  Td,
+  Th,
 } from "../ui";
 import { IdeVerifyPanel } from "./IdeVerify";
 import { PostMergePanel } from "./PostMerge";
@@ -77,7 +82,7 @@ export function OnItsOwn({ projectId }: OnItsOwnProps) {
             <RefusalNote refusal={rules.error} />
           ) : (
             <ErrorNote>
-              the {DAEMON_NAME} gave no reply — nothing is known about this project&apos;s rules
+              the {DAEMON_NAME} gave no reply: nothing is known about this project&apos;s rules
             </ErrorNote>
           )}
         </Panel>
@@ -141,7 +146,7 @@ export function ReadAt({ at }: { at: number }) {
     <span className="pj-read">
       read{" "}
       <time dateTime={when.toISOString()} title={when.toLocaleString()}>
-        {when.toTimeString().slice(0, 5)}
+        {clockText(at)}
       </time>
     </span>
   );
@@ -254,7 +259,7 @@ function RulesFileState({
           </pre>
           <p className="pj-note">
             The file is parsed strictly on purpose: an unknown key is an error rather than a silently
-            empty ruleset. Until it parses, nothing this project might run is known — not because
+            empty ruleset. Until it parses, nothing this project might run is known, not because
             there is nothing, but because none of it could be loaded.
           </p>
           {editable && (
@@ -266,9 +271,9 @@ function RulesFileState({
       )}
       {rules.rules_file === "absent" && (
         <p className="pj-note">
-          There is no {file} yet. That is an ordinary state and not a fault — it lives with this
-          machine&rsquo;s settings rather than in the project, and exists once somebody writes rules
-          — and it means this project starts nothing by itself.
+          There is no {file} yet. That is an ordinary state and not a fault: it lives with this
+          machine&rsquo;s settings rather than in the project, and exists once somebody writes rules,
+          and it means this project starts nothing by itself.
         </p>
       )}
     </div>
@@ -320,8 +325,8 @@ function Autonomy({ projectId, rules }: { projectId: string; rules: ProjectRules
         >
           <p>
             No schedule and no repo trigger, so this project only ever does what somebody asks it to.
-            Both are written in <code>{rulesFileName(rules)}</code> — a schedule runs on a clock, a
-            repo trigger runs when a branch gets a commit — and the file is edited in the project
+            Both are written in <code>{rulesFileName(rules)}</code>: a schedule runs on a clock, a
+            repo trigger runs when a branch gets a commit, and the file is edited in the project
             workspace, as text, so the comments in it survive.
           </p>
         </Quiet>
@@ -332,25 +337,15 @@ function Autonomy({ projectId, rules }: { projectId: string; rules: ProjectRules
   return (
     <Panel title="What starts work here without you" aside={<Count n={running.length} />}>
       <div className="pj-table-scroller">
-        <table className="pj-table">
-          <caption className="sr-only">
-            Every rule that can start work in this project with nobody asking, what makes it go, and
-            when it last did.
-          </caption>
+        <Table label="Every rule that can start work in this project with nobody asking, what makes it go, and when it last did.">
           <thead>
             <tr>
-              <th scope="col">Rule</th>
-              <th scope="col">What makes it go</th>
-              <th scope="col">State</th>
-              <th scope="col" className="pj-col-num">
-                Next
-              </th>
-              <th scope="col" className="pj-col-num">
-                Last
-              </th>
-              <th scope="col" className="pj-col-num">
-                Today
-              </th>
+              <Th>Rule</Th>
+              <Th>What makes it go</Th>
+              <Th>State</Th>
+              <Th num>Next</Th>
+              <Th num>Last</Th>
+              <Th num>Today</Th>
             </tr>
           </thead>
           <tbody>
@@ -358,7 +353,7 @@ function Autonomy({ projectId, rules }: { projectId: string; rules: ProjectRules
               <RuleRows key={`${rule.clock}:${rule.name}`} rule={rule} />
             ))}
           </tbody>
-        </table>
+        </Table>
       </div>
     </Panel>
   );
@@ -367,45 +362,49 @@ function Autonomy({ projectId, rules }: { projectId: string; rules: ProjectRules
 function RuleRows({ rule }: { rule: AutonomyRule }) {
   return (
     <>
-      <tr className={rule.problem === null ? undefined : "pj-row-problem"}>
-        <th scope="row" className="pj-row-name">
-          <span className="pj-row-title">
-            <span className="pj-row-kind" aria-hidden="true">
-              {CLOCK_MARK[rule.clock]}
+      <tr>
+        <Td>
+          {/* The name column's bounds, now that the table is the shared one: the clamped prompt
+              below is as wide as its text, and left alone it would set the width of the column. */}
+          <div className="max-w-88 min-w-56">
+            <span className="pj-row-title">
+              <span className="pj-row-kind" aria-hidden="true">
+                {CLOCK_MARK[rule.clock]}
+              </span>
+              {rule.name}
+              <span className="sr-only">, {CLOCK_SAID[rule.clock]}</span>
             </span>
-            {rule.name}
-            <span className="sr-only">, {CLOCK_SAID[rule.clock]}</span>
-          </span>
-          {/* Always drawn, whatever its length, and clamped to one line. A field
-              that appears on some rows and not others starts the next column at
-              two different heights — the defect the Teams cards had. The whole
-              prompt is on hover, because the clamp used to cut exactly the part
-              of a sentence that said what the rule was for. */}
-          <span className="pj-row-asks" title={rule.prompt}>
-            {rule.prompt}
-          </span>
-          {rule.cwd !== null && <span className="pj-row-where">in {rule.cwd}</span>}
-        </th>
-        <td>
+            {/* Always drawn, whatever its length, and clamped to one line. A field
+                that appears on some rows and not others starts the next column at
+                two different heights — the defect the Teams cards had. The whole
+                prompt is on hover, because the clamp used to cut exactly the part
+                of a sentence that said what the rule was for. */}
+            <span className="pj-row-asks" title={rule.prompt}>
+              {rule.prompt}
+            </span>
+            {rule.cwd !== null && <span className="pj-row-where">in {rule.cwd}</span>}
+          </div>
+        </Td>
+        <Td>
           <Trigger rule={rule} />
-        </td>
-        <td>
+        </Td>
+        <Td>
           <StateBadge domain="rule" state={rule.state} />
-        </td>
-        <td className="pj-col-num">
+        </Td>
+        <Td num>
           <Moment
             at={rule.next}
             absent={
               rule.clock === "commit" || rule.state === "never-fires" ? "—" : "not scheduled"
             }
           />
-        </td>
-        <td className="pj-col-num">
+        </Td>
+        <Td num>
           <Moment at={rule.last} absent={rule.clock === "commit" ? "—" : "never"} />
-        </td>
-        <td className="pj-col-num">
+        </Td>
+        <Td num>
           <Today today={rule.today} />
-        </td>
+        </Td>
       </tr>
       {/*
         First-class and spanning, not a tooltip: an unparseable cron or an
@@ -417,11 +416,11 @@ function RuleRows({ rule }: { rule: AutonomyRule }) {
       */}
       {rule.problem !== null && (
         <tr>
-          <td className="pj-problem-cell" colSpan={6}>
+          <Td colSpan={6}>
             <ErrorNote>
               <code className="pj-verbatim">{rule.problem}</code>
             </ErrorNote>
-          </td>
+          </Td>
         </tr>
       )}
     </>
@@ -480,7 +479,7 @@ function Today({ today }: { today: AutonomyRule["today"] }) {
     <span className={full ? "pj-figure pj-figure-full" : "pj-figure"}>
       {today.fired}
       <span className="pj-figure-of"> / {today.cap}</span>
-      {full && <span className="sr-only"> — today&apos;s allowance is spent</span>}
+      {full && <span className="sr-only">, today&apos;s allowance is spent</span>}
     </span>
   );
 }
@@ -655,7 +654,7 @@ function JudgePanel({
              from an empty list, and saying so about a perfectly good one would be a lie the panel
              tells for as long as the daemon is unreachable. */
           models.data !== undefined
-          ? `${judge.model} — not on the menu now`
+          ? `${judge.model} (not on the menu now)`
           : judge.model
       : null;
 
@@ -736,7 +735,7 @@ function JudgePanel({
       <Why lead="A judge answers, in your place, what a conversation on Auto would otherwise ask you.">
         <p>
           A conversation on <strong>Auto</strong> stops and asks about anything its rules do not
-          recognise. A judge is what answers those in your place — a model, given the command and
+          recognise. A judge is what answers those in your place: a model, given the command and
           nothing else, inside the same window you would have had to answer in.
         </p>
       </Why>
@@ -783,7 +782,7 @@ function JudgePanel({
 
       {stale ? (
         <p className="pj-note">
-          The judge can be changed again once the rules read is current — changing it beside a
+          The judge can be changed again once the rules read is current: changing it beside a
           reading nobody can vouch for would be deciding on a guess.
         </p>
       ) : (
@@ -802,7 +801,7 @@ function JudgePanel({
             }}
           >
             {orphan !== null && <option value={current}>{orphan}</option>}
-            <option value="default">The default — the local brain, on its configured model</option>
+            <option value="default">The default: the local brain, on its configured model</option>
             <option value="off">Nobody but me</option>
             {(["local", "openrouter"] as const).map((route) => {
               const rows = judges.filter((choice) => choice.brain === route);
@@ -812,7 +811,7 @@ function JudgePanel({
                   {rows.map((choice) => (
                     <option key={choice.id} value={choice.id} disabled={choice.installed === false}>
                       {choice.label}
-                      {choice.installed === false ? " — not downloaded" : ""}
+                      {choice.installed === false ? " (not downloaded)" : ""}
                     </option>
                   ))}
                 </optgroup>
@@ -851,10 +850,10 @@ function JudgePanel({
         (isApiRefusal(name.error) ? (
           <RefusalNote refusal={name.error} />
         ) : (
-          <ErrorNote>the {DAEMON_NAME} gave no reply — the judge is unchanged</ErrorNote>
+          <ErrorNote>the {DAEMON_NAME} gave no reply: the judge is unchanged</ErrorNote>
         ))}
       {clear.isError && !isApiRefusal(clear.error) && (
-        <ErrorNote>the {DAEMON_NAME} gave no reply — the judge is unchanged</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} gave no reply: the judge is unchanged</ErrorNote>
       )}
     </Panel>
   );
@@ -921,8 +920,8 @@ function WipPanel({
         onSuccess: () =>
           setChanged(
             limit === null
-              ? `Ceiling removed — it was ${ceilingSaid(before.current)}.`
-              : `Ceiling set to ${limit} — it was ${ceilingSaid(before.current)}.`,
+              ? `Ceiling removed. It was ${ceilingSaid(before.current)}.`
+              : `Ceiling set to ${limit}. It was ${ceilingSaid(before.current)}.`,
           ),
       },
     );
@@ -932,7 +931,7 @@ function WipPanel({
     <Panel title="Work-in-progress ceiling">
       <Why lead="How much unreviewed work this project may hold before it stops starting more.">
         <p>
-          The brake is self-clearing — it releases the moment you review something — so this is the
+          The brake is self-clearing: it releases the moment you review something, so this is the
           answer to &ldquo;how much unanswered work am I willing to have open&rdquo;, not a quota.
         </p>
       </Why>
@@ -987,16 +986,18 @@ function WipPanel({
             onChange={(event) => setDraft(event.target.value)}
           />
           {zero && (
-            <p className="pj-warn" id={zeroId}>
-              A ceiling of 0 means this project starts nothing new on its own until you raise it.
-            </p>
+            <div id={zeroId}>
+              <Callout tone="paused">
+                A ceiling of 0 means this project starts nothing new on its own until you raise it.
+              </Callout>
+            </div>
           )}
           <div className="pj-actions">
             {zero ? (
               <ConfirmButton
                 variant="ghost"
                 label="Set the ceiling"
-                confirmLabel="Set 0 — nothing new starts here"
+                confirmLabel="Set 0: nothing new starts here"
                 disabled={setLimit.isPending}
                 onConfirm={() => send(0)}
               />
@@ -1025,7 +1026,7 @@ function WipPanel({
 
       {draft.trim() !== "" && !valid && (
         <p className="pj-note">
-          A ceiling is a whole number, zero or more. The {DAEMON_NAME} refuses a negative one outright — it
+          A ceiling is a whole number, zero or more. The {DAEMON_NAME} refuses a negative one outright: it
           would read like a number somebody chose and mean &ldquo;never start anything again&rdquo;.
         </p>
       )}
@@ -1036,7 +1037,7 @@ function WipPanel({
 
 function WipError({ error }: { error: unknown }) {
   if (!isApiRefusal(error)) {
-    return <ErrorNote>the {DAEMON_NAME} gave no reply — the ceiling is unchanged</ErrorNote>;
+    return <ErrorNote>the {DAEMON_NAME} gave no reply: the ceiling is unchanged</ErrorNote>;
   }
   return (
     <RefusalNote
