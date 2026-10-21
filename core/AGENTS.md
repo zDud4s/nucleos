@@ -314,6 +314,8 @@ the contract, not a snapshot.
 | `fleet.rs` | The live fleet tree (spec 2026-10-20): module root, `FleetEnv` and the `sources()` registry that each harness adapter adds one line to. |
 | `fleet/limits.rs` | Every number of the live fleet tree (watch window, batching, retention, caps, ring, line cut) as a named `pub const`. |
 | `fleet/model.rs` | The normalised fleet model handed to the shell: `NodeKey`, `FleetNode`, `NodeMetrics`, `collapse_ws` (the one whitespace collapse, shared with the transcript builders), `clean_label` (collapse, redact, then cut: the one cleaning order for labels and lines), `TermLine` (the one place a line is cut to 200 characters) and the transcript page types. Names no harness. |
+| `fleet/source.rs` | The adapter contract of the live fleet tree: `AgentSource` and `EdgeSource`, and the `Sighting`, `Offset`, `LinesRead`, `Edge` they exchange, plus `SourceError` / `SourceResult` (their error type; no `anyhow`). The only place a harness's format may be known is behind these traits. |
+| `fleet/event.rs` | The `GET /fleet/live` events as one serde enum (`{"t":"snapshot"|"node"|"metrics"|"lines"|"removed"|"heartbeat"}`). |
 | `governance/triage.rs` | Parent of `governance/triage/`. The email pillar's triage execution machinery: the sandbox a run executes in, and the startup verification that proves its hook barrier is really in force. |
 | `governance/triage/sandbox.rs` | The sandbox a triage run executes in, and the startup check that its hook barrier holds. |
 | `governance/triage/prompt.rs` | Turning stored messages into the prompt a triage batch sees (`build_prompt`, `triage_inputs`). |
