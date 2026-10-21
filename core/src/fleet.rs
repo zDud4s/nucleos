@@ -2,3 +2,4 @@
 //! shell over one NDJSON stream. Design: `.ai/specs/2026-10-20-fleet-arvore-viva-design.md`.
 
 pub mod limits;
+pub mod model;
