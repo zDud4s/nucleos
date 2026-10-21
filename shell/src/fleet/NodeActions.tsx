@@ -94,7 +94,11 @@ function StopControl({ runId, label }: { runId: number; label: string }) {
           className="fleet-act fleet-act-stop"
           aria-label={`Stop ${label}`}
           title="Stop"
-          onClick={() => setArmed(true)}
+          disabled={cancel.isPending}
+          onClick={() => {
+            cancel.reset();
+            setArmed(true);
+          }}
         >
           ■
         </button>

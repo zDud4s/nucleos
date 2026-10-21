@@ -155,6 +155,29 @@ describe("Fleet", () => {
     await waitFor(() => expect(screen.queryByRole("complementary")).toBeNull());
   });
 
+  it("closes the panel and clears the selection when their node leaves the tree", async () => {
+    daemon.apiFetch.mockImplementation(respond((path) => (path.startsWith("/fleet/nodes/") ? { entries: [], before: null } : undefined)));
+    const keep = node("cc:keep", { label: "keeper" });
+    const { pipe } = await open(snapshot([node("cc:r", { label: "leaver", capabilities: ALL, run_id: 7 }), keep]));
+    fireEvent.click(await screen.findByRole("article", { name: /^leaver/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open the full transcript" }));
+    expect(await screen.findByRole("complementary", { name: "Transcript of leaver" })).toBeDefined();
+    await act(async () => pipe.send({ t: "removed", node_id: "cc:r" }));
+    await waitFor(() => expect(screen.queryByRole("complementary")).toBeNull());
+    expect(screen.getByRole("article", { name: /^keeper/ }).className).not.toContain("fleet-node-path");
+  });
+
+  it("says so when the project filter matches nothing instead of drawing a blank pane", async () => {
+    await open(
+      snapshot([node("a", { label: "alpha", project: "nucleos" }), node("c", { label: "gamma", project: "other", state: "done" })]),
+    );
+    await screen.findByRole("article", { name: /^alpha/ });
+    fireEvent.change(screen.getByLabelText("Project"), { target: { value: "other" } });
+    fireEvent.click(screen.getByLabelText("Active only"));
+    expect(await screen.findByText("Nothing matches this project")).toBeDefined();
+    expect(screen.queryByText("Nothing is running")).toBeNull();
+  });
+
   it("pins a root through the pin route and reflects the stream's pinned flag", async () => {
     const root = node("cc:r", { label: "nucleos-37", capabilities: ALL, run_id: 7 });
     const kid = child("cc:k", root, { label: "kid", capabilities: { ...ALL, pin: false } });

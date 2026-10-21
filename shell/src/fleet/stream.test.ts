@@ -120,4 +120,30 @@ describe("startFleetStream", () => {
     expect(signals[0].aborted).toBe(true);
     expect(open).toHaveBeenCalledTimes(1);
   });
+
+  it("a handler that throws is not a dropped connection: no reconnect, the stream keeps reading", async () => {
+    const p = pipe();
+    const seen: FleetEvent[] = [];
+    const states: ConnectionState[] = [];
+    const open = vi.fn(async () => p.stream);
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    startFleetStream(
+      {
+        onEvent: (e) => {
+          if (e.t === "node") throw new TypeError("boom");
+          seen.push(e);
+        },
+        onState: (s) => states.push(s),
+      },
+      open,
+    );
+    await flush();
+    p.send(ndjson(snapshot([node("a:1")]), { t: "node", node: node("a:2") }, { t: "removed", node_id: "a:1" }));
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(seen.map((e) => e.t)).toEqual(["snapshot", "removed"]);
+    expect(states).toEqual(["connecting", "live"]);
+    quiet.mockRestore();
+  });
 });

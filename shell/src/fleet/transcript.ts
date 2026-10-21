@@ -29,6 +29,12 @@ const asEntry = (line: TermLine): TranscriptEntry => ({ kind: line.kind, text: l
  */
 const DEDUPE_GRACE_MS = 2_000;
 
+/**
+ * Most rows the panel keeps. The list is not virtualised, so a panel left open on a busy agent
+ * keeps only the newest pages; "Load earlier" still pages back from the oldest cursor it holds.
+ */
+export const MAX_ROWS = 2_000;
+
 interface State {
   rows: Row[];
   before: string | null;
@@ -68,7 +74,7 @@ export function useTranscript(id: string) {
       const fresh = Date.now() < graceUntil.current ? freshLines(firstPage.current, lines) : lines;
       if (fresh.length === 0) return;
       const rows = append(fresh.map(asEntry));
-      setState((s) => ({ ...s, rows: [...s.rows, ...rows] }));
+      setState((s) => ({ ...s, rows: [...s.rows, ...rows].slice(-MAX_ROWS) }));
     });
     fetchTranscriptPage(id, null).then(
       (page) => {

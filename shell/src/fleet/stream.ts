@@ -62,11 +62,18 @@ export function startFleetStream(handlers: StreamHandlers, open: Open = openStre
           for (const text of splitter.push(value)) {
             const event = parseEvent(text);
             if (event === null) continue;
+            // A handler that throws is a bug in the shell, not a dropped connection: it must not
+            // reach the catch below (which would reconnect and hide the "can't reach" note logic).
+            try {
+              handlers.onEvent(event);
+            } catch (error) {
+              console.error("fleet: could not apply an event", error);
+              continue;
+            }
             if (event.t === "snapshot") {
               attempt = 0;
               handlers.onState("live");
             }
-            handlers.onEvent(event);
           }
         }
       } catch {
