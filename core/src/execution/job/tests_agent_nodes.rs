@@ -525,7 +525,7 @@ async fn a_custom_agent_node_asking_permission_parks_the_job_awaiting_approval()
 
 // `a_replan_that_fails_stops_not_fails_the_job` is already covered by
 // `a_replan_that_could_not_answer_stops_the_job_rather_than_failing_it` (job.rs) and
-// `a_replan_that_writes_nothing_stops_the_job_and_does_not_reuse_the_last_plan` (tests_c4.rs).
+// `a_replan_that_writes_nothing_stops_the_job_and_does_not_reuse_the_last_plan` (tests_plan_landing.rs).
 
 #[tokio::test]
 async fn crash_between_node_done_and_next_dispatch_resumes_without_rerunning_the_node() {

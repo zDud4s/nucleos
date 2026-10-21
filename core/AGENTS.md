@@ -91,11 +91,11 @@ the contract, not a snapshot.
 | `execution/job/spawn.rs` | Spawning a node: the worktree, the item claim and provisioning, the loadout, and parking or releasing an item. |
 | `execution/job/start.rs` | Starting a job: `resolve_start` (pure) and `start` (writes the row, provisions the worktree). |
 | `execution/job/store.rs` | The job rows: loading a view, status writes guarded by compare-and-set, inserting, cancelling, and recovering orphans at startup. |
-| `execution/job/tests_c2.rs` | Database-level tests of the job engine, chunk C2. |
-| `execution/job/tests_c3.rs` | Database-level tests of the job engine, chunk C3. |
-| `execution/job/tests_c4.rs` | Database-level tests of the job engine, chunk C4. |
-| `execution/job/tests_c5.rs` | Database-level tests of the job engine, chunk C5. |
-| `execution/job/tests_c6.rs` | Database-level tests of the job engine, chunk C6. |
+| `execution/job/tests_agent_launcher.rs` | Database-level tests of the default agent launcher through a real context. |
+| `execution/job/tests_command_nodes.rs` | Database-level tests of command nodes in the job engine. |
+| `execution/job/tests_plan_landing.rs` | Database-level tests of plan landing and replan in the job engine. |
+| `execution/job/tests_start_snapshot.rs` | Database-level tests of the graph snapshot taken at job start. |
+| `execution/job/tests_walk_state_parity.rs` | Database-level tests of walk state parity with the legacy reading. |
 | `execution/job/tests_agent_nodes.rs` | Database-level tests of agent nodes: the launcher seam and its refusals, a real run's stage and link, landing, output validation and its single retry, parked approvals. |
 | `execution/job/tests_graph_walk.rs` | Database-level tests of the walker as the authority: how a job ends (completed, stuck, unreadable emission), the brakes, loops and pre-upgrade jobs. |
 | `execution/job/tests_job_support.rs` | Shared fixtures of the job-engine DB-level tests: graphs, seeded jobs, feed and row readers. |

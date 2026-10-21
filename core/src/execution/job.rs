@@ -50,15 +50,15 @@ mod store;
 #[cfg(test)]
 mod tests_agent_nodes;
 #[cfg(test)]
-mod tests_c2;
+mod tests_agent_launcher;
 #[cfg(test)]
-mod tests_c3;
+mod tests_command_nodes;
 #[cfg(test)]
-mod tests_c4;
+mod tests_plan_landing;
 #[cfg(test)]
-mod tests_c5;
+mod tests_start_snapshot;
 #[cfg(test)]
-mod tests_c6;
+mod tests_walk_state_parity;
 #[cfg(test)]
 mod tests_graph_walk;
 #[cfg(test)]
