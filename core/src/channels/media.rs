@@ -312,14 +312,47 @@ where
 }
 
 /// Housekeeping hook called hourly by `run_housekeeping`. TTL of `channel_media` is 7 days; the
-/// file follows the files-folder rules, so it stays.
-pub async fn prune(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
+/// row goes first, then its file under `files_root`. A file already gone is fine and any other
+/// IO error is logged: the row is deleted either way, so a stuck file never fails the prune.
+pub async fn prune(
+    pool: &SqlitePool,
+    files_root: Option<&std::path::Path>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<u64> {
     let cutoff = (now - Duration::days(7)).to_rfc3339();
+    let paths: Vec<(String,)> =
+        sqlx::query_as("SELECT path FROM channel_media WHERE created_at < ?")
+            .bind(&cutoff)
+            .fetch_all(pool)
+            .await?;
     let result = sqlx::query("DELETE FROM channel_media WHERE created_at < ?")
         .bind(cutoff)
         .execute(pool)
         .await?;
+    if let Some(root) = files_root {
+        for (relative,) in paths {
+            remove_media_file(root, &relative);
+        }
+    }
     Ok(result.rows_affected())
+}
+
+/// Best-effort removal of one stored media file; never fails the caller.
+fn remove_media_file(root: &std::path::Path, relative: &str) {
+    let path = match crate::files::resolve_within(root, relative) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!(error = ?e, relative, "media prune: path not resolvable, file left");
+            return;
+        }
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "media prune: file not removed");
+        }
+    }
 }
 
 /// What a message becomes for the turn (§7.1 `media.rs`).
@@ -729,14 +762,29 @@ mod tests {
             .await
             .unwrap();
         let old_file = open(&state, "fake", &old).await.unwrap().path;
-        assert_eq!(prune(&state.pool, now).await.unwrap(), 1);
+        let fresh_file = open(&state, "fake", &fresh).await.unwrap().path;
+        let root = state.files_root.clone();
+        assert_eq!(prune(&state.pool, root.as_deref(), now).await.unwrap(), 1);
         assert!(matches!(
             open(&state, "fake", &old).await,
             Err(MediaError::UnknownMedia)
         ));
         assert!(open(&state, "fake", &fresh).await.is_ok());
-        // The file follows the files-folder rules: pruning the row does not delete it.
-        assert!(old_file.exists());
+        assert!(!old_file.exists(), "the pruned row's file is deleted");
+        assert!(fresh_file.exists());
+    }
+
+    #[tokio::test]
+    async fn prune_tolerates_a_file_already_gone() {
+        let (state, _dir) = state_with_root().await;
+        let now = Utc::now();
+        let old = store(&state, "fake", "text/plain", b"o", now - Duration::days(8))
+            .await
+            .unwrap();
+        let file = open(&state, "fake", &old).await.unwrap().path;
+        std::fs::remove_file(&file).unwrap();
+        let root = state.files_root.clone();
+        assert_eq!(prune(&state.pool, root.as_deref(), now).await.unwrap(), 1);
     }
 
     // ---- the routes (RA) ------------------------------------------------------------------
