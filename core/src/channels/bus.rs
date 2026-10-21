@@ -53,6 +53,8 @@ pub struct Cadence {
     pub second_look: Duration,
     pub budget_min_gap: Duration,
     pub ping_after: Duration,
+    /// Minimum gap between two progress edits of one turn.
+    pub stream_every: Duration,
 }
 
 impl Default for Cadence {
@@ -63,6 +65,7 @@ impl Default for Cadence {
             second_look: Duration::from_secs(2),
             budget_min_gap: Duration::from_secs(10),
             ping_after: Duration::from_secs(10 * 60),
+            stream_every: Duration::from_secs(5),
         }
     }
 }
@@ -79,6 +82,7 @@ mod tests {
         assert_eq!(c.second_look, Duration::from_secs(2));
         assert_eq!(c.budget_min_gap, Duration::from_secs(10));
         assert_eq!(c.ping_after, Duration::from_secs(600));
+        assert_eq!(c.stream_every, Duration::from_secs(5));
     }
 
     #[test]

@@ -106,6 +106,17 @@ pub struct ChannelConfig {
     /// Project id to `conversation_ref` (a thread in Telegram).
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
+    /// Whether a running turn's ack message is edited with the live text (`channels.stream_edits`
+    /// in the plan). Absent = on; it only ever applies to a channel that declares `edit`.
+    #[serde(default)]
+    pub stream_edits: Option<bool>,
+}
+
+impl ChannelConfig {
+    /// `stream_edits` with its default: on unless the file says `stream_edits: false`.
+    pub fn stream_edits(&self) -> bool {
+        self.stream_edits.unwrap_or(true)
+    }
 }
 
 /// Reads one channel's `<root>/<settings_file>.yaml`. Absent, unreadable or malformed = default,
@@ -848,6 +859,7 @@ mod tests {
                 ("alpha".to_string(), "-1:5".to_string()),
                 ("beta".to_string(), "-1:6".to_string()),
             ]),
+            stream_edits: None,
         };
         assert_eq!(
             project_for_conversation(&config, "-1:6").as_deref(),

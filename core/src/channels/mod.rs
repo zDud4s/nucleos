@@ -17,6 +17,7 @@ pub mod replies;
 pub mod routing;
 #[cfg(test)]
 pub(crate) mod schema;
+pub mod streaming;
 pub mod strings;
 #[cfg(test)]
 mod switch_tests;

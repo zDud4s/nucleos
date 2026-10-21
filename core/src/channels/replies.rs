@@ -10,6 +10,7 @@ use tokio::time::Instant;
 use crate::channels::bus::{Cadence, ChannelsBus};
 use crate::channels::outbox::{self, Class, NewAction, Subject};
 use crate::channels::routing::advance_turn_watermark;
+use crate::channels::streaming::{Throttle, finish_progress, stream_progress};
 use crate::channels::strings::{self, Text};
 use crate::channels::{contract, registry};
 use crate::state::AppState;
@@ -310,6 +311,11 @@ pub async fn run_replies_loop(state: AppState, mut bus: ChannelsBus, cadence: Ca
     let mut typing_tick = tokio::time::interval(TYPING_EVERY);
     typing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut typing = TypingRefresh::default();
+    // Half the minimum gap, so the gap (not the tick phase) decides when an edit goes out.
+    let stream_period = (cadence.stream_every / 2).max(Duration::from_millis(1));
+    let mut stream_tick = tokio::time::interval(stream_period);
+    stream_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut streaming = Throttle::default();
     loop {
         let next_ping = pings.first();
         // Without a deadline the arm is disabled; the placeholder instant is never awaited.
@@ -318,6 +324,10 @@ pub async fn run_replies_loop(state: AppState, mut bus: ChannelsBus, cadence: Ca
             _ = sweep.tick() => sweep_logged(&state, &cadence, &mut pings).await,
             _ = runs_changed(&mut bus.runs) => sweep_logged(&state, &cadence, &mut pings).await,
             _ = typing_tick.tick() => refresh_typing(&state, &mut typing, Instant::now()).await,
+            _ = stream_tick.tick() => {
+                let (gap, wall) = (cadence.stream_every, Utc::now());
+                stream_progress(&state, &mut streaming, Instant::now(), gap, wall).await
+            }
             _ = tokio::time::sleep_until(deadline), if next_ping.is_some() => {
                 for run_id in pings.pop_due(Instant::now()) {
                     if let Err(error) = fire_ping(&state, run_id, Utc::now()).await {
@@ -460,7 +470,7 @@ const OPEN_TURNS: &str = "SELECT t.run_id, t.channel, t.conversation, r.status, 
      FROM channel_turn_replies t JOIN runs r ON r.id = t.run_id \
      WHERE t.replied_at IS NULL";
 
-fn key_of(channel: &str, conversation: &str) -> Option<contract::ConversationKey> {
+pub(super) fn key_of(channel: &str, conversation: &str) -> Option<contract::ConversationKey> {
     registry::by_id(channel).map(|m| contract::ConversationKey::new(m.id, conversation))
 }
 
@@ -484,6 +494,9 @@ async fn reply_once(
     .rows_affected()
         == 1;
     if won {
+        // The progress edits come first on the ordered lane, so the ack ends as "finished" before
+        // the answer arrives as a new message.
+        finish_progress(&mut tx, state, key, run_id, now).await?;
         enqueue_text(&mut tx, key, run_id, text, now).await?;
     }
     tx.commit().await?;
@@ -495,7 +508,7 @@ async fn reply_once(
 
 /// Answers every acknowledged turn that finished and returns the ones still running. An interrupted
 /// turn (the daemon died under it) is terminal too, so it is answered here with its status sentence.
-/// Emits `send` only, never `edit` (Q8).
+/// The answer is always a new `send`; the only `edit` is the best-effort "finished" mark on the ack.
 pub async fn open_pass(state: &AppState, now: DateTime<Utc>) -> sqlx::Result<OpenPass> {
     let rows: Vec<OpenRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "{OPEN_TURNS} ORDER BY t.run_id"
@@ -808,6 +821,7 @@ mod tests {
             second_look: Duration::from_millis(150),
             budget_min_gap: Duration::ZERO,
             ping_after: Duration::from_millis(ping_after_ms),
+            stream_every: Duration::from_secs(5),
         }
     }
 
@@ -1637,5 +1651,30 @@ mod tests {
             queue_paused_text(&state.pool, "telegram:77").await.unwrap(),
             Some(strings::render(&Text::QueuePaused { waiting: 1 }))
         );
+    }
+
+    #[tokio::test]
+    async fn final_reply_order_is_finished_edit_then_send() {
+        let state = testkit::hello_state(false, true).await;
+        let run = insert_run(&state.pool, "telegram:77", "running", None, None).await;
+        turn_started(&state, run, "telegram:77").await;
+        sqlx::query("UPDATE runs SET status = 'completed', stdout = 'Done.' WHERE id = ?")
+            .bind(run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        reply_now(&state, run).await;
+
+        let rows = outbox_rows(&state.pool).await;
+        let shape: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(action, class, _, _)| (action.as_str(), class.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            [("send", "turn"), ("edit", "progress"), ("send", "turn")]
+        );
+        assert_eq!(rows[1].3, strings::render(&Text::Finished { turn: run }));
+        assert_eq!(rows[2].3, "Done.");
     }
 }

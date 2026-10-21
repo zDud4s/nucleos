@@ -190,6 +190,7 @@ mod tests {
             second_look: Duration::from_millis(150),
             budget_min_gap: Duration::ZERO,
             ping_after: Duration::from_secs(600),
+            stream_every: Duration::from_secs(5),
         }
     }
 
