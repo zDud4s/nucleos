@@ -284,7 +284,7 @@ fn summarize(structured: Option<&Value>, body: &str) -> String {
         {
             return plural(count_lines(content), "line", "lines");
         }
-        if let Some(n) = t.pointer("/file/numLines").and_then(Value::as_u64) {
+        if let Some(n) = t.get("file").and_then(|f| f.get("numLines")).and_then(Value::as_u64) {
             return plural(n, "line", "lines");
         }
         // WebFetch: `{code, bytes, ...}` -> `200 · 41 KB` (rounded to the nearest KB, at least 1).
