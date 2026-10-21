@@ -52,7 +52,7 @@ fn paths_of(state: &AppState) -> Option<SwitchPaths> {
 }
 
 /// Startup entry: carries the v1 state over. Without a v1 config (or a machine-config root) it
-/// does nothing.
+/// does nothing. Tests must use `run_at` with temp paths: `run` with a `machine_config_root` reads and renames the real v1 JSON.
 pub async fn run(state: &AppState) -> Result<(), SwitchError> {
     match paths_of(state) {
         Some(paths) => run_at(&state.pool, &paths).await,
@@ -62,7 +62,7 @@ pub async fn run(state: &AppState) -> Result<(), SwitchError> {
 
 /// `run` for the caller that must not stop on a failure: the SQL migration already ran, so the
 /// switch is retried on the next start (every step is idempotent and the JSON is only renamed
-/// once the targets are written).
+/// once the targets are written). Tests must use `run_at` with temp paths, not this.
 pub async fn run_or_warn(state: &AppState) {
     if let Err(error) = run(state).await {
         tracing::warn!(%error, "telegram switch: the v1 import failed; startup continues");
