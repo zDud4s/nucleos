@@ -13,8 +13,8 @@ Read-only forms. A phase READS a schema and EMITS a filled copy; it never edits 
 | `execute.md` | `execute` | the steps, the boundaries, the validation commands, and the Handoff with its evidence |
 | `review.md` | `review` | the hard gates, the checklist, the verdict |
 | `rescue.md` | `rescue` | what was attempted, what failed, which assumption to test next |
-| `node.md` | the parent node (or the root controller) | one work-tree node's identity, goal, owned paths, budget, inherited limits and plan pointers; read by a sub-orchestrator or leaf |
-| `handoff.md` | the node itself, on close | the full node handoff at `<state_dir>/nodes/<root_id>/<node_id>.md`; its Summary is the text `node_close` passes up |
+| `node.md` | the parent node (or the root controller) | one work-tree node's identity, goal, owned paths, budget, inherited limits and plan pointers; read by a sub-orchestrator or leaf. Its `## Rules by role` section is the single source of the per-role rules `tree.py prompt` appends |
+| `handoff.md` | the node itself, on close | the full node handoff at `<state_dir>/nodes/<root_id>/<node_id>.md`; its Summary is the text `node_close` passes up. In a tree it is the node report (Role, Outcome, Contract used) that `tree.py record` validates |
 
 ## Where filled copies go
 

@@ -23,6 +23,15 @@ nodes:
   orchestrator_budget: 150000
   ceiling: 200000
   subtree_verify: false
+# Orchestration tree (scripts/tree.py). Generic numbers only; what belongs to one project
+# (worktrees_dir, links, heavy, base_branch) lives in <state_dir>/project.yaml under `tree:`.
+tree:
+  floor_gb: 15
+  max_live_branches: 4
+  seed_gb_per_layer: 8
+  lock_wait_minutes: 10
+  stale_minutes: 30
+  report_max_lines: 60
 profiles:
   normal:
     reasoning_effort: medium   # codex-safe subset only: low | medium | high | xhigh
