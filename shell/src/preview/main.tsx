@@ -13,6 +13,7 @@ import { windowKind } from "../app/notch-mode";
 import { createAppRouter } from "../router";
 import { adoptStyleNonce } from "../lib/style-nonce";
 import { CHAT_HELD_ID, NOW, answer, answerText, refusal } from "./daemon";
+import { answerFleet } from "./fleet-live";
 import { holdMessage } from "../chats/held";
 
 /**
@@ -96,6 +97,11 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   if (path === "/health") return new Response("ok", { status: 200 });
   // `apiText`, not `apiFetch` — the connection gate reads this one as prose.
   if (path === "/status") return new Response("daemon running", { status: 200 });
+
+  // The fleet's stream, transcript and pins: a stream needs a Response of its own, which
+  // `answer()` (plain data) cannot be.
+  const fleet = answerFleet(path);
+  if (fleet !== null) return fleet;
 
   /*
     Three answers and not one, because the núcleo gives three. A refusal carries
