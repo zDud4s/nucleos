@@ -129,6 +129,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(email::routes())
         .merge(files::routes())
         .merge(fleet::routes())
+        .merge(crate::fleet::route::routes())
         .merge(git_ops::routes())
         .merge(hooks::routes())
         .merge(judging::routes())
