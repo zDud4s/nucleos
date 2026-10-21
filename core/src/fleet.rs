@@ -1,11 +1,19 @@
 //! The live fleet tree: every running agent session on this machine, normalised, pushed to the
 //! shell over one NDJSON stream. Design: `.ai/specs/2026-10-20-fleet-arvore-viva-design.md`.
 
+pub mod book;
+pub mod daemon_runs;
 pub mod event;
+pub mod fuse;
+pub mod hub;
 pub mod limits;
 pub mod model;
+pub mod route;
 pub mod source;
 pub mod tail;
+#[cfg(test)]
+pub(crate) mod testkit;
+pub mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,11 +37,12 @@ pub type Sources = (Vec<Arc<dyn AgentSource>>, Vec<Arc<dyn EdgeSource>>);
 /// Every source, in precedence order. Each track adds ONE `push` line here; nothing else in this
 /// file changes. Edge sources are applied in the order they are listed: native edges first (they
 /// come from the `AgentSource`s themselves), then `work_nodes`, then `run_launch`.
+#[allow(clippy::vec_init_then_push)]
 pub fn sources(env: &FleetEnv) -> Sources {
     let _ = env;
-    #[allow(unused_mut)]
+    #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut agents: Vec<Arc<dyn AgentSource>> = Vec::new();
-    // TODO-A: agents.push(Arc::new(daemon_runs::DaemonRuns::new(env)));
+    agents.push(Arc::new(daemon_runs::DaemonRuns::new(env)));
     // TODO-B: agents.push(Arc::new(claude_code::ClaudeCode::new(env)));
     // TODO-C: agents.push(Arc::new(codex_cli::CodexCli::new(env)));
     #[allow(unused_mut)]
