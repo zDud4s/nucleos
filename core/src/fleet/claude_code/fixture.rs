@@ -1,9 +1,12 @@
 //! Test fixtures: jsonl lines shaped like Claude Code's, and (below, added later) a tempdir home.
 
-use serde_json::{json, Value};
-
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
+
+use serde_json::{json, Value};
 
 use super::session::{Proc, ProcessProbe};
 
@@ -114,4 +117,91 @@ pub fn open_turn() -> Vec<String> {
             Some((10, 20, 300)),
         ),
     ]
+}
+
+/// A fake `~` holding a `.claude` tree.
+pub struct Home {
+    dir: tempfile::TempDir,
+}
+
+impl Home {
+    pub fn new() -> Self {
+        Self { dir: tempfile::tempdir().expect("a tempdir") }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.path().to_path_buf()
+    }
+
+    fn claude(&self) -> PathBuf {
+        self.dir.path().join(".claude")
+    }
+
+    pub fn project_dir(&self) -> PathBuf {
+        self.claude().join("projects").join(PROJ)
+    }
+
+    /// `sessions/<pid>.json`, shaped like the real one (cwd `c:\work\proj`). `startedAt` is its own
+    /// constant (Task 10 asserts it); `updatedAt` is a clearly OLD one (Sept 2020), so the retention
+    /// tests depend on the transcript's mtime only and pass whatever the wall clock says.
+    pub fn session_file(&self, pid: u32, session_id: &str, status: &str, proc_start: &str) -> PathBuf {
+        let dir = self.claude().join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{pid}.json"));
+        let body = json!({
+            "pid": pid, "sessionId": session_id, "cwd": "c:\\work\\proj",
+            "startedAt": 1_792_523_514_511_i64, "procStart": proc_start, "version": "2.1.304",
+            "kind": "interactive", "entrypoint": "cli", "name": "proj-1", "status": status,
+            "updatedAt": 1_600_000_000_000_i64
+        });
+        fs::write(&path, body.to_string()).unwrap();
+        path
+    }
+
+    fn write_lines(path: &Path, lines: &[String]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text = lines.join("\n");
+        if !lines.is_empty() {
+            text.push('\n');
+        }
+        fs::write(path, text).unwrap();
+    }
+
+    /// `projects/<proj>/<session>.jsonl`.
+    pub fn transcript(&self, session_id: &str, lines: &[String]) -> PathBuf {
+        let path = self.project_dir().join(format!("{session_id}.jsonl"));
+        Self::write_lines(&path, lines);
+        path
+    }
+
+    pub fn subagents_dir(&self, session_id: &str) -> PathBuf {
+        self.project_dir().join(session_id).join("subagents")
+    }
+
+    /// `agent-<id>.meta.json` + `agent-<id>.jsonl`; returns the jsonl path.
+    pub fn subagent(&self, session_id: &str, agent: &str, meta: Value, lines: &[String]) -> PathBuf {
+        let dir = self.subagents_dir(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("agent-{agent}.meta.json")), meta.to_string()).unwrap();
+        let path = dir.join(format!("agent-{agent}.jsonl"));
+        Self::write_lines(&path, lines);
+        path
+    }
+
+    pub fn meta_path(&self, session_id: &str, agent: &str) -> PathBuf {
+        self.subagents_dir(session_id).join(format!("agent-{agent}.meta.json"))
+    }
+}
+
+/// Appends raw text (no newline added) to an existing file.
+pub fn append(path: &Path, text: &str) {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+/// Moves a file's mtime into the past.
+pub fn age(path: &Path, minutes: u64) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(SystemTime::now() - Duration::from_secs(minutes * 60)).unwrap();
 }
