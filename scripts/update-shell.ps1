@@ -74,6 +74,12 @@ if ($running.Count -gt 0) {
 # --- 3. replace the copy ----------------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 Copy-Item -LiteralPath $Built -Destination $Copy -Force
+# shell.exe links WebView2Loader.dll dynamically; without it beside the copy the process dies at
+# load with 0xC0000135 (STATUS_DLL_NOT_FOUND) and no window ever appears.
+$Loader = Join-Path (Split-Path -Parent $Built) 'WebView2Loader.dll'
+if (Test-Path -LiteralPath $Loader) {
+    Copy-Item -LiteralPath $Loader -Destination $RunDir -Force
+}
 
 $commit = (git -C $RepoRoot rev-parse HEAD).Trim()
 $dirty = if ((git -C $RepoRoot status --porcelain -- shell) -ne $null) { ' (plus uncommitted changes under shell/)' } else { '' }
