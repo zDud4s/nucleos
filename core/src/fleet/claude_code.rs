@@ -375,7 +375,7 @@ fn started_at_of(path: &Path) -> Option<Timestamp> {
 
 impl Inner {
     /// Folds this pass's registry entries and daemon runs into the root cache.
-    fn attach_sources(&self, st: &mut State, runs: HashMap<String, RunRow>) {
+    fn attach_sources(&self, st: &mut State, runs: HashMap<String, RunRow>, since: Timestamp) {
         // Two files may name one session (a resumed one): prefer the live one.
         let mut regs: HashMap<String, (SessionFile, bool, Stamp)> = HashMap::new();
         for (stamp, file) in st.sessions.values() {
@@ -407,8 +407,15 @@ impl Inner {
             root.registry = Some((file, alive));
             root.registry_stamp = Some(stamp);
         }
-        // Daemon runs: added in Task 12.
-        let _ = runs;
+        for (id, run) in runs {
+            let live = matches!(run.status.as_str(), "running" | "awaiting_approval");
+            // Same rule as the SQL below: a terminal run counts by its completion time (creation
+            // time when it has none).
+            let recent = run.completed_at.or(run.created_at).is_none_or(|t| t >= since);
+            if safe_id(&id) && (live || recent) {
+                st.roots.entry(id).or_default().run = Some(run);
+            }
+        }
     }
 
     /// Transcript path, tail facts and start time of one root; reads only when the stamp moved.
@@ -444,11 +451,10 @@ impl Inner {
     }
 
     fn scan(&self, since: Timestamp, runs: HashMap<String, RunRow>) -> Vec<Sighting> {
-        let _ = since; // used from Task 14
         let mut guard = self.lock();
         let st = &mut *guard;
         self.refresh_registry(st);
-        self.attach_sources(st, runs);
+        self.attach_sources(st, runs, since);
         let mut out = Vec::new();
         let ids: Vec<String> = st.roots.keys().cloned().collect();
         for id in ids {
@@ -545,6 +551,49 @@ fn root_sighting(id: &str, root: &RootCache, state: NodeState) -> Sighting {
     }
 }
 
+impl ClaudeCode {
+    /// The runs that name a Claude session and are live or inside the retention window. Runs are
+    /// the only way to find a root launched in print mode, which has no `sessions/*.json` entry
+    /// (spec §4).
+    async fn runs_by_session(&self, since: Timestamp) -> HashMap<String, RunRow> {
+        type Row = (i64, String, String, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Row> = match sqlx::query_as(
+            "SELECT id, session_id, status, cwd, created_at, completed_at FROM runs \
+             WHERE session_id IS NOT NULL AND session_id <> '' AND session_id <> 'shared' \
+             AND (runner IS NULL OR runner = 'claude') \
+             AND (status IN ('running', 'awaiting_approval') \
+                  OR julianday(COALESCE(completed_at, created_at)) >= julianday(?)) \
+             ORDER BY id DESC",
+        )
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(_) => {
+                self.inner.warn_once("the runs table could not be read");
+                return HashMap::new();
+            }
+        };
+        let time = |raw: Option<String>| {
+            raw.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|t| t.with_timezone(&Utc))
+        };
+        let mut out = HashMap::new();
+        for (id, session_id, status, cwd, created, completed) in rows {
+            // Newest first: the first run seen for a session is the one that is current.
+            out.entry(session_id).or_insert(RunRow {
+                id,
+                status,
+                cwd,
+                created_at: time(created),
+                completed_at: time(completed),
+            });
+        }
+        out
+    }
+}
+
 #[async_trait]
 impl AgentSource for ClaudeCode {
     fn name(&self) -> &'static str {
@@ -557,7 +606,7 @@ impl AgentSource for ClaudeCode {
 
     async fn discover(&self, since: Timestamp) -> SourceResult<Vec<Sighting>> {
         let inner = self.inner.clone();
-        let runs = HashMap::new(); // Task 12
+        let runs = self.runs_by_session(since).await;
         Ok(tokio::task::spawn_blocking(move || inner.scan(since, runs)).await?)
     }
 
@@ -731,6 +780,127 @@ mod tests {
         assert_eq!(root.label, "proj-1");
         assert_eq!(root.project.as_deref(), Some("proj"));
         assert_eq!(root.role.as_deref(), Some("chat"));
+    }
+
+    async fn insert_run(
+        pool: &sqlx::SqlitePool,
+        id: i64,
+        status: &str,
+        runner: &str,
+        completed_at: Option<chrono::DateTime<Utc>>,
+    ) {
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, session_id, runner, cwd, created_at, completed_at) \
+             VALUES (?, 'p', ?, ?, ?, 'c:\\work\\proj', ?, ?)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(fx::SESSION)
+        .bind(runner)
+        .bind(Utc::now().to_rfc3339())
+        .bind(completed_at.map(|t| t.to_rfc3339()))
+        .execute(pool)
+        .await
+        .expect("insert run");
+    }
+
+    /// A print-mode run: a transcript, a run row, and NO registry entry.
+    async fn run_root(status: &str, runner: &str, completed: Option<chrono::DateTime<Utc>>) -> Vec<Sighting> {
+        let home = Home::new();
+        home.transcript(fx::SESSION, &fx::open_turn());
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, db) = setup(&home, &probe).await;
+        insert_run(&db.pool, 5, status, runner, completed).await;
+        cc.discover(since()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_running_daemon_run_without_a_registry_entry_is_a_busy_root_carrying_its_run_id() {
+        let all = run_root("running", "claude", None).await;
+        let root = find(&all, &root_id());
+        assert_eq!(root.state, NodeState::Busy);
+        assert_eq!(root.run_id, Some(5));
+        assert_eq!(root.role.as_deref(), Some("job"));
+        assert_eq!(root.label, "run 5");
+        assert!(!root.can_stop, "only daemon_runs can stop");
+        assert!(root.has_lines && root.has_transcript);
+        assert_eq!(root.project.as_deref(), Some("proj"));
+    }
+
+    #[tokio::test]
+    async fn run_states_map_to_node_states() {
+        let now = Some(Utc::now());
+        for (status, expected) in [
+            ("awaiting_approval", NodeState::Idle),
+            ("completed", NodeState::Done),
+            ("failed", NodeState::Done),
+            ("cancelled", NodeState::Done),
+            ("timed_out", NodeState::Done),
+            ("interrupted", NodeState::Lost),
+        ] {
+            let all = run_root(status, "claude", now).await;
+            assert_eq!(find(&all, &root_id()).state, expected, "run status {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_run_outside_the_retention_window_is_not_a_root() {
+        let long_ago = Some(Utc::now() - chrono::Duration::hours(2));
+        assert!(run_root("completed", "claude", long_ago).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn another_runner_and_a_run_without_a_transcript_are_not_claude_roots() {
+        assert!(run_root("running", "codex", None).await.is_empty());
+
+        // No transcript on disk and no registry entry: nothing to read or page, so no root (the
+        // `registry.is_none() && transcript.is_none()` guard at the top of `root_state`).
+        let home = Home::new();
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, db) = setup(&home, &probe).await;
+        insert_run(&db.pool, 6, "running", "claude", None).await;
+        assert!(cc.discover(since()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_run_is_found_however_many_newer_runs_exist() {
+        let home = Home::new();
+        home.transcript(fx::SESSION, &fx::open_turn());
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, db) = setup(&home, &probe).await;
+        insert_run(&db.pool, 1, "running", "claude", None).await; // the OLDEST row
+        let long_ago = (Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        for n in 2..=250_i64 {
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, session_id, runner, created_at, completed_at) \
+                 VALUES (?, 'p', 'completed', ?, 'claude', ?, ?)",
+            )
+            .bind(n)
+            .bind(format!("other-session-{n}"))
+            .bind(&long_ago)
+            .bind(&long_ago)
+            .execute(&db.pool)
+            .await
+            .expect("insert old run");
+        }
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(all.len(), 1, "the 249 old runs are filtered in SQL, the live one is not cut off");
+        assert_eq!(find(&all, &root_id()).run_id, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_live_registry_entry_and_a_run_for_one_session_make_one_root_with_the_run_id() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "idle", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, db) = setup(&home, &probe).await;
+        insert_run(&db.pool, 5, "running", "claude", None).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(all.len(), 1);
+        let root = find(&all, &root_id());
+        assert_eq!((root.state, root.run_id), (NodeState::Idle, Some(5)));
     }
 
     #[tokio::test]
