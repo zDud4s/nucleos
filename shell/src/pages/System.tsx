@@ -181,10 +181,9 @@ export function System() {
         {view === "settings" && (
           <>
             <MachineSettings />
-            {/* A preference of this screen, not a limit: it lives with the machine's own settings. */}
-            <Section label="Appearance">
-              <NotchProviders />
-            </Section>
+            {/* A preference of this screen, not a limit: it lives with the machine's own settings,
+                as one more panel beside them rather than under a heading of its own. */}
+            <NotchProviders />
           </>
         )}
       </div>
