@@ -48,21 +48,21 @@ mod spawn;
 mod start;
 mod store;
 #[cfg(test)]
-mod tests_agent_nodes;
-#[cfg(test)]
 mod tests_agent_launcher;
 #[cfg(test)]
+mod tests_agent_nodes;
+#[cfg(test)]
 mod tests_command_nodes;
+#[cfg(test)]
+mod tests_graph_walk;
+#[cfg(test)]
+mod tests_job_support;
 #[cfg(test)]
 mod tests_plan_landing;
 #[cfg(test)]
 mod tests_start_snapshot;
 #[cfg(test)]
 mod tests_walk_state_parity;
-#[cfg(test)]
-mod tests_graph_walk;
-#[cfg(test)]
-mod tests_job_support;
 mod views;
 
 pub use self::agent_launcher::CatalogAgentLauncher;
