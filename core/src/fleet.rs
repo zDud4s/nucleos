@@ -2,6 +2,7 @@
 //! shell over one NDJSON stream. Design: `.ai/specs/2026-10-20-fleet-arvore-viva-design.md`.
 
 pub mod book;
+pub mod claude_code;
 pub mod daemon_runs;
 pub mod event;
 pub mod fuse;
@@ -43,9 +44,9 @@ pub fn sources(env: &FleetEnv) -> Sources {
     #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut agents: Vec<Arc<dyn AgentSource>> = Vec::new();
     agents.push(Arc::new(daemon_runs::DaemonRuns::new(env)));
-    // TODO-B: agents.push(Arc::new(claude_code::ClaudeCode::new(env)));
+    agents.push(Arc::new(claude_code::ClaudeCode::new(env)));
     // TODO-C: agents.push(Arc::new(codex_cli::CodexCli::new(env)));
-    #[allow(unused_mut)]
+    #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut edges: Vec<Arc<dyn EdgeSource>> = Vec::new();
     // TODO-C: edges.push(Arc::new(work_nodes_edges::WorkNodesEdges::new(env)));
     // TODO-C: edges.push(Arc::new(run_launch::RunLaunch::new(env)));
