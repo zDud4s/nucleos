@@ -642,12 +642,21 @@ async fn read_secret(key: &'static str) -> Option<String> {
 /// Refreshes the `configured` cache for every manifest, even when `sidecars_wanted` is false (a
 /// non-primary daemon still reports configuration, it just spawns nothing).
 pub async fn launch_all(state: &AppState, sidecars_wanted: bool) {
+    launch_all_with(state, sidecars_wanted, read_secret).await;
+}
+
+/// `launch_all` with the secret loader injected, so tests never touch the OS credential store.
+async fn launch_all_with<F, Fut>(state: &AppState, sidecars_wanted: bool, load: F)
+where
+    F: Fn(&'static str) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
     let presence = &state.channels.presence;
     for manifest in MANIFESTS {
         let mut secrets: Vec<(&'static str, String)> = Vec::new();
         let mut missing: Vec<&'static str> = Vec::new();
         for spec in manifest.secrets {
-            match read_secret(spec.key).await {
+            match load(spec.key).await {
                 Some(value) => secrets.push((spec.env, value)),
                 None if spec.required => missing.push(spec.key),
                 None => {}
@@ -1056,6 +1065,43 @@ mod tests {
         assert!(channel_instances_exist(&st));
     }
 
+    #[tokio::test]
+    async fn launch_all_skips_spawn_when_sidecars_not_wanted() {
+        let st = state().await;
+        // Nothing is spawned or marked launched, and the secrets cache is refreshed for every
+        // manifest (a secondary daemon still reports it). The loader is fake: no keyring access.
+        launch_all_with(&st, false, |_| async { None }).await;
+        for manifest in MANIFESTS {
+            assert!(st.channels.presence.launched_at(manifest.id).is_none());
+            assert!(!st.channels.presence.is_live(manifest.id));
+            let guard = st.channels.presence.lock();
+            let missing = guard.missing.get(manifest.id).expect("manifest refreshed");
+            for spec in manifest.secrets.iter().filter(|s| s.required) {
+                assert!(missing.contains(&spec.key));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_all_marks_secrets_present_so_channel_instances_exist() {
+        let st = state().await;
+        assert!(!channel_instances_exist(&st));
+        // Fake loader with no secrets: telegram lacks its token. (The test-only `fake` manifest
+        // has no secrets, so `channel_instances_exist` is true here regardless; assert telegram.)
+        launch_all_with(&st, false, |_| async { None }).await;
+        assert_eq!(
+            st.channels.presence.lock().missing["telegram"],
+            vec!["telegram-token"]
+        );
+        // Fake loader holding the telegram token: telegram has nothing missing, an instance exists.
+        launch_all_with(&st, false, |key| async move {
+            (key == "telegram-token").then(|| "dummy-token".to_string())
+        })
+        .await;
+        assert!(channel_instances_exist(&st));
+        assert!(st.channels.presence.lock().missing["telegram"].is_empty());
+    }
+
     #[test]
     fn routing_state_roundtrips_its_fields() {
         let all = [
@@ -1346,6 +1392,28 @@ mod tests {
             ]
         );
         assert_eq!(env_for(&FAKE, "u", "t", &[]).len(), 3);
+    }
+
+    #[test]
+    fn env_for_telegram_has_the_channel_vars_and_no_control_token() {
+        // The retired v1 env handed the sidecar the Control token; the channel env must not.
+        let control_token = "control-token-must-not-leak";
+        let env: std::collections::HashMap<String, String> = env_for(
+            &TELEGRAM,
+            "http://127.0.0.1:8791",
+            "telegram.svc-secret",
+            &[("TELEGRAM_BOT_TOKEN", "bot".to_string())],
+        )
+        .into_iter()
+        .collect();
+
+        assert_eq!(env.len(), 4);
+        assert_eq!(env["NUCLEOS_DAEMON_URL"], "http://127.0.0.1:8791");
+        assert_eq!(env["NUCLEOS_CHANNEL_ID"], "telegram");
+        assert_eq!(env["NUCLEOS_CHANNEL_TOKEN"], "telegram.svc-secret");
+        assert_eq!(env["TELEGRAM_BOT_TOKEN"], "bot");
+        assert!(!env.contains_key("NUCLEOS_DAEMON_TOKEN"));
+        assert!(env.values().all(|v| v != control_token));
     }
 
     #[tokio::test]

@@ -248,6 +248,17 @@ pub(super) async fn sending_turn_of(
     let origin = match origin.as_deref() {
         Some("telegram") => Some(crate::assistant::Origin::Telegram),
         Some("shell") => Some(crate::assistant::Origin::Shell),
+        // `from_wire` is consulted only for the `channel:` family, because it maps every unknown
+        // spelling to `Shell` and that leniency would certify an unreadable origin as local.
+        Some(wire) if wire.starts_with("channel:") => {
+            match crate::assistant::Origin::from_wire(Some(wire)) {
+                // An unregistered channel id falls back to `Shell` there: unknown, so refused.
+                crate::assistant::Origin::Channel(id) => {
+                    Some(crate::assistant::Origin::Channel(id))
+                }
+                _ => None,
+            }
+        }
         _ => None,
     };
     Some((chat_id?, origin))

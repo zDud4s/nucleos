@@ -76,6 +76,35 @@ pub fn module_path(path: &Path) -> String {
         .join("/")
 }
 
+/// Whether `path` is a module its parent declares as `#[cfg(test)] mod <stem>;`, so the whole
+/// file is test code. The parent is `mod.rs` (or `lib.rs`/`main.rs`) in the same directory, or
+/// `<dir>.rs` beside that directory.
+pub fn is_test_only_module(path: &Path) -> bool {
+    let (Some(dir), Some(stem)) = (
+        path.parent(),
+        path.file_stem().and_then(|stem| stem.to_str()),
+    ) else {
+        return false;
+    };
+    let mut parents = vec![dir.join("mod.rs"), dir.join("lib.rs"), dir.join("main.rs")];
+    if let (Some(grand), Some(name)) = (dir.parent(), dir.file_name()) {
+        parents.push(grand.join(name).with_extension("rs"));
+    }
+    parents
+        .iter()
+        .filter_map(|parent| std::fs::read_to_string(parent).ok())
+        .any(|source| declares_test_only_mod(&source, stem))
+}
+
+/// Whether `source` has `#[cfg(test)]` on the line right before `mod <stem>;`.
+fn declares_test_only_mod(source: &str, stem: &str) -> bool {
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    lines.windows(2).any(|w| {
+        w[0] == "#[cfg(test)]"
+            && (w[1] == format!("mod {stem};") || w[1] == format!("pub(crate) mod {stem};"))
+    })
+}
+
 fn is_rust(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("rs")
 }
@@ -101,6 +130,26 @@ mod tests {
             "a module directory such as council/ must be walked"
         );
         assert!(files.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn an_out_of_line_cfg_test_module_is_test_only() {
+        assert!(declares_test_only_mod(
+            "#[cfg(test)]\nmod switch_tests;",
+            "switch_tests"
+        ));
+        assert!(!declares_test_only_mod("mod switch_tests;", "switch_tests"));
+        assert!(!declares_test_only_mod(
+            "#[cfg(test)]\nmod other;\nmod x;",
+            "x"
+        ));
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(is_test_only_module(
+            &src.join("channels").join("switch_tests.rs")
+        ));
+        assert!(!is_test_only_module(
+            &src.join("channels").join("commands.rs")
+        ));
     }
 
     #[test]

@@ -311,6 +311,8 @@ the contract, not a snapshot.
 | `channels/outbox/ack.rs` | Outbox acknowledgement handling. |
 | `channels/outbox/degrade.rs` | Outbox degradation of unsupported content. |
 | `channels/outbox/lease.rs` | Outbox lease handling: claim, renew, expiry. |
+| `channels/port_tests_commands.rs` | Test-only: v1 Telegram tests ported to the chat commands, access policy and strings (`port_<original_name>`). |
+| `channels/port_tests_flow.rs` | Test-only: v1 Telegram tests ported to ingest, replies, routing and media (`port_<original_name>`). |
 | `channels/registry.rs` | Channel manifests, per-channel configuration and presence: in-memory `Presence` (last hello/request, launch time, drop counters, secrets cache), `record_hello` (contract check, `channel_presence` upsert, leased outbox rows released), `capabilities`, and the `GET /channels` readout (`list`, `channel_state`, `RoutingState`). |
 | `channels/replies.rs` | Turn cycle and queue notices sent back to a channel. |
 | `channels/routing.rs` | Notifications to the primary channel. |
@@ -320,6 +322,8 @@ the contract, not a snapshot.
 | `channels/routing/announce.rs` | Feed lines to the primary channel's outbox (policy, project thread or prefix, 24 h TTL). |
 | `channels/schema.rs` | Test-only: checks that migrations 0220-0227 and 0230 create the channel tables, indexes and CHECKs. |
 | `channels/strings.rs` | Single table of user-visible channel text. |
+| `channels/switch_tests.rs` | Test-only: tests for the Telegram channel switch (`telegram_switch.rs`). |
+| `channels/telegram_switch.rs` | The Telegram channel switch. |
 | `channels/testkit.rs` | Test-only: helpers that build a real `AppState` over a fresh pool. |
 | `channels/tokens.rs` | Button action tokens and their housekeeping. |
 | `chats/groups.rs` | User-defined groups for the Chats column (migration 0157): CRUD and assignment; deleting a group ungroups its chats. Never touches turns. |

@@ -2948,7 +2948,7 @@ const STORAGE: StorageReport = {
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
 const CHANNEL_TELEGRAM_WHAT =
-  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in (the older telegram area keeps the bot token and chat id until the channel migration)";
+  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in; the bot token is stored here too";
 
 const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["email", "Which mailbox the e-mail pillar reads, and how often.", "host: imap.example.com\nusername: me@example.com\nmailbox: INBOX\npoll_interval_secs: 120\n"],
@@ -2983,7 +2983,7 @@ const MACHINE_CONFIG: MachineConfig = {
 
 const MACHINE_SECRETS: MachineSecret[] = [
   { key: "email-password", area: "email", what: "the IMAP password", present: true },
-  { key: "telegram-bot-token", area: "telegram", what: "the bot's token", present: false },
+  { key: "telegram-token", area: "channels/telegram", what: "the bot's token", present: false },
   { key: "github-token", area: "github", what: "the token gh is handed", present: false },
   { key: "web-search-api-key", area: "web", what: "the search provider's key", present: true },
 ];

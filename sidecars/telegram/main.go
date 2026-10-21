@@ -1,3 +1,4 @@
+// Command telegram is the Telegram sidecar on the channel kit (built as telegram-sidecar).
 package main
 
 import (
@@ -6,120 +7,42 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"nucleostelegram/config"
-	"nucleostelegram/daemon"
-	"nucleostelegram/pipe"
+	"nucleoschannelkit/clock"
+	"nucleoschannelkit/kit"
+
+	"nucleostelegram/adapter"
 	"nucleostelegram/telegram"
 )
 
-// shutdownGrace is how long in-flight updates get to finish once a stop is asked for. An approval
-// already on its way to the daemon should land rather than be cut in half.
-const shutdownGrace = 15 * time.Second
+// The Bot API client must serve every role the adapter plays.
+var (
+	_ adapter.SendBot = (*telegram.Client)(nil)
+	_ adapter.PollBot = (*telegram.Client)(nil)
+	_ adapter.FileBot = (*telegram.Client)(nil)
+)
 
 func main() {
-	cfg, err := config.Load()
+	cfg, err := loadConfig(os.Getenv)
 	if err != nil {
 		log.Fatalf("telegram sidecar config: %v", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	// The lifeline (spec D3): a daemon that is gone cancels the same context a signal does, so the
-	// loop below ends and in-flight updates finish through the shutdown at the bottom of main.
-	ctx, cut := context.WithCancel(ctx)
-	defer cut()
-	watchLifeline(os.Getenv, os.Stdin, cut)
 
-	dc := daemon.New(cfg.DaemonURL, cfg.DaemonToken)
 	bot := telegram.New(cfg.BotToken)
-	tr := pipe.NewTracker()
-	dispatcher := pipe.NewDispatcher()
+	clk := clock.Real()
 
-	if cfg.AllowedChatID != 0 {
-		// Supervised, not bare: a panic in the notifier used to take the process down and the
-		// command path with it, silently.
-		go pipe.Supervise("notifier", func() {
-			// Feed lines may go to their project's topic (cfg.ProjectTopics). Everything else the
-			// notifier announces — a new proposal, the kill switch, a budget alert — is about the
-			// machine and not about any one topic, so it stays on the bare chat where the whole
-			// room sees it rather than buried in whichever topic was open.
-			pipe.RunNotifier(ctx, bot, dc, telegram.Destination{ChatID: cfg.AllowedChatID}, cfg.ProjectTopics, cfg.PollInterval)
-		})
-	} else {
-		log.Printf("no allowed_chat_id configured — notifier disabled until one is set")
+	factory := func(c *kit.Client, sink kit.Sink) (kit.Adapter, kit.Ingest, error) {
+		attacher := adapter.MediaAttacher{Bot: bot, Up: mediaUploader{c: c}}
+		ingest := func(ctx context.Context) error {
+			return adapter.Poll(ctx, bot, attacher, &sink, cfg.OffsetPath, clk)
+		}
+		return adapter.New(bot, c), ingest, nil
 	}
 
-	offsetPath := config.OffsetPath()
-	offset := config.LoadOffset(offsetPath)
-
-	log.Printf("telegram sidecar started; long-polling updates from offset %d", offset)
-	retry := updatesRetryBase
-	for ctx.Err() == nil {
-		updates, err := bot.GetUpdatesContext(ctx, offset, 50)
-		if err != nil {
-			if ctx.Err() != nil {
-				break
-			}
-			log.Printf("getUpdates error: %v", err)
-			if !sleepUntil(ctx, retry) {
-				break
-			}
-			retry = nextRetryDelay(retry, updatesRetryBase, updatesRetryMax)
-			continue
-		}
-		retry = updatesRetryBase
-		if len(updates) == 0 {
-			continue
-		}
-
-		for _, u := range updates {
-			offset = u.UpdateID + 1
-		}
-		// The batch is confirmed before it is handled, on purpose. Telegram redelivers anything not
-		// confirmed, so a crash halfway through would re-execute whatever was in flight — and
-		// `/kill off` re-executed re-arms an autonomous agent nobody asked to re-arm. Losing an
-		// update to a crash is the safer direction for this particular channel.
-		if err := config.SaveOffset(offsetPath, offset); err != nil {
-			log.Printf("could not persist update offset: %v", err)
-		}
-
-		for _, u := range updates {
-			dispatcher.Dispatch(pipe.ChatKey(pipe.DestinationOf(u)), func() {
-				pipe.HandleUpdate(bot, dc, bot, cfg, tr, u)
-			})
-		}
-	}
-
-	log.Printf("stopping; finishing updates already in flight")
-	dispatcher.Shutdown(shutdownGrace)
-}
-
-const (
-	updatesRetryBase = 2 * time.Second
-	updatesRetryMax  = 60 * time.Second
-)
-
-// nextRetryDelay doubles the delay after a failed getUpdates, within [base, max].
-func nextRetryDelay(cur, base, max time.Duration) time.Duration {
-	next := cur * 2
-	if next > max {
-		next = max
-	}
-	if next < base {
-		next = base
-	}
-	return next
-}
-
-func sleepUntil(ctx context.Context, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
+	if err := kit.Run(ctx, cfg.Kit, factory); err != nil {
+		log.Fatalf("telegram sidecar: %v", err)
 	}
 }
