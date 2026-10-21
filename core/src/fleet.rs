@@ -42,7 +42,7 @@ pub fn sources(env: &FleetEnv) -> Sources {
     #[allow(unused_mut)]
     let mut edges: Vec<Arc<dyn EdgeSource>> = Vec::new();
     edges.push(std::sync::Arc::new(work_nodes_edges::WorkNodesEdges::new(env.pool.clone())));
-    // TODO-C: edges.push(Arc::new(run_launch::RunLaunch::new(env)));
+    edges.push(std::sync::Arc::new(run_launch::RunLaunchEdges::new(env.pool.clone())));
     (agents, edges)
 }
 
