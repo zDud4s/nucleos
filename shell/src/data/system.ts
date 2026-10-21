@@ -2,7 +2,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiFetch, probeHealth } from "./client";
-import type { NotifyPolicy } from "./feed";
+import type { ChannelNotifyPolicy, NotifyPolicy } from "./feed";
 import { keys } from "./keys";
 import { POLL, backgroundCadence } from "./poll";
 
@@ -825,7 +825,7 @@ export function usePiiTally() {
 /* ------------------------------------------------- notification policy -- */
 
 /**
- * Which feed kinds still reach Telegram — `GET /notifications/policy`.
+ * Which feed kinds still reach a messaging channel — `GET /notifications/policy`.
  *
  * **No `refetchInterval`, deliberately**, and it says so here because in this
  * layer not polling is the exception: almost every neighbour runs at
@@ -897,7 +897,40 @@ export function useSetNotifyPolicy() {
       }),
     retry: false,
     onSettled: () => {
+      // React Query invalidates by prefix: `notifyPolicy` is the prefix of every
+      // `notifyPolicyFor(channel)`, so the per-channel reads refresh here too.
       void queryClient.invalidateQueries({ queryKey: keys.system.notifyPolicy });
+    },
+  });
+}
+
+/**
+ * One channel's view of the policy — `GET /notifications/policy?channel=<id>`.
+ * No `refetchInterval`, for the same reason as `useNotifyPolicy`: it seeds a form.
+ */
+export function useChannelNotifyPolicy(channel: string) {
+  return useQuery({
+    queryKey: keys.system.notifyPolicyFor(channel),
+    queryFn: () =>
+      apiFetch<ChannelNotifyPolicy>(`/notifications/policy?channel=${encodeURIComponent(channel)}`),
+  });
+}
+
+/**
+ * Save one channel's overrides, whole — `PUT /notifications/policy?channel=<id>`.
+ * Invalidates only that channel's read, not the shared prefix.
+ */
+export function useSetChannelNotifyPolicy(channel: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (overrides: NotifyPolicy) =>
+      apiFetch<void>(`/notifications/policy?channel=${encodeURIComponent(channel)}`, {
+        method: "PUT",
+        body: JSON.stringify(overrides),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.notifyPolicyFor(channel) });
     },
   });
 }

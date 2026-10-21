@@ -1,8 +1,10 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { isApiRefusal } from "../data/client";
 import {
   NOTIFY_FAMILIES,
   groupKinds,
+  mergePolicy,
+  ruleSource,
   readFeedKind,
   type FamilyRow,
   type KindRow,
@@ -10,13 +12,20 @@ import {
   type NotifyPolicy,
   type NotifyRule,
 } from "../data/feed";
+import { useChannels } from "../data/channels";
 import { useDesktopNotify } from "../data/desktop-notify-pref";
-import { useNotifyPolicy, useObservedKinds, useSetNotifyPolicy } from "../data/system";
+import {
+  useChannelNotifyPolicy,
+  useNotifyPolicy,
+  useObservedKinds,
+  useSetChannelNotifyPolicy,
+  useSetNotifyPolicy,
+} from "../data/system";
 import { Button, ErrorNote, Panel, RefusalNote } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
- * Which notifications reach Telegram.
+ * Which notifications reach the messaging channels.
  *
  * The screen is the resolution of the policy, drawn — not a second idea laid
  * over it. `groupKinds` resolves once, in `data/feed.ts`, and everything here
@@ -29,41 +38,158 @@ import { DAEMON_NAME } from "../copy";
  * two halves drift) and because a switch that fired a request per flip would
  * make a settings screen into a stream of writes.
  */
-export function NotificationsView() {
+export function NotificationsView({
+  channel,
+  onChannelChange,
+}: {
+  channel?: string;
+  onChannelChange?: (channel: string | undefined) => void;
+} = {}) {
+  // Two modes, two components: each owns its own queries, so no hook is ever called conditionally.
+  // The channel is the key, so a switch of channel starts a fresh draft instead of carrying edits
+  // from one channel's overrides into another's.
+  return channel === undefined ? (
+    <DefaultMode onChannelChange={onChannelChange} />
+  ) : (
+    <ChannelMode key={channel} channel={channel} onChannelChange={onChannelChange} />
+  );
+}
+
+/**
+ * A draft seeded from the núcleo and re-seeded whenever the stored policy arrives again — a save
+ * settling, not a clock, because neither read polls. A refetch that brings the SAME content
+ * (window focus, say) must not wipe edits made meanwhile; only a policy that differs re-seeds.
+ */
+function useDraft(stored: NotifyPolicy | undefined) {
+  const [draft, setDraft] = useState<NotifyPolicy | null>(null);
+  const seeded = useRef<NotifyPolicy | null>(null);
+  useEffect(() => {
+    if (!stored) return;
+    if (seeded.current !== null && samePolicy(seeded.current, stored)) return;
+    seeded.current = stored;
+    setDraft(stored);
+  }, [stored]);
+  return [draft, setDraft] as const;
+}
+
+/** The scope every channel shares: the original screen, unchanged. */
+function DefaultMode({
+  onChannelChange,
+}: {
+  onChannelChange?: (channel: string | undefined) => void;
+}) {
   const stored = useNotifyPolicy();
   const observed = useObservedKinds();
   const save = useSetNotifyPolicy();
-
-  // The draft. Seeded from the núcleo and re-seeded whenever the stored policy
-  // arrives again — which is a save settling, not a clock, because neither read
-  // polls. `stored.data` is a new object per fetch, so the effect keys on the
-  // fetch rather than on a deep compare nobody would maintain.
-  const [draft, setDraft] = useState<NotifyPolicy | null>(null);
-  // The policy the draft was last seeded from. A refetch that brings the SAME content (window
-  // focus, say) must not wipe edits made meanwhile; only a policy that differs re-seeds.
-  const seeded = useRef<NotifyPolicy | null>(null);
-  useEffect(() => {
-    if (!stored.data) return;
-    if (seeded.current !== null && samePolicy(seeded.current, stored.data)) return;
-    seeded.current = stored.data;
-    setDraft(stored.data);
-  }, [stored.data]);
-  const [saved, setSaved] = useState(false);
+  const [draft, setDraft] = useDraft(stored.data);
 
   if (stored.isError) return <NotificationsError error={stored.error} what="the notification policy" />;
   if (observed.isError) return <NotificationsError error={observed.error} what="the kinds this machine writes" />;
-  if (!draft || !observed.data) return <p className="sy-note" role="status">reading the notification policy…</p>;
+  if (!draft || !stored.data || !observed.data) {
+    return <p className="sy-note" role="status">reading the notification policy…</p>;
+  }
 
-  const { families, loose } = groupKinds(observed.data, draft);
-  const dirty = !samePolicy(draft, stored.data);
+  return (
+    <PolicyEditor
+      stored={stored.data}
+      draft={draft}
+      setDraft={setDraft}
+      observed={observed.data}
+      save={save}
+      onChannelChange={onChannelChange}
+    />
+  );
+}
+
+/**
+ * One channel's overrides, drawn over the default policy.
+ *
+ * The draft is the OVERRIDES only; what is drawn is `groupKinds` over the default with the draft
+ * laid on top, so the resolution stays in one place. Save sends the overrides and nothing else —
+ * never the default or the resolved view, which the núcleo owns.
+ */
+function ChannelMode({
+  channel,
+  onChannelChange,
+}: {
+  channel: string;
+  onChannelChange?: (channel: string | undefined) => void;
+}) {
+  const stored = useChannelNotifyPolicy(channel);
+  const observed = useObservedKinds();
+  const save = useSetChannelNotifyPolicy(channel);
+  const [draft, setDraft] = useDraft(stored.data?.overrides);
+
+  if (stored.isError) return <NotificationsError error={stored.error} what="the notification policy" />;
+  if (observed.isError) return <NotificationsError error={observed.error} what="the kinds this machine writes" />;
+  if (!draft || !stored.data || !observed.data) {
+    return <p className="sy-note" role="status">reading the notification policy…</p>;
+  }
+
+  return (
+    <PolicyEditor
+      stored={stored.data.overrides}
+      base={stored.data.default}
+      primary={stored.data.primary}
+      draft={draft}
+      setDraft={setDraft}
+      observed={observed.data}
+      save={save}
+      channel={channel}
+      onChannelChange={onChannelChange}
+    />
+  );
+}
+
+interface SaveMutation {
+  mutate(policy: NotifyPolicy, options?: { onSuccess?: () => void }): void;
+  isPending: boolean;
+  isError: boolean;
+  error: unknown;
+}
+
+/**
+ * The switches, shared by both modes. `base` is the default policy when `channel` is set: then the
+ * draft holds overrides, each row carries its source, and a row with an override can be reset.
+ */
+function PolicyEditor({
+  stored,
+  base,
+  primary,
+  draft,
+  setDraft,
+  observed,
+  save,
+  channel,
+  onChannelChange,
+}: {
+  stored: NotifyPolicy;
+  base?: NotifyPolicy;
+  primary?: boolean;
+  draft: NotifyPolicy;
+  setDraft: Dispatch<SetStateAction<NotifyPolicy | null>>;
+  observed: string[];
+  save: SaveMutation;
+  channel?: string;
+  onChannelChange?: (channel: string | undefined) => void;
+}) {
+  const [saved, setSaved] = useState(false);
+
+  // In channel mode the rows show the overrides laid over the default.
+  const shown = base ? mergePolicy(base, draft) : draft;
+  const { families, loose } = groupKinds(observed, shown);
+  const dirty = !samePolicy(draft, stored);
+  const sourceOf = (selector: string, scope: "families" | "kinds") =>
+    base ? ruleSource(selector, scope, base, draft) : undefined;
 
   function setFamily(selector: string, on: boolean) {
     setSaved(false);
-    // Read off the NÚCLEO's policy, not the draft. By the time somebody flips a
+    // Read off the stored policy, not the draft. By the time somebody flips a
     // switch back the draft already holds the `false` they just wrote, so asking
     // the draft what was there originally always answers `false` — and the
     // explicit `true` this exists to preserve is gone by then.
-    const asStored = stored.data?.families.find((f) => f.selector === selector);
+    const asStored = stored.families.find((f) => f.selector === selector);
+    const baseRule = base?.families.find((f) => f.selector === selector);
 
     setDraft((current) => {
       if (!current) return current;
@@ -78,8 +204,12 @@ export function NotificationsView() {
       // put there. If there was no rule, or the stored rule was the `false` being
       // undone, we go back to no rule at all, because absence is how a machine
       // nobody has configured behaves and re-storing `true` would claim otherwise.
+      //
+      // On a channel, absence means "follow the default", so when the default itself says
+      // `false` an explicit `true` override is the only way to turn the family on.
       if (!on) families.push({ selector, enabled: false });
       else if (asStored?.enabled === true) families.push(asStored);
+      else if (baseRule?.enabled === false) families.push({ selector, enabled: true });
 
       return { ...current, families };
     });
@@ -95,14 +225,35 @@ export function NotificationsView() {
     });
   }
 
+  // A loose kind has no family to follow: its checkbox sends `inherit` for "on". Where the default
+  // silences it, "inherit" would leave it silenced, so the channel needs an explicit `always`.
+  function setLooseKind(kind: string, verdict: KindVerdict) {
+    const silencedByDefault = base?.kinds.some((k) => k.selector === kind && !k.enabled) ?? false;
+    setKind(kind, verdict === "inherit" && silencedByDefault ? "always" : verdict);
+  }
+
+  /** Drop the channel's own rule, so the row follows the default again. */
+  function reset(selector: string, scope: "families" | "kinds") {
+    setSaved(false);
+    setDraft((current) =>
+      current ? { ...current, [scope]: current[scope].filter((r) => r.selector !== selector) } : current,
+    );
+  }
+
+  const empty = draft.families.length === 0 && draft.kinds.length === 0;
+
   return (
     <>
       <DesktopSwitch />
       <Panel
-        title="Telegram notifications"
+        title="Notifications"
         /* Save sits in the head, where it is on screen whatever is expanded below it. */
         aside={
           <div className="sy-notify-actions">
+            {/* Drawn only when the parent can act on a choice; `System` passes it. */}
+            {onChannelChange && (
+              <ChannelScopeSelector channel={channel} onChannelChange={onChannelChange} />
+            )}
             {dirty && <span className="sy-meta">unsaved changes</span>}
             <span className="sy-meta" role="status">
               {saved && !dirty ? "saved" : null}
@@ -124,8 +275,17 @@ export function NotificationsView() {
         <p className="sy-note">
           A family is a prefix, and a kind can override its family. Anything no rule claims is sent —
           so a machine nobody has configured behaves exactly as it did before this screen existed.
-          The sidecar re-reads this on its next round: nothing needs restarting.
+          The adapter picks this up on its next round: nothing needs restarting.
         </p>
+        {base && primary === false && (
+          <p className="sy-note">
+            This channel is dormant: it is not the primary. Its overrides are stored and take effect
+            when it becomes the primary.
+          </p>
+        )}
+        {base && empty && (
+          <p className="sy-note">This channel inherits everything from the default.</p>
+        )}
 
         {save.isError &&
           (isApiRefusal(save.error) ? (
@@ -136,7 +296,15 @@ export function NotificationsView() {
 
         <ul className="sy-notify-families">
           {families.map((family) => (
-            <FamilyItem key={family.selector} family={family} onFamily={setFamily} onKind={setKind} />
+            <FamilyItem
+              key={family.selector}
+              family={family}
+              onFamily={setFamily}
+              onKind={setKind}
+              source={sourceOf(family.selector, "families")}
+              sourceOfKind={(kind) => sourceOf(kind, "kinds")}
+              onReset={base ? reset : undefined}
+            />
           ))}
         </ul>
 
@@ -149,12 +317,62 @@ export function NotificationsView() {
             </p>
             <ul className="sy-notify-kinds sy-notify-loose">
               {loose.map((row) => (
-                <KindItem key={row.kind} row={row} onKind={setKind} inFamily={false} />
+                <KindItem
+                  key={row.kind}
+                  row={row}
+                  onKind={setLooseKind}
+                  inFamily={false}
+                  source={sourceOf(row.kind, "kinds")}
+                  onReset={base ? reset : undefined}
+                />
               ))}
             </ul>
           </>
         )}
       </Panel>
+    </>
+  );
+}
+
+/**
+ * Picks which scope the policy below applies to: the default for every channel, or one channel.
+ *
+ * Only configured channels are offered; an unconfigured one has no adapter to read an override. A
+ * failed channel list must not take the Default mode down with it, so the error is a quiet note and
+ * the selector keeps its one safe option.
+ */
+function ChannelScopeSelector({
+  channel,
+  onChannelChange,
+}: {
+  channel?: string;
+  onChannelChange: (channel: string | undefined) => void;
+}) {
+  const channels = useChannels();
+  const selectId = useId();
+  const options = channels.data?.channels.filter((c) => c.configured) ?? [];
+  const primary = channels.data?.primary ?? null;
+
+  return (
+    <>
+      <label className="sy-meta" htmlFor={selectId}>
+        Channel
+      </label>
+      <select
+        id={selectId}
+        className="sy-notify-select"
+        value={channel ?? ""}
+        disabled={channels.isPending}
+        onChange={(event) => onChannelChange(event.target.value === "" ? undefined : event.target.value)}
+      >
+        <option value="">Default (all channels)</option>
+        {options.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.id === primary ? `${c.label} (primary)` : c.label}
+          </option>
+        ))}
+      </select>
+      {channels.isError && <span className="sy-note">the channel list did not load</span>}
     </>
   );
 }
@@ -214,14 +432,55 @@ function NotificationsError({ error, what }: { error: unknown; what: string }) {
   return <ErrorNote>the {DAEMON_NAME} is not responding — nothing is known about {what}</ErrorNote>;
 }
 
+type RuleSource = "default" | "override" | "pinned";
+
+/** The origin mark of a rule on a channel, with "Reset to default" when the channel has its own. */
+function SourceMark({
+  source,
+  onReset,
+  what,
+}: {
+  source: RuleSource;
+  onReset?: () => void;
+  what: string;
+}) {
+  return (
+    <>
+      <span
+        className={`sy-rule-source sy-rule-source-${source}`}
+        title={source === "pinned" ? "pinned to the default" : undefined}
+      >
+        {source}
+      </span>
+      {source !== "default" && onReset && (
+        <button
+          type="button"
+          className="sy-rule-reset"
+          aria-label={`Reset to default: ${what}`}
+          onClick={onReset}
+        >
+          Reset to default
+        </button>
+      )}
+    </>
+  );
+}
+
 function FamilyItem({
   family,
   onFamily,
   onKind,
+  source,
+  sourceOfKind,
+  onReset,
 }: {
   family: FamilyRow;
   onFamily: (selector: string, on: boolean) => void;
   onKind: (kind: string, verdict: KindVerdict) => void;
+  /** Channel mode only: where this family's value comes from. */
+  source?: RuleSource;
+  sourceOfKind?: (kind: string) => RuleSource | undefined;
+  onReset?: (selector: string, scope: "families" | "kinds") => void;
 }) {
   const [open, setOpen] = useState(false);
   const card = useRef<HTMLLIElement>(null);
@@ -273,6 +532,13 @@ function FamilyItem({
             hidden: the rule is in force either way, and a rule you cannot see is one you cannot
             undo. */}
         {!known && <span className="sy-note">unknown family</span>}
+        {source && (
+          <SourceMark
+            source={source}
+            what={family.label ?? family.selector}
+            onReset={onReset && (() => onReset(family.selector, "families"))}
+          />
+        )}
         <button
           type="button"
           ref={disclose}
@@ -288,7 +554,13 @@ function FamilyItem({
       {open && family.kinds.length > 0 && (
         <ul id={popId} className="sy-notify-kinds sy-notify-pop">
           {family.kinds.map((row) => (
-            <KindItem key={row.kind} row={row} onKind={onKind} />
+            <KindItem
+              key={row.kind}
+              row={row}
+              onKind={onKind}
+              source={sourceOfKind?.(row.kind)}
+              onReset={onReset}
+            />
           ))}
         </ul>
       )}
@@ -306,9 +578,14 @@ function KindItem({
   row,
   onKind,
   inFamily = true,
+  source,
+  onReset,
 }: {
   row: KindRow;
   onKind: (kind: string, verdict: KindVerdict) => void;
+  /** Channel mode only: where this kind's value comes from. */
+  source?: RuleSource;
+  onReset?: (selector: string, scope: "families" | "kinds") => void;
   /** `false` for a kind no family prefix claims — it has nothing to inherit from. */
   inFamily?: boolean;
 }) {
@@ -327,6 +604,13 @@ function KindItem({
         // Kept on screen rather than hidden. It is a rule somebody wrote; hiding
         // it would leave it silencing with nowhere to undo it.
         <span className="sy-note">not seen in the last 90 days</span>
+      )}
+      {source && (
+        <SourceMark
+          source={source}
+          what={label}
+          onReset={onReset && (() => onReset(row.kind, "kinds"))}
+        />
       )}
       {inFamily ? (
         <select

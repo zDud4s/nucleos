@@ -4,7 +4,9 @@ import {
   NOTIFY_FAMILIES,
   groupKinds,
   mergeFeedTimeline,
+  mergePolicy,
   newestFeedId,
+  ruleSource,
   timelineQueryString,
   type FeedEntry,
   type NotifyPolicy,
@@ -201,5 +203,87 @@ describe("NOTIFY_FAMILIES", () => {
     expect(new Set(selectors).size).toBe(selectors.length);
     expect(selectors.every((s) => s.length > 0)).toBe(true);
     expect(NOTIFY_FAMILIES.every((f) => f.label.length > 0)).toBe(true);
+  });
+});
+
+describe("per-channel policy", () => {
+  const d: NotifyPolicy = {
+    families: [{ selector: "worktree_", enabled: false }],
+    kinds: [{ selector: "job_gc_failed", enabled: false }],
+  };
+  const o: NotifyPolicy = {
+    families: [{ selector: "worktree_", enabled: true }],
+    kinds: [{ selector: "run_failed", enabled: false }],
+  };
+
+  it("merges the three objects of the annex into its resolved", () => {
+    expect(mergePolicy(d, o)).toEqual({
+      families: [{ selector: "worktree_", enabled: true }],
+      kinds: [
+        { selector: "job_gc_failed", enabled: false },
+        { selector: "run_failed", enabled: false },
+      ],
+    });
+  });
+
+  it("replaces in place, keeps default order, then appends channel-only rules in stored order", () => {
+    const def: NotifyPolicy = {
+      families: [
+        { selector: "a_", enabled: true },
+        { selector: "b_", enabled: true },
+      ],
+      kinds: [],
+    };
+    const ov: NotifyPolicy = {
+      families: [
+        { selector: "z_", enabled: false },
+        { selector: "b_", enabled: false },
+        { selector: "y_", enabled: false },
+      ],
+      kinds: [],
+    };
+    expect(mergePolicy(def, ov).families).toEqual([
+      { selector: "a_", enabled: true },
+      { selector: "b_", enabled: false },
+      { selector: "z_", enabled: false },
+      { selector: "y_", enabled: false },
+    ]);
+  });
+
+  it("handles empty sides", () => {
+    expect(mergePolicy(d, NO_POLICY)).toEqual(d);
+    expect(mergePolicy(NO_POLICY, o)).toEqual(o);
+  });
+
+  it("keeps families and kinds apart for the same selector", () => {
+    const def: NotifyPolicy = { families: [{ selector: "x", enabled: true }], kinds: [] };
+    const ov: NotifyPolicy = { families: [], kinds: [{ selector: "x", enabled: false }] };
+    expect(mergePolicy(def, ov)).toEqual({
+      families: [{ selector: "x", enabled: true }],
+      kinds: [{ selector: "x", enabled: false }],
+    });
+  });
+
+  it("does not mutate its inputs", () => {
+    const dc = structuredClone(d);
+    const oc = structuredClone(o);
+    mergePolicy(d, o);
+    expect(d).toEqual(dc);
+    expect(o).toEqual(oc);
+  });
+
+  it("classifies the source of a rule", () => {
+    expect(ruleSource("worktree_", "families", d, o)).toBe("override");
+    const pinned: NotifyPolicy = { families: [{ selector: "worktree_", enabled: false }], kinds: [] };
+    expect(ruleSource("worktree_", "families", d, pinned)).toBe("pinned");
+    expect(ruleSource("worktree_", "families", d, NO_POLICY)).toBe("default");
+    expect(ruleSource("run_failed", "kinds", d, o)).toBe("override");
+    expect(ruleSource("worktree_", "kinds", d, o)).toBe("default");
+  });
+
+  it("serves groupKinds unchanged", () => {
+    const { families } = groupKinds(["worktree_removed", "job_gc_failed"], mergePolicy(d, o));
+    const wt = families.find((f) => f.selector === "worktree_")!;
+    expect(wt.kinds.map((k) => k.kind)).toEqual(["worktree_removed"]);
   });
 });

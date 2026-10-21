@@ -46,6 +46,7 @@ export function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
 
   return (
     <Queue
+      id={QUEUES.exclusions.id}
       title={QUEUES.exclusions.title}
       view={view}
       what="the exclusion requests"
@@ -62,67 +63,79 @@ export function ExclusionRequestSection({ view }: { view: Reading<Proposal> }) {
       <Rows label={QUEUES.exclusions.title} className={dense(items.length) ? "waiting-dense" : undefined}>
         {items.map((proposal) => {
           const pair = readExclusionPair(proposal.tool_input);
+          const context = pair.paths.length > 0;
           return (
-            <Row className="waiting-card" dense={dense(items.length)} key={proposal.id}>
-              <div className="waiting-card-head">
-                <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>request #{proposal.id}</span>
-                <span className="waiting-card-title">
-                  {pair.low === null || pair.high === null
-                    ? "a pair this request does not name"
-                    : `jobs ${pair.low} and ${pair.high}`}
-                </span>
-                <span className="waiting-meta">
-                  {proposal.project_id ?? "no project"}
-                </span>
-                <RelativeTime at={proposal.created_at} />
+            <Row
+              className={context ? "waiting-card waiting-item waiting-item-split" : "waiting-card waiting-item"}
+              dense={dense(items.length)}
+              key={proposal.id}
+            >
+              <div className="waiting-item-main">
+                <div className="waiting-card-head">
+                  <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>request #{proposal.id}</span>
+                  <span className="waiting-card-title">
+                    {pair.low === null || pair.high === null
+                      ? "a pair this request does not name"
+                      : `jobs ${pair.low} and ${pair.high}`}
+                  </span>
+                  <span className="waiting-meta">
+                    {proposal.project_id ?? "no project"}
+                  </span>
+                  <RelativeTime at={proposal.created_at} />
+                </div>
+                <Reasoning>
+                  {proposal.reasoning.trim() === ""
+                    ? "nothing was recorded about why"
+                    : proposal.reasoning}
+                </Reasoning>
+                {(proposal.job_low_task || proposal.job_high_task) && (
+                  <dl className="waiting-input" aria-label={`Jobs in request #${proposal.id}`}>
+                    {[
+                      [pair.low, proposal.job_low_task],
+                      [pair.high, proposal.job_high_task],
+                    ].map(([job, task]) => (
+                      <div className="waiting-input-line" key={String(job)}>
+                        <dt className="waiting-input-name">job {job ?? "?"}</dt>
+                        <dd className="waiting-input-value">
+                          {taskLine(task as string | null) ?? "the daemon no longer has this job"}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                )}
+                <div className="waiting-cluster">
+                  <ConfirmButton
+                    label={`Approve request #${proposal.id}`}
+                    confirmLabel="Approve — keep these two apart"
+                    subject={`#${proposal.id}`}
+                    variant="approve"
+                    disabled={approve.isPending || pair.low === null || pair.high === null}
+                    onArmedChange={onArmedChange}
+                    onConfirm={() => approve.mutate(proposal.id)}
+                  />
+                  <ConfirmButton
+                    label={`Decline request #${proposal.id}`}
+                    confirmLabel="Decline — let them run together"
+                    subject={`#${proposal.id}`}
+                    variant="ghost"
+                    disabled={reject.isPending}
+                    onArmedChange={onArmedChange}
+                    onConfirm={() => reject.mutate(proposal.id)}
+                  />
+                </div>
               </div>
-              <Reasoning>
-                {proposal.reasoning.trim() === ""
-                  ? "nothing was recorded about why"
-                  : proposal.reasoning}
-              </Reasoning>
-              {(proposal.job_low_task || proposal.job_high_task) && (
-                <dl className="waiting-input" aria-label={`Jobs in request #${proposal.id}`}>
-                  {[
-                    [pair.low, proposal.job_low_task],
-                    [pair.high, proposal.job_high_task],
-                  ].map(([job, task]) => (
-                    <div className="waiting-input-line" key={String(job)}>
-                      <dt className="waiting-input-name">job {job ?? "?"}</dt>
-                      <dd className="waiting-input-value">
-                        {taskLine(task as string | null) ?? "the daemon no longer has this job"}
-                      </dd>
-                    </div>
-                  ))}
-                </dl>
+              {context && (
+                <div className="waiting-item-context">
+                  <div className="waiting-provenance">
+                    <p className="waiting-provenance-head">files it names</p>
+                    <ul className="waiting-paths">
+                      {pair.paths.map((path) => (
+                        <li key={path}>{path}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
               )}
-              {pair.paths.length > 0 && (
-                <ul className="waiting-paths">
-                  {pair.paths.map((path) => (
-                    <li key={path}>{path}</li>
-                  ))}
-                </ul>
-              )}
-              <div className="waiting-actions">
-                <ConfirmButton
-                  label={`Approve request #${proposal.id}`}
-                  confirmLabel="Approve — keep these two apart"
-                  subject={`#${proposal.id}`}
-                  variant="approve"
-                  disabled={approve.isPending || pair.low === null || pair.high === null}
-                  onArmedChange={onArmedChange}
-                  onConfirm={() => approve.mutate(proposal.id)}
-                />
-                <ConfirmButton
-                  label={`Decline request #${proposal.id}`}
-                  confirmLabel="Decline — let them run together"
-                  subject={`#${proposal.id}`}
-                  variant="ghost"
-                  disabled={reject.isPending}
-                  onArmedChange={onArmedChange}
-                  onConfirm={() => reject.mutate(proposal.id)}
-                />
-              </div>
             </Row>
           );
         })}

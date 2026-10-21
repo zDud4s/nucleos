@@ -15,7 +15,8 @@ import type {
   ProjectRules,
 } from "../data/projects";
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
-import type { FeedEntry, FeedSeen, FeedTimeline, NotifyPolicy, PendingNotification } from "../data/feed";
+import type { ChannelNotifyPolicy, FeedEntry, FeedSeen, FeedTimeline, NotifyPolicy, PendingNotification } from "../data/feed";
+import type { ChannelIdentities, ChannelsReadout, PairingCode, PairingStatus } from "../data/channels";
 import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
@@ -886,7 +887,7 @@ export const RECRUITS = [
 */
 export const OWNER_NOTES: OwnerNote[] = [
   { id: 1, text: "Alpha's release waits on the signing key, not on the tests.", origin: "shell", state: "active", created_at: ago(3 * DAY), updated_at: ago(3 * DAY) },
-  { id: 2, text: "Ask Rita whether the invoice run can move to Mondays.", origin: "telegram", state: "active", created_at: ago(2 * DAY), updated_at: ago(DAY) },
+  { id: 2, text: "Ask Rita whether the invoice run can move to Mondays.", origin: "channel:telegram", state: "active", created_at: ago(2 * DAY), updated_at: ago(DAY) },
   { id: 3, text: "The signing key sits with the accountant's backup, per the last call.", origin: "shell", state: "active", created_at: ago(DAY), updated_at: ago(DAY) },
   { id: 4, text: "Old idea: a nightly digest by mail.", origin: "shell", state: "archived", created_at: ago(9 * DAY), updated_at: ago(5 * DAY) },
 ];
@@ -2941,6 +2942,9 @@ const STORAGE: StorageReport = {
 };
 
 /** This machine's settings files, a few written and most not — the honest state of a new install. */
+const CHANNEL_TELEGRAM_WHAT =
+  "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in (the older telegram area keeps the bot token and chat id until the channel migration)";
+
 const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["email", "Which mailbox the e-mail pillar reads, and how often.", "host: imap.example.com\nusername: me@example.com\nmailbox: INBOX\npoll_interval_secs: 120\n"],
   ["voice", "Dictation hotkeys, the clean-up model and how long recordings are kept.", "hotkey: Ctrl+Alt+Space\nretain_dictations_days: 14\n"],
@@ -2948,6 +2952,7 @@ const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["web", "The search provider and how many results a query returns.", null],
   ["browser", "Which browser driver the browser pillar starts.", "driver: chrome\n"],
   ["telegram", "The bot and the chat notifications are sent to.", null],
+  ["channels/telegram", CHANNEL_TELEGRAM_WHAT, null],
   ["github", "Which account `gh` acts as.", null],
   ["council", "Who sits on the council and how votes are counted.", null],
   ["models", "Which model each phase uses.", null],
@@ -2982,6 +2987,126 @@ const MACHINE_SECRETS: MachineSecret[] = [
 const NOTIFY_POLICY: NotifyPolicy = {
   families: [{ selector: "worktree_", enabled: false }],
   kinds: [{ selector: "job_gc_failed", enabled: false }],
+};
+
+/** The channel readout: telegram online and homed on a thread, discord a fixture-only offline second channel. */
+export const CHANNELS: ChannelsReadout = {
+  contract_version: "1.0.0",
+  primary: "telegram",
+  routing: { state: "ok" },
+  channels: [
+    {
+      id: "telegram",
+      kind: "telegram",
+      label: "Telegram",
+      health_row: "telegram_sidecar",
+      configured: true,
+      missing_secrets: [],
+      settings_area: "channels/telegram",
+      state: "online",
+      since: ago(3 * HOUR),
+      adapter: { contract_version: "1.0.0" },
+      capabilities: {
+        buttons: true, edit: true, typing: true, threads: true, reply_to: true,
+        max_text: 4096,
+        media_in: ["audio", "image", "file"],
+        media_out: ["image", "file", "audio"],
+      },
+      home: { conversation_ref: "-100123:5", kind: "thread", parent: "-100123", sender_ref: "4242" },
+      identities: { senders: 1, conversations: 3 },
+      pairing: null,
+      outbox: { pending: 0, leased: 0, failed: 1, oldest_due_at: null },
+      drops: { unknown_sender: 3, pairing_failures: 0, counted_since: ago(5 * HOUR) },
+    },
+    {
+      id: "discord",
+      kind: "discord",
+      label: "Discord",
+      health_row: "discord_sidecar",
+      configured: true,
+      missing_secrets: [],
+      settings_area: "channels/discord",
+      state: "offline",
+      since: ago(2 * HOUR),
+      adapter: { contract_version: "1.0.0" },
+      capabilities: {
+        buttons: false, edit: true, typing: true, threads: false, reply_to: true,
+        max_text: 2000,
+        media_in: ["image", "file"],
+        media_out: ["image", "file"],
+      },
+      home: null,
+      identities: { senders: 0, conversations: 0 },
+      pairing: null,
+      outbox: { pending: 0, leased: 0, failed: 0, oldest_due_at: null },
+      drops: { unknown_sender: 0, pairing_failures: 0, counted_since: ago(5 * HOUR) },
+    },
+  ],
+};
+
+export const CHANNEL_IDENTITIES: Record<string, ChannelIdentities> = {
+  telegram: {
+    channel: "telegram",
+    home: "-100123:5",
+    identities: [
+      {
+        sender_ref: "4242",
+        sender_name: "Duarte",
+        role: "owner",
+        conversations: [
+          { conversation_ref: "-100123", kind: "group", parent: null, home: false, covers_threads: true, created_at: "2026-10-12T18:02:11Z" },
+          { conversation_ref: "-100123:5", kind: "thread", parent: "-100123", home: true, covers_threads: false, created_at: "2026-10-12T18:02:11Z" },
+          { conversation_ref: "4242", kind: "private", parent: null, home: false, covers_threads: false, created_at: "2026-10-14T09:15:40Z" },
+        ],
+      },
+    ],
+    projects: [{ project_id: "alpha", conversation_ref: "-100123:7" }],
+  },
+  discord: { channel: "discord", home: null, identities: [], projects: [] },
+};
+
+export const PAIRING_CODE: PairingCode = {
+  code: "482913",
+  command: "/pair 482913",
+  expires_at: new Date(NOW + 10 * MINUTE).toISOString(),
+  attempts_left: 5,
+};
+
+/** Both states at once, by channel: the mock keeps no state, so each stays photographable. */
+export const PAIRING_STATUS: Record<string, PairingStatus> = {
+  telegram: { state: "waiting", expires_at: new Date(NOW + 10 * MINUTE).toISOString(), attempts_left: 5 },
+  discord: {
+    state: "paired",
+    paired_at: ago(MINUTE),
+    identity: {
+      sender_ref: "7001", sender_name: "Duarte", conversation_ref: "7001",
+      conversation_kind: "private", parent: null, home: true,
+    },
+  },
+};
+
+/** Telegram overrides one family and one kind over the default; discord is dormant with none. */
+export const CHANNEL_NOTIFY_POLICY: Record<string, ChannelNotifyPolicy> = {
+  telegram: {
+    channel: "telegram",
+    primary: true,
+    default: NOTIFY_POLICY,
+    overrides: {
+      families: [{ selector: "worktree_", enabled: true }],
+      kinds: [{ selector: "run_failed", enabled: false }],
+    },
+    resolved: {
+      families: [{ selector: "worktree_", enabled: true }],
+      kinds: [{ selector: "job_gc_failed", enabled: false }, { selector: "run_failed", enabled: false }],
+    },
+  },
+  discord: {
+    channel: "discord",
+    primary: false,
+    default: NOTIFY_POLICY,
+    overrides: { families: [], kinds: [] },
+    resolved: NOTIFY_POLICY,
+  },
 };
 
 const NOTIFY_KINDS: string[] = [
@@ -3400,7 +3525,7 @@ export function answer(path: string, init?: RequestInit): unknown {
         { name: "credential_manager", status: "ok" },
         { name: "worktree_disk", status: "degraded", reason: "low-disk-space" },
         { name: "echo_sidecar", status: "ok" },
-        { name: "telegram_sidecar", status: "disabled", reason: "not-configured" },
+        { name: "telegram_sidecar", status: "ok" },
         { name: "email_sidecar", status: "ok" },
         { name: "web_sidecar", status: "ok" },
         { name: "browser_sidecar", status: "down", reason: "not-running" },
@@ -3424,7 +3549,43 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/config/capture-wait" && init?.method === undefined) return { minutes: 120 };
   if (path === "/config/embedding" && init?.method === undefined) return { model: "nomic-embed-text" };
   if (path === "/config/secrets" && init?.method === undefined) return { secrets: MACHINE_SECRETS };
-  if (path === "/notifications/policy" && init?.method === undefined) return NOTIFY_POLICY;
+  if (route === "/notifications/policy") {
+    const channel = query.get("channel");
+    if (channel === null) {
+      if (init?.method === undefined) return NOTIFY_POLICY;
+    } else {
+      if (init?.method === undefined) return CHANNEL_NOTIFY_POLICY[channel];
+      if (init.method === "PUT") return undefined;
+    }
+  }
+
+  /* Channel management (annex E). Writes are stateless like every other write here. */
+  if (route === "/channels" && init?.method === undefined) return CHANNELS;
+  if (route === "/channels/primary" && init?.method === "PUT") {
+    const body = JSON.parse(init.body as string) as { channel: string | null };
+    // Clearing the primary only leaves `no_primary`; it never reseeds.
+    return { primary: body.channel, reseeded: body.channel !== null && body.channel !== "telegram" };
+  }
+  const channelRoute = /^\/channels\/([^/]+)\/(pairing|identities)(?:\/([^/]+)(\/home)?)?$/.exec(route);
+  if (channelRoute !== null) {
+    const id = decodeURIComponent(channelRoute[1]);
+    const method = init?.method ?? "GET";
+    if (channelRoute[2] === "pairing" && channelRoute[3] === undefined) {
+      if (method === "POST") return PAIRING_CODE;
+      if (method === "DELETE") return undefined;
+      if (method === "GET") return PAIRING_STATUS[id] ?? { state: "none" };
+    }
+    if (channelRoute[2] === "identities") {
+      if (channelRoute[3] === undefined && method === "GET") return CHANNEL_IDENTITIES[id];
+      if (channelRoute[3] !== undefined && channelRoute[4] === undefined && method === "DELETE") {
+        return { removed: 1, home_cleared: false };
+      }
+      if (channelRoute[3] !== undefined && channelRoute[4] !== undefined && method === "PUT") {
+        const body = JSON.parse(init?.body as string) as { conversation_ref: string };
+        return { home: body.conversation_ref, previous: "-100123:5" };
+      }
+    }
+  }
   if (path === "/notifications/kinds") return NOTIFY_KINDS;
 
   /* The notch's own reading. See `QUOTA` above for why these figures are the shape they are. */

@@ -33,6 +33,7 @@ export function TeamActionSection({
 
   return (
     <Queue
+      id={QUEUES.teamActions.id}
       title={QUEUES.teamActions.title}
       view={view}
       what="the team's action requests"
@@ -120,6 +121,11 @@ function TeamActionPayload({
   );
 }
 
+/** Whether a department asked at all, which is when the context column has anything to say. */
+export function hasDepartmentContext(proposal: Proposal): boolean {
+  return (proposal.team_name ?? null) !== null || (proposal.team_run_id ?? null) !== null;
+}
+
 /**
  * Which department asked, who in it, and what it was working on.
  *
@@ -131,10 +137,10 @@ export function DepartmentContext({ proposal }: { proposal: Proposal }) {
   const team = proposal.team_name ?? null;
   const runId = proposal.team_run_id ?? null;
   const task = taskLine(proposal.team_request);
-  if (team === null && runId === null) return null;
+  if (!hasDepartmentContext(proposal)) return null;
   return (
     <>
-      <p className="waiting-meta">
+      <p className="waiting-meta waiting-asked">
         asked by {proposal.asked_by ?? "an agent the daemon no longer names"}
         {proposal.asked_for ? (
           <>
@@ -178,65 +184,76 @@ function TeamActionCard({
   // moved on between polls simply is not in this list — absent is not a state.
   const action = executing?.find((row) => row.proposal_id === proposal.id);
 
+  const context = hasDepartmentContext(proposal);
+
   return (
-    <Row className="waiting-card" dense={dense(count)}>
-      <div className="waiting-card-head">
-        <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>team action #{proposal.id}</span>
-        <span className="waiting-card-title">
-          {proposal.tool_name ?? "an action that names no tool"}
-        </span>
-        <span className="waiting-meta">
-          {proposal.project_id ?? "no project"}
-        </span>
-        <RelativeTime at={proposal.created_at} />
-      </div>
-      <DepartmentContext proposal={proposal} />
-      <dl className="waiting-facts">
-        <div className="waiting-fact">
-          <dt>execution</dt>
-          <dd>
-            {action === undefined ? (
-              <span className="waiting-meta">
-                the execution state is not known yet
-              </span>
-            ) : (
-              <StateBadge
-                domain="team_action"
-                state={teamActionState(action)}
-              />
-            )}
-          </dd>
+    <Row
+      className={context ? "waiting-card waiting-item waiting-item-split" : "waiting-card waiting-item"}
+      dense={dense(count)}
+    >
+      <div className="waiting-item-main">
+        <div className="waiting-card-head">
+          <span className="waiting-card-id" tabIndex={-1} data-waiting-heading>team action #{proposal.id}</span>
+          <span className="waiting-card-title">
+            {proposal.tool_name ?? "an action that names no tool"}
+          </span>
+          <span className="waiting-meta">
+            {proposal.project_id ?? "no project"}
+          </span>
+          <RelativeTime at={proposal.created_at} />
+          {/* The núcleo's half of the story, at the far end of the identity line: the owner's
+              decision is below it, and this is what happens after. */}
+          <dl className="waiting-head-fact">
+            <dt>execution</dt>
+            <dd>
+              {action === undefined ? (
+                <span className="waiting-meta">
+                  the execution state is not known yet
+                </span>
+              ) : (
+                <StateBadge
+                  domain="team_action"
+                  state={teamActionState(action)}
+                />
+              )}
+            </dd>
+          </dl>
         </div>
-      </dl>
-      <Reasoning>
-        {proposal.reasoning.trim() === ""
-          ? "nothing was recorded about why"
-          : proposal.reasoning}
-      </Reasoning>
-      <TeamActionPayload kind={proposal.tool_name} raw={proposal.tool_input} />
-      <div className="waiting-actions-split">
-        <ConfirmButton
-          label="Approve"
-          confirmLabel="Approve and let this action happen"
-          variant="approve"
-          disabled={approve.isPending}
-          onArmedChange={onArmedChange}
-          onConfirm={() => approve.mutate(proposal.id)}
-        />
-        <ConfirmButton
-          label="Decline"
-          confirmLabel="Decline and close the action"
-          variant="ghost"
-          disabled={reject.isPending}
-          onArmedChange={onArmedChange}
-          onConfirm={() => reject.mutate(proposal.id)}
+        <Reasoning>
+          {proposal.reasoning.trim() === ""
+            ? "nothing was recorded about why"
+            : proposal.reasoning}
+        </Reasoning>
+        <TeamActionPayload kind={proposal.tool_name} raw={proposal.tool_input} />
+        <div className="waiting-cluster">
+          <ConfirmButton
+            label="Approve"
+            confirmLabel="Approve and let this action happen"
+            variant="approve"
+            disabled={approve.isPending}
+            onArmedChange={onArmedChange}
+            onConfirm={() => approve.mutate(proposal.id)}
+          />
+          <ConfirmButton
+            label="Decline"
+            confirmLabel="Decline and close the action"
+            variant="ghost"
+            disabled={reject.isPending}
+            onArmedChange={onArmedChange}
+            onConfirm={() => reject.mutate(proposal.id)}
+          />
+        </div>
+        <DecisionNotes
+          outcome={approve.data}
+          approveError={approve.isError ? approve.error : null}
+          refuseError={reject.isError ? reject.error : null}
         />
       </div>
-      <DecisionNotes
-        outcome={approve.data}
-        approveError={approve.isError ? approve.error : null}
-        refuseError={reject.isError ? reject.error : null}
-      />
+      {context && (
+        <div className="waiting-item-context">
+          <DepartmentContext proposal={proposal} />
+        </div>
+      )}
     </Row>
   );
 }

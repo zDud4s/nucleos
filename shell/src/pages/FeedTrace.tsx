@@ -454,7 +454,9 @@ function SequenceRow({
       data-open={sequence.open || undefined}
     >
       <button type="button" className="feed-trace-label" aria-pressed={selected} aria-label={name} onClick={onSelect}>
-        <span className="feed-trace-name">{sequence.name}</span>
+        <span className="feed-trace-name" title={sequence.name}>
+          {sequence.name}
+        </span>
         {sequence.attempts !== null && <span className="feed-trace-retry">×{sequence.attempts}</span>}
         {sequence.owner !== null && <span className="feed-trace-owner">{sequence.owner}</span>}
       </button>
