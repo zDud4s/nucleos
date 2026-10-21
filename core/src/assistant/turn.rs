@@ -100,6 +100,8 @@ pub(super) async fn spawn_local_turn(
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
     crate::chats::stamp_project(&state.pool, id, &slot.chat_id).await;
+    // A channel conversation sees "working" as soon as its turn exists. A no-op for any other chat.
+    crate::channels::replies::turn_started(state, id, &slot.chat_id).await;
 
     // The relay learns which turn answered it, now that the turn has an id to learn.
     //
@@ -1489,6 +1491,7 @@ mod tests {
             run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
+            fleet: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,

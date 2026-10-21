@@ -93,6 +93,7 @@ import { OnboardPanel } from "../project/Onboard";
 import { JudgeOpinionLine, JudgePanel, JudgeReviewPanel } from "./AutopilotJudge";
 import { RefusedActionsPanel, SkippedItemsPanel } from "./AutopilotRecords";
 import { ResolvePanel } from "./AutopilotResolve";
+import { ExclusionsPanel } from "./AutopilotExclusions";
 import "./autopilot.css";
 
 /**
@@ -270,6 +271,7 @@ export function Autopilot() {
         </div>
         <div id="ap-jobs" className="ap-block">
           <JobsPanel rows={rows} selected={selected} />
+          <ExclusionsPanel />
         </div>
         {/* Records of what the night and the barrier already settled. They were on the Waiting
             page, which now holds only what asks for a decision. Records, not controls: shut until
@@ -1781,7 +1783,7 @@ function JobsPanel({
   return (
     <Panel title="Jobs in flight" aside={<Count n={jobs.data?.length} />}>
       {jobs.isError && jobs.data === undefined && <ListError error={jobs.error} what="the jobs" />}
-      {jobs.data !== undefined && live.length === 0 && <Quiet says="Nothing is running. Start one below, or from the Fleet page." />}
+      {jobs.data !== undefined && live.length === 0 && <Quiet says="Nothing is running. Start one below." />}
       {live.length > 0 && (
         <ul className="ap-list" aria-label="Jobs in flight">
           {live.map((job) => (
@@ -1833,9 +1835,9 @@ function JobsPanel({
                 budget_usd: null,
                 max_rounds: null,
                 // No picker here, exactly as there is none for budget or rounds:
-                // this panel is the one-line "start something" and the Fleet page
-                // is where a job is specified. Sending null keeps it the queue in
-                // one checkout, which is what this button has always started.
+                // this panel is the one-line "start something". Sending null keeps
+                // it the queue in one checkout, which is what this button has
+                // always started.
                 team_id: null,
               },
               { onSuccess: () => setPrompt("") },

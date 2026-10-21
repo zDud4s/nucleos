@@ -100,16 +100,33 @@ pub fn by_id(id: &str) -> Option<&'static Manifest> {
 /// `~/.nucleos/channels/<id>.yaml`. Absent or malformed file = default, never fatal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ChannelConfig {
-    #[serde(default)]
+    // `pillars` is a private module of `config`; its glob re-export carries the `pub(crate)` fn.
+    #[serde(default, deserialize_with = "crate::config::deserialize_blank_as_none")]
     pub doctrine: Option<String>,
     /// Project id to `conversation_ref` (a thread in Telegram).
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
 }
 
-/// Reads every channel's yaml. P0 returns the empty map (the inert hub); A2 reads the files.
-pub fn load_configs(_machine_config_root: Option<&Path>) -> HashMap<&'static str, ChannelConfig> {
-    HashMap::new()
+/// Reads one channel's `<root>/<settings_file>.yaml`. Absent, unreadable or malformed = default,
+/// never fatal: a typo must cost fidelity, not stop the daemon.
+pub fn load_config(machine_config_root: &Path, manifest: &Manifest) -> ChannelConfig {
+    let path = machine_config_root.join(format!("{}.yaml", manifest.settings_file));
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_yaml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Reads every channel's yaml. `None` (no machine-config root) gives the empty map, the inert hub.
+pub fn load_configs(machine_config_root: Option<&Path>) -> HashMap<&'static str, ChannelConfig> {
+    let Some(root) = machine_config_root else {
+        return HashMap::new();
+    };
+    MANIFESTS
+        .iter()
+        .map(|manifest| (manifest.id, load_config(root, manifest)))
+        .collect()
 }
 
 /// Reverse lookup: the project mapped to a conversation, if any.
@@ -124,10 +141,6 @@ pub fn project_for_conversation(config: &ChannelConfig, conversation_ref: &str) 
 /// Online = the channel's last request is younger than this (Anexo E, E.2). The kit always keeps a
 /// 30 s long-poll open, so 45 s tolerates one slow round trip.
 pub const ONLINE_WINDOW: chrono::Duration = chrono::Duration::seconds(45);
-
-/// Mirrors `access::MAX_PAIR_ATTEMPTS` (D.7); the pairing chunk owns the constant and replaces
-/// this copy.
-const PAIR_ATTEMPTS_LIMIT: u32 = 5;
 
 /// What the hub last learned from one adapter's `hello` and requests.
 #[derive(Debug, Clone)]
@@ -402,6 +415,32 @@ pub fn channel_state(
     }
 }
 
+/// Folds the supervisor's view of the adapter process into the E.2 state: a process that died
+/// (`Restarting`) or never started (`FailedToSpawn`) is `Offline` even while its last poll is
+/// still inside the online window. A `Starting` channel is only demoted by `FailedToSpawn`: a
+/// `Restarting` entry before the first hello is just the spawn in progress. `None` (nobody
+/// supervises it, e.g. a non-primary daemon) leaves the state alone. `since` becomes `now` only
+/// when the state actually flips.
+fn apply_liveness(
+    (state, since): (ChannelState, Option<DateTime<Utc>>),
+    liveness: Option<crate::sidecar::Liveness>,
+    now: DateTime<Utc>,
+) -> (ChannelState, Option<DateTime<Utc>>) {
+    use crate::sidecar::Liveness;
+    let dead = matches!(
+        (state, liveness),
+        (
+            ChannelState::Online,
+            Some(Liveness::Restarting | Liveness::FailedToSpawn(_))
+        ) | (ChannelState::Starting, Some(Liveness::FailedToSpawn(_)))
+    );
+    if dead {
+        (ChannelState::Offline, Some(now))
+    } else {
+        (state, since)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AdapterInfo {
     pub contract_version: String,
@@ -471,94 +510,49 @@ pub struct ChannelsReadout {
     pub channels: Vec<ChannelStatus>,
 }
 
-fn parse_time(text: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
-}
-
 async fn home_of(pool: &SqlitePool, channel: &str) -> sqlx::Result<Option<HomeReadout>> {
-    let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT conversation_ref, conversation_kind, parent, sender_ref \
-         FROM channel_identities WHERE channel = ? AND home = 1",
-    )
-    .bind(channel)
-    .fetch_optional(pool)
-    .await?;
-    Ok(
-        row.and_then(|(conversation_ref, kind, parent, sender_ref)| {
-            Some(HomeReadout {
-                conversation_ref,
-                kind: serde_json::from_value(serde_json::Value::String(kind)).ok()?,
-                parent,
-                sender_ref,
-            })
-        }),
-    )
+    Ok(super::access::home_identity(pool, channel)
+        .await?
+        .map(|home| HomeReadout {
+            conversation_ref: home.conversation_ref,
+            kind: home.conversation_kind,
+            parent: home.parent,
+            sender_ref: home.sender_ref,
+        }))
 }
 
 async fn identity_counts(pool: &SqlitePool, channel: &str) -> sqlx::Result<IdentityCounts> {
-    let (senders, conversations): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(DISTINCT sender_ref), COUNT(DISTINCT conversation_ref) \
-         FROM channel_identities WHERE channel = ?",
-    )
-    .bind(channel)
-    .fetch_one(pool)
-    .await?;
+    let (senders, conversations) = super::access::identity_counts(pool, channel).await?;
     Ok(IdentityCounts {
-        senders: senders as u32,
-        conversations: conversations as u32,
+        senders,
+        conversations,
     })
 }
 
+/// The active code's deadline, from the pairing status (the one place that reads the table).
 async fn pairing_of(
     pool: &SqlitePool,
     channel: &str,
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<PairingReadout>> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT expires_at, attempts FROM channel_pairing_codes WHERE channel = ? \
-         AND superseded_at IS NULL AND cancelled_at IS NULL AND paired_at IS NULL \
-         AND expires_at > ?",
+    Ok(
+        match super::access::pairing_status(pool, channel, now).await? {
+            super::access::PairingStatus::Waiting {
+                expires_at,
+                attempts_left,
+            } => Some(PairingReadout {
+                expires_at,
+                attempts_left,
+            }),
+            _ => None,
+        },
     )
-    .bind(channel)
-    .bind(stamp(now))
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.and_then(|(expires_at, attempts)| {
-        Some(PairingReadout {
-            expires_at: parse_time(&expires_at)?,
-            attempts_left: PAIR_ATTEMPTS_LIMIT.saturating_sub(attempts.max(0) as u32),
-        })
-    }))
 }
 
-async fn outbox_counts_of(pool: &SqlitePool, channel: &str) -> sqlx::Result<OutboxCounts> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT state, COUNT(*) FROM channel_outbox WHERE channel = ? GROUP BY state",
-    )
-    .bind(channel)
-    .fetch_all(pool)
-    .await?;
-    let oldest: Option<String> = sqlx::query_scalar(
-        "SELECT MIN(due_at) FROM channel_outbox WHERE channel = ? AND state = 'pending'",
-    )
-    .bind(channel)
-    .fetch_one(pool)
-    .await?;
-    let mut counts = OutboxCounts {
-        oldest_due_at: oldest.as_deref().and_then(parse_time),
-        ..OutboxCounts::default()
-    };
-    for (state, n) in rows {
-        match state.as_str() {
-            "pending" => counts.pending = n as u32,
-            "leased" => counts.leased = n as u32,
-            "failed" => counts.failed = n as u32,
-            _ => {}
-        }
-    }
-    Ok(counts)
+/// Whether every required secret of `id` is present, from the in-memory cache alone (no query).
+/// An unknown or never-checked channel is not configured.
+pub(crate) fn is_configured(state: &AppState, id: &str) -> bool {
+    by_id(id).is_some_and(|manifest| state.channels.presence.secrets_status(manifest).0)
 }
 
 /// `GET /channels`: one status per compiled manifest. Presence, cache and drops come from memory;
@@ -579,7 +573,13 @@ pub async fn list(state: &AppState) -> sqlx::Result<ChannelsReadout> {
         let (configured, missing_secrets) = presence.secrets_status(manifest);
         let seen = presence.seen(id);
         let (state_now, since) = if configured {
-            channel_state(manifest, seen.as_ref(), presence.launched_at(id), now)
+            let (state_now, since) =
+                channel_state(manifest, seen.as_ref(), presence.launched_at(id), now);
+            apply_liveness(
+                (state_now, since),
+                crate::sidecar::liveness_of(manifest.binary),
+                now,
+            )
         } else {
             (ChannelState::NotConfigured, None)
         };
@@ -603,7 +603,7 @@ pub async fn list(state: &AppState) -> sqlx::Result<ChannelsReadout> {
             home: home_of(pool, id).await?,
             identities: identity_counts(pool, id).await?,
             pairing: pairing_of(pool, id, now).await?,
-            outbox: outbox_counts_of(pool, id).await?,
+            outbox: super::outbox::counts(pool, id).await?,
             drops: presence.drops(id),
         });
     }
@@ -621,24 +621,165 @@ pub async fn list(state: &AppState) -> sqlx::Result<ChannelsReadout> {
     })
 }
 
-/// Launches every channel whose required secrets are present. A2; phase 1 never calls it.
-pub async fn launch_all(_state: &AppState, _sidecars_wanted: bool) {
-    todo!()
+/// Reads one secret off the async runtime (the credential store blocks). A store error counts as
+/// absent: the channel then reads as not configured instead of taking the launcher down.
+async fn read_secret(key: &'static str) -> Option<String> {
+    match tokio::task::spawn_blocking(move || crate::secrets::load_secret(key)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, key, "channel: could not read a secret from the credential store");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, key, "channel: the secret read did not finish");
+            None
+        }
+    }
 }
 
-/// The environment of one adapter process. A2.
+/// Launches every channel whose required secrets are present. Phase 1 never calls it.
+///
+/// Refreshes the `configured` cache for every manifest, even when `sidecars_wanted` is false (a
+/// non-primary daemon still reports configuration, it just spawns nothing).
+pub async fn launch_all(state: &AppState, sidecars_wanted: bool) {
+    let presence = &state.channels.presence;
+    for manifest in MANIFESTS {
+        let mut secrets: Vec<(&'static str, String)> = Vec::new();
+        let mut missing: Vec<&'static str> = Vec::new();
+        for spec in manifest.secrets {
+            match read_secret(spec.key).await {
+                Some(value) => secrets.push((spec.env, value)),
+                None if spec.required => missing.push(spec.key),
+                None => {}
+            }
+        }
+        let configured = missing.is_empty();
+        presence.set_secrets_present(manifest.id, missing);
+        if !configured || !sidecars_wanted {
+            continue;
+        }
+        let token = match crate::auth::mint_service_token(
+            &state.pool,
+            crate::auth::Service::Channel(manifest.id),
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(%error, channel = manifest.id, "channel: could not mint its key");
+                continue;
+            }
+        };
+        let env = env_for(
+            manifest,
+            &crate::daemon_client::daemon_url(),
+            &token,
+            &secrets,
+        );
+        tokio::spawn(crate::sidecar::supervise(
+            manifest.binary.to_string(),
+            crate::sidecar::binary(manifest.binary),
+            env,
+        ));
+        presence.set_launched(manifest.id, Utc::now());
+        tracing::info!(channel = manifest.id, "channel adapter supervised");
+    }
+}
+
+/// The environment of one adapter process: the daemon URL, the channel id, the channel key (sent
+/// by the kit as `Authorization: Bearer <token>`), then each secret as `(env name, value)`.
 pub fn env_for(
-    _manifest: &Manifest,
-    _daemon_url: &str,
-    _channel_token: &str,
-    _secrets: &[(&'static str, String)],
+    manifest: &Manifest,
+    daemon_url: &str,
+    channel_token: &str,
+    secrets: &[(&'static str, String)],
 ) -> Vec<(String, String)> {
-    todo!()
+    let mut env = vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_CHANNEL_ID".to_string(), manifest.id.to_string()),
+        (
+            "NUCLEOS_CHANNEL_TOKEN".to_string(),
+            channel_token.to_string(),
+        ),
+    ];
+    env.extend(
+        secrets
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone())),
+    );
+    env
 }
 
-/// One health row per manifest. A2.
-pub async fn health_rows(_state: &AppState) -> Vec<crate::health::SubsystemReadout> {
-    todo!()
+/// The health row of one channel, from the same status `list` returns.
+fn health_row(status: &ChannelStatus, binary: &str) -> crate::health::SubsystemReadout {
+    use crate::health::{FailureCategory, HealthState, SubsystemReadout};
+    let (state, reason) = match status.state {
+        ChannelState::NotConfigured => {
+            (HealthState::Disabled, Some(FailureCategory::NotConfigured))
+        }
+        ChannelState::Online if status.outbox.failed > 0 => {
+            (HealthState::Degraded, Some(FailureCategory::Unknown))
+        }
+        ChannelState::Online => (HealthState::Ok, None),
+        ChannelState::Starting => (HealthState::Degraded, Some(FailureCategory::NotRunning)),
+        ChannelState::Offline => (HealthState::Down, Some(FailureCategory::NotRunning)),
+        ChannelState::Incompatible => (HealthState::Down, Some(FailureCategory::Unknown)),
+    };
+    // A binary that never started is worse news than a quiet adapter: say why.
+    let reason = match crate::sidecar::liveness_of(binary) {
+        Some(crate::sidecar::Liveness::FailedToSpawn(kind)) if state == HealthState::Down => {
+            Some(match kind {
+                std::io::ErrorKind::NotFound => FailureCategory::Missing,
+                std::io::ErrorKind::PermissionDenied => FailureCategory::PermissionDenied,
+                _ => FailureCategory::Unknown,
+            })
+        }
+        _ => reason,
+    };
+    SubsystemReadout {
+        name: status.health_row,
+        status: state,
+        reason,
+        counts: Some(BTreeMap::from([
+            (
+                "unknown_sender",
+                i64::try_from(status.drops.unknown_sender).unwrap_or(i64::MAX),
+            ),
+            (
+                "pairing_failures",
+                i64::try_from(status.drops.pairing_failures).unwrap_or(i64::MAX),
+            ),
+            ("outbox_failed", i64::from(status.outbox.failed)),
+        ])),
+    }
+}
+
+/// One health row per manifest, named `health_name`. Built from `list`, so the page and the row
+/// never disagree. A failed readout query degrades every row to `down` rather than hiding them.
+pub async fn health_rows(state: &AppState) -> Vec<crate::health::SubsystemReadout> {
+    use crate::health::{FailureCategory, HealthState, SubsystemReadout};
+    match list(state).await {
+        Ok(readout) => readout
+            .channels
+            .iter()
+            .map(|status| {
+                let binary = by_id(status.id).map_or(status.id, |m| m.binary);
+                health_row(status, binary)
+            })
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "channels: the health rows could not be read");
+            MANIFESTS
+                .iter()
+                .map(|m| SubsystemReadout {
+                    name: m.health_name,
+                    status: HealthState::Down,
+                    reason: Some(FailureCategory::Unknown),
+                    counts: None,
+                })
+                .collect()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -652,6 +793,77 @@ mod tests {
         matches!(chars.next(), Some('a'..='z'))
             && id.len() <= 32
             && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
+    fn write_yaml(root: &Path, file: &str, text: &str) {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn load_config_missing_or_malformed_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_config(dir.path(), &TELEGRAM), ChannelConfig::default());
+
+        write_yaml(
+            dir.path(),
+            "channels/telegram.yaml",
+            "doctrine: [not a string\n",
+        );
+        assert_eq!(load_config(dir.path(), &TELEGRAM), ChannelConfig::default());
+
+        write_yaml(
+            dir.path(),
+            "channels/telegram.yaml",
+            "doctrine: be brief\nprojects:\n  nucleos: \"-100:5\"\n",
+        );
+        let config = load_config(dir.path(), &TELEGRAM);
+        assert_eq!(config.doctrine.as_deref(), Some("be brief"));
+        assert_eq!(
+            config.projects.get("nucleos").map(String::as_str),
+            Some("-100:5")
+        );
+
+        let all = load_configs(Some(dir.path()));
+        assert_eq!(all.get("telegram"), Some(&config));
+        assert_eq!(all.get("fake"), Some(&ChannelConfig::default()));
+        assert!(load_configs(None).is_empty());
+    }
+
+    #[test]
+    fn project_for_conversation_reverse_lookup() {
+        let config = ChannelConfig {
+            doctrine: None,
+            projects: BTreeMap::from([
+                ("alpha".to_string(), "-1:5".to_string()),
+                ("beta".to_string(), "-1:6".to_string()),
+            ]),
+        };
+        assert_eq!(
+            project_for_conversation(&config, "-1:6").as_deref(),
+            Some("beta")
+        );
+        assert_eq!(project_for_conversation(&config, "-1:9"), None);
+        assert_eq!(
+            project_for_conversation(&ChannelConfig::default(), "-1:5"),
+            None
+        );
+    }
+
+    #[test]
+    fn blank_doctrine_reads_as_none() {
+        for text in [
+            "doctrine: \"  \"\n",
+            "doctrine: \"\"\n",
+            "doctrine:\n",
+            "projects: {}\n",
+        ] {
+            let config: ChannelConfig = serde_yaml::from_str(text).unwrap();
+            assert_eq!(config.doctrine, None, "{text:?}");
+        }
+        let config: ChannelConfig = serde_yaml::from_str("doctrine: hi\n").unwrap();
+        assert_eq!(config.doctrine.as_deref(), Some("hi"));
     }
 
     #[test]
@@ -896,6 +1108,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_dead_adapter_process_reads_as_offline() {
+        use crate::sidecar::Liveness::{FailedToSpawn, Restarting, Running};
+        let kind = std::io::ErrorKind::NotFound;
+        let online = (ChannelState::Online, Some(at(0)));
+        let starting = (ChannelState::Starting, Some(at(1)));
+        let offline = (ChannelState::Offline, Some(at(9)));
+        assert_eq!(apply_liveness(online, Some(Restarting), at(9)), offline);
+        assert_eq!(
+            apply_liveness(online, Some(FailedToSpawn(kind)), at(9)),
+            offline
+        );
+        assert_eq!(
+            apply_liveness(starting, Some(FailedToSpawn(kind)), at(9)),
+            offline
+        );
+        // Unchanged: a live or unsupervised process, a spawn still in progress, other states.
+        assert_eq!(apply_liveness(online, Some(Running), at(9)), online);
+        assert_eq!(apply_liveness(online, None, at(9)), online);
+        assert_eq!(apply_liveness(starting, Some(Restarting), at(9)), starting);
+        let incompatible = (ChannelState::Incompatible, Some(at(3)));
+        assert_eq!(
+            apply_liveness(incompatible, Some(Restarting), at(9)),
+            incompatible
+        );
+    }
+
     #[tokio::test]
     async fn list_reports_every_manifest_and_a_no_primary_routing() {
         let st = state().await;
@@ -945,10 +1184,11 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class, \
-             state, due_at, attempts, created_at) VALUES \
+             state, due_at, attempts, created_at, settled_at) VALUES \
              ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'pending', \
-              '2026-10-19T09:00:00Z', 0, 't'), \
-             ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'failed', 't', 3, 't')",
+              '2026-10-19T09:00:00Z', 0, 't', NULL), \
+             ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'failed', 't', 3, 't', \
+              '2999-01-01T00:00:00Z')",
         )
         .execute(&st.pool)
         .await
@@ -976,5 +1216,152 @@ mod tests {
         );
         assert!(tg.outbox.oldest_due_at.is_some());
         assert_eq!(tg.drops.unknown_sender, 1);
+    }
+
+    #[tokio::test]
+    async fn list_reports_not_configured_when_a_secret_is_missing() {
+        let st = state().await;
+        st.channels
+            .presence
+            .set_secrets_present("telegram", vec!["telegram-token"]);
+        // Even a launched process does not make a channel without its secret anything else.
+        st.channels.presence.set_launched("telegram", at(0));
+        let readout = list(&st).await.unwrap();
+        let tg = readout
+            .channels
+            .iter()
+            .find(|c| c.id == "telegram")
+            .unwrap();
+        assert!(!tg.configured);
+        assert_eq!(tg.missing_secrets, ["telegram-token"]);
+        assert_eq!(tg.state, ChannelState::NotConfigured);
+        assert!(tg.since.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_counts_identities_outbox_and_pairing() {
+        let st = state().await;
+        sqlx::query(
+            "INSERT INTO channel_identities (channel, sender_ref, conversation_ref, \
+             conversation_kind, parent, home, created_at) \
+             VALUES ('telegram', '42', '7', 'private', NULL, 1, 't'), \
+             ('telegram', '43', '8', 'private', NULL, 0, 't')",
+        )
+        .execute(&st.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO channel_pairing_codes (channel, code_hash, created_at, expires_at, \
+             attempts) VALUES ('telegram', 'h', 't', '2999-01-01T00:00:00Z', 1)",
+        )
+        .execute(&st.pool)
+        .await
+        .unwrap();
+        insert_leased(&st.pool, "telegram", 1).await;
+        sqlx::query(
+            "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class, \
+             state, due_at, attempts, created_at) VALUES \
+             ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'pending', \
+              '2026-10-19T09:00:00Z', 0, 't'), \
+             ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'pending', \
+              '2026-10-19T08:00:00Z', 0, 't')",
+        )
+        .execute(&st.pool)
+        .await
+        .unwrap();
+
+        let readout = list(&st).await.unwrap();
+        let tg = readout
+            .channels
+            .iter()
+            .find(|c| c.id == "telegram")
+            .unwrap();
+        assert_eq!((tg.identities.senders, tg.identities.conversations), (2, 2));
+        assert_eq!(tg.pairing.as_ref().unwrap().attempts_left, 4);
+        assert_eq!((tg.outbox.pending, tg.outbox.leased), (2, 1));
+        assert_eq!(
+            tg.outbox.oldest_due_at,
+            Some("2026-10-19T08:00:00Z".parse().unwrap())
+        );
+        let fake = readout.channels.iter().find(|c| c.id == "fake").unwrap();
+        assert_eq!((fake.identities.senders, fake.outbox.pending), (0, 0));
+        assert!(fake.pairing.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_routing_state_is_primary_not_configured_without_secrets() {
+        let st = state().await;
+        sqlx::query("UPDATE channels_global SET primary_channel = 'telegram'")
+            .execute(&st.pool)
+            .await
+            .unwrap();
+        let readout = list(&st).await.unwrap();
+        assert_eq!(readout.primary, Some("telegram"));
+        assert_eq!(readout.routing.state, RoutingState::PrimaryNotConfigured);
+    }
+
+    #[tokio::test]
+    async fn list_serializes_oldest_due_at_and_a_null_since_when_not_configured() {
+        let st = state().await;
+        sqlx::query(
+            "INSERT INTO channel_outbox (channel, conversation, lane, action, payload, class, \
+             state, due_at, attempts, created_at) VALUES \
+             ('telegram', 'c', 'ordered', 'send', '{}', 'turn', 'pending', \
+              '2026-10-19T09:00:00Z', 0, 't')",
+        )
+        .execute(&st.pool)
+        .await
+        .unwrap();
+        let readout = list(&st).await.unwrap();
+        let json = serde_json::to_value(&readout).unwrap();
+        let tg = &json["channels"][0];
+        assert_eq!(tg["id"], "telegram");
+        assert_eq!(tg["state"], "not_configured");
+        assert!(tg["since"].is_null());
+        assert!(tg["outbox"]["oldest_due_at"].is_string());
+        assert!(tg["outbox"].get("oldest_due").is_none());
+    }
+
+    #[test]
+    fn env_for_orders_daemon_url_channel_token_then_secrets() {
+        let env = env_for(
+            &TELEGRAM,
+            "http://127.0.0.1:8791",
+            "telegram.svc-secret",
+            &[("TELEGRAM_BOT_TOKEN", "bot".to_string())],
+        );
+        assert_eq!(
+            env,
+            vec![
+                (
+                    "NUCLEOS_DAEMON_URL".to_string(),
+                    "http://127.0.0.1:8791".to_string()
+                ),
+                ("NUCLEOS_CHANNEL_ID".to_string(), "telegram".to_string()),
+                (
+                    "NUCLEOS_CHANNEL_TOKEN".to_string(),
+                    "telegram.svc-secret".to_string()
+                ),
+                ("TELEGRAM_BOT_TOKEN".to_string(), "bot".to_string()),
+            ]
+        );
+        assert_eq!(env_for(&FAKE, "u", "t", &[]).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn health_rows_one_per_manifest_named_id_sidecar() {
+        let st = state().await;
+        let rows = health_rows(&st).await;
+        let names: Vec<_> = rows.iter().map(|r| r.name).collect();
+        assert_eq!(rows.len(), MANIFESTS.len());
+        assert_eq!(names, ["telegram_sidecar", "fake_sidecar"]);
+        for manifest in MANIFESTS {
+            assert_eq!(manifest.health_name, format!("{}_sidecar", manifest.id));
+        }
+        // Nothing configured: every row is a state, not a fault.
+        assert!(
+            rows.iter()
+                .all(|r| r.status == crate::health::HealthState::Disabled)
+        );
     }
 }

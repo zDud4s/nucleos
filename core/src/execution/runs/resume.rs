@@ -1060,6 +1060,10 @@ pub(super) async fn continue_paused_run(
     .await?;
 
     tx.commit().await?;
+    // The paused run left `awaiting_approval` (now `superseded`) and its successor is `running`.
+    // Signalled after the commit, never inside the transaction: a woken reader must find the new
+    // state, and a rolled-back resume must not wake anyone.
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
 
     // The resume continues the paused run's work, so it keeps the tools that run was frozen with,
     // like the handoff successor (`prepare_handoff_successor`). After the commit, for the same
@@ -1186,4 +1190,38 @@ pub(super) async fn continue_paused_run(
     );
 
     Ok(resume_id)
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use std::time::Duration;
+
+    use crate::execution::runs::testkit::{seed_real_worktree_approval, test_state_with_runner};
+
+    /// An approved resume supersedes the paused run and starts its successor, then wakes the runs topic.
+    ///
+    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_continue_paused_run_bumps_runs() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        let before = *rx.borrow();
+
+        let resume_id =
+            super::continue_paused_run(&state, proposal_id, super::Continuation::Approve)
+                .await
+                .unwrap();
+
+        assert!(resume_id > 0);
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+        let superseded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE status = 'superseded'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(superseded, 1, "the signal follows the committed write");
+    }
 }

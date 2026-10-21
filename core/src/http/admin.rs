@@ -476,6 +476,23 @@ pub(super) async fn get_machine_config(
     })))
 }
 
+/// Creates the directory a settings row lives in under `root`, if it has one beyond `root` itself.
+///
+/// `setting_path` is the table's own string (`Setting::path`), never the caller's `body.path`, so
+/// the directories made are only ever ones a row names.
+pub(super) fn create_setting_dirs(
+    root: &std::path::Path,
+    setting_path: &str,
+) -> std::io::Result<()> {
+    match root.join(setting_path).parent() {
+        Some(parent) => std::fs::create_dir_all(parent),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod channels_write_tests;
+
 /// Writes one of this machine's settings files, having first made it prove it parses.
 ///
 /// Deliberately the same shape as [`post_project_write`] — same refusal names, same validate-then-
@@ -514,6 +531,12 @@ pub(super) async fn post_machine_config(
     // is known to be a row, so a refused path still leaves nothing behind.
     std::fs::create_dir_all(&root).map_err(|error| {
         tracing::warn!(%error, "could not create this machine's settings directory");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+    // A row may sit in a subdirectory (`channels/telegram.yaml`), and `safe_write_target` answers
+    // only for a parent that exists. Made from the table's string, before the target is resolved.
+    create_setting_dirs(&root, setting.path).map_err(|error| {
+        tracing::warn!(%error, "could not create the directory of a machine settings file");
         refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
     })?;
     // `setting.path` and not `body.path`: the caller's spelling has been matched against the table

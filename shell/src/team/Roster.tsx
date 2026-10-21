@@ -37,9 +37,8 @@ import {
  * as a grid, and the console still draws it that way. One department is a containment: it holds a
  * director, who holds a roster, whose members hold work. Containment is a tree.
  *
- * **SVG by hand, and `roster-graph.ts` for everything that is not drawing** — the same division
- * `JobProgressGraph.tsx` makes, and for the same reason: the interesting half is arithmetic, and
- * arithmetic tested through a renderer is arithmetic tested badly.
+ * **SVG by hand, and `roster-graph.ts` for everything that is not drawing** — the interesting half is
+ * arithmetic, and arithmetic tested through a renderer is arithmetic tested badly.
  */
 
 /**
@@ -82,7 +81,7 @@ export function Roster({ team, runs, onOpenCharter }: RosterProps) {
   /*
     The layout depends on ids, labels and parents — never on a state. States change on every poll,
     and a chart that relaid itself each time would move under the cursor of whoever is reading it
-    while nothing structural had changed. `JobProgressGraph.tsx:26-35` memoises on the same fact.
+    while nothing structural had changed.
   */
   const shape = useMemo(
     () => JSON.stringify(model.nodes.map((node) => [node.id, node.label, node.parent])),

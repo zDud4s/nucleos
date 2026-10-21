@@ -178,13 +178,94 @@ pub(super) async fn get_pii_observations(
 /// `GET /notifications/policy` — the stored selection policy, verbatim (spec §5.3). A fresh
 /// database has no rows, so this answers `{"families": [], "kinds": []}` rather than 404: absence
 /// of a rule is the resolution's own "passes" default, not an error.
-pub(super) async fn get_notify_policy(State(state): State<AppState>) -> impl IntoResponse {
-    match notify_policy::load(&state.pool).await {
-        Ok(policy) => Json(policy).into_response(),
+///
+/// With `?channel=<id>` it answers `{channel, primary, default, overrides, resolved}` instead:
+/// the machine-wide rows, the channel's own rows, their merge, and whether the channel is the
+/// primary one.
+pub(super) async fn get_notify_policy(
+    State(state): State<AppState>,
+    Query(query): Query<PolicyQuery>,
+) -> impl IntoResponse {
+    let channel = match policy_channel(&query) {
+        Ok(channel) => channel,
+        Err(response) => return response,
+    };
+
+    let Some(channel) = channel else {
+        return match notify_policy::load(&state.pool).await {
+            Ok(policy) => Json(policy).into_response(),
+            Err(error) => {
+                tracing::warn!(%error, "notify_policy: reading the stored policy failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+            }
+        };
+    };
+
+    let read = async {
+        let default = notify_policy::load(&state.pool).await?;
+        let overrides = crate::channels::routing::channel_overrides(&state.pool, channel).await?;
+        let resolved =
+            crate::channels::routing::resolved_policy(&state.pool, Some(channel)).await?;
+        let primary = crate::channels::access::primary(&state.pool).await? == Some(channel);
+        Ok::<_, sqlx::Error>((default, overrides, resolved, primary))
+    };
+    match read.await {
+        Ok((default, overrides, resolved, primary)) => Json(serde_json::json!({
+            "channel": channel,
+            "primary": primary,
+            "default": default,
+            "overrides": overrides,
+            "resolved": resolved,
+        }))
+        .into_response(),
         Err(error) => {
-            tracing::warn!(%error, "notify_policy: reading the stored policy failed");
+            tracing::warn!(%error, "notify_policy: reading the channel policy failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
         }
+    }
+}
+
+/// The optional `?channel=<id>` of both policy routes. Absent = the machine-wide default policy,
+/// exactly as before channels existed.
+#[derive(Debug, Deserialize)]
+pub(super) struct PolicyQuery {
+    channel: Option<String>,
+}
+
+/// A channel id is a lowercase slug: letters, digits, `_` or `-`.
+fn is_well_formed_channel(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// `Ok(None)` = no `?channel=`; `Ok(Some(id))` = a compiled channel; `Err` = the 400/404 to send.
+#[allow(clippy::result_large_err)] // the error is the ready-made axum response, as in access::resolve_channel
+fn policy_channel(query: &PolicyQuery) -> Result<Option<&'static str>, axum::response::Response> {
+    let Some(raw) = query.channel.as_deref() else {
+        return Ok(None);
+    };
+    if !is_well_formed_channel(raw) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "refusal": "malformed_channel",
+                "detail": "the channel id is empty or not lowercase letters, digits, `_` or `-`",
+            })),
+        )
+            .into_response());
+    }
+    match crate::channels::registry::by_id(raw) {
+        Some(manifest) => Ok(Some(manifest.id)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "refusal": "unknown_channel",
+                "detail": format!("no channel {raw:?} is compiled into this build"),
+            })),
+        )
+            .into_response()),
     }
 }
 
@@ -202,28 +283,62 @@ pub(super) fn notify_policy_refusal_name(error: &notify_policy::ValidationError)
     }
 }
 
+/// The 400 every validation refusal of `PUT /notifications/policy` sends, with or without a channel.
+fn notify_policy_refusal(error: &notify_policy::ValidationError) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        // `detail`, not `message`: the shell's `refusalFrom` reads `body.detail` beside a
+        // `refusal` and never looks at `message`, so naming it wrong throws the selector away
+        // and leaves the page showing the code twice. Same pair every refusal in this file
+        // sends.
+        Json(serde_json::json!({
+            "refusal": notify_policy_refusal_name(error),
+            "detail": error.to_string(),
+        })),
+    )
+        .into_response()
+}
+
 /// `PUT /notifications/policy` — replaces the whole policy (spec §5.3). Validates BEFORE writing;
 /// `notify_policy::replace` itself never calls `validate`, so a rejected shape and a database
 /// error cannot share a code path. A `400` names the refusal and the selector in question, so the
 /// shell can point at the offending row instead of saying "invalid" (§7.4). A `500` means the
 /// transaction never committed, so the table is exactly as it was.
+///
+/// With `?channel=<id>` it replaces that channel's override rows instead (an empty policy clears
+/// them); the same five refusals apply.
 pub(super) async fn put_notify_policy(
     State(state): State<AppState>,
+    Query(query): Query<PolicyQuery>,
     Json(policy): Json<notify_policy::Policy>,
 ) -> impl IntoResponse {
+    let channel = match policy_channel(&query) {
+        Ok(channel) => channel,
+        Err(response) => return response,
+    };
+
     if let Err(error) = notify_policy::validate(&policy) {
-        return (
-            StatusCode::BAD_REQUEST,
-            // `detail`, not `message`: the shell's `refusalFrom` reads `body.detail` beside a
-            // `refusal` and never looks at `message`, so naming it wrong throws the selector away
-            // and leaves the page showing the code twice. Same pair every refusal in this file
-            // sends.
-            Json(serde_json::json!({
-                "refusal": notify_policy_refusal_name(&error),
-                "detail": error.to_string(),
-            })),
+        return notify_policy_refusal(&error);
+    }
+
+    if let Some(channel) = channel {
+        return match crate::channels::routing::put_channel_policy(
+            &state.pool,
+            channel,
+            &policy,
+            chrono::Utc::now(),
         )
-            .into_response();
+        .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(crate::channels::routing::PolicyError::Invalid(error)) => {
+                notify_policy_refusal(&error)
+            }
+            Err(crate::channels::routing::PolicyError::Db(error)) => {
+                tracing::warn!(%error, "notify_policy: writing the channel policy failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
+            }
+        };
     }
 
     match notify_policy::replace(&state.pool, &policy).await {
@@ -245,5 +360,205 @@ pub(super) async fn get_notify_kinds(State(state): State<AppState>) -> impl Into
             tracing::warn!(%error, "notify_policy: reading observed kinds failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "database error").into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    // `channels::testkit` is `#[cfg(test)]` in the lib, so it does not exist when the bin's tests
+    // compile; the `mod http` tests build their state with `http::tests::test_state`. The lib's
+    // `fake` channel is `#[cfg(test)]` too, so these tests use the production `telegram` manifest.
+    async fn state() -> AppState {
+        super::super::tests::test_state().await
+    }
+
+    async fn call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test-token");
+        let body = match body {
+            Some(body) => {
+                request = request.header("content-type", "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = super::super::build_router(state.clone())
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn empty_policy() -> serde_json::Value {
+        serde_json::json!({"families": [], "kinds": []})
+    }
+
+    #[tokio::test]
+    async fn notify_policy_without_channel_is_unchanged() {
+        let state = state().await;
+        let (status, body) = call(&state, "GET", "/notifications/policy", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, empty_policy());
+
+        let put = serde_json::json!({
+            "families": [{"selector": "job_", "enabled": false}],
+            "kinds": []
+        });
+        let (status, _) = call(&state, "PUT", "/notifications/policy", Some(put.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = call(&state, "GET", "/notifications/policy", None).await;
+        assert_eq!(body, put);
+    }
+
+    #[tokio::test]
+    async fn notify_policy_empty_channel_param_is_400_malformed_channel() {
+        let state = state().await;
+        for uri in [
+            "/notifications/policy?channel=",
+            "/notifications/policy?channel=Bad%20Id",
+        ] {
+            let (status, body) = call(&state, "GET", uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["refusal"], "malformed_channel");
+            let (status, body) = call(&state, "PUT", uri, Some(empty_policy())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["refusal"], "malformed_channel");
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_policy_unknown_channel_is_404() {
+        let state = state().await;
+        let (status, body) = call(&state, "GET", "/notifications/policy?channel=nope", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "unknown_channel");
+        let (status, body) = call(
+            &state,
+            "PUT",
+            "/notifications/policy?channel=nope",
+            Some(empty_policy()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["refusal"], "unknown_channel");
+    }
+
+    #[tokio::test]
+    async fn notify_policy_get_with_channel_returns_default_overrides_resolved_primary() {
+        let state = state().await;
+        notify_policy::replace(
+            &state.pool,
+            &notify_policy::Policy {
+                families: vec![notify_policy::Rule {
+                    selector: "job_".into(),
+                    enabled: false,
+                }],
+                kinds: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let (status, _) = call(
+            &state,
+            "PUT",
+            "/notifications/policy?channel=telegram",
+            Some(serde_json::json!({
+                "families": [{"selector": "job_", "enabled": true}],
+                "kinds": []
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = call(
+            &state,
+            "GET",
+            "/notifications/policy?channel=telegram",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["channel"], "telegram");
+        assert_eq!(body["primary"], false);
+        assert_eq!(
+            body["default"]["families"],
+            serde_json::json!([{"selector": "job_", "enabled": false}])
+        );
+        assert_eq!(
+            body["overrides"]["families"],
+            serde_json::json!([{"selector": "job_", "enabled": true}])
+        );
+        assert_eq!(
+            body["resolved"]["families"],
+            serde_json::json!([{"selector": "job_", "enabled": true}])
+        );
+
+        // Once the channel is the primary one, `primary` says so.
+        sqlx::query("UPDATE channels_global SET primary_channel = 'telegram' WHERE id = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (_, body) = call(
+            &state,
+            "GET",
+            "/notifications/policy?channel=telegram",
+            None,
+        )
+        .await;
+        assert_eq!(body["primary"], true);
+    }
+
+    #[tokio::test]
+    async fn notify_policy_put_with_channel_replaces_overrides_204() {
+        let state = state().await;
+        let uri = "/notifications/policy?channel=telegram";
+        let first = serde_json::json!({
+            "families": [{"selector": "job_", "enabled": false}],
+            "kinds": [{"selector": "job_done", "enabled": true}]
+        });
+        let (status, _) = call(&state, "PUT", uri, Some(first)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let second = serde_json::json!({
+            "families": [{"selector": "email_", "enabled": false}],
+            "kinds": []
+        });
+        let (status, _) = call(&state, "PUT", uri, Some(second.clone())).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = call(&state, "GET", uri, None).await;
+        assert_eq!(body["overrides"], second);
+
+        // A refusal names the selector and writes nothing.
+        let refused = serde_json::json!({
+            "families": [{"selector": "", "enabled": true}],
+            "kinds": []
+        });
+        let (status, body) = call(&state, "PUT", uri, Some(refused)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["refusal"], "empty_selector");
+        let (_, body) = call(&state, "GET", uri, None).await;
+        assert_eq!(body["overrides"], second);
+
+        // The machine-wide policy was never touched.
+        let (_, body) = call(&state, "GET", "/notifications/policy", None).await;
+        assert_eq!(body, empty_policy());
     }
 }

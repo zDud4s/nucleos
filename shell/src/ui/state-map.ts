@@ -450,8 +450,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * One "these two never run at the same time", in either of its two lives.
    *
    * A shell derivation, allowed by this docstring: `active` is a row of `fleet_exclusions` and
-   * `pending` is a `fleet-exclusion` proposal still in the queue (`canvas/model.ts`,
-   * `exclusionEdges`). A rule in force holds a job back, which is Held Ember's whole meaning —
+   * `pending` is a `fleet-exclusion` proposal still in the queue (the Waiting queue's `ExclusionRequests`). A rule in force holds a job back, which is Held Ember's whole meaning —
    * not Deliberating Violet, which is shadow mode and nothing else. A question nobody has answered
    * asks something of the reader, so it is amber.
    */

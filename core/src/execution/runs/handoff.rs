@@ -511,7 +511,7 @@ pub(super) async fn prepare_handoff_successor(
         .await?;
 
     if !record_handoff_if_needed(pool, run_id, successor_id).await? {
-        crate::storage::settle_write("run (interrupted)", successor_id, || {
+        let settled = crate::storage::settle_write("run (interrupted)", successor_id, || {
             sqlx::query(
                 "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE id = ? AND status = 'running'",
             )
@@ -520,6 +520,10 @@ pub(super) async fn prepare_handoff_successor(
             .execute(pool)
         })
         .await;
+        // After the write, and only if it landed: a woken reader finds the successor interrupted.
+        if settled {
+            nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
+        }
         return Ok(false);
     }
 
@@ -577,6 +581,10 @@ pub(super) async fn prepare_handoff_successor(
             .execute(pool)
             .await;
             warn_on_terminal_write_err(&failed, successor_id, "failed");
+            // After the write, and only if it won the compare-and-set.
+            if matches!(&failed, Ok(done) if done.rows_affected() == 1) {
+                nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
+            }
             return Err(error);
         }
     }
@@ -793,4 +801,48 @@ pub(super) async fn spawn_handoff_if_needed(
         JobNodeMcp::for_run(successor.id, successor.job_id),
         max_turns,
     );
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// A handoff that cannot be completed fails the successor and wakes the runs topic.
+    ///
+    /// The failure is forced by an abort trigger on the handoff event, so the successor is born
+    /// `running` and then settled by the `failed` write the bump follows. The wake bus is
+    /// process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_handoff_successor_bumps_runs() {
+        let state = crate::channels::testkit::state().await;
+        sqlx::query(
+            "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill, created_at)
+             VALUES (43901, 'project-w', 'the task', 'running', 'real', ?, '2026-10-19T00:00:00Z')",
+        )
+        .bind(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER wake_test_refuse_handoff_event BEFORE INSERT ON run_events
+             WHEN NEW.kind = 'context_handoff'
+             BEGIN SELECT RAISE(ABORT, 'refused for the wake test'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        let before = *rx.borrow();
+
+        let outcome = prepare_handoff_successor(&state.pool, 43901).await;
+
+        assert!(outcome.is_err(), "the handoff event write was refused");
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+        let failed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE status = 'failed' AND id <> 43901")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(failed, 1, "the signal follows the failed write");
+    }
 }

@@ -49,6 +49,7 @@ pub mod embed;
 pub mod execution;
 pub use nucleos_base::feed;
 pub mod files;
+pub mod fleet;
 pub use nucleos_base::gate;
 pub mod governance;
 pub use nucleos_base::handoff;
