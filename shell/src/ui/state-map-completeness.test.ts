@@ -105,6 +105,9 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   },
   // The fake channel's `feed_row` stimulus writes whatever kind the test script supplies.
   "channels/fake.rs": { 'text_of(stimulus,"kind")?': [] },
+  // A test-only module (`#[cfg(test)] mod port_tests_commands;`): its `feed_line` helper forwards
+  // the kind each test passes, so it writes no kind of the product's own.
+  "channels/port_tests_commands.rs": { kind: [] },
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
 };
 
