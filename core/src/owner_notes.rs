@@ -1234,13 +1234,10 @@ mod tests {
         one_call_is_sanctioned(source, &format!("{needle}s::create("))
     }
 
-    /// True when the production code of `source` names the notes module only inside `call`, and
-    /// exactly once.
-    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
-        let needle = ["owner", "note"].join("_");
-        let mut calls = 0;
-        // Cut at the test module itself, not at any `#[cfg(test)]`: a test-only helper above it
-        // would otherwise hide the production code that follows from the sweep.
+    /// `source` up to its test module. Cut at the test module itself, not at any `#[cfg(test)]`:
+    /// a test-only helper above it would otherwise hide the production code that follows from
+    /// the sweep.
+    fn production_code(source: &str) -> String {
         let lines: Vec<&str> = source.lines().collect();
         let end = lines
             .windows(2)
@@ -1248,7 +1245,16 @@ mod tests {
                 w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
             })
             .unwrap_or(lines.len());
-        for line in &lines[..end] {
+        lines[..end].join("\n")
+    }
+
+    /// True when the production code of `source` names the notes module only inside `call`, and
+    /// exactly once.
+    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        let mut calls = 0;
+        let production = production_code(source);
+        for line in production.lines() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
@@ -1326,6 +1332,21 @@ mod tests {
     }
 
     #[test]
+    fn the_generic_sweep_ignores_test_modules_but_not_production_code() {
+        let needle = ["owner", "note"].join("_");
+        let only_in_tests =
+            format!("fn run() {{}}\n#[cfg(test)]\nmod tests {{\nJOIN {needle}s;\n}}");
+        assert!(!production_code(&only_in_tests).contains(&needle));
+        let in_production = format!("use crate::{needle}s;\n#[cfg(test)]\nmod tests {{\n}}");
+        assert!(production_code(&in_production).contains(&needle));
+        // A test-only helper above production code does not end the sweep.
+        let helper_first = format!("#[cfg(test)]\nfn helper() {{}}\nuse crate::{needle}s;");
+        assert!(production_code(&helper_first).contains(&needle));
+    }
+
+    /// The guard below scans production code only: a test module may read the notes table to
+    /// assert behaviour (D4 is about production reach, not about what a test inspects).
+    #[test]
     fn no_core_module_but_six_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1391,8 +1412,9 @@ mod tests {
                 continue;
             }
             assert!(
-                !source.contains(&needle),
-                "{} mentions `{needle}`: the owner's notes are reachable from owner_notes.rs, \
+                !production_code(&source).contains(&needle),
+                "{} mentions `{needle}` in production code (test modules are not scanned): the \
+                 owner's notes are reachable from owner_notes.rs, \
                  http.rs and main.rs (spec D4), from distill.rs through one read call, and from \
                  capture.rs and channels/commands.rs through one write call each, only, so that \
                  nothing in the agent's memory can read them",
