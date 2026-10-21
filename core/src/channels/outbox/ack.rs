@@ -100,15 +100,15 @@ pub async fn ack(
 ) -> sqlx::Result<Option<AckOutcome>> {
     let stamped = stamp(now);
     let mut tx = state.pool.begin().await?;
-    let row: Option<(String, i64, String, String, String, String, Option<String>)> =
-        sqlx::query_as(
-            "SELECT state, attempts, conversation, action, payload, class, subject \
+    type OutboxRow = (String, i64, String, String, String, String, Option<String>);
+    let row: Option<OutboxRow> = sqlx::query_as(
+        "SELECT state, attempts, conversation, action, payload, class, subject \
              FROM channel_outbox WHERE id = ? AND channel = ?",
-        )
-        .bind(id)
-        .bind(channel)
-        .fetch_optional(&mut *tx)
-        .await?;
+    )
+    .bind(id)
+    .bind(channel)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some((row_state, attempts, conversation, action, payload, class, subject)) = row else {
         return Ok(None);
     };
@@ -238,7 +238,7 @@ async fn fall_back(
         _ => parts.insert(0, OutPart::Text { text: prefix }),
     }
     let replacement = enqueue(
-        &mut **tx,
+        tx,
         &ConversationKey::new(channel, &home),
         NewAction::Send {
             reply_to: None,

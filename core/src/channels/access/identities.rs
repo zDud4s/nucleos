@@ -270,10 +270,10 @@ pub async fn forget(
         .map(String::as_str)
         .chain(still_covered)
         .collect();
-    outbox::revoke_unallowed(&mut *tx, channel, &allowed, now)
+    outbox::revoke_unallowed(&mut tx, channel, &allowed, now)
         .await
         .map_err(ForgetError::Db)?;
-    tokens::purge_unallowed(&mut *tx, channel, &allowed)
+    tokens::purge_unallowed(&mut tx, channel, &allowed)
         .await
         .map_err(ForgetError::Db)?;
     tx.commit().await.map_err(ForgetError::Db)?;

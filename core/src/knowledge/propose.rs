@@ -255,38 +255,6 @@ pub async fn propose_in_with(
     Ok((knowledge_id, proposal_id))
 }
 
-#[cfg(test)]
-mod wake_tests {
-    use super::*;
-
-    /// Declaring a learning wakes the proposals topic once the transaction has committed.
-    ///
-    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
-    #[tokio::test]
-    async fn wake_signal_knowledge_propose_bumps_proposals() {
-        let pool = crate::testdb::fresh_pool().await;
-        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
-        let before = *rx.borrow();
-
-        propose(
-            &pool,
-            Declaration {
-                project_id: None,
-                origin_run_id: None,
-                kind: Kind::Memory,
-                title: "Wake lesson",
-                body: "Signals the proposals topic.",
-                reasoning: "wake signal test",
-                supersedes: None,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(rx.borrow().wrapping_sub(before) >= 1);
-    }
-}
-
 /// How many runs a distilled episode may go unconfirmed before it expires - the consolidator's
 /// trial, spec `destilador` section 3.
 pub const DISTILLED_TRIAL_RUNS: i64 = 50;
@@ -527,4 +495,36 @@ pub(super) async fn reconfirm_row_in(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// Declaring a learning wakes the proposals topic once the transaction has committed.
+    ///
+    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_knowledge_propose_bumps_proposals() {
+        let pool = crate::testdb::fresh_pool().await;
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Proposals);
+        let before = *rx.borrow();
+
+        propose(
+            &pool,
+            Declaration {
+                project_id: None,
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title: "Wake lesson",
+                body: "Signals the proposals topic.",
+                reasoning: "wake signal test",
+                supersedes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
 }

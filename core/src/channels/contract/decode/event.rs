@@ -128,7 +128,7 @@ fn validate_part(part: &PartWire, at: &str) -> Result<(), ContractError> {
     let (allowed, required) = part_fields(part.kind);
     for &(name, here) in present.iter() {
         check(
-            !here || allowed.iter().any(|a| *a == name),
+            !here || allowed.contains(&name),
             ErrorCode::Forbidden,
             &format!("{at}/{name}"),
         )?;

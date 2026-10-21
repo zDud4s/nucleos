@@ -241,6 +241,7 @@ fn is_well_formed_channel(id: &str) -> bool {
 }
 
 /// `Ok(None)` = no `?channel=`; `Ok(Some(id))` = a compiled channel; `Err` = the 400/404 to send.
+#[allow(clippy::result_large_err)] // the error is the ready-made axum response, as in access::resolve_channel
 fn policy_channel(query: &PolicyQuery) -> Result<Option<&'static str>, axum::response::Response> {
     let Some(raw) = query.channel.as_deref() else {
         return Ok(None);

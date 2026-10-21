@@ -806,7 +806,7 @@ mod tests {
     }
 
     async fn run_steps(st: &AppState, scenario: &Value) -> Result<(), String> {
-        let adapter = FakeAdapter::new(&st, "fake").await;
+        let adapter = FakeAdapter::new(st, "fake").await;
         let hello = adapter
             .hello(scenario["hello"]["capabilities"].clone())
             .await;
@@ -825,7 +825,7 @@ mod tests {
             let at = |why: String| format!("step {}: {why}", index + 1);
             let mut response = Value::Null;
             if let Some(core) = step.get("core") {
-                stimulate(&st, core).await.map_err(at)?;
+                stimulate(st, core).await.map_err(at)?;
             } else if let Some(event) = step.get("event") {
                 decode::<EventShape>(event.to_string().as_bytes())
                     .map_err(|e| at(format!("the event is not a valid event: {e:?}")))?;

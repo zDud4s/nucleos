@@ -73,10 +73,10 @@ pub fn route(text: &str) -> Intent {
             filter: Some(arg.to_string()),
         };
     }
-    if let Some(code) = word_argument(trimmed, "/pair") {
-        if !code.is_empty() {
-            return Intent::Pair(code.to_string());
-        }
+    if let Some(code) = word_argument(trimmed, "/pair")
+        && !code.is_empty()
+    {
+        return Intent::Pair(code.to_string());
     }
     if let Some(rest) = word_argument(trimmed, "/cap") {
         let mut parts = rest.splitn(2, char::is_whitespace);

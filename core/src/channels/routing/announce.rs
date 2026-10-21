@@ -390,11 +390,11 @@ mod tests {
         }
     }
 
+    type SentRow = (String, String, String, Option<String>, Option<String>);
+
     /// `(conversation, text, class, subject, expires_at)` of every outbox row, oldest first.
-    async fn sent(
-        state: &AppState,
-    ) -> Vec<(String, String, String, Option<String>, Option<String>)> {
-        let rows: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+    async fn sent(state: &AppState) -> Vec<SentRow> {
+        let rows: Vec<SentRow> = sqlx::query_as(
             "SELECT conversation, payload, class, subject, expires_at \
              FROM channel_outbox ORDER BY id",
         )
