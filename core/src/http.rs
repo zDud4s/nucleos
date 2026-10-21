@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn the_live_parameter_reaches_past_the_window_and_its_absence_changes_nothing() {
         let (state, db) = file_test_state().await;
-        let old_live = seed_job_row(&state.pool, "project-a", "implementing").await;
+        let old_live = seed_job_row(&state.pool, "project-a", "running").await;
         for _ in 0..25 {
             seed_job_row(&state.pool, "project-b", "completed").await;
         }
@@ -1313,9 +1313,9 @@ mod tests {
     async fn seed_pressure_team(pool: &sqlx::SqlitePool, with_a_job: bool) {
         for agent in ["director", "Nucleo"] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, 'a speciality', 'a prompt', 'claude', 'unrestricted',
+                 VALUES (?, ?, 'a speciality', 'a prompt', 'claude', '[\"shell\"]',
                          '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')",
             )
             .bind(agent)
@@ -1655,7 +1655,7 @@ mod tests {
     async fn add_job(pool: &sqlx::SqlitePool, project_id: &str) -> i64 {
         sqlx::query(
             "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
-             VALUES (?, ?, 'implementing', 5, '2026-08-15T00:00:00Z')",
+             VALUES (?, ?, 'running', 5, '2026-08-15T00:00:00Z')",
         )
         .bind(project_id)
         .bind(format!("C:/projects/{project_id}"))
@@ -2921,7 +2921,7 @@ mod tests {
         let state = test_state().await;
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES (9, 'proj', 'C:/x', 'x', 'implementing', 5, 1, 1, '2026-09-27T00:00:00Z')",
+             VALUES (9, 'proj', 'C:/x', 'x', 'running', 5, 1, 1, '2026-09-27T00:00:00Z')",
         )
         .execute(&state.pool)
         .await
@@ -3965,7 +3965,7 @@ mod tests {
 
     /// Points `state` at a temporary directory standing in for `~/.nucleos`, so project state can be
     /// written and read without a real home. The directory lives as long as the returned guard.
-    fn with_project_home(state: &mut AppState) -> tempfile::TempDir {
+    pub(super) fn with_project_home(state: &mut AppState) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         state.machine_config_root = Some(home.path().to_path_buf());
         home
@@ -3974,7 +3974,11 @@ mod tests {
     /// Registers a project with a root on disk and, when `state` has a stand-in home, writes its
     /// rules where the daemon reads them: `<home>/projects/<id>/autopilot.yaml`. Without one the
     /// project simply has no rules, which is all most callers here need.
-    async fn project_with_rules(state: &AppState, id: &str, yaml: &str) -> tempfile::TempDir {
+    pub(super) async fn project_with_rules(
+        state: &AppState,
+        id: &str,
+        yaml: &str,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         if let Some(home) = state.machine_config_root.as_deref() {
             crate::project::state::write_for_test(
@@ -8352,7 +8356,9 @@ mod tests {
     /// The library goes through `AppState` rather than through the machine's home directory, which
     /// is what makes any of this testable without touching the person running the suite. See the
     /// field's own comment in `state.rs`.
-    fn library_with(bundles: &[(&str, &str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
+    pub(super) fn library_with(
+        bundles: &[(&str, &str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         for (name, version, manifest) in bundles {
             let at = dir.path().join(name).join(version);
@@ -8396,7 +8402,45 @@ mod tests {
         );
     }
 
-    async fn workflow_call(
+    /// Installs `name@version` into project `alpha` the way the shell will: read the consent
+    /// listing, then send back its digest. Asserts the install succeeded.
+    pub(super) async fn install_consenting(state: &AppState, name: &str, version: &str) {
+        let (status, listing) = workflow_call(
+            state.clone(),
+            "GET",
+            &format!("/projects/alpha/workflows/{name}/consent?version={version}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        // `GET .../consent` carries no digest (the refusal does), so ask for it by installing
+        // without one first when the listing says a command needs agreeing to.
+        let needs = listing["commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|c| c["change"] != "unchanged"));
+        let mut request = serde_json::json!({ "name": name, "version": version });
+        if needs {
+            let (status, refused) = workflow_call(
+                state.clone(),
+                "POST",
+                "/projects/alpha/workflows",
+                Some(request.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+            request["consent_digest"] = refused["digest"].clone();
+        }
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/workflows",
+            Some(request),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    }
+
+    pub(super) async fn workflow_call(
         state: AppState,
         method: &str,
         uri: &str,
@@ -9810,13 +9854,7 @@ mod tests {
         let _home = with_project_home(&mut state);
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
-        workflow_call(
-            state.clone(),
-            "POST",
-            "/projects/alpha/workflows",
-            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
-        )
-        .await;
+        install_consenting(&state, "harness", "1.0").await;
 
         let (status, graph) = workflow_call(
             state.clone(),
@@ -9869,13 +9907,7 @@ mod tests {
         let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
-        workflow_call(
-            state.clone(),
-            "POST",
-            "/projects/alpha/workflows",
-            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
-        )
-        .await;
+        install_consenting(&state, "harness", "1.0").await;
 
         // Through the route that writes it, rather than by editing the file in the test: the
         // shape of the pins file is `render_pins`'s business, and a test that hand-indented it
@@ -10023,13 +10055,7 @@ mod tests {
         assert_eq!(first["commands"][0]["command"], "cargo test");
         assert_eq!(first["commands"][0]["change"], "new");
 
-        workflow_call(
-            state.clone(),
-            "POST",
-            "/projects/alpha/workflows",
-            Some(serde_json::json!({ "name": "harness", "version": "1.0" })),
-        )
-        .await;
+        install_consenting(&state, "harness", "1.0").await;
 
         let (status, update) = workflow_call(
             state.clone(),
@@ -19396,7 +19422,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(status, "planning", "a job's first act is to plan");
+        assert_eq!(status, "running", "a job's first act is to plan");
         assert_eq!(rule_name, None, "no rule asked for this one; a person did");
 
         // Read through `owner_kind`/`owner_id` because that is how the row is written — and it is
@@ -19416,9 +19442,9 @@ mod tests {
     async fn team_in(pool: &sqlx::SqlitePool, team_id: &str) {
         let now = "2026-08-20T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', 'inherit', ?, ?)",
+             VALUES ('dir', 'Dir', 'directing', 'lead', 'claude', '[]', ?, ?)",
         )
         .bind(now)
         .bind(now)
@@ -23322,9 +23348,9 @@ mod tests {
     async fn agent_in(pool: &sqlx::SqlitePool, agent_id: &str) {
         let now = "2026-10-09T00:00:00Z";
         sqlx::query(
-            "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+            "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                  created_at, updated_at)
-             VALUES (?, ?, 'remembering', 'recall', 'claude', 'inherit', ?, ?)",
+             VALUES (?, ?, 'remembering', 'recall', 'claude', '[]', ?, ?)",
         )
         .bind(agent_id)
         .bind(format!("Agent {agent_id}"))
@@ -24217,7 +24243,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, created_at)
-             VALUES (5, 'proj', 'C:/x', 'x', 'implementing', 5, '2026-09-27T00:00:00Z')",
+             VALUES (5, 'proj', 'C:/x', 'x', 'running', 5, '2026-09-27T00:00:00Z')",
         )
         .execute(&state.pool)
         .await
@@ -24233,7 +24259,7 @@ mod tests {
         let long = "a".repeat(80);
         sqlx::query(
             "INSERT INTO jobs (id, project_id, project_root, prompt, status, max_items, created_at)
-             VALUES (5, 'proj', 'C:/x', ?, 'implementing', 5, '2026-09-27T00:00:00Z')",
+             VALUES (5, 'proj', 'C:/x', ?, 'running', 5, '2026-09-27T00:00:00Z')",
         )
         .bind(format!("{long}\nsecond line"))
         .execute(&state.pool)
@@ -24957,8 +24983,8 @@ mod tests {
     async fn loadout_seed_agent_and_team(pool: &sqlx::SqlitePool) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
-                 (id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at)
-             VALUES ('scout', 'Scout', 'reads', 'p', 'claude', NULL, 'mcp_only',
+                 (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
+             VALUES ('scout', 'Scout', 'reads', 'p', 'claude', NULL, '[\"mcp.nucleos\"]',
                      '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z')",
         )
         .execute(pool)

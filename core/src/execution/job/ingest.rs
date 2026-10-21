@@ -24,8 +24,8 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
     // SQL built at runtime. `a_node_still_in_flight_is_not_reconciled` holds the two in step.
     let landed: Vec<(i64, i64, String)> = sqlx::query_as(
         "SELECT i.ordinal, r.id, r.status
-         FROM job_items i JOIN runs r ON r.id = i.run_id
-         WHERE i.job_id = ? AND i.status = 'running'
+         FROM job_nodes i JOIN runs r ON r.id = i.run_id
+         WHERE i.job_id = ? AND i.status = 'running' AND i.ordinal IS NOT NULL
            AND r.status NOT IN ('running','awaiting_approval')",
     )
     .bind(job.id)
@@ -35,7 +35,7 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
     for (ordinal, run_id, run_status) in landed {
         // **A terminal row whose task is still registered is not finished yet.** The run body
         // writes its ending first and only then decides on a context handoff, inserts the
-        // successor and moves `job_items.run_id` onto it. A pass landing in that gap read the
+        // successor and moves `job_nodes.run_id` onto it. A pass landing in that gap read the
         // predecessor's `completed`, called the item implemented and gated or started the next
         // item while the successor was editing the same tree. The registration outlives every
         // write the body makes — it drops when the task returns, after the handoff — so waiting
@@ -114,7 +114,7 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
         // `AND status = 'running'`: a job cancel marks the item `cancelled` on its own, and this
         // pass, having read the row before that, must not write `implemented` back over it.
         sqlx::query(
-            "UPDATE job_items SET status = ? WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+            "UPDATE job_nodes SET status = ? WHERE job_id = ? AND ordinal = ? AND status = 'running'",
         )
         .bind(item_status)
         .bind(job.id)
@@ -152,7 +152,7 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
         }
     }
 
-    if job.stage() == "planning" {
+    if !plan_is_recorded(pool, job.id).await? {
         ingest_plan(state, job).await?;
     }
     // Unconditional, unlike the plan node's, because a replan node has no status of its own to key
@@ -164,7 +164,7 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
 
 /// Whether one of this job's nodes has stopped to ask permission.
 ///
-/// The job row otherwise reads `implementing` while the whole chain is blocked on a person, and
+/// The job row otherwise reads `running` while the whole chain is blocked on a person, and
 /// the only sign anywhere is a proposal in a queue that never names the job it came from.
 pub(super) async fn node_awaiting_approval(pool: &SqlitePool, job_id: i64) -> sqlx::Result<bool> {
     let paused: Option<i64> = sqlx::query_scalar(
@@ -207,15 +207,26 @@ pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<
         return Ok(());
     }
 
-    let contents = match job_worktree(pool, job.id).await? {
-        Some((worktree, _)) => {
-            let file = worktree
-                .join(crate::execution::worktree::ARTIFACTS_DIR)
-                .join(PLAN_FILE);
-            tokio::fs::read(&file).await.ok()
-        }
-        None => None,
+    // Read once; the same bytes feed `parse_plan` (the queue) and the flat emission facts.
+    let read = match job_worktree(pool, job.id).await? {
+        Some((worktree, _)) => super::engine::read_emission_bytes(&worktree, "plan").await,
+        None => Ok(None),
     };
+    let contents = match read {
+        Ok(contents) => contents,
+        Err(error) => {
+            finish(pool, job.id, Outcome::Failed).await?;
+            say(
+                pool,
+                job,
+                "job_plan_failed",
+                &format!("job {} could not plan: {error}", job.id),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    let _flat = super::engine::plan_facts_of(contents.as_deref());
 
     let planned = match parse_plan(
         contents.as_deref(),
@@ -240,7 +251,7 @@ pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<
     };
 
     // One transaction for the queue and the status that says the queue exists. Written apart, a
-    // crash after some of the items left a `planning` job holding half a queue: the next pass
+    // crash after some of the items left a job with no recorded plan holding half a queue: the next pass
     // read the same plan again and wrote it a second time on top of the first.
     let mut tx = pool.begin().await?;
     for (ordinal, item) in planned.items.iter().enumerate() {
@@ -251,21 +262,26 @@ pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<
         let files = (!item.files.is_empty())
             .then(|| serde_json::to_string(&item.files).ok())
             .flatten();
-        sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, files, depends_on,
-                                    agent_id)
-             VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+        let depends_on = edges(&item.depends_on);
+        insert_fan_item(
+            &mut *tx,
+            &NewFanItem {
+                job_id: job.id,
+                node_id: "implement",
+                ordinal: ordinal as i64,
+                round: 0,
+                description: &item.description,
+                files: files.as_deref(),
+                depends_on: depends_on.as_deref(),
+                agent_id: item.agent_id.as_deref(),
+            },
         )
-        .bind(job.id)
-        .bind(ordinal as i64)
-        .bind(&item.description)
-        .bind(files)
-        .bind(edges(&item.depends_on))
-        .bind(item.agent_id.as_deref())
-        .execute(&mut *tx)
         .await?;
     }
-    let moved = set_live_status(&mut *tx, job.id, "implementing").await?;
+    // The plan node is done: its singleton row says so, in the same transaction as the queue. The
+    // live check keeps the old compare-and-set's job: `false` means the job ended meanwhile.
+    insert_singleton_node(&mut *tx, job.id, "plan", job.round, "passed").await?;
+    let moved = job_is_live(&mut *tx, job.id).await?;
     tx.commit().await?;
     if !moved {
         // Ended while its plan was being read. The queue stays written — it is what the job meant
@@ -391,15 +407,24 @@ pub(super) async fn ingest_replan(state: &AppState, job: &JobRow) -> sqlx::Resul
         return Ok(());
     }
 
-    let contents = match job_worktree(pool, job.id).await? {
-        Some((worktree, _)) => {
-            let file = worktree
-                .join(crate::execution::worktree::ARTIFACTS_DIR)
-                .join(PLAN_FILE);
-            tokio::fs::read(&file).await.ok()
-        }
-        None => None,
+    let read = match job_worktree(pool, job.id).await? {
+        Some((worktree, _)) => super::engine::read_emission_bytes(&worktree, "plan").await,
+        None => Ok(None),
     };
+    let contents = match read {
+        Ok(contents) => contents,
+        Err(error) => {
+            stop_after_replan(
+                state,
+                job,
+                run_id,
+                &format!("its replan node left a plan.json that could not be read ({error})"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let _flat = super::engine::plan_facts_of(contents.as_deref());
     let planned = match parse_plan(
         contents.as_deref(),
         job.max_items.max(0) as usize,
@@ -471,7 +496,7 @@ pub(super) async fn stop_after_replan(
 
 /// Queues what a replan asked for and moves the job onto the next round.
 ///
-/// Ordinals CONTINUE rather than restart, because `ordinal` is half `job_items`'s primary key and
+/// Ordinals CONTINUE rather than restart, because `ordinal` is half `job_nodes`'s primary key and
 /// because the position in the loaded queue is the number `advance` looks an item up by. The round
 /// is carried on the row as a label, for the replan node's history and for a person reading which
 /// round a given item came from.
@@ -488,11 +513,7 @@ pub(super) async fn open_the_next_round(
     // a crash between the items and the marker left the items queued and the replan untaken, and
     // the next pass opened the same round a second time.
     let mut tx = pool.begin().await?;
-    let next_ordinal: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(ordinal) + 1, 0) FROM job_items WHERE job_id = ?")
-            .bind(job.id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let next_ordinal: i64 = next_ordinal(&mut *tx, job.id, "implement").await?;
 
     for (offset, item) in planned.items.iter().enumerate() {
         // The same NULL-rather-than-`[]` rule as the first round's ingestion, and carried here for
@@ -502,19 +523,20 @@ pub(super) async fn open_the_next_round(
         let files = (!item.files.is_empty())
             .then(|| serde_json::to_string(&item.files).ok())
             .flatten();
-        sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, round, files, depends_on,
-                                    agent_id)
-             VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+        let depends_on = edges(&item.depends_on);
+        insert_fan_item(
+            &mut *tx,
+            &NewFanItem {
+                job_id: job.id,
+                node_id: "implement",
+                ordinal: next_ordinal + offset as i64,
+                round,
+                description: &item.description,
+                files: files.as_deref(),
+                depends_on: depends_on.as_deref(),
+                agent_id: item.agent_id.as_deref(),
+            },
         )
-        .bind(job.id)
-        .bind(next_ordinal + offset as i64)
-        .bind(&item.description)
-        .bind(round)
-        .bind(files)
-        .bind(edges(&item.depends_on))
-        .bind(item.agent_id.as_deref())
-        .execute(&mut *tx)
         .await?;
     }
 
@@ -523,7 +545,7 @@ pub(super) async fn open_the_next_round(
     // naming anything else is ignored rather than trusted, which is what the `WHERE` is for.
     for ordinal in &planned.replaces {
         sqlx::query(
-            "UPDATE job_items SET status = ?
+            "UPDATE job_nodes SET status = ?
              WHERE job_id = ? AND ordinal = ? AND round < ? AND status IN ('gate_failed', 'failed')",
         )
         .bind(STATUS_SUPERSEDED)
@@ -551,7 +573,7 @@ pub(super) async fn open_the_next_round(
     .execute(&mut *tx)
     .await?;
 
-    let moved = dry || set_live_status(&mut *tx, job.id, "implementing").await?;
+    let moved = dry || job_is_live(&mut *tx, job.id).await?;
     tx.commit().await?;
     if !moved {
         // Ended while the replan was being read; see `ingest_plan`.

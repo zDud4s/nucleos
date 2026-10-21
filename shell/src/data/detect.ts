@@ -81,10 +81,23 @@ export function useDetect(path: string | null) {
 export function useAdoptWorkflow() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ projectId, name, path }: { projectId: string; name: string; path: string }) =>
+    mutationFn: ({
+      projectId,
+      name,
+      path,
+      consentDigest,
+    }: {
+      projectId: string;
+      name: string;
+      path: string;
+      /** From the daemon's `consent_required` refusal, once the person agreed to its commands. */
+      consentDigest?: string;
+    }) =>
       apiFetch<void>(`/projects/${encodeURIComponent(projectId)}/workflows/adopt`, {
         method: "POST",
-        body: JSON.stringify({ name, path }),
+        body: JSON.stringify(
+          consentDigest === undefined ? { name, path } : { name, path, consent_digest: consentDigest },
+        ),
       }),
     retry: false,
     onSettled: () => {

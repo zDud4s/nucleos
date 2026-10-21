@@ -137,7 +137,7 @@ function agentRequest(overrides: Partial<AgentRequest> = {}): AgentRequest {
     prompt: "handle billing questions",
     engine: "claude-cli",
     model: null,
-    tool_policy: "restricted",
+    capabilities: ["fs.read"],
     ...overrides,
   };
 }
@@ -1443,7 +1443,7 @@ describe("Waiting - one verb pair", () => {
     expect(screen.getByRole("button", { name: "Decline action and keep the run going" })).toBeDefined();
   });
 
-  it("the recruit's caution is visible, and says so when engine or tool policy left the proposal", async () => {
+  it("the recruit's caution is visible, and says so when engine or capabilities left the proposal", async () => {
     const world = waitingWorld({
       recruits: [proposal({ id: 301, tool_input: JSON.stringify(agentRequest({ engine: "claude" })) })],
     });
@@ -1613,7 +1613,7 @@ describe("Waiting - the facts a card needs", () => {
     await renderWaiting();
 
     const engine = await screen.findByLabelText("Engine");
-    const policy = screen.getByLabelText("Tool policy");
+    const policy = screen.getByRole("group", { name: "Capabilities" });
     for (const field of [engine, policy]) {
       const described = field.getAttribute("aria-describedby");
       expect(described).not.toBeNull();

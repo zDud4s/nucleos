@@ -6,20 +6,19 @@ use super::*;
 pub const STATUS_AWAITING_APPROVAL: &str = "awaiting_approval";
 
 /// Assembles what `next_step` needs from the two tables.
+///
+/// **Legacy adapter over `job_nodes`.** `JobView.items` is the queue of ONE fan: the rows with
+/// `node_id = 'implement'` and a non-NULL `ordinal`, in ordinal order (M3/M4 pass the fan's first
+/// `each` node from the graph snapshot instead of the literal). Singleton rows (`plan`, `review`,
+/// ...) have a NULL ordinal and never enter the queue, the round counts or the item states.
+/// `planned` is [`plan_is_recorded`], so a job parked before its plan row exists does not come back
+/// planned with an empty queue.
 pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> {
-    let (status, resume_status, review_wanted, gate_retries, team_id): (
-        String,
-        Option<String>,
-        i64,
-        i64,
-        Option<String>,
-    ) = sqlx::query_as(
-        "SELECT status, resume_status, review, gate_retries, team_id FROM jobs WHERE id = ?",
-    )
-    .bind(job_id)
-    .fetch_one(pool)
-    .await?;
-    let stage = effective_status(&status, resume_status.as_deref());
+    let (review_wanted, gate_retries, team_id): (i64, i64, Option<String>) =
+        sqlx::query_as("SELECT review, gate_retries, team_id FROM jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
 
     let (round, dry_rounds, max_rounds, replan_done, opened_by, rule_name, budget_usd): RoundColumns =
         sqlx::query_as(
@@ -45,8 +44,8 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     // means any more: read against the job's budget it is either an item to try again or an item
     // that is over, and reading it without the count would make every red gate terminal again.
     let items: Vec<(String, i64, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT status, gate_attempts, depends_on, files FROM job_items
-         WHERE job_id = ? ORDER BY ordinal",
+        "SELECT status, gate_attempts, depends_on, files FROM job_nodes
+         WHERE job_id = ? AND node_id = 'implement' AND ordinal IS NOT NULL ORDER BY ordinal",
     )
     .bind(job_id)
     .fetch_all(pool)
@@ -77,23 +76,28 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
         .await
     };
     // The one question the unfiltered queue above cannot answer: did THIS round put anything in it.
-    let queued_this_round: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM job_items WHERE job_id = ? AND round = ?")
-            .bind(job_id)
-            .bind(round)
-            .fetch_one(pool)
-            .await?;
+    let queued_this_round: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM job_nodes
+             WHERE job_id = ? AND round = ? AND node_id = 'implement' AND ordinal IS NOT NULL",
+    )
+    .bind(job_id)
+    .bind(round)
+    .fetch_one(pool)
+    .await?;
     // And the one after it: did anything this round queued PASS. Asked of the rows for the same
     // reason, and asked on every read rather than written down, so a round spared its review is
     // spared it again after a restart — see `ReviewState::Skipped`.
     let passed_this_round: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM job_items WHERE job_id = ? AND round = ? AND status = 'passed'",
+        "SELECT COUNT(*) FROM job_nodes
+         WHERE job_id = ? AND round = ? AND status = 'passed'
+           AND node_id = 'implement' AND ordinal IS NOT NULL",
     )
     .bind(job_id)
     .bind(round)
     .fetch_one(pool)
     .await?;
 
+    let planned = plan_is_recorded(pool, job_id).await?;
     let plan_run = latest_node("plan").await?;
     let spec_run = latest_node("spec").await?;
 
@@ -160,32 +164,28 @@ pub async fn load_view(pool: &SqlitePool, job_id: i64) -> sqlx::Result<JobView> 
     };
 
     Ok(JobView {
-        // Two readings, either of which is enough. `planning` is the one status that means the
-        // queue does not exist yet; everything past it has been through the plan node, including a
-        // planner that honestly found nothing to do. And a job that HAS items has plainly planned,
-        // whatever its status says — which is what stops a status lost to a bad resume from
-        // spawning a second planner on top of a queue that already exists.
+        // `planned` is `plan_is_recorded`: a `plan` node that finished, including a planner that
+        // honestly found nothing to do, or a queue that exists. The queue reading is what stops a
+        // lost row from spawning a second planner on top of a queue that already exists.
         // Four arms, and each one answers a job the others miss.
         //
         // A spec run that has ENDED, whichever way it ended — the ordinary case, and why a spec
         // node that failed does not strand a job (see the field's own doc).
         //
         // **A plan node existing AT ALL**, which is the arm two tests had to teach this: a job whose
-        // planner is running, or paused waiting for a person to approve one action, has a stage of
-        // `planning` and an empty queue, so without this it read as unspecced and the very next tick
-        // sent it BACKWARDS to write a brief for a plan already under way.
+        // planner is running, or paused waiting for a person to approve one action, has no
+        // queue yet, so without this it read as unspecced and the very next tick sent it
+        // BACKWARDS to write a brief for a plan already under way.
         //
-        // Then a job past the planning stage, and a job with a queue: two readings of "this predates
-        // the spec node", kept apart because a job whose status was lost to a bad resume has one of
-        // them and not the other.
+        // Then a job whose plan is recorded: a reading of "this predates the spec node", which
+        // covers a queue and a plan row alike.
         specced: spec_run
             .as_deref()
             .is_some_and(|status| !node_in_flight(status))
             || plan_run.is_some()
-            || stage != "planning"
-            || !items.is_empty(),
+            || planned,
         speccing: spec_run.as_deref().is_some_and(node_in_flight),
-        planned: stage != "planning" || !items.is_empty(),
+        planned,
         planning: plan_run.as_deref().is_some_and(node_in_flight),
         items: items
             .iter()
@@ -344,11 +344,28 @@ pub async fn finish(pool: &SqlitePool, job_id: i64, outcome: Outcome) -> sqlx::R
     retire(pool, job_id, outcome.as_status()).await.map(drop)
 }
 
-/// Moves a job to another live stage, but only while it is still live.
+/// Whether the job is still live: `running`, `awaiting_approval` or `waiting`.
+///
+/// The cancel-race guard that survives the phase words. A pass reads a job, spends minutes in a node
+/// or a gate, and asks this before it acts on what it read; `false` means the job ended in between
+/// (cancelled, expired, retired by another path) and the caller must stop.
+pub async fn job_is_live(ex: impl sqlx::SqliteExecutor<'_>, job_id: i64) -> sqlx::Result<bool> {
+    let live: i64 = sqlx::query_scalar(concat!(
+        "SELECT COUNT(*) FROM jobs WHERE id = ? AND status IN ",
+        live_statuses_sql!()
+    ))
+    .bind(job_id)
+    .fetch_one(ex)
+    .await?;
+    Ok(live > 0)
+}
+
+/// Moves a job to another live status, but only while it is still live.
 ///
 /// `false` means the job ended — cancelled, expired, retired by another path — between the read
-/// that led here and this write. The caller must stop: writing the stage anyway is exactly what
-/// used to bring a cancelled job back to `implementing` and start its next item.
+/// that led here and this write. The caller must stop. Phase words are gone from `jobs.status`, so
+/// callers that only want the liveness check use [`job_is_live`].
+#[allow(dead_code)]
 pub(super) async fn set_live_status(
     pool: impl sqlx::SqliteExecutor<'_>,
     job_id: i64,
@@ -409,19 +426,19 @@ pub async fn pause(pool: &SqlitePool, job_id: i64, status: &str, reason: &str) -
 /// have to remember which one stopped it, and a second brake that came on meanwhile parks it again
 /// on the same pass. `wait_reason` is therefore a note for the reader, never a latch.
 ///
-/// Falls back to `planning`, not to `implementing`, if the stage was somehow lost. Re-planning
-/// costs a run; assuming a queue exists when it does not reports work as complete that was never
-/// started, which is the failure nobody sees.
+/// Falls back to `running` if the status to return to was somehow lost. Whether the job has planned
+/// is read from its rows (`plan_is_recorded`), not from the status, so the fallback cannot report
+/// work as complete that was never started.
 ///
 /// Clears `wait_reason` with the status, for the reason `retire` does: a job that is no longer
 /// waiting is not waiting for anything, and the note outlives the pause it explains. Left behind, a
-/// job running normally reads `implementing / budget` — which names a brake that lifted hours ago
+/// job running normally reads `running / budget` — which names a brake that lifted hours ago
 /// and is the one thing a reader would act on. `park` is unaffected either way: its "say it once"
 /// test is `reason changed OR status is not waiting`, and a resumed job fails the second half.
 pub async fn resume(pool: &SqlitePool, job_id: i64) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE jobs
-         SET status = COALESCE(resume_status, 'planning'), resume_status = NULL,
+         SET status = COALESCE(resume_status, 'running'), resume_status = NULL,
              wait_reason = NULL
          WHERE id = ? AND status IN ('waiting','awaiting_approval')",
     )
@@ -468,12 +485,15 @@ pub struct NewJob<'a> {
     pub budget_usd: Option<f64>,
     /// The team directing it, already checked to exist. `None` is the job of today.
     pub team_id: Option<&'a str>,
+    /// The resolved workflow graph the job runs, frozen at start. `None` for a job that predates
+    /// the engine or a project with no pinned bundle; the three columns stay NULL.
+    pub graph: Option<GraphSnapshot>,
 }
 
 /// Starts a job and returns its id.
 ///
-/// Always `planning`: a job's first act is to plan, and a caller that could choose the starting
-/// status could start one mid-queue with no queue.
+/// Always `running`: a job's first act is to plan, but that is the first node, not a status, and a
+/// caller that could choose the starting status could start one mid-queue with no queue.
 ///
 /// Refuses nothing, and it used to. A project's second live job was turned away here by the unique
 /// index `one_live_job_per_project`, which came out in migration 0053; a project may now have as
@@ -484,8 +504,9 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     let result = sqlx::query(
         "INSERT INTO jobs
            (project_id, project_root, rule_name, prompt, status, max_items, gate_each, review,
-            gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id)
-         VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            gate_retries, head_sha, max_rounds, budget_usd, created_at, team_id,
+            graph_snapshot, graph_bundle_ref, graph_bundle_hash)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(job.project_id)
     .bind(job.project_root)
@@ -505,6 +526,10 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
     // nothing arrives here as a raw constraint failure — which the caller turns into "the job was
     // created and could not be provisioned", a sentence that is wrong in both halves.
     .bind(job.team_id)
+    // Written here and nowhere else: the snapshot is never refreshed from the bundle.
+    .bind(job.graph.as_ref().map(|g| g.graph_json.as_str()))
+    .bind(job.graph.as_ref().and_then(|g| g.bundle_ref.as_deref()))
+    .bind(job.graph.as_ref().and_then(|g| g.bundle_hash.as_deref()))
     .execute(pool)
     .await?;
     Ok(result.last_insert_rowid())
@@ -515,19 +540,16 @@ pub async fn insert_job(pool: &SqlitePool, job: &NewJob<'_>) -> sqlx::Result<i64
 /// Kept beside the SQL that reads it rather than spelled out at each call site, because a status
 /// that falls out of this list stops being ticked while still holding a concurrency slot — the
 /// sweep spares exactly these statuses too — so the project goes quiet with no error anywhere,
-/// until somebody opens the database. Three tests pin the four copies together:
+/// until somebody opens the database. Three tests pin the copies together:
 /// `a_live_status_is_a_status_some_pass_would_load` and `the_live_listing_names_every_live_status`
 /// here, and `every_live_status_is_a_status_the_sweep_spares` in `concurrency.rs`.
-pub const LIVE_STATUSES: [&str; 6] = [
-    "planning",
-    "implementing",
-    "gating",
-    "reviewing",
-    "awaiting_approval",
-    "waiting",
-];
+pub const LIVE_STATUSES: [&str; 3] = [STATUS_RUNNING, "awaiting_approval", "waiting"];
 
-/// The `job_items.status` values that mean an item may still run, and therefore that anything it
+/// The one active status of a live job. What it is doing is a node, read from `job_nodes` and `runs`
+/// (see [`current_node`]), never a status word.
+pub const STATUS_RUNNING: &str = "running";
+
+/// The `job_nodes.status` values that mean an item may still run, and therefore that anything it
 /// holds — a worktree, a concurrency slot — has to be left alone.
 ///
 /// The sweep in `concurrency.rs` reads these words out of a SQL literal — sqlx refuses SQL built at
@@ -584,10 +606,6 @@ pub struct JobRow {
 }
 
 impl JobRow {
-    pub(super) fn stage(&self) -> &str {
-        effective_status(&self.status, self.resume_status.as_deref())
-    }
-
     /// Whether the owner asked for this job **and** named what it may spend.
     ///
     /// Delegates rather than restating: `load_view` asks the same question of loose columns, and
@@ -641,8 +659,7 @@ pub(super) const LIVE_JOBS_SQL: &str =
                                     wait_reason, max_items, gate_each, head_sha, round, budget_usd,
                                     rule_name, created_at
                              FROM jobs
-                             WHERE status IN ('planning','implementing','gating','reviewing',
-                                              'awaiting_approval','waiting')
+                             WHERE status IN ('running','awaiting_approval','waiting')
                              ORDER BY id";
 
 pub(super) const ONE_JOB_SQL: &str =
@@ -741,7 +758,9 @@ pub(super) async fn stop_nodes_in_flight(state: &AppState, job_id: i64) -> sqlx:
 
     // Only the item that was in someone's hands. The ones still `pending` were never started, and
     // marking them cancelled would claim the job got to them and turned back.
-    sqlx::query("UPDATE job_items SET status = ? WHERE job_id = ? AND status = 'running'")
+    // No `ordinal IS NOT NULL` filter, on purpose: a singleton node (`plan`, `review`, ...) that was
+    // `running` was in someone's hands too, and has to be cancelled with the fan item.
+    sqlx::query("UPDATE job_nodes SET status = ? WHERE job_id = ? AND status = 'running'")
         .bind(STATUS_CANCELLED)
         .bind(job_id)
         .execute(pool)
@@ -832,4 +851,807 @@ pub async fn reconcile_orphaned_jobs(pool: &SqlitePool) -> sqlx::Result<u64> {
         retired += 1;
     }
     Ok(retired)
+}
+
+// ---------------------------------------------------------------------------------------------
+// `job_nodes`: the typed API over the one table that says what a job is doing and has done.
+// ---------------------------------------------------------------------------------------------
+
+/// One row of `job_nodes`, every column.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct NodeRow {
+    pub id: i64,
+    pub job_id: i64,
+    pub node_id: String,
+    /// `None` for a node outside a fan-out; else the index of the item in that fan.
+    pub ordinal: Option<i64>,
+    pub round: i64,
+    pub description: String,
+    pub status: String,
+    pub run_id: Option<i64>,
+    pub gate_status: Option<String>,
+    pub gate_attempts: i64,
+    pub gate_output: Option<String>,
+    pub checkpoint_sha: Option<String>,
+    pub merge_base_sha: Option<String>,
+    pub depends_on: Option<String>,
+    pub files: Option<String>,
+    pub agent_id: Option<String>,
+}
+
+/// Every row of the job, in creation order.
+pub async fn nodes_of(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Vec<NodeRow>> {
+    sqlx::query_as(
+        "SELECT id, job_id, node_id, ordinal, round, description, status, run_id, gate_status,
+                gate_attempts, gate_output, checkpoint_sha, merge_base_sha, depends_on, files,
+                agent_id
+         FROM job_nodes WHERE job_id = ? ORDER BY id",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Enters a singleton node (ordinal NULL) for a round. Idempotent on `(job_id, node_id, round)`: a
+/// second call returns the existing row's id and leaves its status alone.
+pub async fn insert_singleton_node(
+    ex: impl sqlx::SqliteExecutor<'_>,
+    job_id: i64,
+    node_id: &str,
+    round: i64,
+    status: &str,
+) -> sqlx::Result<i64> {
+    // `DO UPDATE SET id = id` is a no-op write whose only job is to make `RETURNING` yield the
+    // existing row, which `DO NOTHING` would not.
+    sqlx::query_scalar(
+        "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, round)
+         VALUES (?, ?, NULL, ?, ?, ?)
+         ON CONFLICT (job_id, node_id, round) WHERE ordinal IS NULL DO UPDATE SET id = id
+         RETURNING id",
+    )
+    .bind(job_id)
+    .bind(node_id)
+    .bind(node_id)
+    .bind(status)
+    .bind(round)
+    .fetch_one(ex)
+    .await
+}
+
+/// Compare-and-set on a singleton row. `true` means it moved. An empty `from` accepts any status.
+pub async fn set_singleton_status(
+    ex: impl sqlx::SqliteExecutor<'_>,
+    job_id: i64,
+    node_id: &str,
+    round: i64,
+    from: &[&str],
+    to: &str,
+) -> sqlx::Result<bool> {
+    let guard = if from.is_empty() {
+        String::new()
+    } else {
+        format!(" AND status IN ({})", vec!["?"; from.len()].join(","))
+    };
+    // Only `?` placeholders are interpolated; every value is bound.
+    let sql = sqlx::AssertSqlSafe(format!(
+        "UPDATE job_nodes SET status = ?
+         WHERE job_id = ? AND node_id = ? AND round = ? AND ordinal IS NULL{guard}"
+    ));
+    let mut query = sqlx::query(sql)
+        .bind(to)
+        .bind(job_id)
+        .bind(node_id)
+        .bind(round);
+    for status in from {
+        query = query.bind(*status);
+    }
+    Ok(query.execute(ex).await?.rows_affected() > 0)
+}
+
+/// Status of the singleton instance for `(node, round)`, `None` if it was never entered.
+pub async fn singleton_status(
+    ex: impl sqlx::SqliteExecutor<'_>,
+    job_id: i64,
+    node_id: &str,
+    round: i64,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT status FROM job_nodes
+         WHERE job_id = ? AND node_id = ? AND round = ? AND ordinal IS NULL",
+    )
+    .bind(job_id)
+    .bind(node_id)
+    .bind(round)
+    .fetch_optional(ex)
+    .await
+}
+
+/// A fan item to queue.
+pub struct NewFanItem<'a> {
+    pub job_id: i64,
+    pub node_id: &'a str,
+    pub ordinal: i64,
+    pub round: i64,
+    pub description: &'a str,
+    pub files: Option<&'a str>,
+    pub depends_on: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
+}
+
+/// Queues one fan item as `pending` and returns its row id.
+pub async fn insert_fan_item(
+    ex: impl sqlx::SqliteExecutor<'_>,
+    item: &NewFanItem<'_>,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "INSERT INTO job_nodes
+           (job_id, node_id, ordinal, round, description, status, files, depends_on, agent_id)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+         RETURNING id",
+    )
+    .bind(item.job_id)
+    .bind(item.node_id)
+    .bind(item.ordinal)
+    .bind(item.round)
+    .bind(item.description)
+    .bind(item.files)
+    .bind(item.depends_on)
+    .bind(item.agent_id)
+    .fetch_one(ex)
+    .await
+}
+
+/// The next free ordinal of ONE fan: `MAX(ordinal) + 1` over `(job_id, node_id)`, 0 for an empty fan.
+pub async fn next_ordinal(
+    ex: impl sqlx::SqliteExecutor<'_>,
+    job_id: i64,
+    node_id: &str,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM job_nodes WHERE job_id = ? AND node_id = ?",
+    )
+    .bind(job_id)
+    .bind(node_id)
+    .fetch_one(ex)
+    .await
+}
+
+/// Whether the plan node has finished: a `plan` singleton that passed, or any fan item (a job with a
+/// queue has plainly planned). The one definition shared by `load_view` and ingest.
+pub async fn plan_is_recorded(
+    ex: impl sqlx::SqliteExecutor<'_>,
+    job_id: i64,
+) -> sqlx::Result<bool> {
+    let found: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM job_nodes
+             WHERE job_id = ?
+               AND ((node_id = 'plan' AND ordinal IS NULL AND status = 'passed')
+                    OR ordinal IS NOT NULL))",
+    )
+    .bind(job_id)
+    .fetch_one(ex)
+    .await?;
+    Ok(found != 0)
+}
+
+/// What the job is doing right now, for the feed and the shell. Derived on every read, never stored:
+/// a column would be a third truth beside `runs` and `job_nodes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CurrentNode {
+    pub node_id: String,
+    pub ordinal: Option<i64>,
+    /// How many items the fan has in the round of `ordinal`.
+    pub of: Option<i64>,
+}
+
+/// The node a live job is in. First hit wins:
+/// 1. a run of the job in flight names its stage (and, for an item's run, its position);
+/// 2. an item that is `implemented` or `merging` is in the gate, a subprocess with no run;
+/// 3. otherwise `None`, as for a terminal job or one between nodes.
+pub async fn current_node(pool: &SqlitePool, job_id: i64) -> sqlx::Result<Option<CurrentNode>> {
+    if !job_is_live(pool, job_id).await? {
+        return Ok(None);
+    }
+    let run: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT stage, item_id FROM runs
+         WHERE job_id = ? AND status IN ('running','awaiting_approval')
+         ORDER BY id LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((stage, item_id)) = run {
+        let position = match item_id {
+            Some(item_id) => position_of(pool, item_id).await?,
+            None => None,
+        };
+        return Ok(Some(CurrentNode {
+            node_id: stage,
+            ordinal: position.map(|(ordinal, _)| ordinal),
+            of: position.map(|(_, of)| of),
+        }));
+    }
+    let gated: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM job_nodes
+         WHERE job_id = ? AND ordinal IS NOT NULL AND status IN ('implemented','merging')
+         ORDER BY ordinal LIMIT 1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(item_id) = gated {
+        let position = position_of(pool, item_id).await?;
+        return Ok(Some(CurrentNode {
+            node_id: "gate".to_string(),
+            ordinal: position.map(|(ordinal, _)| ordinal),
+            of: position.map(|(_, of)| of),
+        }));
+    }
+    Ok(None)
+}
+
+/// `(ordinal, items in the same node and round)` of a fan item row, `None` for a singleton or a
+/// missing row.
+async fn position_of(pool: &SqlitePool, item_id: i64) -> sqlx::Result<Option<(i64, i64)>> {
+    sqlx::query_as(
+        "SELECT n.ordinal,
+                (SELECT COUNT(*) FROM job_nodes o
+                  WHERE o.job_id = n.job_id AND o.node_id = n.node_id AND o.round = n.round
+                    AND o.ordinal IS NOT NULL)
+         FROM job_nodes n WHERE n.id = ? AND n.ordinal IS NOT NULL",
+    )
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// A job's frozen workflow graph: the resolved `Graph` as JSON, and which bundle it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphSnapshot {
+    pub graph_json: String,
+    pub bundle_ref: Option<String>,
+    pub bundle_hash: Option<String>,
+}
+
+/// Freezes a resolved graph for [`NewJob::graph`].
+pub fn snapshot_of(
+    graph: &crate::workflows::graph::Graph,
+    bundle_ref: Option<&str>,
+    bundle_hash: Option<&str>,
+) -> Result<GraphSnapshot, serde_json::Error> {
+    Ok(GraphSnapshot {
+        graph_json: serde_json::to_string(graph)?,
+        bundle_ref: bundle_ref.map(str::to_string),
+        bundle_hash: bundle_hash.map(str::to_string),
+    })
+}
+
+/// The graph inside a snapshot.
+pub fn graph_from_snapshot(
+    snapshot: &GraphSnapshot,
+) -> Result<crate::workflows::graph::Graph, serde_json::Error> {
+    serde_json::from_str(&snapshot.graph_json)
+}
+
+/// Freezes an [`EffectiveGraph`] (origin graph + painted overlay + disabled set) for
+/// [`NewJob::graph`]. M4 C5: the snapshot a job runs from carries the overlay, so a pins edit
+/// mid-job cannot change it.
+pub fn snapshot_of_effective(
+    effective: &crate::workflows::effective::EffectiveGraph,
+    bundle_ref: Option<&str>,
+    bundle_hash: Option<&str>,
+) -> Result<GraphSnapshot, serde_json::Error> {
+    Ok(GraphSnapshot {
+        graph_json: serde_json::to_string(effective)?,
+        bundle_ref: bundle_ref.map(str::to_string),
+        bundle_hash: bundle_hash.map(str::to_string),
+    })
+}
+
+/// The effective graph inside a snapshot. A snapshot written by [`snapshot_of`] (a bare `Graph`,
+/// no overlay) reads as an effective graph with nothing disabled.
+pub fn effective_from_snapshot(
+    snapshot: &GraphSnapshot,
+) -> Result<crate::workflows::effective::EffectiveGraph, serde_json::Error> {
+    match serde_json::from_str::<crate::workflows::effective::EffectiveGraph>(&snapshot.graph_json)
+    {
+        Ok(effective) => Ok(effective),
+        Err(first) => {
+            match serde_json::from_str::<crate::workflows::graph::Graph>(&snapshot.graph_json) {
+                Ok(graph) => Ok(crate::workflows::effective::EffectiveGraph {
+                    graph,
+                    ..Default::default()
+                }),
+                Err(_) => Err(first),
+            }
+        }
+    }
+}
+
+/// Reads the snapshot columns. `Ok(None)` is a NULL snapshot: a job that predates the engine.
+/// There is deliberately no update function; the snapshot is written once, by `insert_job`.
+pub async fn load_graph_snapshot(
+    pool: &SqlitePool,
+    job_id: i64,
+) -> sqlx::Result<Option<GraphSnapshot>> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT graph_snapshot, graph_bundle_ref, graph_bundle_hash FROM jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(graph_json, bundle_ref, bundle_hash)| {
+        graph_json.map(|graph_json| GraphSnapshot {
+            graph_json,
+            bundle_ref,
+            bundle_hash,
+        })
+    }))
+}
+
+/// Live jobs of a project whose snapshot hash differs from the installed bundle's. Jobs with a NULL
+/// hash are not compared.
+pub async fn jobs_on_a_different_bundle(
+    pool: &SqlitePool,
+    project_id: &str,
+    installed_hash: &str,
+) -> sqlx::Result<Vec<i64>> {
+    sqlx::query_scalar(concat!(
+        "SELECT id FROM jobs
+         WHERE project_id = ? AND graph_bundle_hash IS NOT NULL AND graph_bundle_hash <> ?
+           AND status IN ",
+        live_statuses_sql!(),
+        " ORDER BY id"
+    ))
+    .bind(project_id)
+    .bind(installed_hash)
+    .fetch_all(pool)
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn pool() -> SqlitePool {
+        crate::testdb::fresh_pool().await
+    }
+
+    async fn job_with(pool: &SqlitePool, graph: Option<GraphSnapshot>) -> i64 {
+        insert_job(
+            pool,
+            &NewJob {
+                project_id: "p",
+                project_root: "/project/a",
+                rule_name: None,
+                prompt: "x",
+                max_items: 5,
+                gate_each: true,
+                review: true,
+                gate_retries: 0,
+                head_sha: None,
+                max_rounds: None,
+                budget_usd: None,
+                team_id: None,
+                graph,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn item<'a>(job_id: i64, node_id: &'a str, ordinal: i64, round: i64) -> NewFanItem<'a> {
+        NewFanItem {
+            job_id,
+            node_id,
+            ordinal,
+            round,
+            description: "d",
+            files: None,
+            depends_on: None,
+            agent_id: None,
+        }
+    }
+
+    async fn run_of(pool: &SqlitePool, job_id: i64, stage: &str, item_id: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO runs (project_id, prompt, status, mode, created_at, job_id, stage, item_id)
+             VALUES ('p', 'x', 'running', 'worktree', '2026-10-21T00:00:00Z', ?, ?, ?)",
+        )
+        .bind(job_id)
+        .bind(stage)
+        .bind(item_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_job_is_running() {
+        let pool = pool().await;
+        let id = job_with(&pool, None).await;
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, STATUS_RUNNING);
+        assert!(job_is_live(&pool, id).await.unwrap());
+        assert!(!job_is_live(&pool, id + 99).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn insert_singleton_node_is_idempotent_per_round() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        let first = insert_singleton_node(&pool, job, "plan", 0, "running")
+            .await
+            .unwrap();
+        let second = insert_singleton_node(&pool, job, "plan", 0, "passed")
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            singleton_status(&pool, job, "plan", 0)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("running"),
+            "the second call must not rewrite the status"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_revisited_in_a_new_round_gets_a_new_row() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        let r0 = insert_singleton_node(&pool, job, "plan", 0, "passed")
+            .await
+            .unwrap();
+        let r1 = insert_singleton_node(&pool, job, "plan", 1, "running")
+            .await
+            .unwrap();
+        assert_ne!(r0, r1);
+        assert_eq!(singleton_status(&pool, job, "plan", 2).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn set_singleton_status_is_a_compare_and_set() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        insert_singleton_node(&pool, job, "review", 0, "running")
+            .await
+            .unwrap();
+        assert!(
+            !set_singleton_status(&pool, job, "review", 0, &["pending"], "passed")
+                .await
+                .unwrap()
+        );
+        assert!(
+            set_singleton_status(&pool, job, "review", 0, &["pending", "running"], "passed")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !set_singleton_status(&pool, job, "review", 0, &["running"], "failed")
+                .await
+                .unwrap()
+        );
+        assert!(
+            set_singleton_status(&pool, job, "review", 0, &[], "failed")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !set_singleton_status(&pool, job, "review", 1, &[], "failed")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn next_ordinal_counts_one_fan_not_the_job() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        assert_eq!(next_ordinal(&pool, job, "implement").await.unwrap(), 0);
+        insert_fan_item(&pool, &item(job, "implement", 0, 0))
+            .await
+            .unwrap();
+        insert_fan_item(&pool, &item(job, "implement", 1, 0))
+            .await
+            .unwrap();
+        assert_eq!(next_ordinal(&pool, job, "implement").await.unwrap(), 2);
+        assert_eq!(next_ordinal(&pool, job, "other").await.unwrap(), 0);
+        insert_fan_item(&pool, &item(job, "other", 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(next_ordinal(&pool, job, "other").await.unwrap(), 1);
+        // A singleton row has a NULL ordinal and counts for nothing.
+        insert_singleton_node(&pool, job, "plan", 0, "passed")
+            .await
+            .unwrap();
+        assert_eq!(next_ordinal(&pool, job, "plan").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn plan_is_recorded_reads_the_plan_row_or_a_queue() {
+        let pool = pool().await;
+        let by_row = job_with(&pool, None).await;
+        let by_queue = job_with(&pool, None).await;
+        assert!(!plan_is_recorded(&pool, by_row).await.unwrap());
+        insert_singleton_node(&pool, by_row, "plan", 0, "running")
+            .await
+            .unwrap();
+        assert!(
+            !plan_is_recorded(&pool, by_row).await.unwrap(),
+            "a running plan is not recorded"
+        );
+        set_singleton_status(&pool, by_row, "plan", 0, &["running"], "passed")
+            .await
+            .unwrap();
+        assert!(plan_is_recorded(&pool, by_row).await.unwrap());
+        insert_fan_item(&pool, &item(by_queue, "implement", 0, 0))
+            .await
+            .unwrap();
+        assert!(plan_is_recorded(&pool, by_queue).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_queue_view_ignores_singleton_rows() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        insert_fan_item(&pool, &item(job, "implement", 0, 0))
+            .await
+            .unwrap();
+        let before = load_view(&pool, job).await.unwrap();
+        insert_singleton_node(&pool, job, "plan", 0, "passed")
+            .await
+            .unwrap();
+        insert_singleton_node(&pool, job, "review", 0, "passed")
+            .await
+            .unwrap();
+        let after = load_view(&pool, job).await.unwrap();
+        assert_eq!(after.items.len(), 1);
+        assert_eq!(after.items.len(), before.items.len());
+        assert_eq!(
+            after.rounds.round_added_nothing,
+            before.rounds.round_added_nothing
+        );
+        assert!(!after.rounds.round_added_nothing);
+    }
+
+    #[tokio::test]
+    async fn a_job_parked_while_planning_does_not_come_back_planned() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        pause(&pool, job, "waiting", "budget").await.unwrap();
+        resume(&pool, job).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+            .bind(job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, STATUS_RUNNING);
+        assert!(!load_view(&pool, job).await.unwrap().planned);
+        insert_singleton_node(&pool, job, "plan", 0, "passed")
+            .await
+            .unwrap();
+        assert!(
+            load_view(&pool, job).await.unwrap().planned,
+            "a passed plan row with no items"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_node_names_the_running_stage_and_item() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        assert_eq!(current_node(&pool, job).await.unwrap(), None);
+        run_of(&pool, job, "plan", None).await;
+        assert_eq!(
+            current_node(&pool, job).await.unwrap(),
+            Some(CurrentNode {
+                node_id: "plan".into(),
+                ordinal: None,
+                of: None
+            })
+        );
+        sqlx::query("DELETE FROM runs WHERE job_id = ?")
+            .bind(job)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_fan_item(&pool, &item(job, "implement", 0, 0))
+            .await
+            .unwrap();
+        let second = insert_fan_item(&pool, &item(job, "implement", 1, 0))
+            .await
+            .unwrap();
+        insert_fan_item(&pool, &item(job, "implement", 2, 0))
+            .await
+            .unwrap();
+        run_of(&pool, job, "implement", Some(second)).await;
+        assert_eq!(
+            current_node(&pool, job).await.unwrap(),
+            Some(CurrentNode {
+                node_id: "implement".into(),
+                ordinal: Some(1),
+                of: Some(3)
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn current_node_says_gate_for_an_implemented_item() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        let id = insert_fan_item(&pool, &item(job, "implement", 0, 0))
+            .await
+            .unwrap();
+        insert_fan_item(&pool, &item(job, "implement", 1, 0))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE job_nodes SET status = 'implemented' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            current_node(&pool, job).await.unwrap(),
+            Some(CurrentNode {
+                node_id: "gate".into(),
+                ordinal: Some(0),
+                of: Some(2)
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn current_node_is_none_for_a_terminal_job() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        run_of(&pool, job, "plan", None).await;
+        retire(&pool, job, STATUS_CANCELLED).await.unwrap();
+        assert_eq!(current_node(&pool, job).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn nodes_of_returns_every_row_in_creation_order() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        insert_singleton_node(&pool, job, "plan", 0, "passed")
+            .await
+            .unwrap();
+        insert_fan_item(&pool, &item(job, "implement", 0, 0))
+            .await
+            .unwrap();
+        let rows = nodes_of(&pool, job).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].node_id.as_str(), rows[0].ordinal), ("plan", None));
+        assert_eq!(
+            (rows[1].node_id.as_str(), rows[1].ordinal),
+            ("implement", Some(0))
+        );
+        assert_eq!(rows[1].status, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_graph_snapshot_round_trips_and_is_written_once() {
+        let pool = pool().await;
+        let graph = crate::workflows::graph::Graph::default();
+        let snapshot = snapshot_of(&graph, Some("autopilot/1.0.0"), Some("sha256:aa")).unwrap();
+        let job = job_with(&pool, Some(snapshot.clone())).await;
+        let loaded = load_graph_snapshot(&pool, job).await.unwrap().unwrap();
+        assert_eq!(loaded, snapshot);
+        assert_eq!(graph_from_snapshot(&loaded).unwrap(), graph);
+        let summary = list(&pool, Some("p"), 10).await.unwrap();
+        assert_eq!(summary[0].bundle.as_deref(), Some("autopilot/1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn an_effective_graph_snapshot_round_trips_and_a_bare_graph_still_reads() {
+        let pool = pool().await;
+        let mut effective = crate::workflows::effective::EffectiveGraph::default();
+        effective.disabled.insert("review".to_string());
+        effective.orphaned_overlay.push("ghost".to_string());
+        let snapshot = snapshot_of_effective(&effective, Some("a/1"), Some("sha256:aa")).unwrap();
+        let job = job_with(&pool, Some(snapshot)).await;
+        let loaded = load_graph_snapshot(&pool, job).await.unwrap().unwrap();
+        assert_eq!(effective_from_snapshot(&loaded).unwrap(), effective);
+
+        let bare = snapshot_of(&crate::workflows::graph::Graph::default(), None, None).unwrap();
+        assert_eq!(
+            effective_from_snapshot(&bare).unwrap(),
+            crate::workflows::effective::EffectiveGraph::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_with_a_null_snapshot_still_loads() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        assert_eq!(load_graph_snapshot(&pool, job).await.unwrap(), None);
+        load_view(&pool, job).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn jobs_on_a_different_bundle_compares_only_live_hashed_jobs() {
+        let pool = pool().await;
+        let graph = crate::workflows::graph::Graph::default();
+        let old = job_with(
+            &pool,
+            Some(snapshot_of(&graph, Some("a/1"), Some("sha256:old")).unwrap()),
+        )
+        .await;
+        let same = job_with(
+            &pool,
+            Some(snapshot_of(&graph, Some("a/1"), Some("sha256:new")).unwrap()),
+        )
+        .await;
+        let _null = job_with(&pool, None).await;
+        assert_eq!(
+            jobs_on_a_different_bundle(&pool, "p", "sha256:new")
+                .await
+                .unwrap(),
+            vec![old]
+        );
+        assert_eq!(
+            jobs_on_a_different_bundle(&pool, "other", "sha256:new")
+                .await
+                .unwrap(),
+            Vec::<i64>::new()
+        );
+        retire(&pool, old, STATUS_CANCELLED).await.unwrap();
+        assert!(
+            jobs_on_a_different_bundle(&pool, "p", "sha256:new")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let _ = same;
+    }
+
+    /// Tripwire against a future "refresh" of the snapshot: no `UPDATE jobs` statement in this file
+    /// may touch a graph column.
+    #[test]
+    fn no_store_fn_updates_the_snapshot() {
+        let source = include_str!("store.rs");
+        let needle = concat!("\"UPDATE", " jobs");
+        for statement in source.split(needle).skip(1) {
+            let literal = statement.split('"').next().unwrap_or("");
+            assert!(
+                !literal.contains("graph_"),
+                "an UPDATE touches the snapshot: {literal}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_lists_only_fan_items_and_current_node() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        insert_singleton_node(&pool, job, "plan", 0, "passed")
+            .await
+            .unwrap();
+        let first = insert_fan_item(&pool, &item(job, "implement", 0, 0))
+            .await
+            .unwrap();
+        insert_fan_item(&pool, &item(job, "implement", 1, 0))
+            .await
+            .unwrap();
+        run_of(&pool, job, "implement", Some(first)).await;
+        let detail = detail(&pool, job).await.unwrap().unwrap();
+        assert_eq!(detail.items.len(), 2);
+        assert_eq!(
+            detail.job.node,
+            Some(CurrentNode {
+                node_id: "implement".into(),
+                ordinal: Some(0),
+                of: Some(2)
+            })
+        );
+        let live = list_live(&pool, Some("p"), 10).await.unwrap();
+        assert_eq!(live[0].node, detail.job.node);
+    }
 }

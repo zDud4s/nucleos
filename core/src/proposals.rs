@@ -847,8 +847,8 @@ pub async fn list_skipped_items(pool: &SqlitePool) -> sqlx::Result<Vec<Proposal>
                 r.stage AS run_stage, i.ordinal AS item_ordinal, i.description AS item_description
          FROM proposals p
          LEFT JOIN runs r ON r.id = p.run_id
-         LEFT JOIN job_items i ON i.id = (
-             SELECT j.id FROM job_items j WHERE j.run_id = p.run_id ORDER BY j.id DESC LIMIT 1
+         LEFT JOIN job_nodes i ON i.id = (
+             SELECT j.id FROM job_nodes j WHERE j.run_id = p.run_id ORDER BY j.id DESC LIMIT 1
          )
          WHERE p.status = 'pending' AND p.kind = 'skipped-item'
          ORDER BY p.id DESC",
@@ -1712,9 +1712,9 @@ mod tests {
     async fn seed_department(pool: &sqlx::SqlitePool) {
         for (id, name) in [("dir", "Ana"), ("spec", "Rui")] {
             sqlx::query(
-                "INSERT INTO agents (id, name, speciality, prompt, engine, tool_policy,
+                "INSERT INTO agents (id, name, speciality, prompt, engine, capabilities,
                                      created_at, updated_at)
-                 VALUES (?, ?, 's', 'p', 'claude', 'none', '2026-10-10T00:00:00Z',
+                 VALUES (?, ?, 's', 'p', 'claude', '[]', '2026-10-10T00:00:00Z',
                          '2026-10-10T00:00:00Z')",
             )
             .bind(id)
@@ -1975,7 +1975,7 @@ mod tests {
             .unwrap();
         let job_id = sqlx::query(
             "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
-             VALUES ('nucleos', 'C:/somewhere', 'implementing', 5, '2026-09-17T00:00:00Z')",
+             VALUES ('nucleos', 'C:/somewhere', 'running', 5, '2026-09-17T00:00:00Z')",
         )
         .execute(&pool)
         .await
@@ -1991,8 +1991,8 @@ mod tests {
         .unwrap()
         .last_insert_rowid();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
-             VALUES (?, 3, 'tidy the imports', 'skipped', ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, run_id)
+             VALUES (?, 'implement', 3, 'tidy the imports', 'skipped', ?)",
         )
         .bind(job_id)
         .bind(run_id)
@@ -2024,7 +2024,7 @@ mod tests {
             .unwrap();
         let job_id = sqlx::query(
             "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
-             VALUES ('nucleos', 'C:/somewhere', 'implementing', 5, '2026-09-17T00:00:00Z')",
+             VALUES ('nucleos', 'C:/somewhere', 'running', 5, '2026-09-17T00:00:00Z')",
         )
         .execute(&pool)
         .await

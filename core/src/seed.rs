@@ -76,6 +76,15 @@ pub fn digest() -> String {
     workflows::digest_of(&files)
 }
 
+/// The embedded autopilot `graph.yaml`, for a job that starts without a pinned bundle (M4 C5).
+pub fn graph_yaml() -> &'static str {
+    FILES
+        .iter()
+        .find(|(path, _)| *path == crate::workflows::graph::GRAPH_FILE)
+        .map(|(_, contents)| *contents)
+        .expect("the seeded bundle has a graph")
+}
+
 /// Put the autopilot in the library if it is not there, or not itself.
 pub fn seed(library_root: &Path) -> std::io::Result<Seeded> {
     let dir = library_root.join(NAME).join(VERSION);
@@ -124,6 +133,12 @@ mod tests {
     /// The bundle this binary carries has to be a bundle. It is embedded rather than read, so
     /// nothing else in the build would ever notice that it stopped parsing.
     #[test]
+    fn graph_yaml_is_the_embedded_graph_and_parses() {
+        assert!(crate::workflows::graph::parse(graph_yaml()).is_ok());
+        assert!(!digest().is_empty());
+    }
+
+    #[test]
     fn the_bundle_this_binary_carries_parses_as_a_graph() {
         let graph = FILES
             .iter()
@@ -134,7 +149,18 @@ mod tests {
 
         // The sequence `job.rs` runs, by the names `runs.stage` already uses.
         let ids: Vec<&str> = parsed.nodes.iter().map(|node| node.id.as_str()).collect();
-        assert_eq!(ids, ["plan", "implement", "gate", "work", "more", "review"]);
+        assert_eq!(
+            ids,
+            [
+                "spec",
+                "plan",
+                "implement",
+                "gate",
+                "work",
+                "more",
+                "review"
+            ]
+        );
 
         // The replan round is a DECISION and not a condition written on the edge out of the fan.
         // §4.4 gives the condition to the decision node and leaves `when` on any other edge as a
@@ -152,6 +178,16 @@ mod tests {
             crate::workflows::graph::command_source(gate.command.as_deref().unwrap()),
             crate::workflows::graph::CommandSource::Project("gate")
         );
+    }
+
+    /// Pins the seeded decision to the planner's namespace until the engine resolves it.
+    #[test]
+    fn the_condition_of_the_seeded_decision_reads_the_planners_namespace() {
+        let parsed = crate::workflows::graph::parse(FILES[1].1).unwrap();
+        let more = parsed.nodes.iter().find(|n| n.id == "more").unwrap();
+        let condition =
+            crate::workflows::condition::parse(more.condition.as_deref().unwrap()).unwrap();
+        assert_eq!(condition.keys().collect::<Vec<_>>(), ["plan.done"]);
     }
 
     /// A gate is what stops a pipeline, so the picture has to draw it as one.

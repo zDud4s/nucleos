@@ -106,6 +106,8 @@ pub(super) async fn start_job(
             // Absent from every rule written so far, which is what keeps every night already
             // scheduled running exactly as it ran yesterday.
             team_id: graph.team.as_deref(),
+            // A rule names no workflow: the default one (D13).
+            workflow: None,
         },
     )
     .await

@@ -16,7 +16,7 @@ import { daemonFetch, daemonState, renderWithRouter } from "../test/harness";
 
 function job(id: number, project_id = "alpha"): Job {
   return {
-    id, project_id, rule_name: null, status: "implementing", wait_reason: null, max_items: 4,
+    id, project_id, rule_name: null, status: "running", node: null, bundle: null, wait_reason: null, max_items: 4,
     created_at: "2026-10-20T09:00:00Z", completed_at: null, slot: 0, round: 0, max_rounds: 3,
     team_id: null, team_name: null, team_max_parallel: null,
   };

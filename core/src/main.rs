@@ -129,6 +129,7 @@ async fn main() {
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
     startup::reconcile_after_restart(&pool).await;
+    startup::install_agents(&pool, is_primary).await;
 
     // Before anything can launch a Claude run, so the first run's credential is already watched.
     execution::runner::watch_claude_auth(pool.clone());
@@ -1046,6 +1047,8 @@ async fn main() {
         machine_config_root.clone(),
     );
     verify::install(verify_executor.clone());
+    // A graph node that names an `agent:` launches as that catalogue agent (agent spec section 13).
+    execution::job::install_launcher(Arc::new(execution::job::CatalogAgentLauncher));
     if admission_enabled {
         // The runs' heavy commands and verify units draw on one budget, verify first.
         execution::admission::install(admission.clone());
@@ -1522,6 +1525,13 @@ mod tests {
     }
 
     /// A named checkout is sent as given, made absolute; no name means the working directory.
+    #[test]
+    fn agents_sync_flag_is_recognised() {
+        assert!(agents_sync_flag(&words("nucleos-core --agents-sync")));
+        assert!(!agents_sync_flag(&words("nucleos-core --workflow-sync")));
+        assert!(!agents_sync_flag(&words("nucleos-core")));
+    }
+
     #[test]
     fn workflow_sync_names_the_argument_or_the_working_directory() {
         let named = workflow_sync_target(&words("nucleos-core --workflow-sync some/tree")).unwrap();

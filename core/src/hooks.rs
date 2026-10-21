@@ -1737,7 +1737,7 @@ mod tests {
         let job_id = sqlx::query(
             "INSERT INTO jobs
              (project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES ('proj', 'C:\\work\\repo', 'advance the backlog', 'implementing', 5, 1, 1,
+             VALUES ('proj', 'C:\\work\\repo', 'advance the backlog', 'running', 5, 1, 1,
                      '2026-08-07T00:00:00Z')",
         )
         .execute(&state.pool)
@@ -1761,8 +1761,8 @@ mod tests {
             .unwrap();
 
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, run_id)
-             VALUES (?, 0, 'the first thing', 'running', ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, run_id)
+             VALUES (?, 'implement', 0, 'the first thing', 'running', ?)",
         )
         .bind(job_id)
         .bind(run_id)
@@ -2031,7 +2031,7 @@ mod tests {
         let job_id = sqlx::query(
             "INSERT INTO jobs
              (project_id, project_root, prompt, status, max_items, gate_each, review, created_at)
-             VALUES ('proj', 'C:\\work\\repo', 'x', 'implementing', 5, 1, 1, '2026-08-07T00:00:00Z')",
+             VALUES ('proj', 'C:\\work\\repo', 'x', 'running', 5, 1, 1, '2026-08-07T00:00:00Z')",
         )
         .execute(&state.pool)
         .await
@@ -2183,7 +2183,7 @@ mod tests {
         );
 
         let item: String =
-            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? AND run_id = ?")
+            sqlx::query_scalar("SELECT status FROM job_nodes WHERE job_id = ? AND run_id = ?")
                 .bind(job_id)
                 .bind(run_id)
                 .fetch_one(&state.pool)
@@ -2215,7 +2215,7 @@ mod tests {
         let state = test_state().await;
         let (job_id, run_id) = in_flight_job_node(&state).await;
         // What makes it a plan node: it owns no running item, and its stage says so.
-        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET status = 'passed', run_id = NULL WHERE job_id = ?")
             .bind(job_id)
             .execute(&state.pool)
             .await
@@ -2272,7 +2272,7 @@ mod tests {
             let (job_id, run_id) = in_flight_job_node(&state).await;
             if !owns_an_item {
                 sqlx::query(
-                    "UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?",
+                    "UPDATE job_nodes SET status = 'passed', run_id = NULL WHERE job_id = ?",
                 )
                 .bind(job_id)
                 .execute(&state.pool)
@@ -4038,7 +4038,7 @@ mod tests {
         assert_eq!(decision.decision, "pending_approval");
 
         let item: (String, i64) =
-            sqlx::query_as("SELECT status, ordinal FROM job_items WHERE job_id = ? AND run_id = ?")
+            sqlx::query_as("SELECT status, ordinal FROM job_nodes WHERE job_id = ? AND run_id = ?")
                 .bind(job_id)
                 .bind(run_id)
                 .fetch_one(&state.pool)
@@ -4052,7 +4052,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            job_status, "implementing",
+            job_status, "running",
             "the job itself is untouched — it has a queue to get on with"
         );
 
@@ -4439,7 +4439,7 @@ mod tests {
         let state = test_state().await;
         let (job_id, run_id) = in_flight_job_node(&state).await;
         // What makes it a plan node: the queue does not exist yet.
-        sqlx::query("DELETE FROM job_items WHERE job_id = ?")
+        sqlx::query("DELETE FROM job_nodes WHERE job_id = ?")
             .bind(job_id)
             .execute(&state.pool)
             .await
@@ -4504,7 +4504,7 @@ mod tests {
         let state = test_state().await;
         let (job_id, run_id) = in_flight_job_node(&state).await;
         nobody_asked_for_this_job(&state.pool, job_id).await;
-        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET status = 'passed', run_id = NULL WHERE job_id = ?")
             .bind(job_id)
             .execute(&state.pool)
             .await
@@ -4547,7 +4547,7 @@ mod tests {
         assert_eq!(kinds, vec!["skipped-item"]);
         // The rounds that ran are what `stop_after_replan` keeps, so nothing may be reverted here.
         let item_statuses: Vec<String> =
-            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+            sqlx::query_scalar("SELECT status FROM job_nodes WHERE job_id = ? ORDER BY ordinal")
                 .bind(job_id)
                 .fetch_all(&state.pool)
                 .await
@@ -4561,7 +4561,7 @@ mod tests {
         let (job_id, run_id) = in_flight_job_node(&state).await;
         nobody_asked_for_this_job(&state.pool, job_id).await;
         // What makes it a review node: it owns no running item, and its stage says so.
-        sqlx::query("UPDATE job_items SET status = 'passed', run_id = NULL WHERE job_id = ?")
+        sqlx::query("UPDATE job_nodes SET status = 'passed', run_id = NULL WHERE job_id = ?")
             .bind(job_id)
             .execute(&state.pool)
             .await
@@ -4616,7 +4616,7 @@ mod tests {
         // And the items it was going to read are untouched. A review node owns no item, so a revert
         // here would target whichever ran last and throw away that item's checkpoint.
         let item_statuses: Vec<String> =
-            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? ORDER BY ordinal")
+            sqlx::query_scalar("SELECT status FROM job_nodes WHERE job_id = ? ORDER BY ordinal")
                 .bind(job_id)
                 .fetch_all(&state.pool)
                 .await
@@ -4653,7 +4653,7 @@ mod tests {
         .await;
 
         let status: String =
-            sqlx::query_scalar("SELECT status FROM job_items WHERE job_id = ? AND run_id = ?")
+            sqlx::query_scalar("SELECT status FROM job_nodes WHERE job_id = ? AND run_id = ?")
                 .bind(job_id)
                 .bind(run_id)
                 .fetch_one(&state.pool)

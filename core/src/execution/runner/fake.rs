@@ -354,6 +354,9 @@ impl CommandRunner for FakeCommandRunner {
             .iter()
             .find(|(key, _)| key == "NUCLEOS_JOB_ARTIFACTS")
             .map(|(_, value)| value)
+            // Only the planner (or the replanner) writes the queue: "REPLAN node" contains this too.
+            // The spec and review runs also carry the artifacts directory and must not consume it.
+            && request.prompt.contains("PLAN node of an autonomous job")
             && let Some(plan) = self.plan_to_write.lock().unwrap().take()
         {
             let _ = std::fs::create_dir_all(artifacts);

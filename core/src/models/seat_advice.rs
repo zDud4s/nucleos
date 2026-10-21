@@ -37,6 +37,10 @@ fn seat_query(prompt: &str) -> RouteQuery {
         stage: None,
         item: None,
         resume: false,
+        restrict_runners: None,
+        pin: None,
+        judged_later: false,
+        effort: None,
     }
 }
 
@@ -190,6 +194,65 @@ pub async fn route_team_seat(
     )
     .await;
     advice.map(|advice| advice.decision_id)
+}
+
+/// Routes a team seat whose agent pins no engine: the router chooses among `runners` (the agent's
+/// own, already narrowed by `agents::launch`), and the runner it names is the one that launches.
+///
+/// Returns the runner to launch on and the `decision_id` when there was usable advice. Without
+/// advice (router down, 400/422, an answer outside what was sent, or `shadow`) the default engine
+/// launches, but only when it is one of `runners` (`fallback_engine`); `off` asks nothing and
+/// launches the primary. Under `apply` the model and effort are rewritten as `route_team_seat` does.
+pub async fn route_agent_seat(
+    pool: &SqlitePool,
+    router: &Router,
+    run_id: i64,
+    request: &mut RunRequest,
+    runners: &[RunnerKind],
+) -> Result<(RunnerKind, Option<String>), crate::agents::launch::LaunchError> {
+    let mode = router.mode_for(Surface::Team);
+    if mode == Mode::Off {
+        return Ok((router.primary.kind, None));
+    }
+    let sent = router.build_request(&seat_query(&request.prompt), runners);
+    let advice = ask(router, &sent, Some(run_id), |advice| {
+        router.check_answer(advice, &sent).map(|_| ())
+    })
+    .await;
+    let advised = advice.and_then(|advice| {
+        let kind = router.check_answer(&advice, &sent).ok()?;
+        Some((advice, kind))
+    });
+    let kind = match &advised {
+        Some((_, kind)) if mode == Mode::Apply => *kind,
+        _ => crate::agents::launch::fallback_engine(router.primary.kind, runners)?,
+    };
+    if mode == Mode::Apply
+        && let Some((advice, _)) = &advised
+    {
+        let ceiling = effort_ceiling(speed_of(&request.env));
+        request.model = Some(advice.model.clone());
+        request.effort = advice
+            .effort
+            .as_deref()
+            .map(|effort| clamp_effort(effort, ceiling));
+    }
+    let model = request.model.clone().unwrap_or_else(|| {
+        router
+            .available(kind)
+            .map_or_else(String::new, |launched| launched.default_model.clone())
+    });
+    record(
+        pool,
+        run_id,
+        mode,
+        kind,
+        &model,
+        request.effort.as_deref(),
+        advised.as_ref().map(|(advice, _)| advice),
+    )
+    .await;
+    Ok((kind, advised.map(|(advice, _)| advice.decision_id)))
 }
 
 /// Routes a cloud council seat, whose `request.model` is its `model_ref`. Under `apply` only the

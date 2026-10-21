@@ -21,7 +21,7 @@ use super::*;
 /// The item is put down as `conflicted` and the run that clears it works in the item's own tree —
 /// the procedure `git_exec::compute_merge` already tells an agent to follow when the queue refuses
 /// its merge.
-pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -> Step {
+pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -> Pass {
     let pool = &state.pool;
 
     let Ok(Some((worktree, _))) = job_worktree(pool, job.id).await else {
@@ -30,10 +30,10 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
             ordinal,
             "no worktree on record to merge into"
         );
-        return Step::Stopped;
+        return Pass::Stopped;
     };
     let item_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+        sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = ?")
             .bind(job.id)
             .bind(ordinal as i64)
             .fetch_optional(pool)
@@ -42,7 +42,7 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
             .flatten();
     let Some(item_id) = item_id else {
         tracing::warn!(job_id = job.id, ordinal, "no item row to merge");
-        return Step::Stopped;
+        return Pass::Stopped;
     };
     let branch = crate::execution::worktree::Owner::Item(item_id).branch_name();
 
@@ -77,7 +77,7 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
             ordinal,
             "no checkout on record for the item being merged"
         );
-        return Step::Stopped;
+        return Pass::Stopped;
     };
     if let Err(error) = crate::execution::worktree::checkpoint(Path::new(&item_tree)).await {
         // Fatal here, where the same failure is survivable in `record_gate`. There the work is
@@ -85,7 +85,7 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
         // only in a working tree, and merging without it would put a green gate on a branch that is
         // missing the thing it is measuring.
         tracing::warn!(job_id = job.id, ordinal, %error, "could not commit an item's work, so nothing was merged");
-        return Step::Stopped;
+        return Pass::Stopped;
     }
 
     let Ok(base) = crate::execution::worktree::head_sha(&worktree).await else {
@@ -94,10 +94,10 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
             ordinal,
             "could not read where the job's branch stands, so nothing was merged"
         );
-        return Step::Stopped;
+        return Pass::Stopped;
     };
     let recorded =
-        sqlx::query("UPDATE job_items SET merge_base_sha = ? WHERE job_id = ? AND ordinal = ?")
+        sqlx::query("UPDATE job_nodes SET merge_base_sha = ? WHERE job_id = ? AND ordinal = ?")
             .bind(&base)
             .bind(job.id)
             .bind(ordinal as i64)
@@ -105,7 +105,7 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
             .await;
     if let Err(error) = recorded {
         tracing::warn!(job_id = job.id, ordinal, %error, "could not record where a merge would start, so nothing was merged");
-        return Step::Stopped;
+        return Pass::Stopped;
     }
 
     match crate::execution::worktree::merge_branch(&worktree, &branch).await {
@@ -114,7 +114,7 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
             // would carry on over a state the database does not have: stop, like the checks above.
             let marked = crate::storage::settle_write("job item (merging)", job.id, || {
                 sqlx::query(
-                    "UPDATE job_items SET status = 'merging' WHERE job_id = ? AND ordinal = ?",
+                    "UPDATE job_nodes SET status = 'merging' WHERE job_id = ? AND ordinal = ?",
                 )
                 .bind(job.id)
                 .bind(ordinal as i64)
@@ -127,14 +127,14 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
                     ordinal,
                     "could not mark a merged item as merging, so the job stops here"
                 );
-                return Step::Stopped;
+                return Pass::Stopped;
             }
-            Step::Continued
+            Pass::Continued
         }
         Ok(false) => {
             let marked = crate::storage::settle_write("job item (conflicted)", job.id, || {
                 sqlx::query(
-                    "UPDATE job_items SET status = 'conflicted' WHERE job_id = ? AND ordinal = ?",
+                    "UPDATE job_nodes SET status = 'conflicted' WHERE job_id = ? AND ordinal = ?",
                 )
                 .bind(job.id)
                 .bind(ordinal as i64)
@@ -147,7 +147,7 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
                     ordinal,
                     "could not mark a conflicting item as conflicted, so the job stops here"
                 );
-                return Step::Stopped;
+                return Pass::Stopped;
             }
             say(
                 pool,
@@ -160,11 +160,11 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
                 ),
             )
             .await;
-            Step::Continued
+            Pass::Continued
         }
         Err(error) => {
             tracing::warn!(job_id = job.id, ordinal, %error, "could not merge an item");
-            Step::Stopped
+            Pass::Stopped
         }
     }
 }
@@ -231,7 +231,7 @@ pub(super) async fn gate_item(
     job: &JobRow,
     ordinal: usize,
     items: usize,
-) -> Step {
+) -> Pass {
     gate_item_with(state, job, ordinal, items, crate::verify::installed()).await
 }
 
@@ -243,7 +243,7 @@ pub(super) async fn gate_item_with(
     ordinal: usize,
     items: usize,
     installed: Option<std::sync::Arc<crate::verify::exec::Executor>>,
-) -> Step {
+) -> Pass {
     let pool = &state.pool;
     let last = ordinal + 1 == items;
 
@@ -260,14 +260,14 @@ pub(super) async fn gate_item_with(
     // comfort the column exists to avoid.
     let pass_without_measuring = |why: &'static str| async move {
         let _ =
-            sqlx::query("UPDATE job_items SET status = 'passed' WHERE job_id = ? AND ordinal = ?")
+            sqlx::query("UPDATE job_nodes SET status = 'passed' WHERE job_id = ? AND ordinal = ?")
                 .bind(job.id)
                 .bind(ordinal as i64)
                 .execute(pool)
                 .await;
         credit_the_briefing(pool, job, ordinal).await;
         tracing::debug!(job_id = job.id, ordinal, why, "item not gated");
-        Step::Continued
+        Pass::Continued
     };
 
     // `gate_after_each_item: false` buys back the N suite runs, and the final gate runs regardless
@@ -334,8 +334,8 @@ pub(super) async fn gate_item_with(
     if item_gate(last, trusted, executor.is_some(), scoped_final) == ItemGate::Scope
         && let Some(executor) = executor
     {
-        if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
-            return Step::Stopped;
+        if matches!(job_is_live(pool, job.id).await, Ok(false)) {
+            return Pass::Stopped;
         }
         // The timeout counts from the submit, so time queued behind other work is part of it.
         let verdict = crate::verify::gate_job_scope(
@@ -345,16 +345,13 @@ pub(super) async fn gate_item_with(
             crate::state::DEFAULT_GATE_TIMEOUT,
         )
         .await;
-        if matches!(
-            set_live_status(pool, job.id, "implementing").await,
-            Ok(false)
-        ) {
+        if matches!(job_is_live(pool, job.id).await, Ok(false)) {
             tracing::info!(
                 job_id = job.id,
                 ordinal,
                 "job ended while its gate ran; the outcome is not recorded"
             );
-            return Step::Stopped;
+            return Pass::Stopped;
         }
         // The last item's gate is the one the owner reads as "the job passed", so the feed says
         // which gate measured it, whatever the verdict (an unavailable scope says the full gate follows).
@@ -403,13 +400,12 @@ pub(super) async fn gate_item_with(
         }
     }
 
-    // Both writes are compare-and-set, and losing either stops the pass. A gate takes minutes, and
-    // a cancel is most likely to land inside one: the old unconditional `implementing` afterwards
-    // brought the cancelled job back to life, and `record_gate` then checkpointed and moved on to
-    // the next item. `Ok(false)` is the job having ended; an `Err` says nothing about the job and
-    // is let through as before.
-    if matches!(set_live_status(pool, job.id, "gating").await, Ok(false)) {
-        return Step::Stopped;
+    // Both reads are live checks, and failing either stops the pass. A gate takes minutes, and
+    // a cancel is most likely to land inside one: `record_gate` would otherwise checkpoint and move
+    // on to the next item of a cancelled job. `Ok(false)` is the job having ended; an `Err` says
+    // nothing about the job and is let through as before.
+    if matches!(job_is_live(pool, job.id).await, Ok(false)) {
+        return Pass::Stopped;
     }
     let outcome = crate::verify::runs::timed_gate(
         Some(pool),
@@ -425,16 +421,13 @@ pub(super) async fn gate_item_with(
         crate::state::DEFAULT_GATE_TIMEOUT,
     )
     .await;
-    if matches!(
-        set_live_status(pool, job.id, "implementing").await,
-        Ok(false)
-    ) {
+    if matches!(job_is_live(pool, job.id).await, Ok(false)) {
         tracing::info!(
             job_id = job.id,
             ordinal,
             "job ended while its gate ran; the outcome is not recorded"
         );
-        return Step::Stopped;
+        return Pass::Stopped;
     }
     record_gate(state, job, ordinal, outcome).await
 }
@@ -461,7 +454,7 @@ pub(super) async fn revert_point(
     ordinal: usize,
 ) -> Option<String> {
     let merged: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT merge_base_sha FROM job_items WHERE job_id = ? AND ordinal = ?",
+        "SELECT merge_base_sha FROM job_nodes WHERE job_id = ? AND ordinal = ?",
     )
     .bind(job.id)
     .bind(ordinal as i64)
@@ -486,7 +479,7 @@ pub(super) async fn revert_point(
 /// the honest response is to leave the tree alone and stop rather than guess at a revision.
 pub(super) async fn footing_for(pool: &SqlitePool, job: &JobRow, ordinal: usize) -> Option<String> {
     let earlier: Option<String> = sqlx::query_scalar(
-        "SELECT checkpoint_sha FROM job_items
+        "SELECT checkpoint_sha FROM job_nodes
          WHERE job_id = ? AND ordinal < ? AND checkpoint_sha IS NOT NULL
          ORDER BY ordinal DESC LIMIT 1",
     )
@@ -507,7 +500,7 @@ pub(super) async fn footing_for(pool: &SqlitePool, job: &JobRow, ordinal: usize)
 /// the same query rather than growing a second answer to "what does this item fall back to".
 pub(super) async fn footing_for_run(pool: &SqlitePool, job_id: i64, run_id: i64) -> Option<String> {
     let ordinal: i64 =
-        sqlx::query_scalar("SELECT ordinal FROM job_items WHERE job_id = ? AND run_id = ?")
+        sqlx::query_scalar("SELECT ordinal FROM job_nodes WHERE job_id = ? AND run_id = ?")
             .bind(job_id)
             .bind(run_id)
             .fetch_optional(pool)
@@ -666,7 +659,7 @@ pub(super) async fn pass_unmeasured_with_checkpoint(
     job: &JobRow,
     ordinal: usize,
     worktree: &Path,
-) -> Step {
+) -> Pass {
     let checkpoint_sha = match crate::execution::worktree::checkpoint(worktree).await {
         Ok(sha) => Some(sha),
         Err(error) => {
@@ -675,7 +668,7 @@ pub(super) async fn pass_unmeasured_with_checkpoint(
         }
     };
     let written = sqlx::query(
-        "UPDATE job_items SET status = 'passed', checkpoint_sha = ? WHERE job_id = ? AND ordinal = ?",
+        "UPDATE job_nodes SET status = 'passed', checkpoint_sha = ? WHERE job_id = ? AND ordinal = ?",
     )
     .bind(checkpoint_sha)
     .bind(job.id)
@@ -684,7 +677,7 @@ pub(super) async fn pass_unmeasured_with_checkpoint(
     .await;
     if let Err(error) = written {
         tracing::warn!(job_id = job.id, ordinal, %error, "could not record an unmeasured last item");
-        return Step::Stopped;
+        return Pass::Stopped;
     }
     credit_the_briefing(pool, job, ordinal).await;
     tracing::debug!(
@@ -692,7 +685,7 @@ pub(super) async fn pass_unmeasured_with_checkpoint(
         ordinal,
         "last item not measured; checkpointed"
     );
-    Step::Continued
+    Pass::Continued
 }
 
 pub(super) async fn record_gate(
@@ -700,7 +693,7 @@ pub(super) async fn record_gate(
     job: &JobRow,
     ordinal: usize,
     outcome: crate::gate::GateOutcome,
-) -> Step {
+) -> Pass {
     let pool = &state.pool;
     // Three states out of three, never two. A binary that would not start says the measurement did
     // not happen; a non-zero exit says the code is broken. One of those is a verdict and the other
@@ -778,7 +771,7 @@ pub(super) async fn record_gate(
         // item — and the budget it is read against is a number that can differ between two jobs
         // gating the same repository on the same night.
         if let Err(error) = sqlx::query(
-            "UPDATE job_items SET gate_attempts = gate_attempts + 1, gate_output = ?
+            "UPDATE job_nodes SET gate_attempts = gate_attempts + 1, gate_output = ?
              WHERE job_id = ? AND ordinal = ?",
         )
         .bind(gate_output_tail(output))
@@ -795,7 +788,7 @@ pub(super) async fn record_gate(
         // that cannot be read spends nothing, which is exactly today's behaviour.
         let spendable: Option<(i64, i64)> = sqlx::query_as(
             "SELECT i.gate_attempts, j.gate_retries
-             FROM job_items i JOIN jobs j ON j.id = i.job_id
+             FROM job_nodes i JOIN jobs j ON j.id = i.job_id
              WHERE i.job_id = ? AND i.ordinal = ?",
         )
         .bind(job.id)
@@ -807,7 +800,7 @@ pub(super) async fn record_gate(
 
         // A merged item's work lives on the job's branch as a merge, not in the shared tree.
         let merged: bool = sqlx::query_scalar::<_, bool>(
-            "SELECT merge_base_sha IS NOT NULL FROM job_items WHERE job_id = ? AND ordinal = ?",
+            "SELECT merge_base_sha IS NOT NULL FROM job_nodes WHERE job_id = ? AND ordinal = ?",
         )
         .bind(job.id)
         .bind(ordinal as i64)
@@ -827,7 +820,7 @@ pub(super) async fn record_gate(
             && item_state_from(item_status, attempts, retries) == ItemState::GateRetriable
         {
             let written = sqlx::query(
-                "UPDATE job_items SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+                "UPDATE job_nodes SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
             )
             .bind(item_status)
             .bind(gate_status)
@@ -837,7 +830,7 @@ pub(super) async fn record_gate(
             .await;
             if let Err(error) = written {
                 tracing::warn!(job_id = job.id, ordinal, %error, "could not record a red gate that still has a retry");
-                return Step::Stopped;
+                return Pass::Stopped;
             }
             say(
                 pool,
@@ -852,7 +845,7 @@ pub(super) async fn record_gate(
                 ),
             )
             .await;
-            return Step::Continued;
+            return Pass::Continued;
         }
     }
 
@@ -870,7 +863,7 @@ pub(super) async fn record_gate(
     // said no.
     if matches!(outcome, crate::gate::GateOutcome::Failed { .. }) {
         let marked = sqlx::query(
-            "UPDATE job_items SET status = 'reverted', gate_status = ? WHERE job_id = ? AND ordinal = ?",
+            "UPDATE job_nodes SET status = 'reverted', gate_status = ? WHERE job_id = ? AND ordinal = ?",
         )
         .bind(gate_status)
         .bind(job.id)
@@ -880,7 +873,7 @@ pub(super) async fn record_gate(
         if let Err(error) = marked {
             // The item is still `implemented`/`merging`, so the next pass gates it again.
             tracing::warn!(job_id = job.id, ordinal, %error, "could not mark a red item for revert");
-            return Step::Stopped;
+            return Pass::Stopped;
         }
         return settle_revert(state, job, ordinal, note).await;
     }
@@ -888,7 +881,7 @@ pub(super) async fn record_gate(
     let written = async {
         let mut tx = pool.begin().await?;
         sqlx::query(
-            "UPDATE job_items SET status = ?, gate_status = ?, checkpoint_sha = ?
+            "UPDATE job_nodes SET status = ?, gate_status = ?, checkpoint_sha = ?
              WHERE job_id = ? AND ordinal = ?",
         )
         .bind(item_status)
@@ -904,7 +897,7 @@ pub(super) async fn record_gate(
     .await;
     if let Err(error) = written {
         tracing::warn!(job_id = job.id, ordinal, %error, "could not record a gate verdict");
-        return Step::Stopped;
+        return Pass::Stopped;
     }
     credit_the_briefing(pool, job, ordinal).await;
 
@@ -917,7 +910,7 @@ pub(super) async fn record_gate(
         )
         .await;
     }
-    Step::Continued
+    Pass::Continued
 }
 
 /// The second half of `reverted`: put the job's branch back and write the item's final status.
@@ -928,14 +921,14 @@ pub(super) async fn record_gate(
 /// `reverted` (`next_step` settles it before anything else).
 ///
 /// A revert that cannot be done writes `revert_failed` and retires the job `stopped` here, AND
-/// `next_step` short-circuits on that status. `Step::Stopped` alone only ends the pass, and the next
+/// `next_step` short-circuits on that status. `Pass::Stopped` alone only ends the pass, and the next
 /// tick used to carry on over the work the gate had rejected (the defect this replaces).
 pub(super) async fn settle_revert(
     state: &AppState,
     job: &JobRow,
     ordinal: usize,
     note: Option<String>,
-) -> Step {
+) -> Pass {
     let pool = &state.pool;
     let target = match (
         job_worktree(pool, job.id).await,
@@ -969,7 +962,7 @@ pub(super) async fn settle_revert(
             let written = async {
                 let mut tx = pool.begin().await?;
                 sqlx::query(
-                    "UPDATE job_items SET status = 'gate_failed'
+                    "UPDATE job_nodes SET status = 'gate_failed'
                      WHERE job_id = ? AND ordinal = ? AND status = 'reverted'",
                 )
                 .bind(job.id)
@@ -983,13 +976,13 @@ pub(super) async fn settle_revert(
             if let Err(error) = written {
                 // The row stays `reverted`; the next pass settles it again.
                 tracing::warn!(job_id = job.id, ordinal, %error, "could not settle a reverted item");
-                return Step::Stopped;
+                return Pass::Stopped;
             }
             credit_the_briefing(pool, job, ordinal).await;
 
             let spendable: Option<(i64, i64)> = sqlx::query_as(
                 "SELECT i.gate_attempts, j.gate_retries
-                 FROM job_items i JOIN jobs j ON j.id = i.job_id
+                 FROM job_nodes i JOIN jobs j ON j.id = i.job_id
                  WHERE i.job_id = ? AND i.ordinal = ?",
             )
             .bind(job.id)
@@ -1019,13 +1012,13 @@ pub(super) async fn settle_revert(
                 ),
             };
             say(pool, job, "job_gate_failed", &message).await;
-            Step::Continued
+            Pass::Continued
         }
         Err(reason) => {
             let written = async {
                 let mut tx = pool.begin().await?;
                 sqlx::query(
-                    "UPDATE job_items SET status = 'revert_failed'
+                    "UPDATE job_nodes SET status = 'revert_failed'
                      WHERE job_id = ? AND ordinal = ? AND status = 'reverted'",
                 )
                 .bind(job.id)
@@ -1055,7 +1048,7 @@ pub(super) async fn settle_revert(
                 ),
             )
             .await;
-            Step::Stopped
+            Pass::Stopped
         }
     }
 }

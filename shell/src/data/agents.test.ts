@@ -5,7 +5,9 @@ import {
   canTakeASeat,
   employmentOf,
   hasTools,
+  proposedCapabilities,
   renamed,
+  sameCapabilities,
   slugOf,
   unemployed,
   type Agent,
@@ -30,6 +32,7 @@ function agent(overrides: Partial<Agent> = {}): Agent {
     prompt: "You write short, punchy copy.",
     engine: "claude",
     model: null,
+    capabilities: ["mcp.nucleos"],
     tool_policy: "mcp_only",
     created_at: "2026-08-01T09:00:00Z",
     updated_at: "2026-08-01T09:00:00Z",
@@ -100,16 +103,34 @@ describe("canTakeASeat", () => {
   });
 });
 
+describe("proposedCapabilities", () => {
+  it("maps a legacy tool_policy-only payload like the daemon backfill", () => {
+    expect(proposedCapabilities({ tool_policy: "mcp_only" })).toEqual(["mcp.nucleos"]);
+    expect(proposedCapabilities({ tool_policy: "none" })).toEqual([]);
+  });
+
+  it("prefers stored capabilities over tool_policy", () => {
+    expect(proposedCapabilities({ capabilities: ["web"], tool_policy: "mcp_only" })).toEqual(["web"]);
+    expect(proposedCapabilities({})).toEqual([]);
+  });
+});
+
+describe("sameCapabilities", () => {
+  it("ignores order and duplicates", () => {
+    expect(sameCapabilities(["web", "shell"], ["shell", "web"])).toBe(true);
+    expect(sameCapabilities(["web"], ["web", "shell"])).toBe(false);
+  });
+});
+
 describe("hasTools", () => {
-  it("is true for mcp_only and false for none", () => {
-    expect(hasTools(agent({ tool_policy: "mcp_only" }))).toBe(true);
-    expect(hasTools(agent({ tool_policy: "none" }))).toBe(false);
+  it("is true when any capability is held and false for none", () => {
+    expect(hasTools(agent({ capabilities: ["mcp.nucleos"] }))).toBe(true);
+    expect(hasTools(agent({ capabilities: [] }))).toBe(false);
   });
 
   it("reads a policy this shell has never heard of as no tools, never as tools", () => {
-    // `tool_policy` is a bare string on the wire. Guessing upward would draw a
-    // barrier that may not be there; guessing downward understates a power.
-    expect(hasTools(agent({ tool_policy: "unrestricted" }))).toBe(false);
+    // A capability id is a bare string on the wire; any held one counts as a power.
+    expect(hasTools(agent({ capabilities: ["fs.write"] }))).toBe(true);
   });
 });
 

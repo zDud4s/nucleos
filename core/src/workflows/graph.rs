@@ -47,6 +47,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::condition;
+
 /// The file inside a bundle that holds the graph.
 pub const GRAPH_FILE: &str = "graph.yaml";
 
@@ -100,6 +102,11 @@ pub struct Node {
     /// The instructions file, relative to the bundle. The node's actual content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// A catalogue agent package, `name@X.Y.Z` (agentes spec section 6). Only an agent node has one;
+    /// its prompt then carries the package's layers between the engine's protocol and the `body`.
+    /// The version is mandatory: a graph that follows "the latest" would change under its owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +243,7 @@ pub fn parse(contents: &str) -> Result<Graph, String> {
 /// one, a verdict leaving something that has no exit code to have a verdict about.
 pub fn validate(graph: &Graph) -> Result<(), String> {
     let mut ids = BTreeSet::new();
+    let mut conditions: Vec<(&str, condition::Condition)> = Vec::new();
     for node in &graph.nodes {
         if node.id.trim().is_empty() {
             return Err("a node has no id".to_string());
@@ -275,11 +283,88 @@ pub fn validate(graph: &Graph) -> Result<(), String> {
                 }
             }
         }
-        if node.kind == Kind::Decision && node.condition.is_none() {
+        // `agent:` names a package version. Whether it is INSTALLED is the dispatcher's question
+        // (it fails the node before a run exists); here only the reference's shape is checked.
+        if let Some(reference) = node.agent.as_deref() {
+            if node.kind != Kind::Agent {
+                return Err(format!(
+                    "`{}` has an `agent:` but is not an agent node",
+                    node.id
+                ));
+            }
+            if let Err(error) = crate::agents::package::PackageRef::parse(reference) {
+                return Err(format!(
+                    "`{}` has an `agent:` that is not `name@X.Y.Z`: {error}",
+                    node.id
+                ));
+            }
+        }
+        // A wall-clock ceiling is a command node's. A command's has to parse, and an agent's is
+        // refused: its ceiling is the daemon's `run_timeout`, and a field that installs and then
+        // does nothing is what `JOIN_RULES` was written to prevent.
+        if let Some(timeout) = node.timeout.as_deref() {
+            match node.kind {
+                Kind::Command => {
+                    if let Err(error) = super::timeout::parse(timeout) {
+                        return Err(format!(
+                            "`{}` has a timeout that does not parse: {error}",
+                            node.id
+                        ));
+                    }
+                }
+                Kind::Agent => {
+                    return Err(format!(
+                        "`{}` is an agent node with a `timeout`; a model run's ceiling is the daemon's `run_timeout`, and a wall-clock ceiling on an agent node is not implemented",
+                        node.id
+                    ));
+                }
+                Kind::Decision | Kind::Fan => {}
+            }
+        }
+        // `job` and `project` are the engine's own fact namespaces, so a node of that name would
+        // make `job.x` mean two things.
+        if RESERVED_NAMESPACES.contains(&node.id.as_str()) {
             return Err(format!(
-                "`{}` is a decision node with no condition",
+                "`{}` is a reserved name (the engine's own namespace), so no node can have that id",
                 node.id
             ));
+        }
+        if node.kind == Kind::Decision {
+            let Some(source) = node.condition.as_deref() else {
+                return Err(format!(
+                    "`{}` is a decision node with no condition",
+                    node.id
+                ));
+            };
+            match condition::parse(source) {
+                Ok(parsed) => conditions.push((node.id.as_str(), parsed)),
+                Err(error) => {
+                    return Err(format!(
+                        "`{}` has a condition that does not parse: {error}",
+                        node.id
+                    ));
+                }
+            }
+        }
+    }
+
+    // Install-time shape only: a key's namespace has to be somebody. Whether the key exists at run
+    // time is not decided here.
+    for (id, parsed) in &conditions {
+        for key in parsed.keys() {
+            let owned = RESERVED_NAMESPACES.iter().any(|ns| {
+                key.strip_prefix(ns)
+                    .is_some_and(|rest| rest.starts_with('.'))
+            }) || ids.iter().any(|node| {
+                key.strip_prefix(node)
+                    .is_some_and(|rest| rest.starts_with('.'))
+            });
+            if !owned {
+                let namespace = key.split('.').next().unwrap_or(key);
+                return Err(format!(
+                    "`{id}` reads `{key}`, but `{namespace}` is neither a node here nor `job`/`project`"
+                ));
+            }
         }
     }
 
@@ -344,8 +429,53 @@ pub fn validate(graph: &Graph) -> Result<(), String> {
             }
         }
     }
+
+    // A decision is one-way: exactly one edge for `true` and one for `false`. Edges leaving any
+    // other node keep `when` as free label text and are not looked at here.
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == Kind::Decision)
+    {
+        let (mut on_true, mut on_false) = (0usize, 0usize);
+        for edge in graph.edges.iter().filter(|edge| edge.from == node.id) {
+            match edge.when.as_deref().map(str::trim) {
+                Some("true") => on_true += 1,
+                Some("false") => on_false += 1,
+                other => {
+                    return Err(format!(
+                        "`{}` is a decision, so its edge to `{}` has to say `when: true` or `when: false`, not `{}`",
+                        node.id,
+                        edge.to,
+                        other.unwrap_or("nothing")
+                    ));
+                }
+            }
+        }
+        // A round decision (its `true` edge loops back to it) may leave `false` without an edge: the
+        // graph ends there (M3 D2). Anything else must cover both values.
+        let loops_back =
+            on_true == 1 && on_false == 0 && reaches(graph, node.id.as_str(), node.id.as_str());
+        for (value, count) in [("true", on_true), ("false", on_false)] {
+            if count == 0 && !(loops_back && value == "false") {
+                return Err(format!(
+                    "`{}` is a decision whose edges do not cover both `true` and `false` (missing `{value}`)",
+                    node.id
+                ));
+            }
+            if count > 1 {
+                return Err(format!(
+                    "`{}` has two `when: {value}` edges, and a decision goes one way",
+                    node.id
+                ));
+            }
+        }
+    }
     Ok(())
 }
+
+/// Fact namespaces the engine owns; no node may take one as its id.
+const RESERVED_NAMESPACES: &[&str] = &["job", "project"];
 
 /// What a node is *for*, as distinct from who runs it.
 ///
@@ -439,6 +569,7 @@ pub fn resolve(
         // what a node IS, not only what was changed about it.
         for (name, value) in [
             ("body", node.body.as_deref()),
+            ("agent", node.agent.as_deref()),
             ("effort", node.effort.as_deref()),
             ("contract", node.contract.as_deref()),
             ("cwd", node.cwd.as_deref()),
@@ -522,6 +653,23 @@ fn push_field(
     }
 }
 
+/// Whether `from` can reach `target` by following at least one edge.
+fn reaches(graph: &Graph, from: &str, target: &str) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![from];
+    while let Some(id) = stack.pop() {
+        for edge in graph.edges.iter().filter(|edge| edge.from == id) {
+            if edge.to == target {
+                return true;
+            }
+            if seen.insert(edge.to.as_str()) {
+                stack.push(edge.to.as_str());
+            }
+        }
+    }
+    false
+}
+
 /// Whether anything branches on how this node exited.
 pub fn is_gate(edges: &[Edge], node_id: &str) -> bool {
     edges
@@ -539,7 +687,7 @@ nodes:
   - id: triage
     type: decision
     label: Triage
-    condition: size
+    condition: plan.size != trivial
   - id: plan
     type: agent
     label: Plan
@@ -555,7 +703,8 @@ nodes:
     type: agent
     body: skills/rescue/SKILL.md
 edges:
-  - {from: triage, to: plan, when: "size != trivial"}
+  - {from: triage, to: plan, when: true}
+  - {from: triage, to: rescue, when: false}
   - {from: plan, to: gate}
   - {from: gate, to: rescue, verdict: fail}
 "#;
@@ -564,7 +713,7 @@ edges:
     fn the_harness_this_repository_already_has_parses_as_a_graph() {
         let graph = parse(HARNESS).unwrap();
         assert_eq!(graph.nodes.len(), 4);
-        assert_eq!(graph.edges.len(), 3);
+        assert_eq!(graph.edges.len(), 4);
         assert_eq!(graph.nodes[1].kind, Kind::Agent);
         assert_eq!(graph.nodes[1].model.as_deref(), Some("opus"));
     }
@@ -638,7 +787,7 @@ edges:
 
         let painted = resolve(&graph, &overlay);
         assert_eq!(painted.nodes.len(), 4);
-        assert_eq!(painted.edges.len(), 3);
+        assert_eq!(painted.edges.len(), 4);
         let rescue = painted.nodes.iter().find(|n| n.id == "rescue").unwrap();
         assert!(rescue.disabled);
         // Switching a node off is the most drastic change a project can make, so it carries the
@@ -808,6 +957,29 @@ edges:
         assert!(error.contains("all"), "{error}");
     }
 
+    #[test]
+    fn a_command_with_an_unparsable_timeout_does_not_install() {
+        for bad in ["1h30m", "0m", "13h", "30x"] {
+            let yaml =
+                format!("nodes:\n  - {{id: gate, type: command, command: make, timeout: {bad}}}\n");
+            let error = parse(&yaml).unwrap_err();
+            assert!(
+                error.contains("gate") && error.contains("timeout"),
+                "{bad}: {error}"
+            );
+        }
+        assert!(
+            parse("nodes:\n  - {id: gate, type: command, command: make, timeout: 30m}\n").is_ok()
+        );
+    }
+
+    #[test]
+    fn a_timeout_on_an_agent_node_does_not_install() {
+        let error = parse("nodes:\n  - {id: plan, type: agent, timeout: 30m}\n").unwrap_err();
+        assert!(error.contains("plan"), "{error}");
+        assert!(error.contains("run_timeout"), "{error}");
+    }
+
     /* --------------------------------------------------------------- command -- */
 
     /// A gate is a project's own definition of green, so the built-in workflow names it instead of
@@ -856,5 +1028,196 @@ edges:
         let fan = painted.nodes.iter().find(|n| n.id == "work").unwrap();
         let each = fan.fields.iter().find(|f| f.name == "each").unwrap();
         assert_eq!(each.value, "implement, gate");
+    }
+
+    /* ------------------------------------------------------------- decision -- */
+
+    /// A decision `d` reading `condition`, next to two agents, with the given edges leaving it.
+    fn decision(condition: &str, edges: &str) -> String {
+        format!(
+            "nodes:\n  \
+             - {{id: a, type: agent}}\n  \
+             - {{id: yes, type: agent}}\n  \
+             - {{id: no, type: agent}}\n  \
+             - {{id: d, type: decision, condition: '{condition}'}}\n\
+             edges:\n{edges}"
+        )
+    }
+
+    const BOTH: &str = "  - {from: d, to: yes, when: true}\n  - {from: d, to: no, when: false}\n";
+
+    #[test]
+    fn a_condition_that_mixes_and_with_or_does_not_install() {
+        let error = parse(&decision("a.x == 1 and a.y == 2 or a.z == 3", BOTH)).unwrap_err();
+        assert!(error.contains("`d`"), "{error}");
+        assert!(error.contains("and") && error.contains("or"), "{error}");
+    }
+
+    #[test]
+    fn a_condition_that_does_not_parse_does_not_install() {
+        let error = parse(&decision("size", BOTH)).unwrap_err();
+        assert!(error.contains("`d`"), "{error}");
+        assert!(error.contains("does not parse"), "{error}");
+    }
+
+    #[test]
+    fn a_decision_whose_edges_do_not_cover_true_and_false_does_not_install() {
+        for (edges, missing) in [
+            ("  - {from: d, to: yes, when: true}\n", "false"),
+            ("  - {from: d, to: no, when: false}\n", "true"),
+            ("  []\n", "true"),
+        ] {
+            let source = if edges.trim() == "[]" {
+                decision("a.x == 1", "  - {from: a, to: yes}\n")
+            } else {
+                decision("a.x == 1", edges)
+            };
+            let error = parse(&source).unwrap_err();
+            assert!(error.contains("`d`"), "{error}");
+            assert!(error.contains(&format!("missing `{missing}`")), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_decision_edge_has_to_say_true_or_false() {
+        for when in ["\"size != trivial\"", "True", "yes", "~"] {
+            let edges = format!(
+                "  - {{from: d, to: yes, when: {when}}}\n  - {{from: d, to: no, when: false}}\n"
+            );
+            let error = parse(&decision("a.x == 1", &edges)).unwrap_err();
+            assert!(
+                error.contains("`d`") && error.contains("`yes`"),
+                "{when}: {error}"
+            );
+            assert!(error.contains("when: true"), "{when}: {error}");
+        }
+        let error = parse(&decision(
+            "a.x == 1",
+            "  - {from: d, to: yes}\n  - {from: d, to: no, when: false}\n",
+        ))
+        .unwrap_err();
+        assert!(error.contains("nothing"), "{error}");
+    }
+
+    #[test]
+    fn two_edges_for_one_value_are_refused() {
+        let edges = format!("{BOTH}  - {{from: d, to: a, when: true}}\n");
+        let error = parse(&decision("a.x == 1", &edges)).unwrap_err();
+        assert!(error.contains("two `when: true` edges"), "{error}");
+    }
+
+    #[test]
+    fn a_decision_that_reads_a_namespace_nobody_owns_is_refused() {
+        let error = parse(&decision("ghost.x == 1", BOTH)).unwrap_err();
+        assert!(
+            error.contains("`d`") && error.contains("ghost.x"),
+            "{error}"
+        );
+        assert!(error.contains("`ghost`"), "{error}");
+    }
+
+    #[test]
+    fn a_decision_that_reads_job_and_project_and_node_namespaces_fine() {
+        for condition in ["job.size == 1", "project.kind == x", "a.done != true"] {
+            parse(&decision(condition, BOTH)).unwrap_or_else(|e| panic!("{condition}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_node_cannot_take_an_engine_namespace_as_its_id() {
+        for id in ["job", "project"] {
+            let error = parse(&format!("nodes:\n  - {{id: {id}, type: agent}}\n")).unwrap_err();
+            assert!(error.contains(id) && error.contains("reserved"), "{error}");
+        }
+    }
+
+    /// The exact text of the spec's rule 6.
+    #[test]
+    fn rule_6_is_a_valid_decision_node() {
+        let graph = parse(
+            "nodes:\n  \
+             - {id: triage, type: agent}\n  \
+             - {id: review?, type: decision, condition: 'triage.risk == elevated or triage.size in [medium, large]'}\n  \
+             - {id: review, type: agent}\n  \
+             - {id: done, type: agent}\n\
+             edges:\n  \
+             - {from: triage, to: review?}\n  \
+             - {from: review?, to: review, when: true}\n  \
+             - {from: review?, to: done, when: false}\n",
+        )
+        .unwrap();
+        assert_eq!(graph.edges.len(), 3);
+    }
+
+    #[test]
+    fn an_edge_that_is_not_leaving_a_decision_keeps_its_free_text_when() {
+        for when in ["\"size != trivial\"", "true"] {
+            let source = format!(
+                "nodes:\n  - {{id: a, type: agent}}\n  - {{id: b, type: agent}}\nedges:\n  - {{from: a, to: b, when: {when}}}\n"
+            );
+            parse(&source).unwrap_or_else(|e| panic!("{when}: {e}"));
+        }
+    }
+
+    /* ----------------------------------------------------------------- agent -- */
+
+    #[test]
+    fn an_agent_node_may_name_a_package_version_and_keeps_it() {
+        let graph = parse(
+            "nodes:
+  - {id: review, type: agent, agent: reviewer@1.0.0, body: b.md}
+",
+        )
+        .unwrap();
+        assert_eq!(graph.nodes[0].agent.as_deref(), Some("reviewer@1.0.0"));
+    }
+
+    #[test]
+    fn an_agent_node_without_agent_still_loads() {
+        let graph = parse(
+            "nodes:
+  - {id: plan, type: agent, body: b.md}
+",
+        )
+        .unwrap();
+        assert_eq!(graph.nodes[0].agent, None);
+    }
+
+    #[test]
+    fn an_agent_reference_without_a_version_or_with_a_bad_one_is_refused() {
+        for reference in [
+            "reviewer",
+            "Reviewer@1.0.0",
+            "reviewer@1.0",
+            "reviewer@latest",
+        ] {
+            let source = format!(
+                "nodes:
+  - {{id: r, type: agent, agent: \"{reference}\"}}
+"
+            );
+            let error = parse(&source).expect_err(reference);
+            assert!(
+                error.contains("`r`") && error.contains("agent"),
+                "{reference}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_on_a_node_that_is_not_an_agent_is_refused() {
+        let error = parse(
+            "nodes:
+  - {id: gate, type: command, command: x.sh, agent: reviewer@1.0.0}
+",
+        )
+        .expect_err("a command node with an agent");
+        assert!(error.contains("not an agent node"), "{error}");
+    }
+
+    #[test]
+    fn the_autopilot_graph_has_no_agent_references() {
+        let graph = parse(include_str!("../../assets/autopilot/1.0.0/graph.yaml")).unwrap();
+        assert!(graph.nodes.iter().all(|node| node.agent.is_none()));
     }
 }

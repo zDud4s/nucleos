@@ -46,6 +46,7 @@ function agent(id: string, name: string, overrides: Partial<Agent> = {}): Agent 
     prompt: "You do the thing.",
     engine: "claude",
     model: null,
+    capabilities: ["mcp.nucleos"],
     tool_policy: "mcp_only",
     created_at: "2026-08-01T09:00:00Z",
     updated_at: "2026-08-01T09:00:00Z",

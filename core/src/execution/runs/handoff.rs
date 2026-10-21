@@ -414,7 +414,7 @@ pub(super) static RESUME_INSERT: std::sync::LazyLock<String> = std::sync::LazyLo
 /// Only a run that finished its turn (`completed`) — or one not yet terminated — hands off. A run
 /// that `failed`, `timed_out`, was `cancelled`, `interrupted` or `superseded` ended for a reason a
 /// fresh window does not answer: a turn ceiling or a deadline is a brake, and a successor would
-/// relaunch the very work the brake stopped. Worse, the successor takes over `job_items.run_id`, so
+/// relaunch the very work the brake stopped. Worse, the successor takes over `job_nodes.run_id`, so
 /// the job reads a live node instead of the failure that ended this one.
 pub(super) fn ends_in_a_handoff(status: &str) -> bool {
     status == "completed" || !TERMINAL_RUN_STATUSES.contains(&status)
@@ -504,7 +504,7 @@ pub(super) async fn prepare_handoff_successor(
     // The item follows its node, for the same reason it follows an approval resume: left pointing
     // at the predecessor, the job's next pass reads a terminal node that did not complete and stops
     // the whole chain — turning a context handoff into a failure.
-    sqlx::query("UPDATE job_items SET run_id = ? WHERE run_id = ?")
+    sqlx::query("UPDATE job_nodes SET run_id = ? WHERE run_id = ?")
         .bind(successor_id)
         .bind(run_id)
         .execute(pool)
