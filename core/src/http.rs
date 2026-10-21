@@ -1539,16 +1539,17 @@ mod tests {
             || path.contains("/outbox")
     }
 
-    /// What the control key gets from an empty-bodied probe of a management route. Everything but
-    /// `GET /channels` (still the A2 stub) has a real handler: the pairing reads and writes
-    /// succeed (200/201/204), forgetting an unknown sender is a 404 named refusal, and the two
-    /// routes that take a JSON body refuse the empty one (400).
+    /// What the control key gets from an empty-bodied probe of a management route. Every route has
+    /// a real handler: the list and the pairing reads succeed (200/204), minting a code on a
+    /// channel whose secrets were never checked is a 409 named refusal (`test_state` never ran
+    /// `launch_all`), forgetting an unknown sender is a 404 named refusal, and the two routes that
+    /// take a JSON body refuse the empty one (400).
     fn management_control_probe(method: &str, path: &str) -> StatusCode {
         match (method, path) {
-            ("GET", "/channels") => StatusCode::NOT_IMPLEMENTED,
+            ("GET", "/channels") => StatusCode::OK,
             ("PUT", "/channels/primary") => StatusCode::BAD_REQUEST,
             ("GET", p) if p.ends_with("/pairing") => StatusCode::OK,
-            ("POST", p) if p.ends_with("/pairing") => StatusCode::CREATED,
+            ("POST", p) if p.ends_with("/pairing") => StatusCode::CONFLICT,
             ("DELETE", p) if p.ends_with("/pairing") => StatusCode::NO_CONTENT,
             ("GET", p) if p.ends_with("/identities") => StatusCode::OK,
             ("DELETE", p) if p.contains("/identities/") => StatusCode::NOT_FOUND,
@@ -1590,6 +1591,20 @@ mod tests {
                 "{method} {path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pairing_post_is_409_until_the_channel_is_configured() {
+        let state = test_state().await;
+        let path = "/channels/telegram/pairing";
+        let status = channel_status(&state, "POST", path, Some("test-token")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        state
+            .channels
+            .presence
+            .set_secrets_present("telegram", Vec::new());
+        let status = channel_status(&state, "POST", path, Some("test-token")).await;
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     #[tokio::test]

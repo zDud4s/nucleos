@@ -3,20 +3,23 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
     use std::time::Duration;
 
     use axum::http::StatusCode;
     use chrono::Utc;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sqlx::SqlitePool;
 
     use crate::channels::ChannelsRuntime;
-    use crate::channels::contract::{ConversationKey, OutPart};
-    use crate::channels::fake::{FakeAdapter, Reply, request};
+    use crate::channels::contract::{
+        ConversationKey, EventShape, HelloShape, OutPart, decode, fixtures_dir,
+    };
+    use crate::channels::fake::{FakeAdapter, Reply, register_media, request, stimulate};
     use crate::channels::outbox::{self, Class, NewAction};
     use crate::channels::registry::ChannelConfig;
+    use crate::channels::routing;
     use crate::channels::strings::{self, Text};
     use crate::channels::testkit::state;
     use crate::state::AppState;
@@ -472,6 +475,8 @@ mod tests {
     async fn pairing_over_http_end_to_end() {
         let st = state().await;
         let adapter = ready(&st).await;
+        // Minting a code needs a configured channel (409 otherwise).
+        st.channels.presence.set_secrets_present("fake", Vec::new());
 
         // The owner mints a code with the control key.
         let minted = request(
@@ -545,5 +550,387 @@ mod tests {
             .await,
             1
         );
+    }
+
+    // ---- the capability scenarios of the shared fixtures (Anexo C, C.10) -------------------
+
+    /// Every `capabilities/*.json`, by file name.
+    fn scenarios() -> Vec<(String, Value)> {
+        let dir = fixtures_dir().join("capabilities");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                let bytes = std::fs::read(&path).unwrap();
+                let value = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|e| panic!("{name} is not JSON: {e}"));
+                (name, value)
+            })
+            .collect()
+    }
+
+    fn needles(want: &Value) -> Vec<&str> {
+        want.as_array()
+            .map(|list| list.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// `actual` satisfies `expected` (C.10.1): a key without `$` is equal (objects are matched key
+    /// by key, so extra keys of `actual` are fine), arrays have the same length and are matched
+    /// position by position, `$present` / `$absent` name keys, and `$contains`, `$not_contains`
+    /// and `$prefix` look at the `text` of the object.
+    fn matches(actual: &Value, expected: &Value, at: &str) -> Result<(), String> {
+        match expected {
+            Value::Object(wanted) => {
+                if !actual.is_object() {
+                    return Err(format!("{at}: expected an object, got {actual}"));
+                }
+                for (key, want) in wanted {
+                    match key.as_str() {
+                        "$present" | "$absent" => {
+                            for name in needles(want) {
+                                let there = actual.get(name).is_some_and(|v| !v.is_null());
+                                if there != (key == "$present") {
+                                    return Err(format!("{at}: {key} {name:?} failed in {actual}"));
+                                }
+                            }
+                        }
+                        "$contains" | "$not_contains" => {
+                            let text = actual["text"]
+                                .as_str()
+                                .ok_or_else(|| format!("{at}: {key} on a part without text"))?;
+                            for needle in needles(want) {
+                                if text.contains(needle) != (key == "$contains") {
+                                    return Err(format!(
+                                        "{at}: {key} {needle:?} failed on {text:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        "$prefix" => {
+                            let text = actual["text"].as_str().unwrap_or_default();
+                            let prefix = want.as_str().unwrap_or_default();
+                            if !text.starts_with(prefix) {
+                                return Err(format!(
+                                    "{at}: {text:?} does not start with {prefix:?}"
+                                ));
+                            }
+                        }
+                        plain => {
+                            let got = actual.get(plain).unwrap_or(&Value::Null);
+                            matches(got, want, &format!("{at}/{plain}"))?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Value::Array(wanted) => {
+                let Some(got) = actual.as_array() else {
+                    return Err(format!("{at}: expected an array, got {actual}"));
+                };
+                if got.len() != wanted.len() {
+                    return Err(format!(
+                        "{at}: expected {} items, got {}: {actual}",
+                        wanted.len(),
+                        got.len()
+                    ));
+                }
+                got.iter()
+                    .zip(wanted)
+                    .enumerate()
+                    .try_for_each(|(i, (got, want))| matches(got, want, &format!("{at}/{i}")))
+            }
+            scalar if scalar == actual => Ok(()),
+            scalar => Err(format!("{at}: expected {scalar}, got {actual}")),
+        }
+    }
+
+    /// What the adapter sees after a step: it asks until the outbox is empty and acknowledges
+    /// every action `ok` with `p<id>`, so the next one of a conversation can come out. Actions are
+    /// returned by id, the ephemerals as delivered.
+    async fn drain(adapter: &FakeAdapter) -> Result<(Vec<Value>, Vec<Value>), String> {
+        let mut actions: Vec<Value> = Vec::new();
+        let mut ephemeral: Vec<Value> = Vec::new();
+        for _ in 0..20 {
+            let reply = adapter.poll(Duration::ZERO).await;
+            if reply.status != StatusCode::OK {
+                return Err(format!("the poll answered {}", reply.status));
+            }
+            let body = reply.json();
+            ephemeral.extend(body["ephemeral"].as_array().cloned().unwrap_or_default());
+            let batch = body["actions"].as_array().cloned().unwrap_or_default();
+            if batch.is_empty() {
+                actions.sort_by_key(|action| action["id"].as_i64());
+                return Ok((actions, ephemeral));
+            }
+            for action in &batch {
+                let id = action["id"].as_i64().ok_or("an action without an id")?;
+                let acked = adapter.ack_ok(id).await;
+                if acked.status != StatusCode::OK {
+                    return Err(format!("the ack of {id} answered {}", acked.status));
+                }
+            }
+            actions.extend(batch);
+        }
+        Err("the outbox never drained".to_string())
+    }
+
+    /// `expect.state`: a proposal's status or a capture's answer, read from the test database.
+    async fn check_state(pool: &SqlitePool, want: &Value) -> Result<(), String> {
+        if let Some(proposal) = want.get("proposal") {
+            let id = proposal["id"]
+                .as_i64()
+                .ok_or("state.proposal without an id")?;
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let wanted = proposal["status"].as_str().unwrap_or_default();
+            if status.as_deref() != Some(wanted) {
+                return Err(format!("proposal {id} is {status:?}, expected {wanted:?}"));
+            }
+        }
+        if let Some(capture) = want.get("capture") {
+            let id = capture["id"]
+                .as_i64()
+                .ok_or("state.capture without an id")?;
+            let answer: Option<String> = sqlx::query_scalar(
+                "SELECT n.note_text FROM capture_requests r \
+                 JOIN owner_notes n ON n.id = r.note_id WHERE r.job_id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            let wanted = capture["answer"].as_str().unwrap_or_default();
+            if answer.as_deref() != Some(wanted) {
+                return Err(format!("capture {id} is {answer:?}, expected {wanted:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A state for the scenario: `fake` is the primary, configured, with the scenario's identities,
+    /// projects and media, and a runner that keeps a started turn open until the scenario ends it.
+    async fn scenario_state(scenario: &Value) -> Result<AppState, String> {
+        let mut st = state().await;
+        let projects: Vec<(String, String)> = scenario["setup"]["projects"]
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(project, thread)| {
+                        Some((project.clone(), thread.as_str()?.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let config = ChannelConfig {
+            projects: projects.into_iter().collect(),
+            ..ChannelConfig::default()
+        };
+        st.channels = Arc::new(ChannelsRuntime::with_configs(HashMap::from([(
+            "fake", config,
+        )])));
+        st.channels.presence.set_secrets_present("fake", Vec::new());
+        st.runner = Arc::new(crate::execution::runner::FakeCommandRunner {
+            delay: std::sync::Mutex::new(Some(Duration::from_secs(30))),
+            ..Default::default()
+        });
+        for who in scenario["setup"]["identities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            sqlx::query(
+                "INSERT INTO channel_identities (channel, sender_ref, conversation_ref, \
+                 conversation_kind, home, created_at) VALUES ('fake', ?, ?, 'private', ?, ?)",
+            )
+            .bind(who["sender_ref"].as_str())
+            .bind(who["conversation_ref"].as_str())
+            .bind(who["home"].as_bool().unwrap_or(false) as i64)
+            .bind("2026-10-20T10:00:00Z")
+            .execute(&st.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+        for media in scenario["setup"]["media"].as_array().into_iter().flatten() {
+            let id = media["id"].as_str().ok_or("a media without an id")?;
+            let mime = media["mime"].as_str().ok_or("a media without a mime")?;
+            register_media(&st, "fake", id, media["name"].as_str(), mime).await?;
+        }
+        sqlx::query("UPDATE channels_global SET primary_channel = 'fake' WHERE id = 1")
+            .execute(&st.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        // The routing row exists before the first step, so nothing set up is announced as news.
+        let mut conn = st.pool.acquire().await.map_err(|e| e.to_string())?;
+        routing::seed(&mut conn, "fake")
+            .await
+            .map_err(|e| e.to_string())?;
+        drop(conn);
+        Ok(st)
+    }
+
+    /// Runs one scenario end to end. The `hello` and every `event` also pass the strict decoders.
+    async fn run_scenario(scenario: &Value) -> Result<(), String> {
+        decode::<HelloShape>(scenario["hello"].to_string().as_bytes())
+            .map_err(|e| format!("the hello is not a valid hello: {e:?}"))?;
+        let st = scenario_state(scenario).await?;
+        let outcome = run_steps(&st, scenario).await;
+        end_turns(&st).await;
+        outcome
+    }
+
+    /// Ends every turn a scenario left in flight. A chat's slot is process-wide (`BUSY_CHATS`) and
+    /// the scenarios share conversation refs, so a turn held open by the 30 s fake runner would make
+    /// the next scenario's first message queue instead of starting a turn. Aborting the task drops
+    /// its slot; the status write inside is a compare-and-set, so a finished turn keeps its status.
+    async fn end_turns(st: &AppState) {
+        let runs: Vec<i64> = sqlx::query_scalar("SELECT id FROM runs WHERE chat_id LIKE 'fake:%'")
+            .fetch_all(&st.pool)
+            .await
+            .unwrap_or_default();
+        for run in runs {
+            crate::execution::runs::finalize_termination(st, run, "cancelled").await;
+        }
+        // Let the aborted tasks drop their slots before the next scenario sends.
+        tokio::task::yield_now().await;
+    }
+
+    async fn run_steps(st: &AppState, scenario: &Value) -> Result<(), String> {
+        let adapter = FakeAdapter::new(&st, "fake").await;
+        let hello = adapter
+            .hello(scenario["hello"]["capabilities"].clone())
+            .await;
+        if hello.status != StatusCode::OK {
+            return Err(format!(
+                "the hello answered {}: {}",
+                hello.status,
+                hello.json()
+            ));
+        }
+        let forbid = &scenario["forbid"];
+        let steps = scenario["steps"]
+            .as_array()
+            .ok_or("a scenario without steps")?;
+        for (index, step) in steps.iter().enumerate() {
+            let at = |why: String| format!("step {}: {why}", index + 1);
+            let mut response = Value::Null;
+            if let Some(core) = step.get("core") {
+                stimulate(&st, core).await.map_err(at)?;
+            } else if let Some(event) = step.get("event") {
+                decode::<EventShape>(event.to_string().as_bytes())
+                    .map_err(|e| at(format!("the event is not a valid event: {e:?}")))?;
+                response = adapter.post_event(event).await.json();
+            } else {
+                return Err(at("neither a core stimulus nor an event".to_string()));
+            }
+            let (actions, ephemeral) = drain(&adapter).await.map_err(at)?;
+            for action in &actions {
+                if needles(&forbid["action_types"]).contains(&action["type"].as_str().unwrap_or(""))
+                {
+                    return Err(at(format!("a forbidden action came out: {action}")));
+                }
+            }
+            for item in &ephemeral {
+                if needles(&forbid["ephemeral_types"])
+                    .contains(&item["type"].as_str().unwrap_or(""))
+                {
+                    return Err(at(format!("a forbidden ephemeral came out: {item}")));
+                }
+            }
+            let expect = &step["expect"];
+            if let Some(want) = expect.get("response") {
+                matches(&response, want, "response").map_err(at)?;
+            }
+            if let Some(want) = expect.get("actions") {
+                matches(&Value::Array(actions), want, "actions").map_err(at)?;
+            }
+            if let Some(want) = expect.get("ephemeral") {
+                matches(&Value::Array(ephemeral), want, "ephemeral").map_err(at)?;
+            }
+            if let Some(want) = expect.get("state") {
+                check_state(&st.pool, want).await.map_err(at)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_scenario_runs() {
+        let mut failures = Vec::new();
+        let all = scenarios();
+        for (name, scenario) in &all {
+            if let Err(why) = run_scenario(scenario).await {
+                failures.push(format!("{name}: {why}"));
+            }
+        }
+        assert!(all.len() >= 7, "only {} scenarios found", all.len());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn the_matchers_read_the_way_the_scenarios_use_them() {
+        let action = json!({"type": "send", "conversation": "4242", "buttons": [[]],
+            "parts": [{"type": "text", "text": "[nucleos] Build finished"}]});
+        let ok = |want: Value| matches(&action, &want, "action");
+        assert!(ok(json!({"type": "send", "$present": ["buttons"]})).is_ok());
+        assert!(ok(json!({"$absent": ["buttons"]})).is_err());
+        assert!(ok(json!({"$absent": ["edit"]})).is_ok());
+        assert!(ok(json!({"parts": [{"$prefix": "[nucleos] ", "$contains": ["Build"]}]})).is_ok());
+        assert!(ok(json!({"parts": [{"$not_contains": ["Build"]}]})).is_err());
+        // Arrays are matched position by position and must be as long.
+        assert!(ok(json!({"parts": []})).is_err());
+        assert!(ok(json!({"parts": [{"type": "text"}, {"type": "text"}]})).is_err());
+        assert!(ok(json!({"conversation": "4243"})).is_err());
+    }
+
+    #[test]
+    fn the_missing_set_is_exactly_the_six_rows_of_section_6_5_plus_null() {
+        let all = scenarios();
+        let missing: BTreeSet<Option<String>> = all
+            .iter()
+            .map(|(_, scenario)| scenario["missing"].as_str().map(str::to_owned))
+            .collect();
+        let wanted: BTreeSet<Option<String>> = [
+            None,
+            Some("buttons"),
+            Some("edit"),
+            Some("threads"),
+            Some("typing"),
+            Some("reply_to"),
+            Some("media_out"),
+        ]
+        .into_iter()
+        .map(|row| row.map(str::to_owned))
+        .collect();
+        assert_eq!(missing, wanted);
+        assert_eq!(all.len(), wanted.len(), "one scenario per row");
+
+        // The hello of each declares exactly that one capability less (`media_out`: the strong form,
+        // `image` stays and `file` and `audio` are gone).
+        for (name, scenario) in &all {
+            let caps = &scenario["hello"]["capabilities"];
+            match scenario["missing"].as_str() {
+                None => {}
+                Some("media_out") => {
+                    assert_eq!(caps["media_out"], json!(["image"]), "{name}");
+                }
+                Some(row) => {
+                    assert!(
+                        caps.get(row).is_none_or(|v| v == &json!(false)),
+                        "{name} still declares {row}"
+                    );
+                }
+            }
+        }
     }
 }

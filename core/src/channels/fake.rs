@@ -6,8 +6,13 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{StatusCode, header};
+use chrono::Utc;
+use serde_json::Value;
 
 use crate::auth::Service;
+use crate::channels::contract::{ConversationKey, OutPart};
+use crate::channels::outbox::{self, Class, NewAction};
+use crate::channels::{replies, routing};
 use crate::state::AppState;
 
 /// What one request answered.
@@ -203,5 +208,223 @@ impl FakeAdapter {
             Vec::new(),
         )
         .await
+    }
+}
+
+// ---- the `core` stimuli of the capability scenarios (Anexo C, C.10.1) --------------------------
+
+/// What a stimulus did: `Err` names why it could not be applied.
+pub(crate) type Stimulated = Result<(), String>;
+
+fn db(error: sqlx::Error) -> String {
+    format!("database error: {error}")
+}
+
+fn text_of<'a>(stimulus: &'a Value, name: &str) -> Result<&'a str, String> {
+    stimulus[name]
+        .as_str()
+        .ok_or_else(|| format!("the stimulus has no text field {name:?}: {stimulus}"))
+}
+
+fn number_of(stimulus: &Value, name: &str) -> Result<i64, String> {
+    stimulus[name]
+        .as_i64()
+        .ok_or_else(|| format!("the stimulus has no number field {name:?}: {stimulus}"))
+}
+
+/// One routing pass over the feed and the proposals, as the routing loop would run after a signal.
+async fn announce(state: &AppState) -> Stimulated {
+    let wanted = routing::Wanted {
+        feed: true,
+        proposals: true,
+        ..routing::Wanted::default()
+    };
+    routing::route_once(state, Utc::now(), wanted)
+        .await
+        .map(|_| ())
+        .map_err(db)
+}
+
+/// Registers a media blob the scenario can name in `send_parts` (only the row, never the bytes:
+/// degradation reads the display name, the adapter would read the file).
+pub(crate) async fn register_media(
+    state: &AppState,
+    channel: &str,
+    id: &str,
+    name: Option<&str>,
+    mime: &str,
+) -> Stimulated {
+    sqlx::query(
+        "INSERT INTO channel_media (id, channel, path, mime, name, bytes, created_at) \
+         VALUES (?, ?, 'channels/fake/scenario', ?, ?, 1, ?)",
+    )
+    .bind(id)
+    .bind(channel)
+    .bind(mime)
+    .bind(name)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&state.pool)
+    .await
+    .map(|_| ())
+    .map_err(db)
+}
+
+/// A pending approval with the id the scenario names. It is a paused run's `action-approval`,
+/// the only kind the chat announces with buttons, so approving it from the chat really resumes
+/// the run (through the state's fake runner).
+async fn proposal_pending(state: &AppState, id: i64, title: &str) -> Stimulated {
+    let pool = &state.pool;
+    let now = Utc::now().to_rfc3339();
+    let run: i64 = sqlx::query_scalar(
+        "INSERT INTO runs (project_id, cwd, prompt, status, session_id, mode, created_at) \
+         VALUES ('proj', 'C:/worktrees/proj/paused', 'x', 'awaiting_approval', 'sess-a', \
+         'worktree', ?) RETURNING id",
+    )
+    .bind(&now)
+    .fetch_one(pool)
+    .await
+    .map_err(db)?;
+    sqlx::query(
+        "INSERT INTO worktrees (owner_kind, owner_id, project_id, project_root, path, branch, \
+         created_at) VALUES ('run', ?, 'proj', 'C:/repos/proj', ?, ?, ?)",
+    )
+    .bind(run)
+    .bind(format!("C:/worktrees/proj/run-{run}"))
+    .bind(format!("nucleos/run-{run}"))
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    let made = crate::proposals::create_action_approval(
+        pool,
+        run,
+        Some("sess-a"),
+        Some("proj"),
+        "Bash",
+        title,
+        Some(r#"{"command":"git push origin main"}"#),
+    )
+    .await
+    .map_err(db)?;
+    if made != id {
+        sqlx::query("UPDATE proposals SET id = ? WHERE id = ?")
+            .bind(id)
+            .bind(made)
+            .execute(pool)
+            .await
+            .map_err(db)?;
+        sqlx::query("UPDATE proposal_events SET proposal_id = ? WHERE proposal_id = ?")
+            .bind(id)
+            .bind(made)
+            .execute(pool)
+            .await
+            .map_err(db)?;
+    }
+    announce(state).await
+}
+
+/// An open capture request for job `job`, announced through the feed like the distiller's.
+async fn capture_requested(state: &AppState, job: i64, summary: &str) -> Stimulated {
+    sqlx::query(
+        "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, \
+         deadline, created_at) VALUES (?, 'p', '[]', ?, 'open', '2099-01-01T00:00:00Z', ?)",
+    )
+    .bind(job)
+    .bind(summary)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&state.pool)
+    .await
+    .map_err(db)?;
+    nucleos_base::feed::append(
+        &state.pool,
+        None,
+        crate::capture::FEED_KIND,
+        summary,
+        None,
+        Some(&nucleos_base::feed::Subject::Job(job)),
+    )
+    .await
+    .map_err(db)?;
+    announce(state).await
+}
+
+/// Ends, with `stdout`, the newest turn of a `fake` conversation and answers it.
+async fn turn_finished(state: &AppState, stdout: &str) -> Stimulated {
+    let run: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM runs WHERE chat_id LIKE 'fake:%' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db)?;
+    let run = run.ok_or("no turn of a fake conversation is open")?;
+    sqlx::query("UPDATE runs SET status = 'completed', stdout = ? WHERE id = ?")
+        .bind(stdout)
+        .bind(run)
+        .execute(&state.pool)
+        .await
+        .map_err(db)?;
+    replies::reply_now(state, run).await;
+    Ok(())
+}
+
+/// Queues a `send` of `parts` the common way, where degradation happens at lease time.
+async fn send_parts(state: &AppState, conversation: &str, parts: &Value) -> Stimulated {
+    let parts: Vec<OutPart> = serde_json::from_value(parts.clone())
+        .map_err(|error| format!("the parts are not outbound parts: {error}"))?;
+    let mut conn = state.pool.acquire().await.map_err(db)?;
+    outbox::enqueue(
+        &mut conn,
+        &ConversationKey::new("fake", conversation),
+        NewAction::Send {
+            reply_to: None,
+            parts,
+            buttons: None,
+            silent: false,
+        },
+        Class::Turn,
+        None,
+        Utc::now(),
+    )
+    .await
+    .map_err(db)?;
+    drop(conn);
+    outbox::wake(state, "fake");
+    Ok(())
+}
+
+/// Applies one `core` stimulus of a scenario to the test state, discriminated by `do`.
+pub(crate) async fn stimulate(state: &AppState, stimulus: &Value) -> Stimulated {
+    match stimulus["do"].as_str() {
+        Some("proposal_pending") => {
+            let id = number_of(stimulus, "proposal_id")?;
+            proposal_pending(state, id, text_of(stimulus, "title")?).await
+        }
+        Some("feed_row") => {
+            nucleos_base::feed::append(
+                &state.pool,
+                stimulus["project_id"].as_str(),
+                text_of(stimulus, "kind")?,
+                text_of(stimulus, "text")?,
+                None,
+                None,
+            )
+            .await
+            .map_err(db)?;
+            announce(state).await
+        }
+        Some("capture_requested") => {
+            let job = number_of(stimulus, "capture")?;
+            capture_requested(state, job, text_of(stimulus, "summary")?).await
+        }
+        Some("turn_finished") => turn_finished(state, text_of(stimulus, "stdout")?).await,
+        Some("send_parts") => {
+            send_parts(
+                state,
+                text_of(stimulus, "conversation")?,
+                &stimulus["parts"],
+            )
+            .await
+        }
+        other => Err(format!("unknown stimulus {other:?}")),
     }
 }

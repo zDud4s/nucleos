@@ -415,6 +415,30 @@ pub fn channel_state(
     }
 }
 
+/// Folds the supervisor's view of the adapter process into the E.2 state: a process that died
+/// (`Restarting`) or never started (`FailedToSpawn`) is `Offline` even while its last poll is
+/// still inside the online window. A `Starting` channel is only demoted by `FailedToSpawn`: a
+/// `Restarting` entry before the first hello is just the spawn in progress. `None` (nobody
+/// supervises it, e.g. a non-primary daemon) leaves the state alone. `since` becomes `now` only
+/// when the state actually flips.
+fn apply_liveness(
+    (state, since): (ChannelState, Option<DateTime<Utc>>),
+    liveness: Option<crate::sidecar::Liveness>,
+    now: DateTime<Utc>,
+) -> (ChannelState, Option<DateTime<Utc>>) {
+    use crate::sidecar::Liveness;
+    let dead = match (state, liveness) {
+        (ChannelState::Online, Some(Liveness::Restarting | Liveness::FailedToSpawn(_))) => true,
+        (ChannelState::Starting, Some(Liveness::FailedToSpawn(_))) => true,
+        _ => false,
+    };
+    if dead {
+        (ChannelState::Offline, Some(now))
+    } else {
+        (state, since)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AdapterInfo {
     pub contract_version: String,
@@ -547,7 +571,13 @@ pub async fn list(state: &AppState) -> sqlx::Result<ChannelsReadout> {
         let (configured, missing_secrets) = presence.secrets_status(manifest);
         let seen = presence.seen(id);
         let (state_now, since) = if configured {
-            channel_state(manifest, seen.as_ref(), presence.launched_at(id), now)
+            let (state_now, since) =
+                channel_state(manifest, seen.as_ref(), presence.launched_at(id), now);
+            apply_liveness(
+                (state_now, since),
+                crate::sidecar::liveness_of(manifest.binary),
+                now,
+            )
         } else {
             (ChannelState::NotConfigured, None)
         };
@@ -1073,6 +1103,33 @@ mod tests {
         assert_eq!(
             channel_state(m, Some(&seen(Some(10), true)), None, at(56)),
             (ChannelState::Incompatible, Some(at(3)))
+        );
+    }
+
+    #[test]
+    fn a_dead_adapter_process_reads_as_offline() {
+        use crate::sidecar::Liveness::{FailedToSpawn, Restarting, Running};
+        let kind = std::io::ErrorKind::NotFound;
+        let online = (ChannelState::Online, Some(at(0)));
+        let starting = (ChannelState::Starting, Some(at(1)));
+        let offline = (ChannelState::Offline, Some(at(9)));
+        assert_eq!(apply_liveness(online, Some(Restarting), at(9)), offline);
+        assert_eq!(
+            apply_liveness(online, Some(FailedToSpawn(kind)), at(9)),
+            offline
+        );
+        assert_eq!(
+            apply_liveness(starting, Some(FailedToSpawn(kind)), at(9)),
+            offline
+        );
+        // Unchanged: a live or unsupervised process, a spawn still in progress, other states.
+        assert_eq!(apply_liveness(online, Some(Running), at(9)), online);
+        assert_eq!(apply_liveness(online, None, at(9)), online);
+        assert_eq!(apply_liveness(starting, Some(Restarting), at(9)), starting);
+        let incompatible = (ChannelState::Incompatible, Some(at(3)));
+        assert_eq!(
+            apply_liveness(incompatible, Some(Restarting), at(9)),
+            incompatible
         );
     }
 

@@ -1,6 +1,5 @@
 //! Access policy, pairing, primary channel and management routes (flow C). The management routes
-//! of Anexo E (pairing, identities, home, primary) are real; `GET /channels` stays a 501 stub
-//! until A2 (`registry::list`).
+//! of Anexo E (list, pairing, identities, home, primary) are all real.
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -160,7 +159,7 @@ pub async fn primary(pool: &SqlitePool) -> sqlx::Result<Option<&'static str>> {
 /// Control-only: `auth.rs` answers a channel key with a bare 403 before any handler here runs.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/channels", get(not_implemented))
+        .route("/channels", get(get_channels))
         .route("/channels/primary", put(put_primary))
         .route(
             "/channels/{channel}/pairing",
@@ -177,9 +176,12 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// Placeholder handler for `GET /channels` (A2: `registry::list`).
-async fn not_implemented() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+/// `GET /channels` (E.2): one status per compiled manifest plus the primary and routing state.
+async fn get_channels(State(state): State<AppState>) -> Response {
+    match registry::list(&state).await {
+        Ok(readout) => Json(readout).into_response(),
+        Err(error) => database_failure(&error, "channel list"),
+    }
 }
 
 /// The body of every named refusal of Anexo E (E.1): `{"refusal": wire, "detail": english}`. It is
@@ -230,18 +232,19 @@ fn bad_body() -> Response {
     StatusCode::BAD_REQUEST.into_response()
 }
 
-/// `POST /channels/{channel}/pairing` (E.4): mints a code, 201.
-///
-/// TODO(A2): the `409 channel_not_configured` of E.4 is NOT checked here. The only predicate over
-/// the required secrets is `Presence::secrets_status`, private to `registry.rs`, and its cache is
-/// filled by the launcher (`launch_all`, A2): in A1 every real channel would read as not configured
-/// and the route could never mint. A2 adds a public predicate and the check goes right after
-/// `resolve_channel`.
+/// `POST /channels/{channel}/pairing` (E.4): mints a code, 201; `409 channel_not_configured` while
+/// a required secret is missing (the cache `launch_all` fills).
 async fn post_pairing(State(state): State<AppState>, Path(channel): Path<String>) -> Response {
     let manifest = match resolve_channel(&channel) {
         Ok(manifest) => manifest,
         Err(refusal) => return refusal,
     };
+    if !registry::is_configured(&state, manifest.id) {
+        return refuse(
+            contract::ManagementRefusal::ChannelNotConfigured,
+            "the channel is not configured, so it cannot pair yet",
+        );
+    }
     match mint_pairing_code(&state.pool, manifest.id, Utc::now()).await {
         Ok(minted) => (StatusCode::CREATED, Json(minted)).into_response(),
         Err(error) => database_failure(&error, "pairing mint"),
@@ -924,6 +927,7 @@ mod tests {
     #[tokio::test]
     async fn route_pairing_mints_reads_and_cancels() {
         let st = state().await;
+        st.channels.presence.set_secrets_present("fake", Vec::new());
         let (status, body) = call(&st, CONTROL_KEY, "GET", "/channels/fake/pairing", "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "none");
@@ -948,6 +952,45 @@ mod tests {
         }
         let (_, body) = call(&st, CONTROL_KEY, "GET", "/channels/fake/pairing", "").await;
         assert_eq!(body["state"], "none");
+    }
+
+    #[tokio::test]
+    async fn route_pairing_post_is_409_while_the_channel_is_not_configured() {
+        let st = state().await;
+        let (status, body) = call(&st, CONTROL_KEY, "POST", "/channels/fake/pairing", "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "channel_not_configured");
+        let minted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_pairing_codes")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        assert_eq!(minted, 0);
+        // A missing required secret keeps it refused; an empty missing list lets it mint.
+        st.channels
+            .presence
+            .set_secrets_present("fake", vec!["fake.token"]);
+        let (status, _) = call(&st, CONTROL_KEY, "POST", "/channels/fake/pairing", "").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        st.channels.presence.set_secrets_present("fake", Vec::new());
+        let (status, _) = call(&st, CONTROL_KEY, "POST", "/channels/fake/pairing", "").await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn route_channels_list_is_200_with_every_manifest() {
+        let st = state().await;
+        let (status, body) = call(&st, CONTROL_KEY, "GET", "/channels", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["contract_version"], contract::CONTRACT_VERSION);
+        assert_eq!(body["routing"]["state"], "no_primary");
+        assert!(body["primary"].is_null());
+        assert!(
+            body["channels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["id"] == "fake")
+        );
     }
 
     #[tokio::test]

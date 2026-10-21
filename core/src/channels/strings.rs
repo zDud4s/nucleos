@@ -63,6 +63,10 @@ pub enum Text {
     ReplyApproveReject {
         id: i64,
     },
+    /// A capture request on a channel without `reply_to` (§6.5): the typed form is the way to answer.
+    ReplyCap {
+        job: i64,
+    },
     HeardCommand {
         text: String,
     },
@@ -167,6 +171,7 @@ pub fn render(text: &Text) -> String {
         Text::Approved { id } => format!("Approved #{id}."),
         Text::Rejected { id } => format!("Rejected #{id}."),
         Text::ReplyApproveReject { id } => format!("Reply approve {id} or reject {id}."),
+        Text::ReplyCap { job } => format!("Answer with /cap {job} <your answer>."),
         Text::HeardCommand { text } => format!(
             "I heard a command in that voice note and did not run it - type it instead: {text}"
         ),
@@ -385,6 +390,7 @@ mod tests {
             Text::Approved { id: 12 },
             Text::Rejected { id: 12 },
             Text::ReplyApproveReject { id: 12 },
+            Text::ReplyCap { job: 3 },
             Text::HeardCommand {
                 text: "/kill".into(),
             },

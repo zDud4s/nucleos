@@ -116,6 +116,41 @@ async fn degrade_media(
     Ok(out)
 }
 
+/// Adds a hint to the message it is about: a new line of the last text part, or a part of its own
+/// when the message does not end in text.
+fn append_hint(parts: &mut Vec<OutPart>, hint: Text) {
+    let hint = strings::render(&hint);
+    match parts.last_mut() {
+        Some(OutPart::Text { text }) => {
+            text.push('\n');
+            text.push_str(&hint);
+        }
+        _ => parts.push(OutPart::Text { text: hint }),
+    }
+}
+
+/// Without `reply_to`: a capture request (`subject = capture:<job>`) says how to answer it, the
+/// typed `/cap <job>` form (§6.5). Anything else is left as it is.
+async fn degrade_capture(
+    conn: &mut SqliteConnection,
+    caps: &Capabilities,
+    row_id: i64,
+    parts: &mut Vec<OutPart>,
+) -> sqlx::Result<()> {
+    if caps.reply_to {
+        return Ok(());
+    }
+    let subject: Option<Option<String>> =
+        sqlx::query_scalar("SELECT subject FROM channel_outbox WHERE id = ?")
+            .bind(row_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if let Some(Subject::Capture(job)) = subject.flatten().as_deref().and_then(Subject::from_text) {
+        append_hint(parts, Text::ReplyCap { job });
+    }
+    Ok(())
+}
+
 /// Without `buttons`: drops them and, for an approval request (`subject = proposal:<id>`), adds the
 /// "reply approve N / reject N" text. Without a proposal subject the buttons are only dropped.
 async fn degrade_buttons(
@@ -134,7 +169,7 @@ async fn degrade_buttons(
             .fetch_optional(&mut *conn)
             .await?;
     if let Some(Subject::Proposal(id)) = subject.flatten().as_deref().and_then(Subject::from_text) {
-        parts.push(text_part(Text::ReplyApproveReject { id }));
+        append_hint(parts, Text::ReplyApproveReject { id });
     }
     Ok(None)
 }
@@ -159,6 +194,7 @@ pub(super) async fn degrade(
         } => {
             let mut parts = degrade_media(conn, caps, parts).await?;
             let buttons = degrade_buttons(conn, caps, id, &mut parts, buttons).await?;
+            degrade_capture(conn, caps, id, &mut parts).await?;
             let mut reply_ref = None;
             let mut reply_to = reply_to;
             if let Some(target_id) = reply_to {
@@ -323,12 +359,32 @@ mod tests {
         .await;
         assert!(got.get("buttons").is_none(), "{got}");
         let all = texts(&got);
-        assert_eq!(all[0], "hi");
+        // The hint rides in the message it is about, as a line of its text.
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(all[0].starts_with("hi\n"), "{all:?}");
         let last = all.last().unwrap();
         assert!(
             last.contains("approve 12") && last.contains("reject 12"),
             "{last}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_reply_to_adds_the_typed_cap_form_to_a_capture_request() {
+        let state = crate::channels::testkit::state().await;
+        let pool = &state.pool;
+        let id = insert(pool, "c1", "pending", None, None, Some("capture:3")).await;
+        let got = run(pool, &Capabilities::default(), send(id, None, hi(), None)).await;
+        let all = texts(&got);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(
+            all[0].starts_with("hi\n") && all[0].contains("/cap 3"),
+            "{all:?}"
+        );
+
+        // With `reply_to` the platform's reply is the way to answer: nothing is added.
+        let got = run(pool, &full_caps(), send(id, None, hi(), None)).await;
+        assert_eq!(texts(&got), vec!["hi".to_string()]);
     }
 
     #[tokio::test]

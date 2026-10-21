@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 
 use super::{Identity, PrimaryError, PrimarySet};
 use crate::channels::contract::ConversationKind;
-use crate::channels::{outbox, registry, tokens};
+use crate::channels::{outbox, registry, routing, tokens};
 use crate::state::AppState;
 
 fn parse_time(text: &str) -> Option<DateTime<Utc>> {
@@ -387,8 +387,33 @@ pub async fn set_primary(
     if home.is_none() {
         return Err(PrimaryError::NoHomeConversation);
     }
-    // A1: switching needs routing::reseed (A2); I2 replaces this refusal with the real switch.
-    Err(PrimaryError::ChannelNotConfigured)
+    // A channel without its required secrets is never launched, so it cannot be primary. Read
+    // before the transaction opens: `list` uses the pool, which has one connection in tests.
+    let configured = registry::list(state)
+        .await
+        .map_err(PrimaryError::Db)?
+        .channels
+        .iter()
+        .any(|entry| entry.id == manifest.id && entry.configured);
+    if !configured {
+        return Err(PrimaryError::ChannelNotConfigured);
+    }
+    // A different channel becomes primary: store it and reset its cursors to "now" in one
+    // transaction, so the backlog it missed while it was not primary is never announced.
+    let mut tx = pool.begin().await.map_err(PrimaryError::Db)?;
+    sqlx::query("UPDATE channels_global SET primary_channel = ? WHERE id = 1")
+        .bind(manifest.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(PrimaryError::Db)?;
+    routing::reseed(&mut tx, manifest.id)
+        .await
+        .map_err(PrimaryError::Db)?;
+    tx.commit().await.map_err(PrimaryError::Db)?;
+    Ok(PrimarySet {
+        primary: Some(manifest.id),
+        reseeded: true,
+    })
 }
 
 #[cfg(test)]
@@ -897,7 +922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switching_primary_to_another_channel_is_refused_as_not_configured_in_a1() {
+    async fn switching_primary_to_a_channel_without_its_secrets_is_refused() {
         let st = state().await;
         seed(
             &st.pool,
@@ -915,6 +940,78 @@ mod tests {
             Err(PrimaryError::ChannelNotConfigured)
         ));
         assert_eq!(stored_primary(&st.pool).await, None);
+        let seeded: Option<i64> = sqlx::query_scalar(
+            "SELECT feed_cursor FROM channel_routing_state WHERE channel = 'telegram'",
+        )
+        .fetch_optional(&st.pool)
+        .await
+        .unwrap();
+        assert_eq!(seeded, None, "a refused switch reseeds nothing");
+    }
+
+    /// A state where `telegram` has its secrets and a home, and the feed has moved on.
+    async fn switchable() -> (AppState, i64) {
+        let st = state().await;
+        st.channels
+            .presence
+            .set_secrets_present("telegram", Vec::new());
+        seed(
+            &st.pool,
+            "1",
+            None,
+            "c1",
+            "private",
+            None,
+            true,
+            "2026-10-12T09:00:00Z",
+        )
+        .await;
+        let old = nucleos_base::feed::append(&st.pool, None, "summary", "old news", None, None)
+            .await
+            .unwrap();
+        (st, old)
+    }
+
+    #[tokio::test]
+    async fn switching_primary_reseeds_and_reports_it() {
+        let (st, old) = switchable().await;
+        let set = set_primary(&st, Some("telegram")).await.unwrap();
+        assert_eq!((set.primary, set.reseeded), (Some("telegram"), true));
+        assert_eq!(stored_primary(&st.pool).await.as_deref(), Some("telegram"));
+        let cursor: i64 = sqlx::query_scalar(
+            "SELECT feed_cursor FROM channel_routing_state WHERE channel = 'telegram'",
+        )
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+        assert_eq!(cursor, old, "the cursor sits at the newest line");
+
+        // Asking again is the no-op of E.3: no second reseed.
+        let again = set_primary(&st, Some("telegram")).await.unwrap();
+        assert_eq!((again.primary, again.reseeded), (Some("telegram"), false));
+    }
+
+    #[tokio::test]
+    async fn primary_switch_does_not_announce_the_backlog() {
+        let (st, _) = switchable().await;
+        set_primary(&st, Some("telegram")).await.unwrap();
+        let wanted = routing::Wanted {
+            feed: true,
+            ..routing::Wanted::default()
+        };
+        let report = routing::route_once(&st, Utc::now(), wanted).await.unwrap();
+        assert_eq!(report.feed, 0, "the line from before the switch is history");
+
+        nucleos_base::feed::append(&st.pool, None, "summary", "fresh news", None, None)
+            .await
+            .unwrap();
+        let report = routing::route_once(&st, Utc::now(), wanted).await.unwrap();
+        assert_eq!(report.feed, 1);
+        let sent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_outbox")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        assert_eq!(sent, 1);
     }
 
     #[tokio::test]

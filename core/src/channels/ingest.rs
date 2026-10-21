@@ -24,6 +24,7 @@ use super::tokens::{self, Redeemed, TokenAction};
 use super::{access, media, replies};
 use crate::assistant::{Origin, Sent};
 use crate::auth::{Scope, Service};
+use crate::proposals::{self, ApproveInput, DecideError};
 use crate::state::AppState;
 
 /// Retention of `channel_events`: far above the redelivery window of any platform (section 5.3).
@@ -354,20 +355,50 @@ async fn enqueue_and_wake(
     Ok(())
 }
 
-/// Why a button press could not be decided. I1 replaces `decide_button` with
-/// `proposals::approve/reject`; whatever it can fail with (`Conflict`, `Invalid`, `BadRequest`,
-/// `BadGateway`, `Internal`) lands in the one generic `Err(_)` arm of `on_action` (R12).
-enum ButtonError {
-    Unavailable,
+/// Decides the proposal a fresh button token names, through the same service functions the HTTP
+/// door and the typed `approve N` use. The token was only spent if the proposal was pending, so a
+/// lost compare-and-set here means somebody decided it between the two.
+async fn decide_button(
+    state: &AppState,
+    action: TokenAction,
+    proposal_id: i64,
+) -> Result<Text, DecideError> {
+    match action {
+        TokenAction::Approve => {
+            proposals::approve(state, proposal_id, ApproveInput::default()).await?;
+            Ok(Text::Approved { id: proposal_id })
+        }
+        TokenAction::Reject => {
+            proposals::reject(state, proposal_id).await?;
+            Ok(Text::Rejected { id: proposal_id })
+        }
+    }
 }
 
-/// A1: the proposal service functions do not exist yet, so a fresh button is never decided.
-async fn decide_button(
-    _state: &AppState,
-    _action: TokenAction,
-    _proposal_id: i64,
-) -> Result<Text, ButtonError> {
-    Err(ButtonError::Unavailable)
+/// The answer to a button press. Only a lost compare-and-set is "already handled"; every other
+/// decide error (`NotFound`, `Conflict`, `Invalid`, `BadRequest`, `BadGateway`, `Internal`,
+/// `Status`) lands in the one generic `_` arm and is "not sent" (R12).
+fn button_answer(decided: Result<Text, DecideError>) -> Text {
+    match decided {
+        Ok(text) => text,
+        Err(DecideError::AlreadyDecided) => Text::AlreadyHandled,
+        Err(error) => {
+            tracing::warn!(?error, "a button press could not be decided");
+            let refusal = match error {
+                DecideError::Conflict(message)
+                | DecideError::Invalid(message)
+                | DecideError::BadRequest(message)
+                | DecideError::BadGateway(message)
+                | DecideError::Status(_, message)
+                    if !message.is_empty() =>
+                {
+                    message
+                }
+                _ => "the decision could not be recorded".to_string(),
+            };
+            Text::NotSent { refusal }
+        }
+    }
 }
 
 /// Step 4: a pressed button. The answer goes to the callback itself (`answer_action`).
@@ -382,12 +413,7 @@ async fn on_action(
         Redeemed::Fresh {
             action: kind,
             proposal_id,
-        } => match decide_button(state, kind, proposal_id).await {
-            Ok(text) => text,
-            Err(_) => Text::NotSent {
-                refusal: "approving from a button is not available yet".to_string(),
-            },
-        },
+        } => button_answer(decide_button(state, kind, proposal_id).await),
     };
     let answer = NewAction::AnswerAction {
         action_ref: action.reference.clone(),
@@ -424,7 +450,6 @@ async fn on_message(
         sender: &event.sender,
         message_ref: &message.reference,
     };
-    // A1 placeholder: always `None`, so `answer_capture` (A2) is not reached.
     if let Some(job) = commands::capture_target(state, &inbound, message).await? {
         return commands::answer_capture(state, &inbound, job, &input).await;
     }
@@ -444,7 +469,6 @@ async fn on_message(
         Intent::Chat(_) => {}
         // Handled before `admit` for typed text; a transcript never yields it.
         Intent::Pair(_) => return Ok(()),
-        // A2: until then the placeholder router yields nothing else.
         other => return commands::execute(state, &inbound, other).await,
     }
 
@@ -848,6 +872,189 @@ mod tests {
             strings::render(&Text::AlreadyHandled).as_str()
         );
         assert_eq!(run_count(&st.pool, "telegram:button-chat").await, 0);
+    }
+
+    // ---- buttons and typed commands (I1) --------------------------------------------------
+
+    async fn proposal(pool: &SqlitePool, status: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO proposals (kind, status, reasoning, created_at) \
+             VALUES ('team-action', ?, 'send the summary', ?) RETURNING id",
+        )
+        .bind(status)
+        .bind(NOW)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn proposal_status(pool: &SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Issues a token for `proposal_id` in `telegram:<conversation>` and presses it.
+    async fn press(
+        st: &AppState,
+        conversation: &str,
+        action: TokenAction,
+        proposal_id: i64,
+    ) -> serde_json::Value {
+        let key = ConversationKey::new("telegram", conversation.to_string());
+        let mut conn = st.pool.acquire().await.unwrap();
+        let token = tokens::issue(&mut conn, &key, action, proposal_id, now())
+            .await
+            .unwrap();
+        drop(conn);
+        let mut pressed = text_event("ev-press", "u1", conversation, "unused");
+        pressed.body = EventBody::Action {
+            action: InAction {
+                reference: "77".to_string(),
+                message_ref: "990".to_string(),
+                token,
+            },
+        };
+        let reply = ingest_event(st, "telegram", pressed, now()).await;
+        assert_eq!(reply, IngestReply::Accepted);
+        let rows = outbox_rows(&st.pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "answer_action");
+        assert_eq!(rows[0].1["action_ref"], "77");
+        rows[0].1["text"].clone()
+    }
+
+    #[tokio::test]
+    async fn button_fresh_approve_token_approves_and_answers() {
+        let st = state().await;
+        owner(&st.pool, "u1", "approve-chat").await;
+        let id = proposal(&st.pool, "pending").await;
+        let text = press(&st, "approve-chat", TokenAction::Approve, id).await;
+        assert_eq!(text, strings::render(&Text::Approved { id }).as_str());
+        assert_eq!(proposal_status(&st.pool, id).await, "approved");
+    }
+
+    #[tokio::test]
+    async fn button_fresh_reject_token_rejects() {
+        let st = state().await;
+        owner(&st.pool, "u1", "reject-chat").await;
+        let id = proposal(&st.pool, "pending").await;
+        let text = press(&st, "reject-chat", TokenAction::Reject, id).await;
+        assert_eq!(text, strings::render(&Text::Rejected { id }).as_str());
+        assert_eq!(proposal_status(&st.pool, id).await, "rejected");
+    }
+
+    #[tokio::test]
+    async fn button_a_lost_compare_and_set_answers_already_handled() {
+        let st = state().await;
+        // The token redeemed while the proposal was pending; somebody decided it before the press
+        // reached the service function, which is the compare-and-set that loses.
+        let id = proposal(&st.pool, "approved").await;
+        for action in [TokenAction::Approve, TokenAction::Reject] {
+            let decided = decide_button(&st, action, id).await;
+            assert!(
+                matches!(decided, Err(DecideError::AlreadyDecided)),
+                "{decided:?}"
+            );
+            assert!(matches!(button_answer(decided), Text::AlreadyHandled));
+        }
+    }
+
+    #[tokio::test]
+    async fn button_any_other_decide_error_answers_not_sent() {
+        let st = state().await;
+        // A proposal that does not exist is `NotFound`, not a lost race.
+        let decided = decide_button(&st, TokenAction::Approve, 424_242).await;
+        assert!(matches!(decided, Err(DecideError::NotFound)), "{decided:?}");
+        assert!(matches!(button_answer(decided), Text::NotSent { .. }));
+        for error in [
+            DecideError::Internal(String::new()),
+            DecideError::Conflict("it cannot resume".to_string()),
+            DecideError::BadGateway("upstream".to_string()),
+        ] {
+            assert!(matches!(button_answer(Err(error)), Text::NotSent { .. }));
+        }
+        match button_answer(Err(DecideError::Conflict("it cannot resume".to_string()))) {
+            Text::NotSent { refusal } => assert_eq!(refusal, "it cannot resume"),
+            other => panic!("unexpected answer {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_a_typed_slash_command_executes() {
+        let st = state().await;
+        owner(&st.pool, "u1", "slash-chat").await;
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-help", "u1", "slash-chat", "/help"),
+            now(),
+        )
+        .await;
+        assert_eq!(reply, IngestReply::Accepted);
+        let rows = outbox_rows(&st.pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(sent_text(&rows[0].1), strings::render(&Text::Help));
+        assert_eq!(run_count(&st.pool, "telegram:slash-chat").await, 0);
+    }
+
+    #[tokio::test]
+    async fn command_pair_never_reaches_execute() {
+        let st = state().await;
+        owner(&st.pool, "u1", "pair-owner-chat").await;
+        // An admitted owner typing `/pair`: the pairing path answers, `execute` (which would log an
+        // error and say nothing) is never entered, and no turn runs.
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-pair-owner", "u1", "pair-owner-chat", "/pair 123456"),
+            now(),
+        )
+        .await;
+        assert_eq!(reply, IngestReply::Accepted);
+        let rows = outbox_rows(&st.pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(sent_text(&rows[0].1), strings::render(&Text::PairInvalid));
+        assert_eq!(run_count(&st.pool, "telegram:pair-owner-chat").await, 0);
+    }
+
+    #[tokio::test]
+    async fn command_approve_n_works_without_buttons_and_answers_in_english() {
+        let st = state().await;
+        owner(&st.pool, "u1", "typed-chat").await;
+        let id = proposal(&st.pool, "pending").await;
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-typed", "u1", "typed-chat", &format!("approve {id}")),
+            now(),
+        )
+        .await;
+        assert_eq!(reply, IngestReply::Accepted);
+        assert_eq!(proposal_status(&st.pool, id).await, "approved");
+        let rows = outbox_rows(&st.pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(sent_text(&rows[0].1), format!("Approved #{id}."));
+    }
+
+    #[tokio::test]
+    async fn command_aprovar_n_is_not_a_command() {
+        let st = state().await;
+        owner(&st.pool, "u1", "pt-chat").await;
+        let id = proposal(&st.pool, "pending").await;
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-pt", "u1", "pt-chat", &format!("aprovar {id}")),
+            now(),
+        )
+        .await;
+        assert_eq!(reply, IngestReply::Accepted);
+        // Plain chat: it went to the turn and decided nothing.
+        assert_eq!(proposal_status(&st.pool, id).await, "pending");
+        assert_eq!(run_count(&st.pool, "telegram:pt-chat").await, 1);
     }
 
     #[tokio::test]
