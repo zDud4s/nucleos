@@ -527,6 +527,12 @@ impl FleetHub {
         Self::publish(&mut state, &[FleetEvent::Heartbeat]);
     }
 
+    /// Test seam: publish a heartbeat now instead of waiting 15 s.
+    #[cfg(test)]
+    pub(crate) fn emit_heartbeat(&self) {
+        self.heartbeat();
+    }
+
     /// (Re)starts the OS watcher when the set of existing directories changed: a directory that
     /// did not exist at start-up (`~/.codex/sessions` on a fresh machine) gets watched once it does.
     fn rewatch(&self) {
