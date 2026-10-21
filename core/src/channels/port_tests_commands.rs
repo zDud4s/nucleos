@@ -241,6 +241,11 @@ fn port_a_turn_that_failed_for_no_stated_reason_still_says_so() {
     assert!(got.contains("connection refused"), "{got}");
     // No remedy is invented for a failure that stated none.
     assert!(!got.contains("/cancel") && !got.contains("/resume"), "{got}");
+    // A busy turn does name the way out.
+    let busy = strings::render(&Text::NotSent {
+        refusal: crate::assistant::TURN_IN_PROGRESS.to_string(),
+    });
+    assert!(busy.contains("/cancel"), "{busy}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -508,7 +513,7 @@ async fn port_a_reply_to_a_capture_request_answers_it_without_a_turn() {
 
 #[tokio::test]
 async fn port_a_late_answer_says_the_distiller_moved_on() {
-    // Adapted: the late answer keeps its note and is acknowledged; it releases nothing.
+    // The late answer keeps its note and says the question has moved on; it releases nothing.
     let state = testkit::state().await;
     open_request(&state, 7).await;
     let (c, s) = (conversation(), sender());
@@ -523,7 +528,9 @@ async fn port_a_late_answer_says_the_distiller_moved_on() {
     assert_eq!(request_state(&state, 7).await, "answered");
     assert_eq!(count(&state, "owner_notes").await, 2);
     let said = answers(&state).await;
-    assert_eq!(said, vec![strings::render(&Text::CaptureAnswered { job: 7 }); 2]);
+    let late = strings::render(&Text::CaptureLate { note: 2 });
+    assert!(late.contains("moved on"), "{late}");
+    assert_eq!(said, vec![strings::render(&Text::CaptureAnswered { job: 7 }), late]);
 }
 
 #[tokio::test]
