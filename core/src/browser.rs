@@ -572,12 +572,12 @@ pub async fn open_with(
     // The shell's own browser, when it is registered for this project. Only for the project profile
     // (the embedded one IS that profile) and never for a visible window; otherwise, or when the
     // shell does not attach in time, the headless path below runs unchanged.
-    if !visible && profile == Profile::Project {
-        if let Some(row) =
+    if !visible
+        && profile == Profile::Project
+        && let Some(row) =
             route_embedded::try_open(pool, runtime, row_id, ask, &sites, &placement).await
-        {
-            return Ok(Opened::Session(Box::new(row)));
-        }
+    {
+        return Ok(Opened::Session(Box::new(row)));
     }
 
     let opened = if visible {
