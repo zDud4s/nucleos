@@ -31,7 +31,9 @@ pub fn read_complete_lines(path: &Path, from: Offset) -> io::Result<(Vec<String>
     // Start one byte early: if that byte is a '\n' the window already begins on a line.
     file.seek(SeekFrom::Start(window - 1))?;
     let mut buf = Vec::with_capacity(TAIL_BYTES as usize + 1);
-    file.by_ref().take(len - (window - 1)).read_to_end(&mut buf)?;
+    file.by_ref()
+        .take(len - (window - 1))
+        .read_to_end(&mut buf)?;
     let Some(newline) = buf.iter().position(|b| *b == b'\n') else {
         // One line longer than the window: no safe boundary yet. Try the window again next time.
         return Ok((Vec::new(), Offset::TAIL));
@@ -153,7 +155,10 @@ mod tests {
         assert_eq!(offset, Offset(4));
 
         // The writer finishes the line: it is now read whole, from where we stayed.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         file.write_all(b"d\n").unwrap();
         let (lines, offset) = read_complete_lines(&path, offset).unwrap();
         assert_eq!(lines, ["cd"]);
@@ -191,9 +196,17 @@ mod tests {
 
         let (lines, offset) = read_complete_lines(&path, Offset::TAIL).unwrap();
         assert_eq!(offset, Offset(body.len() as u64));
-        assert!(lines.len() < 10_000 && lines.len() > 5_000, "{}", lines.len());
+        assert!(
+            lines.len() < 10_000 && lines.len() > 5_000,
+            "{}",
+            lines.len()
+        );
         // Every line is whole: the window started mid-line and that fragment was dropped.
-        assert!(lines.iter().all(|l| l.len() == 10 && l.starts_with("line-")));
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.len() == 10 && l.starts_with("line-"))
+        );
         assert_eq!(lines.last().unwrap(), "line-09999");
         assert!(lines.first().unwrap().as_str() > "line-00000");
     }
@@ -309,9 +322,15 @@ mod tests {
 
     #[test]
     fn the_project_is_the_last_path_component_with_either_separator() {
-        assert_eq!(project_of(r"C:\Projects\nucleos").as_deref(), Some("nucleos"));
+        assert_eq!(
+            project_of(r"C:\Projects\nucleos").as_deref(),
+            Some("nucleos")
+        );
         assert_eq!(project_of("/home/u/proj/").as_deref(), Some("proj"));
-        assert_eq!(project_of(r"C:\Projects\nucleos\").as_deref(), Some("nucleos"));
+        assert_eq!(
+            project_of(r"C:\Projects\nucleos\").as_deref(),
+            Some("nucleos")
+        );
         assert_eq!(project_of("/").as_deref(), None);
         assert_eq!(project_of("").as_deref(), None);
         assert_eq!(project_of("solo").as_deref(), Some("solo"));

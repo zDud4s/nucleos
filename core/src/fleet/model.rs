@@ -236,7 +236,10 @@ mod tests {
         assert_eq!(cut.chars().count(), 20);
         assert!(cut.ends_with('…'));
         let token = format!("ghp_{}", "x".repeat(36));
-        assert_eq!(clean_label(&format!("fix {token}"), 80), "fix [SECRET:github]");
+        assert_eq!(
+            clean_label(&format!("fix {token}"), 80),
+            "fix [SECRET:github]"
+        );
     }
 
     #[test]
@@ -251,7 +254,13 @@ mod tests {
             serde_json::to_string(&line).unwrap(),
             r#"{"kind":"final","text":"done"}"#
         );
-        assert_eq!(serde_json::to_string(&NodeState::Busy).unwrap(), r#""busy""#);
-        assert_eq!(serde_json::to_string(&NodeState::Lost).unwrap(), r#""lost""#);
+        assert_eq!(
+            serde_json::to_string(&NodeState::Busy).unwrap(),
+            r#""busy""#
+        );
+        assert_eq!(
+            serde_json::to_string(&NodeState::Lost).unwrap(),
+            r#""lost""#
+        );
     }
 }

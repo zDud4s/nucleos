@@ -16,15 +16,21 @@ pub enum FleetEvent {
         lines: BTreeMap<NodeId, Vec<TermLine>>,
     },
     /// A whole node: new, or its structure or state changed.
-    Node { node: FleetNode },
+    Node {
+        node: FleetNode,
+    },
     /// Metrics that changed, batched; never forces layout.
-    Metrics { metrics: Vec<NodeMetrics> },
+    Metrics {
+        metrics: Vec<NodeMetrics>,
+    },
     Lines {
         node_id: NodeId,
         lines: Vec<TermLine>,
     },
     /// The whole tree under this root is gone.
-    Removed { node_id: NodeId },
+    Removed {
+        node_id: NodeId,
+    },
     Heartbeat,
 }
 
@@ -48,7 +54,9 @@ mod tests {
                                "lines": [{"kind": "text", "text": "hi"}]})
         );
 
-        let removed = FleetEvent::Removed { node_id: "a:1".into() };
+        let removed = FleetEvent::Removed {
+            node_id: "a:1".into(),
+        };
         assert_eq!(
             serde_json::to_value(removed).unwrap(),
             serde_json::json!({"t": "removed", "node_id": "a:1"})

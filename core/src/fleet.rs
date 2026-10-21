@@ -23,10 +23,13 @@ pub struct FleetEnv {
     pub run_tails: crate::state::RunTails,
 }
 
+/// The registered agent and edge sources, as `sources` returns them.
+pub type Sources = (Vec<Arc<dyn AgentSource>>, Vec<Arc<dyn EdgeSource>>);
+
 /// Every source, in precedence order. Each track adds ONE `push` line here; nothing else in this
 /// file changes. Edge sources are applied in the order they are listed: native edges first (they
 /// come from the `AgentSource`s themselves), then `work_nodes`, then `run_launch`.
-pub fn sources(env: &FleetEnv) -> (Vec<Arc<dyn AgentSource>>, Vec<Arc<dyn EdgeSource>>) {
+pub fn sources(env: &FleetEnv) -> Sources {
     let _ = env;
     #[allow(unused_mut)]
     let mut agents: Vec<Arc<dyn AgentSource>> = Vec::new();
@@ -57,7 +60,11 @@ mod tests {
         let mut unique = names.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(names.len(), unique.len(), "two sources share a name: {names:?}");
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "two sources share a name: {names:?}"
+        );
         assert!(edges.iter().all(|e| !e.name().is_empty()));
     }
 }
