@@ -1021,7 +1021,8 @@ mod tests {
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         book.apply_lines("claude-code:root", outcome(&refs, 99), at(5));
 
-        let emitted = lines_of(&book.flush_lines());
+        let flushed = book.flush_lines();
+        let emitted = lines_of(&flushed);
         assert_eq!(emitted[0].1.len(), RING_LINES);
         assert_eq!(emitted[0].1.last(), Some(&"l299"));
         let FleetEvent::Snapshot { lines, .. } = book.snapshot() else { panic!() };
