@@ -304,4 +304,49 @@ mod tests {
             serde_json::json!({"error": "not_a_root"})
         );
     }
+
+    #[tokio::test]
+    async fn the_router_decodes_an_encoded_node_id_and_routes_each_verb() {
+        use tower::ServiceExt as _;
+        let f = fixture().await;
+        let app = routes().with_state(f.state.clone());
+
+        let transcript = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/fleet/nodes/claude-code%3Aa/transcript?before=7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(transcript.status(), StatusCode::OK);
+        assert_eq!(body_json(transcript).await["before"], "42");
+
+        let pinned = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/fleet/pins/claude-code%3Aa")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pinned.status(), StatusCode::NO_CONTENT);
+
+        let unpinned = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/fleet/pins/claude-code%3Aa")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unpinned.status(), StatusCode::NO_CONTENT);
+    }
 }
