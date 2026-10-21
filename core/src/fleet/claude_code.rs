@@ -484,6 +484,7 @@ impl Inner {
                 }
             }
         }
+        self.publish(st);
         out.sort_by(|a, b| a.key.cmp(&b.key));
         out
     }
@@ -750,6 +751,126 @@ impl ClaudeCode {
     }
 }
 
+impl Inner {
+    /// Rebuilds the read-side snapshot. Called at the end of every scan with the scan lock held;
+    /// `node_ref` and `watch_paths` read the result without ever touching that lock.
+    fn publish(&self, st: &State) {
+        let mut watch = Vec::new();
+        let mut nodes = HashMap::new();
+        for (id, root) in &st.roots {
+            if let Some(transcript) = &root.transcript {
+                if let Some(dir) = transcript.parent() {
+                    watch.push(dir.to_path_buf());
+                }
+                // `subagents_mtime` is set only when `refresh_children` found the directory.
+                if root.subagents_mtime.is_some() {
+                    watch.push(transcript.with_extension("").join("subagents"));
+                }
+                nodes.insert(id.clone(), transcript.clone());
+            }
+            for (agent, child) in &root.children {
+                nodes.insert(agent.clone(), child.transcript.clone());
+            }
+        }
+        watch.sort();
+        watch.dedup();
+        *self.published.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Snapshot { watch, nodes });
+    }
+
+    fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.published.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// From the published snapshot: a root (session id) or a subagent (agent id) with a transcript.
+    fn node_ref(&self, key: &NodeKey) -> Option<NodeRef> {
+        if key.harness != HARNESS {
+            return None;
+        }
+        self.snapshot()
+            .nodes
+            .get(&key.native_id)
+            .map(|path| NodeRef { key: key.clone(), path: Some(path.clone()) })
+    }
+
+    fn watch_paths(&self) -> Vec<PathBuf> {
+        let claude = self.claude_dir();
+        let mut paths = vec![claude.join("sessions"), claude.join("projects")];
+        paths.extend(self.snapshot().watch.iter().cloned());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    fn read_lines(&self, node: &NodeRef, from: Offset) -> SourceResult<LinesRead> {
+        let path = node
+            .path
+            .as_deref()
+            .ok_or_else(|| SourceError::msg(format!("node {} has no transcript path", node.key.id())))?;
+        let (raw, offset) = match tail::read_complete_lines(path, from) {
+            Ok(read) => read,
+            // The file went away between discovery and now: nothing new, same offset.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LinesRead { lines: Vec::new(), offset: from, usage: None, last_activity_at: None });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut lines: Vec<TermLine> = Vec::new();
+        let mut usage = None;
+        let mut last = None;
+        for raw_line in &raw {
+            let Some(parsed) = record::parse_line(raw_line) else {
+                self.warn_once("a transcript line is not valid JSON");
+                continue;
+            };
+            lines.extend(parsed.entries.iter().map(record::term_line));
+            if let Some(u) = parsed.usage {
+                record::merge_usage(&mut usage, u);
+            }
+            if let Some(at) = parsed.at {
+                last = last.max(Some(at));
+            }
+        }
+        Ok(LinesRead { lines, offset, usage, last_activity_at: last })
+    }
+
+    /// How many consecutive pages with nothing to show (attachments, titles, ...) are skipped
+    /// before the caller gets an empty page with a cursor to continue from.
+    const MAX_EMPTY_PAGES: usize = 4;
+
+    fn transcript_page(&self, node: &NodeRef, before: Option<Cursor>) -> SourceResult<TranscriptPage> {
+        let path = node
+            .path
+            .as_deref()
+            .ok_or_else(|| SourceError::msg(format!("node {} has no transcript path", node.key.id())))?;
+        let mut cursor = match before {
+            None => None,
+            Some(raw) => Some(
+                raw.parse::<u64>()
+                    .map_err(|_| SourceError::msg(format!("invalid transcript cursor {raw:?}")))?,
+            ),
+        };
+        for _ in 0..Self::MAX_EMPTY_PAGES {
+            let (raw, next) = match tail::read_lines_before(path, cursor, limits::TRANSCRIPT_PAGE_BYTES) {
+                Ok(page) => page,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+                Err(e) => return Err(e.into()),
+            };
+            let mut entries = Vec::new();
+            for line in &raw {
+                match record::parse_line(line) {
+                    Some(parsed) => entries.extend(parsed.entries),
+                    None => self.warn_once("a transcript line is not valid JSON"),
+                }
+            }
+            if !entries.is_empty() || next.is_none() {
+                return Ok(TranscriptPage { entries, before: next.map(|o| o.to_string()) });
+            }
+            cursor = next;
+        }
+        Ok(TranscriptPage { entries: Vec::new(), before: cursor.map(|o| o.to_string()) })
+    }
+}
+
 #[async_trait]
 impl AgentSource for ClaudeCode {
     fn name(&self) -> &'static str {
@@ -757,7 +878,7 @@ impl AgentSource for ClaudeCode {
     }
 
     fn watch_paths(&self) -> Vec<PathBuf> {
-        Vec::new() // Task 17
+        self.inner.watch_paths()
     }
 
     async fn discover(&self, since: Timestamp) -> SourceResult<Vec<Sighting>> {
@@ -766,16 +887,20 @@ impl AgentSource for ClaudeCode {
         Ok(tokio::task::spawn_blocking(move || inner.scan(since, runs)).await?)
     }
 
-    fn node_ref(&self, _key: &NodeKey) -> Option<NodeRef> {
-        None // Task 17
+    fn node_ref(&self, key: &NodeKey) -> Option<NodeRef> {
+        self.inner.node_ref(key)
     }
 
-    async fn read_lines(&self, _node: &NodeRef, _from: Offset) -> SourceResult<LinesRead> {
-        Err(SourceError::msg("read_lines: Task 15"))
+    async fn read_lines(&self, node: &NodeRef, from: Offset) -> SourceResult<LinesRead> {
+        let inner = self.inner.clone();
+        let node = node.clone();
+        tokio::task::spawn_blocking(move || inner.read_lines(&node, from)).await?
     }
 
-    async fn transcript_page(&self, _node: &NodeRef, _before: Option<Cursor>) -> SourceResult<TranscriptPage> {
-        Err(SourceError::msg("transcript_page: Task 16"))
+    async fn transcript_page(&self, node: &NodeRef, before: Option<Cursor>) -> SourceResult<TranscriptPage> {
+        let inner = self.inner.clone();
+        let node = node.clone();
+        tokio::task::spawn_blocking(move || inner.transcript_page(&node, before)).await?
     }
 }
 
@@ -1376,5 +1501,256 @@ mod tests {
         let (cc, _db) = setup(&home, &probe).await;
         assert!(cc.discover(since()).await.unwrap().is_empty());
         assert_eq!(cc.warnings(), 1);
+    }
+
+    async fn node_of(cc: &ClaudeCode, key: &NodeKey) -> NodeRef {
+        cc.discover(since()).await.unwrap();
+        cc.node_ref(key).expect("the node should be known after discover")
+    }
+
+    fn root_key() -> NodeKey {
+        NodeKey::new("claude-code", fx::SESSION)
+    }
+
+    async fn live_root(lines: &[String]) -> (ClaudeCode, Home, NodeRef, crate::storage::TempDb) {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, lines);
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, db) = setup(&home, &probe).await;
+        let node = node_of(&cc, &root_key()).await;
+        (cc, home, node, db)
+    }
+
+    #[tokio::test]
+    async fn reading_from_the_tail_yields_lines_usage_and_activity() {
+        let (cc, _home, node, _db) = live_root(&fx::closed_turn()).await;
+        let read = cc.read_lines(&node, Offset::TAIL).await.unwrap();
+        let shown: Vec<_> = read.lines.iter().map(|l| (l.kind, l.text.as_str())).collect();
+        assert_eq!(shown, vec![(TermKind::Prompt, "do the thing"), (TermKind::Final, "all done")]);
+        assert_eq!(read.usage.and_then(|u| u.context_tokens), Some(330));
+        assert_eq!(read.last_activity_at, Some("2026-10-20T10:00:00Z".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_second_read_returns_only_what_was_appended() {
+        let (cc, home, node, _db) = live_root(&fx::closed_turn()).await;
+        let first = cc.read_lines(&node, Offset::TAIL).await.unwrap();
+        let again = cc.read_lines(&node, first.offset).await.unwrap();
+        assert!(again.lines.is_empty());
+
+        fx::append(
+            &home.project_dir().join(format!("{}.jsonl", fx::SESSION)),
+            &format!("{}\n", fx::user_prompt(fx::TS, "and then?")),
+        );
+        let next = cc.read_lines(&node, first.offset).await.unwrap();
+        assert_eq!(next.lines.len(), 1);
+        assert_eq!(next.lines[0].text, "and then?");
+    }
+
+    #[tokio::test]
+    async fn a_half_written_last_line_waits_until_it_is_complete() {
+        let (cc, home, node, _db) = live_root(&fx::closed_turn()).await;
+        let path = home.project_dir().join(format!("{}.jsonl", fx::SESSION));
+        let first = cc.read_lines(&node, Offset::TAIL).await.unwrap();
+
+        let whole = fx::user_prompt(fx::TS, "second prompt");
+        let (head, rest) = whole.split_at(30);
+        fx::append(&path, head);
+        let partial = cc.read_lines(&node, first.offset).await.unwrap();
+        assert!(partial.lines.is_empty());
+        assert_eq!(partial.offset, first.offset, "the offset stays before the unfinished line");
+
+        fx::append(&path, &format!("{rest}\n"));
+        let done = cc.read_lines(&node, partial.offset).await.unwrap();
+        assert_eq!(done.lines.len(), 1);
+        assert_eq!(done.lines[0].text, "second prompt");
+    }
+
+    #[tokio::test]
+    async fn malformed_lines_are_skipped_and_logged_once() {
+        let mut lines = fx::closed_turn();
+        lines.insert(1, "{\"type\":\"assis".to_owned());
+        lines.insert(1, "not json at all".to_owned());
+        let (cc, _home, node, _db) = live_root(&lines).await;
+        let before = cc.warnings();
+        let read = cc.read_lines(&node, Offset::TAIL).await.unwrap();
+        assert_eq!(read.lines.len(), 2, "the two good lines survive");
+        assert_eq!(cc.warnings(), before + 1, "two bad lines, one cause, one log");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_or_rotated_file_is_read_again_from_the_tail() {
+        let (cc, home, node, _db) = live_root(&fx::closed_turn()).await;
+        let path = home.project_dir().join(format!("{}.jsonl", fx::SESSION));
+        let first = cc.read_lines(&node, Offset::TAIL).await.unwrap();
+
+        std::fs::write(&path, format!("{}\n", fx::user_prompt(fx::TS, "fresh"))).unwrap();
+        let read = cc.read_lines(&node, first.offset).await.unwrap();
+        assert_eq!(read.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["fresh"]);
+    }
+
+    #[tokio::test]
+    async fn a_vanished_file_reads_as_nothing_new() {
+        let (cc, home, node, _db) = live_root(&fx::closed_turn()).await;
+        std::fs::remove_file(home.project_dir().join(format!("{}.jsonl", fx::SESSION))).unwrap();
+        let read = cc.read_lines(&node, Offset(0)).await.unwrap();
+        assert!(read.lines.is_empty());
+        assert_eq!(read.offset, Offset(0));
+    }
+
+    /// One prompt, then `pairs` tool calls with 4 KB results: far more than one page.
+    fn long_transcript(pairs: usize) -> Vec<String> {
+        let mut lines = vec![fx::user_prompt(fx::TS, "start")];
+        for n in 0..pairs {
+            let id = format!("toolu_{n}");
+            lines.push(fx::assistant(
+                fx::TS,
+                Some("tool_use"),
+                fx::tool_block(&id, "Read", json!({"file_path": format!("src/file_{n}.rs")})),
+                None,
+            ));
+            lines.push(fx::tool_result(
+                fx::TS,
+                &id,
+                &"x".repeat(4000),
+                json!({"type":"text","file":{"numLines": n + 1}}),
+            ));
+        }
+        lines
+    }
+
+    #[tokio::test]
+    async fn the_transcript_pages_backwards_with_tool_detail_and_loses_nothing() {
+        let pairs = 90;
+        let (cc, _home, node, _db) = live_root(&long_transcript(pairs)).await;
+
+        let mut pages: Vec<Vec<TranscriptEntry>> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = cc.transcript_page(&node, cursor.clone()).await.unwrap();
+            assert!(!page.entries.is_empty() || page.before.is_none());
+            pages.push(page.entries);
+            cursor = page.before;
+            if cursor.is_none() {
+                break;
+            }
+            assert!(pages.len() < 20, "paging must terminate");
+        }
+        assert!(pages.len() >= 2, "the fixture is bigger than one 256 KB page");
+
+        // Pages arrive newest-first; each is oldest-first inside. Stitch them back in order.
+        let all: Vec<TranscriptEntry> = pages.into_iter().rev().flatten().collect();
+        assert_eq!(all.len(), 1 + 2 * pairs);
+        assert_eq!((all[0].kind, all[0].text.as_str()), (TermKind::Prompt, "start"));
+        assert_eq!(all[1].text, "Read src/file_0.rs");
+        assert!(all[1].detail.as_deref().unwrap().contains("src/file_0.rs"));
+        assert_eq!(all[2].kind, TermKind::Result);
+        assert_eq!(all[2].text, "1 line");
+        assert_eq!(all[2].detail.as_deref().map(str::len), Some(4000), "the result body in full");
+        assert_eq!(all.last().unwrap().text, format!("{pairs} lines"));
+    }
+
+    #[tokio::test]
+    async fn a_short_transcript_is_one_page_with_nothing_earlier() {
+        let (cc, _home, node, _db) = live_root(&fx::closed_turn()).await;
+        let page = cc.transcript_page(&node, None).await.unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.before, None);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_that_is_not_ours_is_an_error() {
+        let (cc, _home, node, _db) = live_root(&fx::closed_turn()).await;
+        assert!(cc.transcript_page(&node, Some("not-a-number".to_owned())).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_transcript_of_a_subagent_is_its_own_file() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        home.subagent(fx::SESSION, "a1", json!({"description":"d"}), &[fx::user_prompt(fx::TS, "sub prompt")]);
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        let node = node_of(&cc, &NodeKey::new("claude-code", "a1")).await;
+        let page = cc.transcript_page(&node, None).await.unwrap();
+        assert_eq!(page.entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), vec!["sub prompt"]);
+    }
+
+    #[tokio::test]
+    async fn watch_paths_cover_the_registry_projects_and_each_known_root_and_subagents_dir() {
+        let (home, probe) = with_children(true);
+        let (cc, _db) = setup(&home, &probe).await;
+        let before = cc.watch_paths();
+        let claude = home.path().join(".claude");
+        assert!(before.contains(&claude.join("sessions")) && before.contains(&claude.join("projects")));
+        assert!(!before.contains(&home.subagents_dir(fx::SESSION)), "nothing known yet");
+
+        cc.discover(since()).await.unwrap();
+        let after = cc.watch_paths();
+        assert!(after.contains(&home.project_dir()));
+        assert!(after.contains(&home.subagents_dir(fx::SESSION)));
+        let mut sorted = after.clone();
+        sorted.dedup();
+        assert_eq!(after, sorted, "no duplicates");
+    }
+
+    #[tokio::test]
+    async fn node_ref_knows_roots_and_children_and_nothing_else() {
+        let (home, probe) = with_children(true);
+        let (cc, _db) = setup(&home, &probe).await;
+        assert!(cc.node_ref(&root_key()).is_none(), "unknown before the first discover");
+        cc.discover(since()).await.unwrap();
+
+        let root = cc.node_ref(&root_key()).unwrap();
+        assert!(root.path.unwrap().ends_with(format!("{}.jsonl", fx::SESSION)));
+        let child = cc.node_ref(&NodeKey::new("claude-code", "a3")).unwrap();
+        assert!(child.path.unwrap().ends_with("agent-a3.jsonl"));
+        assert!(cc.node_ref(&NodeKey::new("codex-cli", fx::SESSION)).is_none());
+        assert!(cc.node_ref(&NodeKey::new("claude-code", "nope")).is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_paths_and_node_ref_never_wait_for_the_scan_lock() {
+        let (home, probe) = with_children(true);
+        let (cc, _db) = setup(&home, &probe).await;
+        cc.discover(since()).await.unwrap();
+
+        // A scan in progress holds the state mutex across file IO; the two synchronous trait
+        // methods (called from async code) must answer from the published snapshot regardless.
+        let held = cc.inner.lock();
+        let inner = cc.inner.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let paths = inner.watch_paths();
+            let node = inner.node_ref(&NodeKey::new("claude-code", "a1"));
+            let _ = tx.send((paths.len(), node.is_some()));
+        });
+        let (paths, found) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("watch_paths / node_ref blocked on the scan lock");
+        drop(held);
+        assert!(paths >= 3 && found);
+    }
+
+    #[tokio::test]
+    async fn the_registry_lists_claude_code_after_daemon_runs() {
+        let env = crate::fleet::FleetEnv {
+            pool: crate::testdb::fresh_pool().await,
+            home: std::env::temp_dir(),
+            run_tails: Default::default(),
+        };
+        let (agents, _edges) = crate::fleet::sources(&env);
+        let names: Vec<_> = agents.iter().map(|a| a.name()).collect();
+        let claude = names.iter().position(|n| *n == "claude_code").expect("claude_code is registered");
+        if let Some(daemon) = names.iter().position(|n| *n == "daemon_runs") {
+            assert!(daemon < claude, "fusion precedence: daemon_runs first, got {names:?}");
+        }
+        if let Some(codex) = names.iter().position(|n| *n == "codex_cli") {
+            assert!(claude < codex, "fusion precedence: claude_code before codex_cli, got {names:?}");
+        }
     }
 }

@@ -35,7 +35,7 @@ pub fn sources(env: &FleetEnv) -> Sources {
     #[allow(unused_mut)]
     let mut agents: Vec<Arc<dyn AgentSource>> = Vec::new();
     // TODO-A: agents.push(Arc::new(daemon_runs::DaemonRuns::new(env)));
-    // TODO-B: agents.push(Arc::new(claude_code::ClaudeCode::new(env)));
+    agents.push(Arc::new(claude_code::ClaudeCode::new(env)));
     // TODO-C: agents.push(Arc::new(codex_cli::CodexCli::new(env)));
     #[allow(unused_mut)]
     let mut edges: Vec<Arc<dyn EdgeSource>> = Vec::new();
