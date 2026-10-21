@@ -243,6 +243,53 @@ fn parse_lines(raw: &[String]) -> Parsed {
     parsed
 }
 
+/// What the last ~64 KB of a rollout says about the session.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TailFacts {
+    /// `Some(true)` after `task_started`, `Some(false)` after `task_complete`/`turn_aborted`
+    /// (the last marker wins), `None` when the window holds no marker. `None` is "unknown" and
+    /// `liveness` reads it as open (Busy while fresh, Lost once quiet, never Done): a finished
+    /// session ends with a closing marker inside the tail, so a window without one is mid-turn.
+    turn_open: Option<bool>,
+    usage: Option<Usage>,
+    model: Option<String>,
+}
+
+fn scan_tail(raw: &[String]) -> TailFacts {
+    let mut facts = TailFacts::default();
+    for line in raw {
+        let Ok(record) = serde_json::from_str::<Value>(line) else { continue };
+        let ptype = record.pointer("/payload/type").and_then(Value::as_str);
+        match (str_of(&record, "type"), ptype) {
+            (Some("event_msg"), Some("task_started")) => facts.turn_open = Some(true),
+            (Some("event_msg"), Some("task_complete" | "turn_aborted")) => facts.turn_open = Some(false),
+            (Some("turn_context"), _) => {
+                if let Some(model) = record.pointer("/payload/model").and_then(Value::as_str) {
+                    facts.model = Some(model.to_owned());
+                }
+            }
+            _ => {}
+        }
+        if let Some(usage) = usage_of(&record) {
+            facts.usage = Some(usage);
+        }
+    }
+    facts
+}
+
+/// Spec §3 for a rollout nobody else vouches for (a live daemon run overrides this in fusion):
+/// an open (or unknown) turn written to within `CODEX_LIVE_MTIME` is `Busy`; the same turn gone
+/// quiet is `Lost` (mid-turn, no process); a closed turn is `Done` whatever its age. There is no
+/// `Idle`: a Codex session between turns cannot be told from a dead one without a process table.
+fn liveness(turn_open: Option<bool>, idle_for: Duration) -> NodeState {
+    let open = turn_open.unwrap_or(true);
+    match (open, idle_for <= limits::CODEX_LIVE_MTIME) {
+        (true, true) => NodeState::Busy,
+        (true, false) => NodeState::Lost,
+        (false, _) => NodeState::Done,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // `super::*` brings in every name above (private `use` items included), so the tests import only
@@ -431,5 +478,69 @@ mod tests {
         assert_eq!(parsed.mapped.len(), 1);
         assert_eq!(parsed.usage.unwrap().context_tokens, Some(30));
         assert_eq!(parsed.last_at.unwrap().to_rfc3339(), "2026-10-20T10:05:00+00:00");
+    }
+
+    fn lines(kinds: &[(&str, Value)]) -> Vec<String> {
+        kinds.iter().map(|(kind, payload)| rec(kind, payload.clone())).collect()
+    }
+
+    #[test]
+    fn the_last_turn_marker_decides_whether_a_turn_is_open() {
+        let open = scan_tail(&lines(&[
+            ("event_msg", json!({"type": "task_started"})),
+            ("event_msg", json!({"type": "task_complete"})),
+            ("event_msg", json!({"type": "task_started"})),
+            ("response_item", json!({"type": "function_call", "name": "exec", "input": "x"})),
+        ]));
+        assert_eq!(open.turn_open, Some(true));
+        let closed = scan_tail(&lines(&[
+            ("event_msg", json!({"type": "task_started"})),
+            ("event_msg", json!({"type": "task_complete"})),
+            ("event_msg", json!({"type": "token_count", "info": {"last_token_usage": {"total_tokens": 7}}})),
+        ]));
+        assert_eq!(closed.turn_open, Some(false));
+        assert_eq!(closed.usage.unwrap().context_tokens, Some(7));
+        let aborted = scan_tail(&lines(&[("event_msg", json!({"type": "turn_aborted"}))]));
+        assert_eq!(aborted.turn_open, Some(false));
+        // No marker in the tail window at all: unknown, which `liveness` reads as open.
+        assert_eq!(scan_tail(&lines(&[("response_item", json!({"type": "reasoning"}))])).turn_open, None);
+    }
+
+    /// Documents a deliberate limit: a tail window with no turn marker at all (a turn so long that its
+    /// `task_started` scrolled out of the last 64 KB, or a rollout that never wrote one) is "unknown",
+    /// and unknown is read as OPEN. So it is `Busy` while the file is fresh and `Lost` once it goes
+    /// quiet, and never `Done`: a closed session always ends with `task_complete`/`turn_aborted`
+    /// inside the tail, so "no marker" cannot be a finished turn.
+    #[test]
+    fn a_tail_without_any_turn_marker_is_busy_then_lost_never_done() {
+        let facts = scan_tail(&lines(&[
+            ("response_item", json!({"type": "function_call", "name": "exec", "input": "x"})),
+            ("response_item", json!({"type": "function_call_output", "output": "ok"})),
+        ]));
+        assert_eq!(facts.turn_open, None);
+        assert_eq!(liveness(facts.turn_open, Duration::from_secs(5)), NodeState::Busy);
+        let stale = limits::CODEX_LIVE_MTIME + Duration::from_secs(1);
+        assert_eq!(liveness(facts.turn_open, stale), NodeState::Lost);
+    }
+
+    #[test]
+    fn the_latest_turn_context_names_the_model() {
+        let facts = scan_tail(&lines(&[
+            ("turn_context", json!({"model": "gpt-5.5"})),
+            ("turn_context", json!({"model": "gpt-5.6-luna"})),
+            ("turn_context", json!({"effort": "high"})),
+        ]));
+        assert_eq!(facts.model.as_deref(), Some("gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn liveness_follows_the_spec_table() {
+        let fresh = Duration::from_secs(5);
+        let stale = limits::CODEX_LIVE_MTIME + Duration::from_secs(1);
+        assert_eq!(liveness(Some(true), fresh), NodeState::Busy);
+        assert_eq!(liveness(None, fresh), NodeState::Busy);
+        assert_eq!(liveness(Some(true), stale), NodeState::Lost);
+        assert_eq!(liveness(Some(false), fresh), NodeState::Done);
+        assert_eq!(liveness(Some(false), stale), NodeState::Done);
     }
 }
