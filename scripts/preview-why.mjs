@@ -27,8 +27,8 @@ const PATH_UNDER_TEST = process.argv[2] ?? "/teams";
  * Buttons to press before reading the page, `|`-separated and pressed in order.
  *
  * Without it this tool can only ever report the surface a route loads with, and the ones that go
- * wrong are usually the ones behind a click — `node scripts/preview-why.mjs /fleet "Show
- * items|As a graph"`. `preview/main.tsx` does the pressing; this only forwards it.
+ * wrong are usually the ones behind a click — `node scripts/preview-why.mjs /fleet "Expand"`.
+ * `preview/main.tsx` does the pressing; this only forwards it.
  */
 const PRESS = process.argv[3];
 

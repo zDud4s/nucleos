@@ -475,6 +475,9 @@ pub struct AppState {
     /// handle when a run's task spawns, removed beside it when the task ends — the three maps are
     /// populated and drained together so none of them can outlive the run it describes.
     pub run_tails: RunTails,
+    /// The live fleet tree's hub (spec 2026-10-20): built on first use, stopped when the last
+    /// client leaves. `Default` is inert, which is what every test that ignores it gets.
+    pub fleet: Arc<crate::fleet::hub::FleetRuntime>,
     /// Maximum silence between streamed events; independent of the total wall-clock run timeout.
     pub progress_timeout: Duration,
     pub run_timeout: Duration,

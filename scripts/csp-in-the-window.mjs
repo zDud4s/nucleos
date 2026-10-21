@@ -455,7 +455,7 @@ if (bootViolations.length === 0) {
 /*
   A few routes past the first, driven through the router's own history rather than by loading URLs:
   the asset protocol serves files, and a deep path is not one. What this buys is the pages that
-  mount the heavy libraries under the real policy — `/fleet` is here because it is `FleetCanvas`,
+  mount the heavy libraries under the real policy — `/fleet` is here because it is `fleet/Surface.tsx`,
   the xyflow surface the gate deliberately leaves out on the grounds that the workflow canvas
   already covers that library. That reasoning is about libraries; this is about the app.
 

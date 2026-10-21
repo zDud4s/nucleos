@@ -7,8 +7,10 @@ import type { Proposal } from "./system";
 /**
  * The fleet's own slice of the núcleo, as hooks.
  *
- * Everything the Fleet page reads or writes goes through here, and the page
- * never names a route or an interval. The shapes below were read off
+ * Capacity (`GET /concurrency`), live jobs and runs, job creation and cancel, and
+ * the exclusions. Read by the Workspace, Occupancy, ModeCode, Roster and Autopilot
+ * (the exclusions panel included); the Fleet page itself reads its tree from
+ * `fleet/` over a stream. The shapes below were read off
  * `core/src/http.rs` and the modules it delegates to rather than inferred from
  * a name — field for field, including the ones the old shell never declared.
  */
