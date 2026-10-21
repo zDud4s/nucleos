@@ -318,6 +318,8 @@ the contract, not a snapshot.
 | `fleet/event.rs` | The `GET /fleet/live` events as one serde enum (`{"t":"snapshot"|"node"|"metrics"|"lines"|"removed"|"heartbeat"}`). |
 | `fleet/tail.rs` | Incremental file reading for the fleet adapters: complete lines from an offset (partial last line kept back, truncation restarts at the tail, first sight jumps to the last 64 KB), backwards paging for the full transcript, and `project_of`. |
 | `fleet/fuse.rs` | Pure fusion of the live fleet tree: equal keys merge (run id, stop, cost and liveness from the daemon, lines and labels from the harness adapter), parent edges by precedence (native, `work_nodes`, `run_launch`), unknown-parent and cycle edges ignored, a live child under a dead root becomes lost, capabilities. |
+| `fleet/daemon_runs.rs` | Parent of `fleet/daemon_runs/`. The `AgentSource` over the `runs` table: every run the daemon launches, with stop, keyed by the runner's native harness when it has a session id (the one place the runner-to-harness mapping lives). |
+| `fleet/daemon_runs/stream.rs` | A run's stdout (the live `RunTails` buffer) as terminal lines: assistant text and tool uses, one-line tool results, reasoning dropped; the synthetic `Final`/`Error` last line of a finished run. |
 | `fleet/testkit.rs` | `#[cfg(test)]` builders and fakes (sighting, fake source, fake clock, fake watcher) for the fleet tests. |
 | `governance/triage.rs` | Parent of `governance/triage/`. The email pillar's triage execution machinery: the sandbox a run executes in, and the startup verification that proves its hook barrier is really in force. |
 | `governance/triage/sandbox.rs` | The sandbox a triage run executes in, and the startup check that its hook barrier holds. |
