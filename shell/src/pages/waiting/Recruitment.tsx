@@ -3,7 +3,7 @@ import { AGENT_CAPABILITIES, proposedCapabilities, sameCapabilities, type AgentE
 import type { Proposal } from "../../data/system";
 import { parseActionPayload, useHireRecruit } from "../../data/teams";
 import { useRejectProposal } from "../../data/waiting";
-import { Button, Callout, ConfirmButton, Field, RelativeTime, Row, Rows } from "../../ui";
+import { Button, Callout, ConfirmButton, Field, RelativeTime, Row, Rows, Select } from "../../ui";
 import type { Reading } from "./reading";
 import { DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
 import { DepartmentContext, hasDepartmentContext } from "./TeamActions";
@@ -209,15 +209,15 @@ function RecruitmentCard({
                   </Field>
                 </div>
                 <Field label="Engine">
-                  <select
-                    className="waiting-recruit-input-careful"
+                  <Select
+                    block
                     id={idFor("engine")}
                     aria-describedby={carefulId}
                     value={form.engine}
                     onChange={(event) => field("engine", event.target.value)}
                   >
                     <OptionsWith current={form.engine} known={RECRUIT_ENGINES} />
-                  </select>
+                  </Select>
                 </Field>
                 <Field label="Model">
                   <input

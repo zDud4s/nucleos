@@ -262,7 +262,6 @@
   gap: var(--space-2);
 }
 
-.learned-scope-chooser select,
 .learned-scope-chooser input {
   padding: var(--space-1) var(--space-2);
   border: 1px solid var(--border);
@@ -283,14 +282,12 @@
   opacity: 1;
 }
 
-.learned-scope-chooser select:focus-visible,
 .learned-scope-chooser input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) .learned-scope-chooser select,
   :root:not([data-theme="dark"]) .learned-scope-chooser input {
     color-scheme: light;
   }

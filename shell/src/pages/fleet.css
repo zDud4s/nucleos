@@ -33,8 +33,8 @@
   min-width: 0;
 }
 
-/* The shared field select, sized for a toolbar: `.ui-field select` asks for 14rem. */
-.fleet-bar .ui-field select {
+/* The shared select, sized for a toolbar: `.ui-field .ui-select` asks for 14rem. */
+.fleet-bar .ui-field .ui-select {
   min-width: 10rem;
 }
 

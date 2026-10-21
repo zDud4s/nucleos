@@ -18,7 +18,7 @@ import { DAEMON_NAME } from "../copy";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
 import { formatSpan } from "../lib/when";
-import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, TimeField } from "../ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, Select, TimeField } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
 /**
@@ -254,7 +254,7 @@ export function DraftEventForm({
         {repeats && (
           <label className="calendar-draft-inline">
             <span>every</span>
-            <select
+            <Select
               value={freq}
               aria-label="Repeat frequency"
               onChange={(event) => setFreq(event.target.value as "daily" | "weekly" | "monthly")}
@@ -262,7 +262,7 @@ export function DraftEventForm({
               <option value="daily">day</option>
               <option value="weekly">week</option>
               <option value="monthly">month</option>
-            </select>
+            </Select>
           </label>
         )}
       </div>

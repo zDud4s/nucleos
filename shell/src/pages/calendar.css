@@ -840,7 +840,6 @@
   ground the shared field uses for a place you type into.
 */
 .calendar-draft input:not([type="checkbox"]),
-.calendar-draft select,
 .calendar-move input {
   padding: 0.34rem var(--space-2);
   min-height: var(--hit-min);
@@ -858,7 +857,6 @@
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) .calendar-draft input:not([type="checkbox"]),
-  :root:not([data-theme="dark"]) .calendar-draft select,
   :root:not([data-theme="dark"]) .calendar-move input {
     color-scheme: light;
   }
@@ -866,7 +864,6 @@
 
 /* An explicit choice of the light theme wins over the system's preference. */
 :root[data-theme="light"] .calendar-draft input:not([type="checkbox"]),
-:root[data-theme="light"] .calendar-draft select,
 :root[data-theme="light"] .calendar-move input {
   color-scheme: light;
 }
@@ -883,7 +880,6 @@
 }
 
 .calendar-draft input:focus-visible,
-.calendar-draft select:focus-visible,
 .calendar-move input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;

@@ -21,7 +21,7 @@ import {
   useSetChannelNotifyPolicy,
   useSetNotifyPolicy,
 } from "../data/system";
-import { Button, Callout, ErrorNote, Panel, Quiet, RefusalNote, Section, Skeleton, Switch } from "../ui";
+import { Button, Callout, ErrorNote, Panel, Quiet, RefusalNote, Section, Select, Skeleton, Switch } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 
@@ -366,9 +366,9 @@ function ChannelScopeSelector({
       <label className="sy-notify-scope-label" htmlFor={selectId}>
         Channel
       </label>
-      <select
+      <Select
         id={selectId}
-        className="sy-notify-select"
+        density="sm"
         value={channel ?? ""}
         disabled={channels.isPending}
         onChange={(event) => onChannelChange(event.target.value === "" ? undefined : event.target.value)}
@@ -379,7 +379,7 @@ function ChannelScopeSelector({
             {c.id === primary ? `${c.label} (primary)` : c.label}
           </option>
         ))}
-      </select>
+      </Select>
       {channels.isError && <span className="sy-notify-scope-label">the channel list did not load</span>}
     </>
   );
@@ -604,8 +604,8 @@ function KindItem({
         />
       )}
       {inFamily ? (
-        <select
-          className="sy-notify-select"
+        <Select
+          density="sm"
           id={controlId}
           value={row.verdict}
           onChange={(event) => onKind(row.kind, event.target.value as KindVerdict)}
@@ -613,7 +613,7 @@ function KindItem({
           <option value="inherit">follows its family</option>
           <option value="always">always</option>
           <option value="never">never</option>
-        </select>
+        </Select>
       ) : (
         // A loose kind has no family to follow, so offering "follows its family"
         // would name a thing that does not exist. Spec §7.3 asks for a plain

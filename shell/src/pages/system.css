@@ -474,7 +474,7 @@
 
 /* `Field` gives its control a 14rem floor; two columns in a 16rem group are narrower than that. */
 .sy-budget-fields .ui-field input,
-.sy-budget-fields .ui-field select {
+.sy-budget-fields .ui-field .ui-select {
   min-width: 0;
   width: 100%;
 }
@@ -1121,30 +1121,10 @@ p.sy-notify-pop {
   font-size: var(--text-xs);
 }
 
-.sy-notify-select {
+/* Flex items: a select keeps its own width rather than shrinking beside the label or the switch. */
+.sy-notify-kind > .ui-select,
+.sy-notify-actions > .ui-select {
   flex: none;
-  max-width: 100%;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--text-xs);
-}
-
-.sy-notify-select:hover:not(:disabled) {
-  border-color: var(--border-strong);
-}
-
-.sy-notify-select:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
-.sy-notify-select:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 /* The scope picker's label, at the same label rank as every other field label. */

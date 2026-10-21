@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useAcceptLayers, useSetLayer, type Layering, type ProjectMap } from "../data/project-map";
 import { buildBands, isolate, ladder, maxLayer, type Band, type LayerBlock } from "./layers-model";
 import { DAEMON_NAME } from "../copy";
-import { Button } from "../ui";
+import { Button, Select } from "../ui";
 
 /**
  * The modules stacked by layer, highest first: what may import what, and which imports break it.
@@ -205,7 +205,8 @@ function BlockFiles({
       {block.files.map((path) => (
         <li key={path} className="flex items-center gap-2">
           <span>{path}</span>
-          <select
+          <Select
+            density="sm"
             aria-label={`Layer of ${path}`}
             value={String(layering.modules[path] ?? block.layer)}
             onChange={(event) => setLayer.mutate({ path, layer: Number(event.target.value) })}
@@ -215,7 +216,7 @@ function BlockFiles({
                 {layer}
               </option>
             ))}
-          </select>
+          </Select>
           {layering.overridden.includes(path) ? (
             <Button
               variant="quiet"

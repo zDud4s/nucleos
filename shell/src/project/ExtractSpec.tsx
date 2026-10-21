@@ -2,7 +2,7 @@
 import { useId, useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useExtractSpec, useProjectSpecs, type Brain } from "../data/project-map";
-import { Button, ErrorNote, Segmented } from "../ui";
+import { Button, ErrorNote, Segmented, Select } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -101,9 +101,10 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
         <label className="ws-read-label" htmlFor={pickId}>
           Read a spec
         </label>
-        <select
+        <Select
           id={pickId}
-          className="ws-read-pick"
+          density="sm"
+          mono
           value={chosen ?? ""}
           disabled={extract.isPending}
           onChange={(event) => setChosen(event.target.value === "" ? null : event.target.value)}
@@ -114,7 +115,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
               {slug}
             </option>
           ))}
-        </select>
+        </Select>
         <Segmented
           label="Which brain reads it"
           value={brain}

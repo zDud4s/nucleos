@@ -43,6 +43,7 @@ import {
   Quiet,
   RefusalNote,
   Section,
+  Select,
   Tip,
   Well,
 } from "../ui";
@@ -1720,7 +1721,7 @@ function DeclareRule({
             three together.
           */}
           <Field label="What this rule is about">
-            <select
+            <Select
               value={tool ?? ""}
               onChange={(event) => setTool(event.target.value === "" ? null : event.target.value)}
             >
@@ -1728,7 +1729,7 @@ function DeclareRule({
               <option value="Edit">Edit writing to a path</option>
               <option value="Write">Write writing to a path</option>
               <option value="NotebookEdit">NotebookEdit writing to a path</option>
-            </select>
+            </Select>
           </Field>
           {/*
             The label follows the choice, because with a tool selected this box holds a PATH and

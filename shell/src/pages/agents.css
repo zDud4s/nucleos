@@ -345,7 +345,6 @@
 
 /* Every control brings its own background — see the note on `.agents-name`. */
 .agents-field input,
-.agents-field select,
 .agents-field textarea {
   padding: var(--space-2);
   border: 1px solid var(--border);
@@ -374,7 +373,6 @@
 /* One of the app's four local rings, and it changes only the offset: at 2px a
    ring around a field inside a twelve-column grid touches its neighbour. */
 .agents-field input:focus-visible,
-.agents-field select:focus-visible,
 .agents-field textarea:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;

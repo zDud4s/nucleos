@@ -19,6 +19,7 @@ import {
   Quiet,
   RefusalNote,
   Rows,
+  Select,
 } from "../../ui";
 import { KnownRow } from "./KnownRow";
 import "./knowledge.css";
@@ -180,7 +181,9 @@ function RowDecisions({
   return (
     <>
       <span className="learned-scope-chooser" role="group" aria-label={`Scope for ${title}`}>
-        <select
+        <Select
+          density="sm"
+          mono
           aria-label="Approve into"
           value={kind}
           onChange={(event) => {
@@ -196,7 +199,7 @@ function RowDecisions({
               {scope}
             </option>
           ))}
-        </select>
+        </Select>
         {kind !== "" && (
           <input
             type="text"

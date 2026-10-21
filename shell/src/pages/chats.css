@@ -2627,8 +2627,7 @@
 }
 
 .chats-helper-field input,
-.chats-helper-field textarea,
-.chats-helper-field select {
+.chats-helper-field textarea {
   padding: var(--space-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -2644,7 +2643,7 @@
   min-height: 4.5rem;
 }
 
-.chats-helper-field :is(input, textarea, select):focus-visible {
+.chats-helper-field :is(input, textarea):focus-visible {
   border-color: var(--border-strong);
   outline: none;
 }

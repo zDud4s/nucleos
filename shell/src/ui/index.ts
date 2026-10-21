@@ -136,6 +136,7 @@ export { ListFilter } from "./ListFilter";
 export type { ListFilterProps, ListFilterChip } from "./ListFilter";
 
 export { Segmented, type SegmentedOption, type SegmentedProps } from "./Segmented";
+export { Select, type SelectProps } from "./Select";
 export { Switch, type SwitchProps } from "./Switch";
 export { Callout, type CalloutProps } from "./Callout";
 export { Drawer, type DrawerProps } from "./Drawer";

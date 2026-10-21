@@ -69,6 +69,7 @@ import {
   Segmented,
   Skeleton,
   StatCard,
+  Select,
   StateBadge,
   Switch,
   Table,
@@ -819,7 +820,7 @@ function BudgetPanel() {
                 />
               </Field>
               <Field label="Period">
-                <select
+                <Select
                   value={form.period}
                   onChange={(event) =>
                     setForm({
@@ -833,7 +834,7 @@ function BudgetPanel() {
                       {period}
                     </option>
                   ))}
-                </select>
+                </Select>
               </Field>
               <Field label="Hourly limit (USD)">
                 <input

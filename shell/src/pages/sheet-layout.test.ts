@@ -20,9 +20,9 @@ describe("two layout facts a stylesheet owns", () => {
     expect(feed).toContain(
       `${feedControlHeight}: calc(var(--text-sm) * var(--leading-normal) + 2 * var(--space-2) + 2px)`,
     );
-    expect(body(feed, /\.feed-filter input,\s*\.feed-filter select\s*\{([^}]*)\}/)).toMatch(
-      new RegExp(`height:\\s*var\\(${feedControlHeight}\\)`),
-    );
+    for (const control of [/\.feed-filter input\s*\{([^}]*)\}/, /\.feed-filter \.ui-select\s*\{([^}]*)\}/]) {
+      expect(body(feed, control)).toMatch(new RegExp(`height:\\s*var\\(${feedControlHeight}\\)`));
+    }
     expect(body(feed, /\.feed-filter-submit\s*>\s*button\s*\{([^}]*)\}/)).toMatch(
       new RegExp(`min-height:\\s*var\\(${feedControlHeight}\\)`),
     );

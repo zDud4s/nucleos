@@ -5,7 +5,7 @@ import {
   useSetDistillerModel,
   type DistillerModel as Choice,
 } from "../data/distiller";
-import { ErrorNote, Field, RefusalNote } from "../ui";
+import { ErrorNote, Field, RefusalNote, Select } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 const LABELS: Record<Choice, string> = {
@@ -35,9 +35,9 @@ export function DistillerModel() {
         label="Distiller model"
         helper="Read by the distiller on its next pass; a choice this machine cannot serve leaves the queue waiting rather than using the cloud."
       >
-        <select
+        <Select
           id="sy-distiller-model"
-          className="sy-pref-input"
+          block
           value={shown}
           disabled={set.isPending}
           onChange={(event) => set.mutate(event.target.value as Choice)}
@@ -47,7 +47,7 @@ export function DistillerModel() {
               {LABELS[model]}
             </option>
           ))}
-        </select>
+        </Select>
       </Field>
       {refusal ? (
         <RefusalNote refusal={refusal} />

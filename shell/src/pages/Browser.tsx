@@ -40,6 +40,7 @@ import {
   Row,
   Rows,
   Section,
+  Select,
   Skeleton,
   StateBadge,
 } from "../ui";
@@ -521,13 +522,13 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
             first project is selected until somebody chooses, so the choice has to be readable. */}
         <label className="browser-bar-project">
           <span>Project</span>
-          <select value={projectId ?? ""} onChange={(event) => setChosen(event.target.value)}>
+          <Select value={projectId ?? ""} onChange={(event) => setChosen(event.target.value)}>
             {options.map((option) => (
               <option key={option.project_id} value={option.project_id}>
                 {option.project_id}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
         <label className="browser-bar-field">
           <Globe aria-hidden="true" size={16} strokeWidth={1.75} />
@@ -643,8 +644,8 @@ function SiteGrants() {
   // on its own line at 20rem it was the widest thing in a panel that was usually empty.
   const picker =
     options.length > 0 ? (
-      <select
-        className="browser-head-select"
+      <Select
+        density="sm"
         aria-label="Project whose grants are shown"
         value={projectId ?? ""}
         onChange={(event) => {
@@ -661,7 +662,7 @@ function SiteGrants() {
             {project.project_id}
           </option>
         ))}
-      </select>
+      </Select>
     ) : undefined;
 
   return (

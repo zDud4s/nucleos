@@ -38,6 +38,7 @@ import {
   Field,
   Modal,
   RefusalNote,
+  Select,
   StateBadge,
 } from "../ui";
 
@@ -831,10 +832,10 @@ function Found({
         {found.harnesses.length === 0 && library.data !== undefined && library.data.length > 0 ? (
           <div className="np-fields">
             <Field label="Workflow">
-              <select
+              <Select
+                block
                 value={installing ?? ""}
                 onChange={(event) => setInstalling(event.target.value === "" ? null : event.target.value)}
-                className="w-full"
               >
                 {/* None is first and is a real answer: a project that develops however whoever is
                     at the keyboard decides is not a project missing something. */}
@@ -844,7 +845,7 @@ function Found({
                     {bundle.name} {bundle.version}
                   </option>
                 ))}
-              </select>
+              </Select>
             </Field>
           </div>
         ) : null}

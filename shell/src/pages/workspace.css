@@ -1218,17 +1218,10 @@ button.ws-lead-door:hover {
   color: var(--text);
 }
 
-.ws-read-pick {
+.ws-read > .ui-select {
   flex: 1 1 18rem;
   min-width: 0;
   max-width: 28rem;
-  padding: var(--space-1) var(--space-2);
-  border: 1px solid var(--border-field);
-  border-radius: var(--radius-md);
-  background: var(--surface);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
 }
 
 /* Lines waiting on the owner: one container, a hairline between rows, the spec as a heading. */
