@@ -1208,6 +1208,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             run_tails: Default::default(),
+            fleet: Default::default(),
             // No files folder: nothing on the wheel's path reads or writes one.
             files_root: None,
             files_trash: None,
