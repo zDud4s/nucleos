@@ -535,24 +535,48 @@ impl FleetHub {
 
     /// (Re)starts the OS watcher when the set of existing directories changed: a directory that
     /// did not exist at start-up (`~/.codex/sessions` on a fresh machine) gets watched once it does.
+    ///
+    /// Watching is recursive, so a path under another watched path is redundant (and would deliver
+    /// every event twice): only the topmost paths are watched, which keeps the set almost constant
+    /// when a `subagents/` directory appears under an already watched project. The new watcher is
+    /// started outside the state lock (the start can walk a whole tree) and swapped in; the old
+    /// one is released after.
     fn rewatch(&self) {
-        let desired: BTreeSet<PathBuf> = self
+        let existing: BTreeSet<PathBuf> = self
             .sources
             .iter()
             .flat_map(|source| source.watch_paths())
             .filter(|path| path.exists())
             .collect();
-        let mut state = self.state();
-        if state.watch.is_some() && state.watched == desired {
-            return;
-        }
-        let Some(tx) = state.dirty_tx.clone() else {
-            return;
+        let desired: BTreeSet<PathBuf> = existing
+            .iter()
+            .filter(|path| !path.ancestors().skip(1).any(|up| existing.contains(up)))
+            .cloned()
+            .collect();
+        let tx = {
+            let state = self.state();
+            if state.watch.is_some() && state.watched == desired {
+                return;
+            }
+            match state.dirty_tx.clone() {
+                Some(tx) => tx,
+                None => return,
+            }
         };
-        state.watch = None; // release the old one before creating the new one
         let paths: Vec<PathBuf> = desired.iter().cloned().collect();
-        state.watch = Some(self.watcher.start(&paths, tx));
-        state.watched = desired;
+        let fresh = self.watcher.start(&paths, tx.clone());
+        let old = {
+            let mut state = self.state();
+            if state.dirty_tx.as_ref().is_some_and(|now| now.same_channel(&tx)) {
+                state.watched = desired;
+                state.watch.replace(fresh)
+            } else {
+                // The hub stopped (or restarted) while the watcher started: it is not wanted.
+                drop(fresh);
+                None
+            }
+        };
+        drop(old);
     }
 
     fn spawn_loop(self: &Arc<Self>) -> (JoinHandle<()>, mpsc::UnboundedSender<PathBuf>) {
@@ -1030,6 +1054,36 @@ mod tests {
             "re-watched"
         );
         assert_eq!(h.watch.live(), 1, "and the old watcher was released");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_path_under_a_watched_one_is_not_watched_and_does_not_rebuild_the_watcher() {
+        let h = harness();
+        h.source.set(vec![root("a")]);
+        let under = h.dir.path().join("sub");
+        std::fs::create_dir(&under).unwrap();
+        h.source
+            .set_paths(vec![h.dir.path().to_path_buf(), under.clone()]);
+        let mut sub = h.hub.subscribe().await;
+        drain(&mut sub).await;
+        assert_eq!(
+            *h.watch.last_paths.lock().unwrap(),
+            vec![h.dir.path().to_path_buf()],
+            "the recursive ancestor covers the subdirectory"
+        );
+
+        let deeper = under.join("subagents");
+        std::fs::create_dir(&deeper).unwrap();
+        h.source
+            .set_paths(vec![h.dir.path().to_path_buf(), under, deeper.clone()]);
+        h.hub
+            .dirty_pass([deeper.join("new.jsonl")].into_iter().collect())
+            .await;
+        assert_eq!(
+            h.watch.started.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a new directory below a watched one changes nothing"
+        );
     }
 
     fn finished_nine_minutes_ago(h: &Harness) {

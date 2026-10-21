@@ -239,6 +239,8 @@ impl AgentSource for FakeSource {
 pub(crate) struct FakeWatch {
     pub(crate) live: Arc<AtomicUsize>,
     pub(crate) started: AtomicUsize,
+    /// The paths of the latest `start`.
+    pub(crate) last_paths: Mutex<Vec<PathBuf>>,
     tx: Mutex<Option<UnboundedSender<PathBuf>>>,
 }
 
@@ -255,6 +257,7 @@ impl FakeWatch {
         Arc::new(Self {
             live: Arc::new(AtomicUsize::new(0)),
             started: AtomicUsize::new(0),
+            last_paths: Mutex::new(Vec::new()),
             tx: Mutex::new(None),
         })
     }
@@ -269,7 +272,8 @@ impl FakeWatch {
 }
 
 impl WatchFactory for FakeWatch {
-    fn start(&self, _paths: &[PathBuf], tx: UnboundedSender<PathBuf>) -> WatchGuard {
+    fn start(&self, paths: &[PathBuf], tx: UnboundedSender<PathBuf>) -> WatchGuard {
+        *self.last_paths.lock().unwrap() = paths.to_vec();
         self.live.fetch_add(1, Ordering::SeqCst);
         self.started.fetch_add(1, Ordering::SeqCst);
         *self.tx.lock().unwrap() = Some(tx);
