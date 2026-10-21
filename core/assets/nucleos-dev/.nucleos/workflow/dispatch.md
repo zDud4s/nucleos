@@ -114,6 +114,7 @@ The work tree lives in the daemon, not in any session's context: MCP tools `mcp_
 - **The parent never reads a child's handoff file** unless the summary status is `blocked` or `failed`.
 - **Budget.** At ~80% of its budget (absolute ceiling 200k) a node stops, writes its handoff and closes with status `handoff`. The parent relaunches a fresh node from daemon state. A sub-orchestrator never rotates its own context; it is replaced.
 - **Ownership.** Siblings with overlapping `owned_paths` never run concurrently; the daemon refuses the second.
+- **Tree engine.** A task run as a tree keeps its manifest, budget, ownership checks and gate log in `<bundle_dir>/scripts/tree.py`; the cycle is in the `orchestrate` skill ("Large tasks: run a node tree") and only the controller calls it.
 - **Non-Claude tools.** A sub-orchestrator may be a daemon-launched session (`create_run`, `claude -p` / `codex exec`) given the same node packet.
 
 ## The phase skill, and the skill that is not one
@@ -158,7 +159,7 @@ The subprocess does not inherit the controller's session. Do not send bare instr
 
 Wrap each dispatcher command with a timeout (`timeout <N>s <cmd>` on POSIX shells, an equivalent wrapper elsewhere). Timeout exit (124 on POSIX `timeout`) is treated as a freeze: dispatch rescue, report to user, stop.
 
-**Synchronous-call invariant.** Dispatcher subprocesses MUST be launched synchronously (the controller blocks on stdout/stderr until the process exits or the timeout fires). NEVER use background-launch flags — e.g. Claude Code's `Bash` tool with `run_in_background: true`, shell `&`, `nohup`, `Start-Job`, `Start-Process` without `-Wait`. Background launches return immediately with metadata instead of the phase's actual output, breaking the Handoff check and the metric record (no exit code, no duration, no stdout to parse). If a phase is genuinely too long for the default timeout, raise `<phase>.timeout_seconds` in `<state_dir>/models.yaml`; do not work around it with background mode.
+**Synchronous-call invariant.** Dispatcher subprocesses MUST be launched synchronously (the controller blocks on stdout/stderr until the process exits or the timeout fires). NEVER use background-launch flags — e.g. Claude Code's `Bash` tool with `run_in_background: true`, shell `&`, `nohup`, `Start-Job`, `Start-Process` without `-Wait`. Background launches return immediately with metadata instead of the phase's actual output, breaking the Handoff check and the metric record (no exit code, no duration, no stdout to parse). If a phase is genuinely too long for the default timeout, raise `<phase>.timeout_seconds` in `<state_dir>/models.yaml`; do not work around it with background mode. The one exception is the branch orchestrators of a node tree in direct mode (see the `orchestrate` skill, "Large tasks: run a node tree"): they may be launched together in the background, the controller waits for their notifications, and nothing else is launched that way.
 
 **Mode: inline.** Run the phase logic in the current session. Assemble the same full prompt you would send to a subprocess, then follow it directly. If `mode: inline` is set explicitly and the resolved session model (the running model) differs from `phase.model`, warn first:
 

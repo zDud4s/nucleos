@@ -23,7 +23,8 @@ packet, `project.yaml`, and a memory slice. This file fixes the walls of the coc
 - `mcp__nucleos__verify` and `mcp__nucleos__verify_status` are listed so the wall does not
   change with the speed table, but they are usable **only when `nodes.subtree_verify` is true**,
   and then only scoped to your branch. When it is false, never call them: the root controller
-  runs the one final verification.
+  runs the one final verification. In a tree driven by `tree.py` they are never usable, whatever
+  `subtree_verify` says: only the controller gates a branch.
 
 You have no `Edit` and no `Bash` on purpose. An orchestrator that patches a file or runs a build
 has stopped orchestrating and started executing, unmeasured and unreviewed. **You run no

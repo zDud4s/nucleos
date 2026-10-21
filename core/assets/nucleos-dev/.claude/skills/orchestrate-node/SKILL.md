@@ -1,6 +1,6 @@
 ---
 name: orchestrate-node
-description: Use when you are a node controller of a node tree — dispatched through the `wf-orchestrator` cockpit with a node packet (`packets/node.md`) as a non-leaf node, or the root controller deciding to decompose a task that will not fit one leaf budget.
+description: Use when you are a node controller of a node tree — dispatched through the `wf-orchestrator` cockpit with a node packet (`packets/node.md`) as a non-leaf node, or the root controller deciding to decompose a task that will not fit one leaf budget; also when a leaf or orchestrator of a tree driven by `tree.py` has to write its report.
 ---
 
 # Orchestrate node
@@ -49,10 +49,40 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
 ## Boundaries
 
 - Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-executor`, `wf-reviewer`.
-- No build, test or verify run. The one exception: `subtree_verify` true, then a
-  branch-scoped `mcp__nucleos__verify` for your own branch. Otherwise the root controller's
-  single final verification is the only one.
+- No build, test or verify run. In a tree driven by `tree.py` that is absolute: `subtree_verify` is
+  ignored and only the controller gates. Outside a tree, with `subtree_verify` true, a branch-scoped
+  `mcp__nucleos__verify` for your own branch is allowed; otherwise the root controller's single
+  final verification is the only one.
 - No edits to source. A part that needs editing is a leaf for `wf-executor`.
+
+## In a tree (`tree.py`)
+
+When your prompt came from `tree.py prompt`, its rules block and these rules both bind you. The
+prompt block is the single source; if they differ, the prompt wins.
+
+- **Your report is your handoff.** Write `<state_dir>/nodes/<root_id>/<node_id>.md` (a reviewer
+  without `Write` returns the same text as its final message; the controller stores it). Use
+  `packets/handoff.md` and fill the header lines the controller reads: `Role:`
+  (`leaf|orchestrator|review`), `Outcome:` (`done|split|contract_request|blocked|failed`) and
+  `Contract used:` (ids from `contract.md`, or `none`). `Status:` must agree with `Outcome`
+  (`done|split` = done, `contract_request|blocked` = blocked, `failed` = failed). At most 60 lines.
+  An invalid report costs one retry, a second one fails the node.
+- **A gap in the contract is a request, not a decision.** Stop, fill `## Contract request` with what
+  is missing and the options, and close with `Outcome: contract_request`. Use only contract ids
+  that exist in the file.
+- **Contained paths.** Every child's `owned_paths` sit inside yours; the daemon refuses a child
+  outside them, including when yours are empty. If the split needs a path outside yours, it is not
+  a split: send a `contract_request`.
+- **Ownership is by file.** Globs, never line ranges (ranges are reading hints only). Live leaves
+  own disjoint files; a file two pieces need goes to one piece, or to two successive waves. A new
+  file belongs to the piece that declares it.
+- **Only leaves edit, and only in their own files.** An orchestrator that touches a file is reverted
+  and its node fails.
+- **No cargo, no commit, no merge, no stash, no push.** List the exact commands you would have run
+  under `## Commands for the root`; the controller runs them. The controller commits for you.
+- **Partition by report.** If your prompt says you do not launch children, return `Outcome: split`
+  with each child's piece (goal, files, line hints, contract sections, budget) in `## What was done`
+  and open no node.
 
 ## Red flags
 
@@ -65,4 +95,9 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
 | "I'll record the decisions in the handoff at the end" | Write through `node_update` as you decide; a node that dies before the end leaves no decisions. |
 | "I'll read the child's handoff to be safe" | Read it only if the child closed `blocked` or `failed`; reading every handoff rebuilds the child's context in yours. |
 | "I have budget left, one more child" | At about 80% of the budget you write the handoff and close `handoff`; the ceiling is a wall, not a target. |
-| "I'll run the tests to check my branch" | Only the root verifies, or you when `subtree_verify` is true; a second test run is unmeasured and slows the tree. |
+| "I'll run the tests to check my branch" | Only the controller verifies; outside a tree, you only when `subtree_verify` is true; a second test run is unmeasured and slows the tree. |
+| "The contract is silent, so I'll pick the signature and note it" | Only the controller writes the contract; a silent choice splits siblings onto different interfaces. Close `contract_request` with the options. |
+| "My child needs one file outside my paths, close enough" | The daemon refuses a child outside your `owned_paths`; widen nothing, send a `contract_request` or merge the pieces. |
+| "I own lines 40-90 of that file, my sibling the rest" | Ownership is by file in a tree; ranges are reading hints. Give the file to one piece or run the two in successive waves. |
+| "`subtree_verify` is true, so I'll verify my branch" | In a tree only the controller gates; `tree.py gate` is the record, and a second run is unmeasured. |
+| "I'll commit so my work isn't lost" | You never commit, merge or stash; the controller makes the WIP commit after `record`. A commit in a leaf's worktree is a foreign write. |
