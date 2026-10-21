@@ -170,9 +170,7 @@ function job(overrides: Partial<Job> = {}): Job {
     id: 41,
     project_id: "alpha",
     rule_name: null,
-    status: "running",
-    node: null,
-    bundle: null,
+    status: "implementing",
     wait_reason: null,
     max_items: 4,
     created_at: "2026-08-17T09:00:00Z",
@@ -972,7 +970,7 @@ describe("Fleet — the slot rack", () => {
     expect(quiet.textContent).toContain("1 of 2 slots held (awaiting reconciliation), room for 1");
     expect(entryOf(rack, "delta").textContent).toContain("0 of 2 slots held, room for 2");
     expect(entryOf(rack, "busy").textContent).toContain(
-      "3 of 3 slots held (running, running, running)",
+      "3 of 3 slots held (implementing, implementing, implementing)",
     );
     expect(entryOf(rack, "busy").textContent).not.toContain("room for");
     // The link's own name is the project, and nothing else.
@@ -1003,7 +1001,7 @@ describe("Fleet — the slot rack", () => {
 
     expect(pipsOf(alpha)).toEqual(["active", "active", "active"]);
     expect(within(alpha).getByText("3/12").className).toBe("ui-pips-count");
-    expect(alpha.textContent).toContain("3 of 12 slots held (running, running, running), room for 9");
+    expect(alpha.textContent).toContain("3 of 12 slots held (implementing, implementing, implementing), room for 9");
   });
 
   it("offers New job wherever there is room, busy or idle, and opens the header's panel aimed at it", async () => {
