@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::fleet::model::{TermKind, TermLine, Timestamp, TranscriptEntry, collapse_ws};
 use crate::fleet::source::Usage;
+use crate::governance::redact::redact_secrets;
 
 /// Longest `detail` (chars) an entry carries; a tool input or result past this is cut.
 const DETAIL_CHARS: usize = 16 * 1024;
@@ -83,9 +84,12 @@ fn timestamp_of(rec: &Value) -> Option<Timestamp> {
         .map(|t| t.with_timezone(&Utc))
 }
 
+/// Redacts, then cuts: a secret (or a PEM block, whose END line the cut would drop) straddling the
+/// cut must not survive half-redacted (amendment 18). The hub redacts again as a backstop.
 fn cut(text: &str, max: usize) -> String {
+    let text = redact_secrets(text);
     if text.chars().count() <= max {
-        return text.to_owned();
+        return text;
     }
     let mut out: String = text.chars().take(max).collect();
     out.push('…');
@@ -338,6 +342,16 @@ mod tests {
     use crate::fleet::claude_code::fixture as fx;
     use crate::fleet::limits;
     use serde_json::json;
+
+    #[test]
+    fn a_secret_straddling_the_detail_cut_is_redacted_whole() {
+        let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4).get(..36).unwrap());
+        let raw = format!("{} {token} tail", "a".repeat(DETAIL_CHARS - 10));
+        let detail = cut(&raw, DETAIL_CHARS);
+        assert!(!detail.contains("ghp_"), "{detail}");
+        assert!(!detail.contains(&token[4..14]), "{detail}");
+        assert!(detail.starts_with("aaaa"));
+    }
 
     fn kinds(line: &str) -> Vec<(TermKind, String)> {
         parse_line(line)

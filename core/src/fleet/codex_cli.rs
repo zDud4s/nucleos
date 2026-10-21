@@ -17,6 +17,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use serde_json::Value;
 
+use crate::governance::redact::redact_secrets;
+
 use super::limits;
 use super::model::{
     Cursor, NodeKey, NodeState, TermKind, TermLine, Timestamp, TranscriptEntry, TranscriptPage,
@@ -72,10 +74,13 @@ impl Mapped {
     }
 }
 
-/// At most `max` chars, with a trailing `…` when something was cut.
+/// Redacted, then at most `max` chars, with a trailing `…` when something was cut: a secret
+/// straddling the cut must not survive half-redacted (amendment 18). The hub redacts again as a
+/// backstop.
 fn cap_chars(text: &str, max: usize) -> String {
+    let text = redact_secrets(text);
     if text.chars().count() <= max {
-        return text.to_owned();
+        return text;
     }
     let mut cut: String = text.chars().take(max).collect();
     cut.push('…');
@@ -947,6 +952,16 @@ mod tests {
             json!({"type": "function_call_output", "output": {"a": 1}}),
         );
         assert_eq!(mapped(&odd)[0].text, "0 lines");
+    }
+
+    #[test]
+    fn a_secret_straddling_the_detail_cut_is_redacted_whole() {
+        let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4).get(..36).unwrap());
+        let raw = format!("{} {token} tail", "a".repeat(DETAIL_CHARS - 10));
+        let detail = cap_chars(&raw, DETAIL_CHARS);
+        assert!(!detail.contains("ghp_"), "{detail}");
+        assert!(!detail.contains(&token[4..14]), "{detail}");
+        assert!(detail.starts_with("aaaa"));
     }
 
     #[test]
