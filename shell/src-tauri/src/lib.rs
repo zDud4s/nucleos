@@ -1,6 +1,10 @@
 //! §spec agenticos-foundation-and-autopilot
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+/// The integrated browser: owner tabs as child webviews of the main window.
+mod browser;
+/// Pure helpers for the agent browser environment.
+mod browser_agent;
 pub mod daemon;
 /// The OS calls that carry those decisions out, and nothing else. Holds no rules.
 pub mod dictation;
@@ -125,6 +129,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(dictation::Dictation::default())
         .manage(drop::Allowed::default())
+        .manage(browser::Browser::default())
         .setup(|app| {
             // Release bundles start the daemon that ships beside the shell, if none answers.
             daemon::ensure_running();
@@ -267,6 +272,15 @@ pub fn run() {
             notch::notch_fit,
             notch::notch_mode,
             notch::notch_set_mode,
+            browser::browser_env_ensure,
+            browser::browser_tab_create,
+            browser::browser_tab_navigate,
+            browser::browser_tab_back,
+            browser::browser_tab_forward,
+            browser::browser_tab_reload,
+            browser::browser_tab_stop,
+            browser::browser_tabs_show,
+            browser::browser_tab_close,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

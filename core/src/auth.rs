@@ -1421,6 +1421,12 @@ mod tests {
             .route("/browser/readonly", post(|| async {}))
             .route("/browser/sites/{project_id}", get(|| async {}))
             .route("/browser/writes/{project_id}", get(|| async {}))
+            .route("/browser/embedded/prepare", post(|| async {}))
+            .route("/browser/embedded/register", post(|| async {}))
+            .route("/browser/embedded/requests", get(|| async {}))
+            .route("/browser/embedded/requests/{id}/ack", post(|| async {}))
+            .route("/browser/embedded/sessions/{id}/closed", post(|| async {}))
+            .route("/browser/embedded/sessions/{id}/owner", post(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -2578,6 +2584,14 @@ mod tests {
             // accounts on, and this says which forms their own identity was used to submit.
             ("POST", "/browser/readonly"),
             ("GET", "/browser/writes/demo"),
+            // The shell's embedded browser: the control token alone registers a CDP address or
+            // acks a webview, whatever the key's level.
+            ("POST", "/browser/embedded/prepare"),
+            ("POST", "/browser/embedded/register"),
+            ("GET", "/browser/embedded/requests"),
+            ("POST", "/browser/embedded/requests/er-1/ack"),
+            ("POST", "/browser/embedded/sessions/s1/closed"),
+            ("POST", "/browser/embedded/sessions/s1/owner"),
         ] {
             assert_eq!(
                 status_of(&app, method, uri, &token).await,
@@ -2760,6 +2774,8 @@ mod tests {
             ("POST", "/web/read"),
             ("POST", "/web/search"),
             ("POST", "/browser/open"),
+            ("POST", "/browser/embedded/register"),
+            ("GET", "/browser/embedded/requests"),
             ("DELETE", "/files"),
             ("GET", "/files/trash"),
             ("POST", "/files/restore"),
@@ -4439,6 +4455,12 @@ mod tests {
             .route("/browser/sites/{project_id}", get(|| async {}))
             .route("/browser/writes/{project_id}", get(|| async {}))
             .route("/browser/sessions/{id}/live", get(|| async {}))
+            .route("/browser/embedded/prepare", post(|| async {}))
+            .route("/browser/embedded/register", post(|| async {}))
+            .route("/browser/embedded/requests", get(|| async {}))
+            .route("/browser/embedded/requests/{id}/ack", post(|| async {}))
+            .route("/browser/embedded/sessions/{id}/closed", post(|| async {}))
+            .route("/browser/embedded/sessions/{id}/owner", post(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -4607,10 +4629,24 @@ mod tests {
                 "{route} is the human's control and stays closed to a chat key"
             );
         }
+        for route in [
+            "/browser/embedded/prepare",
+            "/browser/embedded/register",
+            "/browser/embedded/requests/er-1/ack",
+            "/browser/embedded/sessions/s1/closed",
+            "/browser/embedded/sessions/s1/owner",
+        ] {
+            assert_eq!(
+                post_body_status(&app, route, &key, "{}").await.0,
+                StatusCode::FORBIDDEN,
+                "{route} is the shell's and stays closed to a chat key"
+            );
+        }
         for uri in [
             "/browser/sessions".to_string(),
             "/browser/sites/acme".to_string(),
             "/browser/writes/acme".to_string(),
+            "/browser/embedded/requests".to_string(),
             format!("/browser/sessions/{session}/live"),
         ] {
             assert_eq!(

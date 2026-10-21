@@ -1,0 +1,168 @@
+/* The integrated browser page: tab strip, toolbar, and the placeholder the native webview covers. */
+
+.browser-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  gap: var(--space-2);
+}
+
+.browser-bar,
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.browser-project {
+  font-size: var(--text-sm);
+}
+
+.browser-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.browser-tab {
+  display: flex;
+  align-items: center;
+  max-width: 14rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.browser-tab[data-active="true"] {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.browser-tab-title {
+  min-width: 0;
+  overflow: hidden;
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.browser-omnibox {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.browser-omnibox input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-1) 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.browser-padlock {
+  color: var(--text-faint);
+}
+
+.browser-crashed {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+/* An agent-driven tab: the info tone (never `--accent`, which is the brand colour). */
+.browser-tab[data-role="agent"] {
+  border-color: var(--tone-info-border);
+  outline: 1px solid var(--tone-info-border);
+  outline-offset: -1px;
+}
+
+.browser-tab-badge {
+  flex: none;
+  margin-left: var(--space-2);
+  color: var(--tone-info-fg);
+}
+
+.browser-agent-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--tone-info-border);
+  border-radius: var(--radius-sm);
+  background: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+  font-size: var(--text-sm);
+}
+
+.browser-agent-bar {
+  flex-wrap: wrap;
+}
+
+.browser-agent-hosts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono, monospace);
+}
+
+/* The focus intent from the agent: draw the eye to "Take control" for a moment. */
+.browser-agent-bar button[data-highlight="true"] {
+  outline: 2px solid var(--tone-info-fg);
+  outline-offset: 2px;
+}
+
+.browser-agent-notice {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-sm);
+}
+
+.browser-content {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.browser-placeholder {
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.browser-empty,
+.browser-message {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  height: 100%;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: center;
+}

@@ -35,7 +35,7 @@ import (
 func (d *Driver) Act(ctx context.Context, id browser.SessionID, action browser.Action) (browser.ActResult, error) {
 	d.gate.RLock()
 	defer d.gate.RUnlock()
-	entry, lookupErr := d.lookup(id)
+	entry, lookupErr := d.lookupAttached(id)
 	if lookupErr != nil {
 		return browser.ActResult{}, lookupErr
 	}

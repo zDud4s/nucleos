@@ -310,6 +310,28 @@ describe("Browser - driving a session from the shell", () => {
     await waitFor(() => expect(postsTo(world, "/browser/sessions/5/window")).toHaveLength(1));
   });
 
+  it("on Windows shows no sessions list and no Open real window, but keeps the bar and site grants", async () => {
+    const ua = vi
+      .spyOn(navigator, "userAgent", "get")
+      .mockReturnValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+    try {
+      const world = browserWorld({
+        sessions: [session({ id: 5, mode: "human", seat: "shell" })],
+      });
+      daemon.apiFetch.mockImplementation(browserFetch(world));
+      daemon.openStream.mockImplementation(async () => new ReadableStream<Uint8Array>());
+
+      await renderBrowser();
+
+      expect(await screen.findByText("Site grants")).toBeDefined();
+      expect(screen.queryByRole("button", { name: "Open real window" })).toBeNull();
+      expect(screen.queryByText("Live sessions")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Give back to the agent" })).toBeNull();
+    } finally {
+      ua.mockRestore();
+    }
+  });
+
   it("offers Drive here on a shell seat whose nonce was lost, and never otherwise", async () => {
     const world = browserWorld({
       sessions: [

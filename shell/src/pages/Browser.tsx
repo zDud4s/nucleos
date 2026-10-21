@@ -23,6 +23,7 @@ import {
   type Written,
 } from "../data/browser";
 import { useSeatNonce } from "../data/seat";
+import { isWindows } from "../lib/platform";
 import { useProjects } from "../data/system";
 import { LiveView } from "./LiveView";
 import {
@@ -71,6 +72,8 @@ import "./browser.css";
 export function Browser({ embedded = false }: { embedded?: boolean } = {}) {
   const sessions = useBrowserSessions();
   const health = useBrowserHealth();
+  // On Windows the embedded browser replaces the sessions list and "Open real window".
+  const windows = isWindows();
   const [chainDialogue, setChainDialogue] = useState<{ sessionId: number; chain: string[] } | null>(null);
 
   // The bar leads, as the archive's does: opening a window is what this tab is opened for, and an
@@ -88,10 +91,12 @@ export function Browser({ embedded = false }: { embedded?: boolean } = {}) {
         />
       )}
 
-      <LiveSessions
-        view={sessions}
-        onReturned={(sessionId, chain) => setChainDialogue({ sessionId, chain })}
-      />
+      {!windows && (
+        <LiveSessions
+          view={sessions}
+          onReturned={(sessionId, chain) => setChainDialogue({ sessionId, chain })}
+        />
+      )}
 
       <SiteGrants />
     </>

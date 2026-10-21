@@ -61,6 +61,17 @@ type Fake struct {
 	Handed    []SessionID
 	Forgotten []profile.Ref
 
+	// Embedded attach mode (embedded.go): what PrepareEmbedded, AttachEmbedded and ForgetEmbedded saw.
+	Prepared          []PrepareRequest
+	Attached          []AttachRequest
+	EmbeddedForgotten []string
+	// EmbeddedDetached and EmbeddedReattached are the session ids DetachEmbedded and ReattachEmbedded saw.
+	EmbeddedDetached   []SessionID
+	EmbeddedReattached []SessionID
+	// EmbeddedErr, if set, is what all three embedded methods fail with.
+	EmbeddedErr   error
+	EmbeddedChain []string // what ReattachEmbedded answers
+
 	sessions map[SessionID]Session
 	counter  int
 	// human is the session a person is driving, if any. The Fake keeps it for the same reason the

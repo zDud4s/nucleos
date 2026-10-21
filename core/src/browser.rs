@@ -23,6 +23,9 @@
 //! document — nothing ran — and this module reopens the same request in a throwaway. That is spec
 //! §5.4's "the url is handed to an ephemeral session", and it is a downgrade rather than a failure.
 
+pub mod embedded;
+mod embedded_close;
+pub mod embedded_owner;
 pub mod live;
 pub mod panel;
 pub mod seat;
@@ -39,6 +42,7 @@ use crate::browser_policy::{self, Outcome, Profile, Requester, Surface};
 use crate::state::AppState;
 
 mod handlers;
+mod route_embedded;
 
 pub use self::handlers::*;
 
@@ -53,6 +57,10 @@ pub struct BrowserRuntime {
     pub modes: crate::browser::live::ModeChannels,
     /// Who holds the person's seat in each session, kept in memory only (spec browser-volante §4.3).
     pub seats: crate::browser::seat::SeatState,
+    /// The shell's embedded browser registrations and queued requests (phase 2, Windows).
+    pub embedded: embedded::Registry,
+    /// Test override: pretend the platform supports embedding. See `embedded_supported`.
+    pub embedded_forced: std::sync::atomic::AtomicBool,
 }
 
 impl BrowserRuntime {
@@ -68,6 +76,8 @@ impl BrowserRuntime {
             client: BrowserClient::new(crate::sidecar::BROWSER_ADDR, String::new()),
             modes: Default::default(),
             seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
         }
     }
 }
@@ -559,6 +569,17 @@ pub async fn open_with(
         .map_err(|error| BrowserError::Failed(error.to_string()))?;
     let placement = placement_for(profile, project_id, run_id, row_id, &sites);
 
+    // The shell's own browser, when it is registered for this project. Only for the project profile
+    // (the embedded one IS that profile) and never for a visible window; otherwise, or when the
+    // shell does not attach in time, the headless path below runs unchanged.
+    if !visible
+        && profile == Profile::Project
+        && let Some(row) =
+            route_embedded::try_open(pool, runtime, row_id, ask, &sites, &placement).await
+    {
+        return Ok(Opened::Session(Box::new(row)));
+    }
+
     let opened = if visible {
         runtime.client.open_visible(url, &placement).await
     } else {
@@ -731,6 +752,19 @@ async fn insert_session(
 /// profile back, and it should not have to. The núcleo decided where this runs, so the núcleo is
 /// what records it — a sidecar that answered with a different profile than the one it was sent would
 /// be a sidecar to stop trusting, not a source to read from.
+/// The placement of a project's profile as the sidecar must see it: the project's site grants,
+/// read and write together. The embedded `prepare` and the embedded `attach` both use this one
+/// value, which is what lets the sidecar's proxy and the attach agree (it answers 409 otherwise).
+pub async fn project_placement(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> Result<Placement, BrowserError> {
+    let sites = admitted_origins(pool, project_id)
+        .await
+        .map_err(|error| BrowserError::Failed(error.to_string()))?;
+    Ok(placement_for(Profile::Project, project_id, None, 0, &sites))
+}
+
 async fn finish_session(
     pool: &SqlitePool,
     row_id: i64,
@@ -1098,6 +1132,15 @@ pub async fn close_with_reason(
     if row.closed_at.is_some() {
         return Ok(false);
     }
+    // An embedded session is closed by the shell, on a queued request; the row closes here as usual.
+    if route_embedded::queue_close(runtime, &row.sidecar_id) {
+        // The shell closes the tab, but the sidecar's pool slot is ours to free.
+        embedded_close::release_sidecar_slot(&runtime.client, &row.sidecar_id).await;
+        close_row(pool, id, reason, now)
+            .await
+            .map_err(|error| BrowserError::Failed(error.to_string()))?;
+        return Ok(true);
+    }
     // The sidecar first, and its failure is not fatal here. A session it has already forgotten —
     // because it restarted — must still be closed in this table, or it stays open for ever.
     let sidecar = runtime.client.close(&row.sidecar_id).await;
@@ -1201,6 +1244,8 @@ mod tests {
                 client: BrowserClient::new(&address.to_string(), "tok".into()),
                 modes: Default::default(),
                 seats: Default::default(),
+                embedded: Default::default(),
+                embedded_forced: Default::default(),
             },
             seen,
         )
@@ -2372,6 +2417,8 @@ mod tests {
             client: BrowserClient::new("127.0.0.1:1", "tok".into()),
             modes: Default::default(),
             seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
         };
         let _ = close(&db.pool, &gone, row.id, "2026-08-16T11:00:00Z").await;
         let after = session_row(&db.pool, row.id)
@@ -2560,6 +2607,519 @@ mod tests {
             .count();
         assert_eq!(listed, 1);
         assert_eq!(count_wheel_requests(&db.pool).await.unwrap(), listed);
+        db.close().await;
+    }
+
+    /// Embedding forced on but no shell registered for the project: the open goes headless, exactly
+    /// as before, and nothing is queued for a shell that is not there.
+    #[tokio::test]
+    async fn an_open_without_a_registration_stays_headless_even_where_embedding_is_supported() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_sidecar("https://news.example.net/").await;
+        runtime.force_embedded(true);
+        assert!(runtime.embedded_supported());
+        assert!(!runtime.embedded.has_live("acme"));
+        let ask = Ask {
+            project_id: "acme",
+            run_id: None,
+            url: "https://news.example.net/",
+            surface: Surface::Assistant,
+            requester: Requester::Owner,
+            now: NOW,
+        };
+        let opened = open(&db.pool, &runtime, ask).await.expect("opens");
+        assert!(matches!(opened, Opened::Session(_)), "{opened:?}");
+        assert_eq!(placements(&seen).len(), 1, "the sidecar's /open was used");
+        db.close().await;
+    }
+
+    /// A sidecar that serves the embedded verbs and records every body it was sent.
+    async fn stub_embedded_sidecar(
+        final_url: &'static str,
+    ) -> (
+        BrowserRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use axum::extract::Path;
+        use axum::response::IntoResponse as _;
+        use axum::routing::post;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let plain_recorder = seen.clone();
+        let app = axum::Router::new()
+            // The verbs outside `/embedded` (`close`, `snapshot`, `act`, ...) are only recorded: a
+            // test asserts that the núcleo did or did not call them.
+            .route(
+                "/{verb}",
+                post(
+                    move |Path(verb): Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let recorder = plain_recorder.clone();
+                        async move {
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::json!({"verb": verb, "body": body}));
+                            axum::http::StatusCode::NO_CONTENT.into_response()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/embedded/{verb}",
+                post(
+                    move |Path(verb): Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let recorder = recorder.clone();
+                        async move {
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::json!({"verb": verb, "body": body}));
+                            if verb == "attach" {
+                                return axum::Json(serde_json::json!({
+                                    "id": "e1",
+                                    "mode": "agent",
+                                    "requested_url": body["url"],
+                                    "final_url": final_url,
+                                    "title": "Landed",
+                                }))
+                                .into_response();
+                            }
+                            axum::Json(serde_json::json!({ "proxy_addr": "127.0.0.1:9911" }))
+                                .into_response()
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let runtime = BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&address.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
+        };
+        (runtime, seen)
+    }
+
+    /// Plays the shell: waits for the queued `open` and acks it with a nonce.
+    async fn shell_acks_the_open(runtime: &BrowserRuntime) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let request = loop {
+            if let Some(request) = runtime.embedded.poll().pop() {
+                break request;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no embedded open was queued for the shell"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        runtime.embedded.ack(&request.request_id, "n0nce").await;
+    }
+
+    fn embedded_ask(url: &str) -> Ask<'_> {
+        Ask {
+            project_id: "acme",
+            run_id: None,
+            url,
+            surface: Surface::Assistant,
+            requester: Requester::Owner,
+            now: NOW,
+        }
+    }
+
+    /// Prepare and attach use one placement, and it is the project's real one: the granted origins,
+    /// not an empty ephemeral list. The session row gets the sidecar's final url.
+    #[tokio::test]
+    async fn an_embedded_open_records_the_session_and_attaches_with_the_prepare_placement() {
+        let db = TempDb::new().await;
+        sqlx::query(
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
+             VALUES ('acme', 'https://jira.example.org', 'destination', ?, 0)",
+        )
+        .bind(NOW)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (runtime, seen) = stub_embedded_sidecar("https://jira.example.org/browse").await;
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+
+        let prepare_placement = project_placement(&db.pool, "acme").await.unwrap();
+        assert_eq!(prepare_placement.origins, vec!["https://jira.example.org"]);
+        runtime
+            .client
+            .embedded_prepare("acme", &prepare_placement)
+            .await
+            .unwrap();
+
+        let url = "https://jira.example.org/";
+        let (opened, ()) = tokio::join!(
+            open(&db.pool, &runtime, embedded_ask(url)),
+            shell_acks_the_open(&runtime)
+        );
+        let Opened::Session(row) = opened.expect("opens") else {
+            panic!("expected a session");
+        };
+        assert_eq!(row.sidecar_id, "e1");
+        assert_eq!(row.final_url, "https://jira.example.org/browse");
+        assert!(runtime.embedded.is_embedded("e1"));
+
+        let calls = seen.lock().unwrap().clone();
+        let verbs: Vec<_> = calls.iter().map(|c| c["verb"].as_str().unwrap()).collect();
+        assert_eq!(verbs, ["prepare", "attach"]);
+        assert_eq!(calls[0]["body"]["placement"], calls[1]["body"]["placement"]);
+        db.close().await;
+    }
+
+    /// Closing an embedded session queues a `close` for the shell and frees the sidecar's slot.
+    #[tokio::test]
+    async fn closing_an_embedded_session_queues_a_close_request() {
+        let db = TempDb::new().await;
+        sqlx::query(
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
+             VALUES ('acme', 'https://news.example.net', 'destination', ?, 0)",
+        )
+        .bind(NOW)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+        let url = "https://news.example.net/";
+        let (opened, ()) = tokio::join!(
+            open(&db.pool, &runtime, embedded_ask(url)),
+            shell_acks_the_open(&runtime)
+        );
+        let Opened::Session(row) = opened.expect("opens") else {
+            panic!("expected a session");
+        };
+        seen.lock().unwrap().clear();
+
+        assert!(close(&db.pool, &runtime, row.id, NOW).await.unwrap());
+        let queued = runtime.embedded.poll();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].session_id.as_deref(), Some("e1"));
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|call| call["verb"].clone())
+                .collect::<Vec<_>>(),
+            vec![serde_json::json!("close")],
+            "the sidecar was asked to free the slot"
+        );
+        db.close().await;
+    }
+
+    fn close_calls(seen: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["verb"] == "close")
+            .count()
+    }
+
+    async fn closed_reason(db: &TempDb, id: i64) -> Option<String> {
+        sqlx::query_scalar("SELECT closed_reason FROM browser_sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// The sidecar pool holds three sessions: more open/close cycles than that only work when every
+    /// close frees the slot, so each cycle must reach the sidecar and close its row.
+    #[tokio::test]
+    async fn embedded_open_close_cycles_free_the_sidecar_slot_every_time() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let first = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let mut ids = vec![first.id];
+        for _ in 0..4 {
+            assert!(
+                close(&db.pool, &runtime, *ids.last().unwrap(), NOW)
+                    .await
+                    .unwrap()
+            );
+            runtime.embedded.poll();
+            let (opened, ()) = tokio::join!(
+                open(
+                    &db.pool,
+                    &runtime,
+                    embedded_ask("https://news.example.net/")
+                ),
+                shell_acks_the_open(&runtime)
+            );
+            let Opened::Session(row) = opened.expect("opens") else {
+                panic!("expected a session");
+            };
+            ids.push(row.id);
+        }
+        assert!(
+            close(&db.pool, &runtime, *ids.last().unwrap(), NOW)
+                .await
+                .unwrap()
+        );
+        assert_eq!(ids.len(), 5);
+        assert_eq!(
+            close_calls(&seen),
+            5,
+            "the sidecar closed one session per cycle"
+        );
+        for id in ids {
+            assert!(
+                session_row(&db.pool, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .closed_at
+                    .is_some()
+            );
+        }
+        db.close().await;
+    }
+
+    /// The shell reports the tab gone: the row closes as `tab-closed` and the sidecar slot is freed,
+    /// once; a second report finds nothing left to do.
+    #[tokio::test]
+    async fn a_tab_the_shell_reports_closed_closes_the_row_and_the_sidecar_session() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let row = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+        seen.lock().unwrap().clear();
+
+        for _ in 0..2 {
+            let response =
+                embedded::post_closed(State(state.clone()), Path("e1".to_string())).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+        assert!(!state.browser.embedded.is_embedded("e1"));
+        assert_eq!(
+            closed_reason(&db, row.id).await.as_deref(),
+            Some("tab-closed")
+        );
+        assert_eq!(close_calls(&seen), 1, "the second report is a no-op");
+        db.close().await;
+    }
+
+    /// A stale id from the shell (no row, not embedded) must not make the sidecar close anything.
+    #[tokio::test]
+    async fn a_closed_report_for_an_unknown_session_does_not_touch_the_sidecar() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+        embedded::post_closed(State(state), Path("ghost".to_string())).await;
+        assert_eq!(close_calls(&seen), 0);
+        db.close().await;
+    }
+
+    /// A registered shell that never acks: the open falls back to the headless path on the same row.
+    #[tokio::test]
+    async fn an_embedded_open_the_shell_never_acks_falls_back_to_headless() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_sidecar("https://news.example.net/").await;
+        runtime.force_embedded(true);
+        let runtime = BrowserRuntime {
+            embedded: embedded::Registry::with_timing(
+                std::sync::Arc::new(std::time::Instant::now),
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_millis(40),
+                std::time::Duration::from_secs(5),
+            ),
+            ..runtime
+        };
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+        let opened = open(
+            &db.pool,
+            &runtime,
+            embedded_ask("https://news.example.net/"),
+        )
+        .await
+        .expect("opens");
+        assert!(matches!(opened, Opened::Session(_)), "{opened:?}");
+        assert_eq!(placements(&seen).len(), 1, "the headless /open ran");
+        db.close().await;
+    }
+
+    /// Opens an embedded agent session ("e1") over the stub and returns its row.
+    async fn open_embedded_session(db: &TempDb, runtime: &BrowserRuntime, url: &str) -> SessionRow {
+        sqlx::query(
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
+             VALUES ('acme', 'https://news.example.net', 'destination', ?, 0)",
+        )
+        .bind(NOW)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+        let (opened, ()) = tokio::join!(
+            open(&db.pool, runtime, embedded_ask(url)),
+            shell_acks_the_open(runtime)
+        );
+        let Opened::Session(row) = opened.expect("opens") else {
+            panic!("expected a session");
+        };
+        *row
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    fn agent_verbs_seen(
+        seen: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|call| call["verb"].as_str().unwrap().to_string())
+            .filter(|verb| ["snapshot", "act", "look", "screenshot"].contains(&verb.as_str()))
+            .collect()
+    }
+
+    /// While the owner drives an embedded session by hand, every agent read and action answers
+    /// `owner_has_control` and never reaches the sidecar; once the flag is cleared they pass.
+    #[tokio::test]
+    async fn an_embedded_session_the_owner_drives_refuses_the_agent_verbs() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let row = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+        let id = row.id;
+        assert!(state.browser.embedded.set_human("e1", true));
+
+        let session = || {
+            axum::Json(SessionBody {
+                session_id: id,
+                changes_only: false,
+                text_from: 0,
+                controls_from: 0,
+                find: Default::default(),
+            })
+        };
+        let act = || {
+            axum::Json(ActBody {
+                session_id: id,
+                kind: "click".into(),
+                element_ref: "e1".into(),
+                text: String::new(),
+                filename: String::new(),
+            })
+        };
+        let refused = [
+            post_snapshot(State(state.clone()), session()).await,
+            post_act(State(state.clone()), act()).await,
+            post_look(State(state.clone()), session()).await,
+            post_screenshot(State(state.clone()), session()).await,
+        ];
+        for response in refused {
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = body_json(response).await;
+            assert_eq!(value["outcome"], "refused", "{value}");
+            assert_eq!(value["refusal"]["consequence"], "owner_has_control");
+        }
+        assert!(
+            agent_verbs_seen(&seen).is_empty(),
+            "the sidecar was not asked"
+        );
+
+        assert!(state.browser.embedded.set_human("e1", false));
+        let _ = post_snapshot(State(state.clone()), session()).await;
+        let _ = post_act(State(state.clone()), act()).await;
+        let _ = post_look(State(state.clone()), session()).await;
+        let _ = post_screenshot(State(state.clone()), session()).await;
+        assert_eq!(
+            agent_verbs_seen(&seen),
+            ["snapshot", "act", "look", "screenshot"]
+        );
+        db.close().await;
+    }
+
+    /// A handoff on an embedded agent session asks the shell to focus the tab: no proposal, no mode
+    /// change.
+    #[tokio::test]
+    async fn a_handoff_on_an_embedded_agent_session_queues_a_focus() {
+        let db = TempDb::new().await;
+        let (runtime, _seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let row = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+
+        let response = wheel::post_handoff(
+            State(state.clone()),
+            axum::Json(wheel::HandoffBody {
+                session_id: row.id,
+                reason: "log in".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"focus": "queued"})
+        );
+
+        let queued = state.browser.embedded.poll();
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(queued[0].kind, embedded::Kind::Focus));
+        assert_eq!(queued[0].session_id.as_deref(), Some("e1"));
+
+        let (mode, proposal): (String, Option<i64>) =
+            sqlx::query_as("SELECT mode, proposal_id FROM browser_sessions WHERE id = ?")
+                .bind(row.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "agent");
+        assert_eq!(proposal, None);
+        db.close().await;
+    }
+
+    /// A redirect off the list closes the shell tab AND the sidecar's attached target.
+    #[tokio::test]
+    async fn an_embedded_redirect_downgrade_closes_the_sidecar_target_too() {
+        let db = TempDb::new().await;
+        sqlx::query(
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
+             VALUES ('acme', 'https://news.example.net', 'destination', ?, 0)",
+        )
+        .bind(NOW)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (runtime, seen) = stub_embedded_sidecar("https://elsewhere.example.org/").await;
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+        let (_opened, ()) = tokio::join!(
+            open(
+                &db.pool,
+                &runtime,
+                embedded_ask("https://news.example.net/")
+            ),
+            shell_acks_the_open(&runtime)
+        );
+        let closed: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["verb"] == "close")
+            .map(|call| call["body"]["session_id"].clone())
+            .collect();
+        assert_eq!(closed, [serde_json::json!("e1")]);
         db.close().await;
     }
 }

@@ -1,9 +1,10 @@
 /**
- * The one place the shell asks which operating system it runs on, and only for words on screen.
+ * The one place the shell asks which operating system it runs on, for words on screen and for the
+ * Windows-only removal of the old sessions list (and its "Open real window") from the Web page.
  *
  * Read from the user agent because it is the one fact every webview reports: WebView2 says
- * "Windows NT", WKWebView "Macintosh", WebKitGTK "Linux". Nothing here changes behaviour; a wrong
- * guess costs an example path, never a feature. The user agent is a parameter so tests can pass one.
+ * "Windows NT", WKWebView "Macintosh", WebKitGTK "Linux". Apart from that sessions-list gate, nothing here
+ * changes behaviour; a wrong guess costs an example path. The user agent is a parameter so tests can pass one.
  */
 export function isMac(userAgent: string = navigator.userAgent): boolean {
   return /Mac/.test(userAgent);

@@ -5,6 +5,7 @@ import { XIcon } from "lucide-react"
 import { Dialog as DialogPrimitive } from "radix-ui"
 
 import { cn } from "@/lib/cn"
+import { OverlayReporter } from "../overlay"
 
 function Dialog({
   ...props
@@ -65,6 +66,7 @@ function DialogContent({
         )}
         {...props}
       >
+        <OverlayReporter />
         {children}
         {showCloseButton && (
           <DialogPrimitive.Close

@@ -102,6 +102,37 @@ pub(super) fn routes() -> Router<AppState> {
                 crate::browser::seat::ANSWER_BODY_LIMIT,
             )),
         )
+        // The shell's embedded browser (phase 2). Control token only, in no scope table: a run's key
+        // must never register a CDP address or ack a webview. Bodies are an id, an address or a nonce.
+        .route(
+            "/browser/embedded/prepare",
+            post(crate::browser::embedded::post_prepare)
+                .layer(DefaultBodyLimit::max(crate::browser::embedded::BODY_LIMIT)),
+        )
+        .route(
+            "/browser/embedded/register",
+            post(crate::browser::embedded::post_register)
+                .layer(DefaultBodyLimit::max(crate::browser::embedded::BODY_LIMIT)),
+        )
+        .route(
+            "/browser/embedded/requests",
+            get(crate::browser::embedded::get_requests),
+        )
+        .route(
+            "/browser/embedded/requests/{id}/ack",
+            post(crate::browser::embedded::post_ack)
+                .layer(DefaultBodyLimit::max(crate::browser::embedded::BODY_LIMIT)),
+        )
+        .route(
+            "/browser/embedded/sessions/{id}/closed",
+            post(crate::browser::embedded::post_closed)
+                .layer(DefaultBodyLimit::max(crate::browser::embedded::BODY_LIMIT)),
+        )
+        .route(
+            "/browser/embedded/sessions/{id}/owner",
+            post(crate::browser::embedded_owner::post_owner)
+                .layer(DefaultBodyLimit::max(crate::browser::embedded::BODY_LIMIT)),
+        )
         .route(
             "/browser/sites/{project_id}",
             get(crate::browser::get_sites),

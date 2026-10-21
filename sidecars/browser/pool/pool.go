@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -117,6 +118,10 @@ type Pool struct {
 	watchers map[browser.SessionID]map[*viewer]struct{}
 	// panelListeners are the open PanelEvents calls, ended the same way (panel.go).
 	panelListeners map[browser.SessionID]map[*panelListener]struct{}
+	// embeddedProjects are the person's WebView2 projects this pool fences (embedded.go).
+	embeddedProjects map[string]*embeddedProject
+	// embeddedHTTP is the client for the DevTools HTTP endpoint; nil takes the default (a test seam).
+	embeddedHTTP *http.Client
 }
 
 // placed is one session: the browser it lives in, and the id THAT browser knows it by.
@@ -157,6 +162,10 @@ type entry struct {
 	// human: a visible browser is exclusive on its profile, so a session wanting the other
 	// visibility is refused while any session is open and relaunches the browser once none is.
 	visible bool
+	// embedded marks the entry standing for a person's WebView2 (embedded.go). It is never in
+	// p.running and has no profile directory: release must not retire it, discard anything or shut
+	// the browser down, because the browser is not ours.
+	embedded bool
 
 	sessions map[browser.SessionID]struct{}
 	// opening counts Opens that acquired this browser and have not registered a session on it yet.
@@ -339,6 +348,8 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	}
 	p.running = map[profile.Ref]*entry{}
 	p.sessions = map[browser.SessionID]placed{}
+	embeddedGone := p.embeddedProjects
+	p.embeddedProjects = nil
 	p.mu.Unlock()
 
 	p.endWatchers(browser.EndGone, gone...)
@@ -349,6 +360,9 @@ func (p *Pool) Shutdown(ctx context.Context) {
 			holder.driver.Shutdown(ctx)
 		}
 		p.discard(holder.ref)
+	}
+	for _, project := range embeddedGone {
+		project.shutdown()
 	}
 }
 
@@ -518,6 +532,11 @@ func (p *Pool) release(ctx context.Context, holder *entry, id browser.SessionID)
 	if id != "" {
 		delete(holder.sessions, id)
 		delete(p.sessions, id)
+	}
+	if holder.embedded {
+		// Nothing to retire: the person's browser outlives every session of ours.
+		p.mu.Unlock()
+		return
 	}
 	// Retire it only if it is idle AND still the browser this profile points at. If it is not, a
 	// Shutdown or a relaunch already took it out of the map and has already stopped it — stopping it

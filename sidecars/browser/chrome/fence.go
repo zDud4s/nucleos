@@ -82,6 +82,9 @@ func (d *Driver) answerRequest(ctx context.Context, on cdp.SessionID, paused fet
 		d.answerOrFail(ctx, on, paused.RequestID, "Fetch.continueRequest", map[string]any{"requestId": paused.RequestID})
 		return
 	}
+	// A detached embedded tab is the person's: its main-frame documents are written down before the
+	// fence decides, so a refused host still lands in the chain.
+	d.recordDetachedDocument(paused)
 	request := fence.Request{
 		Method:       paused.Request.Method,
 		URL:          paused.Request.URL,
