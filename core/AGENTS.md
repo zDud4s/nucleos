@@ -108,7 +108,7 @@ the contract, not a snapshot.
 | `http/agents.rs` | Agents, loadouts, presets and model routing (`/agents`, `/loadout/*`, `/presets`, `/models`, `/route`). |
 | `http/brains.rs` | Which models and tools a conversation can use (`/assistant/models*`, `/assistant/local-model*`, `/assistant/tools`, `/assistant/ide-sessions*`). |
 | `http/chat_edit.rs` | Creating and editing a conversation and its groups (`POST /assistant/chats`, `PATCH /assistant/chats/{chat_id}`, `/assistant/chat-groups*`). |
-| `http/chat_turns.rs` | Sending a message and following its turn (`/assistant/message`, `/assistant/turns/*`, `/assistant/{turn_id}*`, relay and forward). |
+| `http/chat_turns.rs` | Sending a message and following its turn (`/assistant/message`, `/assistant/turns/*`, `/assistant/{turn_id}/live*`, relay and forward). |
 | `http/chats.rs` | Reading a conversation and the state around it (`/assistant/chats*`). |
 | `http/commands.rs` | A project's commands, rules and limits (`/projects/{id}/commands*`, `/rules`, `/shell-rules`, `/wip-limit`). |
 | `http/common.rs` | Query shapes, resolvers and refusals shared by more than one route family. |

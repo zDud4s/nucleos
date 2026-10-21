@@ -422,7 +422,6 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // scope that CAN launch runs — for a route that launches none. The narrower grant is the
     // safer one.
     (Method::GET, "/runs/{id}/stop"),
-    (Method::GET, "/assistant/{turn_id}"),
     (Method::GET, "/jobs"),
     (Method::GET, "/jobs/{id}"),
     (Method::GET, "/proposals"),
@@ -548,11 +547,9 @@ pub fn permits(scope: &Scope, method: &Method, path: &str) -> bool {
 /// PURE: whether `scope` may perform `method` on the route TEMPLATE axum actually dispatched to.
 ///
 /// This is what the middleware asks, and it is stricter than `permits`. A concrete path cannot
-/// tell `/assistant/chats` (a route of its own) from `/assistant/{turn_id}` called with the turn id
-/// `chats`: both are two segments, and a `{param}` in a table matched any non-empty one — so a key
-/// granted the read of one turn also reached every literal sibling of it (the conversation list,
-/// the search, the IDE sessions), and a council or team key holding `/runs/{id}` reached
-/// `/runs/awaiting-approval`. The template the router chose carries no such ambiguity: a `{param}`
+/// tell `/runs/awaiting-approval` (a route of its own) from `/runs/{id}` called with the run id
+/// `awaiting-approval`: both are two segments, and a `{param}` in a table matched any non-empty one
+/// — so a council or team key holding `/runs/{id}` reached `/runs/awaiting-approval`. The template the router chose carries no such ambiguity: a `{param}`
 /// in a table matches only a `{param}` in the template, and a literal only the same literal.
 pub fn permits_route(scope: &Scope, method: &Method, route: &str) -> bool {
     grants(scope, method, route, Target::Route)
@@ -1335,8 +1332,7 @@ mod tests {
             .route("/presets", get(|| async {}).post(|| async {}))
             .route("/presets/{id}/run", post(|| async {}))
             .route("/assistant/message", post(|| async {}))
-            .route("/assistant/{turn_id}", get(|| async {}))
-            // Literal siblings of `/assistant/{turn_id}` and `/runs/{id}`, mounted so the tests that
+            // Literal siblings of `/runs/{id}`, mounted so the tests that
             // they do NOT inherit the parameterised grant are answered by `require_token` rather
             // than by the router not knowing the path.
             .route("/assistant/chats", get(|| async {}))
@@ -2249,7 +2245,6 @@ mod tests {
     #[test]
     fn a_param_grant_does_not_cover_a_literal_sibling_route() {
         let reader = Scope::ApiToken(ApiTokenLevel::ReadOnly);
-        assert!(permits_route(&reader, &Method::GET, "/assistant/{turn_id}"));
         for sibling in [
             "/assistant/chats",
             "/assistant/search",
@@ -2261,7 +2256,7 @@ mod tests {
         ] {
             assert!(
                 !permits_route(&reader, &Method::GET, sibling),
-                "GET {sibling} must not borrow the grant of /assistant/{{turn_id}}"
+                "GET {sibling} must not be granted to a read-only key"
             );
         }
 
@@ -2293,10 +2288,6 @@ mod tests {
         let team = live_team_run_with_token(&state, "run-1").await;
         let app = protected_router(state);
 
-        assert_eq!(
-            status_of(&app, "GET", "/assistant/42", &reader).await,
-            StatusCode::OK
-        );
         for sibling in [
             "/assistant/chats",
             "/assistant/search",
