@@ -567,7 +567,11 @@ impl FleetHub {
         let fresh = self.watcher.start(&paths, tx.clone());
         let old = {
             let mut state = self.state();
-            if state.dirty_tx.as_ref().is_some_and(|now| now.same_channel(&tx)) {
+            if state
+                .dirty_tx
+                .as_ref()
+                .is_some_and(|now| now.same_channel(&tx))
+            {
                 state.watched = desired;
                 state.watch.replace(fresh)
             } else {
