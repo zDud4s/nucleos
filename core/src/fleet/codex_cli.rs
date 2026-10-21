@@ -96,6 +96,9 @@ fn map_record(record: &Value) -> Vec<Mapped> {
         (Some("response_item"), "message") => assistant_message(payload),
         (Some("event_msg"), "item_completed") => user_item(payload),
         (Some("event_msg"), "user_message") => prompt(str_of(payload, "message").unwrap_or("")),
+        (Some("response_item"), "function_call") => function_call(payload),
+        (Some("response_item"), "custom_tool_call") => custom_call(payload),
+        (Some("response_item"), "function_call_output" | "custom_tool_call_output") => output(payload),
         _ => Vec::new(),
     }
 }
@@ -118,6 +121,74 @@ fn user_item(payload: &Value) -> Vec<Mapped> {
 
 fn prompt(text: &str) -> Vec<Mapped> {
     if text.trim().is_empty() { Vec::new() } else { vec![Mapped::new(TermKind::Prompt, text)] }
+}
+
+/// Tool names whose calls say nothing a reader needs (`wait` polls a running script cell).
+const QUIET_TOOLS: [&str; 1] = ["wait"];
+
+/// The first non-blank line of `text`, trimmed.
+fn first_line(text: &str) -> String {
+    text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("").to_owned()
+}
+
+/// The argument most likely to say what a tool call does, from a parsed `arguments` object.
+fn argument_preview(arguments: &Value) -> Option<String> {
+    ["command", "cmd", "path", "file_path", "query", "patch", "explanation"]
+        .iter()
+        .find_map(|key| str_of(arguments, key))
+        .map(first_line)
+}
+
+fn tool_line(name: &str, preview: &str) -> String {
+    format!("{name} {preview}").trim_end().to_owned()
+}
+
+fn function_call(payload: &Value) -> Vec<Mapped> {
+    let name = str_of(payload, "name").unwrap_or("tool");
+    if QUIET_TOOLS.contains(&name) {
+        return Vec::new();
+    }
+    let arguments = str_of(payload, "arguments").unwrap_or("");
+    let preview = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|parsed| argument_preview(&parsed))
+        .unwrap_or_else(|| first_line(arguments));
+    vec![Mapped::new(TermKind::Tool, tool_line(name, &preview)).with_detail(arguments)]
+}
+
+fn custom_call(payload: &Value) -> Vec<Mapped> {
+    let name = str_of(payload, "name").unwrap_or("tool");
+    let input = str_of(payload, "input").unwrap_or("");
+    vec![Mapped::new(TermKind::Tool, tool_line(name, &first_line(input))).with_detail(input)]
+}
+
+/// A tool output is `output` as a string or as a list of `{type, text}` parts.
+fn output_text(output: Option<&Value>) -> String {
+    match output {
+        Some(Value::String(text)) => text.clone(),
+        other => content_text(other),
+    }
+}
+
+/// `exit 0 · 12 lines` when the output carries an `Exit code:` header, else `12 lines`.
+fn result_summary(text: &str) -> String {
+    let exit = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Exit code: "))
+        .and_then(|code| code.trim().parse::<i32>().ok());
+    let lines = text.lines().filter(|line| !line.trim().is_empty()).count();
+    match exit {
+        Some(code) => format!("exit {code} · {lines} lines"),
+        None => format!("{lines} lines"),
+    }
+}
+
+fn output(payload: &Value) -> Vec<Mapped> {
+    let text = output_text(payload.get("output"));
+    if text.starts_with("Script running") {
+        return Vec::new();
+    }
+    vec![Mapped::new(TermKind::Result, result_summary(&text)).with_detail(text)]
 }
 
 #[cfg(test)]
@@ -185,5 +256,90 @@ mod tests {
         assert!(mapped(&agent).is_empty());
         // event_msg/agent_message duplicates response_item/message (0.160).
         assert!(mapped(&rec("event_msg", json!({"type": "agent_message", "message": "x"}))).is_empty());
+    }
+
+    #[test]
+    fn a_function_call_is_a_tool_line_with_the_command_as_preview() {
+        let line = rec(
+            "response_item",
+            json!({"type": "function_call", "name": "shell_command", "call_id": "c1",
+                   "arguments": "{\"command\":\"Get-ChildItem -Recurse\nSelect-Object -First 3\",\"workdir\":\"C:\\x\"}"}),
+        );
+        let got = mapped(&line);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].kind, TermKind::Tool);
+        assert_eq!(got[0].text, "shell_command Get-ChildItem -Recurse");
+        assert!(got[0].detail.as_deref().unwrap().contains("Select-Object"));
+    }
+
+    #[test]
+    fn a_function_call_with_unparseable_arguments_still_shows_its_name() {
+        let line = rec(
+            "response_item",
+            json!({"type": "function_call", "name": "update_plan", "arguments": "{not json"}),
+        );
+        let got = mapped(&line);
+        assert_eq!(got[0].text, "update_plan {not json");
+    }
+
+    #[test]
+    fn a_custom_tool_call_shows_the_first_line_of_its_input() {
+        let line = rec(
+            "response_item",
+            json!({"type": "custom_tool_call", "name": "exec", "call_id": "c2",
+                   "input": "\nconst r = await tools.exec_command({cmd: \"ls\"});\ntext(r);"}),
+        );
+        let got = mapped(&line);
+        assert_eq!(got[0].kind, TermKind::Tool);
+        assert_eq!(got[0].text, "exec const r = await tools.exec_command({cmd: \"ls\"});");
+        assert!(got[0].detail.as_deref().unwrap().ends_with("text(r);"));
+    }
+
+    #[test]
+    fn the_wait_poll_and_its_yield_stub_are_noise() {
+        let call = rec(
+            "response_item",
+            json!({"type": "function_call", "name": "wait", "arguments": "{\"cell_id\":\"10\"}"}),
+        );
+        assert!(mapped(&call).is_empty());
+        let stub = rec(
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "c",
+                   "output": "Script running with cell ID 10\nWall time 0.0 seconds"}),
+        );
+        assert!(mapped(&stub).is_empty());
+    }
+
+    #[test]
+    fn a_tool_output_is_one_summary_line_in_either_encoding() {
+        let as_string = rec(
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "c",
+                   "output": "Exit code: 0\nWall time: 1.0 seconds\nOutput:\na\nb\n"}),
+        );
+        let as_list = rec(
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "c",
+                   "output": [{"type": "input_text", "text": "Script completed"},
+                              {"type": "input_text", "text": "x\ny\nz"}]}),
+        );
+        let got = mapped(&as_string);
+        assert_eq!(got[0].kind, TermKind::Result);
+        assert_eq!(got[0].text, "exit 0 · 5 lines");
+        assert!(got[0].detail.as_deref().unwrap().contains("Wall time"));
+        let got = mapped(&as_list);
+        assert_eq!(got[0].text, "4 lines");
+        // A tool output with neither shape degrades to an empty summary rather than failing.
+        let odd = rec("response_item", json!({"type": "function_call_output", "output": {"a": 1}}));
+        assert_eq!(mapped(&odd)[0].text, "0 lines");
+    }
+
+    #[test]
+    fn a_huge_tool_output_keeps_a_capped_detail() {
+        let big = "x".repeat(DETAIL_CHARS * 2);
+        let line = rec("response_item", json!({"type": "function_call_output", "output": big}));
+        let detail = mapped(&line)[0].detail.clone().unwrap();
+        assert_eq!(detail.chars().count(), DETAIL_CHARS + 1);
+        assert!(detail.ends_with('…'));
     }
 }
