@@ -9,6 +9,7 @@ pub mod limits;
 pub mod model;
 pub mod source;
 pub mod tail;
+pub mod watch;
 #[cfg(test)]
 pub(crate) mod testkit;
 
