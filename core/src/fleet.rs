@@ -34,12 +34,12 @@ pub type Sources = (Vec<Arc<dyn AgentSource>>, Vec<Arc<dyn EdgeSource>>);
 /// come from the `AgentSource`s themselves), then `work_nodes`, then `run_launch`.
 pub fn sources(env: &FleetEnv) -> Sources {
     let _ = env;
-    #[allow(unused_mut)]
+    #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut agents: Vec<Arc<dyn AgentSource>> = Vec::new();
     // TODO-A: agents.push(Arc::new(daemon_runs::DaemonRuns::new(env)));
     // TODO-B: agents.push(Arc::new(claude_code::ClaudeCode::new(env)));
     agents.push(Arc::new(codex_cli::CodexCli::new(env.home.clone())));
-    #[allow(unused_mut)]
+    #[allow(unused_mut, clippy::vec_init_then_push)]
     let mut edges: Vec<Arc<dyn EdgeSource>> = Vec::new();
     edges.push(std::sync::Arc::new(work_nodes_edges::WorkNodesEdges::new(env.pool.clone())));
     edges.push(std::sync::Arc::new(run_launch::RunLaunchEdges::new(env.pool.clone())));
