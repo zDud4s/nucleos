@@ -24,6 +24,7 @@
 //! §5.4's "the url is handed to an ephemeral session", and it is a downgrade rather than a failure.
 
 pub mod embedded;
+pub mod embedded_owner;
 pub mod live;
 pub mod panel;
 pub mod seat;
@@ -2641,32 +2642,53 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        let app = axum::Router::new().route(
-            "/embedded/{verb}",
-            post(
-                move |Path(verb): Path<String>, axum::Json(body): axum::Json<serde_json::Value>| {
-                    let recorder = recorder.clone();
-                    async move {
-                        recorder
-                            .lock()
-                            .unwrap()
-                            .push(serde_json::json!({"verb": verb, "body": body}));
-                        if verb == "attach" {
-                            return axum::Json(serde_json::json!({
-                                "id": "e1",
-                                "mode": "agent",
-                                "requested_url": body["url"],
-                                "final_url": final_url,
-                                "title": "Landed",
-                            }))
-                            .into_response();
+        let plain_recorder = seen.clone();
+        let app = axum::Router::new()
+            // The verbs outside `/embedded` (`close`, `snapshot`, `act`, ...) are only recorded: a
+            // test asserts that the núcleo did or did not call them.
+            .route(
+                "/{verb}",
+                post(
+                    move |Path(verb): Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let recorder = plain_recorder.clone();
+                        async move {
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::json!({"verb": verb, "body": body}));
+                            axum::http::StatusCode::NO_CONTENT.into_response()
                         }
-                        axum::Json(serde_json::json!({ "proxy_addr": "127.0.0.1:9911" }))
-                            .into_response()
-                    }
-                },
-            ),
-        );
+                    },
+                ),
+            )
+            .route(
+                "/embedded/{verb}",
+                post(
+                    move |Path(verb): Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let recorder = recorder.clone();
+                        async move {
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::json!({"verb": verb, "body": body}));
+                            if verb == "attach" {
+                                return axum::Json(serde_json::json!({
+                                    "id": "e1",
+                                    "mode": "agent",
+                                    "requested_url": body["url"],
+                                    "final_url": final_url,
+                                    "title": "Landed",
+                                }))
+                                .into_response();
+                            }
+                            axum::Json(serde_json::json!({ "proxy_addr": "127.0.0.1:9911" }))
+                                .into_response()
+                        }
+                    },
+                ),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2815,6 +2837,177 @@ mod tests {
         .expect("opens");
         assert!(matches!(opened, Opened::Session(_)), "{opened:?}");
         assert_eq!(placements(&seen).len(), 1, "the headless /open ran");
+        db.close().await;
+    }
+
+    /// Opens an embedded agent session ("e1") over the stub and returns its row.
+    async fn open_embedded_session(db: &TempDb, runtime: &BrowserRuntime, url: &str) -> SessionRow {
+        sqlx::query(
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
+             VALUES ('acme', 'https://news.example.net', 'destination', ?, 0)",
+        )
+        .bind(NOW)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+        let (opened, ()) = tokio::join!(
+            open(&db.pool, runtime, embedded_ask(url)),
+            shell_acks_the_open(runtime)
+        );
+        let Opened::Session(row) = opened.expect("opens") else {
+            panic!("expected a session");
+        };
+        *row
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    fn agent_verbs_seen(
+        seen: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|call| call["verb"].as_str().unwrap().to_string())
+            .filter(|verb| ["snapshot", "act", "look", "screenshot"].contains(&verb.as_str()))
+            .collect()
+    }
+
+    /// While the owner drives an embedded session by hand, every agent read and action answers
+    /// `owner_has_control` and never reaches the sidecar; once the flag is cleared they pass.
+    #[tokio::test]
+    async fn an_embedded_session_the_owner_drives_refuses_the_agent_verbs() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let row = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+        let id = row.id;
+        assert!(state.browser.embedded.set_human("e1", true));
+
+        let session = || {
+            axum::Json(SessionBody {
+                session_id: id,
+                changes_only: false,
+                text_from: 0,
+                controls_from: 0,
+                find: Default::default(),
+            })
+        };
+        let act = || {
+            axum::Json(ActBody {
+                session_id: id,
+                kind: "click".into(),
+                element_ref: "e1".into(),
+                text: String::new(),
+                filename: String::new(),
+            })
+        };
+        let refused = [
+            post_snapshot(State(state.clone()), session()).await,
+            post_act(State(state.clone()), act()).await,
+            post_look(State(state.clone()), session()).await,
+            post_screenshot(State(state.clone()), session()).await,
+        ];
+        for response in refused {
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = body_json(response).await;
+            assert_eq!(value["outcome"], "refused", "{value}");
+            assert_eq!(value["refusal"]["consequence"], "owner_has_control");
+        }
+        assert!(
+            agent_verbs_seen(&seen).is_empty(),
+            "the sidecar was not asked"
+        );
+
+        assert!(state.browser.embedded.set_human("e1", false));
+        let _ = post_snapshot(State(state.clone()), session()).await;
+        let _ = post_act(State(state.clone()), act()).await;
+        let _ = post_look(State(state.clone()), session()).await;
+        let _ = post_screenshot(State(state.clone()), session()).await;
+        assert_eq!(
+            agent_verbs_seen(&seen),
+            ["snapshot", "act", "look", "screenshot"]
+        );
+        db.close().await;
+    }
+
+    /// A handoff on an embedded agent session asks the shell to focus the tab: no proposal, no mode
+    /// change.
+    #[tokio::test]
+    async fn a_handoff_on_an_embedded_agent_session_queues_a_focus() {
+        let db = TempDb::new().await;
+        let (runtime, _seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        let row = open_embedded_session(&db, &runtime, "https://news.example.net/").await;
+        let state = state_over(db.pool.clone(), runtime);
+
+        let response = wheel::post_handoff(
+            State(state.clone()),
+            axum::Json(wheel::HandoffBody {
+                session_id: row.id,
+                reason: "log in".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"focus": "queued"})
+        );
+
+        let queued = state.browser.embedded.poll();
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(queued[0].kind, embedded::Kind::Focus));
+        assert_eq!(queued[0].session_id.as_deref(), Some("e1"));
+
+        let (mode, proposal): (String, Option<i64>) =
+            sqlx::query_as("SELECT mode, proposal_id FROM browser_sessions WHERE id = ?")
+                .bind(row.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "agent");
+        assert_eq!(proposal, None);
+        db.close().await;
+    }
+
+    /// A redirect off the list closes the shell tab AND the sidecar's attached target.
+    #[tokio::test]
+    async fn an_embedded_redirect_downgrade_closes_the_sidecar_target_too() {
+        let db = TempDb::new().await;
+        sqlx::query(
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
+             VALUES ('acme', 'https://news.example.net', 'destination', ?, 0)",
+        )
+        .bind(NOW)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (runtime, seen) = stub_embedded_sidecar("https://elsewhere.example.org/").await;
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+        let (_opened, ()) = tokio::join!(
+            open(
+                &db.pool,
+                &runtime,
+                embedded_ask("https://news.example.net/")
+            ),
+            shell_acks_the_open(&runtime)
+        );
+        let closed: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["verb"] == "close")
+            .map(|call| call["body"]["session_id"].clone())
+            .collect();
+        assert_eq!(closed, [serde_json::json!("e1")]);
         db.close().await;
     }
 }

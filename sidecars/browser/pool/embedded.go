@@ -231,6 +231,42 @@ func (p *Pool) ForgetEmbedded(_ context.Context, name string) error {
 	return nil
 }
 
+// embeddedDriver resolves an outer session id to the chrome driver of its embedded entry and the
+// driver's own session id. A session that is not an embedded one is ErrNoSuchSession.
+func (p *Pool) embeddedDriver(id browser.SessionID) (*chrome.Driver, browser.SessionID, error) {
+	session, err := p.lookup(id)
+	if err != nil {
+		return nil, "", err
+	}
+	if !session.holder.embedded {
+		return nil, "", browser.ErrNoSuchSession
+	}
+	instance, ok := session.holder.driver.(embeddedInstance)
+	if !ok {
+		return nil, "", browser.ErrNoSuchSession
+	}
+	return instance.Driver, session.inner, nil
+}
+
+// DetachEmbedded detaches the CDP target session of an adopted tab. The session stays registered and
+// the browser-session fence stays armed.
+func (p *Pool) DetachEmbedded(ctx context.Context, id browser.SessionID) error {
+	driver, inner, err := p.embeddedDriver(id)
+	if err != nil {
+		return err
+	}
+	return driver.DetachEmbedded(ctx, inner)
+}
+
+// ReattachEmbedded attaches again to the tab of a detached session.
+func (p *Pool) ReattachEmbedded(ctx context.Context, id browser.SessionID) (browser.Returned, error) {
+	driver, inner, err := p.embeddedDriver(id)
+	if err != nil {
+		return browser.Returned{}, err
+	}
+	return driver.ReattachEmbedded(ctx, inner)
+}
+
 // dropEmbeddedSessions forgets every session of an embedded entry and ends its viewers.
 func (p *Pool) dropEmbeddedSessions(holder *entry) {
 	if holder == nil {

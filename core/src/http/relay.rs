@@ -129,6 +129,11 @@ pub(super) fn routes() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(crate::browser::embedded::BODY_LIMIT)),
         )
         .route(
+            "/browser/embedded/sessions/{id}/owner",
+            post(crate::browser::embedded_owner::post_owner)
+                .layer(DefaultBodyLimit::max(crate::browser::embedded::BODY_LIMIT)),
+        )
+        .route(
             "/browser/sites/{project_id}",
             get(crate::browser::get_sites),
         )

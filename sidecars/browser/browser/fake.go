@@ -65,8 +65,12 @@ type Fake struct {
 	Prepared          []PrepareRequest
 	Attached          []AttachRequest
 	EmbeddedForgotten []string
+	// EmbeddedDetached and EmbeddedReattached are the session ids DetachEmbedded and ReattachEmbedded saw.
+	EmbeddedDetached   []SessionID
+	EmbeddedReattached []SessionID
 	// EmbeddedErr, if set, is what all three embedded methods fail with.
-	EmbeddedErr error
+	EmbeddedErr   error
+	EmbeddedChain []string // what ReattachEmbedded answers
 
 	sessions map[SessionID]Session
 	counter  int

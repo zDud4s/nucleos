@@ -336,3 +336,66 @@ func TestShutdownClosesEmbeddedProxies(t *testing.T) {
 		t.Error("the proxy still listens after shutdown")
 	}
 }
+
+func TestDetachAndReattachEmbeddedKeepTheSessionAndTheFence(t *testing.T) {
+	view := newWebview(t)
+	view.addPage("T1", "n1")
+	pool, _ := preparedPool(t)
+	ctx := context.Background()
+
+	session, err := pool.AttachEmbedded(ctx, attachRequest(view, "n1"))
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	if err := pool.DetachEmbedded(ctx, session.ID); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	methods := view.cdp.Methods()
+	if !slices.Contains(methods, "Target.detachFromTarget") {
+		t.Errorf("no Target.detachFromTarget: %v", methods)
+	}
+	if slices.Contains(methods, "Fetch.disable") {
+		t.Errorf("the fence was disarmed by a detach: %v", methods)
+	}
+	if _, err := pool.lookup(session.ID); err != nil {
+		t.Errorf("session unregistered by detach: %v", err)
+	}
+
+	attachesBefore := 0
+	for _, call := range view.cdp.Calls() {
+		if call.Method == "Target.attachToTarget" {
+			attachesBefore++
+		}
+	}
+	if _, err := pool.ReattachEmbedded(ctx, session.ID); err != nil {
+		t.Fatalf("reattach: %v", err)
+	}
+	var last string
+	attaches := 0
+	for _, call := range view.cdp.Calls() {
+		if call.Method == "Target.attachToTarget" {
+			attaches++
+			last = string(call.Params)
+		}
+	}
+	if attaches != attachesBefore+1 {
+		t.Fatalf("attachToTarget calls = %d, want %d", attaches, attachesBefore+1)
+	}
+	if !strings.Contains(last, `"T1"`) || !strings.Contains(last, `"flatten":true`) {
+		t.Errorf("reattach params = %s", last)
+	}
+	if _, err := pool.lookup(session.ID); err != nil {
+		t.Errorf("session unregistered by reattach: %v", err)
+	}
+}
+
+func TestDetachAndReattachEmbeddedRefuseAnUnknownSession(t *testing.T) {
+	pool, _ := preparedPool(t)
+	if err := pool.DetachEmbedded(context.Background(), "s99"); !errors.Is(err, browser.ErrNoSuchSession) {
+		t.Errorf("detach = %v, want ErrNoSuchSession", err)
+	}
+	if _, err := pool.ReattachEmbedded(context.Background(), "s99"); !errors.Is(err, browser.ErrNoSuchSession) {
+		t.Errorf("reattach = %v, want ErrNoSuchSession", err)
+	}
+}

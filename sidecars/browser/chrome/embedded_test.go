@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp"
@@ -199,4 +200,238 @@ func TestAdoptOnAHeadlessDriverIsRefused(t *testing.T) {
 
 func containsJSON(raw []byte, fragment string) bool {
 	return strings.Contains(string(raw), fragment)
+}
+
+func adoptedEmbedded(t *testing.T) (*cdptest.Browser, *Driver, browser.SessionID) {
+	t.Helper()
+	fake, _, driver := connectEmbedded(t)
+	session, err := driver.Adopt(context.Background(), "TE1", "https://example.org/")
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	return fake, driver, session.ID
+}
+
+func TestDetachEmbeddedLeavesTheFenceAndTheTabAlone(t *testing.T) {
+	fake, driver, id := adoptedEmbedded(t)
+	before := len(fake.Calls())
+	if err := driver.DetachEmbedded(context.Background(), id); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	found := false
+	for _, call := range fake.Calls()[before:] {
+		switch call.Method {
+		case "Target.detachFromTarget":
+			found = true
+			if call.Session != "" || !containsJSON(call.Params, `"sessionId":"SE1"`) {
+				t.Errorf("detach on %q params %s", call.Session, call.Params)
+			}
+		case "Fetch.disable", "Target.closeTarget":
+			t.Errorf("%s was sent", call.Method)
+		}
+	}
+	if !found {
+		t.Fatalf("no detach: %v", fake.Methods())
+	}
+	if _, err := driver.lookup(id); err != nil {
+		t.Errorf("session forgotten: %v", err)
+	}
+	if err := driver.DetachEmbedded(context.Background(), id); err != nil {
+		t.Errorf("second detach = %v, want nil", err)
+	}
+	n := 0
+	for _, call := range fake.Calls() {
+		if call.Method == "Target.detachFromTarget" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("detach sent %d times", n)
+	}
+}
+
+func TestReattachEmbeddedUsesANewSessionWithoutNavigating(t *testing.T) {
+	fake, driver, id := adoptedEmbedded(t)
+	if err := driver.DetachEmbedded(context.Background(), id); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	fake.Handle("Target.attachToTarget", func(cdptest.Call) (any, error) {
+		return map[string]any{"sessionId": "SE2"}, nil
+	})
+	before := len(fake.Calls())
+	if _, err := driver.ReattachEmbedded(context.Background(), id); err != nil {
+		t.Fatalf("reattach: %v", err)
+	}
+	after := fake.Calls()[before:]
+	if len(after) == 0 || after[0].Method != "Target.attachToTarget" ||
+		!containsJSON(after[0].Params, `"targetId":"TE1"`) || !containsJSON(after[0].Params, `"flatten":true`) {
+		t.Fatalf("first call = %+v", after)
+	}
+	var sawEnable bool
+	for _, call := range after {
+		switch call.Method {
+		case "Page.navigate", "Fetch.disable", "Fetch.enable", "Target.closeTarget":
+			t.Errorf("%s was sent on reattach", call.Method)
+		case "Page.enable":
+			sawEnable = call.Session == "SE2"
+		}
+	}
+	if !sawEnable {
+		t.Errorf("Page.enable missing on SE2: %v", fake.Methods())
+	}
+	if _, err := driver.ReattachEmbedded(context.Background(), id); err != nil {
+		t.Errorf("second reattach = %v, want nil", err)
+	}
+
+	mark := len(fake.Calls())
+	_, _ = driver.Screenshot(context.Background(), id)
+	used := false
+	for _, call := range fake.Calls()[mark:] {
+		if call.Method == "Page.captureScreenshot" {
+			used = call.Session == "SE2"
+		}
+	}
+	if !used {
+		t.Error("screenshot did not go to the new cdp session")
+	}
+}
+
+func TestDetachAndReattachEmbeddedUnknownSession(t *testing.T) {
+	_, _, driver := connectEmbedded(t)
+	if err := driver.DetachEmbedded(context.Background(), "nope"); !errors.Is(err, browser.ErrNoSuchSession) {
+		t.Errorf("detach err = %v", err)
+	}
+	if _, err := driver.ReattachEmbedded(context.Background(), "nope"); !errors.Is(err, browser.ErrNoSuchSession) {
+		t.Errorf("reattach err = %v", err)
+	}
+}
+
+// chainEmbedded is an adopted embedded session whose main frame is F1.
+func chainEmbedded(t *testing.T) (*cdptest.Browser, *Driver, browser.SessionID) {
+	t.Helper()
+	fake, _, driver := connectEmbedded(t)
+	fake.Handle("Page.getFrameTree", func(cdptest.Call) (any, error) {
+		return map[string]any{"frameTree": map[string]any{"frame": map[string]any{"id": "F1"}}}, nil
+	})
+	session, err := driver.Adopt(context.Background(), "TE1", "https://example.org/")
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	return fake, driver, session.ID
+}
+
+// emitWhileDetached raises one paused request per item and waits until each has been answered.
+func emitPaused(t *testing.T, fake *cdptest.Browser, requests []map[string]any) {
+	t.Helper()
+	answered := func() int {
+		return len(callsTo(fake, "Fetch.continueRequest")) + len(callsTo(fake, "Fetch.failRequest"))
+	}
+	want := answered() + len(requests)
+	for _, request := range requests {
+		pauseRequest(fake, "", request)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for answered() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d requests answered: %v", answered()-(want-len(requests)), len(requests), fake.Methods())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func pausedAs(id, frame, url, resourceType string) map[string]any {
+	request := requestStage(url, "GET", resourceType, nil)
+	request["requestId"] = id
+	request["frameId"] = frame
+	return request
+}
+
+func reattachWith(t *testing.T, fake *cdptest.Browser, driver *Driver, id browser.SessionID, sessionID string) browser.Returned {
+	t.Helper()
+	fake.Handle("Target.attachToTarget", func(cdptest.Call) (any, error) {
+		return map[string]any{"sessionId": sessionID}, nil
+	})
+	returned, err := driver.ReattachEmbedded(context.Background(), id)
+	if err != nil {
+		t.Fatalf("reattach: %v", err)
+	}
+	return returned
+}
+
+func TestReattachEmbeddedReturnsTheMainFrameDocumentsSeenWhileDetached(t *testing.T) {
+	fake, driver, id := chainEmbedded(t)
+	if err := driver.DetachEmbedded(context.Background(), id); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	emitPaused(t, fake, []map[string]any{
+		pausedAs("A1", "F1", "https://example.org/a", "Document"),
+		pausedAs("A2", "F1", "https://example.org/a", "Document"),
+		pausedAs("A3", "F2", "https://example.org/frame", "Document"),
+		pausedAs("A4", "F1", "https://example.org/api", "XHR"),
+		pausedAs("A5", "F1", "https://idp.example.net/login", "Document"),
+	})
+	// Requests are answered concurrently, so the order of the two recorded urls is only stable when
+	// each is waited for; the dedupe of a repeat needs them adjacent, which they are by emission.
+	returned := reattachWith(t, fake, driver, id, "SE2")
+	want := []string{"https://example.org/a", "https://idp.example.net/login"}
+	if !slices.Equal(returned.Chain, want) {
+		t.Errorf("chain = %v, want %v", returned.Chain, want)
+	}
+}
+
+func TestEmbeddedChainStopsAtReattachAndRestartsPerWindow(t *testing.T) {
+	fake, driver, id := chainEmbedded(t)
+	ctx := context.Background()
+	if err := driver.DetachEmbedded(ctx, id); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	emitPaused(t, fake, []map[string]any{pausedAs("B1", "F1", "https://example.org/first", "Document")})
+	first := reattachWith(t, fake, driver, id, "SE2")
+	if !slices.Equal(first.Chain, []string{"https://example.org/first"}) {
+		t.Fatalf("first chain = %v", first.Chain)
+	}
+
+	emitPaused(t, fake, []map[string]any{pausedAs("B2", "F1", "https://example.org/after", "Document")})
+
+	if err := driver.DetachEmbedded(ctx, id); err != nil {
+		t.Fatalf("second detach: %v", err)
+	}
+	emitPaused(t, fake, []map[string]any{pausedAs("B3", "F1", "https://example.org/second", "Document")})
+	second := reattachWith(t, fake, driver, id, "SE3")
+	if !slices.Equal(second.Chain, []string{"https://example.org/second"}) {
+		t.Errorf("second chain = %v, want only the second window", second.Chain)
+	}
+}
+
+func TestReattachOfANeverDetachedSessionReturnsAnEmptyChain(t *testing.T) {
+	fake, driver, id := chainEmbedded(t)
+	before := len(callsTo(fake, "Target.attachToTarget"))
+	returned, err := driver.ReattachEmbedded(context.Background(), id)
+	if err != nil {
+		t.Fatalf("reattach: %v", err)
+	}
+	if returned.Chain == nil || len(returned.Chain) != 0 {
+		t.Errorf("chain = %#v, want non-nil empty", returned.Chain)
+	}
+	if n := len(callsTo(fake, "Target.attachToTarget")); n != before {
+		t.Errorf("attachToTarget sent %d more times", n-before)
+	}
+}
+
+func TestFailedReattachKeepsTheChainForTheRetry(t *testing.T) {
+	fake, driver, id := chainEmbedded(t)
+	if err := driver.DetachEmbedded(context.Background(), id); err != nil {
+		t.Fatalf("detach: %v", err)
+	}
+	emitPaused(t, fake, []map[string]any{pausedAs("D1", "F1", "https://example.org/kept", "Document")})
+	fake.Handle("Target.attachToTarget", func(cdptest.Call) (any, error) {
+		return nil, errors.New("tab gone")
+	})
+	if _, err := driver.ReattachEmbedded(context.Background(), id); err == nil {
+		t.Fatal("reattach succeeded")
+	}
+	returned := reattachWith(t, fake, driver, id, "SE2")
+	if !slices.Equal(returned.Chain, []string{"https://example.org/kept"}) {
+		t.Errorf("chain = %v, want the first window's", returned.Chain)
+	}
 }

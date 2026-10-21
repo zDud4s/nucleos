@@ -107,3 +107,206 @@ func (d *Driver) Adopt(ctx context.Context, targetID, url string) (browser.Sessi
 
 	return d.arm(ctx, targetID, cdpSession, url, detach)
 }
+
+// DetachEmbedded lets go of the CDP session on the shell's tab without closing the tab or touching the
+// fence: the browser-session interception stays on, the session id and its target id stay valid, and
+// [Driver.ReattachEmbedded] picks the tab up again. A second detach is a no-op.
+//
+// From the detach on, the fence records the main-frame Document requests the person makes into a chain
+// on the session; the recorder is installed before the CDP session is let go of, so none is missed.
+//
+// Only the wiring that dies with the CDP session is cleaned: the session-keyed maps, the execution
+// contexts and a running screencast. A panel is left in place, since it is re-armed on reattach.
+func (d *Driver) DetachEmbedded(ctx context.Context, id browser.SessionID) error {
+	if !d.embedded {
+		return errors.New("chrome: DetachEmbedded is for an embedded driver")
+	}
+	entry, err := d.lookup(id)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	if entry.detached {
+		d.mu.Unlock()
+		return nil
+	}
+	entry.detached = true
+	entry.chain = &chainRecorder{}
+	old := entry.cdp
+	d.mu.Unlock()
+
+	_, callErr := d.conn.Call(ctx, cdp.BrowserSession, "Target.detachFromTarget", map[string]any{
+		"sessionId": string(old),
+	})
+
+	d.mu.Lock()
+	d.forgetCDPWiring(id, entry)
+	d.mu.Unlock()
+	if callErr != nil {
+		return fmt.Errorf("detaching from target: %w", callErr)
+	}
+	return nil
+}
+
+// forgetCDPWiring drops everything keyed to the CDP sessions a session owns. d.mu must be held.
+func (d *Driver) forgetCDPWiring(id browser.SessionID, entry *session) {
+	if cast, ok := d.casts[entry.cdp]; ok {
+		cast.end()
+		delete(d.casts, entry.cdp)
+	}
+	owned := map[cdp.SessionID]bool{entry.cdp: true}
+	for on, owner := range d.cdpToSession {
+		if owner == id {
+			owned[on] = true
+			delete(d.cdpToSession, on)
+		}
+	}
+	for on := range entry.frames {
+		owned[on] = true
+	}
+	for on := range owned {
+		if on == entry.cdp {
+			continue
+		}
+		if cast, ok := d.casts[on]; ok {
+			cast.end()
+			delete(d.casts, on)
+		}
+	}
+	for key := range d.contexts {
+		if owned[key.session] {
+			delete(d.contexts, key)
+		}
+	}
+	entry.frames = map[cdp.SessionID]frameRef{}
+}
+
+// ReattachEmbedded attaches again to a tab detached by [Driver.DetachEmbedded] and redoes the
+// per-session wiring that [Driver.Adopt] and arm do, without navigating, without registering a new
+// session id and without touching the browser-session fence. It is a no-op for an attached session.
+// On a failure after the attach the new CDP session is let go again and the session stays detached.
+//
+// It returns the chain of main-frame documents the person's navigation produced while detached. The
+// recording stops before the attach, so the agent's own first requests are not part of it; on an error
+// the (stopped) chain stays on the session so a retry returns it. An attached session returns an empty,
+// non-nil chain.
+func (d *Driver) ReattachEmbedded(ctx context.Context, id browser.SessionID) (browser.Returned, error) {
+	if !d.embedded {
+		return browser.Returned{}, errors.New("chrome: ReattachEmbedded is for an embedded driver")
+	}
+	entry, err := d.lookup(id)
+	if err != nil {
+		return browser.Returned{}, err
+	}
+	d.mu.Lock()
+	if !entry.detached {
+		d.mu.Unlock()
+		return browser.Returned{Chain: []string{}}, nil
+	}
+	target := entry.target
+	visible := d.visible
+	rec := entry.chain
+	d.mu.Unlock()
+	if rec != nil {
+		rec.stop()
+	}
+	var chain []string
+
+	attached, err := d.conn.Call(ctx, cdp.BrowserSession, "Target.attachToTarget", map[string]any{
+		"targetId": target,
+		"flatten":  true,
+	})
+	if err != nil {
+		return browser.Returned{}, fmt.Errorf("attaching to target: %w", err)
+	}
+	var attachedTo struct {
+		SessionID cdp.SessionID `json:"sessionId"`
+	}
+	if err := json.Unmarshal(attached, &attachedTo); err != nil {
+		return browser.Returned{}, err
+	}
+	if attachedTo.SessionID == "" {
+		return browser.Returned{}, errors.New("chrome: attaching to target returned no session")
+	}
+	cdpSession := attachedTo.SessionID
+
+	registered := false
+	defer func() {
+		if registered {
+			return
+		}
+		closing, cancel := context.WithTimeout(context.Background(), fenceCallTimeout)
+		defer cancel()
+		_, _ = d.conn.Call(closing, cdp.BrowserSession, "Target.detachFromTarget", map[string]any{
+			"sessionId": string(cdpSession),
+		})
+	}()
+
+	if _, err := d.conn.Call(ctx, cdpSession, "Target.setAutoAttach", map[string]any{
+		"autoAttach":             true,
+		"waitForDebuggerOnStart": true,
+		"flatten":                true,
+	}); err != nil {
+		return browser.Returned{}, fmt.Errorf("%w: arming the tab's frames: %v", browser.ErrFenceNotAttached, err)
+	}
+	if _, err := d.conn.Call(ctx, cdpSession, "Page.enable", nil); err != nil {
+		return browser.Returned{}, fmt.Errorf("enabling page domain: %w", err)
+	}
+	// The same wiring arm does, minus the navigation and the registration; duplicated rather than
+	// factored out so arm stays untouched.
+	_, _ = d.conn.Call(ctx, cdpSession, "Page.setLifecycleEventsEnabled", map[string]any{"enabled": true})
+	d.watchCSP(ctx, cdpSession)
+	d.armFerry(ctx, cdpSession)
+	if visible {
+		d.armPanel(ctx, cdpSession)
+	}
+	mainFrame := d.mainFrameOf(ctx, cdpSession)
+
+	d.mu.Lock()
+	if entry.detached {
+		entry.cdp = cdpSession
+		entry.detached = false
+		entry.frameID = mainFrame
+		d.cdpToSession[cdpSession] = id
+		entry.frames = map[cdp.SessionID]frameRef{}
+		// Refs from the old snapshot name nodes of a document we no longer see; mintedRefs is kept so a
+		// ref is never reused.
+		entry.refs = map[string]nodeKey{}
+		entry.refByNode = map[nodeKey]string{}
+		entry.lastReported = map[string]browser.Element{}
+		if visible && entry.panel == nil {
+			entry.panel = newPanelState()
+		}
+		registered = true
+		if entry.chain != nil {
+			chain = entry.chain.Chain()
+			entry.chain = nil
+		}
+	}
+	d.mu.Unlock()
+	if registered && visible {
+		d.adoptPanelWorlds(cdpSession)
+	}
+	return browser.Returned{Chain: append([]string{}, chain...)}, nil
+}
+
+// recordDetachedDocument writes down a main-frame Document request made while the embedded tab is
+// detached (the person is driving it). It runs before the fence decides, so a refused host still lands
+// in the chain the person's navigation produced.
+func (d *Driver) recordDetachedDocument(paused fetchPaused) {
+	if !d.embedded || !isDocumentType(paused.ResourceType) || paused.FrameID == "" {
+		return
+	}
+	var rec *chainRecorder
+	d.mu.Lock()
+	for _, entry := range d.sessions {
+		if entry.detached && entry.chain != nil && entry.frameID == paused.FrameID {
+			rec = entry.chain
+			break
+		}
+	}
+	d.mu.Unlock()
+	if rec != nil {
+		rec.record(paused.Request.URL)
+	}
+}

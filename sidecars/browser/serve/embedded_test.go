@@ -169,6 +169,70 @@ func TestEmbeddedRoutesRefuseMissingFieldsAndMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestEmbeddedDetachAnswers204AndReattachAnswersTheChain(t *testing.T) {
+	fake := &browser.Fake{EmbeddedChain: []string{"https://a/", "https://b/"}}
+	server := embeddedServer(t, fake)
+	session, err := fake.AttachEmbedded(t.Context(), attachBody())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := browser.EmbeddedSessionRequest{SessionID: session.ID}
+	if got := post(t, server, "/embedded/detach", body, true).StatusCode; got != http.StatusNoContent {
+		t.Fatalf("detach: got %d, want 204", got)
+	}
+	response := post(t, server, "/embedded/reattach", body, true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("reattach: got %d, want 200", response.StatusCode)
+	}
+	var returned browser.Returned
+	if err := json.Unmarshal([]byte(readBody(t, response)), &returned); err != nil {
+		t.Fatal(err)
+	}
+	if len(returned.Chain) != 2 || returned.Chain[0] != "https://a/" || returned.Chain[1] != "https://b/" {
+		t.Errorf("chain = %v", returned.Chain)
+	}
+	if len(fake.EmbeddedDetached) != 1 || fake.EmbeddedDetached[0] != session.ID ||
+		len(fake.EmbeddedReattached) != 1 || fake.EmbeddedReattached[0] != session.ID {
+		t.Errorf("fake saw detach %v reattach %v", fake.EmbeddedDetached, fake.EmbeddedReattached)
+	}
+}
+
+func TestEmbeddedReattachAnswersAnEmptyChainAsAnArrayNeverNull(t *testing.T) {
+	fake := &browser.Fake{}
+	server := embeddedServer(t, fake)
+	session, err := fake.AttachEmbedded(t.Context(), attachBody())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := post(t, server, "/embedded/reattach", browser.EmbeddedSessionRequest{SessionID: session.ID}, true)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("reattach: got %d, want 200", response.StatusCode)
+	}
+	raw := readBody(t, response)
+	if !strings.Contains(raw, `"chain":[]`) || strings.Contains(raw, "null") {
+		t.Errorf("body = %s, want an empty chain array", raw)
+	}
+}
+
+func TestEmbeddedDetachAndReattachRefuseWhatTheyShould(t *testing.T) {
+	for _, path := range []string{"/embedded/detach", "/embedded/reattach"} {
+		body := browser.EmbeddedSessionRequest{SessionID: "s1"}
+		if got := post(t, embeddedServer(t, bare{&browser.Fake{}}), path, body, true).StatusCode; got != http.StatusNotImplemented {
+			t.Errorf("%s on a driver without Embedded: got %d, want 501", path, got)
+		}
+		server := embeddedServer(t, &browser.Fake{})
+		if got := post(t, server, path, body, false).StatusCode; got != http.StatusUnauthorized {
+			t.Errorf("%s without the token: got %d, want 401", path, got)
+		}
+		if got := post(t, server, path, browser.EmbeddedSessionRequest{}, true).StatusCode; got != http.StatusBadRequest {
+			t.Errorf("%s with a blank session_id: got %d, want 400", path, got)
+		}
+		if got := post(t, server, path, browser.EmbeddedSessionRequest{SessionID: "nope"}, true).StatusCode; got != http.StatusNotFound {
+			t.Errorf("%s with an unknown session: got %d, want 404", path, got)
+		}
+	}
+}
+
 func TestEmbeddedErrorsMapToTheirStatus(t *testing.T) {
 	cases := map[string]struct {
 		err  error

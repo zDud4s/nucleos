@@ -186,6 +186,10 @@ type session struct {
 	writes []browser.Write
 	// panel is what a visible session keeps for its panel, or nil for a session without one.
 	panel *panelState
+	// detached is set while the CDP session is let go of (embedded driver only); guarded by Driver.mu.
+	detached bool
+	// chain is main-frame Document requests made while detached; nil otherwise. Guarded by Driver.mu.
+	chain *chainRecorder
 }
 
 // contextKey names one execution context. The id is unique within a target and not across them, so

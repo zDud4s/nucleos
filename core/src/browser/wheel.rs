@@ -977,6 +977,18 @@ pub async fn post_handoff(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HandoffBody>,
 ) -> axum::response::Response {
+    // An embedded agent session already sits in the shell: the owner is asked to look at the tab,
+    // not to take the wheel, so no proposal is made and the mode stays as it is.
+    match live(&state.pool, body.session_id).await {
+        Ok(row)
+            if row.mode == mode::AGENT
+                && super::route_embedded::queue_focus(&state.browser, &row.sidecar_id) =>
+        {
+            return axum::Json(serde_json::json!({ "focus": "queued" })).into_response();
+        }
+        Ok(_) => {}
+        Err(error) => return wheel_error(error),
+    }
     match request(&state, body.session_id, &body.reason).await {
         Ok(proposal) => axum::Json(serde_json::json!({ "proposal_id": proposal })).into_response(),
         Err(error) => wheel_error(error),

@@ -12,9 +12,13 @@
 //! to attach to that tab, and only after that does the ack return the session id. If the shell never
 //! acks within ten seconds the request expires and the caller falls back to the headless path.
 //!
+//! A `focus` request asks the shell to bring a session's webview forward; it needs no ack, so it is
+//! listed once and dropped. The registry also remembers which embedded sessions a person is driving
+//! (the owner flag, `set_human`), which `embedded_owner` flips together with the sidecar's detach.
+//!
 //! Nothing here touches the database: the registry is memory only, like the seat state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -54,6 +58,8 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub enum Kind {
     Open,
     Close,
+    /// Bring the session's webview to the front. Carries `session_id`, no url, and needs no ack.
+    Focus,
 }
 
 /// One entry of `GET /requests`.
@@ -93,6 +99,8 @@ struct Inner {
     requests: Vec<Request>,
     /// Embedded session id -> owning project.
     sessions: HashMap<String, String>,
+    /// Sidecar session ids a person is driving (the agent is refused from them).
+    human: HashSet<String>,
     watching: bool,
 }
 
@@ -206,6 +214,10 @@ impl Registry {
             request.delivered = true;
             out.push(request.wire.clone());
         }
+        // A focus is never acked, so listing it settles it.
+        inner
+            .requests
+            .retain(|request| !(request.wire.kind == Kind::Focus && request.delivered));
         out
     }
 
@@ -364,6 +376,8 @@ impl Registry {
                 self.session_closed(&session_id);
                 AckOutcome::Closed(session_id)
             }
+            // Focus is dropped when listed, so it can only reach an ack by a stale id.
+            Kind::Focus => AckOutcome::Gone,
             Kind::Open => {
                 let Some(waiter) = request.waiter else {
                     return AckOutcome::Gone;
@@ -418,9 +432,68 @@ impl Registry {
         true
     }
 
+    /// Queues a `focus` for the project that owns the session. False when the session is not
+    /// embedded; an undelivered focus for the same session is not queued twice.
+    pub fn queue_focus(&self, session_id: &str) -> bool {
+        let now = self.now();
+        let mut inner = self.lock();
+        let Some(project) = inner.sessions.get(session_id).cloned() else {
+            return false;
+        };
+        let queued = inner.requests.iter().any(|request| {
+            request.wire.kind == Kind::Focus
+                && !request.delivered
+                && request.wire.session_id.as_deref() == Some(session_id)
+        });
+        if !queued {
+            inner.requests.push(Request {
+                wire: PendingRequest {
+                    request_id: new_id(),
+                    kind: Kind::Focus,
+                    project,
+                    url: None,
+                    session_id: Some(session_id.to_string()),
+                },
+                delivered: false,
+                expires: now + CLOSE_TTL,
+                waiter: None,
+            });
+        }
+        true
+    }
+
+    /// Marks (or unmarks) an embedded session as driven by a person. False when the session is not
+    /// embedded.
+    pub fn set_human(&self, session_id: &str, human: bool) -> bool {
+        let mut inner = self.lock();
+        if !inner.sessions.contains_key(session_id) {
+            return false;
+        }
+        if human {
+            inner.human.insert(session_id.to_string());
+        } else {
+            inner.human.remove(session_id);
+        }
+        true
+    }
+
+    /// Test seam: records an embedded session without going through an open.
+    #[cfg(test)]
+    pub(super) fn adopt_for_test(&self, session_id: &str, project: &str) {
+        self.lock()
+            .sessions
+            .insert(session_id.to_string(), project.to_string());
+    }
+
+    pub fn is_human(&self, session_id: &str) -> bool {
+        self.lock().human.contains(session_id)
+    }
+
     /// Forgets the session: the tab is gone, whoever closed it.
     pub fn session_closed(&self, session_id: &str) {
-        self.lock().sessions.remove(session_id);
+        let mut inner = self.lock();
+        inner.sessions.remove(session_id);
+        inner.human.remove(session_id);
     }
 }
 
@@ -450,7 +523,7 @@ pub struct AckBody {
     pub nonce: String,
 }
 
-fn pillar_off() -> Response {
+pub(super) fn pillar_off() -> Response {
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({
@@ -461,7 +534,7 @@ fn pillar_off() -> Response {
         .into_response()
 }
 
-fn bad_request(detail: &str) -> Response {
+pub(super) fn bad_request(detail: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({ "error": detail })),
@@ -469,7 +542,7 @@ fn bad_request(detail: &str) -> Response {
         .into_response()
 }
 
-fn sidecar_error(error: BrowserError) -> Response {
+pub(super) fn sidecar_error(error: BrowserError) -> Response {
     let status = match &error {
         BrowserError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
         BrowserError::Unreachable(_) | BrowserError::FenceDown(_) => {
@@ -695,6 +768,52 @@ mod tests {
         registry.queue_close("s2");
         advance(&clock, 31);
         assert!(registry.poll().is_empty());
+    }
+
+    #[test]
+    fn focus_is_queued_once_listed_once_and_only_for_embedded_sessions() {
+        let (registry, _clock) = registry(OPEN_WAIT);
+        assert!(!registry.queue_focus("nope"));
+        registry.register("p", "http://127.0.0.1:1");
+        registry.lock().sessions.insert("s1".into(), "p".into());
+        assert!(registry.queue_focus("s1"));
+        assert!(
+            registry.queue_focus("s1"),
+            "a second ask queues nothing new"
+        );
+        let listed = registry.poll();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, Kind::Focus);
+        assert_eq!(listed[0].project, "p");
+        assert_eq!(listed[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(listed[0].url, None);
+        assert!(registry.poll().is_empty(), "listed once");
+        assert!(registry.lock().requests.is_empty(), "gone once listed");
+    }
+
+    #[test]
+    fn the_owner_flag_round_trips_and_dies_with_the_session() {
+        let (registry, _clock) = registry(OPEN_WAIT);
+        assert!(!registry.set_human("nope", true));
+        assert!(!registry.is_human("nope"));
+        registry.lock().sessions.insert("s1".into(), "p".into());
+        assert!(!registry.is_human("s1"));
+        assert!(registry.set_human("s1", true));
+        assert!(registry.is_human("s1"));
+        assert!(registry.set_human("s1", false));
+        assert!(!registry.is_human("s1"));
+        assert!(registry.set_human("s1", true));
+        registry.session_closed("s1");
+        assert!(!registry.is_human("s1"));
+    }
+
+    #[test]
+    fn focus_serializes_as_a_lowercase_kind() {
+        assert_eq!(serde_json::to_string(&Kind::Focus).unwrap(), "\"focus\"");
+        assert_eq!(
+            serde_json::from_str::<Kind>("\"focus\"").unwrap(),
+            Kind::Focus
+        );
     }
 
     #[tokio::test]
