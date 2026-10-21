@@ -391,6 +391,8 @@ pub(super) async fn pause_for_approval(
         .bind(run_id)
         .execute(&state.pool)
         .await;
+        // The pause was undone: wake the runs topic (a spurious hint is harmless).
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
         match rolled_back {
             Ok(result) if result.rows_affected() == 1 => tracing::warn!(
                 run_id,
@@ -403,5 +405,52 @@ pub(super) async fn pause_for_approval(
                 "pretooluse-decision: could not roll back an unapprovable pause — this project is blocked until restart"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// Rolling back an unapprovable pause wakes the runs topic.
+    ///
+    /// The wake bus is process-global, so the assertion is `>= 1`, never an exact delta.
+    #[tokio::test]
+    async fn wake_signal_pause_for_approval_bumps_runs() {
+        let state = crate::channels::testkit::state().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'worktree', '2026-10-19T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task =
+            tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        // Make recording the proposal fail, so the pause is rolled back.
+        sqlx::query("DROP TABLE proposal_events")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Runs);
+        let before = *rx.borrow();
+
+        pause_for_approval(
+            state.clone(),
+            run_id,
+            "Bash".to_string(),
+            "{}".to_string(),
+            "wake test".to_string(),
+        )
+        .await;
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 }

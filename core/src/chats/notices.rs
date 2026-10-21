@@ -71,6 +71,19 @@ pub async fn post_system(
     from_run_id: i64,
     body: &str,
 ) -> sqlx::Result<i64> {
+    let mut conn = pool.acquire().await?;
+    post_system_in(&mut conn, chat_id, kind, from_run_id, body).await
+}
+
+/// [`post_system`] on a connection the caller already holds, so the note commits or rolls back
+/// with whatever transaction that connection is in.
+pub async fn post_system_in(
+    conn: &mut sqlx::SqliteConnection,
+    chat_id: &str,
+    kind: &str,
+    from_run_id: i64,
+    body: &str,
+) -> sqlx::Result<i64> {
     Ok(sqlx::query(
         "INSERT INTO chat_notices
              (chat_id, team_run_id, from_agent_id, from_run_id, body, kind, created_at)
@@ -81,7 +94,7 @@ pub async fn post_system(
     .bind(body)
     .bind(kind)
     .bind(chrono::Utc::now().to_rfc3339())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?
     .last_insert_rowid())
 }
@@ -342,6 +355,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(marked, 1, "the mark itself is still written");
+    }
+
+    /// The note is written on the caller's connection, so a rollback takes it away again.
+    #[tokio::test]
+    async fn post_system_in_writes_inside_the_callers_transaction() {
+        let pool = test_pool().await;
+        a_chat(&pool, "c-1").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        post_system_in(&mut tx, "c-1", KIND_RESTART, 7, RESTART_NOTICE)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(for_chat(&pool, "c-1").await.unwrap().is_empty());
+
+        let mut tx = pool.begin().await.unwrap();
+        post_system_in(&mut tx, "c-1", KIND_RESTART, 7, RESTART_NOTICE)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(for_chat(&pool, "c-1").await.unwrap().len(), 1);
+    }
+
+    /// Going through the pool still hands back the id of the row it wrote.
+    #[tokio::test]
+    async fn post_system_still_returns_the_new_id() {
+        let pool = test_pool().await;
+        a_chat(&pool, "c-1").await;
+
+        let id = post_system(&pool, "c-1", KIND_UNTRUSTED, 3, UNTRUSTED_NOTICE)
+            .await
+            .unwrap();
+
+        let told = for_chat(&pool, "c-1").await.unwrap();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0].id, id);
+        assert_eq!(told[0].kind, KIND_UNTRUSTED);
+        assert_eq!(told[0].from_agent_id, "nucleos");
     }
 
     /// A department's notice keeps reading back as a department's, whatever kinds exist beside it.

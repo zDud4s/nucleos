@@ -15,6 +15,11 @@
 //! the other. What the old sentence would mislead somebody into is looking for the selection in
 //! this module, where it deliberately is not.)
 //!
+//! (Since the channel hub, `channels::routing` also resolves the selection for the primary
+//! channel, merged with that channel's own overrides, and enqueues the announcement itself. The
+//! Telegram v1 sidecar keeps resolving it for its own forwarding. In both cases the selection
+//! stays out of this module.)
+//!
 //! `feed.rs` stays purely observational and knows nothing about any of this; `calendar.rs` is asked
 //! whether the person is busy and knows nothing about notifications. This module is the only place
 //! the two meet.

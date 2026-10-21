@@ -1445,7 +1445,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
-    async fn test_state() -> AppState {
+    pub(crate) async fn test_state() -> AppState {
         let pool = crate::testdb::fresh_pool().await;
         AppState {
             startup_config: Default::default(),
@@ -1527,16 +1527,84 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    /// Whether the route already has a real handler (RA: hello, events, media; RB: outbox, ack,
+    /// renew). A real handler speaks for ONE channel, so the control key, which has none, gets a
+    /// 403 from it. This covers the adapter-facing contract routes only: the management routes
+    /// (RC) are Control-only and answer the control key themselves, see
+    /// `management_control_probe`.
+    fn has_real_handler(path: &str) -> bool {
+        path.ends_with("/hello")
+            || path.ends_with("/events")
+            || path.contains("/media")
+            || path.contains("/outbox")
+    }
+
+    /// What the control key gets from an empty-bodied probe of a management route. Every route has
+    /// a real handler: the list and the pairing reads succeed (200/204), minting a code on a
+    /// channel whose secrets were never checked is a 409 named refusal (`test_state` never ran
+    /// `launch_all`), forgetting an unknown sender is a 404 named refusal, and the two routes that
+    /// take a JSON body refuse the empty one (400).
+    fn management_control_probe(method: &str, path: &str) -> StatusCode {
+        match (method, path) {
+            ("GET", "/channels") => StatusCode::OK,
+            ("PUT", "/channels/primary") => StatusCode::BAD_REQUEST,
+            ("GET", p) if p.ends_with("/pairing") => StatusCode::OK,
+            ("POST", p) if p.ends_with("/pairing") => StatusCode::CONFLICT,
+            ("DELETE", p) if p.ends_with("/pairing") => StatusCode::NO_CONTENT,
+            ("GET", p) if p.ends_with("/identities") => StatusCode::OK,
+            ("DELETE", p) if p.contains("/identities/") => StatusCode::NOT_FOUND,
+            ("PUT", p) if p.ends_with("/home") => StatusCode::BAD_REQUEST,
+            _ => StatusCode::NOT_IMPLEMENTED,
+        }
+    }
+
+    /// What a channel key gets from an empty-bodied probe of a contract route: the real handlers
+    /// refuse the empty body (400) or the unknown id (404), and an empty outbox poll is a 200;
+    /// the rest are still 501 stubs.
+    fn channel_key_probe(method: &str, path: &str) -> StatusCode {
+        match (method, path) {
+            ("GET", p) if p.contains("/media/") => StatusCode::NOT_FOUND,
+            ("GET", p) if p.ends_with("/outbox") => StatusCode::OK,
+            (_, p) if p.ends_with("/renew") => StatusCode::NOT_FOUND,
+            (_, p) if has_real_handler(p) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::NOT_IMPLEMENTED,
+        }
+    }
+
     #[tokio::test]
     async fn control_reaches_every_channel_route_stub() {
         let state = test_state().await;
-        for (method, path) in CHANNEL_CONTRACT_STUBS
-            .iter()
-            .chain(CHANNEL_MANAGEMENT_STUBS.iter())
-        {
+        for (method, path) in CHANNEL_CONTRACT_STUBS {
             let status = channel_status(&state, method, path, Some("test-token")).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+            let expected = if has_real_handler(path) {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            assert_eq!(status, expected, "{method} {path}");
         }
+        for (method, path) in CHANNEL_MANAGEMENT_STUBS {
+            let status = channel_status(&state, method, path, Some("test-token")).await;
+            assert_eq!(
+                status,
+                management_control_probe(method, path),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_post_is_409_until_the_channel_is_configured() {
+        let state = test_state().await;
+        let path = "/channels/telegram/pairing";
+        let status = channel_status(&state, "POST", path, Some("test-token")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        state
+            .channels
+            .presence
+            .set_secrets_present("telegram", Vec::new());
+        let status = channel_status(&state, "POST", path, Some("test-token")).await;
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     #[tokio::test]
@@ -1548,7 +1616,7 @@ mod tests {
                 .unwrap();
         for (method, path) in CHANNEL_CONTRACT_STUBS {
             let status = channel_status(&state, method, path, Some(&key)).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+            assert_eq!(status, channel_key_probe(method, path), "{method} {path}");
         }
         for (method, path) in CHANNEL_MANAGEMENT_STUBS {
             let status = channel_status(&state, method, path, Some(&key)).await;
@@ -21986,6 +22054,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A reject never has a body: the person asked to refuse and the status is the whole answer.
+    #[tokio::test]
+    async fn reject_unknown_proposal_returns_404_with_an_empty_body() {
+        let app = build_router(test_state().await);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/proposals/999999/reject")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "a reject answers with no body: {body:?}");
     }
 
     #[tokio::test]

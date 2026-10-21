@@ -210,6 +210,7 @@ pub async fn set_budget_config(pool: &SqlitePool, cfg: &BudgetConfig) -> sqlx::R
     .bind(cfg.time_cost_per_hour_usd)
     .execute(pool)
     .await?;
+    nucleos_base::wake::bump(nucleos_base::wake::Topic::Budget);
     Ok(())
 }
 
@@ -727,6 +728,24 @@ mod tests {
                 time_cost_per_hour_usd: 3.0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn wake_signal_set_budget_config_bumps_budget() {
+        let pool = test_pool().await;
+        let rx = nucleos_base::wake::subscribe(nucleos_base::wake::Topic::Budget);
+        let before = *rx.borrow();
+        let config = BudgetConfig {
+            limit_usd: Some(5.0),
+            period: BudgetPeriod::Daily,
+            hourly_limit_usd: None,
+            per_run_reserve_usd: 0.5,
+            time_cost_per_hour_usd: 3.0,
+        };
+
+        set_budget_config(&pool, &config).await.unwrap();
+
+        assert!(rx.borrow().wrapping_sub(before) >= 1);
     }
 
     #[tokio::test]

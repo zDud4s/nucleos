@@ -1,4 +1,4 @@
-//! Schema checks of the channel tables (test-only): migrations 0220-0227 create what D.17 says,
+//! Schema checks of the channel tables (test-only): migrations 0220-0227 and 0230 create what D.17 says,
 //! with the indexes and CHECKs the rest of the hub leans on.
 
 use sqlx::SqlitePool;
@@ -72,6 +72,15 @@ async fn all_eleven_channel_tables_exist() {
     ] {
         assert!(!columns(&pool, table).await.is_empty(), "missing {table}");
     }
+}
+
+#[tokio::test]
+async fn the_queue_pause_marks_table_exists() {
+    let pool = fresh_pool().await;
+    assert_eq!(
+        columns(&pool, "channel_queue_pause_marks").await,
+        ["channel", "conversation", "announced_at"]
+    );
 }
 
 #[tokio::test]

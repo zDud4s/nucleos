@@ -232,6 +232,37 @@ pub(super) async fn stop_turn_within(
     turn_id: i64,
     grace: std::time::Duration,
 ) -> Stopped {
+    let outcome = stop_turn_within_inner(state, turn_id, grace).await;
+    // The final reply goes out first and the pause notice after it, so the outbox reads in the order
+    // the person should. `reply_now` is the same compare-and-set the replies loop uses, so it does
+    // not answer twice. `NotRunning` stopped nothing and announces nothing.
+    if matches!(outcome, Stopped::Interrupted | Stopped::Killed)
+        && let Some(chat) = stopped_chat(state, turn_id).await
+    {
+        crate::channels::replies::reply_now(state, turn_id).await;
+        if let Err(error) = crate::channels::replies::announce_queue_paused(state, &chat).await {
+            tracing::warn!(%error, chat, "could not announce the paused queue");
+        }
+    }
+    outcome
+}
+
+/// The conversation a turn belongs to, if it has one.
+async fn stopped_chat(state: &crate::state::AppState, turn_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT chat_id FROM runs WHERE id = ?")
+        .bind(turn_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+async fn stop_turn_within_inner(
+    state: &crate::state::AppState,
+    turn_id: i64,
+    grace: std::time::Duration,
+) -> Stopped {
     let Ok(Some((chat_id, status))) = sqlx::query_as::<_, (Option<String>, String)>(
         "SELECT chat_id, status FROM runs WHERE id = ? AND mode = 'assistant'",
     )
@@ -284,6 +315,25 @@ pub(super) async fn stop_turn_within(
     } else {
         Stopped::NotRunning
     }
+}
+
+/// Stops the turn running in a conversation, found by chat id: [`stop_turn`] on its newest running
+/// assistant run, with the id it stopped.
+///
+/// `None` when no turn is running, and then nothing is touched: the queue is neither held nor
+/// released, so a hold that was there stays and a free queue stays free. Stopping a conversation
+/// that is not answering does nothing, which keeps it distinct from killing.
+pub async fn stop_chat(state: &crate::state::AppState, chat_id: &str) -> Option<(i64, Stopped)> {
+    let turn_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM runs WHERE chat_id = ? AND mode = 'assistant' AND status = 'running'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()?;
+    Some((turn_id, stop_turn(state, turn_id).await))
 }
 
 /// What became of a request to stop one agent of a conversation.
@@ -456,5 +506,73 @@ impl Drop for TurnGuard {
     fn drop(&mut self) {
         // `slot` releases the chat by being dropped with the rest of this struct.
         let _ = std::fs::remove_file(&self.mcp_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A chat id no other test in this process is using: the queue holds are process-global.
+    fn a_chat(prefix: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        format!(
+            "{prefix}:{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    async fn a_running_turn(state: &crate::state::AppState, chat: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('slow', 'running', 'assistant', ?, '2026-10-20T00:00:00Z') RETURNING id",
+        )
+        .bind(chat)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stop_chat_stops_the_running_turn_and_holds_the_queue() {
+        let state = crate::channels::testkit::state().await;
+        let chat = a_chat("stop-chat");
+        let turn = a_running_turn(&state, &chat).await;
+        // No process is registered for the chat, so Stop takes the kill path, which needs a handle.
+        let task = tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(60)));
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(turn, task.abort_handle());
+        assert!(!queue_is_held(&chat));
+
+        let stopped = stop_chat(&state, &chat).await;
+
+        assert_eq!(stopped, Some((turn, Stopped::Killed)));
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(turn)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert!(queue_is_held(&chat));
+        release_queue(&chat);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_chat_with_nothing_running_is_none_and_leaves_the_queue_hold_as_it_was() {
+        let state = crate::channels::testkit::state().await;
+        let free = a_chat("stop-chat-free");
+        let held = a_chat("stop-chat-held");
+        hold_queue(&held);
+
+        assert_eq!(stop_chat(&state, &free).await, None);
+        assert_eq!(stop_chat(&state, &held).await, None);
+
+        assert!(!queue_is_held(&free), "a free queue must stay free");
+        assert!(queue_is_held(&held), "a held queue must stay held");
+        release_queue(&held);
     }
 }

@@ -309,6 +309,10 @@ pub async fn propose_action(
     .await?
     .last_insert_rowid();
     transaction.commit().await?;
+    // Only a `propose` action puts something in front of the person; signal after the commit.
+    if proposal_id.is_some() {
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
+    }
 
     let outcome = match proposal_id {
         Some(proposal_id) => format!(
