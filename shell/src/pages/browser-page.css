@@ -88,6 +88,37 @@
   font-size: var(--text-sm);
 }
 
+/* An agent-driven tab: the info tone (never `--accent`, which is the brand colour). */
+.browser-tab[data-role="agent"] {
+  border-color: var(--tone-info-border);
+  outline: 1px solid var(--tone-info-border);
+  outline-offset: -1px;
+}
+
+.browser-tab-badge {
+  flex: none;
+  margin-left: var(--space-2);
+  color: var(--tone-info-fg);
+}
+
+.browser-agent-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--tone-info-border);
+  border-radius: var(--radius-sm);
+  background: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+  font-size: var(--text-sm);
+}
+
+.browser-agent-notice {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: var(--text-sm);
+}
+
 .browser-content {
   position: relative;
   flex: 1;

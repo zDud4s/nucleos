@@ -92,3 +92,83 @@ describe("listenBrowserEvents", () => {
     expect(() => cbs["browser://tab-state"]({ payload: 1 })).not.toThrow();
   });
 });
+
+describe("tab map helpers", () => {
+  const mk = (id: string, session?: string) => tabs.newTab(id, `https://${id}.test`, "agent", session);
+  const build = (): tabs.TabMap => ({
+    p1: { tabs: [tabs.newTab("a", "https://a.test"), mk("b", "s-b"), mk("c", "s-c")], activeId: "b" },
+    p2: { tabs: [mk("d", "s-d")], activeId: "d" },
+  });
+
+  it("newTab defaults to owner without a session", () => {
+    const t = tabs.newTab("x", "https://x.test");
+    expect(t.role).toBe("owner");
+    expect(t.sessionId).toBeUndefined();
+    expect(t.failed).toBe(false);
+    expect(tabs.newTab("y", "u", "agent", "s").sessionId).toBe("s");
+  });
+
+  it("addAgentTab keeps the active tab when one exists", () => {
+    const next = tabs.addAgentTab(build(), "p1", mk("e"));
+    expect(next.p1.tabs.map((t) => t.id)).toEqual(["a", "b", "c", "e"]);
+    expect(next.p1.activeId).toBe("b");
+  });
+
+  it("addAgentTab activates when there is none", () => {
+    const next = tabs.addAgentTab({}, "p9", mk("e"));
+    expect(next.p9.activeId).toBe("e");
+    expect(next.p9.tabs).toHaveLength(1);
+  });
+
+  it("finds tabs by id and session across projects", () => {
+    const map = build();
+    expect(tabs.findTabById(map, "d")?.project).toBe("p2");
+    expect(tabs.findTabBySessionId(map, "s-c")?.tab.id).toBe("c");
+    expect(tabs.findTabById(map, "zz")).toBeUndefined();
+    expect(tabs.findTabBySessionId(map, "zz")).toBeUndefined();
+  });
+
+  it("setTabSessionId sets the session without mutating the input", () => {
+    const map = build();
+    const next = tabs.setTabSessionId(map, "a", "s-a");
+    expect(tabs.findTabBySessionId(next, "s-a")?.tab.id).toBe("a");
+    expect(map.p1.tabs[0].sessionId).toBeUndefined();
+    expect(tabs.setTabSessionId(map, "nope", "s")).toBe(map);
+  });
+
+  it("removeTabBySessionId removes the right tab and picks the neighbour when active", () => {
+    const map = build();
+    const res = tabs.removeTabBySessionId(map, "s-b");
+    expect(res.removed?.project).toBe("p1");
+    expect(res.removed?.tab.id).toBe("b");
+    expect(res.map.p1.tabs.map((t) => t.id)).toEqual(["a", "c"]);
+    expect(res.map.p1.activeId).toBe("c");
+    expect(res.map.p2).toBe(map.p2);
+  });
+
+  it("removing the last remaining tab clears the active id", () => {
+    const res = tabs.removeTabBySessionId(build(), "s-d");
+    expect(res.map.p2).toEqual({ tabs: [], activeId: null });
+  });
+
+  it("removing a non-active tab keeps the active id", () => {
+    const res = tabs.removeTabById(build(), "c");
+    expect(res.map.p1.activeId).toBe("b");
+  });
+
+  it("removeTabBySessionId is a no-op for an unknown session", () => {
+    const map = build();
+    const res = tabs.removeTabBySessionId(map, "unknown");
+    expect(res.map).toBe(map);
+    expect(res.removed).toBeUndefined();
+  });
+
+  it("never mutates the input map", () => {
+    const map = build();
+    const snapshot = JSON.parse(JSON.stringify(map));
+    tabs.addAgentTab(map, "p1", mk("e"));
+    tabs.setTabSessionId(map, "a", "s-a");
+    tabs.removeTabBySessionId(map, "s-b");
+    expect(map).toEqual(snapshot);
+  });
+});

@@ -98,3 +98,111 @@ export async function listenBrowserEvents(handlers: BrowserEventHandlers): Promi
     for (const un of unlisteners) un();
   };
 }
+
+export interface Tab {
+  id: string;
+  title: string;
+  url: string;
+  loading: boolean;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  secure: boolean;
+  failed: boolean;
+  role: Role;
+  sessionId?: string;
+}
+
+export interface ProjectTabs {
+  tabs: Tab[];
+  activeId: string | null;
+}
+
+export type TabMap = Record<string, ProjectTabs>;
+
+export const EMPTY_PROJECT_TABS: ProjectTabs = { tabs: [], activeId: null };
+
+export function newTab(id: string, url: string, role: Role = "owner", sessionId?: string): Tab {
+  const tab: Tab = {
+    id,
+    title: "",
+    url,
+    loading: false,
+    canGoBack: false,
+    canGoForward: false,
+    secure: false,
+    failed: false,
+    role,
+  };
+  if (sessionId !== undefined) tab.sessionId = sessionId;
+  return tab;
+}
+
+/** Append an agent tab; it only becomes active when the project had no active tab. */
+export function addAgentTab(map: TabMap, project: string, tab: Tab): TabMap {
+  const current = map[project] ?? EMPTY_PROJECT_TABS;
+  return {
+    ...map,
+    [project]: {
+      tabs: [...current.tabs, tab],
+      activeId: current.activeId ?? tab.id,
+    },
+  };
+}
+
+function findTab(
+  map: TabMap,
+  pred: (tab: Tab) => boolean,
+): { project: string; tab: Tab } | undefined {
+  for (const [project, entry] of Object.entries(map)) {
+    const tab = entry.tabs.find(pred);
+    if (tab !== undefined) return { project, tab };
+  }
+  return undefined;
+}
+
+export function findTabById(map: TabMap, tabId: string): { project: string; tab: Tab } | undefined {
+  return findTab(map, (tab) => tab.id === tabId);
+}
+
+export function findTabBySessionId(
+  map: TabMap,
+  sessionId: string,
+): { project: string; tab: Tab } | undefined {
+  return findTab(map, (tab) => tab.sessionId === sessionId);
+}
+
+export function setTabSessionId(map: TabMap, tabId: string, sessionId: string): TabMap {
+  const found = findTabById(map, tabId);
+  if (found === undefined) return map;
+  const entry = map[found.project];
+  return {
+    ...map,
+    [found.project]: {
+      ...entry,
+      tabs: entry.tabs.map((tab) => (tab.id === tabId ? { ...tab, sessionId } : tab)),
+    },
+  };
+}
+
+export function removeTabById(
+  map: TabMap,
+  tabId: string,
+): { map: TabMap; removed?: { project: string; tab: Tab } } {
+  const found = findTabById(map, tabId);
+  if (found === undefined) return { map };
+  const entry = map[found.project];
+  const index = entry.tabs.findIndex((tab) => tab.id === tabId);
+  const tabs = entry.tabs.filter((tab) => tab.id !== tabId);
+  const activeId =
+    entry.activeId === tabId ? (tabs[Math.min(index, tabs.length - 1)]?.id ?? null) : entry.activeId;
+  return { map: { ...map, [found.project]: { tabs, activeId } }, removed: found };
+}
+
+export function removeTabBySessionId(
+  map: TabMap,
+  sessionId: string,
+): { map: TabMap; removed?: { project: string; tab: Tab } } {
+  const found = findTabBySessionId(map, sessionId);
+  if (found === undefined) return { map };
+  return removeTabById(map, found.tab.id);
+}
