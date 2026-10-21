@@ -297,6 +297,12 @@ impl Book {
                         entry.error_marked = false;
                     }
                     entry.misses = 0;
+                    if incoming.lines_source != entry.fused.lines_source {
+                        // The offset counts bytes of the old source: another source must start
+                        // from its own tail, not from a number that means something else to it.
+                        entry.offset = Offset::TAIL;
+                        entry.path = None;
+                    }
                     entry.fused = incoming;
                 }
                 None => {
@@ -579,10 +585,11 @@ fn end_of(entry: &Entry) -> Timestamp {
 }
 
 /// The nodes of one tree that fit the cap, and how many `Done` nodes each kept node stands in for.
-/// Live and `Lost` nodes and the root always fit; the newest `Done` fill what is left; a kept node
-/// drags its ancestors in. So the result can exceed `TREE_NODES` by the ancestors of kept live
-/// nodes (their `Done` ancestors are not counted against the budget): the cap bounds the `Done`
-/// nodes, never the live ones, and the overshoot is bounded by those ancestors.
+/// Live nodes and the root always fit; the newest finished (`Done` or `Lost`, so a killed
+/// orchestrator's unfinished subagents cannot grow the tree without bound) fill what is left; a
+/// kept node drags its ancestors in. So the result can exceed `TREE_NODES` by the ancestors of kept
+/// live nodes (their finished ancestors are not counted against the budget): the cap bounds the
+/// finished nodes, never the live ones, and the overshoot is bounded by those ancestors.
 fn cap_tree(tree: &[&Entry]) -> (BTreeSet<NodeId>, BTreeMap<NodeId, u32>) {
     if tree.len() <= TREE_NODES {
         return (
@@ -598,7 +605,7 @@ fn cap_tree(tree: &[&Entry]) -> (BTreeSet<NodeId>, BTreeMap<NodeId, u32>) {
     let mut done: Vec<&Entry> = Vec::new();
     for entry in tree {
         let node = &entry.fused.node;
-        if node.state == NodeState::Done && node.parent_id.is_some() {
+        if matches!(node.state, NodeState::Done | NodeState::Lost) && node.parent_id.is_some() {
             done.push(entry);
         } else {
             kept.insert(node.id.clone());
@@ -1300,6 +1307,47 @@ mod tests {
             Offset(42),
             "reads continue from the stored offset"
         );
+    }
+
+    #[test]
+    fn a_change_of_lines_source_restarts_the_read_from_the_tail() {
+        let mut book = live_book();
+        book.read_jobs(ReadWhich::Pending);
+        book.apply_lines("claude-code:root", outcome(&["a"], 42), at(2));
+
+        let mut taken_over = root_node(R, NodeState::Busy);
+        taken_over.lines_source = Some(1);
+        book.apply_fusion(vec![taken_over], at(3));
+        let jobs = book.read_jobs(ReadWhich::AllLive);
+        assert_eq!((jobs[0].source, jobs[0].offset), (1, Offset::TAIL));
+
+        // The same source again keeps its offset.
+        book.apply_lines("claude-code:root", outcome(&["b"], 7), at(4));
+        let mut same = root_node(R, NodeState::Busy);
+        same.lines_source = Some(1);
+        book.apply_fusion(vec![same], at(5));
+        assert_eq!(book.read_jobs(ReadWhich::AllLive)[0].offset, Offset(7));
+    }
+
+    #[test]
+    fn lost_nodes_count_against_the_tree_cap_like_done_ones() {
+        let mut book = Book::new(BTreeSet::new());
+        let mut nodes = vec![root_node(R, NodeState::Busy)];
+        for i in 0..600 {
+            nodes.push(child_node(
+                ("claude-code", &format!("l{i:03}")),
+                R,
+                NodeState::Lost,
+            ));
+        }
+        book.apply_fusion(nodes, at(1000));
+
+        let FleetEvent::Snapshot { nodes, .. } = book.snapshot() else {
+            panic!()
+        };
+        assert_eq!(nodes.len(), TREE_NODES);
+        let root = nodes.iter().find(|n| n.id == "claude-code:root").unwrap();
+        assert_eq!(root.done_omitted, 600 - (TREE_NODES as u32 - 1));
     }
 
     #[test]
