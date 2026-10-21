@@ -38,28 +38,49 @@ pub(super) fn agent_status(error: &agent::AgentError) -> StatusCode {
         agent::AgentError::DuplicateName => StatusCode::CONFLICT,
         // The agent exists and the request is well formed; what refuses is the team standing on it.
         agent::AgentError::InUse => StatusCode::CONFLICT,
+        // A package agent changes by shipping a new package version, not through the catalogue.
+        agent::AgentError::PackageReadOnly => StatusCode::CONFLICT,
         agent::AgentError::Invalid(_) => StatusCode::BAD_REQUEST,
         agent::AgentError::NotFound => StatusCode::NOT_FOUND,
         agent::AgentError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
+/// An agent as the API answers it: the stored fields plus the runner policy derived from its
+/// capabilities. Read-only; `tool_policy` is never accepted on a write.
+#[derive(Serialize)]
+pub(super) struct AgentView {
+    #[serde(flatten)]
+    agent: agent::Agent,
+    tool_policy: &'static str,
+}
+
+impl From<agent::Agent> for AgentView {
+    fn from(agent: agent::Agent) -> Self {
+        let tool_policy = agent.tool_policy();
+        Self { agent, tool_policy }
+    }
+}
+
 pub(super) async fn list_agents(
     State(state): State<AppState>,
-) -> Result<Json<Vec<agent::Agent>>, StatusCode> {
-    agent::list(&state.pool).await.map(Json).map_err(|error| {
-        tracing::warn!(%error, "listing agents failed");
-        agent_status(&error)
-    })
+) -> Result<Json<Vec<AgentView>>, StatusCode> {
+    agent::list(&state.pool)
+        .await
+        .map(|agents| Json(agents.into_iter().map(AgentView::from).collect()))
+        .map_err(|error| {
+            tracing::warn!(%error, "listing agents failed");
+            agent_status(&error)
+        })
 }
 
 pub(super) async fn create_agent(
     State(state): State<AppState>,
     Json(request): Json<agent::AgentRequest>,
-) -> Result<Json<agent::Agent>, StatusCode> {
+) -> Result<Json<AgentView>, StatusCode> {
     agent::create(&state.pool, request)
         .await
-        .map(Json)
+        .map(|created| Json(created.into()))
         .map_err(|error| {
             tracing::warn!(%error, "creating agent failed");
             agent_status(&error)
@@ -69,9 +90,9 @@ pub(super) async fn create_agent(
 pub(super) async fn get_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<agent::Agent>, StatusCode> {
+) -> Result<Json<AgentView>, StatusCode> {
     match agent::get(&state.pool, &id).await {
-        Ok(Some(found)) => Ok(Json(found)),
+        Ok(Some(found)) => Ok(Json(found.into())),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(error) => {
             tracing::warn!(agent_id = %id, %error, "reading agent failed");
@@ -84,10 +105,10 @@ pub(super) async fn update_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<agent::AgentRequest>,
-) -> Result<Json<agent::Agent>, StatusCode> {
+) -> Result<Json<AgentView>, StatusCode> {
     agent::update(&state.pool, &id, request)
         .await
-        .map(Json)
+        .map(|updated| Json(updated.into()))
         .map_err(|error| {
             tracing::warn!(agent_id = %id, %error, "updating agent failed");
             agent_status(&error)
@@ -336,16 +357,14 @@ pub(super) async fn preview_loadout(
         tracing::warn!(%error, "previewing a loadout failed");
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     };
-    let tool_policy =
-        match sqlx::query_scalar::<_, String>("SELECT tool_policy FROM agents WHERE id = ?")
-            .bind(&body.agent_id)
-            .fetch_optional(&state.pool)
-            .await
-        {
-            Ok(Some(policy)) => policy,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(error) => return internal(error),
-        };
+    let tool_policy = match agent::get(&state.pool, &body.agent_id).await {
+        Ok(Some(found)) => found.tool_policy(),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "previewing a loadout failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let team = body.team_id.as_deref().filter(|team| !team.is_empty());
     if let Some(team) = team {
         match sqlx::query_scalar::<_, i64>("SELECT 1 FROM teams WHERE id = ?")

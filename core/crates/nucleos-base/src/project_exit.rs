@@ -132,7 +132,7 @@ const PROJECT_SCOPED: &[&str] = &[
 /// on — `storage.rs` sets it — so the real outcome was a refused DELETE rather than a silent
 /// orphan, which is the better failure and still a failure.
 const VIA_PARENT: &[(&str, &str, &str)] = &[
-    ("job_items", "job_id", "jobs"),
+    ("job_nodes", "job_id", "jobs"),
     ("job_notes", "job_id", "jobs"),
     ("map_anchors", "decision_id", "map_decisions"),
     ("map_stamps", "decision_id", "map_decisions"),

@@ -1,13 +1,14 @@
 # The autopilot, written down.
 #
-# This is the sequence `core/src/job.rs` has always run, said in the vocabulary of §6.4 instead of
-# in the shape of a Rust enum. Nothing here changes what a job does — `next_step` is still the
-# authority until the engine learns to read this file. What it changes is that the sequence can be
-# LOOKED AT, which is the whole of the first slice.
+# This is the sequence `core/src/execution/job.rs` has always run, said in the vocabulary of §6.4
+# instead of in the shape of a Rust enum: spec, plan, the queue (implement + gate per item), a review
+# of the round, then the question of whether to go round again. The pure walker
+# (`core/src/workflows/walk.rs`) reads this file and is checked against the old `next_step` on the
+# same job views, so the two must keep saying the same thing.
 #
 # ## Why the agent nodes carry no `body`
 #
-# A `body` is the instructions a person wrote for a node. These three have none, and it is not an
+# A `body` is the instructions a person wrote for a node. These four have none, and it is not an
 # omission. Their prompt is the PROTOCOL between the engine and the node — write `plan.json` with
 # these keys, your ordinals are numbered from N, these are your teammates and what each is for — and
 # the engine composes it because the engine is what enforces it. It also branches on things no file
@@ -27,14 +28,18 @@
 # ## What the fan says that the prose never could
 #
 # `work` repeats `implement` AND `gate` — per item, which is what the `gate_each` column of the
-# `jobs` table has always meant. `concurrency: 1` is the sequential job; a job a team directs raises
-# it from `teams.max_parallel`, and that is a property of the JOB rather than of this file. The same
-# workflow runs sequential or distributed depending on who asked for it.
+# `jobs` table has always meant. `concurrency` is a CEILING: a job without a team runs one item at a
+# time whatever it says, and a team job runs min(`teams.max_parallel`, `concurrency`) at once. The
+# same workflow runs sequential or distributed depending on who asked for it.
 #
 # The edge back to `plan` is the replan round. `validate` does not check for cycles, deliberately,
 # and this is what that allows.
 
 nodes:
+  - id: spec
+    type: agent
+    label: Spec
+
   - id: plan
     type: agent
     label: Plan
@@ -54,10 +59,10 @@ nodes:
     label: The queue
     source: plan
     each: [implement, gate]
-    concurrency: 1
+    concurrency: 8
     join: all
 
-  # The round is over: is there more to do? A NODE and not a condition written on the edge out of
+  # The round is over and reviewed: is there more to do? A NODE and not a condition written on the edge out of
   # the fan, because §4.4 gives the condition to the decision and leaves `when` on any other edge as
   # a label nothing evaluates. A branch that nothing would ever evaluate is worse than no branch.
   - id: more
@@ -70,13 +75,16 @@ nodes:
     label: Review
 
 edges:
+  - {from: spec, to: plan}
   - {from: plan, to: work}
   # A green gate takes a checkpoint and the queue moves on; a red one spends the item's retry budget
   # before the tree is reverted to the previous item's footing. Both stay inside the fan, which is
   # what "the queue carries on" means.
   - {from: gate, to: work, verdict: pass}
   - {from: gate, to: work, verdict: fail}
-  - {from: work, to: more}
+  # Every round is reviewed before the round decision, as the job has always done.
+  - {from: work, to: review}
+  - {from: review, to: more}
   # The replan round. `validate` does not check for cycles, deliberately, and this is what it allows.
   - {from: more, to: plan, when: true}
-  - {from: more, to: review, when: false}
+  # `more` false has no edge on purpose: the graph ends there and the job completes.

@@ -730,7 +730,7 @@ mod terminal_write_ratchet {
     /// waiting on. Matched against the statement with its whitespace collapsed.
     const TERMINAL: [&str; 5] = [
         "UPDATE runs SET status",
-        "UPDATE job_items",
+        "UPDATE job_nodes",
         "UPDATE team_items",
         "UPDATE team_runs",
         "UPDATE distill_queue",

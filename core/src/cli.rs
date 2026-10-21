@@ -665,6 +665,69 @@ async fn workflow_sync() {
     }
 }
 
+/// Whether the command line asks for `--agents-sync`.
+pub(super) fn agents_sync_flag(args: &[String]) -> bool {
+    args.iter().skip(1).any(|arg| arg == "--agents-sync")
+}
+
+// `nucleos-core --agents-sync`: write the installed agent packages into the harness, no daemon.
+fn agents_sync() {
+    let Some(root) = machine_config::root() else {
+        eprintln!("this machine has no home directory, so it has no installed agents");
+        std::process::exit(1);
+    };
+    match agents::harness::sync_installed(&root.join("agents"), &root) {
+        Ok(report) => {
+            for entry in &report.entries {
+                println!(
+                    "{}: {} ({:?})",
+                    entry.package_ref.as_deref().unwrap_or("-"),
+                    entry.file,
+                    entry.outcome
+                );
+            }
+            println!("{}", report.summary());
+        }
+        Err(error) => {
+            eprintln!("agents sync failed: {error}");
+            std::process::exit(1);
+        }
+    }
+    agents_sync_codex_prefixes(&root.join("agents"));
+}
+
+// The Codex prefixes are per project: written to `<state_dir>/agent-prefix` of the workflow
+// project the current directory is in, and skipped (not an error) when there is none.
+fn agents_sync_codex_prefixes(agents_home: &std::path::Path) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let synced = agents::prefix::project_root_from(&cwd)
+        .and_then(|root| agents::prefix::sync_for_project(agents_home, &root));
+    let Some((out, report)) = synced else {
+        println!("no workflow project here: Codex prefixes skipped");
+        return;
+    };
+    for name in &report.written {
+        println!("codex prefix {name}: written");
+    }
+    for name in &report.unchanged {
+        println!("codex prefix {name}: unchanged");
+    }
+    for name in &report.removed {
+        println!("codex prefix {name}: removed");
+    }
+    for (name, message) in &report.errors {
+        eprintln!("codex prefix {name}: {message}");
+    }
+    println!(
+        "codex prefixes in {}: {} written, {} unchanged, {} removed, {} failed",
+        out.display(),
+        report.written.len(),
+        report.unchanged.len(),
+        report.removed.len(),
+        report.errors.len()
+    );
+}
+
 // `nucleos-core --workflow-package <name> <version> --from <project> --manifest <bundle.yaml>`:
 // copy a workflow out of a project into the library as a new version, and commit it there.
 // `--source <dir>` in place of the last two packages a tree laid out as the bundle itself
@@ -780,6 +843,10 @@ pub(super) async fn run_subcommand() -> bool {
     }
     if std::env::args().any(|a| a == "--workflow-package") {
         workflow_package().await;
+        return true;
+    }
+    if agents_sync_flag(&std::env::args().collect::<Vec<_>>()) {
+        agents_sync();
         return true;
     }
     false

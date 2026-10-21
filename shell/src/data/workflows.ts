@@ -1,6 +1,6 @@
 // §spec motor-de-workflows
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "./client";
+import { apiFetch, isApiRefusal } from "./client";
 import { keys } from "./keys";
 
 /**
@@ -235,14 +235,59 @@ function useWorkflowChange<TVariables extends { projectId: string }>(
   });
 }
 
+/**
+ * The daemon's `422 consent_required`: the listing it would accept and the digest that stands for it.
+ *
+ * The digest is only ever learned from this refusal, so a client re-sends the POST with
+ * `consent_digest` set to it once the person has agreed to exactly these commands.
+ */
+export interface ConsentRefusal {
+  digest: string;
+  consent: WorkflowConsent;
+}
+
+/** Read a `consent_required` refusal, or `null` for any other error. */
+export function consentFromRefusal(error: unknown): ConsentRefusal | null {
+  if (!isApiRefusal(error) || error.code !== "consent_required") return null;
+  const body = error.body as Record<string, unknown> | undefined;
+  if (typeof body !== "object" || body === null || typeof body.digest !== "string") return null;
+  const commands = Array.isArray(body.commands) ? (body.commands as ConsentCommand[]) : [];
+  const removed = Array.isArray(body.removed) ? (body.removed as ConsentRemoved[]) : [];
+  return {
+    digest: body.digest,
+    consent: {
+      version: typeof body.version === "string" ? body.version : "",
+      baseline: typeof body.baseline === "string" ? body.baseline : null,
+      baseline_source: body.baseline_source === "project" || body.baseline_source === "library"
+        ? body.baseline_source
+        : undefined,
+      commands,
+      removed,
+    },
+  };
+}
+
+/** Whether two listings let exactly the same commands run, ignoring presentation fields. */
+export function sameCommands(a: WorkflowConsent, b: WorkflowConsent): boolean {
+  const key = (consent: WorkflowConsent) =>
+    JSON.stringify(
+      consent.commands.map((line) => [line.node, line.command, line.cwd, line.change]),
+    );
+  return key(a) === key(b);
+}
+
 export function useInstallWorkflow() {
-  return useWorkflowChange<{ projectId: string; name: string; version: string }>(
-    ({ projectId, name, version }) => ({
-      path: `/projects/${encodeURIComponent(projectId)}/workflows`,
-      method: "POST",
-      body: { name, version },
-    }),
-  );
+  return useWorkflowChange<{
+    projectId: string;
+    name: string;
+    version: string;
+    consentDigest?: string;
+  }>(({ projectId, name, version, consentDigest }) => ({
+    path: `/projects/${encodeURIComponent(projectId)}/workflows`,
+    method: "POST",
+    body:
+      consentDigest === undefined ? { name, version } : { name, version, consent_digest: consentDigest },
+  }));
 }
 
 export function useEjectWorkflow() {
@@ -254,15 +299,21 @@ export function useEjectWorkflow() {
 }
 
 export function useUpdateWorkflow() {
-  return useWorkflowChange<{ projectId: string; name: string; version?: string }>(
-    ({ projectId, name, version }) => ({
-      path: `/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(name)}/update`,
-      method: "POST",
-      // Absent means the newest the library has. The page always sends what it showed, so the
-      // button cannot install something other than what its label says.
-      body: version === undefined ? {} : { version },
-    }),
-  );
+  return useWorkflowChange<{
+    projectId: string;
+    name: string;
+    version?: string;
+    consentDigest?: string;
+  }>(({ projectId, name, version, consentDigest }) => ({
+    path: `/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(name)}/update`,
+    method: "POST",
+    // Absent means the newest the library has. The page always sends what it showed, so the
+    // button cannot install something other than what its label says.
+    body: {
+      ...(version === undefined ? {} : { version }),
+      ...(consentDigest === undefined ? {} : { consent_digest: consentDigest }),
+    },
+  }));
 }
 
 export function useForgetWorkflow() {

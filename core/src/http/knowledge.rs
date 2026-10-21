@@ -210,6 +210,9 @@ pub(super) async fn create_job(
                 // route's: the catalogue can change between a request being written and it landing,
                 // and the answer has to be read where the row is made.
                 team_id: request.team_id.as_deref(),
+                // D13: `None` is `autopilot`. Only a workflow the project pins resolves; any other
+                // name is `NoGraph`, so the caller picks among the owner's pins and nothing else.
+                workflow: request.workflow.as_deref(),
             },
         )
         .await
@@ -229,6 +232,11 @@ pub(super) async fn create_job(
         // that names something that does not. The same status `resolve_start` gives a project that
         // is real but configured differently from what the request assumed.
         crate::execution::job::JobStart::NoTeam(reason) => {
+            Err((StatusCode::UNPROCESSABLE_ENTITY, reason))
+        }
+        // A pinned workflow whose graph cannot be read or parsed: the same kind of answer as a
+        // missing team (a configuration the caller can fix), never a 500.
+        crate::execution::job::JobStart::NoGraph(reason) => {
             Err((StatusCode::UNPROCESSABLE_ENTITY, reason))
         }
         // Past the INSERT: the row existed and `fail_early` retired it and said so in the feed. 500

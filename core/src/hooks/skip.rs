@@ -74,7 +74,7 @@ pub(super) const NODES_THAT_GIVE_UP: [&str; 2] = ["review", "replan"];
 /// still be `running`. Loud, and recoverable by hand — where a job stalled on a live item is not.
 pub(super) async fn put_the_item_down(pool: &sqlx::SqlitePool, job_id: i64, run_id: i64) -> bool {
     let marked = sqlx::query(
-        "UPDATE job_items SET status = ? WHERE job_id = ? AND run_id = ? AND status = 'running'",
+        "UPDATE job_nodes SET status = ? WHERE job_id = ? AND run_id = ? AND status = 'running'",
     )
     .bind(crate::execution::job::STATUS_SKIPPED)
     .bind(job_id)

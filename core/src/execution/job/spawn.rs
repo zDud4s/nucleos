@@ -85,6 +85,8 @@ pub(super) async fn say_once(pool: &SqlitePool, job: &JobRow, kind: &str, summar
 /// the caller's `JobView` already carries.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ItemClaim {
+    // M4: carry the fan's `node_id` here and thread it into the `(job_id, ordinal)` lookups once a
+    // second fan can exist; until then autopilot's single fan makes `(job_id, ordinal)` unique.
     pub(super) ordinal: usize,
     /// The status the item is in right now: `pending` for an item nobody has attempted, `gate_failed`
     /// for one the gate rejected with a retry left. Also what [`release_item`] puts back, so a claim
@@ -107,7 +109,7 @@ pub(super) struct ItemClaim {
 pub(super) async fn item_provisioning(
     pool: &SqlitePool,
     job: &JobRow,
-    stage: &'static str,
+    stage: &str,
     ordinal: usize,
 ) -> Option<crate::execution::runs::JobItem> {
     let team_id: Option<String> =
@@ -121,7 +123,7 @@ pub(super) async fn item_provisioning(
     team_id?;
 
     let item_id: i64 =
-        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+        sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = ?")
             .bind(job.id)
             .bind(ordinal as i64)
             .fetch_optional(pool)
@@ -138,7 +140,7 @@ pub(super) async fn item_provisioning(
     Some(crate::execution::runs::JobItem {
         job_id: job.id,
         item_id,
-        stage,
+        stage: stage.to_owned(),
         base,
         // Filled by `spawn_node` once the loadout is resolved.
         loadout: None,
@@ -163,7 +165,7 @@ pub(super) async fn catch_up_the_item(
     ordinal: usize,
 ) -> Option<String> {
     let item_id: i64 =
-        sqlx::query_scalar("SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?")
+        sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = ?")
             .bind(job.id)
             .bind(ordinal as i64)
             .fetch_optional(pool)
@@ -234,7 +236,7 @@ pub(super) async fn node_loadout(
         return (team, None, Vec::new());
     };
     let row = match sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT agent_id, files FROM job_items WHERE job_id = ? AND ordinal = ?",
+        "SELECT agent_id, files FROM job_nodes WHERE job_id = ? AND ordinal = ?",
     )
     .bind(job.id)
     .bind(ordinal as i64)
@@ -255,16 +257,38 @@ pub(super) async fn node_loadout(
     (team, agent, files)
 }
 
+/// Everything `spawn_node` needs to know about WHAT it is starting.
+pub(super) struct NodeSpec<'a> {
+    /// Becomes `runs.stage`.
+    pub node_id: &'a str,
+    /// The fan instance being started, as before; `None` for a singleton node.
+    pub claim: Option<ItemClaim>,
+    /// What the launcher decided: the prompt, and the engine restriction, pin and output check that
+    /// travel to the router. `NodeLaunch::plain(prompt)` for the hard-coded arms.
+    pub launch: super::dispatch::NodeLaunch,
+}
+
 pub(super) async fn spawn_node(
     state: &AppState,
     job: &JobRow,
-    stage: &'static str,
-    prompt: String,
-    item: Option<ItemClaim>,
+    spec: NodeSpec<'_>,
     worktree: (PathBuf, String),
     no_room: NoRoom,
-) -> Step {
+) -> Pass {
     let pool = &state.pool;
+    let NodeSpec {
+        node_id: stage,
+        claim: item,
+        launch,
+    } = spec;
+    // The engine-side half of the launch travels to the run; the prompt is extended below.
+    let route = crate::execution::runs::NodeLaunchRoute {
+        restrict_runners: launch.restrict_runners.clone(),
+        pin: launch.pin.clone(),
+        judged_later: launch.output.is_some(),
+        effort: launch.effort.clone(),
+    };
+    let prompt = launch.prompt;
 
     // Claimed BEFORE the run exists, so a creation that succeeds and a bookkeeping write that fails
     // cannot leave an item looking untouched while a node works on it — the next pass would start a
@@ -279,7 +303,7 @@ pub(super) async fn spawn_node(
     // `brief::item_verdict` reads the stored verdict before it falls back to the latest run.
     if let Some(ItemClaim { ordinal, held }) = item {
         let claimed = sqlx::query(
-            "UPDATE job_items SET status = 'running', gate_status = NULL
+            "UPDATE job_nodes SET status = 'running', gate_status = NULL
              WHERE job_id = ? AND ordinal = ? AND status = ?",
         )
         .bind(job.id)
@@ -289,10 +313,10 @@ pub(super) async fn spawn_node(
         .await;
         match claimed {
             Ok(result) if result.rows_affected() == 1 => {}
-            Ok(_) => return Step::Stopped,
+            Ok(_) => return Pass::Stopped,
             Err(error) => {
                 tracing::warn!(job_id = job.id, %error, "could not claim a job item");
-                return Step::Stopped;
+                return Pass::Stopped;
             }
         }
     }
@@ -382,7 +406,7 @@ pub(super) async fn spawn_node(
     //
     // Keyed on the item and on the team together, and both halves matter. Without a team there is
     // no reason to pay for a second checkout, and the sequential job is what this must not change.
-    // Without an item there is nothing to name a tree after: a plan node has no row in `job_items`,
+    // Without an item there is nothing to name a tree after: a plan node has no row in `job_nodes`,
     // and a review node reads the branch the whole job produced rather than any one item's.
     let own_tree = match item {
         Some(ItemClaim { ordinal, .. }) => item_provisioning(pool, job, stage, ordinal).await,
@@ -408,11 +432,12 @@ pub(super) async fn spawn_node(
                 job.project_root.clone(),
                 crate::execution::runs::JobNode {
                     job_id: job.id,
-                    stage,
+                    stage: stage.to_owned(),
                     worktree_path: path.to_string_lossy().into_owned(),
                     branch,
                     item_ordinal: item.as_ref().map(|claim| claim.ordinal),
                     loadout: run_tools.clone(),
+                    launch: route,
                 },
             )
             .await
@@ -435,7 +460,7 @@ pub(super) async fn spawn_node(
             if let Some(briefing) = briefing.as_ref() {
                 let item_id = match item {
                     Some(ItemClaim { ordinal, .. }) => match sqlx::query_scalar(
-                        "SELECT id FROM job_items WHERE job_id = ? AND ordinal = ?",
+                        "SELECT id FROM job_nodes WHERE job_id = ? AND ordinal = ?",
                     )
                     .bind(job.id)
                     .bind(ordinal as i64)
@@ -462,47 +487,40 @@ pub(super) async fn spawn_node(
             }
             // Whether the job was still live to record the node against. `None` is a write that
             // failed, which says nothing about the job and is left alone as before.
-            let still_live = if let Some(ItemClaim { ordinal, .. }) = item {
-                if let Err(error) =
-                    sqlx::query("UPDATE job_items SET run_id = ? WHERE job_id = ? AND ordinal = ?")
+            if let Some(ItemClaim { ordinal, .. }) = item
+                && let Err(error) =
+                    sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ? AND ordinal = ?")
                         .bind(run_id)
                         .bind(job.id)
                         .bind(ordinal as i64)
                         .execute(pool)
                         .await
-                {
-                    // Said out loud: an item that does not name its node is judged without it.
-                    tracing::warn!(job_id = job.id, run_id, ordinal, %error, "could not record a node on its item");
-                }
-                // Denormalised on purpose: the item statuses are what a resume actually reads, and
-                // this is here so a row nobody joins does not read as a lie.
-                sqlx::query(concat!(
-                    "UPDATE jobs SET status = 'implementing', stage_cursor = ?
-                     WHERE id = ? AND status IN ",
-                    live_statuses_sql!()
-                ))
-                .bind(ordinal as i64)
+            {
+                // Said out loud: an item that does not name its node is judged without it.
+                tracing::warn!(job_id = job.id, run_id, ordinal, %error, "could not record a node on its item");
+            }
+            // A singleton node of a bundle graph is linked to its run the same way: its row was
+            // opened `running` by `dispatch_agent_node`, and landing finds the run through it.
+            // The autopilot's own singleton nodes have no running row, so this touches nothing.
+            if item.is_none()
+                && let Err(error) = sqlx::query(
+                    "UPDATE job_nodes SET run_id = ?
+                     WHERE job_id = ? AND node_id = ? AND round = ? AND ordinal IS NULL
+                       AND status = 'running'",
+                )
+                .bind(run_id)
                 .bind(job.id)
+                .bind(stage)
+                .bind(job.round)
                 .execute(pool)
                 .await
-                .ok()
-                .map(|moved| moved.rows_affected() > 0)
-            } else if stage == "review" {
-                set_live_status(pool, job.id, "reviewing").await.ok()
-            } else {
-                // A spec, plan or replan node moves no status of its own, so it only READS whether
-                // the job is still live. It used to answer `None` here, and a cancel that landed
-                // while one of these nodes was being created left it running on a dead job.
-                sqlx::query_scalar::<_, i64>(concat!(
-                    "SELECT COUNT(*) FROM jobs WHERE id = ? AND status IN ",
-                    live_statuses_sql!()
-                ))
-                .bind(job.id)
-                .fetch_one(pool)
-                .await
-                .ok()
-                .map(|live| live > 0)
-            };
+            {
+                tracing::warn!(job_id = job.id, run_id, stage, %error, "could not record a node on its row");
+            }
+            // No node moves the job's status: what the job is doing is derived from its nodes and
+            // runs. Every node only READS whether the job is still live, so a cancel that landed
+            // while one was being created does not leave it running on a dead job.
+            let still_live = job_is_live(pool, job.id).await.ok();
             if still_live == Some(false) {
                 // The job ended while this node was being created — a cancel that swept the job's
                 // runs before this one existed. Left running, it would edit a tree nobody drives
@@ -514,7 +532,7 @@ pub(super) async fn spawn_node(
                 );
                 crate::execution::runs::finalize_termination(state, run_id, STATUS_CANCELLED).await;
             }
-            Step::Stopped
+            Pass::Stopped
         }
         // Decision 15: nobody holds the project's exclusivity slot between two of a job's nodes, so
         // an ordinary run can take it. Losing that race is not a failure of the work — the worktree
@@ -536,7 +554,7 @@ pub(super) async fn spawn_node(
                 // out smaller than the fold proposed. Parking here would tell a reader the job is
                 // blocked while it is in fact working, and the park would be lifted by the next
                 // tick anyway.
-                NoRoom::ShrinkTheBatch => Step::Stopped,
+                NoRoom::ShrinkTheBatch => Pass::Stopped,
             }
         }
         // The same trade as a held slot — the work is untouched, so the job parks and the next pass
@@ -560,7 +578,7 @@ pub(super) async fn spawn_node(
                     )
                     .await
                 }
-                NoRoom::ShrinkTheBatch => Step::Stopped,
+                NoRoom::ShrinkTheBatch => Pass::Stopped,
             }
         }
         // A database error is the store hiccuping, not the work being wrong: the item goes back and
@@ -573,7 +591,7 @@ pub(super) async fn spawn_node(
                 %error,
                 "could not create the {stage} node's run; trying again next tick"
             );
-            Step::Stopped
+            Pass::Stopped
         }
         Err(error) => {
             release_item(pool, job, item).await;
@@ -585,7 +603,7 @@ pub(super) async fn spawn_node(
                 &format!("job {} could not start its {stage} node: {error}", job.id),
             )
             .await;
-            Step::Stopped
+            Pass::Stopped
         }
     }
 }
@@ -612,7 +630,7 @@ pub(super) async fn release_item(pool: &SqlitePool, job: &JobRow, item: Option<I
     };
     crate::storage::settle_write("job item release", job.id, || {
         sqlx::query(
-            "UPDATE job_items
+            "UPDATE job_nodes
          SET status = ?,
              gate_status = CASE WHEN ? = 'gate_failed' THEN 'failed' ELSE gate_status END
          WHERE job_id = ? AND ordinal = ? AND status = 'running'",
@@ -627,11 +645,11 @@ pub(super) async fn release_item(pool: &SqlitePool, job: &JobRow, item: Option<I
 }
 
 /// Parks a job, and says so once rather than every thirty seconds.
-pub(super) async fn park(state: &AppState, job: &JobRow, reason: &str, detail: &str) -> Step {
+pub(super) async fn park(state: &AppState, job: &JobRow, reason: &str, detail: &str) -> Pass {
     let pool = &state.pool;
     if let Err(error) = wait(pool, job.id, reason).await {
         tracing::warn!(job_id = job.id, %error, "could not park a job");
-        return Step::Stopped;
+        return Pass::Stopped;
     }
     // Only when the reason changed. A job parked for three hours would otherwise write a feed row
     // every tick, which is 360 lines saying the same thing and a feed nobody reads afterwards.
@@ -644,7 +662,7 @@ pub(super) async fn park(state: &AppState, job: &JobRow, reason: &str, detail: &
         )
         .await;
     }
-    Step::Stopped
+    Pass::Stopped
 }
 
 #[cfg(test)]

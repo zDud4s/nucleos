@@ -17,6 +17,7 @@
 #![allow(clippy::new_without_default, clippy::should_implement_trait)]
 
 pub use nucleos_base::agent;
+pub mod agents;
 pub mod analytics;
 pub mod analytics_pipeline;
 pub mod assistant;

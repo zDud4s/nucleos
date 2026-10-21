@@ -13,7 +13,7 @@ Repo-local first is the point: `~/.agents/skills/` is shared by every project on
 
 ## Dispatch contract
 
-A controller never substitutes its own model for a configured workflow phase. For every phase (`plan`, `execute`, `review`, `rescue`, `maintenance`, `bootstrap`):
+A controller never substitutes its own model for a configured workflow phase. For every phase (`plan`, `execute`, `review`, `rescue`, `maintenance`, `bootstrap`, `run_pipeline.synthesize`):
 
 1. Read `<phase>.tool` and `<phase>.model` from `<state_dir>/models.yaml`.
 2. Build a standalone prompt packet for that phase, containing:
@@ -128,6 +128,7 @@ Each phase has exactly one skill, named after the phase:
 | `rescue` | `rescue` |
 | `maintenance` | `maintenance` |
 | `bootstrap` | `bootstrap` |
+| `run_pipeline.synthesize` | `synthesizer` |
 
 `claude` and `codex` are **not** phase skills. They are named after tools, and they teach a controller how to reach that tool — `subagent_type`, `timeout`, flags, how to read tokens out of the output. A dispatched phase needs none of it and is forbidden from acting on any of it: they are instructions addressed to the controller, which the one-controller-per-node rule would then have to forbid the phase from following. The executor has its own skill, and the bridge stays with the controller.
 
@@ -189,6 +190,7 @@ The Task tool returns the phase output directly. Apply the same exit/escalation 
 | `rescue` | `wf-rescue` | Read, Glob, Grep |
 | `maintenance` | `wf-maintenance` | Read, Glob, Grep, Edit, Write, Bash |
 | `bootstrap` | `wf-bootstrap` | Read, Glob, Grep, Edit, Write, Bash |
+| `run_pipeline.synthesize` | `wf-synthesizer` | Read, Glob, Grep |
 | `orchestrate_node` | `wf-orchestrator` | Read, Glob, Grep, Write, Agent, mcp__nucleos__node_open, mcp__nucleos__node_update, mcp__nucleos__node_close, mcp__nucleos__node_tree, mcp__nucleos__node_active, mcp__nucleos__record, mcp__nucleos__verify, mcp__nucleos__verify_status |
 
 The definitions live in `.claude/agents/wf-<phase>.md` (`wf-orchestrator.md` for `orchestrate_node`); the `tools:` line in each is the allowlist the harness actually enforces.

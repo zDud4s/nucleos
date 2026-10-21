@@ -150,6 +150,52 @@ function Lead({ consent }: { consent: WorkflowConsent }) {
   );
 }
 
+/**
+ * A listing that is already in hand: the lead, every command, and the dropped ones.
+ *
+ * The panel below reads it from `GET .../consent`; the new-project wizard has no pin to ask about
+ * yet and gets it from the daemon's `consent_required` refusal instead.
+ */
+export function ConsentListing({ consent }: { consent: WorkflowConsent }) {
+  // Moved commands first, because they are the ones that did not run yesterday.
+  const rank = { changed: 0, new: 1, unchanged: 2 } as const;
+  const ordered =
+    consent.baseline === null
+      ? consent.commands
+      : // `sort` is stable, so the bundle's own order holds inside each group.
+        [...consent.commands].sort((a, b) => rank[a.change] - rank[b.change]);
+
+  return (
+    <>
+      <Lead consent={consent} />
+      {ordered.length > 0 ? (
+        <ul aria-label="Commands" className="flex flex-col gap-3">
+          {ordered.map((line) => (
+            <CommandItem key={line.node} line={line} />
+          ))}
+        </ul>
+      ) : null}
+      {consent.removed.length > 0 ? (
+        <div className="flex flex-col gap-1">
+          <p className="text-xs text-text-muted">No longer in {consent.version}:</p>
+          <ul aria-label="Dropped commands" className="flex flex-col gap-2">
+            {consent.removed.map((gone) => (
+              <li key={gone.node} className="flex flex-col gap-0.5">
+                <span className="text-xs text-text-muted">
+                  {gone.node}, {whereText(gone.cwd)}
+                </span>
+                <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text-muted">
+                  {gone.command}
+                </pre>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 export function WorkflowConsentPanel({
   projectId,
   name,
@@ -163,16 +209,6 @@ export function WorkflowConsentPanel({
 }: WorkflowConsentPanelProps) {
   const consent = useWorkflowConsent(projectId, name, version);
   const self = useFocusOnMount<HTMLDivElement>();
-
-  // Moved commands first, because they are the ones that did not run yesterday.
-  const rank = { changed: 0, new: 1, unchanged: 2 } as const;
-  const ordered =
-    consent.data === undefined
-      ? []
-      : consent.data.baseline === null
-        ? consent.data.commands
-        : // `sort` is stable, so the bundle's own order holds inside each group.
-          [...consent.data.commands].sort((a, b) => rank[a.change] - rank[b.change]);
 
   // Nothing is agreed to until the list has been read: a control that fired before the commands
   // arrived would be a consent to text nobody saw.
@@ -206,33 +242,7 @@ export function WorkflowConsentPanel({
       ) : consent.data === undefined ? (
         <p className="text-sm text-text-faint">Reading the commands…</p>
       ) : (
-        <>
-          <Lead consent={consent.data} />
-          {ordered.length > 0 ? (
-            <ul aria-label="Commands" className="flex flex-col gap-3">
-              {ordered.map((line) => (
-                <CommandItem key={line.node} line={line} />
-              ))}
-            </ul>
-          ) : null}
-          {consent.data.removed.length > 0 ? (
-            <div className="flex flex-col gap-1">
-              <p className="text-xs text-text-muted">No longer in {consent.data.version}:</p>
-              <ul aria-label="Dropped commands" className="flex flex-col gap-2">
-                {consent.data.removed.map((gone) => (
-                  <li key={gone.node} className="flex flex-col gap-0.5">
-                    <span className="text-xs text-text-muted">
-                      {gone.node}, {whereText(gone.cwd)}
-                    </span>
-                    <pre className="whitespace-pre-wrap break-all font-mono text-xs text-text-muted">
-                      {gone.command}
-                    </pre>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-        </>
+        <ConsentListing consent={consent.data} />
       )}
 
       <div className="flex flex-wrap items-center gap-3">

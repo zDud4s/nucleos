@@ -30,7 +30,7 @@ pub enum ItemState {
     /// retry would answer a gate whose verdict was about a repository that no longer exists — and a
     /// red gate caused by somebody else's merge would not be fixable from here at all.
     ///
-    /// Never stored. `job_items.status` says `gate_failed` either way; this state is what
+    /// Never stored. `job_nodes.status` says `gate_failed` either way; this state is what
     /// `item_state_from` makes of that status once it has read the attempt count beside the job's
     /// budget, and neither number means anything alone.
     GateRetriable,
@@ -415,6 +415,44 @@ impl ItemView {
     }
 }
 
+/// What a queue that has to stop answers with.
+///
+/// `GateErrored` is apart from `Finish(Outcome::GateErrored)` because a graph walker names the gate
+/// node that would not run, while the old decision only ends the job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Halt {
+    Finish(Outcome),
+    GateErrored,
+}
+
+/// PURE: the first item, in order, that halts the queue, and how.
+///
+/// The short-circuit of `next_step` (the loop that used to sit at its top), extracted so a walker
+/// over the same items applies the identical rules. `Failed` and `GateErrored` halt only a job
+/// without a team (a team's broken item sits in a tree of its own), `Failed` also not where
+/// `may_go_round` licenses walking past it; `Cancelled` and `RevertFailed` halt in every job.
+pub(crate) fn queue_halt(
+    items: &[ItemView],
+    has_team: bool,
+    may_go_round: bool,
+) -> Option<(usize, Halt)> {
+    let broken_item_ends_the_queue = !may_go_round;
+    for (ordinal, item) in items.iter().enumerate() {
+        match item.state {
+            ItemState::Failed if !has_team && broken_item_ends_the_queue => {
+                return Some((ordinal, Halt::Finish(Outcome::Failed)));
+            }
+            ItemState::Cancelled => return Some((ordinal, Halt::Finish(Outcome::Cancelled))),
+            ItemState::GateErrored if !has_team => return Some((ordinal, Halt::GateErrored)),
+            // Team or not: the job's branch still holds work the gate rejected, and carrying on
+            // would build the rest of the queue on top of it.
+            ItemState::RevertFailed => return Some((ordinal, Halt::Finish(Outcome::Stopped))),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Decides a job's next move from what is observable about it.
 ///
 /// Pure, and kept that way on purpose — the same split `classifier.rs` has from `hooks.rs`. Every
@@ -469,19 +507,15 @@ pub fn next_step(job: &JobView) -> Next {
     // Measured 2026-08-30: job 23's item was implemented, gated red, retried — and its retry was
     // killed mid-flight, which marked the item `failed` and ended the job with three items never
     // attempted. Nothing about those three was broken.
-    let broken_item_ends_the_queue = !job.rounds.a_broken_item_may_go_round_again;
-    for item in job.items.iter().map(|item| &item.state) {
-        match item {
-            ItemState::Failed if !job.has_team && broken_item_ends_the_queue => {
-                return Next::Finish(Outcome::Failed);
-            }
-            ItemState::Cancelled => return Next::Finish(Outcome::Cancelled),
-            ItemState::GateErrored if !job.has_team => return Next::Finish(Outcome::GateErrored),
-            // Team or not: the job's branch still holds work the gate rejected, and carrying on
-            // would build the rest of the queue on top of it.
-            ItemState::RevertFailed => return Next::Finish(Outcome::Stopped),
-            _ => {}
-        }
+    if let Some((_, halt)) = queue_halt(
+        &job.items,
+        job.has_team,
+        job.rounds.a_broken_item_may_go_round_again,
+    ) {
+        return Next::Finish(match halt {
+            Halt::Finish(outcome) => outcome,
+            Halt::GateErrored => Outcome::GateErrored,
+        });
     }
 
     // Before the plan, because a queue built from a misread request is a queue every node after it
@@ -646,7 +680,7 @@ pub(super) fn the_skip_decided(view: &JobView) -> bool {
 
 /// Who the director gave this item to, in their own words, or `None`.
 ///
-/// **The prompt is read NOW and not stored on the row**, which is what makes `job_items.agent_id` a
+/// **The prompt is read NOW and not stored on the row**, which is what makes `job_nodes.agent_id` a
 /// reference rather than a copy. An owner who edits an agent between the plan and the run gets the
 /// edited agent doing the work, which is the behaviour a catalogue is for: the alternative freezes a
 /// persona at plan time and leaves the owner unable to say why their correction had no effect.
@@ -715,23 +749,27 @@ pub(super) async fn persona_for(pool: &SqlitePool, agent_id: Option<&str>) -> Op
 /// because the set is a statement about which states hold paths, and a set that is only right
 /// because of the order of the checks above it is a set that breaks silently when that order moves.
 pub(super) fn batch_of(job: &JobView) -> Vec<usize> {
-    let running = job
-        .items
+    batch_over(&job.items, job.max_parallel)
+}
+
+/// PURE: [`batch_of`] over a bare queue and a ceiling, for callers that hold no `JobView`.
+pub(crate) fn batch_over(items: &[ItemView], ceiling: usize) -> Vec<usize> {
+    let running = items
         .iter()
         .filter(|item| item.state == ItemState::Running)
         .count();
     let mut batch: Vec<usize> = Vec::new();
     let mut taken: Vec<&str> = Vec::new();
 
-    for (ordinal, item) in job.items.iter().enumerate() {
-        if batch.len() + running >= job.max_parallel {
+    for (ordinal, item) in items.iter().enumerate() {
+        if batch.len() + running >= ceiling {
             break;
         }
         if item.state.claimable_as().is_none() {
             continue;
         }
         let landed = item.depends_on.iter().all(|dependency| {
-            job.items
+            items
                 .get(*dependency as usize)
                 .is_some_and(|dependency| dependency.state == ItemState::Passed)
         });
@@ -740,7 +778,7 @@ pub(super) fn batch_of(job: &JobView) -> Vec<usize> {
         }
         let clashes = item.files.iter().any(|file| {
             taken.contains(&file.as_str())
-                || job.items.iter().enumerate().any(|(other, mate)| {
+                || items.iter().enumerate().any(|(other, mate)| {
                     other != ordinal && holds_paths(mate.state) && mate.files.contains(file)
                 })
         });
@@ -779,7 +817,7 @@ pub(super) fn holds_paths(state: ItemState) -> bool {
 /// about the prerequisite before any of it can happen.
 ///
 /// `Cancelled` is here for completeness and never decides: it stops the job at the short-circuit.
-pub(super) fn never_lands(state: ItemState) -> bool {
+pub(crate) fn never_lands(state: ItemState) -> bool {
     matches!(
         state,
         ItemState::Failed
@@ -920,35 +958,30 @@ pub(super) fn ending(job: &JobView) -> Outcome {
 /// `Superseded` is absent too, and that absence is the point of the state: a later round took the
 /// failure over, and the item that did is the one read here.
 pub(super) fn failed_ending(job: &JobView) -> Option<Outcome> {
-    if job
-        .items
+    failed_ending_of(&job.items)
+}
+
+/// PURE: [`failed_ending`] over a bare queue, for callers that hold no `JobView`.
+pub(crate) fn failed_ending_of(items: &[ItemView]) -> Option<Outcome> {
+    if items
         .iter()
         .any(|item| item.state == ItemState::RevertFailed)
     {
         return Some(Outcome::Stopped);
     }
-    if job
-        .items
+    if items
         .iter()
         .any(|item| item.state == ItemState::GateErrored)
     {
         return Some(Outcome::GateErrored);
     }
-    if job.items.iter().any(|item| item.state == ItemState::Failed) {
+    if items.iter().any(|item| item.state == ItemState::Failed) {
         return Some(Outcome::Failed);
     }
-    if job
-        .items
-        .iter()
-        .any(|item| item.state == ItemState::GateFailed)
-    {
+    if items.iter().any(|item| item.state == ItemState::GateFailed) {
         return Some(Outcome::GateFailed);
     }
-    if job
-        .items
-        .iter()
-        .any(|item| item.state == ItemState::Orphaned)
-    {
+    if items.iter().any(|item| item.state == ItemState::Orphaned) {
         return Some(Outcome::Failed);
     }
     None
@@ -1009,7 +1042,7 @@ pub fn item_state_from(status: &str, gate_attempts: i64, gate_retries: i64) -> I
 }
 
 impl ItemState {
-    /// PURE: the `job_items.status` a startable item is sitting in, or `None` if it is not startable.
+    /// PURE: the `job_nodes.status` a startable item is sitting in, or `None` if it is not startable.
     ///
     /// The inverse of [`item_state_from`], and kept against it rather than anywhere near the SQL on
     /// purpose. `spawn_node` claims an item with a compare-and-swap that has to name the status it
@@ -1025,7 +1058,7 @@ impl ItemState {
     ///
     /// `None` for everything else, including the terminal states. An item that is not work cannot be
     /// claimed, and answering with a status for one would let a caller start a node on finished work.
-    pub(super) fn claimable_as(self) -> Option<&'static str> {
+    pub(crate) fn claimable_as(self) -> Option<&'static str> {
         match self {
             ItemState::Pending => Some("pending"),
             ItemState::GateRetriable => Some("gate_failed"),
@@ -1060,19 +1093,6 @@ impl ItemState {
 /// review sits paused on a question nobody has been shown yet.
 pub(super) fn node_in_flight(status: &str) -> bool {
     matches!(status, "running" | "awaiting_approval")
-}
-
-/// The stage a job is really at, seeing through a parked one.
-///
-/// `waiting` overwrites the status underneath it, and exactly one of those carries meaning the job
-/// cannot reconstruct: `planning` says the queue does not exist yet. A job parked for budget while
-/// still planning would otherwise resume as planned-with-an-empty-queue, which is the honest
-/// "there was no work" night, and report itself complete without having planned anything.
-pub(super) fn effective_status<'a>(status: &'a str, resume_status: Option<&'a str>) -> &'a str {
-    match (status, resume_status) {
-        (status, Some(stage)) if is_paused(status) => stage,
-        _ => status,
-    }
 }
 
 /// The statuses that stand in front of a stage rather than replacing it.

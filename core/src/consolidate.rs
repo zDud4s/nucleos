@@ -1525,7 +1525,7 @@ mod tests {
         let job = sqlx::query(
             "INSERT INTO jobs
                (project_id, project_root, status, max_items, created_at)
-             VALUES (?, 'C:/Projects/nucleos', 'implementing', 4,
+             VALUES (?, 'C:/Projects/nucleos', 'running', 4,
                      '2026-09-30T00:00:00+00:00')",
         )
         .bind(PROJECT)

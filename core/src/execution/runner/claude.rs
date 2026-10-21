@@ -751,3 +751,24 @@ mod stdio_grace_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A workflow node id the runner has no role for (finding 8: "the default of each") routes
+    /// nowhere, even when every configured role is set.
+    #[test]
+    fn a_stage_it_does_not_know_has_no_configured_model() {
+        let configured = ClaudeCliRunner {
+            model: "claude-sonnet-5".to_string(),
+            plan_model: Some("claude-opus-4-8".to_string()),
+            review_model: Some("claude-haiku-4-5".to_string()),
+            resolve_model: Some("opus".to_string()),
+            resolve_effort: Some("high".to_string()),
+        };
+
+        assert_eq!(configured.model_for_stage(Some("triage")), None);
+        assert_eq!(configured.effort_for_stage(Some("triage")), None);
+    }
+}

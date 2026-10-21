@@ -600,9 +600,9 @@ mod tests {
             name: name.to_string(),
             speciality: format!("the speciality of {name}"),
             prompt: format!("The standing instructions of {name}."),
-            engine: "claude".to_string(),
+            engine: Some("claude".to_string()),
             model: Some("claude-opus-5".to_string()),
-            tool_policy: "mcp_only".to_string(),
+            capabilities: vec!["mcp.nucleos".to_string()],
         }
     }
 
@@ -2075,7 +2075,7 @@ mod tests {
         )
         .await;
         let mut asked = agent_request("Cetico");
-        asked.tool_policy = "none".to_string();
+        asked.capabilities = Vec::new();
         catalogue(&state.pool, asked).await;
 
         let id = start(&state, "why?", None).await.unwrap();
@@ -2090,6 +2090,43 @@ mod tests {
             "phase 1 is the phase that HAS tools, and this agent asked for none"
         );
         assert!(seen[0].mcp_config.is_none());
+    }
+
+    /// Spec 2026-10-20 R3: a package agent has no engine until the router picks one, and a seat's
+    /// kind is decided at load, so a package agent is refused as a seat.
+    #[tokio::test]
+    async fn a_package_agent_is_refused_as_a_council_seat() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let state = council_state(
+            runner,
+            Some(CouncilConfig {
+                timeout_seconds: 1,
+                rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
+                chairman: spec(SeatKind::Cloud, "the-chairman"),
+                members: vec![agent_spec("reviewer")],
+            }),
+        )
+        .await;
+        crate::agent::upsert_package_agent(
+            &state.pool,
+            &crate::agent::PackageAgentRow {
+                name: "reviewer".to_string(),
+                speciality: "reviews".to_string(),
+                prompt: "You review.".to_string(),
+                capabilities: vec!["fs.read".to_string()],
+                package_ref: "reviewer@1.0.0".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let outcome = start(&state, "why?", None).await;
+
+        assert!(
+            matches!(outcome, Err(StartError::Invalid(ref why)) if why.contains("no engine")),
+            "{outcome:?}"
+        );
     }
 
     /// Phase 2 is a blind vote, and giving seats identities put three new strings at risk of
@@ -2137,9 +2174,9 @@ mod tests {
                     name: name.to_string(),
                     speciality: speciality.to_string(),
                     prompt: prompt.to_string(),
-                    engine: "claude".to_string(),
+                    engine: Some("claude".to_string()),
                     model: Some("claude-opus-5".to_string()),
-                    tool_policy: "mcp_only".to_string(),
+                    capabilities: vec!["mcp.nucleos".to_string()],
                 },
             )
             .await;

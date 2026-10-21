@@ -262,7 +262,7 @@ pub(super) async fn feed_subject(pool: &SqlitePool, owner: Owner) -> Option<feed
         Owner::Run(run_id) => Some(feed::run_subject(pool, run_id).await),
         Owner::Job(job_id) => Some(feed::Subject::Job(job_id)),
         Owner::Item(item_id) => {
-            sqlx::query_scalar::<_, i64>("SELECT job_id FROM job_items WHERE id = ?")
+            sqlx::query_scalar::<_, i64>("SELECT job_id FROM job_nodes WHERE id = ?")
                 .bind(item_id)
                 .fetch_optional(pool)
                 .await

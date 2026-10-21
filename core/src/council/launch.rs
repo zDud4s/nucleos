@@ -118,10 +118,16 @@ pub(super) async fn resolve_seat(
             ))
         })?;
 
-    let kind = crate::config::seat_kind_for_engine(&agent.engine).ok_or_else(|| {
+    // A seat's `SeatKind` is decided here, and an agent with no engine of its own (every package
+    // agent) only gets one once the router has chosen — so it cannot hold a seat (spec 2026-10-20 R3).
+    let Some(engine) = agent.engine.as_deref() else {
+        return Err(StartError::Invalid(format!(
+            "{who} names the agent `{agent_id}`, which declares no engine — a package agent              cannot take a council seat"
+        )));
+    };
+    let kind = crate::config::seat_kind_for_engine(engine).ok_or_else(|| {
         StartError::Invalid(format!(
-            "{who} names the agent `{agent_id}`, whose engine `{}` is not one a seat can run",
-            agent.engine
+            "{who} names the agent `{agent_id}`, whose engine `{engine}` is not one a seat can run"
         ))
     })?;
     // The check the file could not make: an agent's engine is a column, so only here is it known
@@ -149,10 +155,10 @@ pub(super) async fn resolve_seat(
         kind,
         model_ref,
         agent: Some(SeatAgent {
+            tool_policy: agent.tool_policy().to_owned(),
             id: agent.id,
             name: agent.name,
             prompt: agent.prompt,
-            tool_policy: agent.tool_policy,
         }),
     })
 }

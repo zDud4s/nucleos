@@ -1,10 +1,65 @@
 use serde::{Deserialize, Serialize};
 
+/// One abstract capability an agent may hold (spec 2026-10-20 §4/§5). The catalogue stores these
+/// and nothing else about tools: the runner's `ToolPolicy` is derived from them, never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capability {
+    FsRead,
+    FsWrite,
+    Shell,
+    Web,
+    MemoryRead,
+    McpNucleos,
+}
+
+impl Capability {
+    pub const ALL: &'static [Capability] = &[
+        Capability::FsRead,
+        Capability::FsWrite,
+        Capability::Shell,
+        Capability::Web,
+        Capability::MemoryRead,
+        Capability::McpNucleos,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FsRead => "fs.read",
+            Self::FsWrite => "fs.write",
+            Self::Shell => "shell",
+            Self::Web => "web",
+            Self::MemoryRead => "memory.read",
+            Self::McpNucleos => "mcp.nucleos",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Capability> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == text)
+    }
+}
+
+/// PURE: the runner policy name a capability set earns: `none`, `mcp_only` or `unrestricted`.
+/// The single place the derivation lives; the core maps the string onto its `ToolPolicy`.
+pub fn policy_str_for(caps: &[Capability]) -> &'static str {
+    if caps.is_empty() {
+        "none"
+    } else if caps.iter().any(|c| {
+        matches!(
+            c,
+            Capability::FsRead | Capability::FsWrite | Capability::Shell | Capability::Web
+        )
+    }) {
+        "unrestricted"
+    } else {
+        "mcp_only"
+    }
+}
+
 /// One named agent in the house catalogue.
 ///
 /// Deliberately not owned by a team: a council seat is not a member of any department, and the
 /// alternative — a catalogue per team — is the second place the same truth gets declared.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agent {
     pub id: String,
     pub name: String,
@@ -12,21 +67,94 @@ pub struct Agent {
     /// and not decoration.
     pub speciality: String,
     pub prompt: String,
-    pub engine: String,
+    /// `None` = the router decides (every package row; a user row that pins nothing).
+    pub engine: Option<String>,
     pub model: Option<String>,
-    pub tool_policy: String,
+    /// Canonical capability strings, stored as a JSON list.
+    pub capabilities: Vec<String>,
+    /// `package` | `user`.
+    pub source: String,
+    /// `reviewer@1.0.0`; set exactly when `source` is `package`.
+    pub package_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
+
+impl Agent {
+    /// The recognised capabilities; an unrecognised string is skipped (it cannot be stored).
+    pub fn capability_set(&self) -> Vec<Capability> {
+        self.capabilities
+            .iter()
+            .filter_map(|text| Capability::parse(text))
+            .collect()
+    }
+
+    /// `none` | `mcp_only` | `unrestricted`, derived from the capabilities.
+    pub fn tool_policy(&self) -> &'static str {
+        policy_str_for(&self.capability_set())
+    }
+
+    pub fn is_package(&self) -> bool {
+        self.source == "package"
+    }
+}
+
+/// The row as SQLite hands it over: `capabilities` is JSON text until `into_agent` decodes it.
+#[derive(sqlx::FromRow)]
+struct AgentRow {
+    id: String,
+    name: String,
+    speciality: String,
+    prompt: String,
+    engine: Option<String>,
+    model: Option<String>,
+    capabilities: String,
+    source: String,
+    package_ref: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl AgentRow {
+    fn into_agent(self) -> Agent {
+        Agent {
+            id: self.id,
+            name: self.name,
+            speciality: self.speciality,
+            prompt: self.prompt,
+            engine: self.engine,
+            model: self.model,
+            // The column is CHECK json_valid; a list of strings by construction of every writer.
+            capabilities: serde_json::from_str(&self.capabilities).unwrap_or_default(),
+            source: self.source,
+            package_ref: self.package_ref,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+const AGENT_COLUMNS: &str = "id, name, speciality, prompt, engine, model, capabilities, source,
+                             package_ref, created_at, updated_at";
 
 #[derive(Debug, Deserialize)]
 pub struct AgentRequest {
     pub name: String,
     pub speciality: String,
     pub prompt: String,
-    pub engine: String,
+    pub engine: Option<String>,
     pub model: Option<String>,
-    pub tool_policy: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// What the installer hands over for one factory package: the catalogue row it owns.
+pub struct PackageAgentRow {
+    pub name: String,
+    pub speciality: String,
+    pub prompt: String,
+    pub capabilities: Vec<String>,
+    pub package_ref: String,
 }
 
 #[derive(Debug)]
@@ -35,6 +163,8 @@ pub enum AgentError {
     Invalid(&'static str),
     NotFound,
     InUse,
+    /// A `package` row changes by shipping a new package version, never through the catalogue.
+    PackageReadOnly,
     Db(sqlx::Error),
 }
 
@@ -61,6 +191,8 @@ impl std::fmt::Display for AgentError {
             Self::InUse => formatter.write_str(
                 "that agent directs or belongs to a team, or is holding work that names it",
             ),
+            Self::PackageReadOnly => formatter
+                .write_str("that agent comes from an installed package and cannot be changed here"),
             Self::Db(error) => write!(formatter, "database error: {error}"),
         }
     }
@@ -70,7 +202,11 @@ impl std::error::Error for AgentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Db(error) => Some(error),
-            Self::DuplicateName | Self::Invalid(_) | Self::NotFound | Self::InUse => None,
+            Self::DuplicateName
+            | Self::Invalid(_)
+            | Self::NotFound
+            | Self::InUse
+            | Self::PackageReadOnly => None,
         }
     }
 }
@@ -82,9 +218,9 @@ impl std::error::Error for AgentError {
 /// the test that catches it needs both lists to be readable from one place.
 pub const ENGINES: &[&str] = &["claude", "codex", "local"];
 
-/// PURE: what an agent is allowed to declare about itself.
+/// PURE: what a `user` agent is allowed to declare about itself.
 ///
-/// `unrestricted` is refused rather than accepted-and-ignored. That policy exists for code runs
+/// A capability set deriving `unrestricted` is refused rather than accepted-and-ignored. That policy exists for code runs
 /// governed by the `PreToolUse` classifier (`runs::classifier_governs_tools`), and an agent of this
 /// catalogue has no worktree and no hook wired — accepting it would name a barrier that is not
 /// there. A `local` engine without a model is refused for the sibling reason: silently falling back
@@ -112,15 +248,25 @@ fn validate(request: &AgentRequest) -> Result<(), AgentError> {
             "speciality must not be empty — it is what a director reads to delegate",
         ));
     }
-    if !ENGINES.contains(&request.engine.as_str()) {
+    if let Some(engine) = &request.engine
+        && !ENGINES.contains(&engine.as_str())
+    {
         return Err(AgentError::Invalid("engine must be claude, codex or local"));
     }
-    if !matches!(request.tool_policy.as_str(), "mcp_only" | "none") {
+    let mut caps = Vec::with_capacity(request.capabilities.len());
+    for text in &request.capabilities {
+        match Capability::parse(text) {
+            Some(capability) => caps.push(capability),
+            None => return Err(AgentError::Invalid("unknown capability")),
+        }
+    }
+    if policy_str_for(&caps) == "unrestricted" {
         return Err(AgentError::Invalid(
-            "tool_policy must be mcp_only or none; unrestricted is for classifier-governed runs",
+            "capabilities must be mcp.nucleos and memory.read only; fs.*, shell and web are for \
+             packaged agents",
         ));
     }
-    if request.engine == "local" && request.model.is_none() {
+    if request.engine.as_deref() == Some("local") && request.model.is_none() {
         return Err(AgentError::Invalid("a local agent must name its model"));
     }
     Ok(())
@@ -162,9 +308,9 @@ pub async fn create(pool: &sqlx::SqlitePool, request: AgentRequest) -> Result<Ag
     }
     let now = chrono::Utc::now().to_rfc3339();
     let result = sqlx::query(
-        "INSERT INTO agents (id, name, speciality, prompt, engine, model, tool_policy,
-                             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agents (id, name, speciality, prompt, engine, model, capabilities,
+                             source, package_ref, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'user', NULL, ?, ?)",
     )
     .bind(&id)
     .bind(&request.name)
@@ -172,7 +318,7 @@ pub async fn create(pool: &sqlx::SqlitePool, request: AgentRequest) -> Result<Ag
     .bind(&request.prompt)
     .bind(&request.engine)
     .bind(&request.model)
-    .bind(&request.tool_policy)
+    .bind(capabilities_json(&request.capabilities))
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -184,25 +330,75 @@ pub async fn create(pool: &sqlx::SqlitePool, request: AgentRequest) -> Result<Ag
     }
 }
 
-pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<Agent>, AgentError> {
-    sqlx::query_as(
-        "SELECT id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at
-         FROM agents ORDER BY name",
+fn capabilities_json(capabilities: &[String]) -> String {
+    serde_json::to_string(capabilities).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// Installs or refreshes the catalogue row of one factory package. Keyed by the slug of its name;
+/// an id or name already held by a `user` row is a conflict, never an overwrite. `engine` and
+/// `model` stay NULL: the router decides, and the package never names a model.
+pub async fn upsert_package_agent(
+    pool: &sqlx::SqlitePool,
+    row: &PackageAgentRow,
+) -> Result<Agent, AgentError> {
+    let id = slug(&row.name);
+    if id.is_empty() {
+        return Err(AgentError::Invalid("name must contain a letter or a digit"));
+    }
+    if row
+        .capabilities
+        .iter()
+        .any(|text| Capability::parse(text).is_none())
+    {
+        return Err(AgentError::Invalid("unknown capability"));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "INSERT INTO agents (id, name, speciality, prompt, engine, model, capabilities,
+                             source, package_ref, created_at, updated_at)
+         VALUES (?, ?, ?, ?, NULL, NULL, ?, 'package', ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name, speciality = excluded.speciality, prompt = excluded.prompt,
+             capabilities = excluded.capabilities, package_ref = excluded.package_ref,
+             updated_at = excluded.updated_at
+         WHERE agents.source = 'package'",
     )
+    .bind(&id)
+    .bind(&row.name)
+    .bind(&row.speciality)
+    .bind(&row.prompt)
+    .bind(capabilities_json(&row.capabilities))
+    .bind(&row.package_ref)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await;
+    match result {
+        // The conflict clause's WHERE skipped a `user` row that owns the id.
+        Ok(result) if result.rows_affected() == 0 => Err(AgentError::DuplicateName),
+        Ok(_) => get(pool, &id).await?.ok_or(AgentError::NotFound),
+        Err(error) if is_unique_violation(&error) => Err(AgentError::DuplicateName),
+        Err(error) => Err(AgentError::Db(error)),
+    }
+}
+
+pub async fn list(pool: &sqlx::SqlitePool) -> Result<Vec<Agent>, AgentError> {
+    let rows: Vec<AgentRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {AGENT_COLUMNS} FROM agents ORDER BY name"
+    )))
     .fetch_all(pool)
-    .await
-    .map_err(AgentError::Db)
+    .await?;
+    Ok(rows.into_iter().map(AgentRow::into_agent).collect())
 }
 
 pub async fn get(pool: &sqlx::SqlitePool, id: &str) -> Result<Option<Agent>, AgentError> {
-    sqlx::query_as(
-        "SELECT id, name, speciality, prompt, engine, model, tool_policy, created_at, updated_at
-         FROM agents WHERE id = ?",
-    )
+    let row: Option<AgentRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {AGENT_COLUMNS} FROM agents WHERE id = ?"
+    )))
     .bind(id)
     .fetch_optional(pool)
-    .await
-    .map_err(AgentError::Db)
+    .await?;
+    Ok(row.map(AgentRow::into_agent))
 }
 
 /// The id is deliberately NOT recomputed from the new name: it is a reference, and
@@ -213,18 +409,23 @@ pub async fn update(
     request: AgentRequest,
 ) -> Result<Agent, AgentError> {
     validate(&request)?;
+    match get(pool, id).await? {
+        None => return Err(AgentError::NotFound),
+        Some(existing) if existing.is_package() => return Err(AgentError::PackageReadOnly),
+        Some(_) => {}
+    }
     let result = sqlx::query(
         "UPDATE agents
-         SET name = ?, speciality = ?, prompt = ?, engine = ?, model = ?, tool_policy = ?,
+         SET name = ?, speciality = ?, prompt = ?, engine = ?, model = ?, capabilities = ?,
              updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND source = 'user'",
     )
     .bind(&request.name)
     .bind(&request.speciality)
     .bind(&request.prompt)
     .bind(&request.engine)
     .bind(&request.model)
-    .bind(&request.tool_policy)
+    .bind(capabilities_json(&request.capabilities))
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
     .execute(pool)
@@ -238,6 +439,9 @@ pub async fn update(
 }
 
 pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError> {
+    if get(pool, id).await?.is_some_and(|agent| agent.is_package()) {
+        return Err(AgentError::PackageReadOnly);
+    }
     // Asked before the DELETE even though the foreign keys already refuse it — measured, not
     // assumed: without this the same call comes back as
     // `Db(SqliteError { code: 787, "FOREIGN KEY constraint failed" })`, which reaches the owner as
@@ -253,7 +457,7 @@ pub async fn delete(pool: &sqlx::SqlitePool, id: &str) -> Result<(), AgentError>
         "SELECT EXISTS (SELECT 1 FROM teams WHERE director_agent_id = ?)
              OR EXISTS (SELECT 1 FROM team_members WHERE agent_id = ?)
              OR EXISTS (SELECT 1 FROM team_items WHERE agent_id = ?)
-             OR EXISTS (SELECT 1 FROM job_items WHERE agent_id = ?)",
+             OR EXISTS (SELECT 1 FROM job_nodes WHERE agent_id = ?)",
     )
     .bind(id)
     .bind(id)
@@ -349,17 +553,17 @@ mod tests {
             name: name.to_owned(),
             speciality: "writes short copy".to_owned(),
             prompt: "You write short copy.".to_owned(),
-            engine: "claude".to_owned(),
+            engine: Some("claude".to_owned()),
             model: Some("claude-opus-5".to_owned()),
-            tool_policy: "mcp_only".to_owned(),
+            capabilities: vec!["mcp.nucleos".to_owned()],
         }
     }
 
     #[tokio::test]
-    async fn an_unrestricted_tool_policy_is_refused() {
+    async fn capabilities_that_derive_unrestricted_are_refused_on_user_rows() {
         let pool = pool().await;
         let mut asked = request("copywriter");
-        asked.tool_policy = "unrestricted".to_owned();
+        asked.capabilities = vec!["shell".to_owned()];
         assert!(matches!(
             create(&pool, asked).await,
             Err(AgentError::Invalid(_))
@@ -374,7 +578,7 @@ mod tests {
     async fn a_local_engine_without_a_model_is_refused() {
         let pool = pool().await;
         let mut asked = request("analyst");
-        asked.engine = "local".to_owned();
+        asked.engine = Some("local".to_owned());
         asked.model = None;
         assert!(matches!(
             create(&pool, asked).await,
@@ -386,7 +590,7 @@ mod tests {
     async fn an_unknown_engine_is_refused() {
         let pool = pool().await;
         let mut asked = request("analyst");
-        asked.engine = "gemini".to_owned();
+        asked.engine = Some("gemini".to_owned());
         assert!(matches!(
             create(&pool, asked).await,
             Err(AgentError::Invalid(_))
@@ -412,7 +616,8 @@ mod tests {
         assert_eq!(updated.name, "renamed");
         assert_eq!(updated.speciality, "writes long copy");
         assert_eq!(updated.id, first.id);
-        assert_eq!(second.engine, "claude");
+        assert_eq!(second.engine.as_deref(), Some("claude"));
+        assert_eq!(second.tool_policy(), "mcp_only");
 
         delete(&pool, &first.id).await.unwrap();
         assert_eq!(get(&pool, &first.id).await.unwrap(), None);
@@ -515,8 +720,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO job_items (job_id, ordinal, description, status, agent_id)
-             VALUES (1, 0, 'an item', 'pending', ?)",
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, agent_id)
+             VALUES (1, 'implement', 0, 'an item', 'pending', ?)",
         )
         .bind(&member.id)
         .execute(&pool)
@@ -736,5 +941,143 @@ mod tests {
             1,
             "another agent's refs were touched"
         );
+    }
+
+    fn package_row(name: &str) -> PackageAgentRow {
+        PackageAgentRow {
+            name: name.to_owned(),
+            speciality: "reviews".to_owned(),
+            prompt: "You review.".to_owned(),
+            capabilities: vec!["fs.read".to_owned(), "mcp.nucleos".to_owned()],
+            package_ref: format!("{name}@1.0.0"),
+        }
+    }
+
+    #[test]
+    fn the_policy_table_follows_the_spec() {
+        use Capability::*;
+        assert_eq!(policy_str_for(&[]), "none");
+        assert_eq!(policy_str_for(&[McpNucleos, MemoryRead]), "mcp_only");
+        assert_eq!(policy_str_for(&[MemoryRead]), "mcp_only");
+        for capability in [FsRead, FsWrite, Shell, Web] {
+            assert_eq!(policy_str_for(&[McpNucleos, capability]), "unrestricted");
+        }
+        for capability in Capability::ALL {
+            assert_eq!(Capability::parse(capability.as_str()), Some(*capability));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_package_row_has_no_engine_and_an_unrestricted_policy() {
+        let pool = pool().await;
+        let agent = upsert_package_agent(&pool, &package_row("reviewer"))
+            .await
+            .unwrap();
+        assert!(agent.is_package());
+        assert_eq!(agent.engine, None);
+        assert_eq!(agent.package_ref.as_deref(), Some("reviewer@1.0.0"));
+        assert_eq!(agent.tool_policy(), "unrestricted");
+        let mut bumped = package_row("reviewer");
+        bumped.package_ref = "reviewer@1.1.0".to_owned();
+        let again = upsert_package_agent(&pool, &bumped).await.unwrap();
+        assert_eq!(again.id, agent.id);
+        assert_eq!(again.package_ref.as_deref(), Some("reviewer@1.1.0"));
+        assert_eq!(list(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_package_row_refuses_update_and_delete() {
+        let pool = pool().await;
+        let agent = upsert_package_agent(&pool, &package_row("reviewer"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            update(&pool, &agent.id, request("reviewer")).await,
+            Err(AgentError::PackageReadOnly)
+        ));
+        assert!(matches!(
+            delete(&pool, &agent.id).await,
+            Err(AgentError::PackageReadOnly)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_package_never_overwrites_a_user_row() {
+        let pool = pool().await;
+        create(&pool, request("reviewer")).await.unwrap();
+        assert!(matches!(
+            upsert_package_agent(&pool, &package_row("reviewer")).await,
+            Err(AgentError::DuplicateName)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_capability_is_refused() {
+        let pool = pool().await;
+        let mut asked = request("copywriter");
+        asked.capabilities = vec!["teleport".to_owned()];
+        assert!(matches!(
+            create(&pool, asked).await,
+            Err(AgentError::Invalid(_))
+        ));
+    }
+
+    /// Spec 2026-10-20 §11: the rebuild keeps ids and the foreign keys that point at them, fills
+    /// `capabilities` from the old `tool_policy`, and leaves every old row a `user` row whose
+    /// derived policy equals the one it had.
+    #[tokio::test]
+    async fn migration_0228_rebuilds_agents_and_keeps_ids_foreign_keys_and_policy() {
+        let pool = crate::testdb::pool_migrated_through(227).await;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, policy) in [("head", "mcp_only"), ("quiet", "none")] {
+            sqlx::query(
+                "INSERT INTO agents (id, name, speciality, prompt, engine, model, tool_policy,
+                                     created_at, updated_at)
+                 VALUES (?, ?, 's', 'p', 'claude', NULL, ?, '2026-10-01T00:00:00Z',
+                         '2026-10-01T00:00:00Z')",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(policy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        team_with(&pool, "head", "quiet").await;
+
+        crate::testdb::apply_migrations_after(&pool, 227).await;
+
+        let violations: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        let head = get(&pool, "head").await.unwrap().unwrap();
+        let quiet = get(&pool, "quiet").await.unwrap().unwrap();
+        assert_eq!(head.capabilities, ["mcp.nucleos"]);
+        assert_eq!(head.tool_policy(), "mcp_only");
+        assert_eq!(quiet.capabilities, Vec::<String>::new());
+        assert_eq!(quiet.tool_policy(), "none");
+        assert_eq!(head.source, "user");
+        assert_eq!(head.package_ref, None);
+        assert_eq!(head.engine.as_deref(), Some("claude"));
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_members")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(members, 1);
+        // The reference still bites: the rebuilt table is the one the keys name.
+        assert!(matches!(
+            delete(&pool, "head").await,
+            Err(AgentError::InUse)
+        ));
+        // And a package row, which the old schema could not hold, now can.
+        upsert_package_agent(&pool, &package_row("reviewer"))
+            .await
+            .unwrap();
     }
 }

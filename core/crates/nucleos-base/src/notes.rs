@@ -8,7 +8,7 @@
 //! update the docs too": the words had to be said to a process that did not exist yet.
 //!
 //! They are said to the JOB instead, and the next node reads them on its way to being started. That
-//! is the mechanism migration 0069 already built for `job_items.gate_output` — text stored on a row,
+//! is the mechanism migration 0069 already built for `job_nodes.gate_output` — text stored on a row,
 //! carried into the next prompt — with a person at the writing end rather than the gate.
 //!
 //! **This module owns the `job_notes` SQL and nothing else**, the way `runs.rs` and `job.rs` own
