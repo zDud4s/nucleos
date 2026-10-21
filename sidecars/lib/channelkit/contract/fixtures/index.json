@@ -127,5 +127,6 @@
     {"file": "capabilities/no-threads.json", "shape": "scenario", "valid": true},
     {"file": "capabilities/no-typing.json", "shape": "scenario", "valid": true},
     {"file": "capabilities/no-reply-to.json", "shape": "scenario", "valid": true},
-    {"file": "capabilities/no-media-out.json", "shape": "scenario", "valid": true}
+    {"file": "capabilities/no-media-out.json", "shape": "scenario", "valid": true},
+    {"file": "capabilities/progress-edits.json", "shape": "scenario", "valid": true}
   ] }

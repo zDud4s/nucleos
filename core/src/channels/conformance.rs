@@ -11,6 +11,7 @@ mod tests {
     use chrono::Utc;
     use serde_json::{Value, json};
     use sqlx::SqlitePool;
+    use tokio::time::Instant;
 
     use crate::channels::ChannelsRuntime;
     use crate::channels::contract::{
@@ -19,6 +20,7 @@ mod tests {
     use crate::channels::fake::{FakeAdapter, Reply, register_media, request, stimulate};
     use crate::channels::outbox::{self, Class, NewAction};
     use crate::channels::registry::ChannelConfig;
+    use crate::channels::replies::{TypingRefresh, refresh_typing};
     use crate::channels::routing;
     use crate::channels::strings::{self, Text};
     use crate::channels::testkit::state;
@@ -873,7 +875,7 @@ mod tests {
                 failures.push(format!("{name}: {why}"));
             }
         }
-        assert!(all.len() >= 7, "only {} scenarios found", all.len());
+        assert!(all.len() >= 8,"only {} scenarios found", all.len());
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
@@ -913,7 +915,8 @@ mod tests {
         .map(|row| row.map(str::to_owned))
         .collect();
         assert_eq!(missing, wanted);
-        assert_eq!(all.len(), wanted.len(), "one scenario per row");
+        // One scenario per row, plus the progress-edits scenario that shares the `null` (full) row.
+        assert_eq!(all.len(), wanted.len() + 1, "one scenario per row");
 
         // The hello of each declares exactly that one capability less (`media_out`: the strong form,
         // `image` stays and `file` and `audio` are gone).
@@ -1101,14 +1104,30 @@ mod tests {
     async fn typing_refreshes_only_with_the_capability() {
         // A turn starting announces "typing" on the ephemeral lane of the next poll, once, and only
         // for an adapter that declared the capability.
-        let (_st, with, _, conversation) = streaming_turn(true, true).await;
+        let (st, with, _, conversation) = streaming_turn(true, true).await;
+        let typing = json!([{"type": "typing", "conversation": conversation}]);
         let polled = with.poll(Duration::ZERO).await.json();
-        assert_eq!(
-            polled["ephemeral"],
-            json!([{"type": "typing", "conversation": conversation}])
-        );
-        let (_st, without, _, _) = streaming_turn(false, true).await;
+        assert_eq!(polled["ephemeral"], typing);
+
+        // While the turn stays running the tracker re-emits it every 4 s of the clock it is handed:
+        // due at once, quiet in between, due again 4 s later, and silent past the 15 min cap.
+        let mut tracker = TypingRefresh::default();
+        let t0 = Instant::now();
+        for (second, due) in [(0, true), (2, false), (4, true), (6, false), (16 * 60, false)] {
+            refresh_typing(&st, &mut tracker, t0 + Duration::from_secs(second)).await;
+            let polled = with.poll(Duration::ZERO).await.json();
+            let want = if due { typing.clone() } else { json!([]) };
+            assert_eq!(polled["ephemeral"], want, "at {second} s");
+        }
+
+        let (st, without, _, _) = streaming_turn(false, true).await;
         let polled = without.poll(Duration::ZERO).await.json();
         assert_eq!(polled["ephemeral"], json!([]));
+        let mut tracker = TypingRefresh::default();
+        for second in [0, 4] {
+            refresh_typing(&st, &mut tracker, t0 + Duration::from_secs(second)).await;
+            let polled = without.poll(Duration::ZERO).await.json();
+            assert_eq!(polled["ephemeral"], json!([]), "at {second} s");
+        }
     }
 }
