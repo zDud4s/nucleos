@@ -462,16 +462,38 @@ impl Inner {
     }
 }
 
-/// extended in Tasks 11 and 12
+/// Spec §3. Order: a live registry entry decides; else the daemon run's status decides; else the
+/// transcript's last conversation record (closed turn = Done, anything else = Lost).
 fn root_state(root: &RootCache) -> Option<NodeState> {
-    match &root.registry {
-        Some((file, true)) => Some(if file.status.as_deref() == Some("busy") {
+    // A root known only from a daemon run needs its transcript on disk: without one there is
+    // nothing to read or page, and the run itself is `daemon_runs`' node. (A registry entry, dead
+    // or alive, keeps the root: a live process with no transcript yet is still sighted.)
+    if root.registry.is_none() && root.transcript.is_none() {
+        return None;
+    }
+    if let Some((file, true)) = &root.registry {
+        return Some(if file.status.as_deref() == Some("busy") {
             NodeState::Busy
         } else {
             NodeState::Idle
-        }),
-        _ => None,
+        });
     }
+    if let Some(run) = &root.run {
+        match run.status.as_str() {
+            "running" => return Some(NodeState::Busy),
+            "awaiting_approval" => return Some(NodeState::Idle),
+            "interrupted" => return Some(NodeState::Lost),
+            "completed" | "failed" | "cancelled" | "timed_out" => return Some(NodeState::Done),
+            _ => {}
+        }
+    }
+    // Nothing to show for a root with neither a live process nor a transcript to judge by.
+    root.transcript.as_ref()?;
+    Some(if root.tail.closed == Some(true) {
+        NodeState::Done
+    } else {
+        NodeState::Lost
+    })
 }
 
 fn root_activity(root: &RootCache) -> Option<Timestamp> {
@@ -631,5 +653,96 @@ mod tests {
         let root = find(&all, &root_id());
         assert_eq!(root.state, NodeState::Busy);
         assert!(!root.has_lines && !root.has_transcript);
+    }
+
+    /// A root whose process is gone (no probe entry), transcript given by `lines`.
+    async fn dead_root(lines: &[String]) -> (Sighting, ClaudeCode, Home, crate::storage::TempDb) {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, lines);
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        let root = find(&all, &root_id()).clone();
+        (root, cc, home, db)
+    }
+
+    #[tokio::test]
+    async fn a_dead_pid_with_a_closed_turn_is_done_and_ended_at_the_last_activity() {
+        let (root, ..) = dead_root(&fx::closed_turn()).await;
+        assert_eq!(root.state, NodeState::Done);
+        assert_eq!(root.ended_at, Some(root.last_activity_at));
+    }
+
+    #[tokio::test]
+    async fn a_dead_pid_with_a_pending_tool_call_is_lost() {
+        let (root, ..) = dead_root(&fx::open_turn()).await;
+        assert_eq!(root.state, NodeState::Lost);
+        assert_eq!(root.ended_at, Some(root.last_activity_at));
+    }
+
+    #[tokio::test]
+    async fn a_dead_pid_whose_last_record_is_an_unanswered_tool_result_is_lost() {
+        let mut lines = fx::open_turn();
+        lines.push(fx::tool_result(fx::TS, "toolu_1", "ok", json!({})));
+        let (root, ..) = dead_root(&lines).await;
+        assert_eq!(root.state, NodeState::Lost);
+    }
+
+    #[tokio::test]
+    async fn trailing_noise_after_the_final_answer_does_not_reopen_the_turn() {
+        let mut lines = fx::closed_turn();
+        lines.push(fx::meta_user(fx::TS, "injected"));
+        lines.push("{\"type\":\"system\",\"subtype\":\"stop_hook_summary\"}".to_owned());
+        let (root, ..) = dead_root(&lines).await;
+        assert_eq!(root.state, NodeState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_recycled_pid_with_a_different_start_time_is_dead() {
+        let home = Home::new();
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "999"); // somebody else's process now holds the pid
+        let (cc, _db) = setup(&home, &probe).await;
+        let all = cc.discover(since()).await.unwrap();
+        assert_eq!(find(&all, &root_id()).state, NodeState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_root_whose_registry_entry_vanished_stays_known_as_done() {
+        let home = Home::new();
+        let entry = home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::closed_turn());
+        let probe = Arc::new(FakeProbe::new());
+        probe.alive(100, "777");
+        let (cc, _db) = setup(&home, &probe).await;
+        assert_eq!(find(&cc.discover(since()).await.unwrap(), &root_id()).state, NodeState::Busy);
+
+        // Claude Code exits cleanly: the process and its registry file are both gone.
+        std::fs::remove_file(entry).unwrap();
+        probe.set(100, session::Proc::Dead);
+        let all = cc.discover(since()).await.unwrap();
+        let root = find(&all, &root_id());
+        assert_eq!(root.state, NodeState::Done);
+        assert!(root.ended_at.is_some());
+        // The identity the deleted entry carried survives it (`last_identity`).
+        assert_eq!(root.label, "proj-1");
+        assert_eq!(root.project.as_deref(), Some("proj"));
+        assert_eq!(root.role.as_deref(), Some("chat"));
+    }
+
+    #[tokio::test]
+    async fn a_session_file_that_is_not_json_is_skipped_and_logged_once() {
+        let home = Home::new();
+        let dir = home.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1.json"), "{\"pid\":1,\"sess").unwrap();
+        std::fs::write(dir.join("2.json"), "also not json").unwrap();
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, _db) = setup(&home, &probe).await;
+        assert!(cc.discover(since()).await.unwrap().is_empty());
+        assert_eq!(cc.warnings(), 1);
     }
 }
