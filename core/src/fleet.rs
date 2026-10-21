@@ -5,6 +5,7 @@ pub mod codex_cli;
 pub mod event;
 pub mod limits;
 pub mod model;
+pub mod run_launch;
 pub mod source;
 pub mod tail;
 pub mod work_nodes_edges;
