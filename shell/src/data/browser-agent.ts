@@ -54,6 +54,8 @@ export function ensureAgentEnv(project: string): Promise<AgentEnvResult> {
 export type AgentPollerHandlers = {
   onOpen(req: EmbeddedRequest & { url: string }): Promise<void> | void;
   onClose(req: EmbeddedRequest & { session_id: string }): Promise<void> | void;
+  /** Bring an agent tab to the front. Fire-and-forget: the daemon needs no ack. */
+  onFocus?(req: EmbeddedRequest & { session_id: string }): Promise<void> | void;
 };
 
 const HANDLED_CAP = 500;
@@ -96,6 +98,11 @@ export function startAgentPoller(
           } else if (req.kind === "close" && req.session_id) {
             markHandled(req.request_id);
             await handlers.onClose(
+              req as EmbeddedRequest & { session_id: string },
+            );
+          } else if (req.kind === "focus" && req.session_id) {
+            markHandled(req.request_id);
+            await handlers.onFocus?.(
               req as EmbeddedRequest & { session_id: string },
             );
           }

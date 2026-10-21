@@ -1,6 +1,15 @@
 // §spec pilar-de-browser
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  handleAgentClose,
+  handleAgentOpen,
+  markCreated,
+  requestFocus,
+  resetBrowserStore,
+  setTabMap,
+} from "../data/browser-store";
+import { addAgentTab, newTab, setTabSessionId } from "../data/browser-tabs";
 import { BrowserPage } from "./BrowserPage";
 
 const mocks = vi.hoisted(() => ({
@@ -9,24 +18,23 @@ const mocks = vi.hoisted(() => ({
   unlisten: vi.fn(),
   overlay: { open: false },
   ensureAgentEnv: vi.fn(),
-  stopPoller: vi.fn(),
-  startAgentPoller: vi.fn(),
   reportAgentTabClosed: vi.fn(),
   embeddedAck: vi.fn(),
-  poller: { handlers: null as null | {
-    onOpen: (r: { request_id: string; project: string; url: string; kind: string }) => void;
-    onClose: (r: { request_id: string; project: string; session_id: string; kind: string }) => void;
-  } },
+  embeddedOwner: vi.fn(),
+  embeddedKeep: vi.fn(),
 }));
 
 vi.mock("../data/browser-agent", () => ({
   ensureAgentEnv: mocks.ensureAgentEnv,
-  startAgentPoller: mocks.startAgentPoller,
   mintNonce: () => "nonce-1",
   agentTabUrl: (n: string) => `about:blank#${n}`,
   reportAgentTabClosed: mocks.reportAgentTabClosed,
 }));
-vi.mock("../data/browser-embedded", () => ({ embeddedAck: mocks.embeddedAck }));
+vi.mock("../data/browser-embedded", () => ({
+  embeddedAck: mocks.embeddedAck,
+  embeddedOwner: mocks.embeddedOwner,
+  embeddedKeep: mocks.embeddedKeep,
+}));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -88,13 +96,10 @@ beforeEach(() => {
   mocks.overlay.open = false;
   mocks.ensureAgentEnv.mockReset();
   mocks.ensureAgentEnv.mockResolvedValue({ ok: true, cdpHttp: "http://127.0.0.1:1" });
-  mocks.stopPoller.mockReset();
-  mocks.poller.handlers = null;
-  mocks.startAgentPoller.mockReset();
-  mocks.startAgentPoller.mockImplementation((handlers) => {
-    mocks.poller.handlers = handlers;
-    return mocks.stopPoller;
-  });
+  resetBrowserStore();
+  mocks.embeddedOwner.mockReset();
+  mocks.embeddedOwner.mockResolvedValue(undefined);
+  mocks.embeddedKeep.mockReset();
   mocks.reportAgentTabClosed.mockReset();
   mocks.reportAgentTabClosed.mockResolvedValue(undefined);
   mocks.embeddedAck.mockReset();
@@ -269,8 +274,10 @@ describe("BrowserPage", () => {
     const openReq = { request_id: "r1", project: "alpha", url: "https://a.example/", kind: "embedded" };
 
     async function openAgent(): Promise<string> {
-      await waitFor(() => expect(mocks.poller.handlers).not.toBeNull());
-      act(() => mocks.poller.handlers!.onOpen(openReq));
+      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      act(() => {
+        void handleAgentOpen(openReq);
+      });
       await waitFor(() => expect(mocks.embeddedAck).toHaveBeenCalled());
       await waitFor(() => expect(document.querySelector('[data-role="agent"]')).not.toBeNull());
       // Let the ack resolve and the session id land in the tab.
@@ -294,11 +301,6 @@ describe("BrowserPage", () => {
       expect(await screen.findByText(/Agent browser unavailable: no chrome/)).toBeTruthy();
       await openTab();
       expect(calls("browser_tab_create")[0]).toMatchObject({ role: "owner" });
-    });
-
-    it("starts the poller once", async () => {
-      render(<BrowserPage />);
-      await waitFor(() => expect(mocks.startAgentPoller).toHaveBeenCalledTimes(1));
     });
 
     it("opens an agent tab and acknowledges it with the nonce", async () => {
@@ -326,14 +328,7 @@ describe("BrowserPage", () => {
       render(<BrowserPage />);
       const tabId = await openAgent();
       await waitFor(() => expect(mocks.embeddedAck).toHaveBeenCalled());
-      act(() =>
-        mocks.poller.handlers!.onClose({
-          request_id: "r2",
-          project: "alpha",
-          session_id: "s1",
-          kind: "embedded",
-        }),
-      );
+      act(() => handleAgentClose({ session_id: "s1" }));
       await waitFor(() => expect(calls("browser_tab_close")).toEqual([{ tabId }]));
       expect(document.querySelector('[data-role="agent"]')).toBeNull();
       expect(mocks.reportAgentTabClosed).not.toHaveBeenCalled();
@@ -352,6 +347,48 @@ describe("BrowserPage", () => {
       await waitFor(() => expect(mocks.listeners.size).toBe(4));
       emit("process-failed", { tabId, kind: "crashed" });
       expect(mocks.reportAgentTabClosed).toHaveBeenCalledWith("s1");
+    });
+
+    /** Seed an agent tab as if it was opened while the page was not mounted. */
+    function seedAgent(project: string, id: string, sessionId: string, url = "https://a.example/") {
+      setTabMap((m) => setTabSessionId(addAgentTab(m, project, newTab(id, url, "agent")), id, sessionId));
+      markCreated(id);
+    }
+
+    it("shows the control bar for an agent tab already in the store", async () => {
+      seedAgent("alpha", "a-1", "s9");
+      render(<BrowserPage />);
+      expect(screen.getByText("Agent is driving")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+      await waitFor(() => expect(last(calls("browser_tabs_show"))?.tabId).toBe("a-1"));
+    });
+
+    it("applies a focus intent: switches project, activates the tab, highlights the control", async () => {
+      seedAgent("beta", "b-1", "s5");
+      render(<BrowserPage />);
+      expect(screen.queryByText("Agent is driving")).toBeNull();
+      act(() => requestFocus("beta", "s5"));
+      await screen.findByText("Agent is driving");
+      expect((screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement).value).toBe("beta");
+      expect(screen.getByRole("button", { name: "Take control" }).getAttribute("data-highlight")).toBe("true");
+      await waitFor(() => expect(last(calls("browser_tabs_show"))?.tabId).toBe("b-1"));
+    });
+
+    it("opens an agent tab in my tabs as an owner tab", async () => {
+      seedAgent("alpha", "a-1", "s9");
+      render(<BrowserPage />);
+      await waitFor(() => expect(mocks.listeners.size).toBe(4));
+      emit("tab-state", state("a-1", { url: "https://deep.example/page" }));
+      fireEvent.click(screen.getByRole("button", { name: "Take control" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Open in my tabs" }));
+      await waitFor(() => expect(calls("browser_tab_create")).toHaveLength(1));
+      expect(calls("browser_tab_create")[0]).toMatchObject({
+        project: "alpha",
+        role: "owner",
+        url: "https://deep.example/page",
+      });
+      const id = calls("browser_tab_create")[0].tabId as string;
+      await waitFor(() => expect(last(calls("browser_tabs_show"))?.tabId).toBe(id));
     });
 
     it("drops a new-window event from an agent tab", async () => {

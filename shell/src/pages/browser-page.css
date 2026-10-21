@@ -113,6 +113,26 @@
   font-size: var(--text-sm);
 }
 
+.browser-agent-bar {
+  flex-wrap: wrap;
+}
+
+.browser-agent-hosts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono, monospace);
+}
+
+/* The focus intent from the agent: draw the eye to "Take control" for a moment. */
+.browser-agent-bar button[data-highlight="true"] {
+  outline: 2px solid var(--tone-info-fg);
+  outline-offset: 2px;
+}
+
 .browser-agent-notice {
   margin: 0;
   color: var(--text-faint);
