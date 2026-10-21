@@ -16,13 +16,13 @@ use tokio::task::JoinHandle;
 use crate::governance::redact::redact_secrets;
 
 use super::FleetEnv;
-use super::book::{Book, ReadOutcome, ReadWhich};
+use super::book::{Book, PinError, ReadOutcome, ReadWhich};
 use super::event::FleetEvent;
 use super::fuse::{Fused, SourceSightings, fuse};
 use super::limits::{
     CLIENT_CHANNEL, HEARTBEAT, LINES_BATCH, METRICS_BATCH, RETENTION, SAFETY_NET, WATCH_DEBOUNCE,
 };
-use super::model::{TermLine, Timestamp};
+use super::model::{Cursor, TermLine, Timestamp, TranscriptPage};
 use super::source::{AgentSource, Edge, EdgeSource, Sighting, SourceError, SourceResult};
 use super::watch::{NotifyWatch, WatchFactory, WatchGuard};
 
@@ -391,7 +391,6 @@ impl FleetHub {
 
     /// Fuses a fresh look at every source without touching the running state. For pins and
     /// transcripts asked while nobody is subscribed.
-    #[allow(dead_code)] // first used by the pin and transcript calls (Task 15)
     async fn fuse_once(&self) -> Fused {
         let since = self.clock.now() - retention();
         let mut sightings = Vec::with_capacity(self.sources.len());
@@ -586,12 +585,6 @@ impl FleetHub {
             }
         }
     }
-
-    /// Pins a root so its tree outlives the retention window. Temporary stub until Task 15.
-    pub async fn pin(&self, id: &str, on: bool) -> Result<(), super::book::PinError> {
-        let _ = (id, on);
-        todo!("Task 15")
-    }
 }
 
 /// One connected client. Dropping it leaves the hub; the last drop stops the hub.
@@ -622,6 +615,111 @@ impl Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         self.hub.unsubscribe(self.id);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TranscriptError {
+    UnknownNode,
+    NoTranscript,
+    /// The adapter failed; the message is for the log, never for the client.
+    Failed(String),
+}
+
+impl FleetHub {
+    /// Pins or unpins a root. Pins live in memory and are lost when the daemon restarts (spec §9).
+    pub async fn pin(&self, root_id: &str, on: bool) -> Result<(), PinError> {
+        let now = self.clock.now();
+        {
+            let mut guard = self.state();
+            let state = &mut *guard;
+            if state.task.is_some() {
+                let events = state.book.set_pin(root_id, on, now)?;
+                Self::publish(state, &events);
+                return Ok(());
+            }
+        }
+        // Nobody is subscribed, so the book is empty: validate against a one-shot look, then keep
+        // the pin for when the hub next starts.
+        let mut scratch = Book::new(BTreeSet::new());
+        scratch.apply_fusion(self.fuse_once().await.nodes, now);
+        scratch.set_pin(root_id, on, now)?;
+        self.state().book.pin_raw(root_id, on);
+        Ok(())
+    }
+
+    /// One backwards page of a node's full transcript, with every entry redacted.
+    pub async fn transcript(
+        &self,
+        node_id: &str,
+        before: Option<Cursor>,
+    ) -> Result<TranscriptPage, TranscriptError> {
+        let known = {
+            let state = self.state();
+            if state.task.is_some() {
+                state
+                    .book
+                    .lookup(node_id)
+                    .map(|f| (f.key.clone(), f.transcript_source))
+            } else {
+                None
+            }
+        };
+        let (key, source_index) = match known {
+            Some(found) => found,
+            None => {
+                let fused = self.fuse_once().await;
+                let node = fused
+                    .nodes
+                    .into_iter()
+                    .find(|n| n.node.id == node_id)
+                    .ok_or(TranscriptError::UnknownNode)?;
+                (node.key, node.transcript_source)
+            }
+        };
+        let source = source_index
+            .and_then(|index| self.sources.get(index))
+            .ok_or(TranscriptError::NoTranscript)?;
+        let node = source.node_ref(&key).ok_or(TranscriptError::NoTranscript)?;
+        let mut page = self
+            .bounded(source.name(), source.transcript_page(&node, before))
+            .await
+            .ok_or_else(|| TranscriptError::Failed("the adapter failed or timed out".to_owned()))?;
+        for entry in &mut page.entries {
+            entry.text = redact_secrets(&entry.text);
+            entry.detail = entry.detail.as_deref().map(redact_secrets);
+        }
+        Ok(page)
+    }
+}
+
+/// The hub as `AppState` carries it: built on first use from the state it is asked with, so a
+/// state that never opens the fleet page never starts anything. `Default` is inert.
+#[derive(Default)]
+pub struct FleetRuntime {
+    hub: std::sync::OnceLock<Arc<FleetHub>>,
+}
+
+impl FleetRuntime {
+    pub fn hub(&self, state: &crate::state::AppState) -> Arc<FleetHub> {
+        self.hub
+            .get_or_init(|| {
+                let home = directories::BaseDirs::new()
+                    .map(|dirs| dirs.home_dir().to_path_buf())
+                    .unwrap_or_else(std::env::temp_dir);
+                FleetHub::production(&FleetEnv {
+                    pool: state.pool.clone(),
+                    home,
+                    run_tails: state.run_tails.clone(),
+                })
+            })
+            .clone()
+    }
+
+    /// Tests put their own hub (fake source, clock and watcher) in place.
+    #[cfg(test)]
+    pub(crate) fn install(&self, hub: Arc<FleetHub>) {
+        let _ = self.hub.set(hub);
     }
 }
 
@@ -954,7 +1052,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[ignore = "needs Task 15 (pin); remove this attribute there"]
     async fn a_pin_holds_a_finished_tree_past_its_window() {
         let h = harness();
         finished_nine_minutes_ago(&h);
@@ -1158,5 +1255,66 @@ mod tests {
         let lines = snapshot["lines"]["claude-code:a"].as_array().expect("lines");
         assert_eq!(lines[0]["kind"], "text", "success keeps the native closing line");
         assert_eq!(lines[0]["text"], "closing words");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pinning_validates_the_node_and_works_with_nobody_subscribed() {
+        let h = harness();
+        let mut done = root("a");
+        done.state = NodeState::Done;
+        done.ended_at = Some(at(990));
+        let mut kid = sighting("claude-code", "kid");
+        kid.parent = Some(NodeKey::new("claude-code", "a"));
+        h.source.set(vec![done, kid]);
+
+        // Stopped hub: validated against a one-shot look.
+        assert_eq!(h.hub.pin("claude-code:ghost", true).await, Err(PinError::Unknown));
+        assert_eq!(h.hub.pin("claude-code:kid", true).await, Err(PinError::NotARoot));
+        h.hub.pin("claude-code:a", true).await.unwrap();
+        assert!(!h.hub.is_running());
+
+        // The pin was kept: the next run shows the node pinned.
+        let mut sub = h.hub.subscribe().await;
+        assert_eq!(drain(&mut sub).await[0]["nodes"][0]["pinned"], true);
+        h.hub.pin("claude-code:a", false).await.unwrap();
+        let events = drain(&mut sub).await;
+        assert!(events.iter().any(|e| e["t"] == "node" && e["node"]["pinned"] == false), "{events:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transcript_page_is_redacted_and_the_errors_are_distinct() {
+        use crate::fleet::model::{TermKind, TranscriptEntry};
+        let h = harness();
+        let mut with = root("a");
+        with.has_transcript = true;
+        let without = root("b");
+        h.source.set(vec![with, without]);
+        h.source.set_transcript(TranscriptPage {
+            entries: vec![TranscriptEntry {
+                kind: TermKind::Tool,
+                text: "Bash echo ghp_abcdefghijklmnopqrstuvwxyz0123456789".into(),
+                detail: Some("ghp_abcdefghijklmnopqrstuvwxyz0123456789".into()),
+            }],
+            before: Some("120".into()),
+        });
+
+        let page = h.hub.transcript("claude-code:a", None).await.unwrap();
+        assert!(!page.entries[0].text.contains("ghp_"), "{page:?}");
+        assert!(!page.entries[0].detail.as_deref().unwrap().contains("ghp_"));
+        assert_eq!(page.before.as_deref(), Some("120"), "the cursor passes through untouched");
+
+        assert_eq!(h.hub.transcript("claude-code:b", None).await, Err(TranscriptError::NoTranscript));
+        assert_eq!(h.hub.transcript("claude-code:nope", None).await, Err(TranscriptError::UnknownNode));
+    }
+
+    // Plain `#[tokio::test]`: `start_paused` would auto-advance the clock while sqlx's pool waits
+    // on its worker thread, and `channels::testkit::state()` opens a SQLite pool.
+    #[tokio::test]
+    async fn the_runtime_builds_one_hub_and_hands_it_out_again() {
+        let h = harness();
+        let runtime = FleetRuntime::default();
+        runtime.install(h.hub.clone());
+        let state = crate::channels::testkit::state().await;
+        assert!(Arc::ptr_eq(&runtime.hub(&state), &h.hub));
     }
 }
