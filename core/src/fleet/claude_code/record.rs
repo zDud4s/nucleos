@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::fleet::model::{collapse_ws, TermKind, TermLine, Timestamp, TranscriptEntry};
+use crate::fleet::model::{TermKind, TermLine, Timestamp, TranscriptEntry, collapse_ws};
 use crate::fleet::source::Usage;
 
 /// Longest `detail` (chars) an entry carries; a tool input or result past this is cut.
@@ -180,8 +180,11 @@ fn assistant(rec: &Value, out: &mut Parsed) {
             _ => {}
         }
     }
-    let last_is_text =
-        blocks.last().and_then(|b| b.get("type")).and_then(Value::as_str) == Some("text");
+    let last_is_text = blocks
+        .last()
+        .and_then(|b| b.get("type"))
+        .and_then(Value::as_str)
+        == Some("text");
     if end_turn && last_is_text {
         out.mark = Some(TurnMark::Closed);
     }
@@ -284,7 +287,11 @@ fn summarize(structured: Option<&Value>, body: &str) -> String {
         {
             return plural(count_lines(content), "line", "lines");
         }
-        if let Some(n) = t.get("file").and_then(|f| f.get("numLines")).and_then(Value::as_u64) {
+        if let Some(n) = t
+            .get("file")
+            .and_then(|f| f.get("numLines"))
+            .and_then(Value::as_u64)
+        {
             return plural(n, "line", "lines");
         }
         // WebFetch: `{code, bytes, ...}` -> `200 · 41 KB` (rounded to the nearest KB, at least 1).
@@ -369,18 +376,24 @@ mod tests {
         let line = fx::assistant(
             fx::TS,
             Some("tool_use"),
-            fx::tool_block("t1", "Read", json!({"file_path":"core/src/main.rs","limit":50})),
+            fx::tool_block(
+                "t1",
+                "Read",
+                json!({"file_path":"core/src/main.rs","limit":50}),
+            ),
             None,
         );
         let parsed = parse_line(&line).unwrap();
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].kind, TermKind::Tool);
         assert_eq!(parsed.entries[0].text, "Read core/src/main.rs");
-        assert!(parsed.entries[0]
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("\"limit\": 50"));
+        assert!(
+            parsed.entries[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("\"limit\": 50")
+        );
 
         let no_arg = fx::assistant(
             fx::TS,
@@ -388,7 +401,10 @@ mod tests {
             fx::tool_block("t2", "TaskList", json!({})),
             None,
         );
-        assert_eq!(kinds(&no_arg), vec![(TermKind::Tool, "TaskList".to_owned())]);
+        assert_eq!(
+            kinds(&no_arg),
+            vec![(TermKind::Tool, "TaskList".to_owned())]
+        );
     }
 
     #[test]
@@ -407,7 +423,12 @@ mod tests {
         assert!(parse_line("{\"type\":\"us").is_none());
         assert!(parse_line("").is_none());
         // Valid JSON of an unknown record type is a record with nothing to show.
-        assert!(parse_line("{\"type\":\"mode\"}").unwrap().entries.is_empty());
+        assert!(
+            parse_line("{\"type\":\"mode\"}")
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 
     fn result_of(tool_use_result: Option<serde_json::Value>, body: &str) -> (TermKind, String) {
@@ -428,17 +449,44 @@ mod tests {
     fn tool_results_reduce_to_one_summary_line() {
         let cases = [
             // Edit / overwrite: counted from the structured patch.
-            (json!({"structuredPatch":[{"lines":[" a","-b","+c","+d"]}]}), "+2 −1"),
-            (json!({"mode":"content","numFiles":0,"numLines":12}), "12 matches"),
+            (
+                json!({"structuredPatch":[{"lines":[" a","-b","+c","+d"]}]}),
+                "+2 −1",
+            ),
+            (
+                json!({"mode":"content","numFiles":0,"numLines":12}),
+                "12 matches",
+            ),
             (json!({"mode":"files_with_matches","numFiles":3}), "3 files"),
-            (json!({"filenames":[],"numFiles":4,"truncated":false}), "4 files"),
-            (json!({"type":"text","file":{"numLines":75,"totalLines":900}}), "75 lines"),
-            (json!({"type":"create","content":"a\nb\nc\n","structuredPatch":[]}), "3 lines"),
-            (json!({"stdout":"a\r\nb","stderr":"","interrupted":false}), "2 lines"),
-            (json!({"stdout":"","stderr":"","interrupted":false}), "no output"),
-            (json!({"status":"completed","totalToolUseCount":7}), "agent done · 7 tools"),
+            (
+                json!({"filenames":[],"numFiles":4,"truncated":false}),
+                "4 files",
+            ),
+            (
+                json!({"type":"text","file":{"numLines":75,"totalLines":900}}),
+                "75 lines",
+            ),
+            (
+                json!({"type":"create","content":"a\nb\nc\n","structuredPatch":[]}),
+                "3 lines",
+            ),
+            (
+                json!({"stdout":"a\r\nb","stderr":"","interrupted":false}),
+                "2 lines",
+            ),
+            (
+                json!({"stdout":"","stderr":"","interrupted":false}),
+                "no output",
+            ),
+            (
+                json!({"status":"completed","totalToolUseCount":7}),
+                "agent done · 7 tools",
+            ),
             // WebFetch (spec §3, `200 · 41 KB`): 41_984 bytes is exactly 41 KB.
-            (json!({"bytes":41984,"code":200,"codeText":"OK","durationMs":310,"url":"https://example.com"}), "200 · 41 KB"),
+            (
+                json!({"bytes":41984,"code":200,"codeText":"OK","durationMs":310,"url":"https://example.com"}),
+                "200 · 41 KB",
+            ),
             (json!({"bytes":12,"code":404}), "404 · 1 KB"),
         ];
         for (tur, expected) in cases {
@@ -452,15 +500,27 @@ mod tests {
 
     #[test]
     fn a_result_without_a_structured_payload_falls_back_to_its_line_count() {
-        assert_eq!(result_of(None, "x\ny\nz"), (TermKind::Result, "3 lines".to_owned()));
-        assert_eq!(result_of(None, "only one"), (TermKind::Result, "1 line".to_owned()));
-        assert_eq!(result_of(None, ""), (TermKind::Result, "no output".to_owned()));
+        assert_eq!(
+            result_of(None, "x\ny\nz"),
+            (TermKind::Result, "3 lines".to_owned())
+        );
+        assert_eq!(
+            result_of(None, "only one"),
+            (TermKind::Result, "1 line".to_owned())
+        );
+        assert_eq!(
+            result_of(None, ""),
+            (TermKind::Result, "no output".to_owned())
+        );
     }
 
     #[test]
     fn an_interrupted_command_and_an_is_error_result_are_errors() {
         assert_eq!(
-            result_of(Some(json!({"stdout":"","stderr":"","interrupted":true})), ""),
+            result_of(
+                Some(json!({"stdout":"","stderr":"","interrupted":true})),
+                ""
+            ),
             (TermKind::Error, "interrupted".to_owned())
         );
         let line = fx::tool_error(fx::TS, "t1", "Error: PreToolUse hook denied\nsecond line");
@@ -485,16 +545,32 @@ mod tests {
 
     #[test]
     fn an_assistant_record_carries_context_tokens_model_and_time() {
-        let line = fx::assistant(fx::TS, Some("end_turn"), fx::text_block("x"), Some((10, 20, 300)));
+        let line = fx::assistant(
+            fx::TS,
+            Some("end_turn"),
+            fx::text_block("x"),
+            Some((10, 20, 300)),
+        );
         let p = parse_line(&line).unwrap();
-        assert_eq!(p.usage, Some(Usage { context_tokens: Some(330), cost_usd: None }));
+        assert_eq!(
+            p.usage,
+            Some(Usage {
+                context_tokens: Some(330),
+                cost_usd: None
+            })
+        );
         assert_eq!(p.model.as_deref(), Some("claude-test-1"));
         assert_eq!(p.at, Some("2026-10-20T10:00:00Z".parse().unwrap()));
     }
 
     #[test]
     fn zero_usage_and_synthetic_models_are_not_reported() {
-        let line = fx::assistant(fx::TS, Some("end_turn"), fx::text_block("x"), Some((0, 0, 0)));
+        let line = fx::assistant(
+            fx::TS,
+            Some("end_turn"),
+            fx::text_block("x"),
+            Some((0, 0, 0)),
+        );
         assert_eq!(parse_line(&line).unwrap().usage, None);
         let synthetic = line.replace("claude-test-1", "<synthetic>");
         assert_eq!(parse_line(&synthetic).unwrap().model, None);
@@ -503,17 +579,47 @@ mod tests {
     #[test]
     fn a_cost_state_record_carries_the_session_cost() {
         let p = parse_line(&fx::cost_state(3.5)).unwrap();
-        assert_eq!(p.usage, Some(Usage { context_tokens: None, cost_usd: Some(3.5) }));
+        assert_eq!(
+            p.usage,
+            Some(Usage {
+                context_tokens: None,
+                cost_usd: Some(3.5)
+            })
+        );
         assert!(p.entries.is_empty());
     }
 
     #[test]
     fn merging_usage_keeps_the_latest_value_of_each_field() {
         let mut acc = None;
-        merge_usage(&mut acc, Usage { context_tokens: Some(100), cost_usd: None });
-        merge_usage(&mut acc, Usage { context_tokens: None, cost_usd: Some(2.0) });
-        merge_usage(&mut acc, Usage { context_tokens: Some(150), cost_usd: None });
-        assert_eq!(acc, Some(Usage { context_tokens: Some(150), cost_usd: Some(2.0) }));
+        merge_usage(
+            &mut acc,
+            Usage {
+                context_tokens: Some(100),
+                cost_usd: None,
+            },
+        );
+        merge_usage(
+            &mut acc,
+            Usage {
+                context_tokens: None,
+                cost_usd: Some(2.0),
+            },
+        );
+        merge_usage(
+            &mut acc,
+            Usage {
+                context_tokens: Some(150),
+                cost_usd: None,
+            },
+        );
+        assert_eq!(
+            acc,
+            Some(Usage {
+                context_tokens: Some(150),
+                cost_usd: Some(2.0)
+            })
+        );
     }
 
     fn mark(line: &str) -> Option<TurnMark> {
@@ -523,12 +629,22 @@ mod tests {
     #[test]
     fn only_a_final_text_answer_closes_the_turn() {
         assert_eq!(
-            mark(&fx::assistant(fx::TS, Some("end_turn"), fx::text_block("done"), None)),
+            mark(&fx::assistant(
+                fx::TS,
+                Some("end_turn"),
+                fx::text_block("done"),
+                None
+            )),
             Some(TurnMark::Closed)
         );
         // A text block followed by a tool call in the same message: not closed.
         assert_eq!(
-            mark(&fx::assistant(fx::TS, Some("tool_use"), fx::text_block("let me check"), None)),
+            mark(&fx::assistant(
+                fx::TS,
+                Some("tool_use"),
+                fx::text_block("let me check"),
+                None
+            )),
             Some(TurnMark::Open)
         );
         // A pending tool call.
@@ -543,12 +659,22 @@ mod tests {
         );
         // A stream cut before `stop_reason` was written (observed: null on some text records).
         assert_eq!(
-            mark(&fx::assistant(fx::TS, None, fx::text_block("partial"), None)),
+            mark(&fx::assistant(
+                fx::TS,
+                None,
+                fx::text_block("partial"),
+                None
+            )),
             Some(TurnMark::Open)
         );
         // A thinking block, even when its record says end_turn.
         assert_eq!(
-            mark(&fx::assistant(fx::TS, Some("end_turn"), fx::thinking_block(), None)),
+            mark(&fx::assistant(
+                fx::TS,
+                Some("end_turn"),
+                fx::thinking_block(),
+                None
+            )),
             Some(TurnMark::Open)
         );
     }

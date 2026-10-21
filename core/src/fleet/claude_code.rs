@@ -1,10 +1,10 @@
 //! Claude Code as a fleet source: sessions registry + transcripts + subagents + daemon-run roots.
 //! Spec `.ai/specs/2026-10-20-fleet-arvore-viva-design.md` §3-§4.
 
-mod record;
-mod session;
 #[cfg(test)]
 mod fixture;
+mod record;
+mod session;
 
 // The FINAL production `use` block of this file (later tasks add none). `Cursor`, `TermLine` and
 // `AgentMeta` are first used in Tasks 13-16 and warn as unused until then.
@@ -19,8 +19,12 @@ use sqlx::SqlitePool;
 
 use crate::fleet::FleetEnv;
 use crate::fleet::limits;
-use crate::fleet::model::{clean_label, Cursor, NodeKey, NodeState, TermLine, Timestamp, TranscriptPage};
-use crate::fleet::source::{AgentSource, LinesRead, NodeRef, Offset, Sighting, SourceError, SourceResult, Usage};
+use crate::fleet::model::{
+    Cursor, NodeKey, NodeState, TermLine, Timestamp, TranscriptPage, clean_label,
+};
+use crate::fleet::source::{
+    AgentSource, LinesRead, NodeRef, Offset, Sighting, SourceError, SourceResult, Usage,
+};
 use crate::fleet::tail;
 use record::TurnMark;
 use session::{AgentMeta, ProcessProbe, SessionFile};
@@ -54,7 +58,9 @@ fn utc(t: SystemTime) -> Timestamp {
 fn safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Counters the tests read to prove discovery is incremental (spec §4).
@@ -191,10 +197,18 @@ pub struct ClaudeCode {
 
 impl ClaudeCode {
     pub fn new(env: &FleetEnv) -> Self {
-        Self::with_probe(env.pool.clone(), env.home.clone(), Arc::new(session::OsProbe))
+        Self::with_probe(
+            env.pool.clone(),
+            env.home.clone(),
+            Arc::new(session::OsProbe),
+        )
     }
 
-    pub(crate) fn with_probe(pool: SqlitePool, home: PathBuf, probe: Arc<dyn ProcessProbe>) -> Self {
+    pub(crate) fn with_probe(
+        pool: SqlitePool,
+        home: PathBuf,
+        probe: Arc<dyn ProcessProbe>,
+    ) -> Self {
         Self {
             pool,
             inner: Arc::new(Inner {
@@ -300,7 +314,9 @@ impl Inner {
                 return Some(path);
             }
         }
-        let mtime = std::fs::metadata(&projects).and_then(|md| md.modified()).ok()?;
+        let mtime = std::fs::metadata(&projects)
+            .and_then(|md| md.modified())
+            .ok()?;
         if *miss == Some(mtime) {
             return None;
         }
@@ -327,7 +343,9 @@ fn tail_facts(path: &Path) -> TailFacts {
         };
         facts = TailFacts::default();
         for line in lines.iter().rev() {
-            let Some(parsed) = record::parse_line(line) else { continue };
+            let Some(parsed) = record::parse_line(line) else {
+                continue;
+            };
             if facts.closed.is_none() {
                 facts.closed = parsed.mark.map(|m| m == TurnMark::Closed);
             }
@@ -335,9 +353,10 @@ fn tail_facts(path: &Path) -> TailFacts {
                 facts.model = parsed.model;
             }
             if let Some(u) = parsed.usage {
-                let have = facts
-                    .usage
-                    .get_or_insert(Usage { context_tokens: None, cost_usd: None });
+                let have = facts.usage.get_or_insert(Usage {
+                    context_tokens: None,
+                    cost_usd: None,
+                });
                 if have.context_tokens.is_none() {
                     have.context_tokens = u.context_tokens;
                 }
@@ -359,7 +378,9 @@ fn started_at_of(path: &Path) -> Option<Timestamp> {
     let first = std::fs::File::open(path).ok().and_then(|file| {
         let mut line = String::new();
         // Bounded: a first record can be a 140 KB attachment.
-        BufReader::new(file.take(256 * 1024)).read_line(&mut line).ok()?;
+        BufReader::new(file.take(256 * 1024))
+            .read_line(&mut line)
+            .ok()?;
         serde_json::from_str::<serde_json::Value>(&line)
             .ok()?
             .get("timestamp")?
@@ -411,7 +432,10 @@ impl Inner {
             let live = matches!(run.status.as_str(), "running" | "awaiting_approval");
             // Same rule as the SQL below: a terminal run counts by its completion time (creation
             // time when it has none).
-            let recent = run.completed_at.or(run.created_at).is_none_or(|t| t >= since);
+            let recent = run
+                .completed_at
+                .or(run.created_at)
+                .is_none_or(|t| t >= since);
             if safe_id(&id) && (live || recent) {
                 st.roots.entry(id).or_default().run = Some(run);
             }
@@ -459,7 +483,9 @@ impl Inner {
         let mut expired = Vec::new();
         let ids: Vec<String> = st.roots.keys().cloned().collect();
         for id in ids {
-            let Some(root) = st.roots.get_mut(&id) else { continue };
+            let Some(root) = st.roots.get_mut(&id) else {
+                continue;
+            };
             self.refresh_root(&id, root, &mut st.stats);
             let Some(state) = root_state(root) else {
                 expired.push(id);
@@ -614,7 +640,8 @@ fn child_sightings(id: &str, root: &RootCache, root_state: NodeState, out: &mut 
             project: root_project.clone(),
             state,
             started_at: child.started_at,
-            ended_at: matches!(state, NodeState::Done | NodeState::Lost).then_some(child.last_activity),
+            ended_at: matches!(state, NodeState::Done | NodeState::Lost)
+                .then_some(child.last_activity),
             last_activity_at: child.last_activity,
             run_id: None,
             can_stop: false,
@@ -713,7 +740,14 @@ impl ClaudeCode {
     /// the only way to find a root launched in print mode, which has no `sessions/*.json` entry
     /// (spec §4).
     async fn runs_by_session(&self, since: Timestamp) -> HashMap<String, RunRow> {
-        type Row = (i64, String, String, Option<String>, Option<String>, Option<String>);
+        type Row = (
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let rows: Vec<Row> = match sqlx::query_as(
             "SELECT id, session_id, status, cwd, created_at, completed_at FROM runs \
              WHERE session_id IS NOT NULL AND session_id <> '' AND session_id <> 'shared' \
@@ -774,7 +808,8 @@ impl Inner {
         }
         watch.sort();
         watch.dedup();
-        *self.published.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(Snapshot { watch, nodes });
+        *self.published.write().unwrap_or_else(|e| e.into_inner()) =
+            Arc::new(Snapshot { watch, nodes });
     }
 
     fn snapshot(&self) -> Arc<Snapshot> {
@@ -789,7 +824,10 @@ impl Inner {
         self.snapshot()
             .nodes
             .get(&key.native_id)
-            .map(|path| NodeRef { key: key.clone(), path: Some(path.clone()) })
+            .map(|path| NodeRef {
+                key: key.clone(),
+                path: Some(path.clone()),
+            })
     }
 
     fn watch_paths(&self) -> Vec<PathBuf> {
@@ -802,15 +840,19 @@ impl Inner {
     }
 
     fn read_lines(&self, node: &NodeRef, from: Offset) -> SourceResult<LinesRead> {
-        let path = node
-            .path
-            .as_deref()
-            .ok_or_else(|| SourceError::msg(format!("node {} has no transcript path", node.key.id())))?;
+        let path = node.path.as_deref().ok_or_else(|| {
+            SourceError::msg(format!("node {} has no transcript path", node.key.id()))
+        })?;
         let (raw, offset) = match tail::read_complete_lines(path, from) {
             Ok(read) => read,
             // The file went away between discovery and now: nothing new, same offset.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(LinesRead { lines: Vec::new(), offset: from, usage: None, last_activity_at: None });
+                return Ok(LinesRead {
+                    lines: Vec::new(),
+                    offset: from,
+                    usage: None,
+                    last_activity_at: None,
+                });
             }
             Err(e) => return Err(e.into()),
         };
@@ -830,18 +872,26 @@ impl Inner {
                 last = last.max(Some(at));
             }
         }
-        Ok(LinesRead { lines, offset, usage, last_activity_at: last })
+        Ok(LinesRead {
+            lines,
+            offset,
+            usage,
+            last_activity_at: last,
+        })
     }
 
     /// How many consecutive pages with nothing to show (attachments, titles, ...) are skipped
     /// before the caller gets an empty page with a cursor to continue from.
     const MAX_EMPTY_PAGES: usize = 4;
 
-    fn transcript_page(&self, node: &NodeRef, before: Option<Cursor>) -> SourceResult<TranscriptPage> {
-        let path = node
-            .path
-            .as_deref()
-            .ok_or_else(|| SourceError::msg(format!("node {} has no transcript path", node.key.id())))?;
+    fn transcript_page(
+        &self,
+        node: &NodeRef,
+        before: Option<Cursor>,
+    ) -> SourceResult<TranscriptPage> {
+        let path = node.path.as_deref().ok_or_else(|| {
+            SourceError::msg(format!("node {} has no transcript path", node.key.id()))
+        })?;
         let mut cursor = match before {
             None => None,
             Some(raw) => Some(
@@ -850,11 +900,12 @@ impl Inner {
             ),
         };
         for _ in 0..Self::MAX_EMPTY_PAGES {
-            let (raw, next) = match tail::read_lines_before(path, cursor, limits::TRANSCRIPT_PAGE_BYTES) {
-                Ok(page) => page,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
-                Err(e) => return Err(e.into()),
-            };
+            let (raw, next) =
+                match tail::read_lines_before(path, cursor, limits::TRANSCRIPT_PAGE_BYTES) {
+                    Ok(page) => page,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+                    Err(e) => return Err(e.into()),
+                };
             let mut entries = Vec::new();
             for line in &raw {
                 match record::parse_line(line) {
@@ -863,11 +914,17 @@ impl Inner {
                 }
             }
             if !entries.is_empty() || next.is_none() {
-                return Ok(TranscriptPage { entries, before: next.map(|o| o.to_string()) });
+                return Ok(TranscriptPage {
+                    entries,
+                    before: next.map(|o| o.to_string()),
+                });
             }
             cursor = next;
         }
-        Ok(TranscriptPage { entries: Vec::new(), before: cursor.map(|o| o.to_string()) })
+        Ok(TranscriptPage {
+            entries: Vec::new(),
+            before: cursor.map(|o| o.to_string()),
+        })
     }
 }
 
@@ -897,7 +954,11 @@ impl AgentSource for ClaudeCode {
         tokio::task::spawn_blocking(move || inner.read_lines(&node, from)).await?
     }
 
-    async fn transcript_page(&self, node: &NodeRef, before: Option<Cursor>) -> SourceResult<TranscriptPage> {
+    async fn transcript_page(
+        &self,
+        node: &NodeRef,
+        before: Option<Cursor>,
+    ) -> SourceResult<TranscriptPage> {
         let inner = self.inner.clone();
         let node = node.clone();
         tokio::task::spawn_blocking(move || inner.transcript_page(&node, before)).await?
@@ -920,7 +981,10 @@ mod tests {
     async fn setup(home: &Home, probe: &Arc<FakeProbe>) -> (ClaudeCode, crate::storage::TempDb) {
         let db = crate::storage::TempDb::new().await;
         let probe: Arc<dyn ProcessProbe> = probe.clone();
-        (ClaudeCode::with_probe(db.pool.clone(), home.path(), probe), db)
+        (
+            ClaudeCode::with_probe(db.pool.clone(), home.path(), probe),
+            db,
+        )
     }
 
     fn root_id() -> String {
@@ -929,7 +993,10 @@ mod tests {
 
     fn find<'a>(all: &'a [Sighting], id: &str) -> &'a Sighting {
         all.iter().find(|s| s.key.id() == id).unwrap_or_else(|| {
-            panic!("no sighting {id}; have {:?}", all.iter().map(|s| s.key.id()).collect::<Vec<_>>())
+            panic!(
+                "no sighting {id}; have {:?}",
+                all.iter().map(|s| s.key.id()).collect::<Vec<_>>()
+            )
         })
     }
 
@@ -957,7 +1024,10 @@ mod tests {
         assert_eq!(root.ended_at, None);
         assert!(!root.can_stop && root.has_lines && root.has_transcript);
         assert_eq!(root.started_at.timestamp_millis(), 1_792_523_514_511);
-        assert_eq!(root.usage.as_ref().and_then(|u| u.context_tokens), Some(330));
+        assert_eq!(
+            root.usage.as_ref().and_then(|u| u.context_tokens),
+            Some(330)
+        );
     }
 
     #[tokio::test]
@@ -1048,7 +1118,10 @@ mod tests {
         let probe = Arc::new(FakeProbe::new());
         probe.alive(100, "777");
         let (cc, _db) = setup(&home, &probe).await;
-        assert_eq!(find(&cc.discover(since()).await.unwrap(), &root_id()).state, NodeState::Busy);
+        assert_eq!(
+            find(&cc.discover(since()).await.unwrap(), &root_id()).state,
+            NodeState::Busy
+        );
 
         // Claude Code exits cleanly: the process and its registry file are both gone.
         std::fs::remove_file(entry).unwrap();
@@ -1086,7 +1159,11 @@ mod tests {
     }
 
     /// A print-mode run: a transcript, a run row, and NO registry entry.
-    async fn run_root(status: &str, runner: &str, completed: Option<chrono::DateTime<Utc>>) -> Vec<Sighting> {
+    async fn run_root(
+        status: &str,
+        runner: &str,
+        completed: Option<chrono::DateTime<Utc>>,
+    ) -> Vec<Sighting> {
         let home = Home::new();
         home.transcript(fx::SESSION, &fx::open_turn());
         let probe = Arc::new(FakeProbe::new());
@@ -1120,7 +1197,11 @@ mod tests {
             ("interrupted", NodeState::Lost),
         ] {
             let all = run_root(status, "claude", now).await;
-            assert_eq!(find(&all, &root_id()).state, expected, "run status {status}");
+            assert_eq!(
+                find(&all, &root_id()).state,
+                expected,
+                "run status {status}"
+            );
         }
     }
 
@@ -1165,7 +1246,11 @@ mod tests {
             .expect("insert old run");
         }
         let all = cc.discover(since()).await.unwrap();
-        assert_eq!(all.len(), 1, "the 249 old runs are filtered in SQL, the live one is not cut off");
+        assert_eq!(
+            all.len(),
+            1,
+            "the 249 old runs are filtered in SQL, the live one is not cut off"
+        );
         assert_eq!(find(&all, &root_id()).run_id, Some(1));
     }
 
@@ -1189,12 +1274,29 @@ mod tests {
     fn with_children(alive: bool) -> (Home, Arc<FakeProbe>) {
         let home = Home::new();
         home.session_file(100, fx::SESSION, "busy", "777");
-        home.transcript(fx::SESSION, &if alive { fx::closed_turn() } else { fx::open_turn() });
+        home.transcript(
+            fx::SESSION,
+            &if alive {
+                fx::closed_turn()
+            } else {
+                fx::open_turn()
+            },
+        );
         let s = fx::SESSION;
         home.subagent(s, "a1", json!({"agentType":"Explore","description":"read specs","model":"sonnet","finished":true}), &fx::closed_turn());
-        home.subagent(s, "a2", json!({"agentType":"general-purpose","description":"write code"}), &fx::open_turn());
+        home.subagent(
+            s,
+            "a2",
+            json!({"agentType":"general-purpose","description":"write code"}),
+            &fx::open_turn(),
+        );
         home.subagent(s, "a3", json!({"agentType":"Explore","description":"deeper","parentAgentId":"a1","spawnDepth":2}), &fx::open_turn());
-        home.subagent(s, "a4", json!({"agentType":"Explore","description":"orphan","parentAgentId":"ghost"}), &fx::open_turn());
+        home.subagent(
+            s,
+            "a4",
+            json!({"agentType":"Explore","description":"orphan","parentAgentId":"ghost"}),
+            &fx::open_turn(),
+        );
         let probe = Arc::new(FakeProbe::new());
         if alive {
             probe.alive(100, "777");
@@ -1215,7 +1317,10 @@ mod tests {
         let root_key = NodeKey::new("claude-code", fx::SESSION);
         assert_eq!(find(&all, &child_id("a1")).parent.as_ref(), Some(&root_key));
         assert_eq!(find(&all, &child_id("a2")).parent.as_ref(), Some(&root_key));
-        assert_eq!(find(&all, &child_id("a3")).parent.as_ref(), Some(&NodeKey::new("claude-code", "a1")));
+        assert_eq!(
+            find(&all, &child_id("a3")).parent.as_ref(),
+            Some(&NodeKey::new("claude-code", "a1"))
+        );
         // Unknown parentAgentId: no heuristics, the parent is the root.
         assert_eq!(find(&all, &child_id("a4")).parent.as_ref(), Some(&root_key));
         let a1 = find(&all, &child_id("a1"));
@@ -1253,7 +1358,12 @@ mod tests {
         let home = Home::new();
         home.session_file(100, fx::SESSION, "busy", "777");
         home.transcript(fx::SESSION, &fx::closed_turn());
-        home.subagent(fx::SESSION, "s1", json!({"agentType":"general-purpose","stoppedByUser":true}), &fx::open_turn());
+        home.subagent(
+            fx::SESSION,
+            "s1",
+            json!({"agentType":"general-purpose","stoppedByUser":true}),
+            &fx::open_turn(),
+        );
         home.subagent(fx::SESSION, "b1", json!({}), &[]);
         let probe = Arc::new(FakeProbe::new());
         probe.alive(100, "777");
@@ -1293,7 +1403,12 @@ mod tests {
     async fn a_run_resolved_root_gets_its_subagents_too() {
         let home = Home::new();
         home.transcript(fx::SESSION, &fx::open_turn());
-        home.subagent(fx::SESSION, "a1", json!({"agentType":"Explore","description":"d"}), &fx::open_turn());
+        home.subagent(
+            fx::SESSION,
+            "a1",
+            json!({"agentType":"Explore","description":"d"}),
+            &fx::open_turn(),
+        );
         let probe = Arc::new(FakeProbe::new());
         let (cc, db) = setup(&home, &probe).await;
         insert_run(&db.pool, 5, "running", "claude", None).await;
@@ -1349,12 +1464,20 @@ mod tests {
         let home = Home::new();
         home.session_file(100, fx::SESSION, "idle", "777");
         home.transcript(fx::SESSION, &fx::closed_turn());
-        let old = home.subagent(fx::SESSION, "a1", json!({"finished":true}), &fx::closed_turn());
+        let old = home.subagent(
+            fx::SESSION,
+            "a1",
+            json!({"finished":true}),
+            &fx::closed_turn(),
+        );
         fx::age(&old, 600);
         let probe = Arc::new(FakeProbe::new());
         probe.alive(100, "777");
         let (cc, _db) = setup(&home, &probe).await;
-        assert_eq!(find(&cc.discover(since()).await.unwrap(), &child_id("a1")).state, NodeState::Done);
+        assert_eq!(
+            find(&cc.discover(since()).await.unwrap(), &child_id("a1")).state,
+            NodeState::Done
+        );
     }
 
     #[tokio::test]
@@ -1371,7 +1494,10 @@ mod tests {
         probe.set(100, session::Proc::Dead);
         fx::age(&transcript, 60);
         assert!(cc.discover(since()).await.unwrap().is_empty());
-        assert!(cc.inner.lock().roots.is_empty(), "the cache entry should be evicted");
+        assert!(
+            cc.inner.lock().roots.is_empty(),
+            "the cache entry should be evicted"
+        );
     }
 
     #[tokio::test]
@@ -1384,11 +1510,19 @@ mod tests {
         let (cc, _db) = setup(&home, &probe).await;
 
         assert!(cc.discover(since()).await.unwrap().is_empty());
-        assert_eq!(cc.stats().tail_reads, 1, "built once, then evicted as outside the window");
+        assert_eq!(
+            cc.stats().tail_reads,
+            1,
+            "built once, then evicted as outside the window"
+        );
         for _ in 0..3 {
             assert!(cc.discover(since()).await.unwrap().is_empty());
         }
-        assert_eq!(cc.stats().tail_reads, 1, "later passes must not re-create the root");
+        assert_eq!(
+            cc.stats().tail_reads,
+            1,
+            "later passes must not re-create the root"
+        );
         assert!(cc.inner.lock().roots.is_empty());
 
         // The file changes (a longer status word, so the stamp differs on any filesystem):
@@ -1398,7 +1532,13 @@ mod tests {
         assert_eq!(cc.stats().tail_reads, 2);
 
         // And when the file goes away the mark is forgotten.
-        std::fs::remove_file(home.path().join(".claude").join("sessions").join("100.json")).unwrap();
+        std::fs::remove_file(
+            home.path()
+                .join(".claude")
+                .join("sessions")
+                .join("100.json"),
+        )
+        .unwrap();
         cc.discover(since()).await.unwrap();
         assert!(cc.inner.lock().stale.is_empty());
     }
@@ -1418,7 +1558,11 @@ mod tests {
         assert_eq!(cc.stats().project_scans, 1);
         cc.discover(since()).await.unwrap();
         cc.discover(since()).await.unwrap();
-        assert_eq!(cc.stats().project_scans, 1, "nothing changed under projects/: no new search");
+        assert_eq!(
+            cc.stats().project_scans,
+            1,
+            "nothing changed under projects/: no new search"
+        );
 
         // The session's transcript shows up in a project directory that does not follow the cwd;
         // creating that directory moves the `projects/` mtime (a short pause keeps the two mtimes
@@ -1447,10 +1591,19 @@ mod tests {
         assert_eq!(first.session_parses, 1);
 
         cc.discover(since()).await.unwrap();
-        assert_eq!(cc.stats(), first, "nothing changed on disk, nothing may be re-read");
+        assert_eq!(
+            cc.stats(),
+            first,
+            "nothing changed on disk, nothing may be re-read"
+        );
 
         // A new subagent changes the directory mtime: one relisting, one more meta, others untouched.
-        home.subagent(fx::SESSION, "a5", json!({"agentType":"Explore","description":"new"}), &fx::open_turn());
+        home.subagent(
+            fx::SESSION,
+            "a5",
+            json!({"agentType":"Explore","description":"new"}),
+            &fx::open_turn(),
+        );
         let all = cc.discover(since()).await.unwrap();
         let after = cc.stats();
         assert_eq!(after.subagent_listings, 2);
@@ -1468,7 +1621,8 @@ mod tests {
 
         std::fs::write(
             home.meta_path(fx::SESSION, "a2"),
-            json!({"agentType":"general-purpose","description":"write code","finished":true}).to_string(),
+            json!({"agentType":"general-purpose","description":"write code","finished":true})
+                .to_string(),
         )
         .unwrap();
         let all = cc.discover(since()).await.unwrap();
@@ -1484,10 +1638,16 @@ mod tests {
         let probe = Arc::new(FakeProbe::new());
         probe.alive(100, "777");
         let (cc, _db) = setup(&home, &probe).await;
-        assert_eq!(find(&cc.discover(since()).await.unwrap(), &root_id()).state, NodeState::Busy);
+        assert_eq!(
+            find(&cc.discover(since()).await.unwrap(), &root_id()).state,
+            NodeState::Busy
+        );
         // A longer status word, so the stamp changes even on a coarse-mtime filesystem.
         home.session_file(100, fx::SESSION, "waiting", "777");
-        assert_eq!(find(&cc.discover(since()).await.unwrap(), &root_id()).state, NodeState::Idle);
+        assert_eq!(
+            find(&cc.discover(since()).await.unwrap(), &root_id()).state,
+            NodeState::Idle
+        );
     }
 
     #[tokio::test]
@@ -1505,7 +1665,8 @@ mod tests {
 
     async fn node_of(cc: &ClaudeCode, key: &NodeKey) -> NodeRef {
         cc.discover(since()).await.unwrap();
-        cc.node_ref(key).expect("the node should be known after discover")
+        cc.node_ref(key)
+            .expect("the node should be known after discover")
     }
 
     fn root_key() -> NodeKey {
@@ -1527,10 +1688,23 @@ mod tests {
     async fn reading_from_the_tail_yields_lines_usage_and_activity() {
         let (cc, _home, node, _db) = live_root(&fx::closed_turn()).await;
         let read = cc.read_lines(&node, Offset::TAIL).await.unwrap();
-        let shown: Vec<_> = read.lines.iter().map(|l| (l.kind, l.text.as_str())).collect();
-        assert_eq!(shown, vec![(TermKind::Prompt, "do the thing"), (TermKind::Final, "all done")]);
+        let shown: Vec<_> = read
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.text.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (TermKind::Prompt, "do the thing"),
+                (TermKind::Final, "all done")
+            ]
+        );
         assert_eq!(read.usage.and_then(|u| u.context_tokens), Some(330));
-        assert_eq!(read.last_activity_at, Some("2026-10-20T10:00:00Z".parse().unwrap()));
+        assert_eq!(
+            read.last_activity_at,
+            Some("2026-10-20T10:00:00Z".parse().unwrap())
+        );
     }
 
     #[tokio::test]
@@ -1560,7 +1734,10 @@ mod tests {
         fx::append(&path, head);
         let partial = cc.read_lines(&node, first.offset).await.unwrap();
         assert!(partial.lines.is_empty());
-        assert_eq!(partial.offset, first.offset, "the offset stays before the unfinished line");
+        assert_eq!(
+            partial.offset, first.offset,
+            "the offset stays before the unfinished line"
+        );
 
         fx::append(&path, &format!("{rest}\n"));
         let done = cc.read_lines(&node, partial.offset).await.unwrap();
@@ -1577,7 +1754,11 @@ mod tests {
         let before = cc.warnings();
         let read = cc.read_lines(&node, Offset::TAIL).await.unwrap();
         assert_eq!(read.lines.len(), 2, "the two good lines survive");
-        assert_eq!(cc.warnings(), before + 1, "two bad lines, one cause, one log");
+        assert_eq!(
+            cc.warnings(),
+            before + 1,
+            "two bad lines, one cause, one log"
+        );
     }
 
     #[tokio::test]
@@ -1588,7 +1769,13 @@ mod tests {
 
         std::fs::write(&path, format!("{}\n", fx::user_prompt(fx::TS, "fresh"))).unwrap();
         let read = cc.read_lines(&node, first.offset).await.unwrap();
-        assert_eq!(read.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["fresh"]);
+        assert_eq!(
+            read.lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"]
+        );
     }
 
     #[tokio::test]
@@ -1608,7 +1795,11 @@ mod tests {
             lines.push(fx::assistant(
                 fx::TS,
                 Some("tool_use"),
-                fx::tool_block(&id, "Read", json!({"file_path": format!("src/file_{n}.rs")})),
+                fx::tool_block(
+                    &id,
+                    "Read",
+                    json!({"file_path": format!("src/file_{n}.rs")}),
+                ),
                 None,
             ));
             lines.push(fx::tool_result(
@@ -1638,17 +1829,27 @@ mod tests {
             }
             assert!(pages.len() < 20, "paging must terminate");
         }
-        assert!(pages.len() >= 2, "the fixture is bigger than one 256 KB page");
+        assert!(
+            pages.len() >= 2,
+            "the fixture is bigger than one 256 KB page"
+        );
 
         // Pages arrive newest-first; each is oldest-first inside. Stitch them back in order.
         let all: Vec<TranscriptEntry> = pages.into_iter().rev().flatten().collect();
         assert_eq!(all.len(), 1 + 2 * pairs);
-        assert_eq!((all[0].kind, all[0].text.as_str()), (TermKind::Prompt, "start"));
+        assert_eq!(
+            (all[0].kind, all[0].text.as_str()),
+            (TermKind::Prompt, "start")
+        );
         assert_eq!(all[1].text, "Read src/file_0.rs");
         assert!(all[1].detail.as_deref().unwrap().contains("src/file_0.rs"));
         assert_eq!(all[2].kind, TermKind::Result);
         assert_eq!(all[2].text, "1 line");
-        assert_eq!(all[2].detail.as_deref().map(str::len), Some(4000), "the result body in full");
+        assert_eq!(
+            all[2].detail.as_deref().map(str::len),
+            Some(4000),
+            "the result body in full"
+        );
         assert_eq!(all.last().unwrap().text, format!("{pairs} lines"));
     }
 
@@ -1663,7 +1864,11 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_that_is_not_ours_is_an_error() {
         let (cc, _home, node, _db) = live_root(&fx::closed_turn()).await;
-        assert!(cc.transcript_page(&node, Some("not-a-number".to_owned())).await.is_err());
+        assert!(
+            cc.transcript_page(&node, Some("not-a-number".to_owned()))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1671,13 +1876,24 @@ mod tests {
         let home = Home::new();
         home.session_file(100, fx::SESSION, "busy", "777");
         home.transcript(fx::SESSION, &fx::closed_turn());
-        home.subagent(fx::SESSION, "a1", json!({"description":"d"}), &[fx::user_prompt(fx::TS, "sub prompt")]);
+        home.subagent(
+            fx::SESSION,
+            "a1",
+            json!({"description":"d"}),
+            &[fx::user_prompt(fx::TS, "sub prompt")],
+        );
         let probe = Arc::new(FakeProbe::new());
         probe.alive(100, "777");
         let (cc, _db) = setup(&home, &probe).await;
         let node = node_of(&cc, &NodeKey::new("claude-code", "a1")).await;
         let page = cc.transcript_page(&node, None).await.unwrap();
-        assert_eq!(page.entries.iter().map(|e| e.text.as_str()).collect::<Vec<_>>(), vec!["sub prompt"]);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sub prompt"]
+        );
     }
 
     #[tokio::test]
@@ -1686,8 +1902,13 @@ mod tests {
         let (cc, _db) = setup(&home, &probe).await;
         let before = cc.watch_paths();
         let claude = home.path().join(".claude");
-        assert!(before.contains(&claude.join("sessions")) && before.contains(&claude.join("projects")));
-        assert!(!before.contains(&home.subagents_dir(fx::SESSION)), "nothing known yet");
+        assert!(
+            before.contains(&claude.join("sessions")) && before.contains(&claude.join("projects"))
+        );
+        assert!(
+            !before.contains(&home.subagents_dir(fx::SESSION)),
+            "nothing known yet"
+        );
 
         cc.discover(since()).await.unwrap();
         let after = cc.watch_paths();
@@ -1702,14 +1923,24 @@ mod tests {
     async fn node_ref_knows_roots_and_children_and_nothing_else() {
         let (home, probe) = with_children(true);
         let (cc, _db) = setup(&home, &probe).await;
-        assert!(cc.node_ref(&root_key()).is_none(), "unknown before the first discover");
+        assert!(
+            cc.node_ref(&root_key()).is_none(),
+            "unknown before the first discover"
+        );
         cc.discover(since()).await.unwrap();
 
         let root = cc.node_ref(&root_key()).unwrap();
-        assert!(root.path.unwrap().ends_with(format!("{}.jsonl", fx::SESSION)));
+        assert!(
+            root.path
+                .unwrap()
+                .ends_with(format!("{}.jsonl", fx::SESSION))
+        );
         let child = cc.node_ref(&NodeKey::new("claude-code", "a3")).unwrap();
         assert!(child.path.unwrap().ends_with("agent-a3.jsonl"));
-        assert!(cc.node_ref(&NodeKey::new("codex-cli", fx::SESSION)).is_none());
+        assert!(
+            cc.node_ref(&NodeKey::new("codex-cli", fx::SESSION))
+                .is_none()
+        );
         assert!(cc.node_ref(&NodeKey::new("claude-code", "nope")).is_none());
     }
 
@@ -1745,12 +1976,21 @@ mod tests {
         };
         let (agents, _edges) = crate::fleet::sources(&env);
         let names: Vec<_> = agents.iter().map(|a| a.name()).collect();
-        let claude = names.iter().position(|n| *n == "claude_code").expect("claude_code is registered");
+        let claude = names
+            .iter()
+            .position(|n| *n == "claude_code")
+            .expect("claude_code is registered");
         if let Some(daemon) = names.iter().position(|n| *n == "daemon_runs") {
-            assert!(daemon < claude, "fusion precedence: daemon_runs first, got {names:?}");
+            assert!(
+                daemon < claude,
+                "fusion precedence: daemon_runs first, got {names:?}"
+            );
         }
         if let Some(codex) = names.iter().position(|n| *n == "codex_cli") {
-            assert!(claude < codex, "fusion precedence: claude_code before codex_cli, got {names:?}");
+            assert!(
+                claude < codex,
+                "fusion precedence: claude_code before codex_cli, got {names:?}"
+            );
         }
     }
 }

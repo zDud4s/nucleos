@@ -104,7 +104,9 @@ pub enum Proc {
     Dead,
     /// `start_token` is the process creation time in the same encoding as
     /// `SessionFile::proc_start`, or `None` where it cannot be read or is not compared.
-    Alive { start_token: Option<String> },
+    Alive {
+        start_token: Option<String>,
+    },
 }
 
 pub trait ProcessProbe: Send + Sync {
@@ -155,15 +157,20 @@ fn os_probe(pid: u32) -> Proc {
         }
         let mut code = 0u32;
         let running = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE;
-        let (mut created, mut exited, mut kernel, mut user) =
-            (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
         let timed = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
         CloseHandle(handle);
         if !running {
             return Proc::Dead;
         }
         let start_token = timed.then(|| {
-            ((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)).to_string()
+            ((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+                .to_string()
         });
         Proc::Alive { start_token }
     }
@@ -218,10 +225,21 @@ mod tests {
     fn only_pid_and_session_id_are_required() {
         let s = parse_session(r#"{"pid":7,"sessionId":"abc"}"#).unwrap();
         assert_eq!((s.pid, s.session_id.as_str()), (7, "abc"));
-        assert!(s.cwd.is_none() && s.proc_start.is_none() && s.name.is_none() && s.status.is_none());
-        assert_eq!(parse_session(r#"{"sessionId":"abc"}"#), Err("session file has no pid"));
-        assert_eq!(parse_session(r#"{"pid":7}"#), Err("session file has no sessionId"));
-        assert_eq!(parse_session("{\"pid\":7,\"sess"), Err("session file is not valid JSON"));
+        assert!(
+            s.cwd.is_none() && s.proc_start.is_none() && s.name.is_none() && s.status.is_none()
+        );
+        assert_eq!(
+            parse_session(r#"{"sessionId":"abc"}"#),
+            Err("session file has no pid")
+        );
+        assert_eq!(
+            parse_session(r#"{"pid":7}"#),
+            Err("session file has no sessionId")
+        );
+        assert_eq!(
+            parse_session("{\"pid\":7,\"sess"),
+            Err("session file is not valid JSON")
+        );
     }
 
     #[test]
@@ -246,7 +264,10 @@ mod tests {
         let empty = parse_meta("{}").unwrap();
         assert_eq!(empty, AgentMeta::default());
         assert!(!empty.is_closed());
-        assert_eq!(parse_meta("{\"agentTy"), Err("agent meta file is not valid JSON"));
+        assert_eq!(
+            parse_meta("{\"agentTy"),
+            Err("agent meta file is not valid JSON")
+        );
     }
 
     #[test]
@@ -287,7 +308,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn on_windows_the_start_token_is_the_creation_filetime() {
-        let Proc::Alive { start_token: Some(token) } = OsProbe.probe(std::process::id()) else {
+        let Proc::Alive {
+            start_token: Some(token),
+        } = OsProbe.probe(std::process::id())
+        else {
             panic!("this process should be alive with a start token");
         };
         let ticks: u64 = token.parse().expect("a decimal FILETIME");

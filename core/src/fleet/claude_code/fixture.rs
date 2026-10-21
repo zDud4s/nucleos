@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::session::{Proc, ProcessProbe};
 
@@ -25,13 +25,23 @@ impl FakeProbe {
 
     /// Alive, with the start token the session file will carry.
     pub fn alive(&self, pid: u32, token: &str) {
-        self.set(pid, Proc::Alive { start_token: Some(token.to_owned()) });
+        self.set(
+            pid,
+            Proc::Alive {
+                start_token: Some(token.to_owned()),
+            },
+        );
     }
 }
 
 impl ProcessProbe for FakeProbe {
     fn probe(&self, pid: u32) -> Proc {
-        self.0.lock().unwrap().get(&pid).cloned().unwrap_or(Proc::Dead)
+        self.0
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .cloned()
+            .unwrap_or(Proc::Dead)
     }
 }
 
@@ -52,7 +62,12 @@ pub fn meta_user(ts: &str, text: &str) -> String {
 
 /// One assistant record carrying ONE content block, as Claude Code writes them.
 /// `usage` is `(input, cache_creation, cache_read)`.
-pub fn assistant(ts: &str, stop: Option<&str>, block: Value, usage: Option<(i64, i64, i64)>) -> String {
+pub fn assistant(
+    ts: &str,
+    stop: Option<&str>,
+    block: Value,
+    usage: Option<(i64, i64, i64)>,
+) -> String {
     let mut message = json!({
         "model": "claude-test-1", "role": "assistant", "content": [block], "stop_reason": stop
     });
@@ -102,7 +117,12 @@ pub fn cost_state(usd: f64) -> String {
 pub fn closed_turn() -> Vec<String> {
     vec![
         user_prompt(TS, "do the thing"),
-        assistant(TS, Some("end_turn"), text_block("all done"), Some((10, 20, 300))),
+        assistant(
+            TS,
+            Some("end_turn"),
+            text_block("all done"),
+            Some((10, 20, 300)),
+        ),
     ]
 }
 
@@ -126,7 +146,9 @@ pub struct Home {
 
 impl Home {
     pub fn new() -> Self {
-        Self { dir: tempfile::tempdir().expect("a tempdir") }
+        Self {
+            dir: tempfile::tempdir().expect("a tempdir"),
+        }
     }
 
     pub fn path(&self) -> PathBuf {
@@ -144,7 +166,13 @@ impl Home {
     /// `sessions/<pid>.json`, shaped like the real one (cwd `c:\work\proj`). `startedAt` is its own
     /// constant (Task 10 asserts it); `updatedAt` is a clearly OLD one (Sept 2020), so the retention
     /// tests depend on the transcript's mtime only and pass whatever the wall clock says.
-    pub fn session_file(&self, pid: u32, session_id: &str, status: &str, proc_start: &str) -> PathBuf {
+    pub fn session_file(
+        &self,
+        pid: u32,
+        session_id: &str,
+        status: &str,
+        proc_start: &str,
+    ) -> PathBuf {
         let dir = self.claude().join("sessions");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{pid}.json"));
@@ -179,17 +207,28 @@ impl Home {
     }
 
     /// `agent-<id>.meta.json` + `agent-<id>.jsonl`; returns the jsonl path.
-    pub fn subagent(&self, session_id: &str, agent: &str, meta: Value, lines: &[String]) -> PathBuf {
+    pub fn subagent(
+        &self,
+        session_id: &str,
+        agent: &str,
+        meta: Value,
+        lines: &[String],
+    ) -> PathBuf {
         let dir = self.subagents_dir(session_id);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(format!("agent-{agent}.meta.json")), meta.to_string()).unwrap();
+        fs::write(
+            dir.join(format!("agent-{agent}.meta.json")),
+            meta.to_string(),
+        )
+        .unwrap();
         let path = dir.join(format!("agent-{agent}.jsonl"));
         Self::write_lines(&path, lines);
         path
     }
 
     pub fn meta_path(&self, session_id: &str, agent: &str) -> PathBuf {
-        self.subagents_dir(session_id).join(format!("agent-{agent}.meta.json"))
+        self.subagents_dir(session_id)
+            .join(format!("agent-{agent}.meta.json"))
     }
 }
 
@@ -203,5 +242,6 @@ pub fn append(path: &Path, text: &str) {
 /// Moves a file's mtime into the past.
 pub fn age(path: &Path, minutes: u64) {
     let file = fs::OpenOptions::new().write(true).open(path).unwrap();
-    file.set_modified(SystemTime::now() - Duration::from_secs(minutes * 60)).unwrap();
+    file.set_modified(SystemTime::now() - Duration::from_secs(minutes * 60))
+        .unwrap();
 }
