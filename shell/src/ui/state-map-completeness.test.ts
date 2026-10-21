@@ -13,6 +13,7 @@ const concurrencyRs = readFileSync(`${repoRoot}core/src/execution/concurrency.rs
 const runsRs = moduleSource("core/src/execution/runs");
 const sidecarRs = readFileSync(`${repoRoot}core/src/sidecar.rs`, "utf8");
 const quotaRs = readFileSync(`${repoRoot}core/src/quota.rs`, "utf8");
+const registryRs = readFileSync(`${repoRoot}core/src/channels/registry.rs`, "utf8");
 
 /**
  * Every `.rs` under `core/src`, subdirectories included. The judge's module (`core/src/judge/`)
@@ -267,6 +268,22 @@ describe("state-map completeness", () => {
     expect(new Set(statesOf("sidecar"))).toEqual(new Set(states));
     expect(readState("sidecar", "down")?.tone).toBe("danger");
     expect(readState("sidecar", "running")?.tone).toBe("active");
+  });
+
+  it("every channel state the registry can report has a reading", () => {
+    const body = /pub enum ChannelState \{([^}]*)\}/.exec(registryRs)?.[1];
+    expect(body, "ChannelState is gone from channels/registry.rs").toBeDefined();
+    // `#[serde(rename_all = "snake_case")]` is what the shell receives.
+    const states = [...body!.matchAll(/\b([A-Z][A-Za-z]*),/g)].map(([, variant]) =>
+      variant.replace(/(?<!^)([A-Z])/g, "_$1").toLowerCase(),
+    );
+
+    expect(states).toHaveLength(5);
+    expect(new Set(statesOf("channel"))).toEqual(new Set(states));
+    // Not set up is a fact about the machine, not a fault; the two that stop delivery are.
+    expect(readState("channel", "not_configured")?.tone).toBe("off");
+    expect(readState("channel", "offline")?.tone).toBe("danger");
+    expect(readState("channel", "incompatible")?.tone).toBe("danger");
   });
 
   it("every quota state the núcleo can produce has a reading", () => {

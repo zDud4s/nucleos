@@ -57,7 +57,8 @@ export type StateDomain =
   | "rule"
   | "folder"
   | "knowledge"
-  | "sidecar";
+  | "sidecar"
+  | "channel";
 
 export interface StateReading {
   tone: BadgeTone;
@@ -630,6 +631,25 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   sidecar: {
     running: { tone: "active", label: "running" },
     down: { tone: "danger", label: "down" },
+  },
+
+  /**
+   * A messaging channel's link to its adapter (`ChannelState`, `core/src/channels/registry.rs`).
+   *
+   * `not_configured` is a channel nobody has set up: a fact about the machine, not a fault, so
+   * it takes the quiet `off`. `starting` has launched and not yet heard hello, so it is
+   * pending. `offline` and `incompatible` both stop delivery and take the failure tone, for the
+   * reason a dead sidecar does: what depends on the channel goes quiet without saying so. They
+   * stay two labels because they ask for different things — `offline` may come back on its
+   * own and the outbox holds what is waiting, while `incompatible` needs a person to update
+   * the adapter.
+   */
+  channel: {
+    not_configured: { tone: "off", label: "not configured" },
+    starting: { tone: "pending", label: "starting" },
+    online: { tone: "active", label: "online" },
+    offline: { tone: "danger", label: "offline" },
+    incompatible: { tone: "danger", label: "incompatible" },
   },
 
   /**

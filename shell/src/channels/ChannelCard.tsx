@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Channel, ChannelState } from "../data/channels";
 import { sidecarKeyOf } from "../data/system";
-import { Button, Callout, Panel, Quiet } from "../ui";
+import { Button, Callout, Panel, Quiet, StateBadge } from "../ui";
 import { RelativeTime } from "../ui/readings";
 import { CapabilityList } from "./CapabilityList";
 import { IdentitiesPanel } from "./IdentitiesPanel";
@@ -11,21 +11,18 @@ import { PrimaryChannelControl } from "./PrimaryChannelControl";
 import { RestartSidecar } from "./RestartSidecar";
 import "./card.css";
 
-const STATE: Record<ChannelState, { label: string; sentence: string }> = {
-  not_configured: { label: "not configured", sentence: "this channel is missing what it needs to start" },
-  starting: { label: "starting", sentence: "waiting for the adapter to say hello" },
-  online: { label: "online", sentence: "connected and delivering" },
-  offline: { label: "offline", sentence: "not connected right now; the outbox holds what is waiting" },
-  incompatible: {
-    label: "incompatible",
-    sentence:
-      "the adapter spoke a contract the background service refused (409 contract_version): update the adapter, then restart it",
-  },
+/** What each state means in a sentence. Its tone and label are the state map's (`channel`). */
+const SENTENCE: Record<ChannelState, string> = {
+  not_configured: "this channel is missing what it needs to start",
+  starting: "waiting for the adapter to say hello",
+  online: "connected and delivering",
+  offline: "not connected right now; the outbox holds what is waiting",
+  incompatible:
+    "the adapter spoke a contract the background service refused (409 contract_version): update the adapter, then restart it",
 };
 
 /** One messaging channel: its state, what it can do, what is queued or dropped, and the primary choice. */
 export function ChannelCard({ channel, primary }: { channel: Channel; primary: string | null }) {
-  const state = STATE[channel.state];
   const key = sidecarKeyOf(channel.health_row);
   const { outbox, drops } = channel;
   const configured = channel.state !== "not_configured";
@@ -36,7 +33,7 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
       title={channel.label}
       aside={
         <>
-          <span className="ch-card-state" data-state={channel.state}>{state.label}</span>
+          <StateBadge domain="channel" state={channel.state} />
           {channel.since !== null && configured ? <RelativeTime at={channel.since} /> : null}
           {channel.adapter !== null ? (
             <span className="ch-card-meta">contract {channel.adapter.contract_version}</span>
@@ -45,7 +42,7 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
       }
     >
       <div className="ch-card">
-        <Quiet compact says={state.sentence} />
+        <Quiet compact says={SENTENCE[channel.state]} />
 
         {!configured ? (
           <Callout tone="pending" title="Missing secrets">

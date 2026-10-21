@@ -8,24 +8,6 @@
 }
 .ch-card > * { max-width: 100%; }
 /* The state word keeps the ink; a small dot beside it carries the tone, so colour only reinforces. */
-.ch-card-state {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  font-weight: var(--weight-semibold);
-  color: var(--text);
-}
-.ch-card-state::before {
-  content: "";
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: var(--radius-pill);
-  background: var(--text-faint);
-}
-.ch-card-state[data-state="online"]::before { background: var(--tone-active-fg); }
-.ch-card-state[data-state="starting"]::before { background: var(--tone-pending-fg); }
-.ch-card-state[data-state="offline"]::before,
-.ch-card-state[data-state="incompatible"]::before { background: var(--tone-danger-fg); }
 .ch-card-meta {
   font-size: var(--text-xs);
   color: var(--text-faint);
