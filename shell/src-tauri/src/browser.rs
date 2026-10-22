@@ -114,6 +114,33 @@ impl EnvKey {
             role,
         })
     }
+
+    // RED stub: wrong constant on purpose, the real no-project scope is not implemented yet.
+    #[allow(dead_code)]
+    fn none(role: Role) -> EnvKey {
+        EnvKey {
+            project: "p".to_string(),
+            role,
+        }
+    }
+
+    // RED stub: ignores the scope on purpose.
+    #[allow(dead_code)]
+    fn scoped(_project: Option<&str>, role: Role) -> EnvKey {
+        EnvKey::none(role)
+    }
+}
+
+// RED stub
+#[allow(dead_code)]
+fn should_retire_none_agent(_registry: &Registry, _key: &EnvKey) -> bool {
+    todo!()
+}
+
+// RED stub
+#[allow(dead_code)]
+fn stale_none_agent_dirs(_names: &[String], _live_generation: Option<u32>) -> Vec<String> {
+    todo!()
 }
 
 /// Names Windows will not let a directory carry, whatever the extension.
@@ -528,9 +555,19 @@ struct TabState {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EnvRebuilt {
-    project: String,
+    project: Option<String>,
     role: String,
     closed_tab_ids: Vec<String>,
+}
+
+// RED stub: skips a `None` project on purpose, so the test for `"project":null` fails.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct EnvRetired {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    role: String,
 }
 
 /// The tab ids behind the labels of closed webviews, in order. Keepalive webviews and labels that
@@ -823,7 +860,7 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
             MAIN_LABEL,
             ENV_REBUILT_EVENT,
             EnvRebuilt {
-                project: key.project.clone(),
+                project: Some(key.project.clone()),
                 role: Role::Agent.as_str().to_string(),
                 closed_tab_ids: closed_tab_ids(&closed_labels),
             },
@@ -1251,6 +1288,137 @@ mod tests {
 
     fn labels(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn envkey_none_scope_is_distinct_from_every_project() {
+        assert_ne!(
+            EnvKey::none(Role::Owner),
+            EnvKey::new("p", "owner").unwrap()
+        );
+        assert_ne!(
+            EnvKey::none(Role::Agent),
+            EnvKey::new("none", "agent").unwrap_or_else(|_| EnvKey::none(Role::Owner))
+        );
+        assert_eq!(EnvKey::scoped(None, Role::Owner), EnvKey::none(Role::Owner));
+        assert_eq!(EnvKey::scoped(None, Role::Agent), EnvKey::none(Role::Agent));
+        assert_ne!(EnvKey::none(Role::Owner), EnvKey::none(Role::Agent));
+        assert_eq!(
+            EnvKey::scoped(Some("p"), Role::Owner),
+            EnvKey::new("p", "owner").unwrap()
+        );
+    }
+
+    #[test]
+    fn envkey_refuses_a_project_named_none() {
+        assert_eq!(
+            EnvKey::new("none", "owner"),
+            Err("invalid_project".to_string())
+        );
+        assert_eq!(
+            EnvKey::new("none", "agent"),
+            Err("invalid_project".to_string())
+        );
+    }
+
+    #[test]
+    fn data_dir_of_the_no_project_scope_is_browser_none_role() {
+        let base = Path::new("base");
+        let root = base.join("nucleos").join("browser");
+        assert_eq!(
+            data_dir(base, &EnvKey::none(Role::Owner)),
+            root.join("none").join("owner")
+        );
+        assert_eq!(
+            data_dir(base, &EnvKey::none(Role::Agent)),
+            root.join("none").join("agent")
+        );
+        assert_eq!(
+            data_dir(base, &EnvKey::new("proj", "owner").unwrap()),
+            root.join("proj").join("owner")
+        );
+    }
+
+    #[test]
+    fn registry_keeps_no_project_and_project_environments_apart() {
+        let mut reg = Registry::default();
+        let none = EnvKey::none(Role::Agent);
+        let proj = EnvKey::new("proj", "agent").unwrap();
+        reg.ensure_env(&none, || env("none-args"));
+        reg.ensure_env(&proj, || env("proj-args"));
+        assert_eq!(reg.env(&none).unwrap().args, "none-args");
+        assert_eq!(reg.env(&proj).unwrap().args, "proj-args");
+
+        reg.reserve_tab("t-none", none.clone()).unwrap();
+        reg.finish_tab("t-none").unwrap();
+        reg.reserve_tab("t-proj", proj.clone()).unwrap();
+        reg.finish_tab("t-proj").unwrap();
+        assert_eq!(reg.tabs_of(&none), vec!["t-none".to_string()]);
+        assert_eq!(reg.tabs_of(&proj), vec!["t-proj".to_string()]);
+
+        assert_eq!(reg.remove_tab("t-none"), Some(none.clone()));
+        assert!(reg.tabs_of(&none).is_empty());
+        assert_eq!(reg.tabs_of(&proj), vec!["t-proj".to_string()]);
+    }
+
+    #[test]
+    fn the_no_project_agent_env_retires_only_when_its_last_tab_is_gone() {
+        let none = EnvKey::none(Role::Agent);
+        let mut reg = Registry::default();
+        reg.ensure_env(&none, || env("a"));
+        assert!(should_retire_none_agent(&reg, &none));
+
+        reg.reserve_tab("t1", none.clone()).unwrap();
+        assert!(!should_retire_none_agent(&reg, &none), "creating");
+        reg.finish_tab("t1").unwrap();
+        assert!(!should_retire_none_agent(&reg, &none), "live");
+        reg.remove_tab("t1");
+        assert!(should_retire_none_agent(&reg, &none));
+
+        let owner = EnvKey::none(Role::Owner);
+        let proj = EnvKey::new("proj", "agent").unwrap();
+        reg.ensure_env(&owner, || env("o"));
+        reg.ensure_env(&proj, || env("p"));
+        assert!(!should_retire_none_agent(&reg, &owner));
+        assert!(!should_retire_none_agent(&reg, &proj));
+    }
+
+    #[test]
+    fn stale_none_agent_dirs_are_everything_but_the_live_generation() {
+        // generation_dir_name: generation 0 -> `agent`, N -> `agent-N`. `owner` is never touched.
+        let names = labels(&["agent", "agent-1", "agent-2", "owner"]);
+        assert_eq!(
+            stale_none_agent_dirs(&names, Some(1)),
+            labels(&["agent", "agent-2"])
+        );
+        assert_eq!(
+            stale_none_agent_dirs(&names, Some(0)),
+            labels(&["agent-1", "agent-2"])
+        );
+        assert_eq!(
+            stale_none_agent_dirs(&names, None),
+            labels(&["agent", "agent-1", "agent-2"])
+        );
+    }
+
+    #[test]
+    fn env_rebuilt_payload_has_a_null_project_for_the_no_project_scope() {
+        let rebuilt = EnvRebuilt {
+            project: None,
+            role: "agent".to_string(),
+            closed_tab_ids: vec!["a".to_string()],
+        };
+        let json = serde_json::to_string(&rebuilt).unwrap();
+        assert!(json.contains("\"project\":null"), "{json}");
+        assert!(json.contains("\"closedTabIds\":[\"a\"]"), "{json}");
+
+        let retired = EnvRetired {
+            project: None,
+            role: "agent".to_string(),
+        };
+        let json = serde_json::to_string(&retired).unwrap();
+        assert!(json.contains("\"project\":null"), "{json}");
+        assert!(json.contains("\"role\":\"agent\""), "{json}");
     }
 
     #[test]
