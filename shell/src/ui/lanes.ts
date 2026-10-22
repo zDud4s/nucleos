@@ -77,6 +77,8 @@ const LANE_OF: Record<string, FeedLane> = {
   job_cancelled: "jobs",
   job_expired: "jobs",
   job_interrupted: "jobs",
+  work_tree_parked: "jobs",
+  work_tree_finished: "jobs",
 
   run_retry: "runs",
   run_failed_final: "runs",

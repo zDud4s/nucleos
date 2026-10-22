@@ -110,6 +110,8 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   // the kind each test passes, so it writes no kind of the product's own.
   "channels/port_tests_commands.rs": { kind: [] },
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
+  // `announce_close` writes the kind `work_nodes::feed_line` picked for the closed node.
+  "http/nodes.rs": { kind: ["work_tree_parked", "work_tree_finished"] },
 };
 
 const EMAIL_CLASS_KINDS = ["email_urgent"];

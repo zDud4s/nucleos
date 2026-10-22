@@ -215,6 +215,10 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     job_cancelled: { tone: "off", label: "job cancelled" },
     job_expired: { tone: "paused", label: "job expired" },
     job_interrupted: { tone: "paused", label: "job interrupted" },
+    // A node tree (`core/src/work_nodes.rs::feed_line`). A parked node waits on the decisions it
+    // names, so it is a question put to the reader; a finished root is said once, done or failed.
+    work_tree_parked: { tone: "pending", label: "node tree parked" },
+    work_tree_finished: { tone: "info", label: "node tree finished" },
     // Runs.
     run_retry: { tone: "info", label: "run retried" },
     run_failed_final: { tone: "danger", label: "run failed for good" },
