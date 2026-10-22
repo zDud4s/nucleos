@@ -17,11 +17,16 @@ async fn browser_answer(response: reqwest::Response, context: &str) -> Result<Va
     }
 }
 
-/// The JSON body of `POST /browser/open`. // RED stub: always sends `project_id`, "" when absent.
+/// The JSON body of `POST /browser/open`.
 ///
-/// GREEN: a `None` project leaves the key out altogether.
+/// A `None` project leaves the key out altogether, so the daemon resolves the scope from the
+/// calling turn rather than from an empty string a caller might mean as something.
 pub(crate) fn browser_open_body(project_id: Option<&str>, url: &str, visible: bool) -> Value {
-    serde_json::json!({ "project_id": project_id.unwrap_or(""), "url": url, "visible": visible })
+    let mut body = serde_json::json!({ "url": url, "visible": visible });
+    if let Some(project_id) = project_id {
+        body["project_id"] = Value::from(project_id);
+    }
+    body
 }
 
 impl DaemonClient {
@@ -54,13 +59,13 @@ impl DaemonClient {
     /// Open a browsing session. The profile is chosen by the daemon, never named here.
     pub async fn browser_open(
         &self,
-        project_id: &str,
+        project_id: Option<&str>,
         url: &str,
         visible: bool,
     ) -> Result<Value, String> {
         let response = self
             .request(reqwest::Method::POST, "/browser/open")
-            .json(&serde_json::json!({ "project_id": project_id, "url": url, "visible": visible }))
+            .json(&browser_open_body(project_id, url, visible))
             .send()
             .await
             .map_err(|e| e.to_string())?;

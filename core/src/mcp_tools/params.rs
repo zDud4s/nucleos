@@ -95,9 +95,10 @@ pub(super) struct UrlParams {
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct BrowserOpenParams {
-    /// Which project this is for. Call list_projects if you do not know it.
-    // RED stub: still required; GREEN makes it `Option<String>` with `#[serde(default)]`.
-    pub(super) project_id: String,
+    /// Which project this is for. Omit it to browse in the project this conversation belongs to,
+    /// or in no project.
+    #[serde(default)]
+    pub(super) project_id: Option<String>,
     /// The page to open. https only.
     pub(super) url: String,
     /// True opens a window the person can see, with a chat panel on the right, on the project's

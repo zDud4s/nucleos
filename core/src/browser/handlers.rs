@@ -12,9 +12,45 @@ use super::*;
 // owner's logins.
 // ---------------------------------------------------------------------------------------------
 
+/// The project a `POST /browser/open` names, if any.
+///
+/// On the wire it is exactly an optional string (`serde(transparent)`): absent or `null` is
+/// `None`. It is a newtype rather than a bare `Option<String>` only so a caller that does name a
+/// project can still write `project_id: "acme".into()`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct RequestedProject(pub Option<String>);
+
+impl RequestedProject {
+    /// The named project, borrowed; `None` when the caller named none.
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl From<&str> for RequestedProject {
+    fn from(project: &str) -> Self {
+        Self(Some(project.to_owned()))
+    }
+}
+
+impl From<String> for RequestedProject {
+    fn from(project: String) -> Self {
+        Self(Some(project))
+    }
+}
+
+impl From<Option<String>> for RequestedProject {
+    fn from(project: Option<String>) -> Self {
+        Self(project)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OpenBody {
-    pub project_id: String,
+    /// Absent or null: the calling turn's stamped project, else no project ([`resolve_scope`]).
+    #[serde(default)]
+    pub project_id: RequestedProject,
     pub url: String,
     /// Still deserialised so an older caller does not fail, but IGNORED: the owning run comes from
     /// the daemon-set header only (spec §4.0).
@@ -61,16 +97,35 @@ pub struct ActBody {
     pub filename: String,
 }
 
-/// The scope a browser open runs under. // RED stub: the old behaviour, `requested` or empty.
+/// The scope a browser open runs under.
 ///
-/// GREEN: an explicit id is kept; an absent one resolves to the calling run's stamped
-/// `runs.project_id`, else [`NO_PROJECT`].
+/// An explicit id is kept as given (and validated downstream exactly as before). An absent one
+/// resolves to the calling run's stamped `runs.project_id`; a run with no project, no run at all,
+/// or a lookup that fails is [`NO_PROJECT`].
 pub(crate) async fn resolve_scope(
-    _pool: &sqlx::SqlitePool,
-    _run_id: Option<i64>,
+    pool: &sqlx::SqlitePool,
+    run_id: Option<i64>,
     requested: Option<&str>,
 ) -> String {
-    requested.unwrap_or(NO_PROJECT).to_owned()
+    if let Some(requested) = requested {
+        return requested.to_owned();
+    }
+    let Some(run_id) = run_id else {
+        return NO_PROJECT.to_owned();
+    };
+    let stamped: Result<Option<Option<String>>, sqlx::Error> =
+        sqlx::query_scalar("SELECT project_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await;
+    match stamped {
+        Ok(Some(Some(project))) if !project.is_empty() => project,
+        Ok(_) => NO_PROJECT.to_owned(),
+        Err(error) => {
+            tracing::warn!(%error, run = run_id, "could not read the calling run's project; browsing in no project");
+            NO_PROJECT.to_owned()
+        }
+    }
 }
 
 /// `POST /browser/open`.
@@ -81,15 +136,18 @@ pub async fn post_open(
     axum::Json(body): axum::Json<OpenBody>,
 ) -> axum::response::Response {
     let now = chrono::Utc::now();
+    // The chat turn the auth door admitted, else the header only (spec §4.0): a `run_id` in the
+    // body is a permission the caller would grant itself, so the body field is deserialised for
+    // compatibility and never read.
+    let run_id = chat
+        .as_ref()
+        .map(|chat| chat.run_id)
+        .or_else(|| crate::door::sending_run_id_of(&headers));
+    // No project named: the calling turn's own project, or no project at all.
+    let project_id = resolve_scope(&state.pool, run_id, body.project_id.as_deref()).await;
     let ask = Ask {
-        project_id: &body.project_id,
-        // The chat turn the auth door admitted, else the header only (spec §4.0): a `run_id` in the
-        // body is a permission the caller would grant itself, so the body field is deserialised for
-        // compatibility and never read.
-        run_id: chat
-            .as_ref()
-            .map(|chat| chat.run_id)
-            .or_else(|| crate::door::sending_run_id_of(&headers)),
+        project_id: &project_id,
+        run_id,
         url: &body.url,
         // The assistant, always, in this version. Spec §6.0b: the autonomous path is a seam and not
         // a road, and the seam is `browser_policy`'s refusal rather than a branch here. When a
