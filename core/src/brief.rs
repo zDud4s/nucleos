@@ -749,16 +749,19 @@ pub async fn credit_item(pool: &SqlitePool, job_id: i64, ordinal: i64) -> sqlx::
     }
 }
 
-/// Credit one standalone run by the final run at the end of its handoff or resume chain.
+/// Credit one run's uncredited `item_id IS NULL` rows by the final run at the end of its handoff
+/// or resume chain.
+///
+/// A standalone run owns all its rows this way. A job-node run owns only the rows traced with no
+/// item (the singleton nodes plan, review, replan and bundle, which have no `job_nodes` row of
+/// their own): `credit_rows` claims `item_id IS NULL` rows only, so the rows of an item node stay
+/// with `credit_item` and are never counted twice.
 pub async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u64> {
-    let owner: Option<(Option<i64>,)> = sqlx::query_as("SELECT job_id FROM runs WHERE id = ?")
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM runs WHERE id = ?")
         .bind(run_id)
         .fetch_optional(pool)
         .await?;
-    let Some((job_id,)) = owner else {
-        return Ok(0);
-    };
-    if job_id.is_some() {
+    if exists.is_none() {
         return Ok(0);
     }
 
@@ -828,10 +831,8 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
              SELECT u.run_id, r.id, {NEXT_HOP_SQL}, 0
                FROM (SELECT DISTINCT rk.run_id
                        FROM run_knowledge rk
-                       JOIN runs r0 ON r0.id = rk.run_id
                       WHERE rk.credited_at IS NULL
-                        AND rk.item_id IS NULL
-                        AND r0.job_id IS NULL) u
+                        AND rk.item_id IS NULL) u
                JOIN runs r ON r.id = u.run_id
              UNION ALL
              SELECT c.unit_id, r.id, {NEXT_HOP_SQL}, c.hops + 1
@@ -1545,6 +1546,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_singleton_job_node_run_is_credited_once_by_its_run_chain_verdict() -> sqlx::Result<()>
+    {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "completed", 0).await?;
+
+        // An item node: its rows carry the item id and belong to `credit_item` alone.
+        let item_knowledge = seed(&pool, "machine", None, "item row").await?;
+        let item_run =
+            seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
+        let item_id =
+            seed_item(&pool, job_id, "passed", Some("passed"), 0, Some(item_run)).await?;
+        record(
+            &pool,
+            item_run,
+            Some(item_id),
+            &[scored(item_knowledge, true)],
+        )
+        .await?;
+
+        // A singleton node (plan/review/replan/bundle): job_id set on the run, item_id NULL on
+        // its rows. One is credited directly, the other by the sweep.
+        let direct_knowledge = seed(&pool, "machine", None, "singleton direct").await?;
+        let direct_run =
+            seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
+        record(
+            &pool,
+            direct_run,
+            None,
+            &[scored(direct_knowledge, true)],
+        )
+        .await?;
+        let swept_knowledge = seed(&pool, "machine", None, "singleton swept").await?;
+        let swept_run = seed_run(&pool, "failed", Some(1), None, Some(job_id)).await?;
+        record(&pool, swept_run, None, &[scored(swept_knowledge, true)]).await?;
+
+        // credit_run on an item node's run claims nothing: its rows have an item id.
+        assert_eq!(credit_run(&pool, item_run).await?, 0);
+        assert_eq!(counters(&pool, item_knowledge).await?, (0, 0, 0, None));
+
+        // credit_run credits the singleton once, by the verdict of its own run chain.
+        assert_eq!(credit_run(&pool, direct_run).await?, 1);
+        let direct = counters(&pool, direct_knowledge).await?;
+        assert_eq!((direct.0, direct.1, direct.2), (1, 1, 1));
+        assert_eq!(credit_run(&pool, direct_run).await?, 0);
+
+        // The sweep credits the other singleton and the item once each, and the already
+        // credited singleton never a second time.
+        assert_eq!(sweep(&pool).await?, 2);
+        let swept = counters(&pool, swept_knowledge).await?;
+        assert_eq!((swept.0, swept.1, swept.2), (1, 1, 0));
+        let item = counters(&pool, item_knowledge).await?;
+        assert_eq!((item.0, item.1, item.2), (1, 1, 1));
+        let direct = counters(&pool, direct_knowledge).await?;
+        assert_eq!((direct.0, direct.1, direct.2), (1, 1, 1));
+
+        // Nothing is left for either path.
+        assert_eq!(sweep(&pool).await?, 0);
+        assert_eq!(credit_run(&pool, swept_run).await?, 0);
+        assert_eq!(credit_item(&pool, job_id, 0).await?, 0);
+        let swept = counters(&pool, swept_knowledge).await?;
+        assert_eq!((swept.0, swept.1, swept.2), (1, 1, 0));
+        let item = counters(&pool, item_knowledge).await?;
+        assert_eq!((item.0, item.1, item.2), (1, 1, 1));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_cancelled_run_leaves_the_rows_it_showed_not_measured_rather_than_failed()
     -> sqlx::Result<()> {
         let pool = test_pool().await;
@@ -1607,7 +1675,7 @@ mod tests {
 
         let dead_knowledge = seed(&pool, "machine", None, "dead job node").await?;
         let dead_job = seed_job(&pool, "running", 0).await?;
-        let dead_run = seed_run(&pool, "completed", Some(0), None, Some(dead_job)).await?;
+        let dead_run = seed_run(&pool, "running", None, None, Some(dead_job)).await?;
         record(&pool, dead_run, None, &[scored(dead_knowledge, true)]).await?;
 
         let mut item_ids = Vec::new();
