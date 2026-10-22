@@ -139,7 +139,12 @@ pub async fn create_job_node_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with(
         state,
-        NewRun::provisioned(prompt, project_id, project_root, Provisioning::Node(node)),
+        NewRun::provisioned(
+            prompt,
+            project_id,
+            project_root,
+            Provisioning::Node(Box::new(node)),
+        ),
     )
     .await
 }
@@ -174,8 +179,9 @@ pub async fn create_job_item_run(
 /// Nothing would report it. Clippy asking for fewer arguments is what sent this looking; the
 /// combination it removes is the reason it stayed.
 pub(super) enum Provisioning {
-    /// One node of a job, inside the worktree the job already owns.
-    Node(JobNode),
+    /// One node of a job, inside the worktree the job already owns. Boxed: it is far the largest
+    /// variant, and the others would otherwise each pay for its size.
+    Node(Box<JobNode>),
     /// A conflict resolution: a worktree of its own, born on the merge's target, with the conflict
     /// already staged in it.
     Resolution(Resolution),
@@ -217,7 +223,7 @@ pub struct JobItem {
 impl Provisioning {
     pub(super) fn node(&self) -> Option<&JobNode> {
         match self {
-            Self::Node(node) => Some(node),
+            Self::Node(node) => Some(node.as_ref()),
             Self::Resolution(_) | Self::Item(_) | Self::Correction(_) => None,
         }
     }

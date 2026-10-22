@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod web_builtin;
+
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -482,79 +484,11 @@ pub(super) async fn pretooluse_decision_from(
         }
     }
 
-    // A job node whose agent declares `web` holds Claude's `WebFetch`/`WebSearch`: its loadout lists
-    // them (`loadout::grant_builtins`). Everything else keeps falling through to the classifier,
-    // which refuses these as an `unrecognized-tool` - an attended run, a team run, a run that is
-    // not a job's node, or a node whose loadout does not list the tool.
-    //
-    // Both tools bring third-party text into the run, so the read is recorded first, exactly as for
-    // a `ReadsUntrusted` extra above, and a failure to record it refuses the call: a read that
-    // cannot be marked would let the run's later writes go ungoverned by that mark.
-    if job_node_web_builtin(&payload.tool_name)
-        && is_in_flight
-        && crate::execution::runs::runs_unattended(&mode)
+    // A job node granted `web` may use Claude's `WebFetch`/`WebSearch`; see `web_builtin`.
+    if let Some(decision) =
+        web_builtin::web_builtin_decision(&state, &payload, run_id, is_in_flight, &mode).await
     {
-        match job_id_of(&state.pool, run_id).await {
-            Ok(Some(job_id)) => {
-                match crate::tool_loadout::run_lists_tool(&state.pool, run_id, &payload.tool_name)
-                    .await
-                {
-                    Ok(true) => {
-                        if let Err(error) =
-                            crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
-                                .await
-                        {
-                            tracing::warn!(
-                                run_id = run_id,
-                                tool = %payload.tool_name,
-                                %error,
-                                "pretooluse-decision: could not record that a job node read third-party content - refusing the read"
-                            );
-                            return Json(Decision {
-                                decision: "deny".to_owned(),
-                                reason: "could not record that this run read third-party content"
-                                    .to_owned(),
-                            });
-                        }
-                        tracing::info!(
-                            run_id = run_id,
-                            job_id = job_id,
-                            tool = %payload.tool_name,
-                            "pretooluse-decision: allowed a web tool the agent's loadout lists"
-                        );
-                        return Json(Decision {
-                            decision: "allow".to_owned(),
-                            reason: "this run's loadout lists it".to_owned(),
-                        });
-                    }
-                    // Not listed: the classifier's own refusal below says it, unchanged.
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            run_id = run_id,
-                            %error,
-                            "pretooluse-decision: failed to read the run's loadout — failing closed"
-                        );
-                        return Json(Decision {
-                            decision: "deny".to_owned(),
-                            reason: "could not read the run's loadout — failing closed".to_owned(),
-                        });
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    run_id = run_id,
-                    %error,
-                    "pretooluse-decision: failed to resolve the run's job — failing closed"
-                );
-                return Json(Decision {
-                    decision: "deny".to_owned(),
-                    reason: "could not resolve the run's job — failing closed".to_owned(),
-                });
-            }
-        }
+        return decision;
     }
 
     // The run's own project, off the row that already named it — and asked for only when the answer
