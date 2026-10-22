@@ -134,9 +134,9 @@ pub async fn related(
     id: i64,
     limit: usize,
 ) -> Result<Vec<Related>, NoteError> {
-    let source = sqlx::query_as::<_, OwnerNote>(&format!(
+    let source = sqlx::query_as::<_, OwnerNote>(sqlx::AssertSqlSafe(format!(
         "SELECT {NOTE_COLUMNS} FROM owner_notes WHERE id = ?"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await?
@@ -157,9 +157,9 @@ pub async fn related(
 
     let mut out = Vec::with_capacity(ranked.len());
     for (note_id, score, reasons) in ranked {
-        let note = sqlx::query_as::<_, OwnerNote>(&format!(
+        let note = sqlx::query_as::<_, OwnerNote>(sqlx::AssertSqlSafe(format!(
             "SELECT {NOTE_COLUMNS} FROM owner_notes WHERE id = ?"
-        ))
+        )))
         .bind(note_id)
         .fetch_one(pool)
         .await?;
