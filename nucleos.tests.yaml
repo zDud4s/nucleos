@@ -9,6 +9,14 @@ tests:
       paths: [core/, Cargo.toml, Cargo.lock, rust-toolchain.toml, .config/, .nucleos/flows.yaml, sidecars/lib/channelkit/contract/**]
       check: cargo clippy -p nucleos-core --all-targets -- -D warnings
       command: bash scripts/gates.sh core
+      # An iteration run whose changes all sit in one module below: the same nextest invocation as
+      # the gate, narrowed to that module's tests (their names start with the module path).
+      select: cargo nextest run -p nucleos-base -p nucleos-core --no-fail-fast -E {filter}
+      filters:
+        - paths: [core/src/channels/**]
+          expr: 'test(/^channels::/)'
+        - paths: [core/src/execution/job/**]
+          expr: 'test(/^execution::job::/)'
     sidecars:
       paths: [sidecars/, scripts/build-sidecars.sh]
       command: bash scripts/gates.sh sidecars

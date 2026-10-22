@@ -236,6 +236,7 @@ mod tests {
             cache: true,
             env: Vec::new(),
             include_ignored: false,
+            filters: Vec::new(),
         }
     }
 
