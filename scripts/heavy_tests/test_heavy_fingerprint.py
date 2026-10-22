@@ -378,6 +378,35 @@ class FingerprintTests(unittest.TestCase):
         _, rb = self.run_broker(cwd=wt_b, target_dir=tb)
         self.assertTrue(self.is_hit(ra) and self.is_hit(rb), f"{ra} / {rb}")
 
+    def test_other_argv_at_the_same_state_keeps_a_hit(self) -> None:
+        # Measured 2026-10-22: a `test --lib` rerun after a clippy or `--bin` run in the same
+        # unchanged tree missed (one entry per target dir), took weight 3 and queued 2-16 min
+        # to run 10-30 s. Every argv that ran at the same state keeps its hit.
+        lib = ["test", "-p", "nucleos-core", "--lib"]
+        clippy = ["clippy", "-p", "nucleos-core", "--all-targets"]
+        self.run_broker(lib)
+        self.run_broker(clippy)
+        _, row = self.run_broker(lib)
+        self.assertTrue(self.is_hit(row), f"lib after clippy at the same state must hit: {row}")
+        _, row = self.run_broker(clippy)
+        self.assertTrue(self.is_hit(row), f"clippy after lib at the same state must hit: {row}")
+        # A run at a new state drops every earlier entry, so reverting the edit does not bring
+        # back a hit whose artifacts were rebuilt in between.
+        before = (self.repo / "core/src/main.rs").read_text(encoding="utf-8")
+        self.write("core/src/main.rs", "fn main() { /* new state */ }\n")
+        self.run_broker(clippy)
+        self.write("core/src/main.rs", before)
+        _, row = self.run_broker(lib)
+        self.assertFalse(self.is_hit(row), f"a revert must not resurrect an old entry: {row}")
+        # A compile failure forgets the target dir, every argv with it.
+        self.run_broker(clippy)
+        _, row = self.run_broker(lib)
+        self.assertTrue(self.is_hit(row), row)
+        self.run_broker(clippy, FAKE_EXIT="101",
+                        FAKE_STDERR="error: could not compile `nucleos-core`")
+        _, row = self.run_broker(lib)
+        self.assertFalse(self.is_hit(row), f"a compile failure must forget every entry: {row}")
+
     # 37
     def test_hit_runs_weight0_and_recording_rules(self) -> None:
         # Register (compiling is fine: the first run is a miss by definition).

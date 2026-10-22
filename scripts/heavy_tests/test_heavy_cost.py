@@ -123,6 +123,23 @@ class CostModel(unittest.TestCase):
         costs = {"classes": {"k": {"cores": 3, "mem_mb": 900, "n": 5}}}
         self.assertEqual(c.predict(costs, "k"), (3, 900))
 
+    def test_an_unseen_workspace_class_takes_the_largest_same_subcommand(self):
+        # Measured 2026-10-22: the first `cargo check --workspace` was predicted at the static
+        # 2 GB, took weight 1 and peaked at 6 GB beside a 9 GB test. A workspace run builds
+        # every member, so until its own class is learned it predicts the largest one.
+        c = load_cost()
+        self.assertEqual(c.class_key(["cargo", "check", "--all"]), "cargo|check|ws|a|c")
+        costs = {"classes": {
+            "cargo|check|nucleos-core|a|c": {"cores": 1.6, "mem_mb": 6766, "n": 13},
+            "cargo|check|-|a|c": {"cores": 4.2, "mem_mb": 3372, "n": 8},
+            "cargo|check|nucleos-core|a|n": {"cores": 9, "mem_mb": 9999, "n": 9},
+            "cargo|clippy|nucleos-core|a|c": {"cores": 9, "mem_mb": 9999, "n": 9},
+        }}
+        self.assertEqual(c.predict(costs, "cargo|check|ws|a|c"), (4.2, 6766))
+        self.assertEqual(c.predict(costs, "cargo|test|ws|a|c"), (2.0, 3072.0))
+        costs["classes"]["cargo|check|ws|a|c"] = {"cores": 2, "mem_mb": 6000, "n": 3}
+        self.assertEqual(c.predict(costs, "cargo|check|ws|a|c"), (2, 6000))
+
 
 PROBE = {"logical": 12, "total_mb": 16000, "avail_mb": 12000, "busy_cores": 0}
 

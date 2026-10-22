@@ -96,7 +96,7 @@ def class_key(argv: list[str], filtered: bool = False, compiled: bool = True) ->
             sub = "exec:" + rest[0] if rest else "exec:-"
         if tool == "cargo":
             pkgs = sorted(vals.get("-p", []) + vals.get("--package", []))
-            if "--workspace" in argv:
+            if "--workspace" in argv or "--all" in argv:  # --all: cargo's older spelling
                 scope = "ws"
             elif pkgs:
                 scope = "+".join(pkgs)
@@ -447,6 +447,20 @@ def predict(costs: dict, cls: str, weight: int = 1) -> tuple[float, float]:
         e = (costs or {}).get("classes", {}).get(cls)
         if isinstance(e, dict) and _num(e.get("cores")) and _num(e.get("mem_mb")):
             return (e["cores"], e["mem_mb"])
+        # A workspace run builds every member, so an unseen one is predicted as the largest
+        # known class of the same tool, subcommand and compiled flag (measured 2026-10-22: the
+        # first `cargo check --workspace` got the static 2 GB and peaked at 6 GB).
+        tool, sub, scope, _, comp = (str(cls).split("|") + [""] * 5)[:5]
+        if scope == "ws":
+            same = []
+            for k, v in (costs or {}).get("classes", {}).items():
+                kp = str(k).split("|")
+                if (len(kp) == 5 and (kp[0], kp[1], kp[4]) == (tool, sub, comp)
+                        and isinstance(v, dict) and _num(v.get("cores"))
+                        and _num(v.get("mem_mb"))):
+                    same.append(v)
+            if same:
+                return (max(v["cores"] for v in same), max(v["mem_mb"] for v in same))
     except Exception:
         pass
     return default_cost(cls, weight)
