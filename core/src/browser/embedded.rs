@@ -639,11 +639,15 @@ pub struct RegisterBody {
 }
 
 /// The registry key of a body's `project`: the no-project key for a missing one, the id itself
-/// otherwise. An explicit empty string is not the no-project scope, it is a client error.
+/// otherwise. An explicit empty string is not the no-project scope, it is a client error, and so is
+/// the internal no-project key named explicitly: the no-project scope is reached only by omitting it.
 fn scope_key(project: Option<&str>) -> Result<&str, Response> {
     match project {
         None => Ok(crate::browser::embedded_key(crate::browser::NO_PROJECT)),
         Some(project) if project.trim().is_empty() => Err(bad_request("project is empty")),
+        Some(crate::browser::NO_PROJECT_KEY) => {
+            Err(bad_request("project is the reserved no-project key"))
+        }
         Some(project) => Ok(project),
     }
 }
@@ -953,6 +957,19 @@ mod tests {
         );
         registry.ack(&request.request_id, "n0nce").await;
         open.await.unwrap();
+    }
+
+    /// The internal no-project key named explicitly is refused like an empty project: the
+    /// no-project scope is reached only by omitting `project`.
+    #[test]
+    fn an_explicit_no_project_key_is_refused_like_an_empty_project() {
+        let refused = scope_key(Some(crate::browser::NO_PROJECT_KEY)).unwrap_err();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            scope_key(Some("")).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(scope_key(Some("acme")).ok(), Some("acme"));
     }
 
     #[test]

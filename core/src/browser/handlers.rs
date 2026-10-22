@@ -12,45 +12,12 @@ use super::*;
 // owner's logins.
 // ---------------------------------------------------------------------------------------------
 
-/// The project a `POST /browser/open` names, if any.
-///
-/// On the wire it is exactly an optional string (`serde(transparent)`): absent or `null` is
-/// `None`. It is a newtype rather than a bare `Option<String>` only so a caller that does name a
-/// project can still write `project_id: "acme".into()`.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
-#[serde(transparent)]
-pub struct RequestedProject(pub Option<String>);
-
-impl RequestedProject {
-    /// The named project, borrowed; `None` when the caller named none.
-    pub fn as_deref(&self) -> Option<&str> {
-        self.0.as_deref()
-    }
-}
-
-impl From<&str> for RequestedProject {
-    fn from(project: &str) -> Self {
-        Self(Some(project.to_owned()))
-    }
-}
-
-impl From<String> for RequestedProject {
-    fn from(project: String) -> Self {
-        Self(Some(project))
-    }
-}
-
-impl From<Option<String>> for RequestedProject {
-    fn from(project: Option<String>) -> Self {
-        Self(project)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct OpenBody {
     /// Absent or null: the calling turn's stamped project, else no project ([`resolve_scope`]).
+    /// An explicit `""` or [`NO_PROJECT_KEY`] is refused ([`explicit_project`]).
     #[serde(default)]
-    pub project_id: RequestedProject,
+    pub project_id: Option<String>,
     pub url: String,
     /// Still deserialised so an older caller does not fail, but IGNORED: the owning run comes from
     /// the daemon-set header only (spec §4.0).
@@ -95,6 +62,23 @@ pub struct ActBody {
     /// deciding and there is nothing here for it to decide against.
     #[serde(default)]
     pub filename: String,
+}
+
+/// The project a `POST /browser/open` body names, checked before it is resolved.
+///
+/// Absent or `null` passes through as `None` (resolved from the calling run by [`resolve_scope`]).
+/// An explicit `""` or [`NO_PROJECT_KEY`] is a 400: the no-project scope is reached only by
+/// omitting the field, never by spelling one of its internal names.
+pub(crate) fn explicit_project(
+    requested: Option<&str>,
+) -> Result<Option<&str>, axum::response::Response> {
+    match requested {
+        Some("") => Err(super::embedded::bad_request("project_id is empty")),
+        Some(NO_PROJECT_KEY) => Err(super::embedded::bad_request(
+            "project_id is the reserved no-project key",
+        )),
+        other => Ok(other),
+    }
 }
 
 /// The scope a browser open runs under.
@@ -143,8 +127,12 @@ pub async fn post_open(
         .as_ref()
         .map(|chat| chat.run_id)
         .or_else(|| crate::door::sending_run_id_of(&headers));
+    let requested = match explicit_project(body.project_id.as_deref()) {
+        Ok(requested) => requested,
+        Err(refused) => return refused,
+    };
     // No project named: the calling turn's own project, or no project at all.
-    let project_id = resolve_scope(&state.pool, run_id, body.project_id.as_deref()).await;
+    let project_id = resolve_scope(&state.pool, run_id, requested).await;
     let ask = Ask {
         project_id: &project_id,
         run_id,
@@ -669,5 +657,20 @@ mod tests {
             resolve_scope(&pool, Some(run), Some("other")).await,
             "other"
         );
+    }
+
+    /// An explicit `""` or the internal no-project key is a 400; absent still resolves from the run.
+    #[test]
+    fn an_explicit_empty_or_no_project_key_project_id_is_refused() {
+        assert_eq!(
+            explicit_project(Some("")).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            explicit_project(Some(NO_PROJECT_KEY)).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(explicit_project(None).ok(), Some(None));
+        assert_eq!(explicit_project(Some("acme")).ok(), Some(Some("acme")));
     }
 }

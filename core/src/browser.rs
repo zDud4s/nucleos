@@ -1363,7 +1363,7 @@ mod tests {
             headers,
             None,
             axum::Json(OpenBody {
-                project_id: "acme".into(),
+                project_id: Some("acme".into()),
                 url: "https://news.example.net/".into(),
                 run_id: Some(99),
                 visible: false,
@@ -1416,7 +1416,7 @@ mod tests {
                 chat_id: "c-1".into(),
             })),
             axum::Json(OpenBody {
-                project_id: "acme".into(),
+                project_id: Some("acme".into()),
                 url: "https://news.example.net/".into(),
                 run_id: None,
                 visible: false,
