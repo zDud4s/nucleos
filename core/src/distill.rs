@@ -471,7 +471,8 @@ async fn fail(
 }
 
 /// Write the extracted items and close the row, all in one transaction. `vectors` is parallel to
-/// `items`; an item without one takes the fingerprint path alone.
+/// `items`; an item without one takes the fingerprint path alone. Returns how many items were
+/// inserted or proposed, i.e. not skipped as a reconfirmation of a learning already held.
 #[allow(clippy::too_many_arguments)]
 async fn write_items(
     pool: &SqlitePool,
@@ -484,7 +485,7 @@ async fn write_items(
     vectors: &[Option<Vec<f32>>],
     model: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+) -> Result<usize, sqlx::Error> {
     let sources: Vec<&str> = owner_context.iter().map(String::as_str).collect();
     let mut evidence_list = vec![serde_json::json!({"t": "job", "id": job_id})];
     evidence_list.extend(
@@ -496,6 +497,7 @@ async fn write_items(
 
     let mut tx = pool.begin().await?;
     let mut proposed_any = false;
+    let mut kept = 0usize;
     for (index, item) in items.iter().enumerate() {
         let Some(fingerprint) = crate::knowledge::title_fingerprint(&item.title) else {
             continue;
@@ -569,6 +571,7 @@ async fn write_items(
                     .0
             }
         };
+        kept += 1;
         if demoted {
             crate::knowledge::arm_trial_in(&mut tx, new_id).await?;
         }
@@ -597,7 +600,15 @@ async fn write_items(
     if proposed_any {
         nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
     }
-    Ok(())
+    Ok(kept)
+}
+
+/// How many elements the model's answer holds as a JSON array, before `parse_items` drops the bad
+/// ones and caps the rest; 0 when the answer is not an array. It unwraps a code fence with the
+/// same `extract::strip_fence` that `parse_items` uses.
+fn raw_item_count(answer: &str) -> usize {
+    serde_json::from_str::<Vec<serde_json::Value>>(extract::strip_fence(answer))
+        .map_or(0, |values| values.len())
 }
 
 /// Distil one claimed row. Every failure ends in [`fail`]; nothing is returned.
@@ -687,7 +698,7 @@ pub(crate) async fn process_one_with(
         vectors.resize(items.len(), None);
     }
     let model = embedder.map(|e| e.model());
-    if write_items(
+    let written = write_items(
         pool,
         &row,
         cause,
@@ -699,10 +710,19 @@ pub(crate) async fn process_one_with(
         model,
         now,
     )
-    .await
-    .is_err()
-    {
-        fail(pool, &row, "db", "writing the learnings failed", now).await;
+    .await;
+    // Ids and counts only: a pass that wrote nothing must be told apart from a model that
+    // answered `[]`, and never by quoting what the model wrote. The count is taken before the log
+    // call so no mail-derived identifier appears inside a tracing macro.
+    let returned = raw_item_count(&extraction_answer);
+    match written {
+        Ok(written) => tracing::info!(
+            "distillation: queue row {} ({}): model returned {returned}, parsed {}, written {written}",
+            row.id,
+            cause.as_str(),
+            items.len()
+        ),
+        Err(_) => fail(pool, &row, "db", "writing the learnings failed", now).await,
     }
 }
 
@@ -760,8 +780,20 @@ pub(crate) async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{CAUSES, Cause, enqueue_item_verdict_in, enqueue_job_ending_in, enqueue_landed_in};
+    use super::{
+        CAUSES, Cause, enqueue_item_verdict_in, enqueue_job_ending_in, enqueue_landed_in,
+        raw_item_count,
+    };
     use sqlx::SqlitePool;
+
+    #[test]
+    fn raw_item_count_counts_every_array_element_even_fenced_or_bad() {
+        assert_eq!(raw_item_count("[]"), 0);
+        assert_eq!(raw_item_count(r#"[{"a":1}, 2, "x"]"#), 3);
+        assert_eq!(raw_item_count("```json\n[1, 2]\n```"), 2);
+        assert_eq!(raw_item_count("```\n[1]\n```"), 1);
+        assert_eq!(raw_item_count("not an array"), 0);
+    }
 
     /// One `distill_queue` row as the tests read it back:
     /// cause, project_id, job_id, item_id, run_id, status.
@@ -1652,6 +1684,54 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(events, 1, "one reconfirmed event for the repeat");
+    }
+
+    /// `write_items` reports what it inserted or proposed, so a reconfirmation of a learning
+    /// already held is not counted.
+    #[tokio::test]
+    async fn write_items_counts_new_items_and_not_reconfirmations() {
+        let pool = test_pool().await;
+        let (row_id, _) = seeded_cause(&pool, "job_failed").await;
+        let row = claim_next(&pool, noon()).await.unwrap().expect("a due row");
+        assert_eq!(row.id, row_id);
+
+        let item = |title: &str| super::Item {
+            layer: Layer::Episodic,
+            title: title.to_owned(),
+            body: "a body".to_owned(),
+            files: Vec::new(),
+        };
+        let write = |items: Vec<super::Item>| {
+            let (pool, row) = (pool.clone(), &row);
+            async move {
+                super::write_items(
+                    &pool,
+                    row,
+                    Cause::JobFailed,
+                    1,
+                    &[],
+                    &items,
+                    &[],
+                    &vec![None; items.len()],
+                    None,
+                    noon(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        assert_eq!(write(vec![item("The gate failed on CRLF")]).await, 1);
+        let counted = write(vec![
+            item("the gate  failed on crlf."),
+            item("Scripts must be LF"),
+        ])
+        .await;
+        assert_eq!(
+            counted, 1,
+            "one reconfirmed item and one new item must count as one written"
+        );
+        assert_eq!(learnings(&pool).await, 2);
     }
 
     const PROJECT_NOTE: &str = "Windows line endings broke the gate on every shell script we ship";

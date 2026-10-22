@@ -73,10 +73,13 @@ pub(super) fn scored_candidates<'a>(
             let mut scored = Scored {
                 knowledge_id: row.id,
                 shown: false,
-                // `brief::of` sets it from SQLite's bm25: each row's score as a fraction of the
-                // pass's best match (`brief::normalise_fts` anchors the floor at 0, so an
-                // unmatched row is 0 and the best match is 1); the clamp keeps out-of-contract
-                // input from outweighing the rest (spec 5.5).
+                // `brief::of` sets it from SQLite's bm25, and it has two meanings. With a query
+                // vector (embedder path) it is the plain pass-normalised share of the best match
+                // (`brief::normalise_fts` anchors the floor at 0, so an unmatched row is 0 and
+                // the best match is 1). Without one (no-embedder path) `brief::lift_fts` lifts
+                // it onto `[MIN_RELEVANCE, 1.0]` for rows at or above its floor, and leaves a
+                // weaker row at its raw share, which the gate then drops. The clamp keeps
+                // out-of-contract input from outweighing the rest (spec 5.5).
                 s_fts: finite_or_zero(row.s_fts).clamp(0.0, 1.0),
                 s_sim: finite_or_zero(row.s_sim).clamp(0.0, 1.0),
                 s_scope: scope_specificity(row, context)?,
@@ -465,12 +468,16 @@ pub(super) fn admitted(row: &Known, context: &Context) -> bool {
 
 /// The least textual relevance a row needs to be briefed at all.
 ///
-/// `s_fts` is bm25 over the best match of the pass: an unmatched row is `0.0` and a sole match is
-/// `1.0`, so `0.1` drops the non-matches and the tail matches under a tenth of the best (one
-/// common term), while any real hit survives. The textual signal is `s_fts`, or the larger of
-/// `s_fts` and `s_sim` when the briefing has a query vector ([`Context::query_embedded`]). For
-/// `s_sim` `0.1` is lenient, because the cosine of unrelated texts depends on the configured
-/// embedder; calibrate it on real vectors later.
+/// `s_fts` is bm25 over the best match of the pass, and it means two things. On the embedder path
+/// it is the plain pass-normalised share of the best: an unmatched row is `0.0` and a sole match
+/// is `1.0`, so `0.1` drops the non-matches and the tail matches under a tenth of the best (one
+/// common term). On the no-embedder path `brief::lift_fts` lifts every row above its small floor
+/// onto `[MIN_RELEVANCE, 1.0]`, so a real selective match clears this gate even when the best
+/// row is far stronger; a row below that floor (a stopword-only or near-noise match, about 1e-6 of
+/// the best) is not lifted, keeps its raw share and falls under the gate. The textual signal is
+/// `s_fts`, or the larger of `s_fts` and `s_sim` when the briefing has a query vector
+/// ([`Context::query_embedded`]). For `s_sim` `0.1` is lenient, because the cosine of unrelated
+/// texts depends on the configured embedder; calibrate it on real vectors later.
 pub const MIN_RELEVANCE: f64 = 0.1;
 
 /// How well a row's text answers the briefing's query, on the unit scale.
