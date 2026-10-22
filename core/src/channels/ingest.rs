@@ -21,9 +21,9 @@ use super::outbox::{self, Class, NewAction};
 use super::registry::{self, HelloError};
 use super::strings::{self, Text};
 use super::tokens::{self, Redeemed, TokenAction};
-use super::{access, media, replies};
+use super::{access, contract_error, media, own_channel, replies};
 use crate::assistant::{Origin, Sent};
-use crate::auth::{Scope, Service};
+use crate::auth::Scope;
 use crate::proposals::{self, ApproveInput, DecideError};
 use crate::state::AppState;
 
@@ -39,29 +39,6 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/channels/{channel}/hello", put(put_hello))
         .route("/channels/{channel}/events", post(post_event))
-}
-
-/// The channel a request speaks for, taken from the authenticated scope and never from the body
-/// (section 7.3). Only a channel's own key is admitted: the control key has no channel to speak for
-/// and gets a bare 403, and a key on another channel's path (which `require_token` already refuses)
-/// gets the `channel_mismatch` body.
-// The refusal is a ready-made HTTP response the caller returns as is; boxing it would only add noise.
-#[allow(clippy::result_large_err)]
-pub(super) fn own_channel(scope: &Scope, named: &str) -> Result<&'static str, Response> {
-    match scope {
-        Scope::Service(Service::Channel(id)) if *id == named => Ok(*id),
-        Scope::Service(Service::Channel(_)) => Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "channel_mismatch" })),
-        )
-            .into_response()),
-        _ => Err(StatusCode::FORBIDDEN.into_response()),
-    }
-}
-
-/// The 400 of T9: `{error, at}` from a failed decode.
-pub(super) fn contract_error(error: ContractError) -> Response {
-    (StatusCode::BAD_REQUEST, Json(ErrorResponse::from(error))).into_response()
 }
 
 /// What `record_hello` takes, from the strictly decoded wire form of the same document.
@@ -520,6 +497,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::auth::Service;
     use crate::channels::contract::{Conversation, ConversationKind, Sender};
     use crate::channels::testkit::state;
 

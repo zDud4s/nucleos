@@ -21,8 +21,8 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
 use tokio::sync::Notify;
 
-use super::ingest::{contract_error, own_channel};
 use super::{contract, registry};
+use super::{contract_error, own_channel};
 use crate::auth::Scope;
 use crate::state::AppState;
 
