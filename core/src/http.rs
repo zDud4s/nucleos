@@ -9206,6 +9206,26 @@ mod tests {
         assert_eq!(body["root_display"], "~/.nucleos");
     }
 
+    /// Saving `channels/telegram.yaml` from the app applies `stream_edits` at once, no restart.
+    #[tokio::test]
+    async fn writing_a_channel_setting_reloads_the_channel_config() {
+        let (state, _temp) = state_with_machine_root().await;
+        assert!(state.channels.config("telegram").is_none());
+
+        let (status, _) = workflow_call(
+            state.clone(),
+            "POST",
+            "/config/machine",
+            Some(serde_json::json!({
+                "path": "channels/telegram.yaml",
+                "contents": "stream_edits: false\n",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!state.channels.config("telegram").unwrap().stream_edits());
+    }
+
     /// The first write on a machine that has never had a settings directory creates it.
     ///
     /// `~/.nucleos/` exists only once something has been put in it, and `safe_write_target`
