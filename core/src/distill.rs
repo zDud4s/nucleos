@@ -604,20 +604,11 @@ async fn write_items(
 }
 
 /// How many elements the model's answer holds as a JSON array, before `parse_items` drops the bad
-/// ones and caps the rest; 0 when the answer is not an array. The fence handling mirrors
-/// `extract::strip_fence`, which is private.
+/// ones and caps the rest; 0 when the answer is not an array. It unwraps a code fence with the
+/// same `extract::strip_fence` that `parse_items` uses.
 fn raw_item_count(answer: &str) -> usize {
-    let s = answer.trim();
-    let inner = match s.strip_prefix("```") {
-        Some(rest) => {
-            let rest = rest.strip_prefix("json").unwrap_or(rest);
-            rest.trim_end()
-                .strip_suffix("```")
-                .map_or(s, |inner| inner.trim())
-        }
-        None => s,
-    };
-    serde_json::from_str::<Vec<serde_json::Value>>(inner).map_or(0, |values| values.len())
+    serde_json::from_str::<Vec<serde_json::Value>>(extract::strip_fence(answer))
+        .map_or(0, |values| values.len())
 }
 
 /// Distil one claimed row. Every failure ends in [`fail`]; nothing is returned.
@@ -721,10 +712,10 @@ pub(crate) async fn process_one_with(
     )
     .await;
     match written {
-        // Ids and counts only: a pass that kept nothing must be told apart from a model that
+        // Ids and counts only: a pass that wrote nothing must be told apart from a model that
         // answered `[]`, and never by quoting what the model wrote.
-        Ok(kept) => tracing::info!(
-            "distillation: queue row {} ({}): model returned {}, parsed {}, kept {kept}",
+        Ok(written) => tracing::info!(
+            "distillation: queue row {} ({}): model returned {}, parsed {}, written {written}",
             row.id,
             cause.as_str(),
             raw_item_count(&extraction_answer),
@@ -1692,6 +1683,54 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(events, 1, "one reconfirmed event for the repeat");
+    }
+
+    /// `write_items` reports what it inserted or proposed, so a reconfirmation of a learning
+    /// already held is not counted.
+    #[tokio::test]
+    async fn write_items_counts_new_items_and_not_reconfirmations() {
+        let pool = test_pool().await;
+        let (row_id, _) = seeded_cause(&pool, "job_failed").await;
+        let row = claim_next(&pool, noon()).await.unwrap().expect("a due row");
+        assert_eq!(row.id, row_id);
+
+        let item = |title: &str| super::Item {
+            layer: Layer::Episodic,
+            title: title.to_owned(),
+            body: "a body".to_owned(),
+            files: Vec::new(),
+        };
+        let write = |items: Vec<super::Item>| {
+            let (pool, row) = (pool.clone(), &row);
+            async move {
+                super::write_items(
+                    &pool,
+                    row,
+                    Cause::JobFailed,
+                    1,
+                    &[],
+                    &items,
+                    &[],
+                    &vec![None; items.len()],
+                    None,
+                    noon(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        assert_eq!(write(vec![item("The gate failed on CRLF")]).await, 1);
+        let counted = write(vec![
+            item("the gate  failed on crlf."),
+            item("Scripts must be LF"),
+        ])
+        .await;
+        assert_eq!(
+            counted, 1,
+            "one reconfirmed item and one new item must count as one written"
+        );
+        assert_eq!(learnings(&pool).await, 2);
     }
 
     const PROJECT_NOTE: &str = "Windows line endings broke the gate on every shell script we ship";
