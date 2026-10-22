@@ -24,6 +24,7 @@ import { ShareBar } from "@/ui/ShareBar";
 import { Sparkline } from "@/ui/Sparkline";
 import { StepLine } from "@/ui/StepLine";
 import { ForceGraph } from "../brain/ForceGraph";
+import { NoteText } from "../brain/NoteText";
 import type { GModel } from "../brain/graph-types";
 import type { Placed } from "../brain/hit-test";
 import {
@@ -41,7 +42,7 @@ import {
  * **This is a list of LIBRARIES, not a list of screens**, and the distinction is what keeps it
  * short enough to stay true. A Content-Security-Policy refusal is a property of how a dependency
  * writes style — a `<style>` element it builds at runtime, or a `style=` attribute it puts into
- * markup — so covering one screen that uses xyflow covers every screen that uses xyflow. Six
+ * markup — so covering one screen that uses xyflow covers every screen that uses xyflow. Seven
  * libraries in this app can write style that way, and every one of them has a surface below.
  *
  * The list is meant to be annoying in the same way `app/nav.test.ts` is: **adding a dependency
@@ -58,6 +59,9 @@ import {
  * - **Radix Tabs** is not here, and it is the same argument in a different library: Tabs rides the
  *   roving-focus machinery the dropdown already exercises and does not position with Popper, so it
  *   can emit nothing the `menu` surface has not already proved.
+ *
+ * `react-markdown` is the seventh: `NoteText` renders owner-written (and channel-sourced) note text
+ * through it, and the `markdown` row proves it emits no `style=` and no runtime `<style>`.
  *
  * This header used to say `@visx/*` was absent because nothing in `src/` imported it, and that
  * it would want a row when something did. Something does: `ui/Sparkline.tsx`. The row is `charts`,
@@ -440,6 +444,30 @@ function ForceGraphSurface({ done }: { done: () => void }) {
   );
 }
 
+const SAMPLE_MARKDOWN = [
+  "# A heading",
+  "",
+  "- first item",
+  "- second item",
+  "",
+  "Some `inline` code and a [link](https://example.com).",
+  "",
+  "```",
+  "a code block",
+  "```",
+].join("\n");
+
+/** `react-markdown`, through `NoteText`: headings, lists, code and a link, with no style written. */
+function MarkdownSurface({ done }: { done: () => void }) {
+  useDoneAfter(done);
+
+  return (
+    <div className="p-6">
+      <NoteText text={SAMPLE_MARKDOWN} />
+    </div>
+  );
+}
+
 export const SURFACES: Surface[] = [
   {
     name: "workflow",
@@ -470,5 +498,10 @@ export const SURFACES: Surface[] = [
     name: "force-graph",
     why: "d3-force / d3-zoom / d3-drag on a canvas — no runtime style, proven here",
     Component: ForceGraphSurface,
+  },
+  {
+    name: "markdown",
+    why: "react-markdown (NoteText) — renders note text as elements; no style attribute or runtime <style>",
+    Component: MarkdownSurface,
   },
 ];
