@@ -15,6 +15,9 @@ export type AgentEnvResult =
   | { ok: false; reason: string };
 
 const inFlightEnv = new Map<string, Promise<AgentEnvResult>>();
+// Fresh runs queued behind an in-flight one and not started yet, so a burst of fresh requests
+// shares one queued run.
+const queuedFresh = new Map<string, Promise<AgentEnvResult>>();
 
 function messageOf(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -44,14 +47,33 @@ async function runEnsure(key: string): Promise<AgentEnvResult> {
 /**
  * Prepare the agent browser env for a scope key (a project id or `NO_PROJECT`). Never throws;
  * concurrent calls share one run.
+ *
+ * With `fresh`, an in-flight run is not joined: a new run starts after it settles. Use it when
+ * the env the in-flight run may be registering is already known to be gone (env retired).
  */
-export function ensureAgentEnv(project: string): Promise<AgentEnvResult> {
+export function ensureAgentEnv(
+  project: string,
+  opts?: { fresh?: boolean },
+): Promise<AgentEnvResult> {
   const existing = inFlightEnv.get(project);
-  if (existing) return existing;
-  const p = runEnsure(project).finally(() => {
+  if (existing && !opts?.fresh) return existing;
+  if (existing) {
+    const queued = queuedFresh.get(project);
+    if (queued) return queued;
+  }
+  // `existing` never rejects (runEnsure catches), so chaining on it always starts the new run.
+  let p: Promise<AgentEnvResult>;
+  const run = existing
+    ? existing.then(() => {
+        if (queuedFresh.get(project) === p) queuedFresh.delete(project);
+        return runEnsure(project);
+      })
+    : runEnsure(project);
+  p = run.finally(() => {
     if (inFlightEnv.get(project) === p) inFlightEnv.delete(project);
   });
   inFlightEnv.set(project, p);
+  if (existing) queuedFresh.set(project, p);
   return p;
 }
 

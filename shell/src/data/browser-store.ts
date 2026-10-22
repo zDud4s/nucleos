@@ -176,9 +176,12 @@ const agentProjects = new Set<string>();
  * Prepare (once per call) the agent browser env for a scope key (a project id or NO_PROJECT) and
  * surface a failure as a notice.
  */
-export async function ensureProjectAgent(key: string): Promise<void> {
+export async function ensureProjectAgent(
+  key: string,
+  opts?: { fresh?: boolean },
+): Promise<void> {
   agentProjects.add(key);
-  const result = await ensureAgentEnv(key);
+  const result = await ensureAgentEnv(key, opts);
   setAgentNotice(key, result.ok ? null : result.reason);
 }
 
@@ -233,13 +236,15 @@ export type EnvRetired = { project: string | null; role: string };
 
 /**
  * A retired agent env is gone together with the cdp endpoint the daemon was told about, so a scope
- * the shell had prepared is prepared again (a fresh env, registered anew).
+ * the shell had prepared is prepared again (a fresh env, registered anew). The run is fresh: an
+ * ensure already in flight may register the retired env's dead endpoint, so a new run follows it
+ * instead of joining it.
  */
 export function handleEnvRetired(ev: EnvRetired): void {
   if (ev.role !== "agent") return;
   const key = scopeKey(ev.project);
   if (!agentProjects.has(key)) return;
-  void ensureProjectAgent(key).catch(() => {});
+  void ensureProjectAgent(key, { fresh: true }).catch(() => {});
 }
 
 /** Merge a patch into the tab with this id, wherever it lives. */

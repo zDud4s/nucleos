@@ -211,6 +211,42 @@ describe("no-project scope", () => {
   });
 });
 
+describe("env-retired during an in-flight ensure", () => {
+  it("runs a fresh prepare/ensure/register after the in-flight one settles", async () => {
+    emb.embeddedRequests.mockResolvedValue([]);
+    emb.embeddedRegister.mockResolvedValue(undefined);
+    let release!: () => void;
+    emb.embeddedPrepare
+      .mockReturnValueOnce(new Promise((r) => (release = () => r({ proxy_addr: "127.0.0.1:1" }))))
+      .mockResolvedValue({ proxy_addr: "127.0.0.1:2" });
+    let ensures = 0;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "browser_env_ensure") return undefined;
+      ensures += 1;
+      return { cdp_http: ensures === 1 ? "http://dead" : "http://fresh" };
+    });
+    const stop = startBrowserBridge();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const first = ensureProjectAgent(NO_PROJECT);
+    events.handlers.get("browser://env-retired")?.({ payload: { project: null, role: "agent" } });
+    await vi.advanceTimersByTimeAsync(0);
+    // The fresh run waits for the in-flight one instead of starting alongside it.
+    expect(emb.embeddedPrepare).toHaveBeenCalledTimes(1);
+
+    release();
+    await first;
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(emb.embeddedPrepare).toHaveBeenCalledTimes(2);
+    expect(emb.embeddedRegister.mock.calls).toEqual([
+      [NO_PROJECT, "http://dead"],
+      [NO_PROJECT, "http://fresh"],
+    ]);
+    stop();
+  });
+});
+
 describe("startBrowserBridge", () => {
   it("polls at 1 s, dispatches, and stop halts polling and unlistens", async () => {
     emb.embeddedRequests.mockResolvedValue([]);
