@@ -288,3 +288,42 @@ describe("BrainPanel", () => {
     expect(list.textContent).toContain("archived");
   });
 });
+
+describe("BrainPanel note text", () => {
+  it("renders the note text as markdown", async () => {
+    const md = { ...NOTE, text: "Rust **owns** the state" };
+    serve(detail({ note: md }));
+    wide = { ...graph, notes: [md] };
+    await renderWithRouter(<BrainPanel nodeId="n:4" graph={wide} model={model} />, { initialPath: "/brain" });
+    const strong = await screen.findByText("owns");
+    expect(strong.tagName).toBe("STRONG");
+  });
+
+  it("Edit then Save patches the text", async () => {
+    serve(detail(), (path, init) =>
+      path === "/owner-notes/4" && init?.method === "PATCH"
+        ? Promise.resolve({ ...NOTE, text: "Rust owns all the state" })
+        : undefined,
+    );
+    await panel();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Note text"), { target: { value: "Rust owns all the state" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith(
+        "/owner-notes/4",
+        expect.objectContaining({ method: "PATCH", body: JSON.stringify({ text: "Rust owns all the state" }) }),
+      ),
+    );
+  });
+
+  it("an archived note cannot be edited", async () => {
+    const archived = { ...NOTE, state: "archived" as const };
+    serve(detail({ note: archived }));
+    await panel({ ...graph, notes: [archived] });
+    const edit = screen.getByRole("button", { name: "Edit" }) as HTMLButtonElement;
+    expect(edit.disabled).toBe(true);
+  });
+});

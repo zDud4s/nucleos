@@ -15,6 +15,7 @@ import {
 import { useRuns } from "../data/runs";
 import { useProjects } from "../data/system";
 import { Button, ErrorNote, Quiet, RefusalNote, Select, Skeleton } from "../ui";
+import "./LinkPicker.css";
 
 /**
  * The "Add link" form of a note, with a search-as-you-type picker in place of a free-text target.

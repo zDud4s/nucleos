@@ -7,20 +7,15 @@ import type { ChannelsReadout } from "../data/channels";
 import { keys } from "../data/keys";
 import { useKnowledge, type Known } from "../data/knowledge";
 import {
-  LINK_TYPES,
   originLabel,
-  TARGET_KINDS,
   TEACH_KINDS,
-  useAddLink,
   useNotesGraph,
   useOwnerNote,
   useRemoveLink,
   useTeachNote,
   useUpdateNote,
-  type LinkType,
   type NoteLink,
   type NotesGraph,
-  type TargetKind,
   type TeachKind,
 } from "../data/owner-notes";
 import { useProjects } from "../data/system";
@@ -31,10 +26,12 @@ import { backlinks, buildModel, localModel } from "./graph-model";
 import type { GFilters, GModel, GNode } from "./graph-types";
 import { EDGE_TYPES, NODE_KINDS } from "./GraphFilters";
 import { itemOfNode } from "./item-ref";
+import { AddLinkForm } from "./LinkPicker";
+import { NoteTextEdit } from "./NoteTextEdit";
 
 /**
  * The side panel of the Brain graph: what the selected node is, and for a note, everything that
- * can be done to it. A note's own text is shown as written; nothing here edits it.
+ * can be done to it. A note's text is shown as markdown, and can be edited in place.
  *
  * Backlinks and the local graph read the notes graph WITH archived notes (spec §3.2): a link from
  * an archived note still points here, and says so. The global graph's archived filter does not
@@ -169,7 +166,7 @@ function NotePanel({
   return (
     <div className="brain-panel">
       <header className="brain-panel-head">
-        <p className="brain-text">{note.text}</p>
+        <NoteTextEdit id={id} text={note.text} disabled={archived} />
         <div className="brain-meta">
           <span className="brain-origin">{originLabel(note.origin, cachedChannels?.channels)}</span>
           <span className="brain-state">{note.state}</span>
@@ -215,7 +212,7 @@ function NotePanel({
           ))}
         </ul>
         {remove.isError && <Failure error={remove.error} />}
-        <AddLink id={id} />
+        <AddLinkForm id={id} />
       </section>
 
       <section className="brain-sec">
@@ -345,62 +342,6 @@ function TargetName({ link, graph }: { link: NoteLink; graph: NotesGraph }) {
       {link.target_kind}: {target?.label ?? link.target_ref}
       {target?.missing === true && <span className="brain-node-tag">gone</span>}
     </span>
-  );
-}
-
-function AddLink({ id }: { id: number }) {
-  const add = useAddLink();
-  const [type, setType] = useState<LinkType>("relates");
-  const [kind, setKind] = useState<TargetKind>("note");
-  const [ref, setRef] = useState("");
-  const blank = ref.trim() === "";
-
-  return (
-    <form
-      className="brain-panel-form brain-addlink"
-      aria-label="Add link"
-      onSubmit={(event) => {
-        event.preventDefault();
-        if (blank || add.isPending) return;
-        add.mutate(
-          { noteId: id, link_type: type, target_kind: kind, target_ref: ref.trim() },
-          { onSuccess: () => setRef("") },
-        );
-      }}
-    >
-      <Select
-        density="sm"
-        mono
-        aria-label="Link type"
-        value={type}
-        onChange={(event) => setType(event.target.value as LinkType)}
-      >
-        {LINK_TYPES.map((value) => (
-          <option key={value}>{value}</option>
-        ))}
-      </Select>
-      <Select
-        density="sm"
-        mono
-        aria-label="Target kind"
-        value={kind}
-        onChange={(event) => setKind(event.target.value as TargetKind)}
-      >
-        {TARGET_KINDS.map((value) => (
-          <option key={value}>{value}</option>
-        ))}
-      </Select>
-      <input
-        aria-label="Target ref"
-        placeholder="id or path"
-        value={ref}
-        onChange={(event) => setRef(event.target.value)}
-      />
-      <Button type="submit" variant="ghost" disabled={blank || add.isPending}>
-        Add link
-      </Button>
-      {add.isError && <Failure error={add.error} />}
-    </form>
   );
 }
 
