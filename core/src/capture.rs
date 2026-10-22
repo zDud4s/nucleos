@@ -197,6 +197,21 @@ pub async fn set_config(
     Ok(())
 }
 
+pub fn question_for(cause: &str) -> &'static str {
+    match cause {
+        "run_exhausted" => "Is there something about this item or the gate that only you know?",
+        "review_blocking" => "Was the review right, or is there a rule of yours behind it?",
+        _ => "What went wrong that the logs would not show?",
+    }
+}
+
+/// One job's line in the digest: ids, project, its facts in arrival order, then the first cause's question.
+pub fn question_line(project: &str, job_id: i64, facts: &[Fact]) -> String {
+    let said: Vec<&str> = facts.iter().map(|f| f.fact.as_str()).collect();
+    let ask = question_for(facts.first().map_or("", |f| f.cause.as_str()));
+    format!("#{job_id} · {project} · job #{job_id} — {}. {ask}", said.join("; "))
+}
+
 /// Queue rows created before this UTC second never ask; see migration 0173. Absent: all may ask.
 pub const FROM_KEY: &str = "distiller.capture_from";
 
@@ -292,15 +307,15 @@ async fn fact_for(conn: &mut SqliteConnection, row: &AskingRow) -> sqlx::Result<
                         .map(|s| format!(": `{}`", s.headline))
                         .unwrap_or_default();
                     format!(
-                        "o item {ordinal} «{short}» esgotou {attempts} tentativas no gate{signature}"
+                        "item {ordinal} «{short}» used up {attempts} gate attempts{signature}"
                     )
                 }
-                None => "um item esgotou as tentativas no gate".to_owned(),
+                None => "an item used up its gate attempts".to_owned(),
             })
         }
         "review_blocking" => Ok(match row.run_id {
-            Some(run) => format!("a review bloqueou o job (run #{run})"),
-            None => "a review bloqueou o job".to_owned(),
+            Some(run) => format!("the review blocked the job (run #{run})"),
+            None => "the review blocked the job".to_owned(),
         }),
         _ => {
             // Not wait_reason: it is only meaningful while a job waits, and would mislead here.
@@ -309,8 +324,8 @@ async fn fact_for(conn: &mut SqliteConnection, row: &AskingRow) -> sqlx::Result<
                 .fetch_optional(&mut *conn)
                 .await?;
             Ok(match status {
-                Some(status) => format!("o job terminou em `{status}`"),
-                None => "o job falhou".to_owned(),
+                Some(status) => format!("the job ended in `{status}`"),
+                None => "the job failed".to_owned(),
             })
         }
     }
@@ -890,6 +905,26 @@ mod tests {
         assert_eq!(request(&pool, 7).await.unwrap().0, STATE_DISMISSED);
     }
 
+    #[test]
+    fn the_question_is_fixed_per_cause_and_the_line_is_one_line() {
+        let line = question_line(
+            "api",
+            9,
+            &[fact(1, "run_exhausted", "item 2 «add retries» used up 3 gate attempts: `error[E0382]`")],
+        );
+        assert_eq!(
+            line,
+            "#9 · api · job #9 — item 2 «add retries» used up 3 gate attempts: `error[E0382]`. Is there something about this item or the gate that only you know?"
+        );
+        assert_eq!(
+            question_line("api", 7, &[fact(1, "job_failed", "the job ended in `failed`")]),
+            "#7 · api · job #7 — the job ended in `failed`. What went wrong that the logs would not show?"
+        );
+        assert!(question_for("review_blocking")
+            .contains("Was the review right, or is there a rule of yours behind it?"));
+        assert!(!line.contains('\n'));
+    }
+
     #[tokio::test]
     async fn a_failed_job_opens_one_request_and_one_feed_line() {
         let pool = pool().await;
@@ -902,7 +937,7 @@ mod tests {
         assert_eq!(state, STATE_OPEN);
         assert_eq!(deadline, "2026-10-07T12:00:00+00:00");
         assert!(
-            text.contains("o job terminou em `failed`") && text.ends_with("#cap7"),
+            text.contains("the job ended in `failed`") && text.ends_with("#cap7"),
             "{text}"
         );
         assert_eq!(serde_json::from_str::<Vec<Fact>>(&causes).unwrap().len(), 1);
@@ -947,7 +982,7 @@ mod tests {
             facts.iter().map(|f| f.cause.as_str()).collect::<Vec<_>>(),
             ["job_failed", "review_blocking"]
         );
-        assert!(text.contains("a review bloqueou o job (run #9)"), "{text}");
+        assert!(text.contains("the review blocked the job (run #9)"), "{text}");
         assert_eq!(
             deadline, "2026-10-07T12:00:00+00:00",
             "joining never moves the deadline"
