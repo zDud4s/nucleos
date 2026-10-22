@@ -27,7 +27,7 @@ const EDGE_LABELS: Partial<Record<GEdgeType, string>> = {
 };
 
 /** Node kinds in the same case as the list's Type segments; link types stay the daemon's words. */
-const KIND_LABELS: Record<GNodeKind, string> = {
+export const KIND_LABELS: Record<GNodeKind, string> = {
   note: "Note",
   knowledge: "Knowledge",
   project: "Project",
