@@ -31,36 +31,49 @@ const PARK_FOR: Duration = Duration::from_secs(60 * 60);
 /// Per note, in memory only (no schema change): the text hash that failed, how many times in a
 /// row, and when it last did. Without it, `NOTE_FAILURES` permanently failing notes at the front of
 /// the id order would end every pass before it reached the notes behind them.
-static FAILURES: LazyLock<Mutex<FailureMap>> = LazyLock::new(Mutex::default);
+///
+/// An explicit value rather than a process-wide static: `run_loop` owns one for its lifetime, and
+/// each test makes its own, so note ids that restart at 1 in every fresh database cannot leak
+/// failure counts from one test into another.
+#[derive(Default)]
+pub struct FailureLog {
+    map: Mutex<FailureMap>,
+}
 
 type FailureMap = HashMap<i64, (String, usize, Instant)>;
 
-fn failures() -> std::sync::MutexGuard<'static, FailureMap> {
-    FAILURES.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Whether the passes skip this note: it failed `NOTE_FAILURES` times on this very text, lately.
-fn is_parked(id: i64, hash: &str) -> bool {
-    failures().get(&id).is_some_and(|(failed_hash, count, at)| {
-        failed_hash == hash && *count >= NOTE_FAILURES && at.elapsed() < PARK_FOR
-    })
-}
-
-fn record_failure(id: i64, hash: &str) {
-    let mut map = failures();
-    let entry = map
-        .entry(id)
-        .or_insert_with(|| (hash.to_string(), 0, Instant::now()));
-    // New text, or an expired park: the count starts over.
-    if entry.0 != hash || entry.2.elapsed() >= PARK_FOR {
-        *entry = (hash.to_string(), 0, Instant::now());
+impl FailureLog {
+    pub fn new() -> Self {
+        Self::default()
     }
-    entry.1 += 1;
-    entry.2 = Instant::now();
-}
 
-fn clear_failure(id: i64) {
-    failures().remove(&id);
+    fn lock(&self) -> std::sync::MutexGuard<'_, FailureMap> {
+        self.map.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the passes skip this note: it failed `NOTE_FAILURES` times on this very text, lately.
+    fn is_parked(&self, id: i64, hash: &str) -> bool {
+        self.lock().get(&id).is_some_and(|(failed_hash, count, at)| {
+            failed_hash == hash && *count >= NOTE_FAILURES && at.elapsed() < PARK_FOR
+        })
+    }
+
+    fn record_failure(&self, id: i64, hash: &str) {
+        let mut map = self.lock();
+        let entry = map
+            .entry(id)
+            .or_insert_with(|| (hash.to_string(), 0, Instant::now()));
+        // New text, or an expired park: the count starts over.
+        if entry.0 != hash || entry.2.elapsed() >= PARK_FOR {
+            *entry = (hash.to_string(), 0, Instant::now());
+        }
+        entry.1 += 1;
+        entry.2 = Instant::now();
+    }
+
+    fn clear_failure(&self, id: i64) {
+        self.lock().remove(&id);
+    }
 }
 
 /// What may be logged about an embed error: its `io::ErrorKind` and, for an Ollama non-2xx, the
@@ -177,8 +190,9 @@ pub async fn embed_note(pool: &SqlitePool, embedder: &dyn Embedder, id: i64) -> 
             return Ok(false);
         }
     };
+    // No failure log here: a stored vector makes the note current, so the passes never consult its
+    // old failure entry, and a later edit changes the hash, which resets the count anyway.
     store(pool, id, embedder.model(), &vector, &hash).await?;
-    clear_failure(id);
     Ok(true)
 }
 
@@ -187,7 +201,7 @@ pub async fn embed_note(pool: &SqlitePool, embedder: &dyn Embedder, id: i64) -> 
 ///
 /// `DOWN_AFTER` errors in a row end the pass (the embedder is down); a success resets the count.
 /// A failing embedder therefore writes nothing and the call still returns `Ok`. A note that failed
-/// `NOTE_FAILURES` times on its current text is skipped (see `FAILURES`), so it cannot starve the
+/// `NOTE_FAILURES` times on its current text is skipped (see `FailureLog`), so it cannot starve the
 /// notes behind it. The first error of a pass is logged, as a kind or status only.
 ///
 /// The text hash cannot be computed in SQL, so every active note is read and filtered here. That is
@@ -197,6 +211,7 @@ pub async fn backfill(
     pool: &SqlitePool,
     embedder: &dyn Embedder,
     limit: i64,
+    failures: &FailureLog,
 ) -> sqlx::Result<usize> {
     if limit <= 0 {
         return Ok(0);
@@ -226,7 +241,7 @@ pub async fn backfill(
         if is_current(stored, embedder.model(), &hash) {
             continue;
         }
-        if is_parked(id, &hash) {
+        if failures.is_parked(id, &hash) {
             continue;
         }
         let outcome = match embedder.embed(&text).await {
@@ -238,11 +253,11 @@ pub async fn backfill(
             Ok(vector) => {
                 errors_in_a_row = 0;
                 store(pool, id, embedder.model(), &vector, &hash).await?;
-                clear_failure(id);
+                failures.clear_failure(id);
                 done += 1;
             }
             Err(kind) => {
-                record_failure(id, &hash);
+                failures.record_failure(id, &hash);
                 if !warned {
                     warned = true;
                     tracing::warn!("owner note embeddings: note {id} not embedded ({kind})");
@@ -266,6 +281,7 @@ pub async fn backfill(
 pub async fn run_loop(state: crate::state::AppState) {
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let failures = FailureLog::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {}
@@ -276,7 +292,7 @@ pub async fn run_loop(state: crate::state::AppState) {
         };
         let mut total = 0;
         loop {
-            match backfill(&state.pool, embedder.as_ref(), BATCH).await {
+            match backfill(&state.pool, embedder.as_ref(), BATCH, &failures).await {
                 Ok(done) => {
                     total += done;
                     if (done as i64) < BATCH {
@@ -299,7 +315,7 @@ pub async fn run_loop(state: crate::state::AppState) {
 mod tests {
     use sqlx::{Row, SqlitePool};
 
-    use super::{backfill, embed_note, text_hash};
+    use super::{FailureLog, backfill, embed_note, text_hash};
     use crate::embed::{FakeEmbedder, decode};
 
     async fn test_pool() -> SqlitePool {
@@ -350,6 +366,7 @@ mod tests {
     #[tokio::test]
     async fn backfill_fills_the_active_notes_that_have_no_row() {
         let pool = test_pool().await;
+        let log = FailureLog::new();
         let first = note(&pool, "first note").await;
         let second = note(&pool, "second note").await;
         let archived = note(&pool, "archived note").await;
@@ -360,7 +377,7 @@ mod tests {
             .unwrap();
 
         let embedder = fake("fake");
-        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 2);
+        assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 2);
 
         let stored = rows(&pool).await;
         let ids: Vec<i64> = stored.iter().map(|r| r.0).collect();
@@ -378,22 +395,24 @@ mod tests {
     #[tokio::test]
     async fn backfill_honours_its_limit() {
         let pool = test_pool().await;
+        let log = FailureLog::new();
         for text in ["one", "two", "three"] {
             note(&pool, text).await;
         }
         let embedder = fake("fake");
-        assert_eq!(backfill(&pool, &embedder, 2).await.unwrap(), 2);
+        assert_eq!(backfill(&pool, &embedder, 2, &log).await.unwrap(), 2);
         assert_eq!(rows(&pool).await.len(), 2);
-        assert_eq!(backfill(&pool, &embedder, 2).await.unwrap(), 1);
+        assert_eq!(backfill(&pool, &embedder, 2, &log).await.unwrap(), 1);
         assert_eq!(rows(&pool).await.len(), 3);
     }
 
     #[tokio::test]
     async fn an_edited_note_is_embedded_again() {
         let pool = test_pool().await;
+        let log = FailureLog::new();
         let id = note(&pool, "before the edit").await;
         let embedder = fake("fake");
-        backfill(&pool, &embedder, 10).await.unwrap();
+        backfill(&pool, &embedder, 10, &log).await.unwrap();
 
         sqlx::query("UPDATE owner_notes SET note_text = ? WHERE id = ?")
             .bind("after the edit")
@@ -401,7 +420,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 1);
+        assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 1);
 
         let stored = rows(&pool).await;
         assert_eq!(stored.len(), 1);
@@ -411,12 +430,13 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_note_is_skipped() {
         let pool = test_pool().await;
+        let log = FailureLog::new();
         let id = note(&pool, "steady note").await;
         let embedder = fake("fake");
-        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 1);
+        assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 1);
         assert_eq!(calls(&embedder), 1);
 
-        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 0);
+        assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 0);
         assert!(!embed_note(&pool, &embedder, id).await.unwrap());
         assert_eq!(calls(&embedder), 1, "no further embed call");
     }
@@ -424,12 +444,13 @@ mod tests {
     #[tokio::test]
     async fn a_row_from_another_model_is_replaced() {
         let pool = test_pool().await;
+        let log = FailureLog::new();
         note(&pool, "model swap").await;
-        backfill(&pool, &fake("old-model"), 10).await.unwrap();
+        backfill(&pool, &fake("old-model"), 10, &log).await.unwrap();
         assert_eq!(rows(&pool).await[0].1, "old-model");
 
         let newer = FakeEmbedder::new("new-model", Vec::new(), Some(vec![0.0, 1.0, 0.0]));
-        assert_eq!(backfill(&pool, &newer, 10).await.unwrap(), 1);
+        assert_eq!(backfill(&pool, &newer, 10, &log).await.unwrap(), 1);
 
         let stored = rows(&pool).await;
         assert_eq!(stored.len(), 1, "one row per note");
@@ -440,12 +461,13 @@ mod tests {
     #[tokio::test]
     async fn a_failing_embedder_writes_nothing_and_still_returns_ok() {
         let pool = test_pool().await;
+        let log = FailureLog::new();
         for text in ["a", "b", "c", "d", "e"] {
             note(&pool, text).await;
         }
         let embedder = FakeEmbedder::failing();
 
-        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 0);
+        assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 0);
         assert!(rows(&pool).await.is_empty());
         assert_eq!(calls(&embedder), 3, "the pass ends after three errors");
 
@@ -457,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn notes_that_keep_failing_stop_starving_the_ones_behind_them() {
         let pool = test_pool().await;
-        // Texts unique to this test: the failure map is process-wide and note ids repeat across tests.
+        let log = FailureLog::new();
         let poisoned = [
             note(&pool, "starve-poison one").await,
             note(&pool, "starve-poison two").await,
@@ -472,12 +494,12 @@ mod tests {
 
         // Three passes of three errors each: the front notes reach their third failure.
         for _ in 0..3 {
-            assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 0);
+            assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 0);
         }
         assert_eq!(calls(&embedder), 9);
 
         // Now they are skipped and the note behind them is reached.
-        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 1);
+        assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 1);
         assert_eq!(calls(&embedder), 10, "only the healthy note was tried");
         let ids: Vec<i64> = rows(&pool).await.iter().map(|r| r.0).collect();
         assert_eq!(ids, vec![healthy]);
@@ -489,7 +511,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 1);
+        assert_eq!(backfill(&pool, &embedder, 10, &log).await.unwrap(), 1);
         assert_eq!(calls(&embedder), 11);
     }
 
