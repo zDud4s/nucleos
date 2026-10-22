@@ -42,9 +42,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Node 24 ships npm 11, the npm the lockfile is written with locally. npm 10 (Node 22) reads
+      # an npm 11 lockfile as out of sync -- bundled deps of @tailwindcss/oxide-wasm32-wasi -- and
+      # `npm ci` refuses it.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: shell/package-lock.json
 

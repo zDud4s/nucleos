@@ -3026,9 +3026,12 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
 
+        // The handler reads the request body before it answers. A handler that ignores it closes
+        // the socket with unread bytes, Windows turns that into an RST, and the hook can see
+        // WinError 10053 instead of the `allow` -- which it reports as unreachable, failing closed.
         let stub = axum::Router::new().route(
             "/hooks/pretooluse-decision",
-            axum::routing::post(|| async {
+            axum::routing::post(|_body: axum::body::Bytes| async {
                 axum::Json(serde_json::json!({"decision": "allow", "reason": "sure"}))
             }),
         );
