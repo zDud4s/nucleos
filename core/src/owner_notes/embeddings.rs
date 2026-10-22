@@ -8,8 +8,9 @@
 //! `encode`/`decode`/`cosine`; `embed.rs` is not touched. Nothing here logs a note's text or a
 //! vector: ids and counts only. SQL on `owner_notes` is allowed in this module (§5 boundary).
 
-use std::sync::LazyLock;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use sqlx::{Row, SqlitePool};
 
@@ -18,6 +19,65 @@ use crate::embed::{Embedder, encode};
 /// Consecutive embed errors after which a pass takes the embedder for down and stops, as
 /// `embed::backfill` does.
 const DOWN_AFTER: usize = 3;
+
+/// Failures of one unchanged note after which the passes skip it.
+const NOTE_FAILURES: usize = 3;
+
+/// How long a skipped note stays skipped. A change of its text releases it at once; this expiry
+/// only bounds the damage of an embedder outage that happened to fail the first notes three passes
+/// running, which would otherwise park them until the process restarts.
+const PARK_FOR: Duration = Duration::from_secs(60 * 60);
+
+/// Per note, in memory only (no schema change): the text hash that failed, how many times in a
+/// row, and when it last did. Without it, `NOTE_FAILURES` permanently failing notes at the front of
+/// the id order would end every pass before it reached the notes behind them.
+static FAILURES: LazyLock<Mutex<FailureMap>> = LazyLock::new(Mutex::default);
+
+type FailureMap = HashMap<i64, (String, usize, Instant)>;
+
+fn failures() -> std::sync::MutexGuard<'static, FailureMap> {
+    FAILURES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether the passes skip this note: it failed `NOTE_FAILURES` times on this very text, lately.
+fn is_parked(id: i64, hash: &str) -> bool {
+    failures().get(&id).is_some_and(|(failed_hash, count, at)| {
+        failed_hash == hash && *count >= NOTE_FAILURES && at.elapsed() < PARK_FOR
+    })
+}
+
+fn record_failure(id: i64, hash: &str) {
+    let mut map = failures();
+    let entry = map
+        .entry(id)
+        .or_insert_with(|| (hash.to_string(), 0, Instant::now()));
+    // New text, or an expired park: the count starts over.
+    if entry.0 != hash || entry.2.elapsed() >= PARK_FOR {
+        *entry = (hash.to_string(), 0, Instant::now());
+    }
+    entry.1 += 1;
+    entry.2 = Instant::now();
+}
+
+fn clear_failure(id: i64) {
+    failures().remove(&id);
+}
+
+/// What may be logged about an embed error: its `io::ErrorKind` and, for an Ollama non-2xx, the
+/// HTTP status. Never the message, which for a non-2xx carries the response body and that may echo
+/// the note's text. The status is read from the `Ollama returned <status>: ...` prefix `embed.rs`
+/// writes; anything that does not parse leaves the kind alone.
+fn error_kind(error: &std::io::Error) -> String {
+    let message = error.to_string();
+    let status = message
+        .strip_prefix("Ollama returned ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|code| code.parse::<u16>().ok());
+    match status {
+        Some(code) => format!("{:?}, HTTP {code}", error.kind()),
+        None => format!("{:?}", error.kind()),
+    }
+}
 
 /// Notes embedded per `backfill` call made by the loop; a full batch is followed by another.
 const BATCH: i64 = 50;
@@ -114,11 +174,15 @@ pub async fn embed_note(
             return Ok(false);
         }
         Err(error) => {
-            tracing::warn!("owner note embeddings: note {id} not embedded: {error}");
+            tracing::warn!(
+                "owner note embeddings: note {id} not embedded ({})",
+                error_kind(&error)
+            );
             return Ok(false);
         }
     };
     store(pool, id, embedder.model(), &vector, &hash).await?;
+    clear_failure(id);
     Ok(true)
 }
 
@@ -126,7 +190,9 @@ pub async fn embed_note(
 /// computed from different text, lowest id first, and returns how many it embedded.
 ///
 /// `DOWN_AFTER` errors in a row end the pass (the embedder is down); a success resets the count.
-/// A failing embedder therefore writes nothing and the call still returns `Ok`.
+/// A failing embedder therefore writes nothing and the call still returns `Ok`. A note that failed
+/// `NOTE_FAILURES` times on its current text is skipped (see `FAILURES`), so it cannot starve the
+/// notes behind it. The first error of a pass is logged, as a kind or status only.
 ///
 /// The text hash cannot be computed in SQL, so every active note is read and filtered here. That is
 /// a few thousand short rows at worst, once a minute, and it keeps the table free of a second
@@ -150,6 +216,7 @@ pub async fn backfill(
     .await?;
     let mut done = 0;
     let mut errors_in_a_row = 0;
+    let mut warned = false;
     for row in rows {
         if done as i64 >= limit {
             break;
@@ -163,13 +230,27 @@ pub async fn backfill(
         if is_current(stored, embedder.model(), &hash) {
             continue;
         }
-        match embedder.embed(&text).await {
-            Ok(vector) if !vector.is_empty() => {
+        if is_parked(id, &hash) {
+            continue;
+        }
+        let outcome = match embedder.embed(&text).await {
+            Ok(vector) if !vector.is_empty() => Ok(vector),
+            Ok(_) => Err("empty vector".to_string()),
+            Err(error) => Err(error_kind(&error)),
+        };
+        match outcome {
+            Ok(vector) => {
                 errors_in_a_row = 0;
                 store(pool, id, embedder.model(), &vector, &hash).await?;
+                clear_failure(id);
                 done += 1;
             }
-            _ => {
+            Err(kind) => {
+                record_failure(id, &hash);
+                if !warned {
+                    warned = true;
+                    tracing::warn!("owner note embeddings: note {id} not embedded ({kind})");
+                }
                 errors_in_a_row += 1;
                 if errors_in_a_row >= DOWN_AFTER {
                     tracing::warn!(
@@ -375,6 +456,56 @@ mod tests {
         let id = note(&pool, "f").await;
         assert!(!embed_note(&pool, &embedder, id).await.unwrap());
         assert!(rows(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn notes_that_keep_failing_stop_starving_the_ones_behind_them() {
+        let pool = test_pool().await;
+        // Texts unique to this test: the failure map is process-wide and note ids repeat across tests.
+        let poisoned = [
+            note(&pool, "starve-poison one").await,
+            note(&pool, "starve-poison two").await,
+            note(&pool, "starve-poison three").await,
+        ];
+        let healthy = note(&pool, "starve-good note").await;
+        let embedder = FakeEmbedder::new(
+            "fake",
+            vec![("starve-good".to_string(), vec![1.0, 0.0])],
+            None,
+        );
+
+        // Three passes of three errors each: the front notes reach their third failure.
+        for _ in 0..3 {
+            assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 0);
+        }
+        assert_eq!(calls(&embedder), 9);
+
+        // Now they are skipped and the note behind them is reached.
+        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 1);
+        assert_eq!(calls(&embedder), 10, "only the healthy note was tried");
+        let ids: Vec<i64> = rows(&pool).await.iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![healthy]);
+
+        // Editing a skipped note changes its hash, which releases it.
+        sqlx::query("UPDATE owner_notes SET note_text = ? WHERE id = ?")
+            .bind("starve-good again")
+            .bind(poisoned[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 1);
+        assert_eq!(calls(&embedder), 11);
+    }
+
+    #[test]
+    fn an_error_is_logged_as_its_kind_and_status_never_its_message() {
+        let body = std::io::Error::other("Ollama returned 404 Not Found: model 'secret note text'");
+        let logged = super::error_kind(&body);
+        assert_eq!(logged, "Other, HTTP 404");
+        assert!(!logged.contains("secret"));
+
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "slow");
+        assert_eq!(super::error_kind(&timeout), "TimedOut");
     }
 
     #[tokio::test]

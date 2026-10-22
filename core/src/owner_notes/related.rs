@@ -21,6 +21,8 @@ const SHARED_EXTRA: f64 = 0.05;
 const SHARED_EXTRA_MAX: i64 = 2;
 /// Weight of the text signal: the bm25 strength scaled so the best FTS match in the pass is 1.0.
 const TEXT_WEIGHT: f64 = 0.2;
+/// FTS matches weaker than this fraction of the pass's best match add neither score nor a reason.
+const TEXT_FLOOR: f64 = 0.2;
 /// How many distinct words of the source note go into the OR query.
 const MAX_TEXT_TERMS: usize = 8;
 /// How many FTS matches are considered at most.
@@ -257,8 +259,8 @@ fn text_expression(text: &str) -> Option<String> {
         seen.push(folded);
         terms.push((inner.chars().count(), term));
     }
-    // Stable, so equal lengths keep their order in the note.
-    terms.sort_by(|a, b| b.0.cmp(&a.0));
+    // Longest first; stable, so equal lengths keep their order in the note.
+    terms.sort_by_key(|term| std::cmp::Reverse(term.0));
     terms.truncate(MAX_TEXT_TERMS);
     (!terms.is_empty()).then(|| {
         terms
@@ -297,15 +299,23 @@ async fn gather_text(
         .map(|(_, rank)| (-rank).max(0.0))
         .fold(0.0_f64, f64::max);
     for (note_id, rank) in rows {
-        let strength = if best > 0.0 {
-            ((-rank).max(0.0) / best).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        // A match always counts for something, however weak its bm25.
-        signals.entry(note_id).or_default().text = Some(strength.max(f64::EPSILON));
+        if let Some(strength) = text_strength(rank, best) {
+            signals.entry(note_id).or_default().text = Some(strength);
+        }
     }
     Ok(())
+}
+
+/// The text signal of one FTS match: its bm25 `rank` relative to the pass's `best` (the largest
+/// flipped bm25). `None` below [`TEXT_FLOOR`], so a single stray shared word does not earn the
+/// `text` reason next to a far better match. The best match itself always passes.
+fn text_strength(rank: f64, best: f64) -> Option<f64> {
+    let strength = if best > 0.0 {
+        ((-rank).max(0.0) / best).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (strength >= TEXT_FLOOR).then_some(strength)
 }
 
 #[cfg(test)]
@@ -511,6 +521,17 @@ mod tests {
             by_target(&pool, "planet", "1").await,
             Err(LinkError::UnknownKind)
         ));
+    }
+
+    #[test]
+    fn a_text_match_far_weaker_than_the_best_earns_no_reason() {
+        // bm25 ranks are negative; -10 is the pass's best.
+        assert_eq!(text_strength(-10.0, 10.0), Some(1.0));
+        assert_eq!(text_strength(-5.0, 10.0), Some(0.5));
+        assert_eq!(text_strength(-2.0, 10.0), Some(0.2));
+        assert_eq!(text_strength(-1.0, 10.0), None);
+        // No usable bm25 anywhere in the pass: every match counts in full.
+        assert_eq!(text_strength(0.0, 0.0), Some(1.0));
     }
 
     #[test]
