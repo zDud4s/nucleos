@@ -427,6 +427,10 @@ const SHOTS_TO_TAKE = [
   // The Brain's queue: a row per scope kind, each with the scope it would be approved into.
   ["14-brain-waiting", { path: "/brain" }],
   ["14a-brain-waiting-light", { path: "/brain", theme: "light" }],
+  // The Brain's Graph view: full-bleed canvas with per-kind node colours, then with a note selected.
+  ["14b-brain-graph", { path: "/brain?view=graph" }],
+  ["14c-brain-graph-light", { path: "/brain?view=graph", theme: "light" }],
+  ["14d-brain-graph-node", { path: "/brain?view=graph&item=note:1" }],
   ["14-catalogue-new", { path: "/agents", press: "New agent" }],
 
   /* The inspector. Four views over four deliberately awkward projects: `alpha`
