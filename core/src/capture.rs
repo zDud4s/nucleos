@@ -1010,7 +1010,7 @@ mod tests {
         tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
         let (_, _, text, _) = request(&pool, 7).await.unwrap();
         assert!(
-            text.contains("o item 2 «build the thing» esgotou 3 tentativas no gate"),
+            text.contains("item 2 «build the thing» used up 3 gate attempts"),
             "{text}"
         );
         assert!(!text.contains("lots of raw lines"), "{text}");
