@@ -425,7 +425,9 @@ fn check_select(at: &str, select: &str, has_filters: bool, errors: &mut Vec<Stri
 /// match a path the group claims), a runner expression, and a plain name for the serial test group.
 fn check_filter(at: &str, group: &Group, filter: &Filter, errors: &mut Vec<String>) {
     if filter.paths.is_empty() {
-        errors.push(format!("{at}.paths: a filter nothing selects would never run"));
+        errors.push(format!(
+            "{at}.paths: a filter nothing selects would never run"
+        ));
     }
     for pattern in &filter.paths {
         check_pattern(&format!("{at}.paths"), pattern, errors);
@@ -702,7 +704,8 @@ mod tests {
     }
 
     const GOOD_SELECT: &str = "cargo nextest run -E {filter}";
-    const GOOD_FILTER: &str = "{paths: [core/src/channels/**], expr: 'test(/^channels::/)', serial: wake}";
+    const GOOD_FILTER: &str =
+        "{paths: [core/src/channels/**], expr: 'test(/^channels::/)', serial: wake}";
 
     #[test]
     fn a_group_with_filters_parses() {
@@ -723,7 +726,11 @@ mod tests {
     #[test]
     fn a_filter_outside_the_groups_paths_is_refused() {
         let text = filtered(GOOD_SELECT, GOOD_FILTER).replace("[core/]", "[sidecars/]");
-        assert!(errors(&text).iter().any(|e| e.contains("not inside the group's `paths`")));
+        assert!(
+            errors(&text)
+                .iter()
+                .any(|e| e.contains("not inside the group's `paths`"))
+        );
         let under_glob = filtered(GOOD_SELECT, GOOD_FILTER).replace("[core/]", "[core/src/**]");
         assert!(parse(&under_glob).is_ok());
     }
@@ -731,7 +738,11 @@ mod tests {
     #[test]
     fn an_empty_expr_or_serial_is_refused() {
         let empty_expr = filtered(GOOD_SELECT, "{paths: [core/a/**], expr: ''}");
-        assert!(errors(&empty_expr).iter().any(|e| e.contains("expr: empty")));
+        assert!(
+            errors(&empty_expr)
+                .iter()
+                .any(|e| e.contains("expr: empty"))
+        );
         let empty_serial = filtered(GOOD_SELECT, "{paths: [core/a/**], expr: x, serial: ''}");
         assert!(errors(&empty_serial).iter().any(|e| e.contains("serial")));
         let bad_serial = filtered(GOOD_SELECT, "{paths: [core/a/**], expr: x, serial: 'a b'}");
@@ -755,8 +766,16 @@ mod tests {
     #[test]
     fn the_filter_marker_needs_filters_and_excludes_the_path_markers() {
         let combined = filtered("cargo test -E {filter} -- {files}", GOOD_FILTER);
-        assert!(errors(&combined).iter().any(|e| e.contains("cannot be combined")));
+        assert!(
+            errors(&combined)
+                .iter()
+                .any(|e| e.contains("cannot be combined"))
+        );
         let orphan = format!("{MINIMAL}      select: cargo nextest run -E {{filter}}\n");
-        assert!(errors(&orphan).iter().any(|e| e.contains("declare `filters`")));
+        assert!(
+            errors(&orphan)
+                .iter()
+                .any(|e| e.contains("declare `filters`"))
+        );
     }
 }

@@ -96,9 +96,7 @@ pub fn select(
         if claimed.is_empty() {
             continue;
         }
-        if filters
-            && let Some(argv) = filtered(group, &claimed)
-        {
+        if filters && let Some(argv) = filtered(group, &claimed) {
             units.push(Unit {
                 group: name.clone(),
                 argv,
@@ -269,7 +267,12 @@ tests:
     #[test]
     fn a_path_in_one_group_runs_only_that_group() {
         let changed = paths(&["core/src/main.rs"]);
-        let selection = select(&map(), &changed, &all_fillable(&["core/src/main.rs"]), false);
+        let selection = select(
+            &map(),
+            &changed,
+            &all_fillable(&["core/src/main.rs"]),
+            false,
+        );
         assert!(!selection.full);
         assert_eq!(selection.units.len(), 1);
         assert_eq!(selection.units[0].group, "core");
@@ -282,7 +285,12 @@ tests:
     #[test]
     fn a_select_template_gets_its_files_prefixed_so_none_reads_as_a_flag() {
         let changed = paths(&["tools/-rf.py", "a.py"]);
-        let selection = select(&map(), &changed, &all_fillable(&["tools/-rf.py", "a.py"]), false);
+        let selection = select(
+            &map(),
+            &changed,
+            &all_fillable(&["tools/-rf.py", "a.py"]),
+            false,
+        );
         assert_eq!(
             selection.units[0].argv,
             ["pytest", "-q", "--", "./a.py", "./tools/-rf.py"]
@@ -413,7 +421,15 @@ tests:
         let argv = run(&filtered_map(), &["core/src/channels/mod.rs"], true);
         assert_eq!(
             argv,
-            ["cargo", "nextest", "run", "-p", "nucleos-core", "-E", "test(/^channels::/)"]
+            [
+                "cargo",
+                "nextest",
+                "run",
+                "-p",
+                "nucleos-core",
+                "-E",
+                "test(/^channels::/)"
+            ]
         );
     }
 
