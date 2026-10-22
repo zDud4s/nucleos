@@ -173,6 +173,37 @@ fn should_retire_none_agent(registry: &Registry, key: &EnvKey) -> bool {
         && registry.tabs_and_creating_of(key).is_empty()
 }
 
+/// [`should_retire_none_agent`], and the registered environment is still of `generation` (`None`:
+/// any). A creator whose build failed passes the generation it built against, so a rebuild that
+/// replaced the environment meanwhile (and so has no tabs yet) is never retired by that failure.
+fn should_retire_none_agent_of(registry: &Registry, key: &EnvKey, generation: Option<u32>) -> bool {
+    should_retire_none_agent(registry, key)
+        && match generation {
+            None => true,
+            Some(g) => registry.envs.get(key).is_some_and(|env| env.generation == g),
+        }
+}
+
+/// Prefix of a tombstone: a stale agent directory renamed away before it is deleted. It does not
+/// start with `agent`, so a tombstone is never taken for a generation directory.
+const TOMBSTONE_PREFIX: &str = "dead-";
+
+/// The tombstone name for the agent directory `name`, renamed by process `pid` as its `n`th one.
+fn tombstone_name(name: &str, pid: u32, n: u32) -> String {
+    format!("{TOMBSTONE_PREFIX}{pid}-{n}.{name}")
+}
+
+/// Whether `name` is exactly a [`tombstone_name`] of an agent generation directory.
+fn is_none_agent_tombstone(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix(TOMBSTONE_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+        .and_then(|(tag, original)| tag.split_once('-').map(|(pid, n)| (pid, n, original)))
+        .is_some_and(|(pid, n, original)| {
+            digits(pid) && digits(n) && agent_generation_of(original).is_some()
+        })
+}
+
 /// The generation of an agent data directory name (`agent` = 0, `agent-N` = N), `None` for any
 /// other name. Only the exact form [`generation_dir_name`] produces is accepted.
 fn agent_generation_of(name: &str) -> Option<u32> {
@@ -985,11 +1016,40 @@ fn dead_none_agent_dirs(none_dir: &Path) -> Vec<String> {
     stale_none_agent_dirs(&dir_names(none_dir), None)
 }
 
-/// Deletes the directories `names` under `none_dir`, each tried up to `attempts` times a short
-/// while apart (a closing WebView2 process may still hold it). A directory that stays locked is
-/// left for the next sweep. Blocking: never call it on the main thread.
+/// Tombstones renamed by this process, for unique tombstone names.
+static TOMBSTONE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Deletes the directories `names` under `none_dir`. Each is first renamed to a tombstone, tried up
+/// to `attempts` times a short while apart (a closing WebView2 process may still hold it); only
+/// tombstones are deleted. On Windows a directory a browser process still uses cannot be renamed,
+/// so one that stays locked, possibly the live profile of another shell process sharing this data
+/// root, is skipped and never deleted. Tombstones left by an earlier sweep (any process) are
+/// deleted too. Blocking: never call it on the main thread.
 fn remove_none_agent_dirs(none_dir: &Path, names: Vec<String>, attempts: u32) {
+    let pid = std::process::id();
     for name in names {
+        let path = none_dir.join(&name);
+        for attempt in 0..attempts {
+            let n = TOMBSTONE_SEQ.fetch_add(1, Ordering::SeqCst);
+            let tomb = none_dir.join(tombstone_name(&name, pid, n));
+            if std::fs::rename(&path, &tomb).is_ok() || !path.exists() {
+                break;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    remove_none_agent_tombstones(none_dir, attempts);
+}
+
+/// Deletes every tombstone under `none_dir`, each tried up to `attempts` times a short while apart.
+/// One that cannot be deleted is left for the next sweep. Blocking: never on the main thread.
+fn remove_none_agent_tombstones(none_dir: &Path, attempts: u32) {
+    let tombs = dir_names(none_dir)
+        .into_iter()
+        .filter(|name| is_none_agent_tombstone(name));
+    for name in tombs {
         let path = none_dir.join(name);
         for attempt in 0..attempts {
             if std::fs::remove_dir_all(&path).is_ok() || !path.exists() {
@@ -1026,7 +1086,8 @@ fn sweep_none_agent_dirs_once(app: &AppHandle) {
 /// Tears down the no-project agent environment once its last tab is gone: closes the keepalive,
 /// forgets the environment, tells the shell and deletes its directories. Blocking-thread only: it
 /// takes `agent_gate`, which an agent build holds across `add_child` (a main-thread wait).
-fn retire_none_agent(app: &AppHandle) {
+/// `generation` `Some` retires only that generation (see [`should_retire_none_agent_of`]).
+fn retire_none_agent(app: &AppHandle, generation: Option<u32>) {
     let state = app.state::<Browser>();
     let key = EnvKey::none(Role::Agent);
     let none_dir = app.path().local_data_dir().ok().map(|b| none_scope_dir(&b));
@@ -1035,7 +1096,7 @@ fn retire_none_agent(app: &AppHandle) {
         // Re-checked under the gate: a tab may have been opened since the close was seen.
         let env = {
             let registry = state.registry();
-            if !should_retire_none_agent(&registry, &key) {
+            if !should_retire_none_agent_of(&registry, &key, generation) {
                 return;
             }
             registry.env(&key)
@@ -1174,12 +1235,22 @@ fn create_tab(
         .then(|| state.agent_gate.lock().unwrap_or_else(|e| e.into_inner()));
     let env = ensure_env(app, &key)?;
     // Reserved before `add_child`, so a close that arrives while the webview is being built is seen.
-    state.registry().reserve_tab(&tab_id, key)?;
+    state.registry().reserve_tab(&tab_id, key.clone())?;
     drop(gate);
     let result = create_reserved(app, &tab_id, url, bounds, &env);
     if result.is_err() {
-        // A no-op once `finish_tab` ran; frees the id when the build failed before it.
-        app.state::<Browser>().registry().release_tab(&tab_id);
+        // Covers a failed build and a failed `finish_tab` (closed while being built): a close then
+        // found no live tab, so it did not retire, and this may have been the last tab.
+        let retire = {
+            let mut registry = state.registry();
+            // A no-op once `finish_tab` ran; frees the id when the build failed before it.
+            registry.release_tab(&tab_id);
+            should_retire_none_agent_of(&registry, &key, Some(env.generation))
+        };
+        if retire {
+            // Already on a blocking thread with `agent_gate` released, which the retire takes.
+            retire_none_agent(app, Some(env.generation));
+        }
     }
     result
 }
@@ -1464,7 +1535,7 @@ pub fn browser_tab_close(app: AppHandle, tab_id: String) -> Result<(), String> {
     if retire {
         // Off the main thread: the retire takes `agent_gate` (see `retire_none_agent`).
         let app = app.clone();
-        tauri::async_runtime::spawn_blocking(move || retire_none_agent(&app));
+        tauri::async_runtime::spawn_blocking(move || retire_none_agent(&app, None));
     }
     closed
 }
@@ -2206,5 +2277,60 @@ mod tests {
             json,
             serde_json::json!({"fromTabId": "t1", "url": "https://a.b/"})
         );
+    }
+
+    #[test]
+    fn a_failed_build_retires_only_the_generation_it_built_against() {
+        let none = EnvKey::none(Role::Agent);
+        let mut reg = Registry::default();
+        reg.ensure_env(&none, || EnvInfo {
+            generation: 3,
+            ..env("a")
+        });
+
+        // Closed while being built: the close only flags the reservation, the creator releases it.
+        reg.reserve_tab("t1", none.clone()).unwrap();
+        assert_eq!(reg.remove_tab("t1"), None);
+        assert!(!should_retire_none_agent_of(&reg, &none, Some(3)), "creating");
+        assert!(reg.finish_tab("t1").is_err());
+        reg.release_tab("t1");
+        assert!(should_retire_none_agent_of(&reg, &none, Some(3)));
+        assert!(should_retire_none_agent_of(&reg, &none, None));
+        // A rebuild replaced the environment meanwhile: the old creator must not retire it.
+        assert!(!should_retire_none_agent_of(&reg, &none, Some(2)));
+
+        let owner = EnvKey::none(Role::Owner);
+        reg.ensure_env(&owner, || env("o"));
+        assert!(!should_retire_none_agent_of(&reg, &owner, Some(0)));
+        assert!(!should_retire_none_agent_of(&reg, &owner, None));
+    }
+
+    #[test]
+    fn tombstones_are_recognised_and_never_taken_for_a_generation() {
+        for name in ["agent", "agent-7"] {
+            let tomb = tombstone_name(name, 4242, 9);
+            assert!(!tomb.starts_with("agent"), "{tomb}");
+            assert!(is_none_agent_tombstone(&tomb), "{tomb}");
+            assert_eq!(agent_generation_of(&tomb), None, "{tomb}");
+        }
+        assert_eq!(tombstone_name("agent-1", 12, 3), "dead-12-3.agent-1");
+
+        for name in [
+            "agent",
+            "agent-1",
+            "owner",
+            "dead-1-2.owner",
+            "dead-x-2.agent",
+            "dead-1-.agent",
+            "dead-1.agent",
+            "dead-1-2agent",
+            "dead-1-2.agent-x",
+        ] {
+            assert!(!is_none_agent_tombstone(name), "{name}");
+        }
+
+        // The sweep's stale list never contains a tombstone, so it is never renamed again.
+        let names = labels(&["agent", "dead-5-0.agent-1", "owner"]);
+        assert_eq!(stale_none_agent_dirs(&names, None), labels(&["agent"]));
     }
 }
