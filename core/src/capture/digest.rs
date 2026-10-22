@@ -12,6 +12,36 @@ pub const FEED_KIND: &str = "capture_digest";
 /// Questions spelled out in the text; the rest are counted and stay answerable in the Brain.
 pub const MAX_QUESTIONS: usize = 8;
 
+/// One digest as the Brain lists it: the jobs it asked about and how many are still open.
+#[derive(Debug, serde::Serialize)]
+pub struct DigestRow {
+    pub id: i64,
+    pub day: String,
+    pub job_ids: Vec<i64>,
+    pub open: i64,
+}
+
+/// The digests from `since_day` (a local `YYYY-MM-DD`) on, newest first.
+pub async fn list(pool: &SqlitePool, since_day: &str) -> sqlx::Result<Vec<DigestRow>> {
+    let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
+        "SELECT d.id, d.day, d.job_ids,
+                (SELECT COUNT(*) FROM capture_requests r WHERE r.digest_id = d.id AND r.state = 'open')
+           FROM capture_digests d WHERE d.day >= ? ORDER BY d.id DESC",
+    )
+    .bind(since_day)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, day, job_ids, open)| DigestRow {
+            id,
+            day,
+            job_ids: serde_json::from_str(&job_ids).unwrap_or_default(),
+            open,
+        })
+        .collect())
+}
+
 pub async fn run_if_due(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Option<i64>> {
     run_if_due_in(pool, now, &chrono::Local).await
 }

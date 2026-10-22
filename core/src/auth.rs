@@ -3237,8 +3237,9 @@ mod tests {
             (Method::GET, "/capture-requests"),
             (Method::POST, "/capture-requests/7/dismiss"),
             (Method::POST, "/capture-requests/7/answer"),
-            (Method::GET, "/config/capture-wait"),
-            (Method::POST, "/config/capture-wait"),
+            (Method::GET, "/config/capture"),
+            (Method::POST, "/config/capture"),
+            (Method::GET, "/capture-digests"),
         ];
         let refused = [
             Scope::Run(1),

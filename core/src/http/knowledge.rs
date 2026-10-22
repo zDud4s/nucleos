@@ -61,6 +61,7 @@ pub(super) fn routes() -> Router<AppState> {
         // Capture requests (spec 2026-10-07-pedidos-captura). In no `auth.rs` table on purpose:
         // Control and Admin only, like the notes an answer becomes.
         .route("/capture-requests", get(get_capture_requests))
+        .route("/capture-digests", get(get_capture_digests))
         .route(
             "/capture-requests/{job_id}/dismiss",
             post(post_capture_dismiss),
@@ -718,6 +719,22 @@ pub(super) async fn get_capture_requests(
         .map(Json)
         .map_err(|error| {
             tracing::warn!(%error, "listing capture requests failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })
+}
+
+/// The digests of the last 14 local days (today included), newest first.
+pub(super) async fn get_capture_digests(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::capture::digest::DigestRow>>, (StatusCode, Json<serde_json::Value>)> {
+    let since = (chrono::Local::now() - chrono::Duration::days(13))
+        .format("%Y-%m-%d")
+        .to_string();
+    crate::capture::digest::list(&state.pool, &since)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing capture digests failed");
             refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
         })
 }

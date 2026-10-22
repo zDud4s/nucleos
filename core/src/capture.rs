@@ -38,27 +38,9 @@ pub fn stamp(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
-/// The old wait setting. Nothing reads it for holding rows any more; `wait_minutes` and
-/// `set_wait_minutes` stay only for the legacy HTTP route that the digest-config route replaces.
-pub const WAIT_SETTING_KEY: &str = "distiller.capture_wait_minutes";
-pub const DEFAULT_WAIT_MINUTES: i64 = 120;
-/// A week. Beyond it the deadline arithmetic could overflow and panic on every tick, inside the
-/// worker's claiming transaction; no owner means to hold a job longer than that.
-pub const MAX_WAIT_MINUTES: i64 = 7 * 24 * 60;
-
-/// Minutes a request holds its job. `0` turns requests off; anything unreadable or out of range is
-/// the default.
-pub async fn wait_minutes(pool: &SqlitePool) -> i64 {
-    sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = ?")
-        .bind(WAIT_SETTING_KEY)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|stored| stored.trim().parse::<i64>().ok())
-        .filter(|minutes| (0..=MAX_WAIT_MINUTES).contains(minutes))
-        .unwrap_or(DEFAULT_WAIT_MINUTES)
-}
+/// The retired wait setting (minutes). Only read as a fallback by [`answer_days`]: a stored `0`
+/// keeps requests off.
+const OLD_WAIT_KEY: &str = "distiller.capture_wait_minutes";
 
 pub const ANSWER_DAYS_KEY: &str = "capture.answer_days";
 pub const DIGEST_HOUR_KEY: &str = "capture.digest_hour";
@@ -81,7 +63,7 @@ pub async fn answer_days(pool: &SqlitePool) -> i64 {
     if let Some(days) = meta(pool, ANSWER_DAYS_KEY).await.and_then(|v| v.trim().parse::<i64>().ok()) {
         return if (0..=MAX_ANSWER_DAYS).contains(&days) { days } else { DEFAULT_ANSWER_DAYS };
     }
-    match meta(pool, WAIT_SETTING_KEY).await.and_then(|v| v.trim().parse::<i64>().ok()) {
+    match meta(pool, OLD_WAIT_KEY).await.and_then(|v| v.trim().parse::<i64>().ok()) {
         Some(0) => 0,
         _ => DEFAULT_ANSWER_DAYS,
     }
@@ -172,59 +154,6 @@ pub fn question_line(project: &str, job_id: i64, facts: &[Fact]) -> String {
 
 /// Queue rows created before this UTC second never ask; see migration 0173. Absent: all may ask.
 pub const FROM_KEY: &str = "distiller.capture_from";
-
-#[derive(Debug)]
-pub enum WaitError {
-    OutOfRange,
-    Db(sqlx::Error),
-}
-
-impl std::fmt::Display for WaitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WaitError::OutOfRange => write!(f, "the wait is 0 to {MAX_WAIT_MINUTES} minutes"),
-            WaitError::Db(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl From<sqlx::Error> for WaitError {
-    fn from(error: sqlx::Error) -> Self {
-        WaitError::Db(error)
-    }
-}
-
-/// Store the wait, refusing anything `wait_minutes` would not read back.
-pub async fn set_wait_minutes(
-    pool: &SqlitePool,
-    minutes: i64,
-    now: DateTime<Utc>,
-) -> Result<(), WaitError> {
-    if !(0..=MAX_WAIT_MINUTES).contains(&minutes) {
-        return Err(WaitError::OutOfRange);
-    }
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO schema_meta (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(WAIT_SETTING_KEY)
-    .bind(minutes.to_string())
-    .execute(&mut *tx)
-    .await?;
-    // A zero wait holds nothing, so a request still open would ask a question nobody waits on:
-    // close them as dismissed, the way the owner would have.
-    if minutes == 0 {
-        sqlx::query("UPDATE capture_requests SET state = ?, closed_at = ? WHERE state = ?")
-            .bind(STATE_DISMISSED)
-            .bind(stamp(now))
-            .bind(STATE_OPEN)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
 
 #[derive(sqlx::FromRow)]
 struct AskingRow {
@@ -505,6 +434,7 @@ pub struct CaptureRequest {
     pub note_id: Option<i64>,
     pub created_at: String,
     pub closed_at: Option<String>,
+    pub digest_id: Option<i64>,
 }
 
 type ListRow = (
@@ -517,6 +447,7 @@ type ListRow = (
     Option<i64>,
     String,
     Option<String>,
+    Option<i64>,
 );
 
 /// Requests for the shell, nearest deadline first; `seconds_left` is 0 for a closed or due one.
@@ -526,7 +457,8 @@ pub async fn list(
     now: DateTime<Utc>,
 ) -> sqlx::Result<Vec<CaptureRequest>> {
     let rows: Vec<ListRow> = sqlx::query_as(
-        "SELECT job_id, project_id, causes, prompt_text, state, deadline, note_id, created_at, closed_at
+        "SELECT job_id, project_id, causes, prompt_text, state, deadline, note_id, created_at, closed_at,
+                digest_id
            FROM capture_requests WHERE (? OR state = ?) ORDER BY deadline, job_id",
     )
     .bind(listing == Listing::All)
@@ -546,6 +478,7 @@ pub async fn list(
                 note_id,
                 created_at,
                 closed_at,
+                digest_id,
             )| {
                 let seconds_left = if state == STATE_OPEN {
                     DateTime::parse_from_rfc3339(&deadline)
@@ -570,6 +503,7 @@ pub async fn list(
                     note_id,
                     created_at,
                     closed_at,
+                    digest_id,
                 }
             },
         )
@@ -645,9 +579,9 @@ mod tests {
     #[tokio::test]
     async fn a_legacy_zero_wait_keeps_requests_off_and_any_other_value_gives_the_default() {
         let pool = pool().await;
-        set_meta(&pool, WAIT_SETTING_KEY, "0").await;
+        set_meta(&pool, OLD_WAIT_KEY, "0").await;
         assert_eq!(answer_days(&pool).await, 0, "an owner who turned requests off keeps them off");
-        set_meta(&pool, WAIT_SETTING_KEY, "30").await;
+        set_meta(&pool, OLD_WAIT_KEY, "30").await;
         assert_eq!(answer_days(&pool).await, 5, "minutes are not converted into days");
         set_meta(&pool, ANSWER_DAYS_KEY, "9").await;
         assert_eq!(answer_days(&pool).await, 9, "the new key wins over the old one");
