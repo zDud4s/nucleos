@@ -90,7 +90,9 @@
 }
 
 .brain-note-link:hover {
-  color: var(--accent);
+  /* Signal Cyan is reserved for the allowlisted link classes; a note's link stays in the
+     text colour and answers the pointer with a heavier underline instead. */
+  text-decoration-thickness: 2px;
 }
 
 .brain-note-link:focus-visible {
