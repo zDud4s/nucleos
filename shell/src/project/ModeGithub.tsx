@@ -1,5 +1,5 @@
 // §spec alcada-por-projecto
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
@@ -34,7 +34,6 @@ import { useKillSwitch } from "../data/system";
 import { clock } from "../lib/timeline";
 import {
   Button,
-  Callout,
   ConfirmButton,
   ConflictNote,
   ErrorNote,
@@ -45,9 +44,9 @@ import {
   Section,
   Select,
   Tip,
-  Well,
 } from "../ui";
 import { DAEMON_NAME } from "../copy";
+import { Settings } from "./Settings";
 
 /**
  * "What may this project do without asking?" — the Authority mode.
@@ -102,6 +101,11 @@ export function ModeGithub({ projectId }: ModeGithubProps) {
   return (
     <div className="ws-page ws-authority">
       <Standing projectId={projectId} stopped={stopped} />
+
+      {/* Autonomy first: the mode, the proposal ceiling and the action classes (six sections). */}
+      <Section label="Autonomy">
+        <Settings projectId={projectId} />
+      </Section>
 
       <Section label="The remote">
         <Remote projectId={projectId} />
@@ -449,9 +453,17 @@ function Listing({
   read: UseQueryResult<ReadOutcome>;
   ci?: boolean;
 }) {
+  // A CI listing with a run that did not succeed says so in its title: the count replaces the
+  // banner that used to sit over the text.
+  const verdict = ci && read.data !== undefined ? ciVerdict(read.data) : null;
+  const heading =
+    verdict !== null && verdict.failed > 0
+      ? `${title} · ${verdict.failed} of ${verdict.listed} did not succeed`
+      : title;
+
   return (
     <Inset>
-      <GroupTitle>{title}</GroupTitle>
+      <GroupTitle>{heading}</GroupTitle>
       <ListingBody read={read} ci={ci} />
     </Inset>
   );
@@ -489,16 +501,9 @@ function ListingBody({ read, ci }: { read: UseQueryResult<ReadOutcome>; ci: bool
         {said === "" ? (
           <p className="text-sm text-text-muted">And it printed nothing at all while failing.</p>
         ) : (
-          /*
-            A `Well` and not a bare `pre`: this is a raw payload, and the recess is what says the
-            text was not written here. `capped` because a failing `gh` can print any amount, and a
-            panel whose height is set by the longest thing it has ever printed is one nobody can
-            scan past — the cap scrolls instead, in both directions, which is what keeps the
-            terminal's own column alignment intact.
-          */
-          <Well as="pre" capped>
-            {said}
-          </Well>
+          // Capped by `.ws-gh`: a failing `gh` can print any amount, and the cap scrolls in both
+          // directions, which keeps the terminal's own column alignment intact.
+          <pre className="ws-gh">{said}</pre>
         )}
       </div>
     );
@@ -517,16 +522,12 @@ function ListingBody({ read, ci }: { read: UseQueryResult<ReadOutcome>; ci: bool
   if (ci) return <CiListing listed={listed} />;
 
   /*
-    The listing itself, in the same recess. It is a terminal table — columns aligned with spaces —
+    The listing itself, with no sunken fill. It is a terminal table — columns aligned with spaces —
     and any element that reflowed it would turn `gh`'s own formatting into noise, which is why it
-    stays a `pre`; `Well` keeps the mono face that claims the machine produced it and scrolls the
-    overflow rather than growing the panel.
+    stays a `pre`; `.ws-gh` keeps the mono face that claims the machine produced it and scrolls
+    the overflow rather than growing the panel.
   */
-  return (
-    <Well as="pre" capped>
-      {listed}
-    </Well>
-  );
+  return <pre className="ws-gh">{listed}</pre>;
 }
 
 /**
@@ -549,28 +550,21 @@ function CiListing({ listed }: { listed: string }) {
 
   return (
     <>
-      {verdict.listed === 0 ? null : verdict.failed === 0 ? (
+      {verdict.failed === 0 && verdict.listed > 0 ? (
         <p className="text-sm text-text-muted">No failed run among the {verdict.listed} listed.</p>
-      ) : (
-        <Callout tone="danger">
-          {verdict.failed} of the {verdict.listed} listed runs did not succeed; they are marked
-          below.
-        </Callout>
-      )}
-      <Well as="pre" capped>
+      ) : null}
+      <pre className="ws-gh">
         {lines.map((line, index) => (
           <span key={index}>
             {index === 0 ? null : "\n"}
             {runFailed(line) ? (
-              <mark className="rounded-sm bg-tone-danger-bg text-tone-danger-fg ring-1 ring-inset ring-tone-danger-border">
-                {line}
-              </mark>
+              <mark className="bg-tone-danger-bg text-tone-danger-fg">{line}</mark>
             ) : (
               line
             )}
           </span>
         ))}
-      </Well>
+      </pre>
     </>
   );
 }
@@ -824,6 +818,7 @@ const GITHUB_OP_LABEL: Record<string, string> = {
   workflow_run: "start a workflow",
   run_rerun: "re-run a CI run",
   pr_create: "open a pull request",
+  pr_merge: "merge a pull request",
   pr_comment: "comment on a pull request",
   issue_close: "close an issue",
   api_read: "call the GitHub API directly",
@@ -920,7 +915,12 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
             here has nothing to run against until it is.
           </ConflictNote>
         ) : null}
-        <OpList ops={reads} empty="This daemon builds no GitHub reads." {...rowProps} />
+        <OpList
+          ops={reads}
+          empty="This daemon builds no GitHub reads."
+          foldOutside={false}
+          {...rowProps}
+        />
       </Inset>
 
       <Inset>
@@ -934,7 +934,12 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
         >
           Actions
         </GroupTitle>
-        <OpList ops={actions} empty="This daemon builds no GitHub actions." {...rowProps} />
+        <OpList
+          ops={actions}
+          empty="This daemon builds no GitHub actions."
+          foldOutside={false}
+          {...rowProps}
+        />
       </Inset>
 
       {stranded.length === 0 ? null : (
@@ -970,6 +975,8 @@ function AutonomousOps({ projectId, stopped }: { projectId: string; stopped: boo
           />
         </Inset>
       )}
+
+      <OutsideLine ops={outsideOps([...reads, ...actions], declared)} />
     </div>
   );
 }
@@ -1015,6 +1022,7 @@ function OpList({
   ops,
   empty,
   stranded = false,
+  foldOutside = true,
   declared,
   stopped,
   writes,
@@ -1028,6 +1036,8 @@ function OpList({
   empty: string;
   /** Rows the build no longer has: the ceiling caption would be the wrong fact about them. */
   stranded?: boolean;
+  /** Draw the quiet "not allowed by this build" line here; a caller with several lists draws it once. */
+  foldOutside?: boolean;
   declared: Set<string>;
   stopped: boolean;
   writes: ReturnType<typeof useRowWrites>;
@@ -1042,97 +1052,139 @@ function OpList({
     return <Quiet says={empty} />;
   }
 
-  return (
-    <ul className="ws-items">
-      {ops.map((op) => {
-        const has = declared.has(op.kind);
-        const busy = writes.isPending(op.kind);
-        const label = labels[op.kind];
-        return (
-          <li key={op.kind} aria-label={`${named} ${op.kind}`} className="ws-item">
-            {/*
-              Two columns and only two: what the row is on the leading side (its name, then the id
-              and where it stands in small type under it), the controls on the trailing one. The
-              state word floated between them, at whatever x the name's length left it.
-            */}
-            <div className="ws-item-main">
-              {label === undefined ? null : <span className="ws-item-name">{label}</span>}
-              <span className="ws-item-sub">
-                {/* The id in the machine's face and nothing more: not a pill, which the system
-                    keeps for badges, and never the only name the row has when a human one exists. */}
-                <span className={label === undefined ? "ws-item-name font-mono" : "font-mono"}>
-                  {op.kind}
-                </span>
-                {op.declarable ? (
-                  has ? (
-                    <span className="ws-item-state-on">without asking</span>
-                  ) : (
-                    <span>asks first</span>
-                  )
-                ) : stranded ? null : (
-                  <span>{has ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}</span>
-                )}
-              </span>
-            </div>
+  // An operation this build does not allow and nobody declared has nothing to act on, so it leaves
+  // the row list and becomes one quiet line. A declared one stays a row: it carries `withdraw`.
+  const rows = ops.filter((op) => op.declarable || declared.has(op.kind) || stranded);
+  const outside = stranded ? [] : outsideOps(ops, declared);
 
-            {op.declarable ? (
-              <span className="ws-trail">
-                <Receipt stamp={writes.stamp(op.kind)} />
-                {has ? (
-                  <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
-                    withdraw
-                  </Button>
-                ) : (
-                  <>
-                    <ConfirmButton
-                      variant="quiet"
-                      label="grant"
-                      confirmLabel="grant without asking"
-                      subject={op.kind}
-                      disabled={busy}
-                      unavailable={stopped}
-                      title={
-                        stopped
-                          ? "The emergency stop is engaged: nothing may be granted until it is released."
-                          : undefined
-                      }
-                      onConfirm={() => onGrant(op.kind)}
-                    />
-                  </>
-                )}
-              </span>
-            ) : (
-              <>
+  return (
+    <>
+      {rows.length === 0 ? (
+        // A caller that folds the outside line elsewhere would leave this group's title over
+        // nothing; say why in the group itself.
+        foldOutside || stranded ? null : <Quiet says="None of these is allowed by this build." />
+      ) : (
+        <ul className="ws-items">
+          {rows.map((op) => {
+            const has = declared.has(op.kind);
+            const busy = writes.isPending(op.kind);
+            const label = labels[op.kind];
+            return (
+              <li key={op.kind} aria-label={`${named} ${op.kind}`} className="ws-item">
                 {/*
-                  A `span` and never a control — the `Settings` chip's argument, applied to an
-                  operation instead of to a class. This build does not admit it, so there is nothing
-                  for a control to be wired to, and one that refused would be a lie about who
-                  decides.
+                  Two columns and only two: what the row is on the leading side (its name, then the id
+                  and where it stands in small type under it), the controls on the trailing one. The
+                  state word floated between them, at whatever x the name's length left it.
                 */}
-                {/*
-                  The one legal gesture, and only when there is a row to remove.
-                  `delete_project_github_op` has no declarability check, and says why: *"withdrawing
-                  narrows, and an operation stored before the ceilings moved still has to be
-                  removable"*. `GET .../github-ops` serves the raw table for the same reason, so a
-                  row outside the ceilings arrives here on purpose.
-                */}
-                {has ? (
+                <div className="ws-item-main">
+                  {label === undefined ? null : <span className="ws-item-name">{label}</span>}
+                  <span className="ws-item-sub">
+                    {/* The id in the machine's face and nothing more: not a pill, which the system
+                        keeps for badges, and never the only name the row has when a human one exists. */}
+                    <span className={label === undefined ? "ws-item-name font-mono" : "font-mono"}>
+                      {op.kind}
+                    </span>
+                    {op.declarable ? (
+                      has ? (
+                        <span className="ws-item-state-on">without asking</span>
+                      ) : (
+                        <span>asks first</span>
+                      )
+                    ) : stranded ? null : (
+                      <span>{has ? OUTSIDE_AND_DECLARED : OUTSIDE_THE_CEILING}</span>
+                    )}
+                  </span>
+                </div>
+
+                {op.declarable ? (
                   <span className="ws-trail">
                     <Receipt stamp={writes.stamp(op.kind)} />
-                    <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
-                      withdraw
-                    </Button>
+                    {has ? (
+                      <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
+                        withdraw
+                      </Button>
+                    ) : (
+                      <>
+                        <ConfirmButton
+                          variant="quiet"
+                          label="grant"
+                          confirmLabel="grant without asking"
+                          subject={op.kind}
+                          disabled={busy}
+                          unavailable={stopped}
+                          title={
+                            stopped
+                              ? "The emergency stop is engaged: nothing may be granted until it is released."
+                              : undefined
+                          }
+                          onConfirm={() => onGrant(op.kind)}
+                        />
+                      </>
+                    )}
                   </span>
-                ) : null}
-              </>
-            )}
+                ) : (
+                  <>
+                    {/*
+                      A `span` and never a control — the `Settings` chip's argument, applied to an
+                      operation instead of to a class. This build does not admit it, so there is nothing
+                      for a control to be wired to, and one that refused would be a lie about who
+                      decides.
+                    */}
+                    {/*
+                      The one legal gesture, and only when there is a row to remove.
+                      `delete_project_github_op` has no declarability check, and says why: *"withdrawing
+                      narrows, and an operation stored before the ceilings moved still has to be
+                      removable"*. `GET .../github-ops` serves the raw table for the same reason, so a
+                      row outside the ceilings arrives here on purpose.
+                    */}
+                    {has ? (
+                      <span className="ws-trail">
+                        <Receipt stamp={writes.stamp(op.kind)} />
+                        <Button variant="quiet" disabled={busy} onClick={() => onWithdraw(op.kind)}>
+                          withdraw
+                        </Button>
+                      </span>
+                    ) : null}
+                  </>
+                )}
 
-            <RowFailure error={writes.failure(op.kind)} sentences={sentences} />
-          </li>
-        );
-      })}
-    </ul>
+                <RowFailure error={writes.failure(op.kind)} sentences={sentences} />
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {foldOutside ? <OutsideLine ops={outside} /> : null}
+    </>
   );
+}
+
+/**
+ * The one quiet line for operations this build does not allow: ids in mono, nothing to press.
+ *
+ * Drawn once per group. The GitHub section draws it after both of its halves, so an operation
+ * outside the ceilings does not repeat the same sentence under Reads and again under Actions.
+ */
+function OutsideLine({ ops }: { ops: { kind: string }[] }) {
+  if (ops.length === 0) {
+    return null;
+  }
+  return (
+    <p className="ws-outside">
+      {ops.map((op, index) => (
+        <span key={op.kind}>
+          {index === 0 ? "" : ", "}
+          <span className="font-mono">{op.kind}</span>
+        </span>
+      ))}{" "}
+      — {OUTSIDE_THE_CEILING}
+    </p>
+  );
+}
+
+/** The operations of a catalogue slice that are outside the ceilings and not declared. */
+function outsideOps(ops: { kind: string; declarable: boolean }[], declared: Set<string>) {
+  return ops.filter((op) => !op.declarable && !declared.has(op.kind));
 }
 
 /**
@@ -1160,6 +1212,9 @@ const GIT_OP_LABEL: Record<string, string> = {
   fetch: "fetch from the remote",
   rebase: "rebase a branch",
   "branch-delete": "delete a branch",
+  // The build's kind is `branch-delete`. The underscore spelling is an alias kept for a project
+  // table or fixture that still stores it; nothing in the shell sends it any more.
+  branch_delete: "delete a branch",
 };
 
 /**
@@ -1665,6 +1720,9 @@ function DeclareRule({
   const [tool, setTool] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [failed, setFailed] = useState<unknown>(null);
+  /** The form is asked for, not always on show. */
+  const [open, setOpen] = useState(false);
+  const focus = useFormFocus(open);
 
   // The núcleo folds a path and a command by two different functions, and the difference is the
   // case: `fold_path_prefix` deliberately does not lower-case, because whether a path's case
@@ -1693,6 +1751,8 @@ function DeclareRule({
         // three directories to `Edit` should not have to say `Edit` three times.
         setPrefix("");
         setNote("");
+        // Success closes the form; a rejection keeps it open with what was typed.
+        setOpen(false);
       })
       .catch((error: unknown) => setFailed(error))
       .finally(() => setSending(false));
@@ -1703,8 +1763,24 @@ function DeclareRule({
     if (ready) submit("deny");
   }
 
+  function cancel() {
+    setPrefix("");
+    setNote("");
+    setFailed(null);
+    setOpen(false);
+  }
+
+  if (!open) {
+    // Wrapped like LandTargets' button: a bare Button stretches across a column-flex parent.
+    return (
+      <div ref={focus.trigger} className="flex flex-wrap items-center gap-3">
+        <Button onClick={() => setOpen(true)}>add a rule</Button>
+      </div>
+    );
+  }
+
   return (
-    <form aria-label="Add a rule" onSubmit={onSubmit}>
+    <form ref={focus.form} aria-label="Add a rule" onSubmit={onSubmit}>
       <Inset>
         <GroupTitle>Add a rule</GroupTitle>
 
@@ -1816,6 +1892,9 @@ function DeclareRule({
           <Button type="submit" disabled={!ready}>
             refuse it here
           </Button>
+          <Button type="button" onClick={cancel}>
+            cancel
+          </Button>
           {tool === null ? (
             <Quiet says="A refusal can name a pipe or a redirection; a permission cannot.">
               A refusal answers at the whole line and needs no shape the classifier can read, so a
@@ -1841,6 +1920,29 @@ function DeclareRule({
       </Inset>
     </form>
   );
+}
+
+/**
+ * Keeps keyboard focus with a collapsible form. The trigger button unmounts when the form opens,
+ * so without this focus falls to the body on open, on cancel and on success.
+ *
+ * Opening moves focus to the form's first field; closing returns it to the trigger's button. The
+ * first run (closed, never opened) touches nothing.
+ */
+function useFormFocus(open: boolean) {
+  const form = useRef<HTMLFormElement>(null);
+  const trigger = useRef<HTMLDivElement>(null);
+  const opened = useRef(false);
+  useEffect(() => {
+    if (open) {
+      opened.current = true;
+      form.current?.querySelector<HTMLElement>("select, input, textarea")?.focus();
+    } else if (opened.current) {
+      opened.current = false;
+      trigger.current?.querySelector<HTMLElement>("button")?.focus();
+    }
+  }, [open]);
+  return { form, trigger };
 }
 
 /* -------------------------------------------- 5. where the work lands -- */
@@ -1875,6 +1977,9 @@ function LandTargets({ projectId }: { projectId: string }) {
   const withdraw = useForgetLandTarget();
   const writes = useRowWrites();
   const [branch, setBranch] = useState("");
+  /** The form is asked for, not always on show. */
+  const [open, setOpen] = useState(false);
+  const focus = useFormFocus(open);
 
   if (landing.isPending) {
     return <Reading>Reading where this project lands…</Reading>;
@@ -1892,8 +1997,16 @@ function LandTargets({ projectId }: { projectId: string }) {
     event.preventDefault();
     if (wanted === "" || adding) return;
     writes.run("+", `added ${wanted}`, () =>
-      add.mutateAsync({ projectId, branch: wanted }).then(() => setBranch("")),
+      add.mutateAsync({ projectId, branch: wanted }).then(() => {
+        setBranch("");
+        setOpen(false);
+      }),
     );
+  }
+
+  function cancel() {
+    setBranch("");
+    setOpen(false);
   }
 
   return (
@@ -1947,31 +2060,41 @@ function LandTargets({ projectId }: { projectId: string }) {
         </ul>
       </Inset>
 
-      <form aria-label="Add a landing target" onSubmit={onSubmit}>
-        <Inset>
-          <GroupTitle>Add a landing target</GroupTitle>
-          <div className="flex flex-wrap items-end gap-3">
-            <Field label="Branch">
-              <input
-                style={{ fontFamily: "var(--font-mono)" }}
-                placeholder="release/next"
-                value={branch}
-                spellCheck={false}
-                onChange={(event) => setBranch(event.target.value)}
-              />
-            </Field>
-            <Button type="submit" disabled={wanted === "" || adding}>
-              add
-            </Button>
-            <Receipt stamp={writes.stamp("+")} />
-          </div>
-          {/*
-            No page copy for `unusable_branch`: its detail says which part of the spelling was refused
-            — an empty name, a leading dash, whitespace — and that is what somebody has to fix.
-          */}
-          <RowFailure error={writes.failure("+")} sentences={TARGET_SENTENCES} />
-        </Inset>
-      </form>
+      {!open ? (
+        <div ref={focus.trigger} className="flex flex-wrap items-center gap-3">
+          <Button onClick={() => setOpen(true)}>add a landing target</Button>
+          <Receipt stamp={writes.stamp("+")} />
+        </div>
+      ) : (
+        <form ref={focus.form} aria-label="Add a landing target" onSubmit={onSubmit}>
+          <Inset>
+            <GroupTitle>Add a landing target</GroupTitle>
+            <div className="flex flex-wrap items-end gap-3">
+              <Field label="Branch">
+                <input
+                  style={{ fontFamily: "var(--font-mono)" }}
+                  placeholder="release/next"
+                  value={branch}
+                  spellCheck={false}
+                  onChange={(event) => setBranch(event.target.value)}
+                />
+              </Field>
+              <Button type="submit" disabled={wanted === "" || adding}>
+                add
+              </Button>
+              <Button type="button" onClick={cancel}>
+                cancel
+              </Button>
+              <Receipt stamp={writes.stamp("+")} />
+            </div>
+            {/*
+              No page copy for `unusable_branch`: its detail says which part of the spelling was refused
+              — an empty name, a leading dash, whitespace — and that is what somebody has to fix.
+            */}
+            <RowFailure error={writes.failure("+")} sentences={TARGET_SENTENCES} />
+          </Inset>
+        </form>
+      )}
     </div>
   );
 }

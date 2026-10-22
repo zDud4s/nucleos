@@ -14,11 +14,8 @@ import { clockText } from "../lib/when";
 import { ErrorNote, Section, StaleNote, StatCard } from "../ui";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
-import { DeleteFolder } from "./DeleteFolder";
-import { LeaveRoster } from "./LeaveRoster";
 import { Occupancy } from "./Occupancy";
 import { OwnedFiles } from "./OwnedFiles";
-import { Settings } from "./Settings";
 import { TestsMap } from "./TestsMap";
 import { WorkflowSummary } from "./Workflows";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
@@ -92,17 +89,18 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
         staleSince={projects.isError && projects.data !== undefined ? projects.dataUpdatedAt : null}
       />
 
-      <Section label="Readings">
+      {/*
+        The title line carries the reading's age and the way to the trends. Four numbers answer
+        "how is it now"; the trend behind them is a mode of its own, so the link is not a fifth
+        card, and it is there whether this read worked or not: the trends come from another route.
+      */}
+      <section aria-label="Readings" className="ui-section">
+        <div className="ws-section-head">
+          <h2 className="ui-section-title">Readings</h2>
+          <ReadingsAside projectId={projectId} />
+        </div>
         <Readings projectId={projectId} />
-        {/*
-          Four numbers answer "how is it now"; the trend behind them is a mode of its own. A link
-          and not a fifth card: it changes nothing here, and it is there whether this read worked or
-          not, because the trends come from a different route.
-        */}
-        <Link to={`/projects/${projectId}/analytics`} className="ws-trends">
-          See trends
-        </Link>
-      </Section>
+      </section>
 
       <Section label="Occupancy">
         <Occupancy projectId={projectId} />
@@ -110,15 +108,6 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
 
       <Section label="Branches">
         <Branches projectId={projectId} />
-      </Section>
-
-      {/*
-        The one live control on the page, straight after what is happening: whether this project
-        acts on its own. It used to sit below Workflow and Commands, two lines that are nearly
-        always "none", so the switch that matters most was the seventh thing down.
-      */}
-      <Section label="Settings">
-        <Settings projectId={projectId} />
       </Section>
 
       {/*
@@ -146,26 +135,6 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
           </Section>
         </div>
       </div>
-
-      {/*
-        Last, and below everything, because it holds the only thing on this page that cannot be
-        undone. Here rather than on the roster on purpose: that page compares projects, and a control
-        that removes one has no business beside the cards that describe it. Somebody reaching this has
-        already opened the project they mean and scrolled past everything it is doing.
-      */}
-      <Section label="Leaving">
-        {/*
-          The reversible exit first, and only over a roster this page can vouch for: removing on a
-          stale read would act on a project nobody can say is still there, and the panel needs the
-          recorded root to say where the folder stays. Gone rather than disabled, as the roster did.
-        */}
-        <div className="ws-group ws-leaving">
-          {project !== undefined && !(projects.isError && projects.data !== undefined) && (
-            <LeaveRoster projectId={projectId} projectRoot={project.project_root} />
-          )}
-          <DeleteFolder projectId={projectId} />
-        </div>
-      </Section>
     </div>
   );
 }
@@ -297,20 +266,40 @@ function Readings({ projectId }: { projectId: string }) {
   }
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="ws-metrics">
-        <GateReading data={data} />
-        <DeliveredReading data={data} />
-        <CostReading data={data} />
-        <EfficiencyReading data={data} />
-      </div>
+    <div className="ws-metrics">
+      <GateReading data={data} />
+      <DeliveredReading data={data} />
+      <CostReading data={data} />
+      <EfficiencyReading data={data} />
+    </div>
+  );
+}
+
+/**
+ * The Readings title line's trailing side: when the numbers were read, and the way to the trends.
+ *
+ * The age is read once when the mode opens and not polled, so "now" is exactly what it cannot
+ * claim; a read that failed after a good one dates the numbers instead. The link is a way to
+ * another route, so it stays whether or not this read worked.
+ */
+function ReadingsAside({ projectId }: { projectId: string }) {
+  const readings = useProjectReadings(projectId);
+  const data = readings.data;
+  // The sentence comes only from an answer: while the read is pending, or refused with nothing to
+  // show, no time is claimed for a read that has not happened.
+
+  return (
+    <div>
       {data === undefined ? null : readings.isError ? (
         <StaleNote dataUpdatedAt={readings.dataUpdatedAt} />
       ) : (
         <p className="text-xs text-text-faint">
-          Last {data.window_days} days, read at {clockText(readings.dataUpdatedAt)}.
+          {`Last ${data.window_days} days, read at ${clockText(readings.dataUpdatedAt)}.`}
         </p>
       )}
+      <Link to={`/projects/${projectId}/analytics`} className="ws-trends-link">
+        See trends
+      </Link>
     </div>
   );
 }

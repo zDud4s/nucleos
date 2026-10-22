@@ -1,10 +1,19 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { MoreHorizontal } from "lucide-react";
 import { AnalyticsView } from "../analytics/AnalyticsView";
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
-import { Count, CopyButton, ErrorNote, PageHeader, QuietTips, StateBadge, Tip } from "../ui";
+import { openInVscode } from "../lib/vscode";
+import { Button, Count, CopyButton, ErrorNote, PageHeader, QuietTips, StateBadge, Tip } from "../ui";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../ui/vendor/dropdown-menu";
+import { LeavingDialog, type Leaving } from "./LeavingDialog";
 import { ModeState } from "./ModeState";
 import { ModeMap } from "./ModeMap";
 import { ModeCode } from "./ModeCode";
@@ -46,8 +55,7 @@ import "../pages/workspace.css";
  * It was called "GitHub" until 2026-09-23, after its first section. Only that
  * section is about GitHub; the other four govern the queue, the worktrees'
  * shell and where work lands, which a project that never touches GitHub has
- * too. The mode and ceiling in State › Settings are the same subject and are
- * meant to move here.
+ * too. The mode and ceiling now live here too, in Permissions (Autonomy).
  *
  * **Analytics is the sixth (2026-10-17), on the same rule.** Its subject is this project over
  * time — cost, tokens, gate results and deliveries by UTC day — which none of the others read:
@@ -255,56 +263,148 @@ export function Workspace() {
   const projectId = params.projectId ?? "";
   const mode = normaliseMode(params.view);
 
+  const [editorFailed, setEditorFailed] = useState(false);
+  const [leaving, setLeaving] = useState<Leaving | null>(null);
+  const more = useRef<HTMLButtonElement>(null);
   const projects = useProjects();
   const project = projects.data?.find((row) => row.project_id === projectId);
   const holding = useHolding(projectId);
   useModeShortcuts(projectId);
+  // A failure belongs to the project it happened on.
+  useEffect(() => {
+    setEditorFailed(false);
+  }, [projectId]);
   const mac = onMac();
   // Known to be missing only once the roster has answered; until then the shell is drawn as usual.
   const missing = projects.data !== undefined && project === undefined;
+  // Removing on a stale read would act on a project nobody can say is still there.
+  const canLeaveRoster = project !== undefined && !(projects.isError && projects.data !== undefined);
   const folder = project?.project_root ?? null;
   // The folder's name reads better than the slug; the slug stays beside it when they differ.
   const name = folder === null ? projectId : (folder.split(/[\\/]/).filter(Boolean).pop() ?? projectId);
 
+  // The title and the actions are drawn together, once the roster has answered. Until then the page
+  // has no heading: a bare-slug title that the folder's name replaces a tick later is a header that
+  // is up before its actions, and a reader (or a test waiting on the heading) takes it for done.
+  const loadingHeader = (
+    <header className="ui-page-header ui-page-header-unruled">
+      <div className="ui-page-header-text">
+        {/* Holds the title line's height, so the tabs below do not jump when the real h1 arrives.
+            Not a heading: the first h1 on the page must be the project's own. */}
+        <p className="ui-page-title invisible" aria-hidden="true">
+          &nbsp;
+        </p>
+        <p role="status" className="ui-page-headline">
+          Loading project…
+        </p>
+      </div>
+    </header>
+  );
+
   return (
     <>
-      <PageHeader
-        title={name}
-        /*
-          The mode through the one non-collapsing map, never a literal: off,
-          shadow and active are three different promises about what happens here
-          without being asked, and picking a tone locally is how that distinction
-          starts to drift page by page. The folder is the other half of the
-          sentence — what this project IS on this disk — and both belong on the
-          header's one derived line rather than beside the name as a second title.
-        */
-        headline={
-          <span className="inline-flex min-w-0 max-w-full items-baseline gap-2">
-            {projects.isPending ? (
-              <span role="status">Loading project…</span>
-            ) : missing ? (
-              <span>Not found</span>
-            ) : (
+      {projects.isPending ? (
+        loadingHeader
+      ) : (
+        <PageHeader
+          title={name}
+          // The tab strip below carries the page's one rule.
+          ruled={false}
+          actions={
+            missing ? undefined : (
               <>
-                {/* "shadow" alone does not say shadow of what. */}
-                <span>Autopilot</span>
-                <StateBadge domain="autopilot" state={project?.mode} />
-                {name !== projectId ? <span className="font-mono text-xs">{projectId}</span> : null}
-                {folder === null ? (
-                  <span>no folder named</span>
-                ) : (
-                  <>
-                    <span className="truncate font-mono text-xs" title={folder}>
-                      {folder}
-                    </span>
-                    <CopyButton value={folder} label="project folder" spoken={false} />
-                  </>
+                {folder === null ? null : (
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      setEditorFailed(false);
+                      openInVscode(folder, null).catch(() => setEditorFailed(true));
+                    }}
+                  >
+                    Open in VS Code
+                  </Button>
                 )}
+                <Link
+                  to="/projects/$projectId/inspect/$view"
+                  params={{ projectId, view: "browse" }}
+                  className="ui-button ui-button-ghost"
+                >
+                  Browse files
+                </Link>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      ref={more}
+                      type="button"
+                      className="ui-icon-button"
+                      aria-label="More actions"
+                      title="More actions"
+                    >
+                      <MoreHorizontal className="ui-icon-button-glyph" strokeWidth={1.5} aria-hidden="true" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    {canLeaveRoster ? (
+                      <DropdownMenuItem onSelect={() => setLeaving("remove")}>
+                        Remove from NucleOS…
+                      </DropdownMenuItem>
+                    ) : null}
+                    <DropdownMenuItem variant="destructive" onSelect={() => setLeaving("delete")}>
+                      Delete this folder…
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </>
-            )}
-          </span>
-        }
+            )
+          }
+          /*
+            The mode through the one non-collapsing map, never a literal: off,
+            shadow and active are three different promises about what happens here
+            without being asked, and picking a tone locally is how that distinction
+            starts to drift page by page. The folder is the other half of the
+            sentence — what this project IS on this disk — and both belong on the
+            header's one derived line rather than beside the name as a second title.
+          */
+          headline={
+            <span className="inline-flex min-w-0 max-w-full items-baseline gap-2">
+              {missing ? (
+                <span>Not found</span>
+              ) : (
+                <>
+                  {/* "shadow" alone does not say shadow of what. */}
+                  <span>Autopilot</span>
+                  <Link to="/projects/$projectId/authority" params={{ projectId }}>
+                    <StateBadge domain="autopilot" state={project?.mode} />
+                  </Link>
+                  {name !== projectId ? <span className="font-mono text-xs">{projectId}</span> : null}
+                  {folder === null ? (
+                    <span>no folder named</span>
+                  ) : (
+                    <>
+                      <span className="truncate font-mono text-xs" title={folder}>
+                        {folder}
+                      </span>
+                      <CopyButton value={folder} label="project folder" spoken={false} />
+                    </>
+                  )}
+                </>
+              )}
+            </span>
+          }
+        />
+      )}
+
+      <LeavingDialog
+        leaving={leaving}
+        projectId={projectId}
+        projectRoot={project?.project_root ?? null}
+        onClose={() => setLeaving(null)}
+        returnFocus={() => more.current?.focus()}
       />
+
+      {editorFailed ? (
+        <ErrorNote>Could not open VS Code: nothing on this machine answers vscode://.</ErrorNote>
+      ) : null}
 
       {projects.isError && projects.data === undefined ? (
         <ErrorNote onRetry={() => void projects.refetch()}>
@@ -340,7 +440,7 @@ export function Workspace() {
             does not fit here: it is an inset rule on the LEADING edge, and the mark a tab strip
             needs is under the label.
           */}
-          <nav aria-label="Project modes" className="ui-tab-list ws-tabs mb-6">
+          <nav aria-label="Project modes" className="ui-tab-list ws-tabs">
             {MODES.map((candidate, index) => {
               const holds = holding[candidate];
               // Quiet is for a door somebody has not walked through. The tab they are standing in keeps

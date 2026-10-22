@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 
 import { isApiRefusal } from "../data/client";
 import { useDeleteProjectFolder, useProjectFolder } from "../data/projects";
 import { heldBy } from "../data/roster";
 import { Button } from "../ui/Button";
 import { Field } from "../ui/Field";
-import { Modal } from "../ui/Modal";
 import { RefusalNote } from "../ui/RefusalNote";
 import { DAEMON_NAME } from "../copy";
 
@@ -14,10 +13,11 @@ import { DAEMON_NAME } from "../copy";
  *
  * **The only irreversible thing this app does, and everything about where it sits says so.** It is
  * not on the roster: that page compares projects, and a control that destroys one has no business
- * sitting in a column beside three that describe it. It is at the foot of the project's own State
- * page, reached only by somebody who is already inside the project they mean. `LeaveRoster`, the
- * reversible exit, sits just above it for the same reason, and the two are not one control with a
- * checkbox because only one of them can be undone.
+ * sitting in a column beside three that describe it. It is the panel the workspace header's
+ * `More actions` menu opens in the shared `Modal` (through `LeavingDialog`, which owns the open
+ * state and the focus), reached only by somebody who is already inside the project they mean.
+ * `LeaveRoster`, the reversible exit, opens from the same menu for the same reason, and the two
+ * are not one control with a checkbox because only one of them can be undone.
  *
  * **Typing the name is the interlock, and it is the only one.** `ConfirmButton`'s arm-then-confirm
  * is the app's interlock for actions whose two labels are all there is to read; this has a path, a
@@ -30,51 +30,39 @@ import { DAEMON_NAME } from "../copy";
  */
 export interface DeleteFolderProps {
   projectId: string;
+  /** Stands the panel down (cancel, Escape); the dialog around it owns the rest of the closing. */
+  onClose: () => void;
+  /** Told whether the request is in flight, so the dialog can refuse to close over it. */
+  onBusyChange?: (busy: boolean) => void;
+  /** The warning paragraph, handed to the dialog as the element focus lands on when it opens. */
+  warningRef?: RefObject<HTMLParagraphElement | null>;
 }
 
-export function DeleteFolder({ projectId }: DeleteFolderProps) {
-  const [open, setOpen] = useState(false);
+export function DeleteFolder({ projectId, onClose, onBusyChange, warningRef }: DeleteFolderProps) {
   const [typed, setTyped] = useState("");
   const [forget, setForget] = useState(false);
-  // Fetched only once the control is open: two git subprocesses and a `stat` are not something a
-  // page runs to draw a button nobody pressed.
-  const folder = useProjectFolder(projectId, open);
+  // The panel only exists while its dialog is open, so the folder is read as soon as it mounts:
+  // two git subprocesses and a `stat` are not something a page runs to draw a menu item nobody pressed.
+  const folder = useProjectFolder(projectId, true);
   const deletion = useDeleteProjectFolder();
 
-  /*
-    Where focus goes when the control opens and when it closes.
+  // Local ref kept when the dialog passes none; both are set through one callback ref.
+  const localWarning = useRef<HTMLParagraphElement | null>(null);
+  const setWarning = (node: HTMLParagraphElement | null) => {
+    localWarning.current = node;
+    if (warningRef !== undefined) warningRef.current = node;
+  };
 
-    Both gestures unmount the element that had focus: "delete this folder…" is replaced by the
-    panel, and "cancel" takes the panel away. Left alone, focus fell to `<body>` in the middle of
-    the one irreversible thing this app does, and a keyboard user had to find their place again
-    from the top of the page. So opening hands focus to the warning — the reading comes first, and
-    it is the first thing a screen reader should say — and closing hands it back to the button that
-    opened it, which is the standard the project switcher already keeps.
-
-    `settle` says which of the two just happened. Neither fires on first paint: a page that
-    stole focus into its last section on arrival would be the opposite bug.
-  */
-  const warning = useRef<HTMLParagraphElement>(null);
-  const trigger = useRef<HTMLDivElement>(null);
-  const [settle, setSettle] = useState<"opened" | "closed" | null>(null);
-
+  const pending = deletion.isPending;
   useEffect(() => {
-    if (settle === "opened") warning.current?.focus();
-    if (settle === "closed") trigger.current?.querySelector("button")?.focus();
-    if (settle !== null) setSettle(null);
-  }, [settle]);
-
-  function show() {
-    setOpen(true);
-    setSettle("opened");
-  }
+    onBusyChange?.(pending);
+  }, [pending, onBusyChange]);
 
   function close() {
-    setOpen(false);
     setTyped("");
     setForget(false);
     deletion.reset();
-    setSettle("closed");
+    onClose();
   }
 
   /*
@@ -87,20 +75,6 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
     close();
   }
 
-  const row = (
-    /* What it does on the leading side, the control on the trailing one, outlined in danger so
-         the permanent exit never looks like the reversible one above it. Both were underlined
-         words, and the only thing telling them apart was a sentence under the wrong one. */
-    <div ref={trigger} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-      <p className="text-sm text-text-muted">
-        Deletes the folder and everything in it. This is permanent.
-      </p>
-      <Button variant="danger" onClick={show}>
-        delete this folder…
-      </Button>
-    </div>
-  );
-
   const reading = folder.data;
   const held = reading === undefined ? null : heldBy(reading.holds);
   const named = reading?.root ?? projectId;
@@ -109,128 +83,113 @@ export function DeleteFolder({ projectId }: DeleteFolderProps) {
   const armed = typed === projectId && stopped === null && held === null && !gone;
 
   /*
-    The panel opens as a modal over a dimmed page, the owner's call: the one irreversible act in the
-    app should take the page away until it is answered, not unfold at the foot of it. The group keeps
-    its name and its own Escape; the modal's Escape, scrim and close button go through `close` too,
-    except while the request is in flight.
+    The panel is drawn inside `LeavingDialog`'s modal over a dimmed page, the owner's call: the one
+    irreversible act in the app should take the page away until it is answered. The group keeps its
+    name and its own Escape; the modal's Escape, scrim and close button are guarded by the dialog
+    while the request is in flight.
   */
   return (
-    <>
-      {row}
-      <Modal
-        open={open}
-        onOpenChange={(next) => {
-          if (!next && !deletion.isPending) close();
-        }}
-        title="Delete this folder"
-        size="md"
-        initialFocus={warning}
+    <div
+      role="group"
+      aria-label={`Delete ${projectId}'s folder`}
+      onKeyDown={onKeyDown}
+      className="flex flex-col gap-4"
+    >
+      {/* `tabIndex={-1}`: a target for the focus the opening hands over, not a tab stop. No
+          ring: inside the modal it was clipped by the body's edge, and the dialog itself
+          already says where focus is — the reader hears this sentence first. Inline,
+          because the ring in `base.css` is unlayered on purpose and beats any utility. */}
+      <p
+        ref={setWarning}
+        tabIndex={-1}
+        style={{ outline: "none" }}
+        className="text-sm leading-relaxed text-text"
       >
-        {open && (
-          <div
-            role="group"
-            aria-label={`Delete ${projectId}'s folder`}
-            onKeyDown={onKeyDown}
-            className="flex flex-col gap-4"
-          >
-            {/* `tabIndex={-1}`: a target for the focus the opening hands over, not a tab stop. No
-                ring: inside the modal it was clipped by the body's edge, and the dialog itself
-                already says where focus is — the reader hears this sentence first. Inline,
-                because the ring in `base.css` is unlayered on purpose and beats any utility. */}
-            <p
-              ref={warning}
-              tabIndex={-1}
-              style={{ outline: "none" }}
-              className="text-sm leading-relaxed text-text"
-            >
-              This deletes <code className="font-mono text-xs">{named}</code> and everything in it,
-              permanently, and takes the project off the roster. Nothing here can undo it.
-            </p>
+        This deletes <code className="font-mono text-xs">{named}</code> and everything in it,
+        permanently, and takes the project off the roster. Nothing here can undo it.
+      </p>
 
-            {folder.isError ? (
-              <p className="text-xs text-text-faint">
-                the {DAEMON_NAME} did not say what is in that folder: nothing has been deleted
-              </p>
-            ) : reading === undefined ? (
-              <p className="text-xs text-text-faint">reading what is in that folder…</p>
-            ) : (
-              <Standing reading={reading} />
-            )}
+      {folder.isError ? (
+        <p className="text-xs text-text-faint">
+          the {DAEMON_NAME} did not say what is in that folder: nothing has been deleted
+        </p>
+      ) : reading === undefined ? (
+        <p className="text-xs text-text-faint">reading what is in that folder…</p>
+      ) : (
+        <Standing reading={reading} />
+      )}
 
-            {/*
-        The same checkbox the remove control above offers, and the same default. Deleting the
-        folder does not imply forgetting what the project did: the two are separate losses, and the
-        owner's standing decision is that history stays unless somebody says otherwise.
+      {/*
+        The same checkbox the remove panel offers, and the same default. Deleting the folder does
+        not imply forgetting what the project did: the two are separate losses, and the owner's
+        standing decision is that history stays unless somebody says otherwise.
       */}
-            <label className="ws-dialog-option">
-              <input
-                type="checkbox"
-                checked={forget}
-                onChange={(event) => setForget(event.target.checked)}
-              />
-              <span className="flex flex-col gap-0.5">
-                <span className="font-medium text-text">Forget its history too</span>
-                <span>
-                  Its runs, proposals and stamps. Left unticked they stay in the {DAEMON_NAME}, which is
-                  what happens by default.
-                </span>
-              </span>
-            </label>
+      <label className="ws-dialog-option">
+        <input
+          type="checkbox"
+          checked={forget}
+          onChange={(event) => setForget(event.target.checked)}
+        />
+        <span className="flex flex-col gap-0.5">
+          <span className="font-medium text-text">Forget its history too</span>
+          <span>
+            Its runs, proposals and stamps. Left unticked they stay in the {DAEMON_NAME}, which is
+            what happens by default.
+          </span>
+        </span>
+      </label>
 
-            {deletion.isError &&
-              (isApiRefusal(deletion.error) ? (
-                <RefusalNote
-                  refusal={deletion.error}
-                  sentences={{
-                    kill_switch: "the kill switch is engaged: nothing was deleted",
-                    in_flight: "work is still in flight here: nothing was deleted",
-                    not_registered: `${projectId} is already off the roster, and its folder was not touched`,
-                    not_found: `${projectId} is already off the roster, and its folder was not touched`,
-                  }}
-                />
-              ) : (
-                <p className="text-xs text-text-faint">
-                  the {DAEMON_NAME} gave no reply: nothing was deleted
-                </p>
-              ))}
+      {deletion.isError &&
+        (isApiRefusal(deletion.error) ? (
+          <RefusalNote
+            refusal={deletion.error}
+            sentences={{
+              kill_switch: "the kill switch is engaged: nothing was deleted",
+              in_flight: "work is still in flight here: nothing was deleted",
+              not_registered: `${projectId} is already off the roster, and its folder was not touched`,
+              not_found: `${projectId} is already off the roster, and its folder was not touched`,
+            }}
+          />
+        ) : (
+          <p className="text-xs text-text-faint">
+            the {DAEMON_NAME} gave no reply: nothing was deleted
+          </p>
+        ))}
 
-            {/*
-              The instruction is drawn here, in the ink the id needs, and the field's own label is
-              hidden: `Field` sets its label in capitals, and the id has to be typed exactly.
-            */}
-            <div className="flex flex-col gap-1.5 text-sm text-text-muted">
-              <span aria-hidden="true">
-                Type <code className="font-mono text-xs text-text">{projectId}</code> to confirm
-              </span>
-              <Field label={`Type ${projectId} to confirm`} labelHidden>
-                <input
-                  type="text"
-                  value={typed}
-                  spellCheck={false}
-                  autoComplete="off"
-                  onChange={(event) => setTyped(event.target.value)}
-                  className="font-mono!"
-                />
-              </Field>
-            </div>
+      {/*
+        The instruction is drawn here, in the ink the id needs, and the field's own label is
+        hidden: `Field` sets its label in capitals, and the id has to be typed exactly.
+      */}
+      <div className="flex flex-col gap-1.5 text-sm text-text-muted">
+        <span aria-hidden="true">
+          Type <code className="font-mono text-xs text-text">{projectId}</code> to confirm
+        </span>
+        <Field label={`Type ${projectId} to confirm`} labelHidden>
+          <input
+            type="text"
+            value={typed}
+            spellCheck={false}
+            autoComplete="off"
+            onChange={(event) => setTyped(event.target.value)}
+            className="font-mono!"
+          />
+        </Field>
+      </div>
 
-            {/* The modal's answer row: bottom edge, right-aligned, the act last. */}
-            <div className="ws-dialog-actions">
-              <Button variant="ghost" onClick={close}>
-                cancel
-              </Button>
-              <Button
-                variant="danger-solid"
-                disabled={!armed || deletion.isPending}
-                onClick={() => deletion.mutate({ projectId, forgetHistory: forget })}
-              >
-                {deletion.isPending ? "deleting…" : "delete the folder"}
-              </Button>
-            </div>
-          </div>
-        )}
-      </Modal>
-    </>
+      {/* The modal's answer row: bottom edge, right-aligned, the act last. */}
+      <div className="ws-dialog-actions">
+        <Button variant="ghost" onClick={close}>
+          cancel
+        </Button>
+        <Button
+          variant="danger-solid"
+          disabled={!armed || deletion.isPending}
+          onClick={() => deletion.mutate({ projectId, forgetHistory: forget })}
+        >
+          {deletion.isPending ? "deleting…" : "delete the folder"}
+        </Button>
+      </div>
+    </div>
   );
 }
 

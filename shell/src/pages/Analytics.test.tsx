@@ -38,4 +38,29 @@ describe("the Analytics page", () => {
     await renderApp({ initialPath: "/analytics" });
     expect(await screen.findByRole("region", { name: "Quota" })).toBeTruthy();
   });
+
+  it("opens on the section the address names", async () => {
+    await renderApp({ initialPath: "/analytics?section=pipeline" });
+    const pipeline = await screen.findByRole("button", { name: "Pipeline" });
+    expect(pipeline.getAttribute("aria-pressed")).toBe("true");
+    expect(await screen.findByRole("region", { name: "Pipeline" })).toBeTruthy();
+  });
+
+  it("falls back to the summary for a section it does not know", async () => {
+    await renderApp({ initialPath: "/analytics?section=bogus" });
+    const summary = await screen.findByRole("button", { name: "Summary" });
+    expect(summary.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("keeps the section in the address when the window changes", async () => {
+    const { router } = await renderApp({ initialPath: "/analytics?section=pipeline&days=90" });
+    fireEvent.click(await screen.findByRole("button", { name: "7 days" }));
+    await waitFor(() => expect(router.state.location.search).toEqual({ section: "pipeline", days: 7 }));
+  });
+
+  it("keeps the window in the address when the section changes", async () => {
+    const { router } = await renderApp({ initialPath: "/analytics?section=pipeline&days=90" });
+    fireEvent.click(await screen.findByRole("button", { name: "Development time" }));
+    await waitFor(() => expect(router.state.location.search).toEqual({ days: 90, section: "devtime" }));
+  });
 });

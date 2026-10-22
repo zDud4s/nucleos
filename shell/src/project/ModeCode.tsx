@@ -112,13 +112,15 @@ export function ModeCode({ projectId, run, onPickRun }: ModeCodeProps) {
       left here is what a person needs once they have pressed anyway.
     */
     return (
-      <Teach title="Nothing to review">
-        <p>
-          This mode reads a run&rsquo;s worktree. When one is working here, its changed files appear
-          on the left, and the whole repository stays where it is, in the editor.
-        </p>
-        <InspectorLink projectId={projectId} />
-      </Teach>
+      <div className="ws-teach">
+        <Teach title="Nothing to review">
+          <p>
+            This mode reads a run&rsquo;s worktree. When one is working here, its changed files appear
+            on the left, and the whole repository stays where it is, in the editor.
+          </p>
+          <InspectorLink projectId={projectId} />
+        </Teach>
+      </div>
     );
   }
 

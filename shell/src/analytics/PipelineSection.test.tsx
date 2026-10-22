@@ -17,7 +17,7 @@ beforeEach(() => {
 });
 
 /** Mount the whole view (the section is mounted in it); any path starting with a `failing` prefix throws. */
-function mount(state: DaemonState, failing: Set<string> = new Set()) {
+async function mount(state: DaemonState, failing: Set<string> = new Set()) {
   const answer = daemonFetch(state);
   daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
     for (const prefix of failing) {
@@ -25,7 +25,10 @@ function mount(state: DaemonState, failing: Set<string> = new Set()) {
     }
     return answer(path, init);
   });
-  return renderWithRouter(<AnalyticsView />);
+  const rendered = await renderWithRouter(<AnalyticsView />);
+  // The view shows one section at a time and opens on Summary: pick the Pipeline.
+  fireEvent.click(await screen.findByRole("button", { name: "Pipeline" }));
+  return rendered;
 }
 
 const withPipeline = (analyticsPipeline: ReturnType<typeof pipelineReport>) =>
@@ -149,8 +152,9 @@ describe("PipelineSection", () => {
     await mount(withPipeline(busyReport()), new Set(["/analytics/pipeline"]));
     expect(await screen.findByText("Could not read the pipeline: the background service may be stopped.")).toBeTruthy();
     expect(screen.getAllByText("Could not read the pipeline: the background service may be stopped.")).toHaveLength(1);
-    // F1's readout above it is not taken down.
-    expect(await screen.findByRole("region", { name: "Spend per day" })).toBeTruthy();
+    // The chosen section stays up; the Summary's readout is unmounted (spec 3.3), not taken down.
+    expect(await screen.findByRole("region", { name: "Pipeline" })).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Spend per day" })).toBeNull();
   });
 
   it("opens the panel of the card clicked, one at a time, and lists what each holds", async () => {

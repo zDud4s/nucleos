@@ -1,4 +1,7 @@
 // §spec workspace-de-projeto
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -17,10 +20,15 @@ import {
 } from "../test/harness";
 import { ApiRefusal } from "../data/client";
 import type { ProjectReadings } from "../data/project-readings";
+import { openInVscode } from "../lib/vscode";
 import { ModeState } from "./ModeState";
 import { normaliseMode } from "./Workspace";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("../lib/vscode", async (original) => ({
+  ...(await original<typeof import("../lib/vscode")>()),
+  openInVscode: vi.fn(() => Promise.resolve()),
+}));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
@@ -270,15 +278,10 @@ describe("the project workspace", () => {
       "Readings",
       "Occupancy",
       "Branches",
-      "Settings",
       "Workflow",
       "Commands",
       "Files the app owns",
       "Test map",
-      // Last, because it is the only thing on this page that cannot be undone — and present in
-      // both states, like everything else here, because the invariant this test defends is that
-      // nothing appears or vanishes when a proposal lands.
-      "Leaving",
     ]);
   });
 
@@ -385,15 +388,10 @@ describe("the project workspace", () => {
       "Readings",
       "Occupancy",
       "Branches",
-      "Settings",
       "Workflow",
       "Commands",
       "Files the app owns",
       "Test map",
-      // Last, because it is the only thing on this page that cannot be undone — and present in
-      // both states, like everything else here, because the invariant this test defends is that
-      // nothing appears or vanishes when a proposal lands.
-      "Leaving",
     ]);
   });
 
@@ -818,6 +816,8 @@ describe("what the app may author", () => {
 });
 
 describe("the settings this app authors", () => {
+  const AUTHORITY = "/projects/nucleos/authority";
+
   function settingsState(overrides: Partial<ReturnType<typeof project>> = {}): DaemonState {
     return daemonState({
       projects: [
@@ -835,7 +835,7 @@ describe("the settings this app authors", () => {
    */
   it("says what the ceiling is holding, and clears it without setting it to zero", async () => {
     const state = settingsState({ wip_limit: 3, open_review_items: 2 });
-    await openState(state);
+    await openState(state, AUTHORITY);
 
     expect(await screen.findByText("2 of 3 taken")).toBeTruthy();
 
@@ -855,6 +855,7 @@ describe("the settings this app authors", () => {
   it("does not offer to let a project act until the núcleo says it has earned it", async () => {
     const locked = await openState(
       settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
+      AUTHORITY,
     );
     const active = await screen.findByRole("button", { name: "Let it act" });
     // Focusable and refused rather than natively disabled: the house pattern, so the reason beside
@@ -871,6 +872,7 @@ describe("the settings this app authors", () => {
         classes_total: 5,
         withheld_classes_ready: 1,
       }),
+      AUTHORITY,
     );
     const earned = await screen.findByRole("button", { name: "Let it act" });
     expect(earned.getAttribute("aria-disabled")).not.toBe("true");
@@ -905,7 +907,7 @@ describe("the settings this app authors", () => {
         },
       ],
     });
-    await openState(state);
+    await openState(state, AUTHORITY);
 
     // A table now, so the class and its tally are separate cells by construction rather than by a
     // margin somebody has to remember: the row header is the class and nothing else.
@@ -939,6 +941,7 @@ describe("the settings this app authors", () => {
         wip_limit: 4,
         open_review_items: 3,
       }),
+      AUTHORITY,
     );
 
     const offer = await screen.findByRole("button", { name: "Let it act" });
@@ -984,6 +987,7 @@ describe("the settings this app authors", () => {
         wip_limit: 4,
         open_review_items: 3,
       }),
+      AUTHORITY,
     );
 
     const offer = await screen.findByRole("button", { name: "Let it act" });
@@ -1013,7 +1017,10 @@ describe("the settings this app authors", () => {
    * (`ui/ModeSwitch`) and the nouns are gone from the controls.
    */
   it("the mode block offers the three verbs", async () => {
-    await openState(settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }));
+    await openState(
+      settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
+      AUTHORITY,
+    );
 
     const group = await screen.findByRole("group", { name: "Autopilot mode" });
     expect(within(group).getByRole("button", { name: "Turn off" })).toBeTruthy();
@@ -1033,7 +1040,7 @@ describe("the settings this app authors", () => {
    * measurement, and the difference is the whole of the never-collapse contract.
    */
   it("says no class was measured rather than saying none cleared", async () => {
-    await openState(settingsState());
+    await openState(settingsState(), AUTHORITY);
     expect(await screen.findByText(/Nothing recorded in shadow yet/)).toBeTruthy();
     expect(screen.getByText(/not the same as a bad one/)).toBeTruthy();
   });
@@ -1383,5 +1390,117 @@ describe("the workspace shell", () => {
 
     fireEvent.keyDown(window, { key: "2", ctrlKey: true, repeat: true });
     expect(screen.getByRole("link", { name: "Overview" }).getAttribute("aria-current")).toBe("page");
+  });
+});
+
+describe("the workspace header", () => {
+  /** The stylesheet the workspace draws with, read as text: jsdom computes no layout. */
+  function workspaceCss(): string {
+    return readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "pages", "workspace.css"),
+      "utf8",
+    );
+  }
+
+  /** Mount the project over a daemon whose project has this folder (or none). */
+  async function openWithRoot(root: string | null) {
+    return openState(
+      daemonState({
+        projects: [project({ project_id: "nucleos", mode: "shadow", project_root: root })],
+      }),
+    );
+  }
+
+  async function headerOf(): Promise<HTMLElement> {
+    const heading = await screen.findByRole("heading", { level: 1 });
+    return heading.closest("header") as HTMLElement;
+  }
+
+  it("the workspace header gives the page one rule, the tab strip's", async () => {
+    await openWithRoot("C:/p");
+    const header = await headerOf();
+    expect(header.classList.contains("ui-page-header")).toBe(true);
+    expect(header.classList.contains("ui-page-header-unruled")).toBe(true);
+    const tabs = await screen.findByRole("navigation", { name: "Project modes" });
+    expect(tabs.classList.contains("ws-tabs")).toBe(true);
+  });
+
+  it("the workspace header offers Open in VS Code and Browse files on a project with a folder", async () => {
+    await openWithRoot("C:/p");
+    const header = await headerOf();
+    expect(within(header).getByRole("button", { name: "Open in VS Code" })).toBeTruthy();
+    expect(within(header).getByRole("link", { name: "Browse files" }).getAttribute("href")).toBe(
+      "/projects/nucleos/inspect/browse",
+    );
+    expect(within(header).getByRole("button", { name: "More actions" })).toBeTruthy();
+  });
+
+  it("the workspace header leaves Open in VS Code out of a project with no folder", async () => {
+    await openWithRoot(null);
+    const header = await headerOf();
+    expect(within(header).queryByRole("button", { name: "Open in VS Code" })).toBeNull();
+    expect(within(header).getByRole("link", { name: "Browse files" })).toBeTruthy();
+    expect(within(header).getByRole("button", { name: "More actions" })).toBeTruthy();
+  });
+
+  it("Open in VS Code opens the project folder", async () => {
+    vi.mocked(openInVscode).mockClear();
+    await openWithRoot("C:/p");
+    const header = await headerOf();
+    fireEvent.click(within(header).getByRole("button", { name: "Open in VS Code" }));
+    await waitFor(() => expect(openInVscode).toHaveBeenCalledWith("C:/p", null));
+  });
+
+  it("the mode badge in the header links to Permissions", async () => {
+    await openWithRoot("C:/p");
+    const header = await headerOf();
+    const links = within(header)
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("href") === "/projects/nucleos/authority");
+    expect(links.some((link) => /shadow/.test(link.textContent ?? ""))).toBe(true);
+  });
+
+  it("the mode tabs stick to the top of the scrolling page", () => {
+    expect(workspaceCss()).toMatch(/\.ws-tabs\s*\{[^}]*position:\s*sticky[^}]*top:\s*0/);
+  });
+
+  it("the more actions menu offers Remove from NucleOS and Delete this folder", async () => {
+    await openWithRoot("C:/p");
+    const header = await headerOf();
+    const trigger = within(header).getByRole("button", { name: "More actions" });
+    fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+    fireEvent.click(trigger);
+    expect(await screen.findByRole("menuitem", { name: "Remove from NucleOS…" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Delete this folder…" })).toBeTruthy();
+  });
+
+  it("Overview holds neither the mode, the ceiling, the action classes nor Leaving", async () => {
+    await openWithRoot("C:/p");
+    await screen.findByRole("region", { name: "Readings" });
+    expect(screen.queryByRole("region", { name: "Settings" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Leaving" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Let it act" })).toBeNull();
+    expect(screen.queryByText("Action classes")).toBeNull();
+  });
+
+  it("Review and Workflows draw their empty state at the same left margin", async () => {
+    const review = await openState(
+      daemonState({ projects: [project({ project_id: "nucleos", mode: "shadow" })] }),
+      "/projects/nucleos/code",
+    );
+    await screen.findByText("Nothing to review");
+    const reviewTeach = review.container.querySelector(".ui-teach") as HTMLElement;
+    expect(reviewTeach.parentElement?.classList.contains("ws-teach")).toBe(true);
+    review.unmount();
+
+    const workflows = await openState(
+      daemonState({ projects: [project({ project_id: "nucleos", mode: "shadow" })] }),
+      "/projects/nucleos/workflows",
+    );
+    await waitFor(() => expect(workflows.container.querySelector(".ui-teach")).not.toBeNull());
+    const workflowsTeach = workflows.container.querySelector(".ui-teach") as HTMLElement;
+    expect(workflowsTeach.parentElement?.classList.contains("ws-teach")).toBe(true);
+
+    expect(workspaceCss()).toMatch(/\.ws-teach\s*>\s*\.ui-teach\s*\{[^}]*padding-inline:\s*0/);
   });
 });

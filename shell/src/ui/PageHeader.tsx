@@ -12,6 +12,11 @@ export interface PageHeaderProps {
   headline?: ReactNode;
   /** The page's own actions, right-aligned. Usually one, occasionally two. */
   actions?: ReactNode;
+  /**
+   * Whether the header draws its own rule underneath. Default true; false drops it because a
+   * tab strip right below the header carries the rule, and two lines would read as a double rule.
+   */
+  ruled?: boolean;
 }
 
 /**
@@ -23,9 +28,9 @@ export interface PageHeaderProps {
  * sentence goes. Keeping the slot in the shared header is what stops it from
  * being omitted on the pages nobody rewrote.
  */
-export function PageHeader({ title, headline, actions }: PageHeaderProps) {
+export function PageHeader({ title, headline, actions, ruled = true }: PageHeaderProps) {
   return (
-    <header className="ui-page-header">
+    <header className={ruled ? "ui-page-header" : "ui-page-header ui-page-header-unruled"}>
       <div className="ui-page-header-text">
         <h1 className="ui-page-title">{title}</h1>
         {headline === undefined ? null : <p className="ui-page-headline">{headline}</p>}

@@ -136,6 +136,77 @@ function shareLabels(name: string): string[] {
     .map((item) => item.querySelector(".ui-share-label")?.textContent ?? "");
 }
 
+/** Pick a section in the `Section` group. */
+function choose(name: "Summary" | "Pipeline" | "Development time") {
+  fireEvent.click(within(screen.getByRole("group", { name: "Section" })).getByRole("button", { name }));
+}
+
+describe("one section at a time", () => {
+  it("offers Summary, Pipeline and Development time, opens on Summary and mounts only that one", async () => {
+    await mount(busy());
+    const group = await screen.findByRole("group", { name: "Section" });
+    expect(within(group).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "Summary",
+      "Pipeline",
+      "Development time",
+    ]);
+    expect(within(group).getByRole("button", { name: "Summary" }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByRole("region", { name: "Pipeline" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Development time" })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Sections" })).toBeNull();
+  });
+
+  it("keeps the section and the window together in the head, with no section nav", async () => {
+    const { container } = await mount(busy());
+    await screen.findByRole("group", { name: "Section" });
+    const head = container.querySelector(".an-head") as HTMLElement;
+    expect(head).toBeTruthy();
+    expect(within(head).getByRole("group", { name: "Section" })).toBeTruthy();
+    expect(within(head).getByRole("group", { name: "Window" })).toBeTruthy();
+    expect(within(head).getByText(/days in UTC/)).toBeTruthy();
+    expect(container.querySelector(".ui-section-nav")).toBeNull();
+  });
+
+  it("swaps the summary for the pipeline and asks only the pipeline's route", async () => {
+    await mount(busy());
+    expect(await screen.findByText("$12.34")).toBeTruthy();
+    choose("Pipeline");
+    expect(await screen.findByRole("region", { name: "Pipeline" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 2, name: "Summary" })).toBeNull();
+    for (const label of ["Spent", "Runs", "Delivered", "Tokens"]) {
+      expect(screen.queryByRole("button", { name: new RegExp(`^${label}`) })).toBeNull();
+    }
+    expect(asked()).toContain("/analytics/pipeline?days=30");
+    expect(asked()).not.toContain("/analytics/devtime?days=30");
+  });
+
+  it("remembers the open card across a trip to another section", async () => {
+    await mount(busy());
+    await screen.findByText("$12.34");
+    fireEvent.click(card("Runs"));
+    choose("Pipeline");
+    await screen.findByRole("region", { name: "Pipeline" });
+    choose("Summary");
+    await screen.findByText("$12.34");
+    expect(card("Runs").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("keeps a project's section choice across a change of window", async () => {
+    await mount(busy("project"), "nucleos");
+    await screen.findByRole("group", { name: "Section" });
+    choose("Development time");
+    await waitFor(() => expect(asked()).toContain("/projects/nucleos/analytics/devtime?days=30"));
+    fireEvent.click(screen.getByRole("button", { name: "7 days" }));
+    await waitFor(() => expect(asked()).toContain("/projects/nucleos/analytics/devtime?days=7"));
+    expect(screen.getByRole("region", { name: "Development time" })).toBeTruthy();
+    expect(
+      within(screen.getByRole("group", { name: "Section" }))
+        .getByRole("button", { name: "Development time" })
+        .getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+});
+
 describe("AnalyticsView, global", () => {
   it("asks the global routes for the default window and draws the cards, the spend chart and the lower row", async () => {
     await mount(busy());
@@ -423,10 +494,10 @@ describe("refused and stale", () => {
     expect(screen.getAllByText(/Loading analytics/).length).toBeGreaterThan(0);
   });
 
-  it("links the three sections and gives the first a heading of its own", async () => {
+  it("offers the three sections as one choice and gives the summary a heading of its own", async () => {
     await mount(busy());
-    const nav = await screen.findByRole("navigation", { name: "Sections" });
-    expect(within(nav).getAllByRole("link").map((link) => link.textContent)).toEqual([
+    const group = await screen.findByRole("group", { name: "Section" });
+    expect(within(group).getAllByRole("button").map((button) => button.textContent)).toEqual([
       "Summary",
       "Pipeline",
       "Development time",
@@ -448,8 +519,9 @@ describe("refused and stale", () => {
 });
 
 describe("pipeline", () => {
-  it("draws the pipeline section under the readout, sharing the window", async () => {
+  it("draws the pipeline section once chosen, sharing the window", async () => {
     await mount(busy());
+    await choose("Pipeline");
     expect(await screen.findByRole("region", { name: "Pipeline" })).toBeTruthy();
     expect(asked()).toContain("/analytics/pipeline?days=30");
     fireEvent.click(screen.getByRole("button", { name: "7 days" }));
@@ -458,21 +530,27 @@ describe("pipeline", () => {
 
   it("asks a project's pipeline in a project's view", async () => {
     await mount(busy("project"), "nucleos");
+    await choose("Pipeline");
     await screen.findByRole("region", { name: "Pipeline" });
     expect(asked()).toContain("/projects/nucleos/analytics/pipeline?days=30");
   });
 });
 
 describe("development time", () => {
-  it("shows development time under the run analytics, and survives their failure", async () => {
+  it("shows development time on its own, and survives the failure of the run analytics", async () => {
     await mount(busy(), undefined, new Set(["/analytics?", "/analytics/quota"]));
+    // Proves the run analytics really failed before the section is left.
+    await screen.findByText("Could not read analytics: the background service may be stopped.");
+    await choose("Development time");
     expect(await screen.findByRole("region", { name: "Development time" })).toBeTruthy();
-    expect(await screen.findByText("Could not read analytics: the background service may be stopped.")).toBeTruthy();
+    // Spec 3.3: the Summary is unmounted, so its failure note is not drawn under another section.
+    expect(screen.queryByText("Could not read analytics: the background service may be stopped.")).toBeNull();
     expect(asked().some((path) => path.startsWith("/analytics/devtime?days=30"))).toBe(true);
   });
 
   it("asks a project's development time in a project's view", async () => {
     await mount(busy("project"), "nucleos");
+    await choose("Development time");
     await screen.findByRole("region", { name: "Development time" });
     expect(asked()).toContain("/projects/nucleos/analytics/devtime?days=30");
   });

@@ -467,7 +467,8 @@ function Classes({ projectId, project }: { projectId: string; project: ProjectSu
             {project.classes_ready} of {project.classes_total}{" "}
             {project.classes_total === 1 ? "class clears" : "classes clear"} the bar.
           </p>
-          <div className="max-w-xl">
+          {/* Full width: the card is the measure, and a narrower table left half of it empty. */}
+          <div className="w-full">
             <Table label="Shadow decisions by action class">
               <thead>
                 <tr>
