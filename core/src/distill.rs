@@ -164,23 +164,21 @@ pub async fn enqueue_answered_in(
     if exists.is_none() {
         return Ok(false);
     }
-    let pending: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM distill_queue WHERE job_id = ? AND status = ? LIMIT 1",
-    )
-    .bind(job_id)
-    .bind(STATUS_PENDING)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let pending: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM distill_queue WHERE job_id = ? AND status = ? LIMIT 1")
+            .bind(job_id)
+            .bind(STATUS_PENDING)
+            .fetch_optional(&mut *conn)
+            .await?;
     if pending.is_some() {
         return Ok(true);
     }
-    let used: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM distill_queue WHERE job_id = ? AND cause = ?",
-    )
-    .bind(job_id)
-    .bind(Cause::OwnerAnswered.as_str())
-    .fetch_one(&mut *conn)
-    .await?;
+    let used: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue WHERE job_id = ? AND cause = ?")
+            .bind(job_id)
+            .bind(Cause::OwnerAnswered.as_str())
+            .fetch_one(&mut *conn)
+            .await?;
     if used >= MAX_REQUEUES_PER_JOB {
         return Ok(false);
     }
@@ -982,7 +980,9 @@ mod tests {
 
     async fn answered(pool: &SqlitePool, job: i64, note: i64) -> bool {
         let mut conn = pool.acquire().await.unwrap();
-        super::enqueue_answered_in(&mut conn, job, note).await.unwrap()
+        super::enqueue_answered_in(&mut conn, job, note)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

@@ -60,10 +60,20 @@ async fn meta(pool: &SqlitePool, key: &str) -> Option<String> {
 /// Days a request stays answerable. `0` turns requests off. Without the new key the old
 /// `distiller.capture_wait_minutes` is read as a fallback: `0` stays off, any other value is the default.
 pub async fn answer_days(pool: &SqlitePool) -> i64 {
-    if let Some(days) = meta(pool, ANSWER_DAYS_KEY).await.and_then(|v| v.trim().parse::<i64>().ok()) {
-        return if (0..=MAX_ANSWER_DAYS).contains(&days) { days } else { DEFAULT_ANSWER_DAYS };
+    if let Some(days) = meta(pool, ANSWER_DAYS_KEY)
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        return if (0..=MAX_ANSWER_DAYS).contains(&days) {
+            days
+        } else {
+            DEFAULT_ANSWER_DAYS
+        };
     }
-    match meta(pool, OLD_WAIT_KEY).await.and_then(|v| v.trim().parse::<i64>().ok()) {
+    match meta(pool, OLD_WAIT_KEY)
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
         Some(0) => 0,
         _ => DEFAULT_ANSWER_DAYS,
     }
@@ -111,7 +121,10 @@ pub async fn set_config(
         return Err(ConfigError::OutOfRange);
     }
     let mut tx = pool.begin().await?;
-    for (key, value) in [(ANSWER_DAYS_KEY, answer_days), (DIGEST_HOUR_KEY, digest_hour)] {
+    for (key, value) in [
+        (ANSWER_DAYS_KEY, answer_days),
+        (DIGEST_HOUR_KEY, digest_hour),
+    ] {
         if let Some(value) = value {
             sqlx::query(
                 "INSERT INTO schema_meta (key, value) VALUES (?, ?)
@@ -149,7 +162,10 @@ pub fn question_for(cause: &str) -> &'static str {
 pub fn question_line(project: &str, job_id: i64, facts: &[Fact]) -> String {
     let said: Vec<&str> = facts.iter().map(|f| f.fact.as_str()).collect();
     let ask = question_for(facts.first().map_or("", |f| f.cause.as_str()));
-    format!("#{job_id} · {project} · job #{job_id} — {}. {ask}", said.join("; "))
+    format!(
+        "#{job_id} · {project} · job #{job_id} — {}. {ask}",
+        said.join("; ")
+    )
 }
 
 /// Queue rows created before this UTC second never ask; see migration 0173. Absent: all may ask.
@@ -193,9 +209,7 @@ async fn fact_for(conn: &mut SqliteConnection, row: &AskingRow) -> sqlx::Result<
                         .and_then(crate::knowledge::failure_signature)
                         .map(|s| format!(": `{}`", s.headline))
                         .unwrap_or_default();
-                    format!(
-                        "item {ordinal} «{short}» used up {attempts} gate attempts{signature}"
-                    )
+                    format!("item {ordinal} «{short}» used up {attempts} gate attempts{signature}")
                 }
                 None => "an item used up its gate attempts".to_owned(),
             })
@@ -573,28 +587,53 @@ mod tests {
     #[tokio::test]
     async fn the_answer_window_and_hour_default_to_5_days_and_18() {
         let pool = pool().await;
-        assert_eq!((answer_days(&pool).await, digest_hour(&pool).await), (5, 18));
+        assert_eq!(
+            (answer_days(&pool).await, digest_hour(&pool).await),
+            (5, 18)
+        );
     }
 
     #[tokio::test]
     async fn a_legacy_zero_wait_keeps_requests_off_and_any_other_value_gives_the_default() {
         let pool = pool().await;
         set_meta(&pool, OLD_WAIT_KEY, "0").await;
-        assert_eq!(answer_days(&pool).await, 0, "an owner who turned requests off keeps them off");
+        assert_eq!(
+            answer_days(&pool).await,
+            0,
+            "an owner who turned requests off keeps them off"
+        );
         set_meta(&pool, OLD_WAIT_KEY, "30").await;
-        assert_eq!(answer_days(&pool).await, 5, "minutes are not converted into days");
+        assert_eq!(
+            answer_days(&pool).await,
+            5,
+            "minutes are not converted into days"
+        );
         set_meta(&pool, ANSWER_DAYS_KEY, "9").await;
-        assert_eq!(answer_days(&pool).await, 9, "the new key wins over the old one");
+        assert_eq!(
+            answer_days(&pool).await,
+            9,
+            "the new key wins over the old one"
+        );
         set_meta(&pool, ANSWER_DAYS_KEY, "31").await;
-        assert_eq!(answer_days(&pool).await, 5, "out of range reads as the default");
+        assert_eq!(
+            answer_days(&pool).await,
+            5,
+            "out of range reads as the default"
+        );
     }
 
     #[tokio::test]
     async fn the_config_is_set_within_bounds_and_zero_days_dismisses_the_open_requests() {
         let pool = pool().await;
         let now = at("2026-10-07T10:00:00+00:00");
-        assert!(matches!(set_config(&pool, Some(31), None, now).await, Err(ConfigError::OutOfRange)));
-        assert!(matches!(set_config(&pool, None, Some(24), now).await, Err(ConfigError::OutOfRange)));
+        assert!(matches!(
+            set_config(&pool, Some(31), None, now).await,
+            Err(ConfigError::OutOfRange)
+        ));
+        assert!(matches!(
+            set_config(&pool, None, Some(24), now).await,
+            Err(ConfigError::OutOfRange)
+        ));
         set_config(&pool, Some(7), Some(9), now).await.unwrap();
         assert_eq!((answer_days(&pool).await, digest_hour(&pool).await), (7, 9));
 
@@ -614,18 +653,28 @@ mod tests {
         let line = question_line(
             "api",
             9,
-            &[fact(1, "run_exhausted", "item 2 «add retries» used up 3 gate attempts: `error[E0382]`")],
+            &[fact(
+                1,
+                "run_exhausted",
+                "item 2 «add retries» used up 3 gate attempts: `error[E0382]`",
+            )],
         );
         assert_eq!(
             line,
             "#9 · api · job #9 — item 2 «add retries» used up 3 gate attempts: `error[E0382]`. Is there something about this item or the gate that only you know?"
         );
         assert_eq!(
-            question_line("api", 7, &[fact(1, "job_failed", "the job ended in `failed`")]),
+            question_line(
+                "api",
+                7,
+                &[fact(1, "job_failed", "the job ended in `failed`")]
+            ),
             "#7 · api · job #7 — the job ended in `failed`. What went wrong that the logs would not show?"
         );
-        assert!(question_for("review_blocking")
-            .contains("Was the review right, or is there a rule of yours behind it?"));
+        assert!(
+            question_for("review_blocking")
+                .contains("Was the review right, or is there a rule of yours behind it?")
+        );
         assert!(!line.contains('\n'));
     }
 
@@ -717,7 +766,10 @@ mod tests {
                 .unwrap();
         assert_eq!((state.as_str(), note), (STATE_ANSWERED, Some(note_id)));
         let (_, late) = answer(&pool, 7, "a second thought", "shell").await.unwrap();
-        assert!(late, "a late answer keeps its note and rides the row already pending");
+        assert!(
+            late,
+            "a late answer keeps its note and rides the row already pending"
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,8 @@
 //! fixed template.
 
 use super::{
-    ASKING_CAUSES, AskingRow, FROM_KEY, Fact, STATE_OPEN, fact_for, facts_json, question_line, stamp,
+    ASKING_CAUSES, AskingRow, FROM_KEY, Fact, STATE_OPEN, fact_for, facts_json, question_line,
+    stamp,
 };
 use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -102,8 +103,7 @@ where
         let mut facts = Vec::new();
         for row in rows {
             // Redacted at the source: the fact is stored in `causes` too, not only in the text.
-            let fact =
-                crate::governance::redact::redact_secrets(&fact_for(&mut tx, row).await?);
+            let fact = crate::governance::redact::redact_secrets(&fact_for(&mut tx, row).await?);
             facts.push(Fact {
                 row: row.id,
                 cause: row.cause.clone(),
@@ -190,7 +190,10 @@ async fn candidates(
 }
 
 pub fn render(day: &str, lines: &[String], more: usize, until: &str) -> String {
-    let mut out = format!("Daily questions · {day} · {} to answer\n", lines.len() + more);
+    let mut out = format!(
+        "Daily questions · {day} · {} to answer\n",
+        lines.len() + more
+    );
     for line in lines {
         out.push_str(line);
         out.push('\n');
@@ -298,8 +301,18 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                (7, "open".into(), "2026-10-12T17:30:00+00:00".into(), Some(id)),
-                (9, "open".into(), "2026-10-12T17:30:00+00:00".into(), Some(id)),
+                (
+                    7,
+                    "open".into(),
+                    "2026-10-12T17:30:00+00:00".into(),
+                    Some(id)
+                ),
+                (
+                    9,
+                    "open".into(),
+                    "2026-10-12T17:30:00+00:00".into(),
+                    Some(id)
+                ),
             ]
         );
         let feed: Vec<(String, Option<String>, Option<String>, String)> =
@@ -309,15 +322,29 @@ mod tests {
                 .unwrap();
         assert_eq!(feed.len(), 1);
         assert_eq!(
-            (feed[0].0.as_str(), feed[0].1.as_deref(), feed[0].2.as_deref()),
-            ("capture_digest", None, Some(format!("capture_digest:{id}").as_str()))
+            (
+                feed[0].0.as_str(),
+                feed[0].1.as_deref(),
+                feed[0].2.as_deref()
+            ),
+            (
+                "capture_digest",
+                None,
+                Some(format!("capture_digest:{id}").as_str())
+            )
         );
         assert!(
-            feed[0].3.starts_with("Daily questions · 2026-10-07 · 2 to answer\n"),
+            feed[0]
+                .3
+                .starts_with("Daily questions · 2026-10-07 · 2 to answer\n"),
             "{}",
             feed[0].3
         );
-        assert!(feed[0].3.ends_with("Open until 2026-10-12."), "{}", feed[0].3);
+        assert!(
+            feed[0].3.ends_with("Open until 2026-10-12."),
+            "{}",
+            feed[0].3
+        );
     }
 
     #[tokio::test]
@@ -443,7 +470,10 @@ mod tests {
             .await
             .unwrap();
         assert!(text.contains("· 10 to answer"), "{text}");
-        assert!(text.contains("#10 · web") && text.contains("#3 · web"), "{text}");
+        assert!(
+            text.contains("#10 · web") && text.contains("#3 · web"),
+            "{text}"
+        );
         assert!(
             !text.contains("#2 · web") && text.contains("and 2 more in the Brain"),
             "{text}"
@@ -545,19 +575,24 @@ mod tests {
     async fn one_digest_per_local_day_and_requests_carry_the_digest_id() {
         let pool = pool().await;
         for (day, ids) in [("2026-10-07", "[7]"), ("2026-10-08", "[8]")] {
-            sqlx::query("INSERT INTO capture_digests (day, job_ids, created_at) VALUES (?, ?, 't')")
-                .bind(day)
-                .bind(ids)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO capture_digests (day, job_ids, created_at) VALUES (?, ?, 't')",
+            )
+            .bind(day)
+            .bind(ids)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         let again = sqlx::query(
             "INSERT INTO capture_digests (day, job_ids, created_at) VALUES ('2026-10-07', '[9]', 't')",
         )
         .execute(&pool)
         .await;
-        assert!(again.is_err(), "a second digest for the same day must be refused");
+        assert!(
+            again.is_err(),
+            "a second digest for the same day must be refused"
+        );
 
         sqlx::query(
             "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
@@ -571,7 +606,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(digest_id, None, "a request opened without a digest has none");
+        assert_eq!(
+            digest_id, None,
+            "a request opened without a digest has none"
+        );
     }
 
     #[test]
@@ -588,7 +626,10 @@ mod tests {
              Reply to this message (when only one is open) or send /cap <job> <answer>. Open until 2026-10-27."
         );
         let text = render("2026-10-22", &lines, 3, "2026-10-27");
-        assert!(text.starts_with("Daily questions · 2026-10-22 · 5 to answer\n"), "{text}");
+        assert!(
+            text.starts_with("Daily questions · 2026-10-22 · 5 to answer\n"),
+            "{text}"
+        );
         assert!(text.contains("\nand 3 more in the Brain\n"), "{text}");
     }
 }

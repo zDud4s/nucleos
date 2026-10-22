@@ -1559,7 +1559,10 @@ mod tests {
 
         remove(&pool, "alpha", true).await.unwrap();
 
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM capture_digests").await, 1);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM capture_digests").await,
+            1
+        );
         let kept: String =
             sqlx::query_scalar("SELECT subject FROM feed WHERE kind = 'capture_digest'")
                 .fetch_one(&pool)

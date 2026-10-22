@@ -25119,12 +25119,14 @@ mod tests {
             .format("%Y-%m-%d")
             .to_string();
         for (day, jobs) in [(&old_day, "[1]"), (&today, "[7,8]")] {
-            sqlx::query("INSERT INTO capture_digests (day, job_ids, created_at) VALUES (?, ?, 't')")
-                .bind(day)
-                .bind(jobs)
-                .execute(&state.pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO capture_digests (day, job_ids, created_at) VALUES (?, ?, 't')",
+            )
+            .bind(day)
+            .bind(jobs)
+            .execute(&state.pool)
+            .await
+            .unwrap();
         }
         let digest: i64 = sqlx::query_scalar("SELECT id FROM capture_digests WHERE day = ?")
             .bind(&today)
