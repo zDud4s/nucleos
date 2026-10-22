@@ -16,6 +16,7 @@ import {
   useUpdateNote,
   type NoteLink,
   type NotesGraph,
+  type TargetKind,
   type TeachKind,
 } from "../data/owner-notes";
 import { useProjects } from "../data/system";
@@ -25,9 +26,11 @@ import { Segments } from "./Segments";
 import { backlinks, buildModel, localModel } from "./graph-model";
 import type { GFilters, GModel, GNode } from "./graph-types";
 import { EDGE_TYPES, NODE_KINDS } from "./GraphFilters";
-import { itemOfNode } from "./item-ref";
+import { itemOfNode, nodeIdOf, parseItem } from "./item-ref";
 import { AddLinkForm } from "./LinkPicker";
 import { NoteTextEdit } from "./NoteTextEdit";
+import { NotesAbout } from "./NotesAbout";
+import { RelatedNotes } from "./RelatedNotes";
 
 /**
  * The side panel of the Brain graph: what the selected node is, and for a note, everything that
@@ -66,6 +69,13 @@ const LOCAL_FILTERS: GFilters = {
 
 const EMPTY_KNOWLEDGE: Known[] = [];
 
+/** A note picked in a related/about list (`note:<id>`) goes through the panel's own `onSelect` as `n:<id>`. */
+function selectItem(item: string, onSelect?: (nodeId: string) => void) {
+  const ref = parseItem(item);
+  const nodeId = ref === null ? null : nodeIdOf(ref);
+  if (nodeId !== null) onSelect?.(nodeId);
+}
+
 /** A refusal as the daemon's own text; anything else means there was no answer. */
 function Failure({ error, sentences }: { error: unknown; sentences?: Record<string, string> }) {
   if (error instanceof ApiRefusal) return <RefusalNote refusal={error} sentences={sentences} />;
@@ -84,7 +94,7 @@ export function BrainPanel({ nodeId, graph, model, onSelect }: BrainPanelProps) 
     return <NotePanel key={nodeId} id={item.id} graph={known} wide={wide.data} onSelect={onSelect} />;
   }
   const node = model.nodes.find((n) => n.id === nodeId);
-  if (node !== undefined) return <OtherPanel node={node} model={model} />;
+  if (node !== undefined) return <OtherPanel node={node} model={model} onSelect={onSelect} />;
   // A well-formed note id the archived-inclusive graph does not know is gone, not merely filtered.
   if (item?.kind === "note" && wide.data !== undefined) {
     const gone: GNode = {
@@ -96,13 +106,21 @@ export function BrainPanel({ nodeId, graph, model, onSelect }: BrainPanelProps) 
       missing: true,
       degree: 0,
     };
-    return <OtherPanel node={gone} model={model} />;
+    return <OtherPanel node={gone} model={model} onSelect={onSelect} />;
   }
   return <Quiet says="That node is not in the graph as filtered." />;
 }
 
 /** An entity, a knowledge row, or a note that is gone: a label and who points at it. */
-function OtherPanel({ node, model }: { node: GNode; model: GModel }) {
+function OtherPanel({
+  node,
+  model,
+  onSelect,
+}: {
+  node: GNode;
+  model: GModel;
+  onSelect?: (nodeId: string) => void;
+}) {
   const label = node.kind === "knowledge" || node.kind === "note" ? node.label : `${node.kind}: ${node.label}`;
   // A note stub that is not gone is one hidden because it is archived.
   const hidden = node.kind === "note" && !node.missing;
@@ -132,6 +150,14 @@ function OtherPanel({ node, model }: { node: GNode; model: GModel }) {
           </ul>
         )}
       </section>
+      {/* A note stub (gone or hidden) is a note, not a target something is written about. */}
+      {node.kind !== "note" && (
+        <NotesAbout
+          kind={node.kind satisfies TargetKind}
+          ref={node.ref}
+          onItem={(item) => selectItem(item, onSelect)}
+        />
+      )}
     </div>
   );
 }
@@ -219,6 +245,8 @@ function NotePanel({
         <h4>Links in</h4>
         <LinksIn id={id} wide={wide} fallback={links_in} onSelect={onSelect} />
       </section>
+
+      <RelatedNotes id={id} onItem={(item) => selectItem(item, onSelect)} />
 
       <section className="brain-sec">
         <h4>History</h4>

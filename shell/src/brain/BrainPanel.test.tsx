@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { BrainPanel } from "./BrainPanel";
 import type { GModel } from "./graph-types";
-import type { NoteDetail, NotesGraph } from "../data/owner-notes";
+import type { NoteDetail, NotesGraph, RelatedNote, TargetNote } from "../data/owner-notes";
 import { renderWithRouter } from "../test/harness";
 import { createAppQueryClient } from "../app/queryClient";
 import { keys } from "../data/keys";
@@ -53,12 +53,17 @@ const model: GModel = {
 
 /** What `/owner-notes/graph?include_archived=true` answers; `panel` sets it. */
 let wide: NotesGraph = graph;
+/** What `/owner-notes/4/related` and `/owner-notes/by-target` answer; a test sets them. */
+let related: RelatedNote[] = [];
+let about: TargetNote[] = [];
 
 function serve(d: NoteDetail, other?: (path: string, init?: RequestInit) => unknown) {
   daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
     if (path === "/owner-notes/4" && init === undefined) return Promise.resolve(d);
     if (path === "/owner-notes/graph?include_archived=true") return Promise.resolve(wide);
     if (path === "/knowledge" || path === "/projects") return Promise.resolve([]);
+    if (path === "/owner-notes/4/related") return Promise.resolve(related);
+    if (path.startsWith("/owner-notes/by-target?")) return Promise.resolve(about);
     const answer = other?.(path, init);
     if (answer !== undefined) return answer;
     return Promise.reject(new Error(`unexpected ${path}`));
@@ -75,6 +80,8 @@ async function panel(g: NotesGraph = graph, onSelect?: (id: string) => void) {
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
+  related = [];
+  about = [];
 });
 
 describe("BrainPanel origin", () => {
@@ -325,5 +332,47 @@ describe("BrainPanel note text", () => {
     await panel({ ...graph, notes: [archived] });
     const edit = screen.getByRole("button", { name: "Edit" }) as HTMLButtonElement;
     expect(edit.disabled).toBe(true);
+  });
+});
+
+describe("BrainPanel related and about", () => {
+  const OTHER = { ...NOTE, id: 9, text: "The signing key sits with the accountant\nsecond line" };
+
+  it("a note panel lists related notes, and choosing one selects its node", async () => {
+    related = [{ note: OTHER, score: 0.8, reasons: ["embedding", "shared_target"] }];
+    serve(detail());
+    const onSelect = vi.fn();
+    await panel(graph, onSelect);
+
+    const list = await screen.findByRole("list", { name: "Related notes" });
+    expect(list.textContent).toContain("similar meaning");
+    expect(list.textContent).not.toContain("second line");
+    fireEvent.click(screen.getByRole("button", { name: "The signing key sits with the accountant" }));
+    expect(onSelect).toHaveBeenCalledWith("n:9");
+  });
+
+  it("an entity panel lists the notes about it, and opening one selects its node", async () => {
+    about = [{ note: OTHER, link_id: 31, link_type: "relates" }];
+    serve(detail());
+    const entityModel: GModel = {
+      nodes: [{ id: "project:alpha", kind: "project", ref: "alpha", label: "alpha", bucket: "in_force", missing: false, degree: 0 }],
+      edges: [],
+    };
+    const onSelect = vi.fn();
+    await renderWithRouter(<BrainPanel nodeId="project:alpha" graph={graph} model={entityModel} onSelect={onSelect} />, {
+      initialPath: "/brain",
+    });
+
+    await screen.findByText("The signing key sits with the accountant");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/owner-notes/by-target?kind=project&ref=alpha");
+    fireEvent.click(screen.getByRole("button", { name: "Open note 9" }));
+    expect(onSelect).toHaveBeenCalledWith("n:9");
+  });
+
+  it("a note that is gone has no notes-about section", async () => {
+    serve(detail());
+    await renderWithRouter(<BrainPanel nodeId="n:99" graph={graph} model={model} />, { initialPath: "/brain" });
+    await screen.findByText("note 99");
+    expect(screen.queryByText("Notes about this")).toBeNull();
   });
 });
