@@ -1,0 +1,135 @@
+/* Markdown inside a note: spacing only; colours and type come from the design tokens. */
+
+/*
+ * `.brain-text` (pages/brain.css) is `pre-wrap`, which would keep the "\n" text nodes react-markdown
+ * emits between blocks and render stray blank lines. Reset it here, and give it back to paragraphs
+ * so soft line breaks inside one still show, as the old plain-text view did.
+ */
+.brain-markdown {
+  white-space: normal;
+}
+
+.brain-markdown p {
+  white-space: pre-wrap;
+}
+
+.brain-markdown pre {
+  white-space: pre;
+}
+
+.brain-markdown > :first-child {
+  margin-top: 0;
+}
+
+.brain-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.brain-markdown p,
+.brain-markdown ul,
+.brain-markdown ol,
+.brain-markdown pre,
+.brain-markdown blockquote {
+  margin: var(--space-2) 0;
+}
+
+.brain-markdown h1,
+.brain-markdown h2,
+.brain-markdown h3,
+.brain-markdown h4,
+.brain-markdown h5,
+.brain-markdown h6 {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--text-base);
+  font-weight: 600;
+  line-height: var(--leading-normal);
+}
+
+.brain-markdown ul,
+.brain-markdown ol {
+  padding-left: var(--space-5, 1.25rem);
+}
+
+.brain-markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+}
+
+.brain-markdown pre {
+  padding: var(--space-2) var(--space-3);
+  overflow-x: auto;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.brain-markdown pre code {
+  padding: 0;
+  background: none;
+}
+
+.brain-markdown blockquote {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-muted);
+}
+
+.brain-note-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.brain-note-link:hover {
+  /* Signal Cyan is reserved for the allowlisted link classes; a note's link stays in the
+     text colour and answers the pointer with a heavier underline instead. */
+  text-decoration-thickness: 2px;
+}
+
+.brain-note-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* Editing a note's text (NoteTextEdit). */
+.brain-note-edit {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.brain-note-edit textarea {
+  width: 100%;
+  min-height: 4.5rem;
+  max-height: 14rem;
+  field-sizing: content;
+  box-sizing: border-box;
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  resize: vertical;
+}
+
+.brain-note-edit textarea:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.brain-note-edit-actions {
+  display: flex;
+  gap: var(--space-2);
+}

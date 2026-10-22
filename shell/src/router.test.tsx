@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
@@ -9,6 +9,7 @@ import { Bench } from "./team/Bench";
 import { daemonFetch, daemonState, renderApp } from "./test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: vi.fn().mockResolvedValue(undefined) }) }));
 
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("./data/client", async (original) => ({
@@ -255,5 +256,41 @@ describe("the app router", () => {
     await renderApp();
 
     expect(await screen.findByRole("heading", { level: 1, name: "Home" })).toBeDefined();
+  });
+
+  describe("the quick-capture window", () => {
+    afterEach(() => {
+      window.history.replaceState({}, "", "/");
+    });
+
+    it("lands on the capture box, with no rail or kill switch, when loaded as ?window=quick-capture", async () => {
+      window.history.replaceState({}, "", "/?window=quick-capture");
+      // Handed another place, as `main-window.tsx` hands it the remembered one.
+      const { router } = await renderApp({ initialPath: "/fleet" });
+
+      expect(await screen.findByRole("textbox", { name: "Capture a note" })).toBeDefined();
+      expect(router.state.location.pathname).toBe("/quick-capture");
+      expect(screen.queryByRole("navigation", { name: "Sections" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /kill switch/i })).toBeNull();
+    });
+
+    it("never restores /quick-capture as the main window's place", async () => {
+      const { router } = await renderApp({ initialPath: "/quick-capture" });
+
+      await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+      expect(await screen.findByRole("heading", { level: 1, name: "Home" })).toBeDefined();
+      expect(screen.getByRole("navigation", { name: "Sections" })).toBeDefined();
+      expect(screen.queryByRole("textbox", { name: "Capture a note" })).toBeNull();
+    });
+
+    it("is a route but not a navigation item", () => {
+      const router = createAppRouter();
+      const byId = router.routesById as unknown as Record<string, { fullPath?: string }>;
+      const paths = Object.values(byId).map((route) => route.fullPath);
+
+      expect(paths).toContain("/quick-capture");
+      expect(NAV_PATHS).not.toContain("/quick-capture");
+      expect(PAGES["/quick-capture"]).toBeUndefined();
+    });
   });
 });

@@ -52,11 +52,6 @@ const STOP_EVENT: &str = "voice://stop";
 /// window is not focused — and gets out of the way.
 const CONVERSATION_EVENT: &str = "voice://conversation-toggle";
 
-/// Emitted when the Brain capture chord is pressed. Like the conversation chord, the work happens in
-/// the webview (`shell/src/app/CaptureChord.tsx` opens the Brain and focuses its capture box); this
-/// process only brings the window forward, since the chord is global and the window may be hidden.
-const CAPTURE_EVENT: &str = "brain://capture";
-
 /// What the shell is doing right now, and which window it promised the text to.
 #[derive(Default)]
 pub struct Dictation {
@@ -905,13 +900,10 @@ fn register_hotkeys(
                         }
                     }
                     Chord::Capture => {
-                        // The default window label: `tauri.conf.json` names none.
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                        if let Err(error) = app.emit(CAPTURE_EVENT, ()) {
-                            eprintln!("[voice] could not open the brain capture: {error}");
+                        // The quick-capture window, and nothing else: the chord is global, so the
+                        // main window must not come forward behind the box.
+                        if let Err(error) = crate::quick_capture::open(&app) {
+                            eprintln!("[voice] could not open the quick capture: {error}");
                         }
                     }
                     Chord::Dictation | Chord::Memo => {
@@ -1094,5 +1086,22 @@ mod tests {
         // Nothing in front is nothing to remember, and the `None` has to survive the mapping:
         // turning it into an id would let delivery paste into whatever happens to be there.
         assert_eq!(macos_front_window_id(None), None);
+    }
+
+    /// The capture chord opens the quick-capture window and leaves the main window where it is.
+    /// An effect on windows, so no app exists to assert it against; the arm is read instead.
+    #[test]
+    fn the_capture_chord_opens_the_quick_capture_window_and_not_the_main_one() {
+        let source = include_str!("dictation.rs");
+        let arm = source
+            .split("Chord::Capture => {")
+            .nth(1)
+            .expect("the capture chord has an arm")
+            .split("Chord::Dictation | Chord::Memo")
+            .next()
+            .expect("the arm ends");
+        assert!(arm.contains("crate::quick_capture::open(&app)"), "{arm}");
+        assert!(!arm.contains("\"main\""), "{arm}");
+        assert!(!arm.contains("emit("), "{arm}");
     }
 }
