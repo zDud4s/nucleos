@@ -57,3 +57,10 @@ c9fb1541066017314be860777604b2b4f40c4051:core/src/redact.rs:jwt:648
 f764d37de65f460b702ea97a2a8ef8867162e1c9:core/src/capture.rs:stripe-access-token:720
 4954af647b459583e54dde6dfecc2fde78ccd8ea:core/src/distill.rs:github-pat:2023
 69ea3ae7d876c26044f0d0abdca6863ee2a9f58f:core/src/governance/redact.rs:gitlab-pat:945
+
+# The `action_bad_token` contract case: a callback token the decoder must reject at `/action/token`.
+# `tk_` plus a repeated hex ladder -- it names nothing and opens nothing.
+# The same literal lives in the shared fixture and in the two places the core decoder's test sat.
+10af9dd9ec7d1303ed3eefac010055c85d1d3c51:sidecars/lib/channelkit/contract/fixtures/events/action-bad-token.json:generic-api-key:1
+489bd496b3d1daa8f4fcac184d1cbc3b7eb84562:core/src/channels/contract/decode.rs:generic-api-key:1666
+2e17e31ade1effc4e70c6093e241a2bf30b847f8:core/src/channels/contract/decode/event.rs:generic-api-key:724
