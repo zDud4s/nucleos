@@ -40,14 +40,18 @@ pub(super) fn routes() -> Router<AppState> {
         // route nobody lists is reachable by Control and Admin alone — the same reasoning as
         // `post_job_note`. No run, service, team or narrower API token reaches them, which is the
         // point: these are the person's thinking, and nothing in the agent's memory reads them.
-        // Static segments (`search`, `graph`, `links`) win over `{id}` in matchit.
+        // Static segments (`search`, `graph`, `by-target`, `review`, `links`) win over `{id}` in
+        // matchit.
         .route("/owner-notes", get(list_owner_notes).post(post_owner_note))
         .route("/owner-notes/search", get(search_owner_notes))
         .route("/owner-notes/graph", get(get_owner_notes_graph))
+        .route("/owner-notes/by-target", get(get_owner_notes_by_target))
+        .route("/owner-notes/review", get(get_owner_notes_review))
         .route(
             "/owner-notes/{id}",
             get(get_owner_note).patch(patch_owner_note),
         )
+        .route("/owner-notes/{id}/related", get(get_owner_note_related))
         .route("/owner-notes/{id}/links", post(post_owner_note_link))
         .route("/owner-notes/{id}/teach", post(post_owner_note_teach))
         .route(
@@ -869,4 +873,210 @@ pub(super) async fn get_owner_notes_graph(
         "links": links,
         "targets": targets,
     })))
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct OwnerNoteByTargetQuery {
+    pub(super) kind: String,
+    #[serde(rename = "ref")]
+    pub(super) target_ref: String,
+}
+
+/// `GET /owner-notes/by-target?kind=&ref=` — the notes pinned to one target, active first. The
+/// target is not looked up, so a gone target still lists the notes written about it.
+pub(super) async fn get_owner_notes_by_target(
+    State(state): State<AppState>,
+    Query(query): Query<OwnerNoteByTargetQuery>,
+) -> Result<Json<Vec<crate::owner_notes::related::TargetNote>>, (StatusCode, String)> {
+    use crate::owner_notes::LinkError;
+    crate::owner_notes::related::by_target(&state.pool, &query.kind, &query.target_ref)
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            LinkError::Db(error) => (owner_note_db_status(&error, None), String::new()),
+            other => (StatusCode::BAD_REQUEST, other.to_string()),
+        })
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct OwnerNoteRelatedQuery {
+    pub(super) limit: Option<i64>,
+}
+
+/// How many related notes `GET /owner-notes/{id}/related` returns when `limit` is absent.
+const RELATED_DEFAULT_LIMIT: i64 = 8;
+/// The most it ever returns, whatever `limit` asks for.
+const RELATED_MAX_LIMIT: i64 = 20;
+
+fn clamp_related_limit(limit: Option<i64>) -> usize {
+    limit
+        .unwrap_or(RELATED_DEFAULT_LIMIT)
+        .clamp(1, RELATED_MAX_LIMIT) as usize
+}
+
+/// `GET /owner-notes/{id}/related?limit=` — the active notes most like this one, best first.
+pub(super) async fn get_owner_note_related(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<OwnerNoteRelatedQuery>,
+) -> Result<Json<Vec<crate::owner_notes::related::Related>>, StatusCode> {
+    crate::owner_notes::related::related(&state.pool, id, clamp_related_limit(query.limit))
+        .await
+        .map(Json)
+        .map_err(|error| owner_note_status(&error, Some(id)))
+}
+
+/// `GET /owner-notes/review` — the review of the current ISO week, in local time.
+pub(super) async fn get_owner_notes_review(
+    State(state): State<AppState>,
+) -> Result<Json<crate::owner_notes::review::Review>, StatusCode> {
+    crate::owner_notes::review::weekly_review(&state.pool, chrono::Local::now())
+        .await
+        .map(Json)
+        .map_err(|error| owner_note_db_status(&error, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `channels::testkit` is `#[cfg(test)]` in the lib and does not exist when the bin's tests
+    // compile; the `mod http` tests build their state with `http::tests::test_state`.
+    async fn state() -> AppState {
+        super::super::tests::test_state().await
+    }
+
+    async fn note(state: &AppState, text: &str) -> i64 {
+        crate::owner_notes::create(&state.pool, text, "shell")
+            .await
+            .unwrap()
+    }
+
+    fn by_target_query(kind: &str, target_ref: &str) -> Query<OwnerNoteByTargetQuery> {
+        Query(OwnerNoteByTargetQuery {
+            kind: kind.to_owned(),
+            target_ref: target_ref.to_owned(),
+        })
+    }
+
+    #[test]
+    fn the_related_limit_defaults_to_eight_and_stays_within_one_to_twenty() {
+        assert_eq!(clamp_related_limit(None), 8);
+        assert_eq!(clamp_related_limit(Some(5)), 5);
+        assert_eq!(clamp_related_limit(Some(0)), 1);
+        assert_eq!(clamp_related_limit(Some(-3)), 1);
+        assert_eq!(clamp_related_limit(Some(20)), 20);
+        assert_eq!(clamp_related_limit(Some(21)), 20);
+        assert_eq!(clamp_related_limit(Some(i64::MAX)), 20);
+    }
+
+    #[tokio::test]
+    async fn by_target_refuses_an_unknown_kind_with_a_400_and_its_reason() {
+        let state = state().await;
+        let (status, body) =
+            get_owner_notes_by_target(State(state), by_target_query("planet", "mars"))
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "unknown target kind");
+    }
+
+    #[tokio::test]
+    async fn by_target_lists_the_linked_notes_in_the_contract_shape() {
+        let state = state().await;
+        let linked = note(&state, "about the project").await;
+        note(&state, "about nothing").await;
+        let link_id =
+            crate::owner_notes::add_link(&state.pool, linked, "relates", "project", "nucleos")
+                .await
+                .unwrap();
+
+        let Json(listed) =
+            get_owner_notes_by_target(State(state.clone()), by_target_query("project", "nucleos"))
+                .await
+                .unwrap();
+        let value = serde_json::to_value(&listed).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["note"]["id"], linked);
+        assert_eq!(value[0]["note"]["text"], "about the project");
+        assert_eq!(value[0]["link_id"], link_id);
+        assert_eq!(value[0]["link_type"], "relates");
+
+        // A target nobody links to answers an empty list, not an error.
+        let Json(none) =
+            get_owner_notes_by_target(State(state), by_target_query("project", "gone"))
+                .await
+                .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn related_answers_404_for_an_unknown_note() {
+        let state = state().await;
+        let status = get_owner_note_related(
+            State(state),
+            Path(9999),
+            Query(OwnerNoteRelatedQuery { limit: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn related_finds_a_note_sharing_a_target_and_never_the_note_itself() {
+        let state = state().await;
+        let first = note(&state, "pinned to the project").await;
+        let second = note(&state, "also pinned there").await;
+        for id in [first, second] {
+            crate::owner_notes::add_link(&state.pool, id, "relates", "project", "nucleos")
+                .await
+                .unwrap();
+        }
+
+        let Json(related) = get_owner_note_related(
+            State(state),
+            Path(first),
+            Query(OwnerNoteRelatedQuery { limit: Some(1000) }),
+        )
+        .await
+        .unwrap();
+        let value = serde_json::to_value(&related).unwrap();
+        let ids: Vec<i64> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["note"]["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![second]);
+        assert!(value[0]["score"].as_f64().unwrap() > 0.0);
+        assert!(
+            value[0]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "shared_target")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_answers_the_current_week_in_the_contract_shape() {
+        let state = state().await;
+        let id = note(&state, "written this week").await;
+
+        let Json(review) = get_owner_notes_review(State(state)).await.unwrap();
+        let value = serde_json::to_value(&review).unwrap();
+        for key in ["week_start", "week_end"] {
+            assert!(
+                chrono::DateTime::parse_from_rfc3339(value[key].as_str().unwrap()).is_ok(),
+                "{key} is rfc3339"
+            );
+        }
+        assert_eq!(value["created"][0]["id"], id);
+        assert_eq!(value["created"][0]["text"], "written this week");
+        // No link at all, so the same note is also waiting to be connected.
+        assert_eq!(value["unlinked"][0]["id"], id);
+        assert!(value["resurfaced"].as_array().unwrap().is_empty());
+        assert_eq!(value["waiting_proposals"], 0);
+    }
 }

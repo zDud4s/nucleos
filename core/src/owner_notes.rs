@@ -12,6 +12,10 @@
 
 use sqlx::SqlitePool;
 
+pub mod embeddings;
+pub mod related;
+pub mod review;
+
 /// Where a note was written from. Checked before the insert.
 pub const ORIGINS: [&str; 1] = ["shell"];
 
@@ -96,6 +100,8 @@ pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, 
     let mut tx = pool.begin().await?;
     let id = insert_note_in(&mut tx, text, origin).await?;
     tx.commit().await?;
+    // Best-effort and asynchronous: the embedder is woken, never awaited.
+    embeddings::nudge();
     Ok(id)
 }
 
@@ -244,6 +250,9 @@ pub async fn update(
         record(&mut tx, id, kind, None, &at).await?;
     }
     tx.commit().await?;
+    if new_text.is_some() {
+        embeddings::nudge();
+    }
     get(pool, id).await
 }
 
@@ -1343,6 +1352,133 @@ mod tests {
         assert!(production_code(&helper_first).contains(&needle));
     }
 
+    /// Whether a `source_scan::module_path` names a file below this module's own directory. The
+    /// sweep skips these by that prefix and nothing else.
+    fn is_owner_notes_submodule(module_path: &str) -> bool {
+        module_path.starts_with("owner_notes/")
+    }
+
+    /// Whether `path` is one of this module's own submodule files: below `core/src/owner_notes/`,
+    /// and not below the same-named folder of another crate's source root (`module_path` strips
+    /// any root, so the prefix alone cannot tell them apart).
+    fn is_owner_notes_submodule_file(
+        path: &std::path::Path,
+        core_src: &std::path::Path,
+        module_path: &str,
+    ) -> bool {
+        path.starts_with(core_src) && is_owner_notes_submodule(module_path)
+    }
+
+    #[test]
+    fn the_sweep_skips_owner_notes_submodules_of_the_core_src_root_only() {
+        let core_src = std::path::Path::new("/repo/core/src");
+        let skipped = |path: &str, module_path: &str| {
+            is_owner_notes_submodule_file(std::path::Path::new(path), core_src, module_path)
+        };
+        assert!(skipped(
+            "/repo/core/src/owner_notes/embeddings.rs",
+            "owner_notes/embeddings.rs"
+        ));
+        // Another crate's `owner_notes/` folder has the same module path and is scanned.
+        assert!(!skipped(
+            "/repo/core/crates/x/src/owner_notes/a.rs",
+            "owner_notes/a.rs"
+        ));
+        assert!(!skipped("/repo/core/src/brief.rs", "brief.rs"));
+    }
+
+    /// The first line of `source`'s production code that names a `runner`, `prompt` or `distill`
+    /// module path: the word followed by `::`, or the word as an item of a `use` or `mod` line.
+    /// Comment lines and the test module are not scanned.
+    fn names_a_forbidden_module(source: &str) -> Option<String> {
+        const FORBIDDEN: [&str; 3] = ["runner", "prompt", "distill"];
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        for line in production_code(source).lines() {
+            let line = line.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            let declares = [
+                "use ",
+                "pub use ",
+                "pub(crate) use ",
+                "mod ",
+                "pub mod ",
+                "pub(crate) mod ",
+            ]
+            .iter()
+            .any(|head| line.starts_with(head));
+            for word in FORBIDDEN {
+                for (at, _) in line.match_indices(word) {
+                    let before = line[..at].chars().next_back();
+                    let after = line[at + word.len()..].chars().next();
+                    if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+                        continue;
+                    }
+                    if line[at + word.len()..].starts_with("::") || declares {
+                        return Some(line.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_forbidden_module_scan_flags_paths_and_declarations_only() {
+        assert!(names_a_forbidden_module("use crate::runner::Run;").is_some());
+        assert!(names_a_forbidden_module("let p = crate::prompt::build();").is_some());
+        assert!(names_a_forbidden_module("use crate::{distill, db};").is_some());
+        assert!(names_a_forbidden_module("pub(crate) mod runner;").is_some());
+        // Words inside identifiers, prose in comments and the test module are not paths.
+        assert!(names_a_forbidden_module("let prompt_text = 1;").is_none());
+        assert!(names_a_forbidden_module("// the prompt::x is never named").is_none());
+        assert!(names_a_forbidden_module("fn distiller() {}").is_none());
+        let in_tests = "fn a() {}\n#[cfg(test)]\nmod tests {\nuse crate::runner::R;\n}";
+        assert!(names_a_forbidden_module(in_tests).is_none());
+    }
+
+    #[test]
+    fn owner_notes_submodules_name_no_runner_prompt_or_distill_module() {
+        let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let running_in = std::env::current_dir().expect("the working directory must be readable");
+        assert_eq!(
+            built_in,
+            running_in.as_path(),
+            "built and running checkouts differ"
+        );
+        let dir = built_in.join("src").join("owner_notes");
+        let mut scanned = 0;
+        for path in crate::source_scan::rust_files() {
+            if !path.starts_with(&dir) || crate::source_scan::is_test_only_module(&path) {
+                continue;
+            }
+            scanned += 1;
+            let source = std::fs::read_to_string(&path).expect("source file must be readable");
+            if let Some(line) = names_a_forbidden_module(&source) {
+                panic!(
+                    "{} names a runner, prompt or distill module (`{line}`): the notes module \
+                     must stay out of the agent's run and prompt path",
+                    path.display()
+                );
+            }
+        }
+        assert!(scanned > 0, "the scan found no owner_notes submodule");
+    }
+
+    #[test]
+    fn the_sweep_skips_owner_notes_submodules_by_prefix_only() {
+        assert!(is_owner_notes_submodule("owner_notes/embeddings.rs"));
+        assert!(is_owner_notes_submodule("owner_notes/deeper/x.rs"));
+        // The module file itself is allowed by name, not by this prefix.
+        assert!(!is_owner_notes_submodule("owner_notes.rs"));
+        // A look-alike sibling, or the name further down a path, is scanned like any other file.
+        assert!(!is_owner_notes_submodule("owner_notes_extra/x.rs"));
+        assert!(!is_owner_notes_submodule("owner_notes_x.rs"));
+        assert!(!is_owner_notes_submodule("council/owner_notes/x.rs"));
+        assert!(!is_owner_notes_submodule("brief.rs"));
+    }
+
     /// The guard below scans production code only: a test module may read the notes table to
     /// assert behaviour (D4 is about production reach, not about what a test inspects).
     #[test]
@@ -1381,6 +1517,15 @@ mod tests {
             }
             // `http.rs`'s children are the same door, split by route family.
             if crate::source_scan::module_path(&path).starts_with("http/") {
+                continue;
+            }
+            // The submodules of this module (`owner_notes/embeddings.rs`, ...) are this module,
+            // but only under `core/src`: another crate's `owner_notes/` folder is scanned.
+            if is_owner_notes_submodule_file(
+                &path,
+                &built_in.join("src"),
+                &crate::source_scan::module_path(&path),
+            ) {
                 continue;
             }
             // An out-of-line `#[cfg(test)] mod x;` is test code from its first line.
