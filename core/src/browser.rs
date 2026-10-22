@@ -2735,30 +2735,29 @@ mod tests {
         }
     }
 
-    /// Prepare and attach use one placement, and it is the project's real one: the granted origins,
-    /// not an empty ephemeral list. The session row gets the sidecar's final url.
+    /// Attach uses the project's real placement (the granted origins, not an empty ephemeral list),
+    /// and the open re-prepares with it first: the shell prepared the environment when it opened,
+    /// before this project had any site, and the sidecar refuses an attach whose placement differs
+    /// from its proxy's. The session row gets the sidecar's final url.
     #[tokio::test]
-    async fn an_embedded_open_records_the_session_and_attaches_with_the_prepare_placement() {
+    async fn an_embedded_open_re_prepares_with_the_current_sites_then_attaches_with_them() {
         let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://jira.example.org/browse").await;
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+
+        // The shell's startup prepare: no site yet.
+        let startup = project_placement(&db.pool, "acme").await.unwrap();
+        assert!(startup.origins.is_empty());
+        runtime.client.embedded_prepare("acme", &startup).await.unwrap();
+
         sqlx::query(
-            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
-             VALUES ('acme', 'https://jira.example.org', 'destination', ?, 0)",
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable)              VALUES ('acme', 'https://jira.example.org', 'destination', ?, 0)",
         )
         .bind(NOW)
         .execute(&db.pool)
         .await
         .unwrap();
-        let (runtime, seen) = stub_embedded_sidecar("https://jira.example.org/browse").await;
-        runtime.force_embedded(true);
-        runtime.embedded.register("acme", "http://127.0.0.1:9333");
-
-        let prepare_placement = project_placement(&db.pool, "acme").await.unwrap();
-        assert_eq!(prepare_placement.origins, vec!["https://jira.example.org"]);
-        runtime
-            .client
-            .embedded_prepare("acme", &prepare_placement)
-            .await
-            .unwrap();
 
         let url = "https://jira.example.org/";
         let (opened, ()) = tokio::join!(
@@ -2774,8 +2773,12 @@ mod tests {
 
         let calls = seen.lock().unwrap().clone();
         let verbs: Vec<_> = calls.iter().map(|c| c["verb"].as_str().unwrap()).collect();
-        assert_eq!(verbs, ["prepare", "attach"]);
-        assert_eq!(calls[0]["body"]["placement"], calls[1]["body"]["placement"]);
+        assert_eq!(verbs, ["prepare", "prepare", "attach"]);
+        assert_eq!(calls[1]["body"]["placement"], calls[2]["body"]["placement"]);
+        assert_eq!(
+            calls[2]["body"]["placement"]["origins"],
+            serde_json::json!(["https://jira.example.org"])
+        );
         db.close().await;
     }
 

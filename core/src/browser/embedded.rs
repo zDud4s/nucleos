@@ -332,6 +332,14 @@ impl Registry {
         url: &str,
         placement: &Placement,
     ) -> Option<Session> {
+        // The shell prepared the environment with the site list of that moment, often an empty
+        // one. Re-preparing with today's list swaps it into the running proxy (same address), so
+        // the attach below is not refused as a placement mismatch. A refusal here (a live session
+        // under another list) takes the headless path.
+        if let Err(error) = client.embedded_prepare(project, placement).await {
+            tracing::info!(project, %error, "embedded open: re-prepare refused, using headless");
+            return None;
+        }
         let project_name = project.to_string();
         let ended = self
             .open_ended(project, url, |cdp_http, nonce, url| async move {

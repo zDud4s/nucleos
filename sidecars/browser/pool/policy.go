@@ -25,6 +25,16 @@ import (
 // than a browser that admits the wrong document. The test for this function asserts exactly that
 // pairing, in both directions.
 func Policy(placement browser.Placement) (fence.Policy, error) {
+	return policyFor(placement, fence.Policy.Validate)
+}
+
+// EmbeddedPolicy is [Policy] for the shell's embedded environment: a project with no admitted site
+// yet is a fence that admits nothing, not a refusal (see [fence.Policy.ValidateEmbedded]).
+func EmbeddedPolicy(placement browser.Placement) (fence.Policy, error) {
+	return policyFor(placement, fence.Policy.ValidateEmbedded)
+}
+
+func policyFor(placement browser.Placement, validate func(fence.Policy) error) (fence.Policy, error) {
 	if err := placement.Profile.Validate(); err != nil {
 		return fence.Policy{}, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
 	}
@@ -53,7 +63,7 @@ func Policy(placement browser.Placement) (fence.Policy, error) {
 		// refuses them. Nothing the núcleo can send opens that list today, and that is deliberate:
 		// there is no browsing reason to reach them, so the list is a seam and not a setting.
 	}
-	if err := policy.Validate(); err != nil {
+	if err := validate(policy); err != nil {
 		return fence.Policy{}, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
 	}
 	return policy, nil

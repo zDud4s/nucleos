@@ -339,6 +339,25 @@
 
 /* The browser fills the row; the side panel sits beside it, never over it (native webviews paint
    above the DOM). */
+/**
+ * The browser fills the window below its bars.
+ *
+ * The shell's page wrapper has no height of its own, so without this takeover `.web-split`'s
+ * `height: 100%` resolves to nothing and the native webview is laid over a zero-height placeholder.
+ * Same `:has()` opt-in as `chats.css` and `voice.css`; the notch strip stays, since a native
+ * webview paints over anything drawn under it.
+ */
+.app-main:has(> .app-page > .web-split) {
+  overflow: hidden;
+}
+
+.app-page:has(> .web-split) {
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  padding-bottom: var(--space-4);
+}
+
 .web-split {
   display: flex;
   flex-direction: column;

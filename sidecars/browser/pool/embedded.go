@@ -79,6 +79,12 @@ type embeddedProject struct {
 // shutdown closes the proxy and the connection. It leaves the person's browser and its tab alone.
 func (e *embeddedProject) shutdown() {
 	_ = e.proxy.Close()
+	e.retire()
+}
+
+// retire closes the connection and marks the state dead, leaving the proxy running: a successor
+// state for the same project has taken the proxy over.
+func (e *embeddedProject) retire() {
 	e.mu.Lock()
 	e.dead = true
 	conn := e.conn
@@ -101,12 +107,13 @@ func (embeddedInstance) Shutdown(context.Context) {}
 // Idempotent: the same project with the same placement answers the same address. A different site
 // list is refused with ErrEmbeddedPolicyChanged while a session (or an attach) of the project is
 // live — a policy swap under a live page is a fence that changes its mind mid-document — and
-// otherwise recreates the proxy and drops the idle connection, as acquire relaunches an idle browser.
+// otherwise swaps the policy into the running proxy (same address, so the shell's environment needs no
+// rebuild) and drops the idle connection, so the next attach arms the CDP fence with the new list.
 func (p *Pool) PrepareEmbedded(_ context.Context, req browser.PrepareRequest) (browser.PrepareReply, error) {
 	if strings.TrimSpace(req.Project) == "" {
 		return browser.PrepareReply{}, fmt.Errorf("%w: project is required", browser.ErrBadAttach)
 	}
-	policy, err := Policy(req.Placement)
+	policy, err := EmbeddedPolicy(req.Placement)
 	if err != nil {
 		return browser.PrepareReply{}, err
 	}
@@ -123,10 +130,21 @@ func (p *Pool) PrepareEmbedded(_ context.Context, req browser.PrepareRequest) (b
 		p.mu.Unlock()
 		return browser.PrepareReply{}, fmt.Errorf("%w: %w: %s", browser.ErrEmbeddedPolicyChanged, ErrPolicyChanged, req.Project)
 	}
-	proxy, err := fence.NewEmbeddedProxy(policy)
-	if err != nil {
-		p.mu.Unlock()
-		return browser.PrepareReply{}, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
+	// An idle project keeps its proxy and only swaps the policy, so the address the shell's
+	// environment was launched with stays valid when the project gains (or loses) a site.
+	var proxy *fence.Proxy
+	if existing != nil {
+		if err := existing.proxy.SetEmbeddedPolicy(policy); err != nil {
+			p.mu.Unlock()
+			return browser.PrepareReply{}, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
+		}
+		proxy = existing.proxy
+	} else {
+		proxy, err = fence.NewEmbeddedProxy(policy)
+		if err != nil {
+			p.mu.Unlock()
+			return browser.PrepareReply{}, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
+		}
 	}
 	if p.embeddedProjects == nil {
 		p.embeddedProjects = map[string]*embeddedProject{}
@@ -141,8 +159,8 @@ func (p *Pool) PrepareEmbedded(_ context.Context, req browser.PrepareRequest) (b
 	p.mu.Unlock()
 
 	if existing != nil {
-		// Idle by the check above: nothing registered on its connection.
-		existing.shutdown()
+		// Idle by the check above: nothing registered on its connection. The proxy is the new state's.
+		existing.retire()
 	}
 	return browser.PrepareReply{ProxyAddr: proxy.Addr()}, nil
 }

@@ -17,6 +17,7 @@ import (
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/cdp/cdptest"
+	"nucleosbrowser/profile"
 )
 
 // webview stands in for the person's WebView2: a CDP endpoint plus the DevTools HTTP routes.
@@ -131,23 +132,49 @@ func TestPrepareEmbeddedIsIdempotentPerProject(t *testing.T) {
 	}
 }
 
-func TestPrepareEmbeddedWithAnotherPolicyRecreatesWhenIdleAndRefusesWhenLive(t *testing.T) {
+// The shell prepares the environment when it opens, before the project has admitted any site: that
+// must give a (closed) fence, not ErrFenceNotAttached, or no agent tab can ever open.
+func TestPrepareEmbeddedAcceptsAProjectWithNoSitesYet(t *testing.T) {
+	pool, _ := testPool(t, &fakeLauncher{}, 4)
+	reply, err := pool.PrepareEmbedded(context.Background(), browser.PrepareRequest{
+		Project: "p1", Placement: project("p1"),
+	})
+	if err != nil {
+		t.Fatalf("prepare with no sites: %v", err)
+	}
+	if reply.ProxyAddr == "" {
+		t.Fatal("no proxy address")
+	}
+	_, err = pool.PrepareEmbedded(context.Background(), browser.PrepareRequest{
+		Project:   "p2",
+		Placement: browser.Placement{Profile: profile.Ref{Kind: profile.Project, ID: "bad/id"}},
+	})
+	if !errors.Is(err, browser.ErrFenceNotAttached) {
+		t.Fatalf("invalid profile id: err = %v, want ErrFenceNotAttached", err)
+	}
+}
+
+func TestPrepareEmbeddedWithAnotherPolicySwapsInPlaceWhenIdleAndRefusesWhenLive(t *testing.T) {
 	view := newWebview(t)
 	pool, first := preparedPool(t)
 	changed := browser.PrepareRequest{Project: "p1", Placement: project("p1", "https://example.org", "https://other.example")}
 
-	// Idle: recreated, and the old proxy is gone.
+	// Idle: the same proxy, so the shell's environment stays valid, now running the new list.
 	second, err := pool.PrepareEmbedded(context.Background(), changed)
 	if err != nil {
 		t.Fatalf("idle policy change: %v", err)
 	}
-	if !stopsListening(first) {
-		t.Error("the old proxy still listens")
+	if second.ProxyAddr != first {
+		t.Errorf("idle policy change moved the proxy: %s, want %s", second.ProxyAddr, first)
 	}
 	if conn, err := net.DialTimeout("tcp", second.ProxyAddr, time.Second); err != nil {
-		t.Errorf("the new proxy does not listen: %v", err)
+		t.Errorf("the proxy does not listen: %v", err)
 	} else {
 		conn.Close()
+	}
+	again, err := pool.PrepareEmbedded(context.Background(), changed)
+	if err != nil || again.ProxyAddr != first {
+		t.Errorf("same policy again = %+v, %v; want the same address", again, err)
 	}
 
 	// Live: refused.

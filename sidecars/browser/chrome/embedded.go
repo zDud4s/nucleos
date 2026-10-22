@@ -31,7 +31,7 @@ var ErrEmbeddedOpen = errors.New("chrome: an embedded driver cannot open a targe
 // The interception and the download denial go on the browser session exactly as in Connect, and fail
 // the same way: no Driver without them.
 func ConnectEmbedded(ctx context.Context, conn *cdp.Conn, policy fence.Policy) (*Driver, error) {
-	if err := policy.Validate(); err != nil {
+	if err := policy.ValidateEmbedded(); err != nil {
 		return nil, fmt.Errorf("%w: %v", browser.ErrFenceNotAttached, err)
 	}
 

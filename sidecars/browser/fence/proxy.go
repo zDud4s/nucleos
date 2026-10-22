@@ -3,6 +3,7 @@
 package fence
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -51,7 +52,8 @@ import (
 // the CDP fence's — which is the same division this layer already makes for the site allowlist, for
 // the same reason. See decideWrite.
 type Proxy struct {
-	policy    Policy
+	// policy is swapped only on an embedded proxy, by SetEmbeddedPolicy; every request reads it once.
+	policy    atomic.Pointer[Policy]
 	listener  net.Listener
 	server    *http.Server
 	transport *http.Transport
@@ -88,7 +90,11 @@ const proxyRefusalCap = 256
 func NewProxy(policy Policy) (*Proxy, error) { return newProxy(policy, false) }
 
 func newProxy(policy Policy, embedded bool) (*Proxy, error) {
-	if err := policy.Validate(); err != nil {
+	validate := policy.Validate
+	if embedded {
+		validate = policy.ValidateEmbedded
+	}
+	if err := validate(); err != nil {
 		return nil, err
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -97,7 +103,6 @@ func newProxy(policy Policy, embedded bool) (*Proxy, error) {
 	}
 	dialer := &Dialer{Timeout: 10 * time.Second}
 	proxy := &Proxy{
-		policy:   policy,
 		embedded: embedded,
 		listener: listener,
 		dialer:   dialer,
@@ -106,12 +111,27 @@ func newProxy(policy Policy, embedded bool) (*Proxy, error) {
 		// to say, which is both a loop and a way out of the fence that nobody wrote down.
 		transport: NewTransport(dialer),
 	}
+	proxy.policy.Store(&policy)
 	proxy.server = &http.Server{
 		Handler:           http.HandlerFunc(proxy.handle),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 	go func() { _ = proxy.server.Serve(listener) }()
 	return proxy, nil
+}
+
+// SetEmbeddedPolicy replaces an embedded proxy's policy in place, so the address the shell's
+// environment was launched with stays valid when the project's site list changes. The caller swaps
+// it only while no session of the project is live; see pool.PrepareEmbedded.
+func (p *Proxy) SetEmbeddedPolicy(policy Policy) error {
+	if !p.embedded {
+		return errors.New("fence: only an embedded proxy's policy can be replaced")
+	}
+	if err := policy.ValidateEmbedded(); err != nil {
+		return err
+	}
+	p.policy.Store(&policy)
+	return nil
 }
 
 // SetPerson turns the person's switch on or off. See the person field.
@@ -168,7 +188,7 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	// answers, and for the gate run that found the two layers disagreeing.
 	verdict := Verdict{Allow: true}
 	if !p.person.Load() {
-		verdict = Decide(p.policy, Request{
+		verdict = Decide(*p.policy.Load(), Request{
 			Method:  r.Method,
 			URL:     r.URL.String(),
 			Headers: flattenHeaders(r.Header),
@@ -188,7 +208,7 @@ func (p *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !p.person.Load() {
-		if verdict := DecideTunnel(p.policy, r.Host); !verdict.Allow {
+		if verdict := DecideTunnel(*p.policy.Load(), r.Host); !verdict.Allow {
 			p.refuse(w, r.Host, verdict)
 			return
 		}

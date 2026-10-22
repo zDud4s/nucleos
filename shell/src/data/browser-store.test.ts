@@ -284,6 +284,17 @@ describe("startBrowserBridge poller resilience", () => {
     stop();
   });
 
+  it("clears the agent notice once the env is ready again", async () => {
+    emb.embeddedPrepare.mockRejectedValueOnce(new Error("fenced off"));
+    await ensureProjectAgent("p");
+    expect(getBrowserState().agentNotice.p).toBe("fenced off");
+    emb.embeddedPrepare.mockResolvedValue({ proxy_addr: "127.0.0.1:1" });
+    emb.embeddedRegister.mockResolvedValue(undefined);
+    invoke.mockResolvedValue({ cdp_http: "http://127.0.0.1:9" });
+    await ensureProjectAgent("p");
+    expect(getBrowserState().agentNotice.p).toBeUndefined();
+  });
+
   it("does not re-register when requests never worked", async () => {
     emb.embeddedPrepare.mockResolvedValue({ proxy_addr: "x" });
     emb.embeddedRegister.mockResolvedValue(undefined);

@@ -109,3 +109,45 @@ func TestIsAmbientHost(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateEmbeddedAcceptsAnEmptyProjectListThatAdmitsNothing(t *testing.T) {
+	empty := Policy{Profile: Project}
+	if err := empty.Validate(); err == nil {
+		t.Fatal("Validate accepted a project with no origins")
+	}
+	if err := empty.ValidateEmbedded(); err != nil {
+		t.Fatalf("ValidateEmbedded: %v", err)
+	}
+	verdict := Decide(empty, Request{Method: "GET", URL: "https://example.org/", ResourceType: "Document"})
+	if verdict.Allow {
+		t.Fatal("an empty list admitted a document")
+	}
+	if err := (Policy{}).ValidateEmbedded(); err == nil {
+		t.Fatal("ValidateEmbedded accepted a policy with no profile kind")
+	}
+	if err := (Policy{Profile: Project, Origins: []string{"not a host"}}).ValidateEmbedded(); err == nil {
+		t.Fatal("ValidateEmbedded accepted a malformed origin")
+	}
+}
+
+func TestSetEmbeddedPolicyIsOnlyForAnEmbeddedProxy(t *testing.T) {
+	plain, err := NewProxy(Policy{Profile: Project, Origins: []string{"https://example.org"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plain.Close()
+	if err := plain.SetEmbeddedPolicy(Policy{Profile: Project}); err == nil {
+		t.Error("a plain proxy accepted a policy swap")
+	}
+	embedded, err := NewEmbeddedProxy(Policy{Profile: Project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer embedded.Close()
+	if err := embedded.SetEmbeddedPolicy(Policy{Profile: Project, Origins: []string{"https://example.org"}}); err != nil {
+		t.Errorf("swap: %v", err)
+	}
+	if err := embedded.SetEmbeddedPolicy(Policy{}); err == nil {
+		t.Error("swap accepted a policy with no profile kind")
+	}
+}

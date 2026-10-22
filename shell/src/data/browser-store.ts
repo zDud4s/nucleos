@@ -171,7 +171,7 @@ const agentProjects = new Set<string>();
 export async function ensureProjectAgent(project: string): Promise<void> {
   agentProjects.add(project);
   const result = await ensureAgentEnv(project);
-  if (!result.ok) setAgentNotice(project, result.reason);
+  setAgentNotice(project, result.ok ? null : result.reason);
 }
 
 /** The daemon lost our registration (requests failed or 404/409/410): redo prepare/ensure/register. */

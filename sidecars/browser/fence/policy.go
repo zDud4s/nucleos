@@ -121,8 +121,22 @@ type Policy struct {
 // rather than to attachment.
 var ErrNoProfileKind = errors.New("fence: policy names no profile kind, refusing to build a fence with a default")
 
+// ValidateEmbedded is [Policy.Validate] for the shell's embedded agent environment, with one rule
+// changed: a project profile may have an empty origin list.
+//
+// The environment is prepared when the shell opens, before the project has admitted a single site,
+// and it must exist then or no agent tab can ever open. An empty list still admits nothing (see
+// [Decide]), so the fence stays closed; the reason Validate refuses it — a session that looks like a
+// broken browser — does not apply to an environment with no session in it yet. Every other rule
+// is Validate's.
+func (p Policy) ValidateEmbedded() error {
+	return p.validate(true)
+}
+
 // Validate reports whether a policy is usable. A driver refuses to exist without one.
-func (p Policy) Validate() error {
+func (p Policy) Validate() error { return p.validate(false) }
+
+func (p Policy) validate(emptyProject bool) error {
 	for _, entry := range p.Loopback {
 		if normaliseLoopback(entry) == "" {
 			return fmt.Errorf("fence: %q is not a loopback origin", entry)
@@ -146,7 +160,7 @@ func (p Policy) Validate() error {
 		}
 		return nil
 	case Project:
-		if len(p.Origins) == 0 {
+		if len(p.Origins) == 0 && !emptyProject {
 			// Not a fail-closed default worth having: it would admit no document at all, so every
 			// session on it would look like a broken browser rather than a refused one.
 			return errors.New("fence: a project profile with an empty origin list would admit no document at all")
