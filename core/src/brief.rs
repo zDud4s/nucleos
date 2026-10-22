@@ -73,13 +73,51 @@ pub fn retention_days() -> i64 {
         .unwrap_or(DEFAULT_KNOWLEDGE_TRACE_RETENTION_DAYS)
 }
 
+/// Words that carry no topic, English and Portuguese. A row that shares only these with a task
+/// text is noise: FTS5 gives a term present in most rows an idf of about 1e-6, so such a row
+/// scores about a millionth of a real match. They are compared lowercased, without quotes and
+/// without edge punctuation; anything under [`MIN_TERM_CHARS`] is dropped by length instead.
+const STOPWORDS: &[&str] = &[
+    // English
+    "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had", "her", "was",
+    "one", "our", "out", "has", "have", "with", "this", "that", "from", "they", "will", "would",
+    "there", "their", "what", "about", "which", "when", "were", "been", "into", "than", "then",
+    "them", "these", "those", "some", "such", "only", "also", "over", "your", "its", "does", "did",
+    "should", "could", "just", "how", "why", "who", "whom", "while", "where", "after", "before",
+    "each", "other", "more", "most", "very", "here", "being", "because", "between", "his", "him",
+    "she", "too", "may", "might", "must", "shall", "per", "via",
+    // Portuguese
+    "que", "para", "com", "uma", "uns", "umas", "por", "como", "mais", "mas", "dos", "das", "nos",
+    "nas", "não", "nao", "são", "sao", "foi", "ser", "ter", "tem", "está", "esta", "este", "isso",
+    "isto", "esse", "essa", "seu", "sua", "seus", "suas", "pelo", "pela", "pelos", "pelas", "num",
+    "numa", "ele", "ela", "eles", "elas", "quando", "onde", "entre", "sobre", "também", "tambem",
+    "até", "ate", "muito", "depois", "antes", "cada", "qual", "quais", "sem", "ainda", "aos",
+    "nem", "foram", "era", "estão", "estao", "têm", "tinha", "vai", "vão", "fazer",
+];
+
+/// A query term shorter than this many characters (after edge punctuation) is dropped.
+const MIN_TERM_CHARS: usize = 3;
+
+/// Whether a quoted `fts_query` term is worth searching: not a stopword, not too short.
+fn is_topical(quoted: &str) -> bool {
+    let word = quoted
+        .trim_matches('"')
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    word.chars().count() >= MIN_TERM_CHARS && !STOPWORDS.contains(&word.as_str())
+}
+
 /// Build an OR expression because an implicit FTS5 AND over a whole node prompt usually matches
 /// no row and would leave the FTS signal at zero for every candidate.
+///
+/// Stopwords and terms under [`MIN_TERM_CHARS`] characters are dropped: the task text is a whole
+/// prompt, and ORing "the" or "to" into the expression lets any row that merely contains them
+/// match. When every term is dropped there is no expression (`None`).
 fn match_expression(query: &str) -> Option<String> {
     let quoted = crate::search::fts_query(query);
-    let mut terms = Vec::new();
+    let mut terms: Vec<&str> = Vec::new();
     for term in quoted.split(' ') {
-        if term.is_empty() || terms.contains(&term) {
+        if term.is_empty() || !is_topical(term) || terms.contains(&term) {
             continue;
         }
         terms.push(term);
@@ -95,8 +133,8 @@ fn match_expression(query: &str) -> Option<String> {
 /// This divides by the best of the pass, so a real but weaker match can land far under
 /// `knowledge::MIN_RELEVANCE` (one common term against a long strong row). The embedder path
 /// keeps that value, because `s_sim` can carry such a row. When no query vector was computed,
-/// [`of_with`] lifts every matched row through [`lift_fts`] afterwards; this function itself does
-/// not change.
+/// [`of_with`] lifts the rows above [`LIFT_FLOOR`] through [`lift_fts`] afterwards; this function
+/// itself does not change.
 fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
     let raw: Vec<Option<f64>> = bm25
         .iter()
@@ -126,16 +164,29 @@ fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
         .collect()
 }
 
-/// Lift a matched row's pass-normalised FTS signal onto `[MIN_RELEVANCE, 1.0]`.
+/// The smallest pass-normalised FTS share [`lift_fts`] lifts. A bound on the lift, chosen over a
+/// top-K cut because it is independent of how many rows the scope holds.
+///
+/// A stopword-only or near-noise match has a bm25 about 1e-6 of the best (FTS5 clamps the idf of
+/// a term found in most rows to 1e-6), so it must not ride the lift into the briefing and be
+/// credited. A real selective term of the task sits far above 1% of the best.
+const LIFT_FLOOR: f64 = 0.01;
+
+/// Lift a matched row's pass-normalised FTS signal onto `[MIN_RELEVANCE, 1.0]`, but only when the
+/// row is at or above [`LIFT_FLOOR`].
 ///
 /// Used only when no query vector exists, so FTS is the only textual signal and
 /// [`normalise_fts`]'s division by the pass best would otherwise drop every real-but-weaker match
-/// under the gate. The map `MIN_RELEVANCE + (1 - MIN_RELEVANCE) * s` is affine and increasing, so
-/// ordering and ties are unchanged and a best match stays `1.0`. A row with no FTS hit (`0.0`,
-/// negative or not finite) stays `0.0` and is still dropped by the gate.
+/// under the gate. Above the floor the map `MIN_RELEVANCE + (1 - MIN_RELEVANCE) * s` is affine and
+/// increasing, so ordering and ties are unchanged and a best match stays `1.0`. A row below the
+/// floor keeps its raw value, which is under `MIN_RELEVANCE`, so the gate drops it; the map as a
+/// whole stays monotone. A row with no FTS hit (`0.0`, negative or not finite) stays `0.0`.
 fn lift_fts(s_fts: f64) -> f64 {
     if !s_fts.is_finite() || s_fts <= 0.0 {
         return 0.0;
+    }
+    if s_fts < LIFT_FLOOR {
+        return s_fts;
     }
     let floor = knowledge::MIN_RELEVANCE;
     (floor + (1.0 - floor) * s_fts.clamp(0.0, 1.0)).clamp(floor, 1.0)
@@ -275,8 +326,8 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
 
 /// [`of`] with the embedder and its deadline injected. One query embedding per briefing; a
 /// timeout, an error or a missing vector leaves every `s_sim` at zero and the weights as before.
-/// With no query vector, matched rows' `s_fts` is lifted onto `[MIN_RELEVANCE, 1.0]` (see
-/// [`lift_fts`]); with one, `s_fts` is the plain pass-normalised value.
+/// With no query vector, `s_fts` of rows at or above [`LIFT_FLOOR`] is lifted onto
+/// `[MIN_RELEVANCE, 1.0]` (see [`lift_fts`]); with one, `s_fts` is the plain pass-normalised value.
 /// Only the error kind is logged, never the query, a title, a body or a vector.
 pub(crate) async fn of_with(
     pool: &SqlitePool,
@@ -345,8 +396,9 @@ pub(crate) async fn of_with(
         };
         return Ok(knowledge::select(&known, &context, &Budget::default()));
     }
-    // FTS is the only textual signal here: lift every matched row over the relevance gate, see
-    // `lift_fts`. Unmatched rows stay at 0.0 and are still dropped.
+    // FTS is the only textual signal here: lift every row at or above `LIFT_FLOOR` over the
+    // relevance gate, see `lift_fts`. Unmatched rows stay at 0.0 and near-noise rows below the
+    // floor keep their raw value; the gate drops both.
     for candidate in known.iter_mut() {
         candidate.s_fts = lift_fts(candidate.s_fts);
     }
@@ -904,9 +956,9 @@ mod tests {
     use sqlx::{Row, SqlitePool};
 
     use super::{
-        SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, lift_fts,
-        match_expression, normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most,
-        trace_of,
+        LIFT_FLOOR, MAX_QUERY_TERMS, SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks,
+        item_verdict, lift_fts, match_expression, normalise_fts, of, prune, record, run_verdict,
+        sweep, sweep_at_most, trace_of,
     };
     use crate::execution::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
@@ -1161,7 +1213,34 @@ mod tests {
 
         assert_eq!(match_expression(""), None);
         assert_eq!(match_expression("\"\" \""), None);
-        assert_eq!(match_expression("a b a"), Some("\"a\" OR \"b\"".into()));
+        // Every term of this one is a stopword or under three characters: no expression at all.
+        assert_eq!(match_expression("a b a"), None);
+        assert_eq!(match_expression("the to of and is"), None);
+        assert_eq!(match_expression("zan b zan"), Some("\"zan\"".into()));
+    }
+
+    #[test]
+    fn stopwords_and_short_tokens_never_reach_the_match_expression() {
+        assert_eq!(
+            match_expression("The zanzibar rollout to the migration, and a db"),
+            Some("\"zanzibar\" OR \"rollout\" OR \"migration,\"".into())
+        );
+        // Portuguese stopwords, matched on the lowercased word.
+        assert_eq!(
+            match_expression("Para a migração COM o zanzibar"),
+            Some("\"migração\" OR \"zanzibar\"".into())
+        );
+        // The dedupe and the cap still apply to what is left.
+        assert_eq!(
+            match_expression("zanzibar the zanzibar"),
+            Some("\"zanzibar\"".into())
+        );
+        let many = (0..MAX_QUERY_TERMS + 10)
+            .map(|n| format!("term{n}"))
+            .collect::<Vec<_>>()
+            .join(" the ");
+        let expression = match_expression(&many).expect("the terms are topical");
+        assert_eq!(expression.split(" OR ").count(), MAX_QUERY_TERMS);
     }
 
     #[tokio::test]
@@ -1178,8 +1257,13 @@ mod tests {
 
     const LIFT_QUERY: &str = "zanzibar rollout migration shared";
 
-    /// One long strong match, five rows sharing only the common term `shared`, two rows that
-    /// match nothing. Returns `(strong, weak, unmatched)` ids; every row is active and in `p1`.
+    /// One long strong match, five rows sharing only the term `shared`, fourteen rows that match
+    /// nothing. Returns `(strong, weak, unmatched)` ids; every row is active and in `p1`.
+    ///
+    /// `shared` is a real, selective term here: it sits in 6 of 20 rows, so FTS5 gives it a
+    /// positive idf (about 0.8; a term in more than half the rows is clamped to 1e-6, which is what
+    /// a stopword looks like). A weak row therefore lands well above [`LIFT_FLOOR`] and under
+    /// `MIN_RELEVANCE` before the lift, which is the case the lift exists for.
     async fn seed_lift_corpus(pool: &SqlitePool) -> sqlx::Result<(i64, Vec<i64>, Vec<i64>)> {
         async fn row(pool: &SqlitePool, title: &str, body: &str) -> sqlx::Result<i64> {
             let result = sqlx::query(
@@ -1213,7 +1297,7 @@ mod tests {
             );
         }
         let mut unmatched = Vec::new();
-        for n in 0..2 {
+        for n in 0..14 {
             unmatched.push(
                 row(
                     pool,
@@ -1248,7 +1332,8 @@ mod tests {
         let pool = test_pool().await;
         let (strong, weak, _unmatched) = seed_lift_corpus(&pool).await?;
 
-        // The collapse this lift answers: every weak match is real (> 0) yet under the gate.
+        // The collapse this lift answers: every weak match is real (a selective term, so above
+        // the lift floor) yet under the gate.
         let mut ids = vec![strong];
         ids.extend(&weak);
         let plain = plain_fts(&pool, &ids).await?;
@@ -1256,7 +1341,7 @@ mod tests {
         assert!(
             plain[1..]
                 .iter()
-                .all(|s| *s > 0.0 && *s < crate::knowledge::MIN_RELEVANCE),
+                .all(|s| *s >= LIFT_FLOOR && *s < crate::knowledge::MIN_RELEVANCE),
             "{plain:?}"
         );
 
@@ -1316,12 +1401,75 @@ mod tests {
         assert_eq!(lift_fts(f64::NEG_INFINITY), 0.0);
         assert_eq!(lift_fts(1.0), 1.0);
         assert_eq!(lift_fts(2.0), 1.0);
-        assert!(lift_fts(1e-8) >= floor);
 
-        let samples = [1e-8, 1e-6, 0.01, 0.0915, 0.1, 0.25, 0.5, 0.9, 1.0];
+        // From the floor up the map is strictly increasing and lands on `[MIN_RELEVANCE, 1.0]`.
+        let samples = [LIFT_FLOOR, 0.0915, 0.1, 0.25, 0.5, 0.9, 1.0];
         let lifted: Vec<f64> = samples.iter().map(|s| lift_fts(*s)).collect();
         assert!(lifted.windows(2).all(|pair| pair[0] < pair[1]), "{lifted:?}");
         assert!(lifted.iter().all(|s| (floor..=1.0).contains(s)));
+        assert_eq!(lifted[lifted.len() - 1], 1.0);
+    }
+
+    #[test]
+    fn fts_lift_leaves_a_row_under_its_floor_at_the_raw_value() {
+        let floor = crate::knowledge::MIN_RELEVANCE;
+        // Just under the floor: not lifted, so the gate still drops it.
+        let under = LIFT_FLOOR * 0.99;
+        assert_eq!(lift_fts(under), under);
+        assert!(lift_fts(under) < floor);
+        for noise in [1e-12, 1e-8, 1e-6, 1e-3] {
+            assert_eq!(lift_fts(noise), noise);
+            assert!(lift_fts(noise) < floor);
+        }
+        // At the floor it is lifted onto the gate and above.
+        assert!(lift_fts(LIFT_FLOOR) >= floor);
+        // Monotone across the floor: nothing under it outranks anything at or above it.
+        assert!(lift_fts(under) < lift_fts(LIFT_FLOOR));
+    }
+
+    /// A row that shares only stopwords with the task text must not be briefed on the no-embedder
+    /// path. Before the stopword filter, `the`/`to` were ORed into the expression and the row
+    /// matched, then rode the lift over the relevance gate and was credited.
+    #[tokio::test]
+    async fn a_row_matching_only_stopwords_is_not_briefed_without_an_embedder()
+    -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let real = seed(&pool, "project", Some("p1"), "zanzibar rollout migration").await?;
+        let noise = seed(
+            &pool,
+            "project",
+            Some("p1"),
+            "the plan to move the cache to the new region",
+        )
+        .await?;
+        let query = "the zanzibar rollout to the migration";
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            query,
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        assert!(trace_row(&brief, real).shown);
+        let noise_row = trace_row(&brief, noise);
+        assert_eq!(noise_row.s_fts, 0.0, "the stopwords are not searched");
+        assert!(!noise_row.shown);
+        let block = brief.block.as_deref().unwrap_or_default();
+        assert!(block.contains("zanzibar rollout migration") && !block.contains("new region"));
+
+        // A task text made only of stopwords and short tokens briefs nothing through FTS.
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            "the to of and a",
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        assert!(brief.trace.iter().all(|row| row.s_fts == 0.0 && !row.shown));
+        Ok(())
     }
 
     #[tokio::test]
