@@ -2,7 +2,11 @@ mod cli;
 mod http;
 mod startup;
 
+use nucleos_app::*;
 use nucleos_core::*;
+// Both crates have a `channels`; the app's is the lib's plus ingest, media and commands, so name it
+// explicitly or the two globs collide (this import also makes `crate::channels` in `http` resolve).
+use nucleos_app::channels;
 
 use auth::Token;
 use state::AppState;
@@ -815,9 +819,13 @@ async fn main() {
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         fleet: Default::default(),
+        turns: Default::default(),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
+    // Voice and the browser panel start turns through this hook; `nucleos-core` cannot name the
+    // assistant. The slot is shared by every clone of the state, so installing it here covers them all.
+    assistant::install_turns(&state);
 
     let app = http::build_router(state.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", daemon_client::port()))

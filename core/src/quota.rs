@@ -809,7 +809,7 @@ fn take_prune_turn(guard: &std::sync::Mutex<Option<DateTime<Utc>>>, now: DateTim
 }
 
 /// Delete history older than [`HISTORY_RETENTION_DAYS`]. Returns how many rows went.
-pub(crate) async fn prune_history(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
+pub async fn prune_history(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
     let cutoff = (now - Duration::days(HISTORY_RETENTION_DAYS)).to_rfc3339();
     sqlx::query("DELETE FROM quota_history WHERE recorded_at < ?")
         .bind(cutoff)
@@ -1304,6 +1304,7 @@ mod tests {
             )),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,

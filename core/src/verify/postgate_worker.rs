@@ -176,7 +176,7 @@ async fn target_tip(
 }
 
 /// Names a failing unit that has no group: the project's `gate_command`.
-pub(crate) const GATE_UNIT: &str = "gate_command";
+pub const GATE_UNIT: &str = "gate_command";
 
 /// What one tick did for one project.
 #[derive(Debug, PartialEq, Eq)]
@@ -319,10 +319,15 @@ async fn tick_project(
 
     // After a change of land target the stored shas describe another branch: start fresh.
     let stored = state.as_ref().filter(|s| s.target == target.as_str());
+    // A tip whose gate measured nothing is not up to date yet: it reads as never attempted, so
+    // `decide` starts it again, within the retry budget.
+    let retry = stored.is_some_and(|s| s.unmeasured_retry_due(&tip));
     let view = TargetState {
         tip: &tip,
         last_green: stored.and_then(|s| s.last_green_sha.as_deref()),
-        last_attempted: stored.and_then(|s| s.last_attempted_sha.as_deref()),
+        last_attempted: stored
+            .filter(|_| !retry)
+            .and_then(|s| s.last_attempted_sha.as_deref()),
         running: false,
     };
     // F3-12: a new tip is covered when a daemon `verify` passed on its exact tree over a base the
@@ -539,7 +544,14 @@ async fn follow(pool: &sqlx::SqlitePool, project_id: &str, sha: &str, request: i
         }
         other => {
             let reason = format!("ticket {request} ended without a verdict ({other:?})");
-            give_up(pool, project_id, sha, reason).await
+            tracing::warn!(project = project_id, sha, %reason, "postgate: gate measured nothing");
+            match verify_postgate::abandon_unmeasured(pool, project_id, sha).await {
+                Ok(_) => Step::Abandoned {
+                    sha: sha.to_owned(),
+                    reason,
+                },
+                Err(error) => Step::Failed(format!("cannot abandon the gate for {sha}: {error}")),
+            }
         }
     }
 }
@@ -1431,6 +1443,47 @@ mod tests {
             Some(Step::Idle(crate::verify::batch::Idle::UpToDate))
         );
         assert_eq!(count(&f.pool, "verify_requests").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_ends_without_a_verdict_runs_the_same_tip_once_more() {
+        // No executor: each gate unit stays queued until the test errors it, as a timeout would.
+        let f = fixture(Some(GATE_ON)).await;
+
+        for run in 1..=2 {
+            let step = tick_until(&f, |s| matches!(s, Step::Started { .. })).await;
+            assert!(matches!(step, Step::Started { ref sha, .. } if *sha == f.tip));
+            sqlx::query(
+                "UPDATE verify_runs SET status = 'errored', finished_at = ?, output_tail = 'timeout' \
+                 WHERE status = 'queued'",
+            )
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&f.pool)
+            .await
+            .unwrap();
+            let step = tick_until(&f, |s| matches!(s, Step::Abandoned { .. })).await;
+            assert!(matches!(step, Step::Abandoned { ref sha, .. } if *sha == f.tip));
+
+            let s = verify_postgate::load(&f.pool, "alpha")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(s.running_sha, None, "the slot is released");
+            assert_eq!(s.last_attempted_sha.as_deref(), Some(f.tip.as_str()));
+            assert_eq!(s.last_green_sha, None);
+            assert_eq!(s.unmeasured_runs, run);
+        }
+
+        // The retry measured nothing either: the tip is left alone until a new merge.
+        assert_eq!(
+            step_of(&f).await,
+            Some(Step::Idle(crate::verify::batch::Idle::UpToDate))
+        );
+        assert_eq!(
+            count(&f.pool, "verify_requests").await,
+            2,
+            "one gate and one retry"
+        );
     }
 
     /// How many `verify_runs` units a given caller label produced.

@@ -16,7 +16,7 @@ use crate::channels::{replies, routing, streaming};
 use crate::state::AppState;
 
 /// What one request answered.
-pub(crate) struct Reply {
+pub struct Reply {
     pub status: StatusCode,
     pub content_type: Option<String>,
     pub bytes: Vec<u8>,
@@ -30,7 +30,7 @@ impl Reply {
 }
 
 /// One request through the channel routes and the real token middleware, as whoever holds `key`.
-pub(crate) async fn request(
+pub async fn request(
     state: &AppState,
     key: &str,
     method: &str,
@@ -73,7 +73,7 @@ pub(crate) async fn request(
 }
 
 /// An adapter of one channel, holding that channel's own key.
-pub(crate) struct FakeAdapter {
+pub struct FakeAdapter {
     state: AppState,
     channel: &'static str,
     key: String,
@@ -214,7 +214,7 @@ impl FakeAdapter {
 // ---- the `core` stimuli of the capability scenarios (Anexo C, C.10.1) --------------------------
 
 /// What a stimulus did: `Err` names why it could not be applied.
-pub(crate) type Stimulated = Result<(), String>;
+pub type Stimulated = Result<(), String>;
 
 fn db(error: sqlx::Error) -> String {
     format!("database error: {error}")
@@ -247,7 +247,7 @@ async fn announce(state: &AppState) -> Stimulated {
 
 /// Registers a media blob the scenario can name in `send_parts` (only the row, never the bytes:
 /// degradation reads the display name, the adapter would read the file).
-pub(crate) async fn register_media(
+pub async fn register_media(
     state: &AppState,
     channel: &str,
     id: &str,
@@ -433,7 +433,7 @@ async fn send_parts(state: &AppState, conversation: &str, parts: &Value) -> Stim
 }
 
 /// Applies one `core` stimulus of a scenario to the test state, discriminated by `do`.
-pub(crate) async fn stimulate(state: &AppState, stimulus: &Value) -> Stimulated {
+pub async fn stimulate(state: &AppState, stimulus: &Value) -> Stimulated {
     match stimulus["do"].as_str() {
         Some("proposal_pending") => {
             let id = number_of(stimulus, "proposal_id")?;

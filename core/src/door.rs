@@ -17,7 +17,7 @@ use crate::state::AppState;
 
 /// The folder root, or a refusal when startup could not create it.
 ///
-/// `pub(crate)` because a second pillar with a loop of its own now reads the same root, and the one
+/// `pub` because a second pillar with a loop of its own now reads the same root, and the one
 /// thing worth sharing is the 503: an installation with no files folder must answer the same way
 /// whichever route asked. The field itself lives on `AppState` rather than in any one pillar's
 /// runtime — see the doc there for why it stopped being the mail pillar's.

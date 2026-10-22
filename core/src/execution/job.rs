@@ -68,7 +68,7 @@ mod views;
 pub use self::agent_launcher::CatalogAgentLauncher;
 use self::brakes::*;
 pub use self::decide::*;
-pub(crate) use self::decide::{Halt, batch_over, failed_ending_of, never_lands, queue_halt};
+pub use self::decide::{Halt, batch_over, failed_ending_of, never_lands, queue_halt};
 pub use self::dispatch::{
     AgentNodeLauncher, EnginePin, LaunchRefused, NodeCtx, NodeLaunch, OutputCheck, ProtocolAndBody,
     composed_protocol, install_launcher, launcher, read_body, retry_prompt,
@@ -197,6 +197,7 @@ mod tests {
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };
@@ -9335,10 +9336,8 @@ tests:
             ("live_statuses_sql!", live_statuses_sql!()),
             ("LIVE_JOBS_SQL", LIVE_JOBS_SQL),
             ("LIVE_WHERE_SQL", LIVE_WHERE_SQL),
-            (
-                "analytics_pipeline::jobs::LIVE_ITEMS_SQL",
-                crate::analytics_pipeline::jobs::LIVE_ITEMS_SQL,
-            ),
+            // analytics_pipeline::jobs::LIVE_ITEMS_SQL is checked by its own module's tests: it
+            // lives in `nucleos-app`, which this crate's tests cannot see.
         ];
         for (name, sql) in sql_lists {
             for word in PHASE_WORDS {

@@ -128,12 +128,22 @@ pub struct State {
     pub covered_sha: Option<String>,
     /// Why a gate start is being held right now (`"interval"` / `"busy"`), until a gate starts.
     pub held_note: Option<String>,
+    /// How many gates of `last_attempted_sha` ended without a verdict.
+    pub unmeasured_runs: i64,
 }
 
 impl State {
     /// A gate is running for this project.
     pub fn running(&self) -> bool {
         self.running_sha.is_some()
+    }
+
+    /// `tip` was attempted, every gate of it ended without a verdict, and it is still within
+    /// [`UNMEASURED_RETRIES`]: the worker gates it once more instead of calling it up to date.
+    pub fn unmeasured_retry_due(&self, tip: &str) -> bool {
+        self.last_attempted_sha.as_deref() == Some(tip)
+            && !self.is_green(tip)
+            && (1..=UNMEASURED_RETRIES).contains(&self.unmeasured_runs)
     }
 
     /// The post-land gate has judged `sha` green: it is the last green sha, or a tip a daemon
@@ -204,6 +214,7 @@ struct Row {
     fix_run_id: Option<i64>,
     covered_sha: Option<String>,
     held_note: Option<String>,
+    unmeasured_runs: i64,
 }
 
 /// A JSON column that cannot be decoded reads as empty, with a warning, like `red_groups`.
@@ -272,6 +283,7 @@ impl From<Row> for State {
             fix_run_id: row.fix_run_id,
             covered_sha: row.covered_sha,
             held_note: row.held_note,
+            unmeasured_runs: row.unmeasured_runs,
         }
     }
 }
@@ -283,7 +295,7 @@ pub async fn load(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Option<St
                 running_request_id, red_groups, red_since_sha, red_phase, red_sha, red_base_sha, \
                 probe_sha, probe_request_id, probes, reported_sha, culprit_sha, candidates, \
                 also_suspect, revert_merge_sha, revert_request_id, revert_sha, fix_branch, \
-                fix_run_id, covered_sha, held_note \
+                fix_run_id, covered_sha, held_note, unmeasured_runs \
          FROM postgate_state WHERE project_id = ?",
     )
     .bind(project_id)
@@ -310,6 +322,9 @@ pub async fn start(
                  (SELECT COALESCE(MAX(id), 0) FROM verify_requests)) \
          ON CONFLICT(project_id) DO UPDATE SET \
              target = excluded.target, \
+             unmeasured_runs = CASE \
+                 WHEN postgate_state.last_attempted_sha = excluded.last_attempted_sha \
+                 THEN postgate_state.unmeasured_runs ELSE 0 END, \
              last_attempted_sha = excluded.last_attempted_sha, \
              running_sha = excluded.running_sha, \
              running_request_id = excluded.running_request_id, \
@@ -394,7 +409,7 @@ async fn read_before(conn: &mut sqlx::SqliteConnection, project_id: &str) -> sql
 /// repeated call never reaches it and cannot duplicate a row.
 // Eight plain columns of one row; a struct used once would only rename them.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_transition(
+pub async fn record_transition(
     conn: &mut sqlx::SqliteConnection,
     project_id: &str,
     was_red: bool,
@@ -562,6 +577,30 @@ pub async fn abandon(pool: &SqlitePool, project_id: &str, sha: &str) -> sqlx::Re
     Ok(done.rows_affected() > 0)
 }
 
+/// How many more gates a tip gets after its gate ended without a verdict. One: a timeout on a
+/// loaded machine is worth a second run, and a gate that errors every time must not loop.
+pub const UNMEASURED_RETRIES: i64 = 1;
+
+/// Like [`abandon`], for a gate whose ticket finished without a verdict: it also counts the run in
+/// `unmeasured_runs`, which earns the tip [`UNMEASURED_RETRIES`] more gates.
+pub async fn abandon_unmeasured(
+    pool: &SqlitePool,
+    project_id: &str,
+    sha: &str,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE postgate_state SET \
+             running_sha = NULL, running_request_id = NULL, running_started_at = NULL, \
+             unmeasured_runs = unmeasured_runs + 1, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND running_sha = ?",
+    )
+    .bind(project_id)
+    .bind(sha)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// Marks `sha` green without running a gate (`verify_batch`'s `MarkCovered`: the full gate
 /// already passed on exactly that sha before it was published). Starts nothing and leaves a
 /// running gate untouched. Writes the `→ green` transition in the same transaction when the
@@ -626,7 +665,7 @@ pub async fn settle_covered(
     let mut tx = pool.begin().await?;
     let done = sqlx::query(
         "UPDATE postgate_state SET \
-             covered_sha = ?1, last_attempted_sha = ?1, held_note = NULL, \
+             covered_sha = ?1, last_attempted_sha = ?1, held_note = NULL, unmeasured_runs = 0, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE project_id = ?2 AND target = ?3 \
            AND running_sha IS NULL AND red_phase IS NULL \
@@ -1129,6 +1168,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unmeasured_gate_earns_its_tip_one_retry_and_a_new_tip_starts_from_zero() {
+        let pool = crate::testdb::fresh_pool().await;
+        assert!(start(&pool, "p", "master", "a1", Some(1)).await.unwrap());
+        assert!(abandon_unmeasured(&pool, "p", "a1").await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.unmeasured_runs, 1);
+        assert!(s.unmeasured_retry_due("a1"));
+        assert!(
+            !s.unmeasured_retry_due("b2"),
+            "only the attempted tip is retried"
+        );
+
+        // The retry of the same tip keeps the count; a second unmeasured run spends the budget.
+        assert!(start(&pool, "p", "master", "a1", Some(2)).await.unwrap());
+        assert!(abandon_unmeasured(&pool, "p", "a1").await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.unmeasured_runs, 2);
+        assert!(!s.unmeasured_retry_due("a1"));
+
+        assert!(start(&pool, "p", "master", "b2", Some(3)).await.unwrap());
+        assert_eq!(load(&pool, "p").await.unwrap().unwrap().unmeasured_runs, 0);
+    }
+
+    #[tokio::test]
     async fn a_second_start_while_one_is_running_is_refused() {
         let pool = crate::testdb::fresh_pool().await;
         assert!(start(&pool, "p", "master", "a1", Some(1)).await.unwrap());
@@ -1551,6 +1614,7 @@ mod tests {
             fix_run_id: None,
             covered_sha: None,
             held_note: None,
+            unmeasured_runs: 0,
         };
         assert_eq!(
             state.already_failing("core").as_deref(),

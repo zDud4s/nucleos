@@ -192,7 +192,7 @@ const MAX_QUOTED_VERDICT: usize = 120;
 /// document rather than over the answer; a daemon that died because a reason happened to be the
 /// wrong length would be invisible until the one decision that triggered it, and then fatal.
 ///
-/// `pub(crate)` for [`crate::map::anchor`], which cuts a file's opening comment, a model's one-line
+/// `pub` for [`crate::map::anchor`], which cuts a file's opening comment, a model's one-line
 /// reason and a quoted-back bad answer against three different ceilings and needs the same
 /// character-boundary rule for all three. Shared rather than respelled for `map_intent::json_object`'s
 /// reason: two spellings of *cut this visibly and do not panic doing it* would agree only while

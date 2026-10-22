@@ -34,10 +34,8 @@ static WARMUP_HELD: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::n
 /// warm-up's slot drains on release, so a message queued then is still sent).
 const WARMUP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Takes a lock a panic poisoned anyway: the data is still there and the next caller needs it.
-pub(super) fn relock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+// Moved down with the process barrier it guards; kept nameable here for the rest of the module.
+pub(super) use crate::assistant_types::relock;
 
 /// Chats whose waiting messages must not be sent on their own: after a Stop, or after a send that
 /// failed. Cleared when the person sends again.

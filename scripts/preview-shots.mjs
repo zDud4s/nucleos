@@ -199,6 +199,9 @@ socket.onmessage = (message) => {
   }
 };
 
+/** The force graph sets this once its layout has settled and been fitted. */
+const SETTLED = ".brain-force[data-settled=true]";
+
 function send(method, params = {}, sessionId) {
   const id = ++nextId;
   return new Promise((ok, no) => {
@@ -242,7 +245,7 @@ await mkdir(SHOTS, { recursive: true });
  * that reads well above the fold and falls apart below it is exactly the defect
  * a viewport-sized screenshot hides.
  */
-async function shoot(name, { path, tab, press, drag, hover, window: windowKind, viewport, theme = "dark" }) {
+async function shoot(name, { path, tab, press, drag, hover, window: windowKind, viewport, waitFor, theme = "dark" }) {
   await send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-color-scheme", value: theme }],
   }, sessionId);
@@ -329,6 +332,17 @@ async function shoot(name, { path, tab, press, drag, hover, window: windowKind, 
       // One beat for the reflow, and one for anything that measures itself.
       await new Promise((ok) => setTimeout(ok, 350));
     }
+  }
+
+  // A shot of something that settles on its own (the force graph) waits for the selector, then a
+  // beat for the fit that follows the settle to be painted.
+  if (waitFor !== undefined) {
+    const until = Date.now() + READY_TIMEOUT;
+    while (!(await evaluate(`document.querySelector(${JSON.stringify(waitFor)}) !== null`).catch(() => false))) {
+      if (Date.now() > until) throw new Error(name + ": never matched " + waitFor);
+      await new Promise((ok) => setTimeout(ok, 100));
+    }
+    await new Promise((ok) => setTimeout(ok, 400));
   }
 
   /*
@@ -427,6 +441,10 @@ const SHOTS_TO_TAKE = [
   // The Brain's queue: a row per scope kind, each with the scope it would be approved into.
   ["14-brain-waiting", { path: "/brain" }],
   ["14a-brain-waiting-light", { path: "/brain", theme: "light" }],
+  // The Brain's Graph view: full-bleed canvas with per-kind node colours, then with a note selected.
+  ["14b-brain-graph", { path: "/brain?view=graph", waitFor: SETTLED }],
+  ["14c-brain-graph-light", { path: "/brain?view=graph", theme: "light", waitFor: SETTLED }],
+  ["14d-brain-graph-node", { path: "/brain?view=graph&item=note:1", waitFor: SETTLED }],
   ["14-catalogue-new", { path: "/agents", press: "New agent" }],
 
   /* The inspector. Four views over four deliberately awkward projects: `alpha`

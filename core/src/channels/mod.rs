@@ -3,40 +3,27 @@
 
 pub mod access;
 pub mod bus;
-pub mod commands;
-#[cfg(test)]
-pub(crate) mod conformance;
 pub mod contract;
-#[cfg(test)]
-pub(crate) mod fake;
-pub mod ingest;
-pub mod media;
 pub mod outbox;
-#[cfg(test)]
-mod port_tests_commands;
-#[cfg(test)]
-mod port_tests_flow;
 pub mod registry;
 pub mod replies;
 pub mod routing;
 #[cfg(test)]
-pub(crate) mod schema;
+pub mod schema;
 pub mod streaming;
 pub mod strings;
 #[cfg(test)]
 mod switch_tests;
 pub mod telegram_switch;
-#[cfg(test)]
-pub(crate) mod testkit;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod tokens;
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::RwLock;
-use std::time::Duration;
 
 use axum::Router;
-use chrono::Utc;
 
 use crate::state::AppState;
 
@@ -52,7 +39,7 @@ pub struct ChannelsRuntime {
     pub presence: registry::Presence,
     /// `~/.nucleos/channels/<id>.yaml`, read at startup and re-read by [`ChannelsRuntime::reload`]
     /// when the app writes one (a hand edit on disk still needs a restart).
-    pub(crate) configs: RwLock<HashMap<&'static str, registry::ChannelConfig>>,
+    pub configs: RwLock<HashMap<&'static str, registry::ChannelConfig>>,
 }
 
 impl ChannelsRuntime {
@@ -85,39 +72,64 @@ impl ChannelsRuntime {
     }
 }
 
-/// The routes of the hub, merged into `protected` by `http.rs` (behind `require_token`).
+/// The routes of the hub that live in `nucleos-core`: the outbox and the access management. The
+/// ingest and media routes sit in `nucleos-app` (they drive assistant turns), whose
+/// `channels::routes()` merges these and is what `http.rs` mounts.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .merge(ingest::routes())
-        .merge(media::routes())
         .merge(outbox::routes())
         .merge(access::routes())
 }
 
-/// Spawned once from `main.rs`: every retention TTL, hourly, in one loop.
-pub async fn run_housekeeping(state: AppState) {
-    let mut tick = tokio::time::interval(Duration::from_secs(3600));
-    loop {
-        tick.tick().await;
-        let now = Utc::now();
-        let pool = &state.pool;
-        let results = [
-            ("ingest", ingest::prune(pool, now).await),
-            (
-                "media",
-                media::prune(pool, state.files_root.as_deref(), now).await,
-            ),
-            ("access", access::prune(pool, now).await),
-            ("outbox", outbox::prune(pool, now).await),
-            ("tokens", tokens::prune(pool, now).await),
-            ("replies", replies::prune(pool, now).await),
-        ];
-        for (what, result) in results {
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "channel housekeeping: {what} prune failed");
-            }
-        }
+/// The channel a request speaks for, taken from the authenticated scope and never from the body
+/// (section 7.3). Only a channel's own key is admitted: the control key has no channel to speak for
+/// and gets a bare 403, and a key on another channel's path (which `require_token` already refuses)
+/// gets the `channel_mismatch` body.
+// The refusal is a ready-made HTTP response the caller returns as is; boxing it would only add noise.
+#[allow(clippy::result_large_err)]
+pub fn own_channel(
+    scope: &crate::auth::Scope,
+    named: &str,
+) -> Result<&'static str, axum::response::Response> {
+    use crate::auth::{Scope, Service};
+    use axum::Json;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match scope {
+        Scope::Service(Service::Channel(id)) if *id == named => Ok(*id),
+        Scope::Service(Service::Channel(_)) => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "channel_mismatch" })),
+        )
+            .into_response()),
+        _ => Err(StatusCode::FORBIDDEN.into_response()),
     }
+}
+
+/// The 400 of T9: `{error, at}` from a failed decode.
+pub fn contract_error(error: contract::ContractError) -> axum::response::Response {
+    use axum::Json;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    (
+        StatusCode::BAD_REQUEST,
+        Json(contract::ErrorResponse::from(error)),
+    )
+        .into_response()
+}
+
+/// The name a media row is shown under: its stored name, else its mime. Lives here, not in the
+/// app's `media` module, because the outbox degrades unsendable media parts to text with it.
+pub async fn display_name<'e, E>(executor: E, media_id: &str) -> sqlx::Result<Option<String>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT name, mime FROM channel_media WHERE id = ?")
+            .bind(media_id)
+            .fetch_optional(executor)
+            .await?;
+    Ok(row.map(|(name, mime)| name.filter(|n| !n.is_empty()).unwrap_or(mime)))
 }
 
 #[cfg(test)]

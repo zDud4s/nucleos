@@ -33,7 +33,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn get_live(State(state): State<AppState>) -> Response {
-    let hub = state.fleet.hub(&state);
+    let hub = super::hub::hub(&state);
     let subscription = hub.subscribe().await;
     let (reader, writer) = tokio::io::duplex(PIPE_BYTES);
     tokio::spawn(pump(subscription, writer));
@@ -97,7 +97,7 @@ async fn get_transcript(
     Path(id): Path<String>,
     Query(query): Query<TranscriptQuery>,
 ) -> Response {
-    let hub = state.fleet.hub(&state);
+    let hub = super::hub::hub(&state);
     match hub.transcript(&id, query.before).await {
         Ok(page) => Json(page).into_response(),
         Err(TranscriptError::UnknownNode) => refusal(StatusCode::NOT_FOUND, "unknown_node"),
@@ -110,7 +110,7 @@ async fn get_transcript(
 }
 
 async fn set_pin(state: AppState, root_id: String, on: bool) -> Response {
-    let hub = state.fleet.hub(&state);
+    let hub = super::hub::hub(&state);
     match hub.pin(&root_id, on).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(PinError::Unknown) => refusal(StatusCode::NOT_FOUND, "unknown_node"),
@@ -167,7 +167,7 @@ mod tests {
             HubConfig::default(),
         );
         let state = crate::channels::testkit::state().await;
-        state.fleet.install(hub.clone());
+        crate::fleet::hub::install(&state.fleet, hub.clone());
         Fixture {
             state,
             hub,

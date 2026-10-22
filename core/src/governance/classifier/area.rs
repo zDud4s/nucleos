@@ -61,7 +61,7 @@ impl Area {
 impl Area {
     /// The same area with more roots, for a measurement that has to rebuild checkouts the disk no
     /// longer holds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub fn with_roots(mut self, roots: &[PathBuf]) -> Self {
         let more = Self::new(roots, None);
         self.roots.extend(more.roots);

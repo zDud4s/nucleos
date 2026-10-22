@@ -30,9 +30,9 @@ pub use self::publish::*;
 pub use self::repo::*;
 pub use self::resolution::*;
 pub use self::transport::*;
-pub(crate) use self::worktrees::*;
+pub use self::worktrees::*;
 
-// `pub(crate)` on the TEST module only, so nothing about this module's production surface widens.
+// `pub` on the TEST module only, so nothing about this module's production surface widens.
 // `vcs.rs`'s end-to-end test needs a real repository with a branch to merge, and the alternative is a
 // fifth copy of `init_contained_repo` — four already exist in this crate. Sharing the four helpers
 // `vcs.rs` reaches for (`repo_with_a_branch_to_merge`, `space_free_tempdir`, `WorktreeRootEnv`,
@@ -72,7 +72,7 @@ pub mod testkit {
             .expect("create space-free tempdir")
     }
 
-    /// `pub(crate)` for `runs.rs`, which needs a real repository to test the approval path against —
+    /// `pub` for `runs.rs`, which needs a real repository to test the approval path against —
     /// the same reason `space_free_tempdir` above is.
     pub fn initialize_repo(repo: &Path) {
         std::fs::create_dir_all(repo).expect("create repository directory");
@@ -174,7 +174,7 @@ pub mod tests {
     }
 
     impl WorktreeRootEnv {
-        // `pub(crate)` on the associated function as well as the struct: the struct alone gives
+        // `pub` on the associated function as well as the struct: the struct alone gives
         // `error[E0624]: associated function 'set' is private` at `vcs.rs`'s call site.
         pub fn set(path: &Path) -> Self {
             let previous = std::env::var_os("NUCLEOS_WORKTREE_ROOT");

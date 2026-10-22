@@ -644,10 +644,7 @@ pub(super) type RoundColumns = (
 /// `budget_usd.is_some()` alone would exempt a scheduled job that happens to carry an allowance,
 /// which is exactly the proactive autonomy the house limits exist for. Only together do they mean:
 /// a person decided this should happen, and said how far it may go.
-pub(crate) fn commissioned_with_an_allowance(
-    rule_name: Option<&str>,
-    budget_usd: Option<f64>,
-) -> bool {
+pub fn commissioned_with_an_allowance(rule_name: Option<&str>, budget_usd: Option<f64>) -> bool {
     rule_name.is_none() && budget_usd.is_some()
 }
 

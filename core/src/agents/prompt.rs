@@ -34,7 +34,7 @@ pub struct ProjectContext {
 
 /// `text` cut to its first `limit` characters, with a marker saying how much was dropped. Text that
 /// fits is returned as it is.
-pub(crate) fn cut_tail(text: &str, limit: usize) -> String {
+pub fn cut_tail(text: &str, limit: usize) -> String {
     let count = text.chars().count();
     if count <= limit {
         return text.to_owned();

@@ -730,7 +730,7 @@ pub async fn give_back(
 }
 
 /// Is the run that owns this session still going? Only then is there somebody to hand it back to.
-pub(crate) async fn run_is_live(pool: &SqlitePool, row: &SessionRow) -> Result<bool, WheelError> {
+pub async fn run_is_live(pool: &SqlitePool, row: &SessionRow) -> Result<bool, WheelError> {
     let Some(run_id) = row.run_id else {
         return Ok(false);
     };
@@ -1208,6 +1208,7 @@ mod tests {
             )),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             // No files folder: nothing on the wheel's path reads or writes one.
             files_root: None,
             files_trash: None,
@@ -1226,6 +1227,8 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         };
+        // The chat owner hears the panel through `Turns`; tests read what it was told.
+        crate::assistant_types::RecordingTurns::install(&state);
         (db, state, seen)
     }
 
@@ -2562,14 +2565,17 @@ mod tests {
     }
 
     /// Everything the daemon said to a chat in the panel's name, oldest first.
+    /// What the panel said to `chat_id`, in order, as the installed `Turns` heard it (the
+    /// assistant itself lives above this crate).
     async fn panel_deliveries(state: &AppState, chat_id: &str) -> Vec<String> {
-        sqlx::query_scalar(
-            "SELECT prompt FROM runs WHERE chat_id = ? AND origin = 'browser-panel' ORDER BY id",
-        )
-        .bind(chat_id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap()
+        crate::assistant_types::RecordingTurns::of(state)
+            .calls()
+            .into_iter()
+            .filter(|(chat, _, origin)| {
+                chat == chat_id && *origin == crate::assistant_types::Origin::BrowserPanel
+            })
+            .map(|(_, text, _)| text)
+            .collect()
     }
 
     fn panel_count(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, verb: &str) -> usize {

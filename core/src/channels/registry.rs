@@ -64,8 +64,10 @@ pub const TELEGRAM: Manifest = Manifest {
     redact_patterns: &[],
 };
 
-/// The manifest the contract scenarios and the isolation tests use. Never part of production.
-#[cfg(test)]
+/// The manifest the contract scenarios and the isolation tests use. Never part of production: also
+/// under `testkit`, because those scenarios run in `nucleos-app`'s tests, where this crate is built
+/// without `cfg(test)`.
+#[cfg(any(test, feature = "testkit"))]
 pub const FAKE: Manifest = Manifest {
     id: "fake",
     kind: "fake",
@@ -83,10 +85,10 @@ pub const FAKE: Manifest = Manifest {
 /// Production manifests. Deliberately not behind `cfg`, so a test can assert `fake` is absent.
 pub const PROD_MANIFESTS: &[&Manifest] = &[&TELEGRAM];
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 pub const MANIFESTS: &[&Manifest] = PROD_MANIFESTS;
 /// Production manifests plus the fake one under test.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub const MANIFESTS: &[&Manifest] = &[&TELEGRAM, &FAKE];
 
 pub fn all() -> &'static [&'static Manifest] {
@@ -100,7 +102,7 @@ pub fn by_id(id: &str) -> Option<&'static Manifest> {
 /// `~/.nucleos/channels/<id>.yaml`. Absent or malformed file = default, never fatal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ChannelConfig {
-    // `pillars` is a private module of `config`; its glob re-export carries the `pub(crate)` fn.
+    // `pillars` is a private module of `config`; its glob re-export carries the `pub` fn.
     #[serde(default, deserialize_with = "crate::config::deserialize_blank_as_none")]
     pub doctrine: Option<String>,
     /// Project id to `conversation_ref` (a thread in Telegram).
@@ -562,7 +564,7 @@ async fn pairing_of(
 
 /// Whether every required secret of `id` is present, from the in-memory cache alone (no query).
 /// An unknown or never-checked channel is not configured.
-pub(crate) fn is_configured(state: &AppState, id: &str) -> bool {
+pub fn is_configured(state: &AppState, id: &str) -> bool {
     by_id(id).is_some_and(|manifest| state.channels.presence.secrets_status(manifest).0)
 }
 

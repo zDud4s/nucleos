@@ -20,7 +20,7 @@ pub const CONFIG_ENV: &str = "NUCLEOS_TELEGRAM_CONFIG";
 
 /// Where the switch reads and writes.
 #[derive(Debug, Clone)]
-pub(crate) struct SwitchPaths {
+pub struct SwitchPaths {
     /// The v1 `telegram-config.json`.
     pub v1_json: PathBuf,
     /// The old `telegram.yaml` (doctrine), kept in place.
@@ -69,7 +69,7 @@ pub async fn run_or_warn(state: &AppState) {
     }
 }
 
-pub(crate) async fn run_at(pool: &SqlitePool, paths: &SwitchPaths) -> Result<(), SwitchError> {
+pub async fn run_at(pool: &SqlitePool, paths: &SwitchPaths) -> Result<(), SwitchError> {
     let Some(v1) = read_v1_config(&paths.v1_json) else {
         return Ok(());
     };
@@ -92,7 +92,7 @@ fn io_err(action: &str, path: &Path, err: impl std::fmt::Display) -> SwitchError
 
 /// The fields of the v1 `telegram-config.json` the switch cares about; the rest is ignored.
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
-pub(crate) struct V1Config {
+pub struct V1Config {
     #[serde(default)]
     pub allowed_chat_id: i64,
     #[serde(default)]
@@ -105,7 +105,7 @@ pub(crate) struct V1Config {
 }
 
 /// Reads the v1 JSON; `None` when the file is absent or unreadable as a config.
-pub(crate) fn read_v1_config(path: &Path) -> Option<V1Config> {
+pub fn read_v1_config(path: &Path) -> Option<V1Config> {
     let text = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str(&text) {
         Ok(config) => Some(config),
@@ -118,7 +118,7 @@ pub(crate) fn read_v1_config(path: &Path) -> Option<V1Config> {
 
 /// One `owner` identity per allowed user in the allowed chat; the first one becomes home unless
 /// the channel already has a home. A zero chat id imports nothing.
-pub(crate) async fn import_identities(pool: &SqlitePool, v1: &V1Config) -> sqlx::Result<()> {
+pub async fn import_identities(pool: &SqlitePool, v1: &V1Config) -> sqlx::Result<()> {
     let Some(first_user) = v1.allowed_user_ids.first() else {
         return Ok(());
     };
@@ -198,7 +198,7 @@ fn non_blank(map: &Mapping, key: &str) -> Option<String> {
 
 /// Copies `doctrine` from the old `telegram.yaml` into `channels/telegram.yaml` when the target
 /// has none. A missing source is a no-op. Returns whether the target was written.
-pub(crate) fn move_doctrine(old_yaml: &Path, new_yaml: &Path) -> Result<bool, SwitchError> {
+pub fn move_doctrine(old_yaml: &Path, new_yaml: &Path) -> Result<bool, SwitchError> {
     let Some(doctrine) = non_blank(&read_mapping(old_yaml)?, "doctrine") else {
         return Ok(false);
     };
@@ -214,7 +214,7 @@ pub(crate) fn move_doctrine(old_yaml: &Path, new_yaml: &Path) -> Result<bool, Sw
 /// Imports `project_topics` as `projects: { project: "<chat>:<thread>" }` for absent keys only,
 /// then retires the v1 JSON by renaming it to `.migrated`. The rename happens only after the
 /// target was written.
-pub(crate) fn import_projects(
+pub fn import_projects(
     v1: &V1Config,
     new_yaml: &Path,
     source_json: &Path,

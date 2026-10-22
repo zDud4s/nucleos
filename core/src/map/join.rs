@@ -282,7 +282,7 @@ pub fn declaration(source: &str) -> Declaration {
 /// a parenthesis, and both are far more common here than a deeper subsection would be. Reading
 /// the dot greedily would invent sections `4.` and `5.2)` that no document has.
 ///
-/// **`pub(crate)` for one caller and not because it is generally useful.**
+/// **`pub` for one caller and not because it is generally useful.**
 /// [`crate::map::anchor::marks`] needs to know WHERE a file wrote each citation, so it can cut the
 /// sentence around it for a prompt, and the alternative was a looser search for the literal `§6.4`
 /// — which finds `§6.44` and quotes the wrong sentence under the right number. Two answers to *what
@@ -675,7 +675,7 @@ pub struct Counts {
 /// than this is an under-reported one, and an under-report is the direction this module errs in on
 /// purpose.
 ///
-/// **`pub(crate)` because this is the one place the question is answered.**
+/// **`pub` because this is the one place the question is answered.**
 /// [`crate::map::anchor`] has to ask it too — a citation already carrying a document of this project
 /// is one the file's header will never govern, so it is exempt from the veto — and a second spelling
 /// there would be a second, quietly different answer to *is this a document of this project*
@@ -695,7 +695,7 @@ pub fn names_document(candidate: &str, spec_slug: &str) -> bool {
 /// Ordered so that the strongest wins when a file says several things at once, which is common:
 /// `shell/src/pages/Fleet.tsx` names §9.2 twice, and the day slice 6 lands a module will routinely
 /// carry the same section bare in one place and with its slug in another.
-/// **`pub(crate)` for the same reason [`names_document`] is**, and the caller is
+/// **`pub` for the same reason [`names_document`] is**, and the caller is
 /// [`crate::map::orphan`]: it asks this question of a blob out of git's history, where this
 /// module asks it of a file on disk. A second spelling there would let the past and the
 /// present disagree about what counts as naming a section — which is precisely the divergence

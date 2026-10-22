@@ -27,10 +27,12 @@ SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z.-]+)
 #   line_after A N      the line right after each line equal to A (exactly N of them)
 TARGETS = [
     ("core/Cargo.toml", ("toml_package",)),
+    ("core/crates/nucleos-daemon/Cargo.toml", ("toml_package",)),
     ("shell/src-tauri/Cargo.toml", ("toml_package",)),
     ("shell/package.json", ("json_top",)),
     ("shell/src-tauri/tauri.conf.json", ("json_top",)),
     ("Cargo.lock", ("line_after", 'name = "nucleos-core"', 1)),
+    ("Cargo.lock", ("line_after", 'name = "nucleos-daemon"', 1)),
     ("shell/src-tauri/Cargo.lock", ("line_after", 'name = "shell"', 1)),
     ("shell/package-lock.json", ("line_after", '"name": "shell",', 2)),
 ]
@@ -134,7 +136,8 @@ def bump(root: Path, version: str):
     edits, problems = {}, []
     for rel, how in TARGETS:
         try:
-            lines = read_lines(root / rel)
+            # A file with two targets (Cargo.lock) is edited on top of its earlier edit.
+            lines = edits[rel].splitlines(keepends=True) if rel in edits else read_lines(root / rel)
             pat = version_pattern(how)
             for i in find_lines(lines, how):
                 text, ending = split_ending(lines[i])

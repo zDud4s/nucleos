@@ -16,12 +16,12 @@ pub use decode::*;
 mod conformance;
 
 /// Where the shared fixtures live, relative to the `nucleos-core` package root.
-#[cfg(test)]
-pub(crate) const FIXTURES_REL: &str = "../sidecars/lib/channelkit/contract/fixtures";
+#[cfg(any(test, feature = "testkit"))]
+pub const FIXTURES_REL: &str = "../sidecars/lib/channelkit/contract/fixtures";
 
 /// The fixture directory of the checkout this test binary was compiled in.
 #[cfg(test)]
-pub(crate) fn fixtures_dir() -> std::path::PathBuf {
+pub fn fixtures_dir() -> std::path::PathBuf {
     let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let running_in = std::env::current_dir().expect("the working directory must be readable");
     // Same guard as governance/redact.rs: a shared target directory can hand this checkout a

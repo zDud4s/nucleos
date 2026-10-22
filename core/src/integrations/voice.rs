@@ -458,7 +458,7 @@ pub fn chunk_transcript(text: &str, budget: usize) -> Vec<String> {
 ///
 /// Every index comes from `char_indices`, so a cut can never land inside a multibyte character. A
 /// byte-arithmetic version of this would panic on the first accented word.
-/// `pub(crate)` so `speak.rs` cuts an over-long answer with the SAME logic that cuts an over-long
+/// `pub` so `speak.rs` cuts an over-long answer with the SAME logic that cuts an over-long
 /// transcript. Two implementations of one cut is how the two come to disagree about where a word ends.
 pub fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
     if sentence.chars().count() <= budget {
@@ -855,21 +855,28 @@ pub async fn converse(
     // sidecar's. Hands-free means the next thing said arrives while the last answer is still being
     // spoken, and refusing it would make the mode drop every second utterance. The person is here,
     // watching; waiting is what they expect.
-    match crate::assistant::send_or_queue(
-        state,
-        chat_id,
-        &text,
-        &[],
-        crate::assistant::Origin::Voice,
-    )
-    .await
+    // The assistant lives above this crate, so the turn starts through the hook the daemon installs.
+    let Some(turns) = crate::assistant_types::turns(state) else {
+        return Err(CaptureError::Refused(
+            crate::assistant_types::NOT_WIRED.to_string(),
+        ));
+    };
+    match turns
+        .send_or_queue(
+            state,
+            chat_id,
+            &text,
+            &[],
+            crate::assistant_types::Origin::Voice,
+        )
+        .await
     {
-        Ok(crate::assistant::Sent::Turn(turn_id)) => Ok(Conversed {
+        Ok(crate::assistant_types::Sent::Turn(turn_id)) => Ok(Conversed {
             text,
             turn_id: Some(turn_id),
             queued: false,
         }),
-        Ok(crate::assistant::Sent::Queued) => Ok(Conversed {
+        Ok(crate::assistant_types::Sent::Queued) => Ok(Conversed {
             text,
             turn_id: None,
             queued: true,
@@ -1254,7 +1261,7 @@ async fn answer_so_far(state: &AppState, turn_id: i64) -> Option<(String, bool)>
     let stdout = stdout.unwrap_or_default();
     let text = if answered_by
         .as_deref()
-        .is_some_and(crate::assistant::answered_by_a_local_agent_loop)
+        .is_some_and(crate::assistant_types::answered_by_a_local_agent_loop)
     {
         stdout
     } else {
@@ -2125,6 +2132,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             email: Arc::new(crate::state::EmailRuntime::default()),
@@ -2267,10 +2275,12 @@ mod tests {
     ///
     /// The absence is the assertion. A conversation turn is already stored twice — as a chat message
     /// and as a `runs` row — and a third copy would be a third place to look for one sentence. The
-    /// table's CHECK constraint would refuse the insert anyway; this proves nobody tries.
+    /// table's CHECK constraint would refuse the insert anyway; this proves nobody tries. The turn
+    /// itself goes through the installed `Turns`; what the assistant does with it is tested there.
     #[tokio::test]
     async fn a_conversation_is_sent_to_the_chat_and_recorded_nowhere_else() {
         let state = conversing_state(hearing("o que esta a correr?")).await;
+        let turns = crate::assistant_types::RecordingTurns::install(&state);
 
         let conversed = converse(&state, "a-conversa", b"RIFF", "wav", Duration::from_secs(3))
             .await
@@ -2279,6 +2289,14 @@ mod tests {
         assert_eq!(conversed.text, "o que esta a correr?");
         assert!(conversed.turn_id.is_some());
         assert!(!conversed.queued);
+        assert_eq!(
+            turns.calls(),
+            vec![(
+                "a-conversa".to_owned(),
+                "o que esta a correr?".to_owned(),
+                crate::assistant_types::Origin::Voice
+            )]
+        );
 
         assert!(list(&state.pool, Kind::Dictation).await.unwrap().is_empty());
         assert!(list(&state.pool, Kind::Memo).await.unwrap().is_empty());
@@ -2294,18 +2312,15 @@ mod tests {
     #[tokio::test]
     async fn the_agent_is_asked_exactly_what_was_heard() {
         let state = conversing_state(hearing("o nucleo esta a correr?")).await;
+        let turns = crate::assistant_types::RecordingTurns::install(&state);
 
         let conversed = converse(&state, "hints", b"RIFF", "wav", Duration::from_secs(2))
             .await
             .unwrap();
 
         assert_eq!(conversed.text, "o núcleo esta a correr?");
-        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
-            .bind(conversed.turn_id.unwrap())
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(prompt, "o núcleo esta a correr?");
+        let asked: Vec<String> = turns.calls().into_iter().map(|(_, text, _)| text).collect();
+        assert_eq!(asked, vec!["o núcleo esta a correr?".to_owned()]);
     }
 
     /// The turn is recorded as having arrived by voice, and survives the round trip.
@@ -2314,10 +2329,10 @@ mod tests {
     /// that came back as `shell` would answer in writing.
     #[test]
     fn a_spoken_turn_is_recorded_as_spoken() {
-        assert_eq!(crate::assistant::Origin::Voice.as_wire(), "voice");
+        assert_eq!(crate::assistant_types::Origin::Voice.as_wire(), "voice");
         assert_eq!(
-            crate::assistant::Origin::from_wire(Some("voice")),
-            crate::assistant::Origin::Voice
+            crate::assistant_types::Origin::from_wire(Some("voice")),
+            crate::assistant_types::Origin::Voice
         );
     }
 

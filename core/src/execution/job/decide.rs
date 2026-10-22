@@ -420,7 +420,7 @@ impl ItemView {
 /// `GateErrored` is apart from `Finish(Outcome::GateErrored)` because a graph walker names the gate
 /// node that would not run, while the old decision only ends the job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Halt {
+pub enum Halt {
     Finish(Outcome),
     GateErrored,
 }
@@ -431,11 +431,7 @@ pub(crate) enum Halt {
 /// over the same items applies the identical rules. `Failed` and `GateErrored` halt only a job
 /// without a team (a team's broken item sits in a tree of its own), `Failed` also not where
 /// `may_go_round` licenses walking past it; `Cancelled` and `RevertFailed` halt in every job.
-pub(crate) fn queue_halt(
-    items: &[ItemView],
-    has_team: bool,
-    may_go_round: bool,
-) -> Option<(usize, Halt)> {
+pub fn queue_halt(items: &[ItemView], has_team: bool, may_go_round: bool) -> Option<(usize, Halt)> {
     let broken_item_ends_the_queue = !may_go_round;
     for (ordinal, item) in items.iter().enumerate() {
         match item.state {
@@ -753,7 +749,7 @@ pub(super) fn batch_of(job: &JobView) -> Vec<usize> {
 }
 
 /// PURE: [`batch_of`] over a bare queue and a ceiling, for callers that hold no `JobView`.
-pub(crate) fn batch_over(items: &[ItemView], ceiling: usize) -> Vec<usize> {
+pub fn batch_over(items: &[ItemView], ceiling: usize) -> Vec<usize> {
     let running = items
         .iter()
         .filter(|item| item.state == ItemState::Running)
@@ -817,7 +813,7 @@ pub(super) fn holds_paths(state: ItemState) -> bool {
 /// about the prerequisite before any of it can happen.
 ///
 /// `Cancelled` is here for completeness and never decides: it stops the job at the short-circuit.
-pub(crate) fn never_lands(state: ItemState) -> bool {
+pub fn never_lands(state: ItemState) -> bool {
     matches!(
         state,
         ItemState::Failed
@@ -962,7 +958,7 @@ pub(super) fn failed_ending(job: &JobView) -> Option<Outcome> {
 }
 
 /// PURE: [`failed_ending`] over a bare queue, for callers that hold no `JobView`.
-pub(crate) fn failed_ending_of(items: &[ItemView]) -> Option<Outcome> {
+pub fn failed_ending_of(items: &[ItemView]) -> Option<Outcome> {
     if items
         .iter()
         .any(|item| item.state == ItemState::RevertFailed)
@@ -1058,7 +1054,7 @@ impl ItemState {
     ///
     /// `None` for everything else, including the terminal states. An item that is not work cannot be
     /// claimed, and answering with a status for one would let a caller start a node on finished work.
-    pub(crate) fn claimable_as(self) -> Option<&'static str> {
+    pub fn claimable_as(self) -> Option<&'static str> {
         match self {
             ItemState::Pending => Some("pending"),
             ItemState::GateRetriable => Some("gate_failed"),

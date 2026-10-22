@@ -1,15 +1,17 @@
 # core/ — Rust núcleo
 
-The núcleo binary crate (`nucleos-core`). Owns the local HTTP API, the SQLite datastore,
+The núcleo library crate (`nucleos-core`), with its binary in the `nucleos-daemon` package
+(`crates/nucleos-daemon`, the exe is still `nucleos-core`) and the top modules nothing here reads in
+`nucleos-app` (`crates/nucleos-app`, root `src/app.rs`). Owns the local HTTP API, the SQLite datastore,
 secrets access, sidecar supervision, and the CLI-wrap agent loop. Entrypoint: `src/main.rs`
 (pure startup orchestration — no domain logic of its own).
 
 **Foundation status: complete.** Every module in spec §3.2's map is implemented and green:
-`cargo test -p nucleos-core` = 1128 passed + 3 ignored (the ignored ones touch the real OS Credential
+`cargo test -p nucleos-core --lib` = 1128 passed + 3 ignored (the ignored ones touch the real OS Credential
 Manager / Task Scheduler; run with `-- --include-ignored` on an interactive desktop session).
 > A count in a document is a claim that goes stale without anybody editing it — this line read
 > `276 passed + 2 ignored` for long enough that four times as many tests had been written under it.
-> Treat it as the order of magnitude it is, and `cargo test -p nucleos-core` as the authority.
+> Treat it as the order of magnitude it is, and `cargo test -p nucleos-core --lib` (plus `-p nucleos-app`, `-p nucleos-daemon`) as the authority.
 
 
 ## Module map — the structural invariant (spec §3.2)
@@ -20,7 +22,7 @@ the contract, not a snapshot.
 
 | File | Responsibility |
 |---|---|
-| `main.rs` | Startup orchestration ONLY: logging → autostart → storage → reconcile orphaned runs/stranded approvals/orphaned worktrees → secrets/token → model config → `AppState` → HTTP router → sidecar + scheduler + repo-poller + worktree-GC + devtime-ingestion background tasks → serve. No business logic. |
+| `main.rs` | The binary of the `nucleos-daemon` package (exe `nucleos-core`). Startup orchestration ONLY: logging → autostart → storage → reconcile orphaned runs/stranded approvals/orphaned worktrees → secrets/token → model config → `AppState` → HTTP router → sidecar + scheduler + repo-poller + worktree-GC + devtime-ingestion background tasks → serve. No business logic. |
 | `shutdown.rs` | Draining the daemon before an update replaces it: an in-memory `draining` flag (never persisted), the live-run count the updater waits on (`GET /system/update-readiness`), the wait that calls `stop` only after two quiet reads in a row and reopens the door instead of interrupting anything when it times out, and the middleware that answers 503 to the routes that start a run without a slot. Slot-taking work is refused one layer down (`concurrency::NoRoom::Draining`). Judges nothing about WHAT to run; the routes themselves (`/system/*`) live in `http/admin.rs`. |
 | `cli.rs` | Binary-only, beside `main.rs`: the command-line subcommands that run instead of the daemon (`--print-token`, `--land`, `--verify`, `--pressao`, the `--set-*` secret prompts, `--mcp-tools`, `--workflow-sync`, `--workflow-package`, `--filter-run`) and their argument helpers. `run_subcommand` checks the flags in the order `main` always did. |
 | `startup.rs` | Binary-only, beside `main.rs`: the daemon's one-off start work — seeding the workflow library, the file-to-database migrations (machine settings, project state, onboarding) and `reconcile_after_restart`, the orphan and interrupted-work reconciliation run once the database is open. |
@@ -156,7 +158,8 @@ the contract, not a snapshot.
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
 | `http/team.rs` | Council and teams (`/council/*`, `/teams/*`, `/team-*`). |
 | `http/workflows.rs` | Workflows (`/workflows/*`, `/projects/{id}/workflows/*`). |
-| `lib.rs` | The library crate root: declares every module except the binary's own (`main`, `http`, `cli`, `startup`) (the bottom ones are re-exported from `nucleos-base`), all `pub`, so the binary (`main.rs` + `http.rs`, `cli.rs`, `startup.rs`) compiles separately and an edit to `http.rs` recompiles only the binary. The `testkit` feature exposes test fixtures to the binary's tests; Cargo turns it on for test builds through the self dev-dependency in `Cargo.toml`. |
+| `app.rs` | Root of `nucleos-app` (`crates/nucleos-app`, sources stay in `core/src`): the top modules nothing in `nucleos-core` reads — `hooks`, `fleet`, `devtime`, `analytics`, `analytics_pipeline`, `price_refresh`, `verify_cli`, `presets` (split out 2026-10-22); `assistant` and `channels::{commands, ingest, media}` (2026-10-22, phase 3b; `app.rs`'s `channels` re-exports the library's and adds those three). Depends on `nucleos-core`; the daemon binary depends on both. |
+| `lib.rs` | The library crate root: declares every module except the binary's own (`main`, `http`, `cli`, `startup`) and the ones in `nucleos-app` (the bottom ones are re-exported from `nucleos-base`), all `pub`, so the binary (`main.rs` + `http.rs`, `cli.rs`, `startup.rs`) compiles separately and an edit to `http.rs` recompiles only the binary. The `testkit` feature exposes test fixtures to the binary's tests; Cargo turns it on for test builds through the self dev-dependency in `Cargo.toml`. |
 | `crates/nucleos-base/src/lib.rs` | Root of `nucleos-base`, the bottom crate: storage (with `MIGRATOR`, which embeds `core/migrations`), the test database, process/gate plumbing and the other modules that name nothing above them. `nucleos-core`'s `lib.rs` re-exports each one (`pub use nucleos_base::storage;`), so `crate::storage::...` is unchanged there. Its `testkit` feature exposes fixtures to the crates above and is enabled by theirs. |
 | `door.rs` | The few pieces of the HTTP door the library itself calls or tests against, moved out of `http.rs` by the lib/bin split: `uncancellable`, `files_root`, `refusal`, `sending_run_id_of`, and the knowledge door (`post_knowledge`, `recall_knowledge`, `post_finding`) that `mcp_tools`' and `assistant`'s tests drive end to end. `http.rs` routes to them; nothing here is new. |
 | `health.rs` | Bounded, credential-safe subsystem readiness readout (SQLite, CLI binary, Credential Manager, worktree disk, devtime ingestion and the supervised sidecars). Sidecar rows report LIVENESS, read from `sidecar.rs`'s registry through a pure function; the one limit left is that a running-but-wedged child reads ok, because the supervisor watches processes and not progress. `cli_binary` and `voice_transcriber` name no resident process, so they are executed — behind a 60s cache refreshed off the request path, because the readout is budgeted at one second and the shell polls it every three. `record_breach_intent` (off unless a project's rules set `health_breach_intent`, and not yet wired to a trigger) writes a line to that project's feed — never a ledger in the project's `.ai/`, which is the AI workflow's. |
@@ -292,6 +295,8 @@ the contract, not a snapshot.
 | `assistant/slots.rs` | Per-chat turn slots, steering, stopping, and immediate answers. |
 | `assistant/spontaneous.rs` | Between-turn watching and spontaneous assistant turns. |
 | `assistant/turn.rs` | Local turns, runner selection, deadlines, and assistant turn launching. |
+| `assistant/turns_impl.rs` | The real `assistant_types::Turns`, installed into `AppState::turns` by `main.rs` (`assistant::install_turns`): how voice and the browser panel, which sit below the assistant, start a turn. |
+| `assistant_types.rs` | What the library needs from the assistant, which lives in `nucleos-app` above it: `Origin`, `Sent`, the refusal strings, the three `build_*_mcp_config`, the process barrier (`live_process_served`), and the `Turns` hook the daemon installs into `AppState::turns` so voice and the browser panel can start a turn. `assistant` re-exports all of it. |
 | `assistants.rs` | The assistant factory: given a route (`chats::Brain`) and an optional pinned model, produces the `LocalAssistant` that answers a turn — replacing the two near-identical `main.rs` singletons that each bake a model in once at startup and so silently ignore a chat's pin. `assistant_for` is SYNC and does no network work of its own: startup has already probed what a model can do (`capabilities.rs`), so this only assembles what that probe already found. `resolve_model` is the separate PURE function for pin-over-configured, refusing `RouteNotConfigured` when a pin exists but the route's own config key does not — the key is the switch, the pin only chooses which model runs once it is on. `ConfiguredAssistants` holds ONE `reqwest::Client` per route, built once in the constructor (`runner::OllamaChat::with_client` / `openai_compatible::OpenAiCompatibleChat::with_client`) and cloned into every assistant it hands out for that route, never built per turn. For the hosted route the model is resolved BEFORE the key is read, so "nothing configured" and "half configured, no key" stay two different refusals. `Brain::Cloud` is refused with `NotServedByThisFactory` before any of that runs — it is the agent CLI, a different mechanism entirely. `AppState.assistants` holds it as an `Arc<dyn Assistants>`, built once in `main.rs`, and it is reached from `assistant.rs` (both turn call sites), `council.rs`, `team.rs`, `scheduler.rs` and `http.rs` (`get_local_model`, `post_chat_title`, `chosen_brain`, `get_assistant_models`). `serves` answers whether a route can answer at all without building anything; `can_serve` and `declared_for` are the picker's questions and are the only async ones, because only they may discover — through a `capabilities::DiscoveryCache` keyed by ROUTE and model, over a short-timeout introspection client, never the 120s generation ones. |
 | `relay.rs` | **Pure.** Whether the conversation at the end of a chain may hand a message on to another: `admits(chain, to)` -> `Verdict::{Ok, Itself, Cycle{at}, TooDeep}`, the sibling of `team_trigger::closes_a_cycle` cut loose from its pool — no row is read, because the caller already holds the whole chain by the time it needs an answer. `Itself` and `Cycle` outrank `TooDeep`: a chain that has looped back on itself is a wrong chain, not merely a long one. It decides and says why; it starts no turn, talks to no model, and opens no route — `assistant.rs` is where a relay, once admitted, actually happens. `admit` is the impure half: it runs the four brakes in order, writes the `chat_relays` row and returns its id. `mark_delivered` closes the loop from the other side once a run exists to name — auditing only, and never what `chain_of` walks. |
 | `channels/mod.rs` | Parent of `channels/`. The channel hub: message channels as adapters over one contract; `ChannelsRuntime` and the route table. Inert in phase 1 (no configs, no channel launched). |
@@ -603,11 +608,13 @@ On Windows, keep the Rust toolchain on a path without spaces: a user profile wit
 breaks the GNU linker, so point `RUSTUP_HOME` and `CARGO_HOME` at a space-free directory and put its
 `bin` on PATH. Then, from the repo root:
 
-- Gate: `cargo nextest run -p nucleos-base -p nucleos-core --no-fail-fast` (every target of both;
+- Gate: `cargo nextest run -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --no-fail-fast` (every target of all four;
   `scripts/gates.sh core` falls back to `cargo test` without nextest). One test, one target:
   `-p nucleos-base <name>` for a module under `crates/nucleos-base/src`, `--lib <name>` for one in the
-  core library (every other module but `http.rs`/`main.rs`/`cli.rs`/`startup.rs`), `--bin nucleos-core <name>` for one in
-  `http.rs`, `main.rs`, `cli.rs` or `startup.rs` — each builds only that test binary.
+  core library (every other module but those below), `-p nucleos-app <name>` for one of the moved modules (`hooks`,
+  `fleet`, `devtime`, `analytics`, `analytics_pipeline`, `price_refresh`, `verify_cli`, `presets`,
+  `assistant`, `channels::{commands, ingest, media}`),
+  `-p nucleos-daemon <name>` for one in `http.rs`, `main.rs`, `cli.rs` or `startup.rs` — each builds only that test binary.
 - `cargo build` · `cargo fmt --all` (check: `cargo fmt --all -- --check`) · `cargo clippy --all-targets`
 - After a `claude update`: run `node scripts/tool-surface.mjs`. It measures the CLI's own advertised
   tool set against `runner.rs`'s `BUILTIN_TOOLS` blocklist and exits non-zero naming any tool the CLI

@@ -328,7 +328,7 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
 /// With no query vector, `s_fts` of rows at or above [`LIFT_FLOOR`] is lifted onto
 /// `[MIN_RELEVANCE, 1.0]` (see [`lift_fts`]); with one, `s_fts` is the plain pass-normalised value.
 /// Only the error kind is logged, never the query, a title, a body or a vector.
-pub(crate) async fn of_with(
+pub async fn of_with(
     pool: &SqlitePool,
     context: &Context,
     query: &str,

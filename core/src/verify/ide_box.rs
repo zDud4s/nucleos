@@ -66,7 +66,7 @@ static HINTS_LOCK: Mutex<()> = Mutex::new(());
 
 /// The hints-file key of a canonical worktree path: no verbatim `\\?\` prefix, `/` separators,
 /// no trailing `/`.
-pub(crate) fn hint_key(canonical: &str) -> String {
+pub fn hint_key(canonical: &str) -> String {
     let plain = canonical.strip_prefix(r"\\?\").unwrap_or(canonical);
     plain.replace('\\', "/").trim_end_matches('/').to_owned()
 }
@@ -95,7 +95,7 @@ fn hint_entry(
 /// Sets (`Some`) or drops (`None`) the entry for `key` in `dir`/`HINTS_FILE`, pruning every entry
 /// that expired at or before `now_unix`. The file is replaced through a temp file and a rename and
 /// deleted when no entry is left; a malformed file is replaced.
-pub(crate) fn write_hint(
+pub fn write_hint(
     dir: &std::path::Path,
     key: &str,
     entry: Option<serde_json::Value>,
@@ -143,7 +143,7 @@ pub(crate) fn write_hint(
 /// Whether a box beat for this worktree (canonical path) recently enough. The hook reads the
 /// hints file instead (it cannot reach this process), so this has no caller yet.
 #[allow(dead_code)] // The hook decides from the hints file, not from this registry.
-pub(crate) fn is_live(key: &str) -> bool {
+pub fn is_live(key: &str) -> bool {
     LIVE.lock()
         .map(|live| live.is_live(key, Instant::now()))
         .unwrap_or(false)
@@ -158,7 +158,7 @@ pub struct BeatAnswer {
 
 /// Why a beat was not recorded.
 #[derive(Debug)]
-pub(crate) enum BeatError {
+pub enum BeatError {
     /// The project's `ide_verify` switch is off; the message names the project.
     Off(String),
     /// The worktree is not a registered worktree of a known project, or could not be resolved.
@@ -167,7 +167,7 @@ pub(crate) enum BeatError {
 
 /// Records a beat for `worktree` at `now`: the worktree must be a registered worktree of a known
 /// project, and that project's switch must be on.
-pub(crate) async fn record_beat(
+pub async fn record_beat(
     pool: &sqlx::SqlitePool,
     registry: &Mutex<Liveness>,
     hints: Option<&std::path::Path>,

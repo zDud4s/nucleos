@@ -281,20 +281,9 @@ pub struct FileCounters {
     pub unknown_records: i64,
 }
 
-#[derive(Debug, Clone, Default, sqlx::FromRow)]
-pub struct IngestStatus {
-    pub enabled: bool,
-    pub cycle_at: String,
-    pub files_seen: i64,
-    pub files_failed: i64,
-    pub lines_read: i64,
-    pub lines_failed: i64,
-    pub unknown_records: i64,
-    pub unmapped_sessions: i64,
-    pub skipped_daemon_sessions: i64,
-    pub failure_amber_rate: f64,
-    pub failure_min_lines: i64,
-}
+// The ingestion cycle's one-row summary lives in `health`, which reads it for the readout and sits
+// below this module's crate.
+pub use crate::health::{IngestStatus, read_ingest_status, write_ingest_status};
 
 /// Everything a lane builder needs about one session.
 #[derive(Debug, Clone, Default)]
@@ -913,51 +902,6 @@ pub async fn replace_spans(
         .await?;
     }
     tx.commit().await
-}
-
-/// The one-row summary of the latest ingestion cycle (`id = 1`).
-pub async fn write_ingest_status(pool: &SqlitePool, status: &IngestStatus) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO devtime_ingest_status
-            (id, enabled, cycle_at, files_seen, files_failed, lines_read, lines_failed,
-             unknown_records, unmapped_sessions, skipped_daemon_sessions, failure_amber_rate,
-             failure_min_lines)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-            enabled = excluded.enabled, cycle_at = excluded.cycle_at,
-            files_seen = excluded.files_seen, files_failed = excluded.files_failed,
-            lines_read = excluded.lines_read, lines_failed = excluded.lines_failed,
-            unknown_records = excluded.unknown_records,
-            unmapped_sessions = excluded.unmapped_sessions,
-            skipped_daemon_sessions = excluded.skipped_daemon_sessions,
-            failure_amber_rate = excluded.failure_amber_rate,
-            failure_min_lines = excluded.failure_min_lines",
-    )
-    .bind(status.enabled)
-    .bind(&status.cycle_at)
-    .bind(status.files_seen)
-    .bind(status.files_failed)
-    .bind(status.lines_read)
-    .bind(status.lines_failed)
-    .bind(status.unknown_records)
-    .bind(status.unmapped_sessions)
-    .bind(status.skipped_daemon_sessions)
-    .bind(status.failure_amber_rate)
-    .bind(status.failure_min_lines)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn read_ingest_status(pool: &SqlitePool) -> sqlx::Result<Option<IngestStatus>> {
-    sqlx::query_as::<_, IngestStatus>(
-        "SELECT enabled, cycle_at, files_seen, files_failed, lines_read, lines_failed,
-                unknown_records, unmapped_sessions, skipped_daemon_sessions, failure_amber_rate,
-                failure_min_lines
-         FROM devtime_ingest_status WHERE id = 1",
-    )
-    .fetch_optional(pool)
-    .await
 }
 
 #[cfg(test)]

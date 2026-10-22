@@ -8,6 +8,37 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::AbortHandle;
 
+/// A runtime built on first use whose type lives in a crate above this one (`nucleos-app`), so
+/// `AppState` cannot name it: the slot holds it erased and its owner reads it back with
+/// [`LateSlot::get_or_init`]. One slot holds one type; `Default` is empty and inert.
+#[derive(Default)]
+pub struct LateSlot(std::sync::OnceLock<Arc<dyn std::any::Any + Send + Sync>>);
+
+impl LateSlot {
+    pub fn get_or_init<T: Send + Sync + 'static>(&self, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
+        self.0
+            .get_or_init(|| init())
+            .clone()
+            .downcast::<T>()
+            .expect("a LateSlot holds a single type")
+    }
+
+    /// The value, or `None` while nothing has been put in the slot. Never builds one.
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        self.0.get().map(|value| {
+            value
+                .clone()
+                .downcast::<T>()
+                .expect("a LateSlot holds a single type")
+        })
+    }
+
+    /// Puts `value` in an empty slot; a slot already filled keeps what it has.
+    pub fn set<T: Send + Sync + 'static>(&self, value: Arc<T>) {
+        let _ = self.0.set(value);
+    }
+}
+
 /// Production default for how long a single run may take before it's marked `"timed_out"` and its
 /// process killed. Tests override `AppState.run_timeout` to something much shorter.
 ///
@@ -468,7 +499,11 @@ pub struct AppState {
     pub run_tails: RunTails,
     /// The live fleet tree's hub (spec 2026-10-20): built on first use, stopped when the last
     /// client leaves. `Default` is inert, which is what every test that ignores it gets.
-    pub fleet: Arc<crate::fleet::hub::FleetRuntime>,
+    pub fleet: Arc<LateSlot>,
+    /// How the lib starts an assistant turn (voice, the browser panel): the assistant lives in
+    /// `nucleos-app`, so the daemon puts its [`crate::assistant_types::Turns`] here at startup.
+    /// `Default` is empty, and a caller that finds it so reports the turn as not wired.
+    pub turns: Arc<LateSlot>,
     /// Maximum silence between streamed events; independent of the total wall-clock run timeout.
     pub progress_timeout: Duration,
     pub run_timeout: Duration,

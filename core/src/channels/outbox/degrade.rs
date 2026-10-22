@@ -5,7 +5,7 @@ use sqlx::SqliteConnection;
 
 use super::Subject;
 use crate::channels::contract::{Button, Capabilities, MediaKind, OutAction, OutPart};
-use crate::channels::media::display_name;
+use crate::channels::display_name;
 use crate::channels::strings::{self, Text};
 
 type Buttons = Option<Vec<Vec<Button>>>;

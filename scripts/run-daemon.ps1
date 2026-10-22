@@ -1,6 +1,6 @@
 # Run the daemon from a COPY of its binaries, so no cargo target dir is ever held open.
 #
-# Why: `cargo run -p nucleos-core` keeps <target>/debug/nucleos-core.exe (and the
+# Why: `cargo run -p nucleos-daemon` keeps <target>/debug/nucleos-core.exe (and the
 # *-sidecar.exe beside it) open for as long as the daemon lives, and on Windows every other
 # cargo build or test that relinks that path then fails with "os error 5". That pushed sessions
 # onto private target dirs, which is what saturated CPU and disk on 2026-10-01. Running a copy
@@ -157,7 +157,7 @@ $out = Join-Path $TargetDir $BuildProfile
 if (-not $NoBuild) {
     Push-Location $RepoRoot
     try {
-        $cargoArgs = @('build', '-p', 'nucleos-core')
+        $cargoArgs = @('build', '-p', 'nucleos-daemon')
         if ($BuildProfile -eq 'release') { $cargoArgs += '--release' }
         & cargo @cargoArgs
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

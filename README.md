@@ -117,9 +117,9 @@ git clone https://github.com/zDud4s/nucleos.git
 cd nucleos
 
 # Daemon and sidecars
-cargo build -p nucleos-core
+cargo build -p nucleos-daemon
 scripts/build-sidecars.sh
-cargo run -p nucleos-core
+cargo run -p nucleos-daemon
 ```
 
 In a second terminal:

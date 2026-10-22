@@ -12,7 +12,7 @@ use crate::verify::runs as verify_runs;
 
 /// One unit of a plan, as the ticket keeps it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PlannedUnit {
+pub struct PlannedUnit {
     /// `None` is the project's `gate_command`.
     pub group: Option<String>,
     /// Empty when `skipped` is `Some`.
@@ -29,7 +29,7 @@ pub(crate) struct PlannedUnit {
     pub skipped: Option<String>,
 }
 
-pub(crate) struct NewRequest<'a> {
+pub struct NewRequest<'a> {
     pub project_id: &'a str,
     pub worktree: &'a str,
     pub kind: &'a str,
@@ -42,7 +42,7 @@ pub(crate) struct NewRequest<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RequestRow {
+pub struct RequestRow {
     pub id: i64,
     pub project_id: String,
     pub worktree: String,
@@ -57,7 +57,7 @@ pub(crate) struct RequestRow {
     pub created_at: String,
 }
 
-pub(crate) struct CacheKey<'a> {
+pub struct CacheKey<'a> {
     pub project_id: &'a str,
     pub group: &'a str,
     pub kind: &'a str,
@@ -66,16 +66,16 @@ pub(crate) struct CacheKey<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CacheHit {
+pub struct CacheHit {
     pub run_id: i64,
     pub duration_ms: Option<i64>,
 }
 
-pub(crate) const DAY_MS: i64 = 86_400_000;
+pub const DAY_MS: i64 = 86_400_000;
 
 /// The argv as `verify_runs.argv` stores it; the same encoding `verify_runs::enqueue` uses, so a
 /// cache key and a queued row compare equal.
-pub(crate) fn argv_json(argv: &[String]) -> String {
+pub fn argv_json(argv: &[String]) -> String {
     serde_json::to_string(argv).unwrap_or_else(|_| "[]".into())
 }
 
@@ -87,10 +87,7 @@ fn cutoff_ms(now_ms: i64, max_age_days: u64) -> i64 {
     now_ms.saturating_sub(age)
 }
 
-pub(crate) async fn insert_request(
-    pool: &SqlitePool,
-    request: &NewRequest<'_>,
-) -> sqlx::Result<i64> {
+pub async fn insert_request(pool: &SqlitePool, request: &NewRequest<'_>) -> sqlx::Result<i64> {
     let unclaimed = serde_json::to_string(request.unclaimed).unwrap_or_else(|_| "[]".into());
     let id = sqlx::query(
         "INSERT INTO verify_requests (project_id, worktree, kind, scope, base, priority, caller, \
@@ -112,7 +109,7 @@ pub(crate) async fn insert_request(
     Ok(id)
 }
 
-pub(crate) async fn set_plan(pool: &SqlitePool, id: i64, plan: &[PlannedUnit]) -> sqlx::Result<()> {
+pub async fn set_plan(pool: &SqlitePool, id: i64, plan: &[PlannedUnit]) -> sqlx::Result<()> {
     let plan = serde_json::to_string(plan).unwrap_or_else(|_| "[]".into());
     sqlx::query("UPDATE verify_requests SET plan = ? WHERE id = ?")
         .bind(plan)
@@ -122,7 +119,7 @@ pub(crate) async fn set_plan(pool: &SqlitePool, id: i64, plan: &[PlannedUnit]) -
     Ok(())
 }
 
-pub(crate) async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<RequestRow>> {
+pub async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<RequestRow>> {
     let Some(row) = sqlx::query(
         "SELECT id, project_id, worktree, kind, scope, base, priority, caller, note, unclaimed, \
          plan, created_at FROM verify_requests WHERE id = ?",
@@ -154,11 +151,7 @@ pub(crate) async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Opti
 
 /// Records the tree a request measured. Write-once: a request that already holds one keeps it,
 /// and the caller learns that by `false`.
-pub(crate) async fn set_measured_tree(
-    pool: &SqlitePool,
-    id: i64,
-    tree: &str,
-) -> sqlx::Result<bool> {
+pub async fn set_measured_tree(pool: &SqlitePool, id: i64, tree: &str) -> sqlx::Result<bool> {
     let result = sqlx::query(
         "UPDATE verify_requests SET measured_tree = ? WHERE id = ? AND measured_tree IS NULL",
     )
@@ -172,7 +165,7 @@ pub(crate) async fn set_measured_tree(
 /// The tree request `id` recorded, or `None` when it never did (or the request does not exist).
 /// Only tests read it back one request at a time; production asks `requests_measuring` by tree.
 #[cfg(test)]
-pub(crate) async fn measured_tree(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<String>> {
+pub async fn measured_tree(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<String>> {
     let tree: Option<Option<String>> =
         sqlx::query_scalar("SELECT measured_tree FROM verify_requests WHERE id = ?")
             .bind(id)
@@ -183,7 +176,7 @@ pub(crate) async fn measured_tree(pool: &SqlitePool, id: i64) -> sqlx::Result<Op
 
 /// The `test`/`scope` requests of `project_id` that recorded exactly `tree`, newest first, with the
 /// base each diffed from. Capped, because only the newest passed one is ever wanted.
-pub(crate) async fn requests_measuring(
+pub async fn requests_measuring(
     pool: &SqlitePool,
     project_id: &str,
     tree: &str,
@@ -198,7 +191,7 @@ pub(crate) async fn requests_measuring(
     .await
 }
 
-pub(crate) async fn cache_lookup(
+pub async fn cache_lookup(
     pool: &SqlitePool,
     key: &CacheKey<'_>,
     now_ms: i64,
@@ -225,7 +218,7 @@ pub(crate) async fn cache_lookup(
     .transpose()
 }
 
-pub(crate) async fn cache_store(
+pub async fn cache_store(
     pool: &SqlitePool,
     key: &CacheKey<'_>,
     run_id: i64,
@@ -250,11 +243,7 @@ pub(crate) async fn cache_store(
 }
 
 /// Drops entries older than the freshness window; returns how many went.
-pub(crate) async fn cache_prune(
-    pool: &SqlitePool,
-    now_ms: i64,
-    max_age_days: u64,
-) -> sqlx::Result<u64> {
+pub async fn cache_prune(pool: &SqlitePool, now_ms: i64, max_age_days: u64) -> sqlx::Result<u64> {
     let result = sqlx::query("DELETE FROM verify_cache WHERE created_ms < ?")
         .bind(cutoff_ms(now_ms, max_age_days))
         .execute(pool)
@@ -264,7 +253,7 @@ pub(crate) async fn cache_prune(
 
 /// Writes the `skipped_cached` record a cache hit leaves in `verify_runs`, so the log shows the
 /// unit was considered and why it did not run.
-pub(crate) async fn record_cache_hit(
+pub async fn record_cache_hit(
     pool: &SqlitePool,
     project_id: &str,
     worktree: &str,

@@ -1,0 +1,54 @@
+[package]
+name = "nucleos-app"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# The top of the núcleo's library: the modules nothing else in `nucleos-core` reads (hooks, fleet,
+# devtime, analytics, ...). Split out on 2026-10-22 so an edit to one of them recompiles this crate
+# and the daemon, not the 160k lines of `nucleos-core` below. The sources stay in `core/src` (see
+# `src/app.rs` there): only the manifest lives here, so no file moved and no path inside one changed.
+[lib]
+name = "nucleos_app"
+path = "../../src/app.rs"
+doctest = false
+
+[features]
+testkit = ["nucleos-core/testkit"]
+
+[dependencies]
+nucleos-core = { path = "../.." }
+nucleos-base = { path = "../nucleos-base" }
+async-trait = "0.1.89"
+axum = "0.8.9"
+base64 = "0.23.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+notify = "8"
+# `channels/media.rs` only (media ids).
+rand = "0.10.2"
+regex = "1"
+# Same features as `nucleos-core`'s, which explains why `native-tls` must stay.
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "native-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml = "0.9.34"
+sha2 = "0.10"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1.53.0", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+
+# `fleet/claude_code/session.rs` only: `GetProcessTimes` for a session process's start time. The same
+# crate and version as `nucleos-core`'s, so nothing new is built.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+nucleos-core = { path = "../..", features = ["testkit"] }
+tempfile = "3.27.0"
+# `channels::port_tests_commands` captures the log lines a refused command writes.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
+tokio = { version = "1.53.0", features = ["test-util"] }

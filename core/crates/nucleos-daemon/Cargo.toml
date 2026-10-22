@@ -1,0 +1,47 @@
+[package]
+name = "nucleos-daemon"
+# Kept equal to the repository's VERSION by scripts/bump-version.py: the daemon reports this one
+# (`--version`, the version header), and main.rs's tests compare it with VERSION.
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# The daemon executable: `main.rs`, `http.rs` and what `main.rs` declares, on top of `nucleos-core`
+# and `nucleos-app`. Its own package since 2026-10-22, because a crate between the library and the
+# binary cannot be a dependency of a binary that shares the library's package (cargo refuses the
+# cycle). The sources stay in `core/src`; the executable keeps its name.
+autotests = false
+
+[[bin]]
+name = "nucleos-core"
+path = "../../src/main.rs"
+
+[features]
+testkit = ["nucleos-core/testkit", "nucleos-app/testkit"]
+
+[dependencies]
+nucleos-core = { path = "../.." }
+nucleos-app = { path = "../nucleos-app" }
+async-trait = "0.1.89"
+axum = "0.8.9"
+base64 = "0.23.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+notify = "8"
+# Same features as `nucleos-core`'s, which explains why `native-tls` must stay.
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "native-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1.53.0", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+nucleos-core = { path = "../..", features = ["testkit"] }
+nucleos-app = { path = "../nucleos-app", features = ["testkit"] }
+tempfile = "3.27.0"
+sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
+tokio = { version = "1.53.0", features = ["test-util"] }

@@ -4,7 +4,7 @@ use super::*;
 
 /// What an item gate makes of a `scope` verification.
 #[derive(Debug)]
-pub(crate) enum ScopeVerdict {
+pub enum ScopeVerdict {
     /// The ticket reached a verdict the gate can record.
     Measured(crate::gate::GateOutcome),
     /// No unit agreed with the work: nothing was measured, so there is nothing to bless.
@@ -16,7 +16,7 @@ pub(crate) enum ScopeVerdict {
 
 /// Translates a ticket into the outcome an item gate records. A failed ticket carries the tail of
 /// each failed unit, so the retry prompt still receives the end of the output as it does today.
-pub(crate) fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
+pub fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
     use crate::gate::GateOutcome;
 
     if !ticket.done {
@@ -71,7 +71,7 @@ pub(crate) fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
 /// The one sentence the feed carries when a final gate (a job's last item, a run) tried `verify
 /// scope` instead of the full gate, so the owner can tell which gate measured the work. `subject`
 /// names what was gated ("job 3 at item 2", "run 7").
-pub(crate) fn scoped_final_note(subject: &str, verdict: &ScopeVerdict) -> String {
+pub fn scoped_final_note(subject: &str, verdict: &ScopeVerdict) -> String {
     use crate::gate::GateOutcome;
 
     match verdict {
@@ -98,7 +98,7 @@ pub(crate) fn scoped_final_note(subject: &str, verdict: &ScopeVerdict) -> String
 /// outcome, never a pass; the units it queued keep running and may still fill the cache. A request
 /// that cannot be submitted at all is `Unavailable`, and the caller measures the old way instead.
 /// `wait` counts from the submit, so time spent queued behind other work eats into it.
-pub(crate) async fn gate_job_scope(
+pub async fn gate_job_scope(
     executor: &Arc<Executor>,
     job_id: i64,
     worktree: &Path,
@@ -110,7 +110,7 @@ pub(crate) async fn gate_job_scope(
 /// The `scope` gate behind `gate_job_scope`, for any daemon-side caller that names itself: the job
 /// item gate as `Caller::Job`, the merge queue's gate before publish as `Caller::Merge`. The
 /// caller's label is what lands in `verify_requests.caller`.
-pub(crate) async fn gate_scope(
+pub async fn gate_scope(
     executor: &Arc<Executor>,
     caller: Caller,
     worktree: &Path,
@@ -123,7 +123,7 @@ pub(crate) async fn gate_scope(
 
 /// `gate_scope` that also returns the ticket it submitted (`None` when it was `Unavailable`), for a
 /// caller that may need to cancel the units that ticket queued.
-pub(crate) async fn gate_scope_ticketed(
+pub async fn gate_scope_ticketed(
     executor: &Arc<Executor>,
     caller: Caller,
     worktree: &Path,
@@ -185,7 +185,7 @@ pub(crate) async fn gate_scope_ticketed(
 /// Ends the still-queued units a verification ticket created, so they stop competing with a
 /// measurement that replaced them. Units the ticket joined from another request are not its own and
 /// are left alone.
-pub(crate) async fn cancel_queued_units(
+pub async fn cancel_queued_units(
     pool: &SqlitePool,
     ticket: i64,
     reason: &str,

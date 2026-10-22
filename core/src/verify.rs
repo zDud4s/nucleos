@@ -57,8 +57,8 @@ use crate::verify::runs::{
 use crate::verify::store::{self as verify_store, CacheKey, NewRequest, PlannedUnit};
 use crate::workflow_records;
 
-pub(crate) use self::resolve::*;
-pub(crate) use self::scope_gate::*;
+pub use self::resolve::*;
+pub use self::scope_gate::*;
 
 /// How often `settle` re-reads a unit it is waiting on to cache.
 const SETTLE_POLL: Duration = Duration::from_millis(500);
@@ -116,7 +116,7 @@ pub struct StatusArgs {
 /// Who asked, as far as verification cares: the owner, one autonomous run, or the daemon gating
 /// a job item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Caller {
+pub enum Caller {
     Owner,
     Run(i64),
     /// The daemon's own item gate. `from_scope` never produces it, so no key can claim to be one.
@@ -134,7 +134,7 @@ pub(crate) enum Caller {
 impl Caller {
     /// Every other key is refused: a sidecar, a team run or a narrower API token has no worktree
     /// of its own to verify, and running arbitrary groups is not part of what those keys grant.
-    pub(crate) fn from_scope(scope: &Scope) -> Option<Caller> {
+    pub fn from_scope(scope: &Scope) -> Option<Caller> {
         match scope {
             Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Some(Caller::Owner),
             Scope::Run(id) => Some(Caller::Run(*id)),
@@ -143,7 +143,7 @@ impl Caller {
     }
 
     /// A person waiting at the keyboard goes ahead of an autonomous run (spec, "Prioridades").
-    pub(crate) fn priority(self) -> i64 {
+    pub fn priority(self) -> i64 {
         match self {
             Caller::Merge(_) => PRIORITY_AUTONOMOUS,
             Caller::Owner => PRIORITY_INTERACTIVE,
@@ -155,7 +155,7 @@ impl Caller {
     }
 
     /// How the request row records its caller, and what `may_read` compares against.
-    pub(crate) fn label(self) -> String {
+    pub fn label(self) -> String {
         match self {
             Caller::Merge(id) => format!("merge:{id}"),
             Caller::Owner => "owner".to_owned(),
@@ -167,7 +167,7 @@ impl Caller {
 
     /// What a unit's `requested_by` records. Only the post-merge gate is named by caller; every
     /// other caller keeps the scope text, so existing readers see no new values.
-    pub(crate) fn requested_by(self, scope: &str) -> String {
+    pub fn requested_by(self, scope: &str) -> String {
         match self {
             Caller::Postgate => verify_runs::REQUESTED_BY_POSTGATE.to_owned(),
             Caller::FlakeCheck => verify_runs::REQUESTED_BY_FLAKE_CHECK.to_owned(),
@@ -179,7 +179,7 @@ impl Caller {
 
 /// A run reads only its own tickets: another run's output tail may carry what that run was
 /// working on, and a ticket id is a guessable integer.
-pub(crate) fn may_read(caller: Caller, row_caller: &str) -> bool {
+pub fn may_read(caller: Caller, row_caller: &str) -> bool {
     match caller {
         Caller::Merge(_) => row_caller == caller.label(),
         Caller::Owner => true,
@@ -192,7 +192,7 @@ pub(crate) fn may_read(caller: Caller, row_caller: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum VerifyError {
+pub enum VerifyError {
     BadRequest(String),
     Forbidden(String),
     NotFound(String),
@@ -202,7 +202,7 @@ pub(crate) enum VerifyError {
 }
 
 impl VerifyError {
-    pub(crate) fn status(&self) -> StatusCode {
+    pub fn status(&self) -> StatusCode {
         match self {
             VerifyError::BadRequest(_) => StatusCode::BAD_REQUEST,
             VerifyError::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -213,7 +213,7 @@ impl VerifyError {
         }
     }
 
-    pub(crate) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         match self {
             VerifyError::BadRequest(message)
             | VerifyError::Forbidden(message)
@@ -284,7 +284,7 @@ fn unit_fingerprint(
 ///
 /// The handler runs this inside its own task, so a caller hanging up halfway does not leave a
 /// request with half its units queued and no plan recorded.
-pub(crate) async fn submit(
+pub async fn submit(
     executor: &Arc<Executor>,
     caller: Caller,
     args: &VerifyArgs,
@@ -716,7 +716,7 @@ async fn submit_checked(
 /// covers anything. Idempotent: `set_measured_tree` writes only while the column is empty, so the
 /// detached copy `submit` spawns and the awaited one in `gate_scope_ticketed` may both run. A
 /// daemon restart halfway loses the proof, like the cache; the cost is one more gate.
-pub(crate) async fn confirm_measured_tree(
+pub async fn confirm_measured_tree(
     pool: SqlitePool,
     id: i64,
     worktree: PathBuf,
@@ -868,10 +868,7 @@ async fn settle(
 }
 
 /// A ticket as it stands now, with the caller label that may read it.
-pub(crate) async fn read_ticket(
-    pool: &SqlitePool,
-    id: i64,
-) -> sqlx::Result<Option<(Ticket, String)>> {
+pub async fn read_ticket(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<(Ticket, String)>> {
     let Some(request) = verify_store::get_request(pool, id).await? else {
         return Ok(None);
     };
@@ -894,7 +891,7 @@ pub(crate) async fn read_ticket(
 
 /// The proof that a tree was verified: the `verify` ticket that passed, and the base it diffed from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Evidence {
+pub struct Evidence {
     pub ticket: i64,
     pub base: String,
 }
@@ -908,7 +905,7 @@ pub(crate) struct Evidence {
 /// means at least one unit passed or was reused from the cache and none failed or errored, so
 /// `nothing_ran`, `failed`, `errored` and an unfinished ticket cover nothing. A base outside
 /// `bases` covers nothing either: the diff it measured is not the one the caller can trust.
-pub(crate) async fn covering_request(
+pub async fn covering_request(
     pool: &SqlitePool,
     project_id: &str,
     tree: &str,
@@ -960,7 +957,7 @@ async fn annotate_red_target(pool: &SqlitePool, ticket: &mut Ticket) {
 }
 
 /// Re-reads the ticket until it is done or `deadline` has passed, whichever comes first.
-pub(crate) async fn wait_ticket(
+pub async fn wait_ticket(
     pool: &SqlitePool,
     id: i64,
     deadline: Duration,
