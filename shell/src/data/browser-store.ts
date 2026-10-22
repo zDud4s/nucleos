@@ -117,6 +117,14 @@ export function consumeFocus(): void {
   set({ ...state, focusIntent: null });
 }
 
+/** The tab in front, as BrowserPage publishes it: its scope key and the active tab (null when none). */
+export type ActiveTab = { scope: string; tab: Tab | null };
+
+/** BrowserPage publishes the scope and tab in front; the agent panel reads it from the store. */
+export function setActiveTab(_next: ActiveTab | null): void {
+  // RED stub
+}
+
 /** The page registers where the native webview goes; null when it unmounts. */
 export function setBoundsProvider(fn: (() => Bounds) | null): void {
   boundsProvider = fn;
