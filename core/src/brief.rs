@@ -73,13 +73,50 @@ pub fn retention_days() -> i64 {
         .unwrap_or(DEFAULT_KNOWLEDGE_TRACE_RETENTION_DAYS)
 }
 
+/// Words that carry no topic, English and Portuguese. A row that shares only these with a task
+/// text is noise: FTS5 gives a term present in most rows an idf of about 1e-6, so such a row
+/// scores about a millionth of a real match. They are compared lowercased, without quotes and
+/// without edge punctuation; anything under [`MIN_TERM_CHARS`] is dropped by length instead.
+const STOPWORDS: &[&str] = &[
+    // English
+    "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had", "her", "was",
+    "one", "our", "out", "has", "have", "with", "this", "that", "from", "they", "will", "would",
+    "there", "their", "what", "about", "which", "when", "were", "been", "into", "than", "then",
+    "them", "these", "those", "some", "such", "only", "also", "over", "your", "its", "does", "did",
+    "should", "could", "just", "how", "why", "who", "whom", "while", "where", "after", "before",
+    "each", "other", "more", "most", "very", "here", "being", "because", "between", "his", "him",
+    "she", "too", "may", "might", "must", "shall", "per", "via", // Portuguese
+    "que", "para", "com", "uma", "uns", "umas", "por", "como", "mais", "mas", "dos", "das", "nos",
+    "nas", "não", "nao", "são", "sao", "foi", "ser", "ter", "tem", "está", "esta", "este", "isso",
+    "isto", "esse", "essa", "seu", "sua", "seus", "suas", "pelo", "pela", "pelos", "pelas", "num",
+    "numa", "ele", "ela", "eles", "elas", "quando", "onde", "entre", "sobre", "também", "tambem",
+    "até", "ate", "muito", "depois", "antes", "cada", "qual", "quais", "sem", "ainda", "aos",
+    "nem", "foram", "era", "estão", "estao", "têm", "tinha", "vai", "vão", "fazer",
+];
+
+/// A query term shorter than this many characters (after edge punctuation) is dropped.
+const MIN_TERM_CHARS: usize = 3;
+
+/// Whether a quoted `fts_query` term is worth searching: not a stopword, not too short.
+fn is_topical(quoted: &str) -> bool {
+    let word = quoted
+        .trim_matches('"')
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    word.chars().count() >= MIN_TERM_CHARS && !STOPWORDS.contains(&word.as_str())
+}
+
 /// Build an OR expression because an implicit FTS5 AND over a whole node prompt usually matches
 /// no row and would leave the FTS signal at zero for every candidate.
+///
+/// Stopwords and terms under [`MIN_TERM_CHARS`] characters are dropped: the task text is a whole
+/// prompt, and ORing "the" or "to" into the expression lets any row that merely contains them
+/// match. When every term is dropped there is no expression (`None`).
 fn match_expression(query: &str) -> Option<String> {
     let quoted = crate::search::fts_query(query);
-    let mut terms = Vec::new();
+    let mut terms: Vec<&str> = Vec::new();
     for term in quoted.split(' ') {
-        if term.is_empty() || terms.contains(&term) {
+        if term.is_empty() || !is_topical(term) || terms.contains(&term) {
             continue;
         }
         terms.push(term);
@@ -91,6 +128,12 @@ fn match_expression(query: &str) -> Option<String> {
 }
 
 /// Turn SQLite's negative bm25 ranks into one signal on the unit scale for this pass.
+///
+/// This divides by the best of the pass, so a real but weaker match can land far under
+/// `knowledge::MIN_RELEVANCE` (one common term against a long strong row). The embedder path
+/// keeps that value, because `s_sim` can carry such a row. When no query vector was computed,
+/// [`of_with`] lifts the rows above [`LIFT_FLOOR`] through [`lift_fts`] afterwards; this function
+/// itself does not change.
 fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
     let raw: Vec<Option<f64>> = bm25
         .iter()
@@ -118,6 +161,34 @@ fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
     raw.iter()
         .map(|value| value.map_or(0.0, |value| (value - lo) / (hi - lo)))
         .collect()
+}
+
+/// The smallest pass-normalised FTS share [`lift_fts`] lifts. A bound on the lift, chosen over a
+/// top-K cut because it is independent of how many rows the scope holds.
+///
+/// A stopword-only or near-noise match has a bm25 about 1e-6 of the best (FTS5 clamps the idf of
+/// a term found in most rows to 1e-6), so it must not ride the lift into the briefing and be
+/// credited. A real selective term of the task sits far above 1% of the best.
+const LIFT_FLOOR: f64 = 0.01;
+
+/// Lift a matched row's pass-normalised FTS signal onto `[MIN_RELEVANCE, 1.0]`, but only when the
+/// row is at or above [`LIFT_FLOOR`].
+///
+/// Used only when no query vector exists, so FTS is the only textual signal and
+/// [`normalise_fts`]'s division by the pass best would otherwise drop every real-but-weaker match
+/// under the gate. Above the floor the map `MIN_RELEVANCE + (1 - MIN_RELEVANCE) * s` is affine and
+/// increasing, so ordering and ties are unchanged and a best match stays `1.0`. A row below the
+/// floor keeps its raw value, which is under `MIN_RELEVANCE`, so the gate drops it; the map as a
+/// whole stays monotone. A row with no FTS hit (`0.0`, negative or not finite) stays `0.0`.
+fn lift_fts(s_fts: f64) -> f64 {
+    if !s_fts.is_finite() || s_fts <= 0.0 {
+        return 0.0;
+    }
+    if s_fts < LIFT_FLOOR {
+        return s_fts;
+    }
+    let floor = knowledge::MIN_RELEVANCE;
+    (floor + (1.0 - floor) * s_fts.clamp(0.0, 1.0)).clamp(floor, 1.0)
 }
 
 async fn fts_ranks(
@@ -254,6 +325,8 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
 
 /// [`of`] with the embedder and its deadline injected. One query embedding per briefing; a
 /// timeout, an error or a missing vector leaves every `s_sim` at zero and the weights as before.
+/// With no query vector, `s_fts` of rows at or above [`LIFT_FLOOR`] is lifted onto
+/// `[MIN_RELEVANCE, 1.0]` (see [`lift_fts`]); with one, `s_fts` is the plain pass-normalised value.
 /// Only the error kind is logged, never the query, a title, a body or a vector.
 pub(crate) async fn of_with(
     pool: &SqlitePool,
@@ -321,6 +394,12 @@ pub(crate) async fn of_with(
             ..context.clone()
         };
         return Ok(knowledge::select(&known, &context, &Budget::default()));
+    }
+    // FTS is the only textual signal here: lift every row at or above `LIFT_FLOOR` over the
+    // relevance gate, see `lift_fts`. Unmatched rows stay at 0.0 and near-noise rows below the
+    // floor keep their raw value; the gate drops both.
+    for candidate in known.iter_mut() {
+        candidate.s_fts = lift_fts(candidate.s_fts);
     }
     Ok(knowledge::select(&known, context, &Budget::default()))
 }
@@ -749,16 +828,19 @@ pub async fn credit_item(pool: &SqlitePool, job_id: i64, ordinal: i64) -> sqlx::
     }
 }
 
-/// Credit one standalone run by the final run at the end of its handoff or resume chain.
+/// Credit one run's uncredited `item_id IS NULL` rows by the final run at the end of its handoff
+/// or resume chain.
+///
+/// A standalone run owns all its rows this way. A job-node run owns only the rows traced with no
+/// item (the singleton nodes plan, review, replan and bundle, which have no `job_nodes` row of
+/// their own): `credit_rows` claims `item_id IS NULL` rows only, so the rows of an item node stay
+/// with `credit_item` and are never counted twice.
 pub async fn credit_run(pool: &SqlitePool, run_id: i64) -> sqlx::Result<u64> {
-    let owner: Option<(Option<i64>,)> = sqlx::query_as("SELECT job_id FROM runs WHERE id = ?")
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM runs WHERE id = ?")
         .bind(run_id)
         .fetch_optional(pool)
         .await?;
-    let Some((job_id,)) = owner else {
-        return Ok(0);
-    };
-    if job_id.is_some() {
+    if exists.is_none() {
         return Ok(0);
     }
 
@@ -828,10 +910,8 @@ async fn sweep_at_most(pool: &SqlitePool, batch: i64) -> sqlx::Result<u64> {
              SELECT u.run_id, r.id, {NEXT_HOP_SQL}, 0
                FROM (SELECT DISTINCT rk.run_id
                        FROM run_knowledge rk
-                       JOIN runs r0 ON r0.id = rk.run_id
                       WHERE rk.credited_at IS NULL
-                        AND rk.item_id IS NULL
-                        AND r0.job_id IS NULL) u
+                        AND rk.item_id IS NULL) u
                JOIN runs r ON r.id = u.run_id
              UNION ALL
              SELECT c.unit_id, r.id, {NEXT_HOP_SQL}, c.hops + 1
@@ -875,8 +955,9 @@ mod tests {
     use sqlx::{Row, SqlitePool};
 
     use super::{
-        SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression,
-        normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most, trace_of,
+        LIFT_FLOOR, MAX_QUERY_TERMS, SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks,
+        item_verdict, lift_fts, match_expression, normalise_fts, of, prune, record, run_verdict,
+        sweep, sweep_at_most, trace_of,
     };
     use crate::execution::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
@@ -1131,7 +1212,34 @@ mod tests {
 
         assert_eq!(match_expression(""), None);
         assert_eq!(match_expression("\"\" \""), None);
-        assert_eq!(match_expression("a b a"), Some("\"a\" OR \"b\"".into()));
+        // Every term of this one is a stopword or under three characters: no expression at all.
+        assert_eq!(match_expression("a b a"), None);
+        assert_eq!(match_expression("the to of and is"), None);
+        assert_eq!(match_expression("zan b zan"), Some("\"zan\"".into()));
+    }
+
+    #[test]
+    fn stopwords_and_short_tokens_never_reach_the_match_expression() {
+        assert_eq!(
+            match_expression("The zanzibar rollout to the migration, and a db"),
+            Some("\"zanzibar\" OR \"rollout\" OR \"migration,\"".into())
+        );
+        // Portuguese stopwords, matched on the lowercased word.
+        assert_eq!(
+            match_expression("Para a migração COM o zanzibar"),
+            Some("\"migração\" OR \"zanzibar\"".into())
+        );
+        // The dedupe and the cap still apply to what is left.
+        assert_eq!(
+            match_expression("zanzibar the zanzibar"),
+            Some("\"zanzibar\"".into())
+        );
+        let many = (0..MAX_QUERY_TERMS + 10)
+            .map(|n| format!("term{n}"))
+            .collect::<Vec<_>>()
+            .join(" the ");
+        let expression = match_expression(&many).expect("the terms are topical");
+        assert_eq!(expression.split(" OR ").count(), MAX_QUERY_TERMS);
     }
 
     #[tokio::test]
@@ -1143,6 +1251,269 @@ mod tests {
         let ranks = fts_ranks(&pool, "\"zanzibar\"", &[a]).await?;
         assert_eq!(ranks.keys().copied().collect::<Vec<_>>(), vec![a]);
         assert!(fts_ranks(&pool, "\"zanzibar\"", &[]).await?.is_empty());
+        Ok(())
+    }
+
+    const LIFT_QUERY: &str = "zanzibar rollout migration shared";
+
+    /// One long strong match, five rows sharing only the term `shared`, fourteen rows that match
+    /// nothing. Returns `(strong, weak, unmatched)` ids; every row is active and in `p1`.
+    ///
+    /// `shared` is a real, selective term here: it sits in 6 of 20 rows, so FTS5 gives it a
+    /// positive idf (about 0.8; a term in more than half the rows is clamped to 1e-6, which is what
+    /// a stopword looks like). A weak row therefore lands well above [`LIFT_FLOOR`] and under
+    /// `MIN_RELEVANCE` before the lift, which is the case the lift exists for.
+    async fn seed_lift_corpus(pool: &SqlitePool) -> sqlx::Result<(i64, Vec<i64>, Vec<i64>)> {
+        async fn row(pool: &SqlitePool, title: &str, body: &str) -> sqlx::Result<i64> {
+            let result = sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', 'project', 'p1', 'owner', 'memory', ?, ?, 'active',
+                         '2026-08-19T00:00:00+00:00')",
+            )
+            .bind(title)
+            .bind(body)
+            .execute(pool)
+            .await?;
+            Ok(result.last_insert_rowid())
+        }
+
+        let strong = row(
+            pool,
+            "zanzibar rollout migration",
+            "zanzibar rollout migration shared plan: the zanzibar rollout needs the migration              before the shared cache moves; zanzibar migration, rollout order, shared owner.",
+        )
+        .await?;
+        let mut weak = Vec::new();
+        for n in 0..5 {
+            weak.push(
+                row(
+                    pool,
+                    &format!("weak note {n}"),
+                    &format!("a shared remark number {n} about something else entirely"),
+                )
+                .await?,
+            );
+        }
+        let mut unmatched = Vec::new();
+        for n in 0..14 {
+            unmatched.push(
+                row(
+                    pool,
+                    &format!("unrelated note {n}"),
+                    &format!("lunch menu number {n}"),
+                )
+                .await?,
+            );
+        }
+        Ok((strong, weak, unmatched))
+    }
+
+    /// The pass-normalised FTS value each candidate would carry without the lift.
+    async fn plain_fts(pool: &SqlitePool, ids: &[i64]) -> sqlx::Result<Vec<f64>> {
+        let expression = match_expression(LIFT_QUERY).expect("the query has terms");
+        let ranks = fts_ranks(pool, &expression, ids).await?;
+        let bm25: Vec<Option<f64>> = ids.iter().map(|id| ranks.get(id).copied()).collect();
+        Ok(normalise_fts(&bm25))
+    }
+
+    fn trace_row(brief: &crate::knowledge::Brief, id: i64) -> &Scored {
+        brief
+            .trace
+            .iter()
+            .find(|row| row.knowledge_id == id)
+            .expect("every admitted candidate is traced")
+    }
+
+    #[tokio::test]
+    async fn fts_lift_keeps_weak_but_real_matches_in_the_briefing_without_an_embedder()
+    -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let (strong, weak, _unmatched) = seed_lift_corpus(&pool).await?;
+
+        // The collapse this lift answers: every weak match is real (a selective term, so above
+        // the lift floor) yet under the gate.
+        let mut ids = vec![strong];
+        ids.extend(&weak);
+        let plain = plain_fts(&pool, &ids).await?;
+        assert_eq!(plain[0], 1.0);
+        assert!(
+            plain[1..]
+                .iter()
+                .all(|s| *s >= LIFT_FLOOR && *s < crate::knowledge::MIN_RELEVANCE),
+            "{plain:?}"
+        );
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            LIFT_QUERY,
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        let strong_row = trace_row(&brief, strong);
+        assert!(strong_row.shown);
+        assert_eq!(strong_row.s_fts, 1.0);
+        for id in &weak {
+            let row = trace_row(&brief, *id);
+            assert!(
+                row.s_fts >= crate::knowledge::MIN_RELEVANCE,
+                "{}",
+                row.s_fts
+            );
+            assert!(row.s_fts < strong_row.s_fts);
+            assert!(row.shown, "a weak but real match is briefed");
+        }
+        let block = brief.block.as_deref().unwrap_or_default();
+        assert!(block.contains("weak note 0") && block.contains("zanzibar rollout migration"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fts_lift_still_drops_a_row_with_no_match() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let (_strong, _weak, unmatched) = seed_lift_corpus(&pool).await?;
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            LIFT_QUERY,
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        for id in unmatched {
+            let row = trace_row(&brief, id);
+            assert_eq!(row.s_fts, 0.0);
+            assert!(!row.shown);
+        }
+        let block = brief.block.as_deref().unwrap_or_default();
+        assert!(!block.contains("unrelated note"));
+        Ok(())
+    }
+
+    #[test]
+    fn fts_lift_is_an_order_preserving_map_onto_the_gate_and_one() {
+        let floor = crate::knowledge::MIN_RELEVANCE;
+        assert_eq!(lift_fts(0.0), 0.0);
+        assert_eq!(lift_fts(-0.5), 0.0);
+        assert_eq!(lift_fts(-0.0), 0.0);
+        assert_eq!(lift_fts(f64::NAN), 0.0);
+        assert_eq!(lift_fts(f64::INFINITY), 0.0);
+        assert_eq!(lift_fts(f64::NEG_INFINITY), 0.0);
+        assert_eq!(lift_fts(1.0), 1.0);
+        assert_eq!(lift_fts(2.0), 1.0);
+
+        // From the floor up the map is strictly increasing and lands on `[MIN_RELEVANCE, 1.0]`.
+        let samples = [LIFT_FLOOR, 0.0915, 0.1, 0.25, 0.5, 0.9, 1.0];
+        let lifted: Vec<f64> = samples.iter().map(|s| lift_fts(*s)).collect();
+        assert!(
+            lifted.windows(2).all(|pair| pair[0] < pair[1]),
+            "{lifted:?}"
+        );
+        assert!(lifted.iter().all(|s| (floor..=1.0).contains(s)));
+        assert_eq!(lifted[lifted.len() - 1], 1.0);
+    }
+
+    #[test]
+    fn fts_lift_leaves_a_row_under_its_floor_at_the_raw_value() {
+        let floor = crate::knowledge::MIN_RELEVANCE;
+        // Just under the floor: not lifted, so the gate still drops it.
+        let under = LIFT_FLOOR * 0.99;
+        assert_eq!(lift_fts(under), under);
+        assert!(lift_fts(under) < floor);
+        for noise in [1e-12, 1e-8, 1e-6, 1e-3] {
+            assert_eq!(lift_fts(noise), noise);
+            assert!(lift_fts(noise) < floor);
+        }
+        // At the floor it is lifted onto the gate and above.
+        assert!(lift_fts(LIFT_FLOOR) >= floor);
+        // Monotone across the floor: nothing under it outranks anything at or above it.
+        assert!(lift_fts(under) < lift_fts(LIFT_FLOOR));
+    }
+
+    /// A row that shares only stopwords with the task text must not be briefed on the no-embedder
+    /// path. Before the stopword filter, `the`/`to` were ORed into the expression and the row
+    /// matched, then rode the lift over the relevance gate and was credited.
+    #[tokio::test]
+    async fn a_row_matching_only_stopwords_is_not_briefed_without_an_embedder() -> sqlx::Result<()>
+    {
+        let pool = test_pool().await;
+        let real = seed(&pool, "project", Some("p1"), "zanzibar rollout migration").await?;
+        let noise = seed(
+            &pool,
+            "project",
+            Some("p1"),
+            "the plan to move the cache to the new region",
+        )
+        .await?;
+        let query = "the zanzibar rollout to the migration";
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            query,
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        assert!(trace_row(&brief, real).shown);
+        let noise_row = trace_row(&brief, noise);
+        assert_eq!(noise_row.s_fts, 0.0, "the stopwords are not searched");
+        assert!(!noise_row.shown);
+        let block = brief.block.as_deref().unwrap_or_default();
+        assert!(block.contains("zanzibar rollout migration") && !block.contains("new region"));
+
+        // A task text made only of stopwords and short tokens briefs nothing through FTS.
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            "the to of and a",
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        assert!(brief.trace.iter().all(|row| row.s_fts == 0.0 && !row.shown));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fts_lift_leaves_the_embedder_path_untouched() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let (strong, weak, unmatched) = seed_lift_corpus(&pool).await?;
+        let mut ids = vec![strong];
+        ids.extend(&weak);
+        let plain = plain_fts(&pool, &ids).await?;
+
+        // A query vector orthogonal to every stored one: `s_sim` is 0, so only `s_fts` can pass.
+        for id in ids.iter().chain(&unmatched) {
+            seed_vector(&pool, *id, &[0.0, 1.0]).await?;
+        }
+        let fake = crate::embed::FakeEmbedder::new("fake", vec![], Some(vec![1.0, 0.0]));
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            LIFT_QUERY,
+            Some(&fake),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+
+        for (id, expected) in ids.iter().zip(&plain) {
+            let row = trace_row(&brief, *id);
+            assert_eq!(row.s_fts, *expected, "the embedder path is not lifted");
+        }
+        assert!(trace_row(&brief, strong).shown);
+        for id in &weak {
+            let row = trace_row(&brief, *id);
+            assert!(row.s_fts < crate::knowledge::MIN_RELEVANCE);
+            assert_eq!(row.s_sim, 0.0);
+            assert!(!row.shown, "under the gate with the old normalisation");
+        }
+        for id in &unmatched {
+            assert_eq!(trace_row(&brief, *id).s_fts, 0.0);
+        }
         Ok(())
     }
 
@@ -1545,6 +1916,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_singleton_job_node_run_is_credited_once_by_its_run_chain_verdict() -> sqlx::Result<()>
+    {
+        let pool = test_pool().await;
+        let job_id = seed_job(&pool, "completed", 0).await?;
+
+        // An item node: its rows carry the item id and belong to `credit_item` alone.
+        let item_knowledge = seed(&pool, "machine", None, "item row").await?;
+        let item_run = seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
+        let item_id = seed_item(&pool, job_id, "passed", Some("passed"), 0, Some(item_run)).await?;
+        record(
+            &pool,
+            item_run,
+            Some(item_id),
+            &[scored(item_knowledge, true)],
+        )
+        .await?;
+
+        // A singleton node (plan/review/replan/bundle): job_id set on the run, item_id NULL on
+        // its rows. One is credited directly, the other by the sweep.
+        let direct_knowledge = seed(&pool, "machine", None, "singleton direct").await?;
+        let direct_run =
+            seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
+        record(&pool, direct_run, None, &[scored(direct_knowledge, true)]).await?;
+        let swept_knowledge = seed(&pool, "machine", None, "singleton swept").await?;
+        let swept_run = seed_run(&pool, "failed", Some(1), None, Some(job_id)).await?;
+        record(&pool, swept_run, None, &[scored(swept_knowledge, true)]).await?;
+
+        // credit_run on an item node's run claims nothing: its rows have an item id.
+        assert_eq!(credit_run(&pool, item_run).await?, 0);
+        assert_eq!(counters(&pool, item_knowledge).await?, (0, 0, 0, None));
+
+        // credit_run credits the singleton once, by the verdict of its own run chain.
+        assert_eq!(credit_run(&pool, direct_run).await?, 1);
+        let direct = counters(&pool, direct_knowledge).await?;
+        assert_eq!((direct.0, direct.1, direct.2), (1, 1, 1));
+        assert_eq!(credit_run(&pool, direct_run).await?, 0);
+
+        // The sweep credits the other singleton and the item once each, and the already
+        // credited singleton never a second time.
+        assert_eq!(sweep(&pool).await?, 2);
+        let swept = counters(&pool, swept_knowledge).await?;
+        assert_eq!((swept.0, swept.1, swept.2), (1, 1, 0));
+        let item = counters(&pool, item_knowledge).await?;
+        assert_eq!((item.0, item.1, item.2), (1, 1, 1));
+        let direct = counters(&pool, direct_knowledge).await?;
+        assert_eq!((direct.0, direct.1, direct.2), (1, 1, 1));
+
+        // Nothing is left for either path.
+        assert_eq!(sweep(&pool).await?, 0);
+        assert_eq!(credit_run(&pool, swept_run).await?, 0);
+        assert_eq!(credit_item(&pool, job_id, 0).await?, 0);
+        let swept = counters(&pool, swept_knowledge).await?;
+        assert_eq!((swept.0, swept.1, swept.2), (1, 1, 0));
+        let item = counters(&pool, item_knowledge).await?;
+        assert_eq!((item.0, item.1, item.2), (1, 1, 1));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_cancelled_run_leaves_the_rows_it_showed_not_measured_rather_than_failed()
     -> sqlx::Result<()> {
         let pool = test_pool().await;
@@ -1607,7 +2037,7 @@ mod tests {
 
         let dead_knowledge = seed(&pool, "machine", None, "dead job node").await?;
         let dead_job = seed_job(&pool, "running", 0).await?;
-        let dead_run = seed_run(&pool, "completed", Some(0), None, Some(dead_job)).await?;
+        let dead_run = seed_run(&pool, "running", None, None, Some(dead_job)).await?;
         record(&pool, dead_run, None, &[scored(dead_knowledge, true)]).await?;
 
         let mut item_ids = Vec::new();

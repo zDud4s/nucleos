@@ -476,9 +476,10 @@ pub(super) async fn spawn_node(
                     .await
                     {
                         Ok(id) => id,
-                        // A NULL item_id is never credited, so say this failure out loud.
+                        // A NULL item_id is credited as a singleton by the run's own verdict, not by
+                        // its item's, so say this failure out loud.
                         Err(error) => {
-                            tracing::warn!(job_id = job.id, run_id, ordinal, %error, "could not resolve a node's item; its briefing trace is written without one and will never be credited");
+                            tracing::warn!(job_id = job.id, run_id, ordinal, %error, "could not resolve a node's item; its briefing trace is written without one and will be credited as a singleton by the run's own verdict");
                             None
                         }
                     },

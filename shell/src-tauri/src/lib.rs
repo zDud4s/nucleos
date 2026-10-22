@@ -12,6 +12,8 @@ pub mod dictation;
 pub mod drop;
 /// Where the quota notch is drawn: inside the main window, or in a floating window of its own.
 pub mod notch;
+/// The small always-on-top window the capture chord opens, to take one note from anywhere.
+pub mod quick_capture;
 /// Dictation decisions. `pub` because it is genuinely this crate's surface: the platform layer
 /// calls into it, and a private module of not-yet-wired functions would be dead code under the
 /// `-D warnings` clippy gate that `scripts/gates.sh` now runs over this package.
@@ -55,9 +57,15 @@ const CLOSE: CloseAction = if cfg!(target_os = "linux") {
 /// the notch existed it hid whichever one asked: closing the floating notch would have hidden it
 /// and left the owner with no notch at all and no setting that said so (design D8, wall 3).
 /// Closing it docks it instead — the notch goes back inside the app, and the mode on disk says so.
+///
+/// The quick-capture box is borderless and off the taskbar, but Alt+F4 still reaches it. It only
+/// ever hides, on every platform: `CLOSE` is `Exit` on Linux, and closing a capture box must not
+/// take the whole app down with it.
 fn close_action_for(label: &str) -> Option<CloseAction> {
     if label == notch::LABEL {
         None
+    } else if label == quick_capture::LABEL {
+        Some(CloseAction::Hide)
     } else {
         Some(CLOSE)
     }
@@ -327,6 +335,15 @@ mod tests {
         assert_eq!(close_action_for("main"), Some(CLOSE));
     }
 
+    /// Alt+F4 on the capture box hides it on every platform; on Linux `CLOSE` would quit the app.
+    #[test]
+    fn closing_the_quick_capture_box_only_hides_it_on_every_platform() {
+        assert_eq!(
+            close_action_for(quick_capture::LABEL),
+            Some(CloseAction::Hide)
+        );
+    }
+
     /// Closing the notch window docks it — and the arm that does it is read here, not only the
     /// decision in front of it. `close_action_for` answering `None` says the notch is not the main
     /// window's case; it says nothing about what happens next, so an arm rewritten to hide the
@@ -368,9 +385,10 @@ mod tests {
         assert!(arm.contains("notch::refit(&notch)"), "{arm}");
     }
 
-    /// The notch reaches the token without a capability of its own (see `notch`), so the one
-    /// capability there is must stay scoped to the main window: widening it would hand the floating
-    /// notch every plugin command the app has.
+    /// The notch reaches the token without a capability of its own (see `notch`), so the default
+    /// capability must stay scoped to the main window: widening it would hand the floating notch
+    /// every plugin command the app has. (`quick-capture.json` is the only other capability, scoped
+    /// to its own window; `quick_capture`'s tests hold it.)
     #[test]
     fn the_only_capability_stays_on_the_main_window() {
         let capability: serde_json::Value =
@@ -383,7 +401,8 @@ mod tests {
     /// is safe without a capability only because this app ships **no ACL manifest of its own**
     /// (see `notch`'s module comment). Tauri builds one from `permissions/`, so the day somebody
     /// adds that directory every command in `invoke_handler` starts being ACL-checked and the
-    /// capability above — scoped to `main` — starts refusing the notch window its own commands.
+    /// default capability above — scoped to `main` — starts refusing the notch window its own
+    /// commands.
     /// `gen/` is untracked, so nothing else in this suite would notice.
     #[test]
     fn the_app_ships_no_acl_manifest_of_its_own() {

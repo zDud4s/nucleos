@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { Brain, validateBrainSearch } from "./Brain";
-import type { NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
+import type { NoteLink, NotesGraph, OwnerNote, WeeklyReview } from "../data/owner-notes";
 import type { GModel } from "../brain/graph-types";
 import { known } from "../brain/knowledge/test-helpers";
 import { renderWithRouter } from "../test/harness";
@@ -65,18 +65,31 @@ const GRAPH: NotesGraph = {
   targets: [{ kind: "project", ref: "nucleos", label: "nucleos", missing: false }],
 };
 
+const REVIEW: WeeklyReview = {
+  week_start: "2026-10-19T00:00:00+00:00",
+  week_end: "2026-10-26T00:00:00+00:00",
+  created: [note(), note({ id: 2, text: "Second thought" })],
+  unlinked: [note({ id: 2, text: "Second thought" })],
+  unlinked_total: 3,
+  resurfaced: [note({ id: 5, text: "Old idea worth a second look" })],
+  waiting_proposals: 1,
+};
+
 interface Served {
   listed?: OwnerNote[];
   matched?: OwnerNote[];
   graph?: NotesGraph;
+  review?: WeeklyReview;
   /** Absent answers `[]`; an Error rejects. */
   knowledge?: Error;
 }
 
-function daemonWith({ listed = [], matched = [], graph = GRAPH, knowledge }: Served = {}) {
+function daemonWith({ listed = [], matched = [], graph = GRAPH, review = REVIEW, knowledge }: Served = {}) {
   return (path: string, init?: RequestInit) => {
     if (path.startsWith("/owner-notes/search")) return Promise.resolve(matched);
     if (path.startsWith("/owner-notes/graph")) return Promise.resolve(graph);
+    if (path === "/owner-notes/review") return Promise.resolve(review);
+    if (/^\/owner-notes\/\d+\/related/.test(path) || path.startsWith("/owner-notes/by-target?")) return Promise.resolve([]);
     if (path.startsWith("/owner-notes?")) return Promise.resolve(listed);
     if (path === "/owner-notes" && init?.method === "POST") return Promise.resolve({ id: 9 });
     const detail = /^\/owner-notes\/(\d+)$/.exec(path);
@@ -232,5 +245,20 @@ describe("Brain", () => {
     fireEvent.change(await screen.findByRole("textbox", { name: "Capture a note" }), { target: { value: "x" } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(await screen.findByText("Note saved")).toBeTruthy();
+  });
+
+  it("shows the weekly review summary between the capture box and the list, and a row opens its note", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith({ listed: [note()] }));
+    await renderWithRouter(<Brain />, { initialPath: "/brain" });
+
+    expect(await screen.findByText("This week: 2 written, 3 unlinked, 1 to revisit, 1 proposal waiting")).toBeTruthy();
+    const capture = screen.getByRole("textbox", { name: "Capture a note" });
+    const week = screen.getByRole("region", { name: "This week" });
+    expect(capture.compareDocumentPosition(week) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show" }));
+    expect(screen.getByText("showing 1 of 3")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Old idea worth a second look" }));
+    expect(await screen.findByRole("complementary", { name: "Selected" })).toBeTruthy();
   });
 });

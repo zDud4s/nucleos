@@ -9,6 +9,7 @@ import { KnowledgePanel } from "../brain/knowledge/KnowledgePanel";
 import { ToolRequests } from "../brain/knowledge/ToolRequests";
 import { WaitingPanel } from "../brain/knowledge/WaitingPanel";
 import { UnifiedList } from "../brain/UnifiedList";
+import { WeeklyReview } from "../brain/WeeklyReview";
 import { ForceGraph } from "../brain/ForceGraph";
 import { buildModel } from "../brain/graph-model";
 import type { GFilters } from "../brain/graph-types";
@@ -72,6 +73,7 @@ export function Brain() {
 
       <div className="brain-page">
         <Capture />
+        <WeeklyReview onItem={showItem} />
         {view === "graph" ? (
           <BrainGraphView item={item} onItem={showItem} />
         ) : (

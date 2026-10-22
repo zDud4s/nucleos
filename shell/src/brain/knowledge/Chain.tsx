@@ -28,7 +28,13 @@ export function Chain({ id }: ChainProps) {
   if (history.data === undefined)
     return <p className="learned-chain-loading">reading…</p>;
 
-  const { events, replaced, replaced_by: replacedBy } = history.data;
+  const { known, events, replaced, replaced_by: replacedBy } = history.data;
+  // Core writes a same-status event with this exact note when a distilled
+  // learning quoted the owner's text and was proposed instead of recorded. The
+  // line is only true while the row still waits, so it goes once it is decided.
+  const quotedOwner =
+    known.status === "proposed" &&
+    events.some((event) => event.note === "quoted_owner_text");
 
   return (
     // A well and not a box: the chain is the same row seen further back in time,
@@ -37,6 +43,11 @@ export function Chain({ id }: ChainProps) {
     // well's default mono face would deny; `capped` because the decisions grow by
     // one each time a person answers something.
     <Well as="div" reads capped>
+      {quotedOwner && (
+        <p className="learned-chain-line">
+          Proposed, not recorded: it quoted your own text, so it waits for you to decide.
+        </p>
+      )}
       {replacedBy !== null && (
         <p className="learned-chain-line">
           Replaced by <strong>{replacedBy.title}</strong>.

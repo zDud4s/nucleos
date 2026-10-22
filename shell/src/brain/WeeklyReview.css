@@ -1,0 +1,87 @@
+/* The collapsible "This week" review at the top of the Brain list (see WeeklyReview.tsx). */
+.brain-week {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.brain-week-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.brain-week-head h3 {
+  margin: 0;
+  font-size: var(--text-base);
+}
+
+.brain-week-range {
+  flex: 1 1 auto;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.brain-week-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.brain-week-toggle:hover {
+  color: var(--text);
+}
+
+.brain-week-summary,
+.brain-week-proposals,
+.brain-week-more {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.brain-week-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.brain-week-section h4 {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.brain-week-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.brain-week-row {
+  display: block;
+  width: 100%;
+  padding: var(--space-1) 0;
+  background: none;
+  border: none;
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.brain-week-row:hover {
+  background: var(--surface-sunken);
+}

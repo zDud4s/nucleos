@@ -314,7 +314,7 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-fn strip_fence(answer: &str) -> &str {
+pub(super) fn strip_fence(answer: &str) -> &str {
     let s = answer.trim();
     let Some(rest) = s.strip_prefix("```") else {
         return s;

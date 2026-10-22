@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED, RESOLVE_MIN_REVIEWED } from "../data/autopilot";
 import { previewPipeline, judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, CHANNELS, CHANNEL_IDENTITIES, CHANNEL_NOTIFY_POLICY, NOW, OWNER_NOTES, PAIRING_CODE, PAIRING_STATUS, answer, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import type { RelatedNote, TargetNote, WeeklyReview } from "../data/owner-notes";
 import { sidecarKeyOf } from "../data/system";
 import { mergePolicy } from "../data/feed";
 import type { MachineConfig } from "../data/machine-config";
@@ -243,6 +244,38 @@ describe("the preview fixtures", () => {
     for (const link of NOTES_GRAPH.links.filter((row) => row.target_kind !== "note")) {
       expect(NOTES_GRAPH.targets.some((target) => target.kind === link.target_kind && target.ref === link.target_ref), link.target_ref).toBe(true);
     }
+  });
+
+  it("answers the weekly review with every section filled and an unlinked list capped like the real daemon's", () => {
+    const review = answer("/owner-notes/review") as WeeklyReview;
+    expect(review.created.length).toBeGreaterThan(0);
+    expect(review.unlinked.length).toBeGreaterThan(0);
+    expect(review.resurfaced.length).toBeGreaterThan(0);
+    expect(review.waiting_proposals).toBeGreaterThan(0);
+    // The real daemon lists at most UNLINKED_MAX (10) unlinked notes; `unlinked_total` is the full count.
+    expect(review.unlinked.length).toBe(Math.min(review.unlinked_total, 10));
+    expect(Date.parse(review.week_end)).toBeGreaterThan(Date.parse(review.week_start));
+  });
+
+  it("answers related notes covering all three reasons, never the note itself or an archived one", () => {
+    const related = answer("/owner-notes/1/related") as RelatedNote[];
+    const reasons = new Set(related.flatMap((row) => row.reasons));
+    expect([...reasons].sort()).toEqual(["embedding", "shared_target", "text"]);
+    expect(related.some((row) => row.note.id === 1 || row.note.state === "archived")).toBe(false);
+    const scores = related.map((row) => row.score);
+    expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+    expect(answer("/owner-notes/1/related?limit=2") as RelatedNote[]).toHaveLength(2);
+    expect(answer("/owner-notes/999/related")).toBeNull();
+  });
+
+  it("answers the notes about a target, and nothing for an unknown kind or an unlinked target", () => {
+    const about = answer("/owner-notes/by-target?kind=project&ref=alpha") as TargetNote[];
+    expect(about.length).toBeGreaterThan(0);
+    expect(about.every((row) => row.link_id > 0 && row.link_type !== "")).toBe(true);
+    expect(answer("/owner-notes/by-target?kind=nonsense&ref=alpha")).toEqual([]);
+    expect(answer("/owner-notes/by-target?kind=project&ref=nobody")).toEqual([]);
+    // The generic list is still reached by its own path, query and all.
+    expect((answer("/owner-notes?state=all") as unknown[]).length).toBe(OWNER_NOTES.length);
   });
 });
 

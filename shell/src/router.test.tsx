@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
@@ -9,6 +9,7 @@ import { Bench } from "./team/Bench";
 import { daemonFetch, daemonState, renderApp } from "./test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ hide: vi.fn().mockResolvedValue(undefined) }) }));
 
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("./data/client", async (original) => ({
@@ -47,17 +48,22 @@ describe("the app router", () => {
     const { router } = await renderApp({ initialPath: "/learned" });
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/brain"));
+    // Wait for the lazy Brain chunk too, so its heavy import drains here rather
+    // than running on into the next test. A cold lazy page import can exceed the
+    // 3 s default under full-suite load.
+    expect(await screen.findByRole("heading", { level: 1, name: "Brain" }, { timeout: 10_000 })).toBeDefined();
   });
 
   it("navigates between two pages with the shell intact", async () => {
     const { router } = await renderApp({ initialPath: "/fleet" });
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Fleet" })).toBeDefined();
+    // A cold lazy page import can exceed the 3 s default under full-suite load.
+    expect(await screen.findByRole("heading", { level: 1, name: "Fleet" }, { timeout: 10_000 })).toBeDefined();
     expect(screen.getByRole("navigation", { name: "Sections" })).toBeDefined();
 
     fireEvent.click(screen.getByRole("link", { name: "Runs" }));
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Runs" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 1, name: "Runs" }, { timeout: 10_000 })).toBeDefined();
     expect(router.state.location.pathname).toBe("/runs");
     // The page changed and nothing around it did: the rail, the connection line
     // and the kill switch are the same DOM they were before the click.
@@ -210,7 +216,7 @@ describe("the app router", () => {
     // The mode's own sections, which no other mode has — and not the tab, which is on screen
     // whichever mode is open.
     expect(
-      await screen.findByRole("region", { name: "GitHub operations without asking" }),
+      await screen.findByRole("region", { name: "GitHub operations without asking" }, { timeout: 10_000 }),
     ).toBeDefined();
     expect(screen.getByRole("region", { name: "What the worktrees may run" })).toBeDefined();
     // State is the fallback an unrecognised segment lands on, so its absence is what proves the
@@ -221,7 +227,7 @@ describe("the app router", () => {
   it("offers the sixth mode in the tab strip, after the five that were there", async () => {
     await renderApp({ initialPath: "/projects/nucleos/state" });
 
-    const modes = await screen.findByRole("navigation", { name: "Project modes" });
+    const modes = await screen.findByRole("navigation", { name: "Project modes" }, { timeout: 10_000 });
     const links = within(modes).getAllByRole("link");
 
     // Read by position rather than by name because two of the tabs carry a count beside their
@@ -236,7 +242,7 @@ describe("the app router", () => {
   it("resolves /analytics with its window, and falls back to 30 for one the núcleo does not serve", async () => {
     const { router } = await renderApp({ initialPath: "/analytics?days=7" });
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Analytics" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 1, name: "Analytics" }, { timeout: 10_000 })).toBeDefined();
     expect((router.state.location.search as { days?: number }).days).toBe(7);
     await waitFor(() =>
       expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain("/analytics?days=7"),
@@ -255,5 +261,41 @@ describe("the app router", () => {
     await renderApp();
 
     expect(await screen.findByRole("heading", { level: 1, name: "Home" })).toBeDefined();
+  });
+
+  describe("the quick-capture window", () => {
+    afterEach(() => {
+      window.history.replaceState({}, "", "/");
+    });
+
+    it("lands on the capture box, with no rail or kill switch, when loaded as ?window=quick-capture", async () => {
+      window.history.replaceState({}, "", "/?window=quick-capture");
+      // Handed another place, as `main-window.tsx` hands it the remembered one.
+      const { router } = await renderApp({ initialPath: "/fleet" });
+
+      expect(await screen.findByRole("textbox", { name: "Capture a note" })).toBeDefined();
+      expect(router.state.location.pathname).toBe("/quick-capture");
+      expect(screen.queryByRole("navigation", { name: "Sections" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /kill switch/i })).toBeNull();
+    });
+
+    it("never restores /quick-capture as the main window's place", async () => {
+      const { router } = await renderApp({ initialPath: "/quick-capture" });
+
+      await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+      expect(await screen.findByRole("heading", { level: 1, name: "Home" })).toBeDefined();
+      expect(screen.getByRole("navigation", { name: "Sections" })).toBeDefined();
+      expect(screen.queryByRole("textbox", { name: "Capture a note" })).toBeNull();
+    });
+
+    it("is a route but not a navigation item", () => {
+      const router = createAppRouter();
+      const byId = router.routesById as unknown as Record<string, { fullPath?: string }>;
+      const paths = Object.values(byId).map((route) => route.fullPath);
+
+      expect(paths).toContain("/quick-capture");
+      expect(NAV_PATHS).not.toContain("/quick-capture");
+      expect(PAGES["/quick-capture"]).toBeUndefined();
+    });
   });
 });

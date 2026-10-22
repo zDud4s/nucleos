@@ -6,7 +6,7 @@ import type { GEdgeType, GFilters, GNodeKind } from "./graph-types";
 import { neighbours } from "./graph-util";
 import { backlinks, buildModel, localModel } from "./graph-model";
 
-const ALL_KINDS: GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file"];
+const ALL_KINDS: GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file", "job"];
 const ALL_EDGES: GEdgeType[] = ["relates", "supports", "contradicts", "details", "supersedes", "supersedes_k", "scope"];
 
 function filters(over: Partial<GFilters> = {}): GFilters {
@@ -111,6 +111,26 @@ describe("buildModel note links", () => {
     expect(m.nodes.find((n) => n.id === "mail:m1")).toMatchObject({ label: "m1", missing: true });
     const bare = buildModel(graph([note(1)], [link(1, "file", "f")]), [], [], filters());
     expect(bare.nodes.find((n) => n.id === "file:f")).toMatchObject({ label: "f", missing: false });
+  });
+
+  it("draws a job link target as its own job:<id> node with an edge from the note", () => {
+    const g = graph([note(1)], [link(1, "job", "42")], [{ kind: "job", ref: "42", label: "Nightly run", missing: false }]);
+    const m = buildModel(g, [], [], filters());
+    expect(m.nodes.find((n) => n.id === "job:42")).toMatchObject({
+      kind: "job", ref: "42", label: "Nightly run", bucket: "in_force", missing: false, degree: 1,
+    });
+    expect(m.edges.map((e) => e.id)).toEqual(["relates|n:1|job:42"]);
+    const bare = buildModel(graph([note(1)], [link(1, "job", "7")]), [], [], filters());
+    expect(bare.nodes.find((n) => n.id === "job:7")).toMatchObject({ label: "7" });
+  });
+
+  it("leaves job nodes out when the job kind is filtered off", () => {
+    const g = graph([note(1)], [link(1, "job", "42")]);
+    const kinds = new Set(ALL_KINDS);
+    kinds.delete("job");
+    const m = buildModel(g, [], [], filters({ nodeKinds: kinds }));
+    expect(m.nodes.some((n) => n.kind === "job")).toBe(false);
+    expect(m.edges).toEqual([]);
   });
 
   it("ignores links from notes that were not kept", () => {

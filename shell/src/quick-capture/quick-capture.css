@@ -1,0 +1,57 @@
+/**
+ * The quick-capture window: one box filling a small borderless window. `quick-capture-` throughout.
+ */
+
+.quick-capture {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  box-sizing: border-box;
+  height: 100vh;
+  padding: var(--space-3);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.quick-capture-input {
+  flex: 1;
+  min-height: 0;
+  box-sizing: border-box;
+  padding: var(--space-3);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+  resize: none;
+}
+
+.quick-capture-input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.quick-capture-input::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+.quick-capture-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.quick-capture-hint kbd {
+  display: inline-block;
+  padding: 0.05rem 0.35rem;
+  border: var(--hairline) solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+  color: var(--text-muted);
+}

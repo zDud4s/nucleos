@@ -11,7 +11,6 @@ import { PaletteProvider, usePaletteGroup, type PaletteGroup } from "../ui";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
 import { BrowserBridge } from "./BrowserBridge";
 import { ConnectionGate } from "./ConnectionGate";
-import { CaptureChord } from "./CaptureChord";
 import { ConversationChord } from "./ConversationChord";
 import { DesktopNotifier } from "./DesktopNotifier";
 import { OverlayProvider } from "../ui/overlay";
@@ -112,7 +111,6 @@ function Frame() {
         <DesktopNotifier />
         <BrowserBridge />
         <ConversationChord />
-        <CaptureChord />
         <Destinations />
         <GlobalSearch />
         <Sidebar

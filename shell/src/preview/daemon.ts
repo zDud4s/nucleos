@@ -37,7 +37,15 @@ import type {
   StorageReport,
 } from "../data/system";
 import type { VoiceConfigView } from "../data/voice";
-import type { NoteDetail, NoteLink, NotesGraph, OwnerNote } from "../data/owner-notes";
+import type {
+  NoteDetail,
+  NoteLink,
+  NotesGraph,
+  OwnerNote,
+  RelatedNote,
+  TargetNote,
+  WeeklyReview,
+} from "../data/owner-notes";
 import type { CaptureRequest } from "../data/captures";
 import type { TeamAction, TeamRun, TeamRunView, TeamTrigger, TeamView } from "../data/teams";
 import type { RunDetail, RunStop, RunTailChunk } from "../data/runs";
@@ -1027,6 +1035,10 @@ export const OWNER_NOTES: OwnerNote[] = [
   { id: 2, text: "Ask Rita whether the invoice run can move to Mondays.", origin: "channel:telegram", state: "active", created_at: ago(2 * DAY), updated_at: ago(DAY) },
   { id: 3, text: "The signing key sits with the accountant's backup, per the last call.", origin: "shell", state: "active", created_at: ago(DAY), updated_at: ago(DAY) },
   { id: 4, text: "Old idea: a nightly digest by mail.", origin: "shell", state: "archived", created_at: ago(9 * DAY), updated_at: ago(5 * DAY) },
+  /* Two notes nothing links to yet (the weekly review's "unlinked") and one old, untouched note it resurfaces. */
+  { id: 5, text: "Try a **shared inbox** for invoices before the quarter closes.", origin: "shell", state: "active", created_at: ago(DAY), updated_at: ago(DAY) },
+  { id: 6, text: "Rita prefers a short voice note over a long mail.", origin: "channel:telegram", state: "active", created_at: ago(5 * HOUR), updated_at: ago(5 * HOUR) },
+  { id: 7, text: "Alpha's changelog should name the signing key's owner.", origin: "shell", state: "active", created_at: ago(41 * DAY), updated_at: ago(41 * DAY) },
 ];
 
 export const NOTE_LINKS: NoteLink[] = [
@@ -1034,6 +1046,7 @@ export const NOTE_LINKS: NoteLink[] = [
   { id: 2, note_id: 2, link_type: "relates", target_kind: "contact", target_ref: "rita@example.com", created_at: ago(2 * DAY) },
   { id: 3, note_id: 3, link_type: "details", target_kind: "note", target_ref: "1", created_at: ago(DAY) },
   { id: 4, note_id: 2, link_type: "supports", target_kind: "mail", target_ref: "48190", created_at: ago(DAY) },
+  { id: 5, note_id: 7, link_type: "relates", target_kind: "project", target_ref: "alpha", created_at: ago(41 * DAY) },
 ];
 
 export const NOTES_GRAPH: NotesGraph = {
@@ -1103,6 +1116,58 @@ const PROJECT_KNOWLEDGE: Known[] = [
 export const OPEN_CAPTURES: CaptureRequest[] = [
   { job_id: 7, project_id: "alpha", causes: ["gate"], prompt_text: "Why did the release gate fail twice on Friday? Anything you know that the logs do not say.", state: "open", deadline: ago(-6 * HOUR), seconds_left: 6 * 3600, note_id: null, created_at: ago(40 * MINUTE), closed_at: null },
 ];
+
+/*
+  `GET /owner-notes/by-target`: the notes linked to one target, active first and newest first within
+  each, as the núcleo sorts them. An unknown kind or a target nothing links to is an empty list
+  (the núcleo answers 400 for the first; the preview only needs to not break).
+*/
+function notesAbout(kind: string, ref: string): TargetNote[] {
+  return NOTE_LINKS.filter((link) => link.target_kind === kind && link.target_ref === ref)
+    .flatMap((link) => {
+      const note = OWNER_NOTES.find((row) => row.id === link.note_id);
+      return note === undefined ? [] : [{ note, link_id: link.id, link_type: link.link_type } satisfies TargetNote];
+    })
+    .sort(
+      (a, b) =>
+        Number(a.note.state === "archived") - Number(b.note.state === "archived") ||
+        b.note.created_at.localeCompare(a.note.created_at),
+    );
+}
+
+/* `GET /owner-notes/{id}/related`: other active notes, the three reasons mixed, highest score first. */
+function relatedNotes(id: number): RelatedNote[] | null {
+  if (!OWNER_NOTES.some((row) => row.id === id)) return null;
+  const pick = (other: number, score: number, reasons: RelatedNote["reasons"]): RelatedNote[] => {
+    const note = OWNER_NOTES.find((row) => row.id === other);
+    return note === undefined || note.id === id || note.state !== "active" ? [] : [{ note, score, reasons }];
+  };
+  return [
+    ...pick(3, 0.83, ["embedding", "shared_target"]),
+    ...pick(7, 0.64, ["shared_target"]),
+    ...pick(1, 0.52, ["embedding"]),
+    ...pick(5, 0.31, ["text"]),
+    ...pick(2, 0.22, ["text"]),
+  ].sort((a, b) => b.score - a.score);
+}
+
+/*
+  `GET /owner-notes/review`: the notes written since `week_start`, the unlinked ones (the daemon lists ten
+  at most and reports the full count beside them), one old note brought back.
+*/
+const WEEK_START = "2026-08-24T00:00:00+00:00";
+const UNLINKED_NOTES = OWNER_NOTES.filter(
+  (note) => note.state === "active" && !NOTE_LINKS.some((link) => link.note_id === note.id),
+);
+const WEEKLY_REVIEW: WeeklyReview = {
+  week_start: WEEK_START,
+  week_end: "2026-08-31T00:00:00+00:00",
+  created: OWNER_NOTES.filter((note) => note.state === "active" && Date.parse(note.created_at) >= Date.parse(WEEK_START)),
+  unlinked: UNLINKED_NOTES.slice(0, 10),
+  unlinked_total: UNLINKED_NOTES.length,
+  resurfaced: OWNER_NOTES.filter((note) => note.state === "active" && NOW - Date.parse(note.updated_at) > 30 * DAY),
+  waiting_proposals: 2,
+};
 
 function noteDetail(id: number): NoteDetail | null {
   const note = OWNER_NOTES.find((row) => row.id === id);
@@ -4196,6 +4261,17 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (splitQuery(path)[0] === "/owner-notes/graph") {
     if (splitQuery(path)[1].get("include_archived") !== "true") return NOTES_GRAPH;
     return { ...NOTES_GRAPH, notes: OWNER_NOTES } satisfies NotesGraph;
+  }
+  /* The three reads that sit beside the generic list: matched on the route, query apart. */
+  if (splitQuery(path)[0] === "/owner-notes/by-target" && init?.method === undefined) {
+    const query = splitQuery(path)[1];
+    return notesAbout(query.get("kind") ?? "", query.get("ref") ?? "");
+  }
+  if (splitQuery(path)[0] === "/owner-notes/review" && init?.method === undefined) return WEEKLY_REVIEW;
+  const relatedRoute = /^\/owner-notes\/(\d+)\/related$/.exec(splitQuery(path)[0]);
+  if (relatedRoute !== null && init?.method === undefined) {
+    const limit = Number(splitQuery(path)[1].get("limit") ?? "8");
+    return relatedNotes(Number(relatedRoute[1]))?.slice(0, Number.isFinite(limit) && limit > 0 ? limit : 8) ?? null;
   }
   if (path === "/loadout/preview" && init?.method === "POST") return LOADOUT_PREVIEW;
   /* One agent's or team's context files; the second is gone from disk, which is the case worth photographing. */

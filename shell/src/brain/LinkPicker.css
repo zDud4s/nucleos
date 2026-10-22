@@ -1,0 +1,37 @@
+/* The search-as-you-type target picker of the "Add link" form (see LinkPicker.tsx). */
+.brain-pick {
+  flex: 1 1 100%;
+}
+
+.brain-pick-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 14rem;
+  overflow: auto;
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+
+.brain-pick-row {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1) var(--space-2);
+  cursor: pointer;
+}
+
+.brain-pick-row[aria-selected="true"],
+.brain-pick-row:hover {
+  background: var(--surface-raised);
+}
+
+.brain-pick-label {
+  font-size: var(--text-sm);
+}
+
+.brain-pick-detail {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
