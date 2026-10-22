@@ -1624,6 +1624,93 @@ mod tests {
         panic!("turn {id} never settled");
     }
 
+    /// A browser agent's reply that could not be delivered reaches the mother's NEXT turn: once,
+    /// in front of what the person typed, and only the `browser_reply` kind. `runs.prompt` keeps
+    /// the typed words, so a later replay of the history cannot repeat the notice.
+    #[tokio::test]
+    async fn a_pending_browser_reply_notice_prefixes_the_parents_next_turn_exactly_once() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = AppState {
+            runner: fake.clone(),
+            ..test_state().await
+        };
+        let chat = a_chat("browser-reply-parent");
+        let refused = "Not delivered (owner_away): [browser agent · Hotels] Found three hotels.";
+        let notice_id = crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_BROWSER_REPLY,
+            0,
+            refused,
+        )
+        .await
+        .unwrap();
+        crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_RESTART,
+            0,
+            crate::chats::notices::RESTART_NOTICE,
+        )
+        .await
+        .unwrap();
+
+        let first = send_message(&state, &chat, "what next?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, first).await;
+
+        let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+        assert!(handed.contains(refused), "the notice did not reach the turn: {handed:?}");
+        assert!(handed.contains("what next?"), "{handed:?}");
+        assert!(
+            handed.find(refused) < handed.find("what next?"),
+            "the notice comes before the typed words: {handed:?}"
+        );
+        assert!(
+            !handed.contains(crate::chats::notices::RESTART_NOTICE),
+            "only browser_reply notices reach the model: {handed:?}"
+        );
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(first)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "what next?", "runs.prompt keeps what the person typed");
+        let consumed: Option<i64> =
+            sqlx::query_scalar("SELECT consumed_by_run FROM chat_notices WHERE id = ?")
+                .bind(notice_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(consumed, Some(first), "the notice names the turn that saw it");
+
+        *fake.last_prompt.lock().unwrap() = None;
+        fake.later_turns.lock().unwrap().clear();
+        let second = send_message(&state, &chat, "and then?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, second).await;
+
+        let mut handed_again: Vec<String> = fake.last_prompt.lock().unwrap().iter().cloned().collect();
+        handed_again.extend(
+            fake.later_turns
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|turn| turn.text.clone()),
+        );
+        assert!(
+            handed_again.iter().any(|text| text.contains("and then?")),
+            "the second turn was never handed over: {handed_again:?}"
+        );
+        assert!(
+            handed_again.iter().all(|text| !text.contains(refused)),
+            "a consumed notice reached a second turn: {handed_again:?}"
+        );
+        crate::assistant::evict_live(&chat);
+    }
+
     /// A state whose `telegram` channel has a routing row and was launched, so its turns are acked.
     async fn live_channel_state() -> AppState {
         let state = crate::channels::testkit::state().await;

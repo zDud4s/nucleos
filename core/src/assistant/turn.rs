@@ -1510,6 +1510,98 @@ mod tests {
         }
     }
 
+    /// A linked browser agent's turn that completes hands its answer to its mother, as a relay the
+    /// child's turn sent, once the child's slot is free: no caller has to fetch it.
+    #[tokio::test]
+    async fn finishing_a_linked_childs_turn_delivers_its_reply() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let mother = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let child = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &child, Some("Flights"))
+            .await
+            .unwrap();
+        crate::chats::links::open(&state.pool, &child, Some(&mother), "browser", None)
+            .await
+            .expect("link the child to its mother");
+        let mother_turn: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('find flights', 'completed', 'assistant', ?, 'shell', ?) RETURNING id",
+        )
+        .bind(&mother)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let task_relay: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES (?, ?, ?, 'find flights', 1, ?) RETURNING id",
+        )
+        .bind(&mother)
+        .bind(&child)
+        .bind(mother_turn)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let child_turn = crate::assistant::send_relayed_message(
+            &state,
+            &child,
+            "find flights",
+            crate::assistant::Origin::Shell,
+            task_relay,
+        )
+        .await
+        .unwrap();
+
+        let mut delivered: Option<(i64, String, i64)> = None;
+        for _ in 0..500 {
+            delivered = sqlx::query_as(
+                "SELECT r.id, r.prompt, c.sending_run_id
+                   FROM runs r JOIN chat_relays c ON c.id = r.from_relay_id
+                  WHERE r.chat_id = ? AND c.from_chat_id = ?",
+            )
+            .bind(&mother)
+            .bind(&child)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            if delivered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&child);
+        let (parent_turn, prompt, sending_run_id) =
+            delivered.expect("the child's finished turn was never delivered to its mother");
+        assert_eq!(sending_run_id, child_turn, "the relay is sent by the child's turn");
+        assert_eq!(prompt, "[browser agent · Flights] fake output");
+        for _ in 0..500 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(parent_turn)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&mother);
+    }
+
     /// A declined chat is not re-evaluated on every poll: it is left alone for the TTL, and only it.
     #[test]
     fn a_declined_prewarm_is_not_re_evaluated_inside_the_ttl() {

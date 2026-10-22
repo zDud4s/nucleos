@@ -52,6 +52,9 @@ pub struct ChatNotice {
 pub const KIND_RESTART: &str = "restart";
 /// A rooted turn that has just read third-party text and is read-only from here on.
 pub const KIND_UNTRUSTED: &str = "untrusted";
+/// A linked browser agent's reply that could not be delivered to its parent conversation. Unlike
+/// every other kind, the parent's next turn sees it once (`take_unconsumed`).
+pub const KIND_BROWSER_REPLY: &str = "browser_reply";
 /// What a `restart` notice says.
 pub const RESTART_NOTICE: &str = "The daemon restarted during this turn; the session is intact.";
 /// What an `untrusted` notice says.
@@ -162,6 +165,19 @@ pub async fn for_chat_since(
     .bind(since)
     .fetch_all(pool)
     .await
+}
+
+/// The bodies of this conversation's notices of `kind` that no turn has consumed yet, oldest
+/// first, stamped `consumed_by_run = run_id` so the next turn does not see them again.
+// RED stub
+pub async fn take_unconsumed(
+    pool: &SqlitePool,
+    chat_id: &str,
+    kind: &str,
+    run_id: i64,
+) -> sqlx::Result<Vec<String>> {
+    let _ = (pool, chat_id, kind, run_id);
+    todo!("RED stub")
 }
 
 #[cfg(test)]

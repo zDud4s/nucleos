@@ -9,6 +9,7 @@ use crate::execution::runner::extract_reply;
 mod chat_key;
 pub mod rotation;
 
+mod linked;
 mod live;
 mod send;
 mod serve;
