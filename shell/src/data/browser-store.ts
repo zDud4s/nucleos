@@ -181,7 +181,8 @@ export async function ensureProjectAgent(
   opts?: { fresh?: boolean },
 ): Promise<void> {
   agentProjects.add(key);
-  const result = await ensureAgentEnv(key, opts);
+  // Only a forced rebuild passes options: callers and tests see the plain one-argument call.
+  const result = await (opts ? ensureAgentEnv(key, opts) : ensureAgentEnv(key));
   setAgentNotice(key, result.ok ? null : result.reason);
 }
 
