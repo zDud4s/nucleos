@@ -12,6 +12,8 @@ pub mod dictation;
 pub mod drop;
 /// Where the quota notch is drawn: inside the main window, or in a floating window of its own.
 pub mod notch;
+/// The small always-on-top window the capture chord opens, to take one note from anywhere.
+pub mod quick_capture;
 /// Dictation decisions. `pub` because it is genuinely this crate's surface: the platform layer
 /// calls into it, and a private module of not-yet-wired functions would be dead code under the
 /// `-D warnings` clippy gate that `scripts/gates.sh` now runs over this package.

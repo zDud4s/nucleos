@@ -2,16 +2,21 @@ import { useEffect } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { listen } from "@tauri-apps/api/event";
 
-/** The chord's event, emitted by `shell/src-tauri/src/dictation.rs`. */
+/**
+ * The Brain capture event. `shell/src-tauri/src/dictation.rs` no longer emits it: the capture chord
+ * now opens the quick-capture window (`quick_capture.rs`, route `/quick-capture`) and leaves this
+ * window where it is. The name stays so the listener below is harmless, not dead code to remove
+ * from `AppShell`, and so anything that still emits it (a future host, a test) keeps working.
+ */
 export const CAPTURE_EVENT = "brain://capture";
 
 /**
- * The Brain capture chord, answered from every page.
+ * A listener for `brain://capture`, from every page: it takes the person to the Brain with a
+ * `capture` stamp and the page focuses its capture box when the stamp changes. The stamp is a
+ * timestamp rather than a flag so a second event while the Brain is already showing is a new
+ * request, not the same URL twice.
  *
- * The host registers the chord with the operating system and brings the window forward; this
- * listener, always mounted, takes the person to the Brain with a `capture` stamp and the page
- * focuses its capture box when the stamp changes. The stamp is a timestamp rather than a flag so a
- * second press while the Brain is already showing is a new request, not the same URL twice.
+ * The global chord itself no longer comes through here; it opens the quick-capture window instead.
  *
  * Renders nothing, in the shape `ConversationChord` uses.
  */

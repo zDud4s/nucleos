@@ -1,16 +1,19 @@
 // §spec novo-frontend
 import { Suspense, lazy, type ComponentType, type ReactNode } from "react";
 import {
+  Outlet,
   createMemoryHistory,
   createRootRoute,
   createRoute,
   createRouter,
   redirect,
+  useRouterState,
 } from "@tanstack/react-router";
 import { AppShell } from "./app/AppShell";
 import { RouteError } from "./app/RouteError";
 import { NAV_ITEMS, type NavItem } from "./app/nav";
 import { validateAnalyticsSearch } from "./data/analytics";
+import { QuickCapture } from "./quick-capture/QuickCapture";
 import { Agents } from "./pages/Agents";
 import { Analytics } from "./pages/Analytics";
 import { Calendar, validateCalendarSearch } from "./pages/Calendar";
@@ -289,6 +292,38 @@ const DETAIL_ROUTES: {
   { path: "/system/$view", component: System, validateSearch: validateSystemSearch },
 ];
 
+/** The quick-capture window's page. Not a nav item: only the window the capture chord opens shows it. */
+export const QUICK_CAPTURE_PATH = "/quick-capture";
+
+/** Whether this document is the quick-capture window (`quick_capture.rs` loads `?window=quick-capture`). */
+function isQuickCaptureWindow(): boolean {
+  return new URLSearchParams(window.location.search).get("window") === "quick-capture";
+}
+
+/** The path of a location string, without its search or hash. */
+function pathOf(location: string): string {
+  return location.split(/[?#]/, 1)[0] ?? location;
+}
+
+/**
+ * The location a window starts at. The quick-capture window always starts on its box, whatever it
+ * was handed; any other window that is handed the box (the remembered place is shared storage, and
+ * the quick window resolves to it too) starts on Home, so the main window never restores it.
+ */
+function startPath(initialPath: string): string {
+  if (isQuickCaptureWindow()) return QUICK_CAPTURE_PATH;
+  return pathOf(initialPath) === QUICK_CAPTURE_PATH ? "/" : initialPath;
+}
+
+/**
+ * The root: the shell around every page, except the quick-capture box, which is the whole window
+ * and has no rail, connection line or kill switch around it.
+ */
+function Root() {
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  return pathname === QUICK_CAPTURE_PATH ? <Outlet /> : <AppShell />;
+}
+
 export function createAppRouter(initialPath = "/") {
   /**
    * Built inside the factory rather than at module scope, and that matters:
@@ -304,7 +339,7 @@ export function createAppRouter(initialPath = "/") {
    * router whose root just failed. The child routes below carry the boundary
    * instead, which is what keeps the shell standing around a page that threw.
    */
-  const rootRoute = createRootRoute({ component: AppShell });
+  const rootRoute = createRootRoute({ component: Root });
 
   /**
    * One route per navigation item, from the same table the sidebar reads.
@@ -358,9 +393,16 @@ export function createAppRouter(initialPath = "/") {
     },
   });
 
+  const quickCapture = createRoute({
+    getParentRoute: () => rootRoute,
+    path: QUICK_CAPTURE_PATH,
+    component: QuickCapture,
+    errorComponent: RouteError,
+  });
+
   return createRouter({
-    routeTree: rootRoute.addChildren([...routes, ...details, learned]),
-    history: createMemoryHistory({ initialEntries: [initialPath] }),
+    routeTree: rootRoute.addChildren([...routes, ...details, learned, quickCapture]),
+    history: createMemoryHistory({ initialEntries: [startPath(initialPath)] }),
     /**
      * Nothing here has a loader, so there is nothing to keep warm and nothing
      * to wait for. Turning preloading off keeps a hover over the rail from

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "quick-capture",
+  "description": "Capability for the quick-capture window: it hides itself and listens for its own focus",
+  "windows": ["quick-capture"],
+  "permissions": ["core:default", "core:window:allow-hide"]
+}
