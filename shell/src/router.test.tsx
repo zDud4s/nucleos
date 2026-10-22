@@ -48,17 +48,22 @@ describe("the app router", () => {
     const { router } = await renderApp({ initialPath: "/learned" });
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/brain"));
+    // Wait for the lazy Brain chunk too, so its heavy import drains here rather
+    // than running on into the next test. A cold lazy page import can exceed the
+    // 3 s default under full-suite load.
+    expect(await screen.findByRole("heading", { level: 1, name: "Brain" }, { timeout: 10_000 })).toBeDefined();
   });
 
   it("navigates between two pages with the shell intact", async () => {
     const { router } = await renderApp({ initialPath: "/fleet" });
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Fleet" })).toBeDefined();
+    // A cold lazy page import can exceed the 3 s default under full-suite load.
+    expect(await screen.findByRole("heading", { level: 1, name: "Fleet" }, { timeout: 10_000 })).toBeDefined();
     expect(screen.getByRole("navigation", { name: "Sections" })).toBeDefined();
 
     fireEvent.click(screen.getByRole("link", { name: "Runs" }));
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Runs" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 1, name: "Runs" }, { timeout: 10_000 })).toBeDefined();
     expect(router.state.location.pathname).toBe("/runs");
     // The page changed and nothing around it did: the rail, the connection line
     // and the kill switch are the same DOM they were before the click.
@@ -211,7 +216,7 @@ describe("the app router", () => {
     // The mode's own sections, which no other mode has — and not the tab, which is on screen
     // whichever mode is open.
     expect(
-      await screen.findByRole("region", { name: "GitHub operations without asking" }),
+      await screen.findByRole("region", { name: "GitHub operations without asking" }, { timeout: 10_000 }),
     ).toBeDefined();
     expect(screen.getByRole("region", { name: "What the worktrees may run" })).toBeDefined();
     // State is the fallback an unrecognised segment lands on, so its absence is what proves the
@@ -222,7 +227,7 @@ describe("the app router", () => {
   it("offers the sixth mode in the tab strip, after the five that were there", async () => {
     await renderApp({ initialPath: "/projects/nucleos/state" });
 
-    const modes = await screen.findByRole("navigation", { name: "Project modes" });
+    const modes = await screen.findByRole("navigation", { name: "Project modes" }, { timeout: 10_000 });
     const links = within(modes).getAllByRole("link");
 
     // Read by position rather than by name because two of the tabs carry a count beside their
@@ -237,7 +242,7 @@ describe("the app router", () => {
   it("resolves /analytics with its window, and falls back to 30 for one the núcleo does not serve", async () => {
     const { router } = await renderApp({ initialPath: "/analytics?days=7" });
 
-    expect(await screen.findByRole("heading", { level: 1, name: "Analytics" })).toBeDefined();
+    expect(await screen.findByRole("heading", { level: 1, name: "Analytics" }, { timeout: 10_000 })).toBeDefined();
     expect((router.state.location.search as { days?: number }).days).toBe(7);
     await waitFor(() =>
       expect(daemon.apiFetch.mock.calls.map(([path]) => String(path))).toContain("/analytics?days=7"),
