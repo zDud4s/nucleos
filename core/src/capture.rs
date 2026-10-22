@@ -102,6 +102,101 @@ pub async fn wait_minutes(pool: &SqlitePool) -> i64 {
         .unwrap_or(DEFAULT_WAIT_MINUTES)
 }
 
+pub const ANSWER_DAYS_KEY: &str = "capture.answer_days";
+pub const DIGEST_HOUR_KEY: &str = "capture.digest_hour";
+pub const DEFAULT_ANSWER_DAYS: i64 = 5;
+pub const MAX_ANSWER_DAYS: i64 = 30;
+pub const DEFAULT_DIGEST_HOUR: i64 = 18;
+
+async fn meta(pool: &SqlitePool, key: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Days a request stays answerable. `0` turns requests off. Without the new key the old
+/// `distiller.capture_wait_minutes` is read as a fallback: `0` stays off, any other value is the default.
+pub async fn answer_days(pool: &SqlitePool) -> i64 {
+    if let Some(days) = meta(pool, ANSWER_DAYS_KEY).await.and_then(|v| v.trim().parse::<i64>().ok()) {
+        return if (0..=MAX_ANSWER_DAYS).contains(&days) { days } else { DEFAULT_ANSWER_DAYS };
+    }
+    match meta(pool, WAIT_SETTING_KEY).await.and_then(|v| v.trim().parse::<i64>().ok()) {
+        Some(0) => 0,
+        _ => DEFAULT_ANSWER_DAYS,
+    }
+}
+
+pub async fn digest_hour(pool: &SqlitePool) -> u32 {
+    meta(pool, DIGEST_HOUR_KEY)
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|h| (0..=23).contains(h))
+        .unwrap_or(DEFAULT_DIGEST_HOUR) as u32
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    OutOfRange,
+    Db(sqlx::Error),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::OutOfRange => write!(f, "answer_days is 0 to 30 and digest_hour 0 to 23"),
+            ConfigError::Db(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<sqlx::Error> for ConfigError {
+    fn from(error: sqlx::Error) -> Self {
+        ConfigError::Db(error)
+    }
+}
+
+/// Store the answer window and/or the digest hour; both are validated before either is written.
+pub async fn set_config(
+    pool: &SqlitePool,
+    answer_days: Option<i64>,
+    digest_hour: Option<i64>,
+    now: DateTime<Utc>,
+) -> Result<(), ConfigError> {
+    if answer_days.is_some_and(|d| !(0..=MAX_ANSWER_DAYS).contains(&d))
+        || digest_hour.is_some_and(|h| !(0..=23).contains(&h))
+    {
+        return Err(ConfigError::OutOfRange);
+    }
+    let mut tx = pool.begin().await?;
+    for (key, value) in [(ANSWER_DAYS_KEY, answer_days), (DIGEST_HOUR_KEY, digest_hour)] {
+        if let Some(value) = value {
+            sqlx::query(
+                "INSERT INTO schema_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(key)
+            .bind(value.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    // Zero days holds nothing, so a request still open would ask a question nobody waits on:
+    // close them as dismissed, the way the owner would have.
+    if answer_days == Some(0) {
+        sqlx::query("UPDATE capture_requests SET state = ?, closed_at = ? WHERE state = ?")
+            .bind(STATE_DISMISSED)
+            .bind(stamp(now))
+            .bind(STATE_OPEN)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Queue rows created before this UTC second never ask; see migration 0173. Absent: all may ask.
 pub const FROM_KEY: &str = "distiller.capture_from";
 
@@ -754,6 +849,45 @@ mod tests {
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn the_answer_window_and_hour_default_to_5_days_and_18() {
+        let pool = pool().await;
+        assert_eq!((answer_days(&pool).await, digest_hour(&pool).await), (5, 18));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_zero_wait_keeps_requests_off_and_any_other_value_gives_the_default() {
+        let pool = pool().await;
+        set_meta(&pool, WAIT_SETTING_KEY, "0").await;
+        assert_eq!(answer_days(&pool).await, 0, "an owner who turned requests off keeps them off");
+        set_meta(&pool, WAIT_SETTING_KEY, "30").await;
+        assert_eq!(answer_days(&pool).await, 5, "minutes are not converted into days");
+        set_meta(&pool, ANSWER_DAYS_KEY, "9").await;
+        assert_eq!(answer_days(&pool).await, 9, "the new key wins over the old one");
+        set_meta(&pool, ANSWER_DAYS_KEY, "31").await;
+        assert_eq!(answer_days(&pool).await, 5, "out of range reads as the default");
+    }
+
+    #[tokio::test]
+    async fn the_config_is_set_within_bounds_and_zero_days_dismisses_the_open_requests() {
+        let pool = pool().await;
+        let now = at("2026-10-07T10:00:00+00:00");
+        assert!(matches!(set_config(&pool, Some(31), None, now).await, Err(ConfigError::OutOfRange)));
+        assert!(matches!(set_config(&pool, None, Some(24), now).await, Err(ConfigError::OutOfRange)));
+        set_config(&pool, Some(7), Some(9), now).await.unwrap();
+        assert_eq!((answer_days(&pool).await, digest_hour(&pool).await), (7, 9));
+
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (7, 'p', '[]', 'q', 'open', '2999-01-01T00:00:00+00:00', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        set_config(&pool, Some(0), None, now).await.unwrap();
+        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_DISMISSED);
     }
 
     #[tokio::test]
