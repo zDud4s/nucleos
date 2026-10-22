@@ -139,7 +139,7 @@ async fn candidates(
         "SELECT q.id, q.cause, q.project_id, q.job_id, q.item_id, q.run_id FROM distill_queue q
           WHERE q.job_id IS NOT NULL AND q.cause IN (?1, ?2, ?3)
             AND substr(q.created_at, 1, 19) > ?4
-            AND (q.status <> ?6 OR ?5 IS NULL OR substr(q.created_at, 1, 19) > ?5)
+            AND (?5 IS NULL OR substr(q.created_at, 1, 19) > ?5)
             AND NOT EXISTS (SELECT 1 FROM capture_requests c WHERE c.job_id = q.job_id)
           ORDER BY q.id",
     )
@@ -148,7 +148,6 @@ async fn candidates(
     .bind(ASKING_CAUSES[2].as_str())
     .bind(cutoff)
     .bind(from)
-    .bind(crate::distill::STATUS_PENDING)
     .fetch_all(&mut *conn)
     .await?;
     let mut by_job: BTreeMap<i64, Vec<AskingRow>> = BTreeMap::new();
@@ -367,7 +366,8 @@ mod tests {
         let pool = pool().await;
         let now = at("2026-10-07T17:30:00+00:00");
         ask(&pool, 1, "2026-10-01T09:00:00+00:00").await; // older than 5 days: out
-        ask(&pool, 2, "2026-10-05T09:00:00+00:00").await; // in, whatever its queue state
+        // in, whatever its queue state (after the marker, which is written below but read at run time)
+        ask(&pool, 2, "2026-10-06T14:00:00+00:00").await;
         sqlx::query("UPDATE distill_queue SET status = 'done' WHERE job_id = 2")
             .execute(&pool)
             .await
