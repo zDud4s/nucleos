@@ -247,7 +247,7 @@ pub async fn verifications_per_task(
 /// `validate` runs before the worktree is resolved, with no project yet, so a malformed body is
 /// refused before any git process starts; the row it built is then completed with what the daemon
 /// resolved, never with anything the caller said.
-pub(crate) async fn record(
+pub async fn record(
     pool: &SqlitePool,
     caller: Caller,
     args: &RecordArgs,

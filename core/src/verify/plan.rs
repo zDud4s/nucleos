@@ -26,7 +26,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Kind::Check => "check",
             Kind::Test => "test",
@@ -47,7 +47,7 @@ pub enum ScopeArg {
 }
 
 impl ScopeArg {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ScopeArg::Own => "own",
             ScopeArg::Scope => "scope",
@@ -56,23 +56,22 @@ impl ScopeArg {
     }
 }
 
-pub(crate) const NO_MAP_OWN_NOTE: &str =
+pub const NO_MAP_OWN_NOTE: &str =
     "no selection: this project has no nucleos.tests.yaml; run your targeted tests";
-pub(crate) const NOTHING_CHANGED_NOTE: &str =
-    "nothing changed since the base; no group is selected";
+pub const NOTHING_CHANGED_NOTE: &str = "nothing changed since the base; no group is selected";
 
 /// Paths named in one `why`; a hundred-file change must not make a hundred-file sentence.
 const WHY_PATHS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Plan {
+pub struct Plan {
     pub units: Vec<PlannedUnit>,
     pub unclaimed: Vec<String>,
     pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PlanError {
+pub enum PlanError {
     InvalidMap(Vec<String>),
     NoGateCommand,
     BadGateCommand(String),
@@ -129,7 +128,7 @@ fn why(reason: &Reason) -> String {
 /// job and not a session's. `filters` lets a group's `filters` narrow its `select`; it is for a
 /// session's own iteration runs, never for a gate or evidence run, which measure the whole group.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn plan(
+pub fn plan(
     map: &MapState,
     kind: Kind,
     scope: ScopeArg,
@@ -321,7 +320,7 @@ fn report(unit: &PlannedUnit, live: &HashMap<i64, State>) -> UnitReport {
 ///
 /// The request's state is derived here from its units and never stored, so it cannot disagree
 /// with the rows it summarises.
-pub(crate) fn assemble(request: &RequestRow, live: &HashMap<i64, State>) -> Ticket {
+pub fn assemble(request: &RequestRow, live: &HashMap<i64, State>) -> Ticket {
     let units: Vec<UnitReport> = request.plan.iter().map(|unit| report(unit, live)).collect();
 
     let total = units.len();

@@ -599,6 +599,13 @@ mod tests {
         assert_eq!(LIVE_SQL_LIST, list);
         assert!(LIVE_JOBS_SQL.contains(&list));
         assert!(LIVE_ITEMS_SQL.contains(&list));
+        // Same words as `execution::job`'s `a_phase_is_never_a_job_status`.
+        for word in ["planning", "implementing", "gating", "reviewing"] {
+            assert!(
+                !LIVE_ITEMS_SQL.contains(word),
+                "LIVE_ITEMS_SQL names the phase word `{word}`"
+            );
+        }
     }
 
     /// A singleton node (the plan row) has no ordinal and is not a fan item: the per-job item

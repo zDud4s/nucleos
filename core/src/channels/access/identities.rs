@@ -70,15 +70,12 @@ async fn load(pool: &SqlitePool, channel: &str) -> sqlx::Result<Vec<Identity>> {
 }
 
 /// The row that holds the channel's home, if any (`registry::list` shows it).
-pub(crate) async fn home_identity(
-    pool: &SqlitePool,
-    channel: &str,
-) -> sqlx::Result<Option<Identity>> {
+pub async fn home_identity(pool: &SqlitePool, channel: &str) -> sqlx::Result<Option<Identity>> {
     Ok(load(pool, channel).await?.into_iter().find(|row| row.home))
 }
 
 /// Distinct senders and distinct conversations of the channel (`registry::list`).
-pub(crate) async fn identity_counts(pool: &SqlitePool, channel: &str) -> sqlx::Result<(u32, u32)> {
+pub async fn identity_counts(pool: &SqlitePool, channel: &str) -> sqlx::Result<(u32, u32)> {
     let (senders, conversations): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(DISTINCT sender_ref), COUNT(DISTINCT conversation_ref) \
          FROM channel_identities WHERE channel = ?",

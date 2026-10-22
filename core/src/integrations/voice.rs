@@ -458,7 +458,7 @@ pub fn chunk_transcript(text: &str, budget: usize) -> Vec<String> {
 ///
 /// Every index comes from `char_indices`, so a cut can never land inside a multibyte character. A
 /// byte-arithmetic version of this would panic on the first accented word.
-/// `pub(crate)` so `speak.rs` cuts an over-long answer with the SAME logic that cuts an over-long
+/// `pub` so `speak.rs` cuts an over-long answer with the SAME logic that cuts an over-long
 /// transcript. Two implementations of one cut is how the two come to disagree about where a word ends.
 pub fn split_oversized(sentence: &str, budget: usize) -> Vec<&str> {
     if sentence.chars().count() <= budget {

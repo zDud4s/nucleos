@@ -281,7 +281,7 @@ pub async fn is_ancestor(
 /// Another sanctioned entry to `run_git`, for the reason the others are. The budget is recomputed
 /// before every spawn, as `is_ancestor` does, so a long range cannot outlive the deadline. Any git
 /// failure, including a base git cannot resolve, is an `Err`; an empty range is `Ok(vec![])`.
-pub(crate) async fn first_parent_commits(
+pub async fn first_parent_commits(
     repo: &Path,
     base: &str,
     tip: &str,

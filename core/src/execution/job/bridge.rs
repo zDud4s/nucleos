@@ -18,7 +18,7 @@ use crate::workflows::walk::{Disabled, NodeState, Step, WalkState};
 ///
 /// `graph` is accepted so the mapping can grow with the graph; today the autopilot's node ids
 /// (`spec`, `plan`, `review`, fan `work`) are the contract.
-pub(crate) fn walk_state_of(_graph: &WorkflowGraph, view: &JobView) -> (WalkState, Facts) {
+pub fn walk_state_of(_graph: &WorkflowGraph, view: &JobView) -> (WalkState, Facts) {
     let mut nodes = std::collections::BTreeMap::new();
     let mut disabled = std::collections::BTreeMap::new();
 
@@ -83,7 +83,7 @@ pub(crate) fn walk_state_of(_graph: &WorkflowGraph, view: &JobView) -> (WalkStat
 
 /// The walker's answer as the old decision would have phrased it, or `None` where the old
 /// vocabulary has no word for it (`Stuck`, or a node the legacy job never had).
-pub(crate) fn step_as_next(step: &Step, _graph: &WorkflowGraph) -> Option<Next> {
+pub fn step_as_next(step: &Step, _graph: &WorkflowGraph) -> Option<Next> {
     Some(match step {
         Step::RunNode {
             node_id,

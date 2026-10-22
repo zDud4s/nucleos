@@ -274,7 +274,7 @@ pub async fn read_untrusted_context(pool: &sqlx::SqlitePool, id: i64) -> sqlx::R
 /// Whether this run, or any LATER run of the same chat, has read third-party text. A task that
 /// outlives its turn runs in a process that later turns also fed, so it is never cleaner than them.
 /// A row that is not there answers `true`, as in `read_untrusted_context`.
-pub(crate) async fn read_untrusted_since(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<bool> {
+pub async fn read_untrusted_since(pool: &sqlx::SqlitePool, id: i64) -> sqlx::Result<bool> {
     sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(MAX(read_untrusted), 1) FROM runs
           WHERE id = ? OR (id > ? AND chat_id = (SELECT chat_id FROM runs WHERE id = ?))",

@@ -727,34 +727,25 @@ impl FleetHub {
     }
 }
 
-/// The hub as `AppState` carries it: built on first use from the state it is asked with, so a
-/// state that never opens the fleet page never starts anything. `Default` is inert.
-#[derive(Default)]
-pub struct FleetRuntime {
-    hub: std::sync::OnceLock<Arc<FleetHub>>,
+/// The hub as `AppState` carries it (`state.fleet`): built on first use from the state it is asked
+/// with, so a state that never opens the fleet page never starts anything.
+pub fn hub(state: &crate::state::AppState) -> Arc<FleetHub> {
+    state.fleet.get_or_init(|| {
+        let home = directories::BaseDirs::new()
+            .map(|dirs| dirs.home_dir().to_path_buf())
+            .unwrap_or_else(std::env::temp_dir);
+        FleetHub::production(&FleetEnv {
+            pool: state.pool.clone(),
+            home,
+            run_tails: state.run_tails.clone(),
+        })
+    })
 }
 
-impl FleetRuntime {
-    pub fn hub(&self, state: &crate::state::AppState) -> Arc<FleetHub> {
-        self.hub
-            .get_or_init(|| {
-                let home = directories::BaseDirs::new()
-                    .map(|dirs| dirs.home_dir().to_path_buf())
-                    .unwrap_or_else(std::env::temp_dir);
-                FleetHub::production(&FleetEnv {
-                    pool: state.pool.clone(),
-                    home,
-                    run_tails: state.run_tails.clone(),
-                })
-            })
-            .clone()
-    }
-
-    /// Tests put their own hub (fake source, clock and watcher) in place.
-    #[cfg(test)]
-    pub(crate) fn install(&self, hub: Arc<FleetHub>) {
-        let _ = self.hub.set(hub);
-    }
+/// Tests put their own hub (fake source, clock and watcher) in place.
+#[cfg(test)]
+pub(crate) fn install(slot: &crate::state::LateSlot, hub: Arc<FleetHub>) {
+    slot.set(hub);
 }
 
 #[cfg(test)]
@@ -1443,9 +1434,8 @@ mod tests {
     #[tokio::test]
     async fn the_runtime_builds_one_hub_and_hands_it_out_again() {
         let h = harness();
-        let runtime = FleetRuntime::default();
-        runtime.install(h.hub.clone());
         let state = crate::channels::testkit::state().await;
-        assert!(Arc::ptr_eq(&runtime.hub(&state), &h.hub));
+        install(&state.fleet, h.hub.clone());
+        assert!(Arc::ptr_eq(&hub(&state), &h.hub));
     }
 }

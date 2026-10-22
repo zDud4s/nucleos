@@ -51,7 +51,7 @@ if [ "$dry" -eq 1 ]; then
   exit 0
 fi
 
-cargo build --release -p nucleos-core
+cargo build --release -p nucleos-daemon
 mkdir -p "$dest_dir" "$sidecar_tmp"
 cp "$target_dir/release/nucleos-core$exe" "$dest_dir/nucleos-core-$triple$exe"
 

@@ -22,6 +22,7 @@ SCRIPT = ROOT / "scripts" / "bump-version.py"
 FILES = [
     "VERSION",
     "core/Cargo.toml",
+    "core/crates/nucleos-daemon/Cargo.toml",
     "shell/src-tauri/Cargo.toml",
     "shell/package.json",
     "shell/src-tauri/tauri.conf.json",
@@ -76,7 +77,7 @@ def bump_writes_every_manifest_and_nothing_else():
             after = snapshot(root)
             assert after["VERSION"].decode().strip() == "9.8.7"
             for rel in FILES[1:]:
-                want = 2 if rel == "shell/package-lock.json" else 1
+                want = 2 if rel in ("shell/package-lock.json", "Cargo.lock") else 1
                 got = changed_lines(before[rel], after[rel])
                 assert got == want, f"{rel}: {got} lines changed, wanted {want} (crlf={crlf})"
                 assert b"9.8.7" in after[rel]

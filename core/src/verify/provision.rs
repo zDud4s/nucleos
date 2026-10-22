@@ -553,7 +553,7 @@ async fn unprovision(path: &str) -> Result<WorktreeReport, String> {
 }
 
 /// Brings every IDE worktree of `project_id` in line with its switch.
-pub(crate) async fn reconcile(
+pub async fn reconcile(
     pool: &SqlitePool,
     project_id: &str,
     exe: &str,
@@ -659,7 +659,7 @@ async fn reconcile_switched_on(pool: &SqlitePool, exe: &str) {
 }
 
 /// Sets the switch and reconciles. Owner only: the check comes before any database or file work.
-pub(crate) async fn switch(
+pub async fn switch(
     pool: &SqlitePool,
     scope: &Scope,
     project: &str,

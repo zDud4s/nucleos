@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """RED tests for `python scripts/heavy.py warm [--cwd PATH] [-- <argv>]`: an idle-priority,
-detached pre-build of a worktree (default `cargo test -p nucleos-core --no-run`, kind cargo,
+detached pre-build of a worktree (default `cargo test -p nucleos-core -p nucleos-app -p nucleos-daemon --no-run`, kind cargo,
 weight 2) that is queued at priority 3, so it never delays any real request (prio <= 2),
 runs at below-normal CPU priority, is deduped per worktree, is skipped when the worktree is
 already warm (fingerprint registry hit), inherits priority from a real run waiting on its
@@ -313,7 +313,7 @@ class WarmTests(unittest.TestCase):
         self.assertLess(elapsed, 4.0, "warm must return within ~3 s, not wait for the build")
         # The build continues in a background broker.
         self.assert_started("no-run")
-        self.assertEqual((self.d / "no-run.argv").read_text(), "test -p nucleos-core --no-run")
+        self.assertEqual((self.d / "no-run.argv").read_text(), "test -p nucleos-core -p nucleos-app -p nucleos-daemon --no-run")
         self.assertTrue(same_path((self.d / "no-run.cwd").read_text(), self.repo_a),
                         "the build must run in the --cwd worktree")
         self.assertEqual(self.log_rows(), [], "the row is written when the build ends")
@@ -451,7 +451,8 @@ class WarmTests(unittest.TestCase):
         # Prime the registry: a real run of the same argv to exit 0 in the same target dir.
         prime = subprocess.run(
             [sys.executable, str(HEAVY), "--kind", "cargo", "--",
-             "cargo", "test", "-p", "nucleos-core", "--no-run"],
+             "cargo", "test", "-p", "nucleos-core", "-p", "nucleos-app",
+             "-p", "nucleos-daemon", "--no-run"],
             env=self.env(FAKE_FAST="1"), cwd=str(self.repo_a),
             capture_output=True, text=True, timeout=60,
         )
@@ -472,7 +473,8 @@ class WarmTests(unittest.TestCase):
     def test_a_changed_worktree_is_not_warm(self) -> None:
         subprocess.run(
             [sys.executable, str(HEAVY), "--kind", "cargo", "--",
-             "cargo", "test", "-p", "nucleos-core", "--no-run"],
+             "cargo", "test", "-p", "nucleos-core", "-p", "nucleos-app",
+             "-p", "nucleos-daemon", "--no-run"],
             env=self.env(FAKE_FAST="1"), cwd=str(self.repo_a),
             capture_output=True, text=True, timeout=60, check=True,
         )

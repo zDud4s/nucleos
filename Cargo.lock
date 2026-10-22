@@ -1775,6 +1775,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "nucleos-app"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.0",
+ "chrono",
+ "directories",
+ "notify",
+ "nucleos-base",
+ "nucleos-core",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "nucleos-base"
 version = "0.1.0"
 dependencies = [
@@ -1817,7 +1844,6 @@ dependencies = [
  "libc",
  "notify",
  "nucleos-base",
- "nucleos-core",
  "num_cpus",
  "rand",
  "regex",
@@ -1839,6 +1865,30 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nucleos-daemon"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.0",
+ "chrono",
+ "directories",
+ "notify",
+ "nucleos-app",
+ "nucleos-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.7.0",
+ "tracing",
 ]
 
 [[package]]

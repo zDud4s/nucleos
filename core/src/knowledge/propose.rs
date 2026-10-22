@@ -377,7 +377,7 @@ pub async fn reconfirm_id_in(
 }
 
 /// The note of an event that says a new learning resembles an older one without being it.
-pub(crate) const NOTE_NEAR_DUPLICATE: &str = "near_duplicate:";
+pub const NOTE_NEAR_DUPLICATE: &str = "near_duplicate:";
 
 /// Write a same-status event on `knowledge_id` carrying `note`.
 pub(super) async fn same_status_event_in(
@@ -414,7 +414,7 @@ pub async fn note_near_duplicate_in(
 
 /// The note of an event that says a distilled learning quoted the owner's text, so it was proposed
 /// rather than recorded (`.ai/specs/2026-10-07-fronteira-prompts-design.md` section 4.3).
-pub(crate) const NOTE_QUOTED_OWNER_TEXT: &str = "quoted_owner_text";
+pub const NOTE_QUOTED_OWNER_TEXT: &str = "quoted_owner_text";
 
 /// Say, in a same-status event, that `knowledge_id` quoted the owner's text.
 pub async fn note_quoted_owner_text_in(

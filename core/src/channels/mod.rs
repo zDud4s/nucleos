@@ -5,10 +5,10 @@ pub mod access;
 pub mod bus;
 pub mod commands;
 #[cfg(test)]
-pub(crate) mod conformance;
+pub mod conformance;
 pub mod contract;
 #[cfg(test)]
-pub(crate) mod fake;
+pub mod fake;
 pub mod ingest;
 pub mod media;
 pub mod outbox;
@@ -20,14 +20,14 @@ pub mod registry;
 pub mod replies;
 pub mod routing;
 #[cfg(test)]
-pub(crate) mod schema;
+pub mod schema;
 pub mod streaming;
 pub mod strings;
 #[cfg(test)]
 mod switch_tests;
 pub mod telegram_switch;
-#[cfg(test)]
-pub(crate) mod testkit;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod tokens;
 
 use std::collections::HashMap;
@@ -52,7 +52,7 @@ pub struct ChannelsRuntime {
     pub presence: registry::Presence,
     /// `~/.nucleos/channels/<id>.yaml`, read at startup and re-read by [`ChannelsRuntime::reload`]
     /// when the app writes one (a hand edit on disk still needs a restart).
-    pub(crate) configs: RwLock<HashMap<&'static str, registry::ChannelConfig>>,
+    pub configs: RwLock<HashMap<&'static str, registry::ChannelConfig>>,
 }
 
 impl ChannelsRuntime {

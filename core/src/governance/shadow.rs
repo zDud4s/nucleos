@@ -253,7 +253,7 @@ pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Res
 /// scoreboard's column headings are what tell the two apart on screen.
 ///
 /// Also read by `analytics_pipeline::autopilot`, which aggregates it across projects.
-pub(crate) const AGREE_CASE: &str = "CASE
+pub const AGREE_CASE: &str = "CASE
     WHEN shadow_decisions.human_verdict = 'approve'
          AND shadow_decisions.decision = 'allow' THEN 1
     WHEN shadow_decisions.human_verdict = 'reject'
@@ -477,8 +477,8 @@ pub async fn project_of_decision(pool: &SqlitePool, id: i64) -> sqlx::Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governance::classifier::Decision;
     use crate::governance::classifier::{CLASSIFIER_VERSION, Classification};
-    use crate::hooks::Decision;
     use serde_json::json;
 
     async fn test_pool() -> sqlx::SqlitePool {

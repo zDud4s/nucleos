@@ -54,7 +54,7 @@ use self::redact::redact_for_judge_with_home;
 #[cfg(any(test, feature = "testkit"))]
 pub use client::ScriptedJudge;
 pub use client::{Answers, JevJudge, Judge, JudgeError, TYPESAFE_KEY};
-pub(crate) use review::READINESS_SELECT;
+pub use review::READINESS_SELECT;
 pub use review::{
     JudgeOpinion, JudgeReadiness, JudgeVerdictView, list_unreviewed, opinions_for_decisions,
     opinions_for_run, project_of_verdict, readiness, readiness_on, set_verdict,

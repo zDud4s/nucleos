@@ -3,19 +3,21 @@ name = "nucleos-core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-# `tests/module_map.rs` is compiled into the library's unit tests (see src/lib.rs). Any integration
-# test makes cargo build the binary as well, and the binary is the most expensive unit here.
+# `tests/module_map.rs` is compiled into the library's unit tests (see src/lib.rs).
 autotests = false
+# The library only, since 2026-10-22. `main.rs` and `http.rs` are the binary of `crates/nucleos-daemon`
+# and `app.rs` the root of `crates/nucleos-app`, both reading their sources from this `src/`: a crate
+# between this library and the binary could not depend on it from the same package.
+autobins = false
 
-# Library + binary in one package: `http.rs` and `main.rs` are the binary, everything else is the
-# library (see src/lib.rs). No doctests: prose in doc comments was never written to compile.
+# No doctests: prose in doc comments was never written to compile.
 [lib]
 name = "nucleos_core"
 path = "src/lib.rs"
 doctest = false
 
-# `testkit` exposes test doubles and fixtures to the binary's tests; the self dev-dependency
-# below turns it on for every test build and never for a release build.
+# `testkit` exposes test doubles and fixtures to the tests of the crates above (`nucleos-app`,
+# `nucleos-daemon`), whose dev-dependency on this crate turns it on; a release build never sees it.
 [features]
 testkit = ["dep:tempfile", "nucleos-base/testkit"]
 
@@ -111,7 +113,9 @@ windows-sys = { version = "0.61.2", features = [
 libc = "0.2"
 
 [dev-dependencies]
-nucleos-core = { path = ".", features = ["testkit"] }
+# The fixtures this crate's own tests read from the base (`testdb`, `storage::TempDb`). A crate above
+# turning `testkit` on hides a missing line here, so `cargo test -p nucleos-core` alone is the check.
+nucleos-base = { path = "crates/nucleos-base", features = ["testkit"] }
 tempfile = "3.27.0"
 sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
 # `tokio::time::pause` / `start_paused` for the admission book's clock tests.

@@ -7,7 +7,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::execution::runner::extract_reply;
 
 mod chat_key;
-pub(crate) mod rotation;
+pub mod rotation;
 
 mod live;
 mod send;

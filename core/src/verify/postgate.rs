@@ -409,7 +409,7 @@ async fn read_before(conn: &mut sqlx::SqliteConnection, project_id: &str) -> sql
 /// repeated call never reaches it and cannot duplicate a row.
 // Eight plain columns of one row; a struct used once would only rename them.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_transition(
+pub async fn record_transition(
     conn: &mut sqlx::SqliteConnection,
     project_id: &str,
     was_red: bool,

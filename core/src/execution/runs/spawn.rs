@@ -205,7 +205,7 @@ pub(super) async fn append_run_events(pool: &sqlx::SqlitePool, run_id: i64, stdo
 /// Best effort, like `append_run_events` above and for the same reason: this is bookkeeping about a
 /// run, and a failure to write it must not turn a launch that is otherwise fine into a failed one.
 ///
-/// `pub(crate)` because `spawn_run` is not the only launcher that writes a `runs` row. An assistant
+/// `pub` because `spawn_run` is not the only launcher that writes a `runs` row. An assistant
 /// turn inserts its own and spawns its own CLI, and it is the launcher that actually carries an
 /// `--mcp-config` — so a column wired only here would be non-null on every run whose schema cost is
 /// a real zero and null on every run that pays one, which is exactly backwards.

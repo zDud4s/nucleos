@@ -7,7 +7,7 @@ use crate::execution::runner::FakeCommandRunner;
 use crate::state::AppState;
 
 /// An `AppState` over a fresh migrated pool, with the inert channel hub and fake collaborators.
-pub(crate) async fn state() -> AppState {
+pub async fn state() -> AppState {
     let pool = crate::testdb::fresh_pool().await;
     AppState {
         startup_config: Default::default(),
@@ -43,7 +43,7 @@ pub(crate) async fn state() -> AppState {
 }
 
 /// A state whose `telegram` has a routing row and said hello with the given capabilities.
-pub(crate) async fn hello_state(typing: bool, edit: bool) -> AppState {
+pub async fn hello_state(typing: bool, edit: bool) -> AppState {
     let state = state().await;
     let mut conn = state.pool.acquire().await.unwrap();
     crate::channels::routing::seed(&mut conn, "telegram")

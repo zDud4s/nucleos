@@ -109,7 +109,7 @@ pub(super) fn strip_fd_duplications(command: &str) -> String {
 /// collapsed to a single ASCII space, both ends trimmed, ASCII letters folded to lower case.
 ///
 /// It does THAT and nothing else: no quote handling, no path work, no token rewriting, no
-/// tokenization. Worth writing down now that it is `pub(crate)`, because `project_policy` pushes a
+/// tokenization. Worth writing down now that it is `pub`, because `project_policy` pushes a
 /// person's declared prefix through it — and a fold with a surprise in it would be a surprise
 /// applied to a refusal.
 ///
@@ -731,7 +731,7 @@ pub(super) fn find_executes_or_writes(command: &str) -> bool {
         .any(|token| EXECUTES_OR_WRITES.contains(&token.as_str()))
 }
 
-/// `pub(crate)` for `project_policy::ShellRules`, which measures a project's declared prefixes with
+/// `pub` for `project_policy::ShellRules`, which measures a project's declared prefixes with
 /// the same rule the compiled list uses. Generic over the element so `&[&str]` and `&[String]` are
 /// the same call — two functions here is how the two lists would drift.
 pub fn matches_command_prefix<S: AsRef<str>>(command: &str, prefixes: &[S]) -> bool {

@@ -118,7 +118,7 @@ pub fn root_nodes(_pool: &SqlitePool) -> Box<dyn RootNodes> {
 /// Test-only stand-in for the node store behind [`root_nodes`], keyed by chat id so tests running in
 /// parallel never see one another's roots. A chat not registered has no root, like production today.
 #[cfg(test)]
-pub(crate) mod test_nodes {
+pub mod test_nodes {
     use super::RootNodes;
     use async_trait::async_trait;
     use std::collections::HashMap;
@@ -128,7 +128,7 @@ pub(crate) mod test_nodes {
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     /// Gives `chat_id` an active root, so a large-enough turn of that chat rotates.
-    pub(crate) fn give_root(chat_id: &str, root_id: &str) {
+    pub fn give_root(chat_id: &str, root_id: &str) {
         ROOTS
             .lock()
             .unwrap()

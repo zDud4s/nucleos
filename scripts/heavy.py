@@ -59,7 +59,9 @@ PROGRESS_LEGACY_STALE_S = 86400.0
 TMP_STALE_S = 3600.0
 SWEEP_STAMP = "sweep.stamp"
 WARM_PRIO = 3
-WARM_ARGV = ["cargo", "test", "-p", "nucleos-core", "--no-run"]
+# The packages whose sources live under core/ and share its target dir.
+CORE_WORKSPACE_PKGS = frozenset({"nucleos-core", "nucleos-app", "nucleos-daemon", "nucleos-base"})
+WARM_ARGV = ["cargo", "test", "-p", "nucleos-core", "-p", "nucleos-app", "-p", "nucleos-daemon", "--no-run"]
 
 
 # --------------------------------------------------------------------------- liveness
@@ -1518,7 +1520,7 @@ def resolve_crate_how(argv: list[str], root: str, cwd: str):
     if "--workspace" in args or "--all" in args:
         return None
     pkgs = _flag_values(args, "-p", "--package")
-    if any(p != "nucleos-core" for p in pkgs):
+    if any(p not in CORE_WORKSPACE_PKGS for p in pkgs):
         return None
     core = rootp / "core"
     return (core, bool(pkgs)) if core.is_dir() else None

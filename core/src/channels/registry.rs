@@ -100,7 +100,7 @@ pub fn by_id(id: &str) -> Option<&'static Manifest> {
 /// `~/.nucleos/channels/<id>.yaml`. Absent or malformed file = default, never fatal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct ChannelConfig {
-    // `pillars` is a private module of `config`; its glob re-export carries the `pub(crate)` fn.
+    // `pillars` is a private module of `config`; its glob re-export carries the `pub` fn.
     #[serde(default, deserialize_with = "crate::config::deserialize_blank_as_none")]
     pub doctrine: Option<String>,
     /// Project id to `conversation_ref` (a thread in Telegram).
@@ -562,7 +562,7 @@ async fn pairing_of(
 
 /// Whether every required secret of `id` is present, from the in-memory cache alone (no query).
 /// An unknown or never-checked channel is not configured.
-pub(crate) fn is_configured(state: &AppState, id: &str) -> bool {
+pub fn is_configured(state: &AppState, id: &str) -> bool {
     by_id(id).is_some_and(|manifest| state.channels.presence.secrets_status(manifest).0)
 }
 

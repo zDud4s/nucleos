@@ -1,15 +1,17 @@
 # core/ — Rust núcleo
 
-The núcleo binary crate (`nucleos-core`). Owns the local HTTP API, the SQLite datastore,
+The núcleo library crate (`nucleos-core`), with its binary in the `nucleos-daemon` package
+(`crates/nucleos-daemon`, the exe is still `nucleos-core`) and the top modules nothing here reads in
+`nucleos-app` (`crates/nucleos-app`, root `src/app.rs`). Owns the local HTTP API, the SQLite datastore,
 secrets access, sidecar supervision, and the CLI-wrap agent loop. Entrypoint: `src/main.rs`
 (pure startup orchestration — no domain logic of its own).
 
 **Foundation status: complete.** Every module in spec §3.2's map is implemented and green:
-`cargo test -p nucleos-core` = 1128 passed + 3 ignored (the ignored ones touch the real OS Credential
+`cargo test -p nucleos-core --lib` = 1128 passed + 3 ignored (the ignored ones touch the real OS Credential
 Manager / Task Scheduler; run with `-- --include-ignored` on an interactive desktop session).
 > A count in a document is a claim that goes stale without anybody editing it — this line read
 > `276 passed + 2 ignored` for long enough that four times as many tests had been written under it.
-> Treat it as the order of magnitude it is, and `cargo test -p nucleos-core` as the authority.
+> Treat it as the order of magnitude it is, and `cargo test -p nucleos-core --lib` (plus `-p nucleos-app`, `-p nucleos-daemon`) as the authority.
 
 
 ## Module map — the structural invariant (spec §3.2)
@@ -20,7 +22,7 @@ the contract, not a snapshot.
 
 | File | Responsibility |
 |---|---|
-| `main.rs` | Startup orchestration ONLY: logging → autostart → storage → reconcile orphaned runs/stranded approvals/orphaned worktrees → secrets/token → model config → `AppState` → HTTP router → sidecar + scheduler + repo-poller + worktree-GC + devtime-ingestion background tasks → serve. No business logic. |
+| `main.rs` | The binary of the `nucleos-daemon` package (exe `nucleos-core`). Startup orchestration ONLY: logging → autostart → storage → reconcile orphaned runs/stranded approvals/orphaned worktrees → secrets/token → model config → `AppState` → HTTP router → sidecar + scheduler + repo-poller + worktree-GC + devtime-ingestion background tasks → serve. No business logic. |
 | `shutdown.rs` | Draining the daemon before an update replaces it: an in-memory `draining` flag (never persisted), the live-run count the updater waits on (`GET /system/update-readiness`), the wait that calls `stop` only after two quiet reads in a row and reopens the door instead of interrupting anything when it times out, and the middleware that answers 503 to the routes that start a run without a slot. Slot-taking work is refused one layer down (`concurrency::NoRoom::Draining`). Judges nothing about WHAT to run; the routes themselves (`/system/*`) live in `http/admin.rs`. |
 | `cli.rs` | Binary-only, beside `main.rs`: the command-line subcommands that run instead of the daemon (`--print-token`, `--land`, `--verify`, `--pressao`, the `--set-*` secret prompts, `--mcp-tools`, `--workflow-sync`, `--workflow-package`, `--filter-run`) and their argument helpers. `run_subcommand` checks the flags in the order `main` always did. |
 | `startup.rs` | Binary-only, beside `main.rs`: the daemon's one-off start work — seeding the workflow library, the file-to-database migrations (machine settings, project state, onboarding) and `reconcile_after_restart`, the orphan and interrupted-work reconciliation run once the database is open. |
@@ -156,7 +158,8 @@ the contract, not a snapshot.
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
 | `http/team.rs` | Council and teams (`/council/*`, `/teams/*`, `/team-*`). |
 | `http/workflows.rs` | Workflows (`/workflows/*`, `/projects/{id}/workflows/*`). |
-| `lib.rs` | The library crate root: declares every module except the binary's own (`main`, `http`, `cli`, `startup`) (the bottom ones are re-exported from `nucleos-base`), all `pub`, so the binary (`main.rs` + `http.rs`, `cli.rs`, `startup.rs`) compiles separately and an edit to `http.rs` recompiles only the binary. The `testkit` feature exposes test fixtures to the binary's tests; Cargo turns it on for test builds through the self dev-dependency in `Cargo.toml`. |
+| `app.rs` | Root of `nucleos-app` (`crates/nucleos-app`, sources stay in `core/src`): the top modules nothing in `nucleos-core` reads — `hooks`, `fleet`, `devtime`, `analytics`, `analytics_pipeline`, `price_refresh`, `detect`, `verify_cli`, `presets` (split out 2026-10-22). Depends on `nucleos-core`; the daemon binary depends on both. |
+| `lib.rs` | The library crate root: declares every module except the binary's own (`main`, `http`, `cli`, `startup`) and the ones in `nucleos-app` (the bottom ones are re-exported from `nucleos-base`), all `pub`, so the binary (`main.rs` + `http.rs`, `cli.rs`, `startup.rs`) compiles separately and an edit to `http.rs` recompiles only the binary. The `testkit` feature exposes test fixtures to the binary's tests; Cargo turns it on for test builds through the self dev-dependency in `Cargo.toml`. |
 | `crates/nucleos-base/src/lib.rs` | Root of `nucleos-base`, the bottom crate: storage (with `MIGRATOR`, which embeds `core/migrations`), the test database, process/gate plumbing and the other modules that name nothing above them. `nucleos-core`'s `lib.rs` re-exports each one (`pub use nucleos_base::storage;`), so `crate::storage::...` is unchanged there. Its `testkit` feature exposes fixtures to the crates above and is enabled by theirs. |
 | `door.rs` | The few pieces of the HTTP door the library itself calls or tests against, moved out of `http.rs` by the lib/bin split: `uncancellable`, `files_root`, `refusal`, `sending_run_id_of`, and the knowledge door (`post_knowledge`, `recall_knowledge`, `post_finding`) that `mcp_tools`' and `assistant`'s tests drive end to end. `http.rs` routes to them; nothing here is new. |
 | `health.rs` | Bounded, credential-safe subsystem readiness readout (SQLite, CLI binary, Credential Manager, worktree disk, devtime ingestion and the supervised sidecars). Sidecar rows report LIVENESS, read from `sidecar.rs`'s registry through a pure function; the one limit left is that a running-but-wedged child reads ok, because the supervisor watches processes and not progress. `cli_binary` and `voice_transcriber` name no resident process, so they are executed — behind a 60s cache refreshed off the request path, because the readout is budgeted at one second and the shell polls it every three. `record_breach_intent` (off unless a project's rules set `health_breach_intent`, and not yet wired to a trigger) writes a line to that project's feed — never a ledger in the project's `.ai/`, which is the AI workflow's. |
@@ -602,11 +605,12 @@ On Windows, keep the Rust toolchain on a path without spaces: a user profile wit
 breaks the GNU linker, so point `RUSTUP_HOME` and `CARGO_HOME` at a space-free directory and put its
 `bin` on PATH. Then, from the repo root:
 
-- Gate: `cargo nextest run -p nucleos-base -p nucleos-core --no-fail-fast` (every target of both;
+- Gate: `cargo nextest run -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --no-fail-fast` (every target of all four;
   `scripts/gates.sh core` falls back to `cargo test` without nextest). One test, one target:
   `-p nucleos-base <name>` for a module under `crates/nucleos-base/src`, `--lib <name>` for one in the
-  core library (every other module but `http.rs`/`main.rs`/`cli.rs`/`startup.rs`), `--bin nucleos-core <name>` for one in
-  `http.rs`, `main.rs`, `cli.rs` or `startup.rs` — each builds only that test binary.
+  core library (every other module but those below), `-p nucleos-app <name>` for one of the moved modules (`hooks`,
+  `fleet`, `devtime`, `analytics`, `analytics_pipeline`, `price_refresh`, `detect`, `verify_cli`, `presets`),
+  `-p nucleos-daemon <name>` for one in `http.rs`, `main.rs`, `cli.rs` or `startup.rs` — each builds only that test binary.
 - `cargo build` · `cargo fmt --all` (check: `cargo fmt --all -- --check`) · `cargo clippy --all-targets`
 - After a `claude update`: run `node scripts/tool-surface.mjs`. It measures the CLI's own advertised
   tool set against `runner.rs`'s `BUILTIN_TOOLS` blocklist and exits non-zero naming any tool the CLI

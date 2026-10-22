@@ -234,7 +234,7 @@ pub async fn test_pool() -> SqlitePool {
         )
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    crate::storage::MIGRATOR.run(&pool).await.unwrap();
     pool
 }
 
