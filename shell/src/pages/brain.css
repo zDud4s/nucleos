@@ -274,6 +274,8 @@
 
 .app-page:has(> .brain-page-graph) > .ui-page-header {
   padding-inline: var(--space-6);
+  /* The canvas starts right at the header rule: no band of page ground between them. */
+  margin-bottom: 0;
 }
 
 .brain-page-graph {

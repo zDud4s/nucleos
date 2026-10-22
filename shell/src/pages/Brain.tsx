@@ -343,7 +343,7 @@ export function BrainGraphView({
 
   return (
     <div ref={setStage} className={drawerOpen ? "brain-stage has-drawer" : "brain-stage"}>
-      <ForceGraph model={model} selected={selected} onSelect={select} height={canvasHeight} />
+      <ForceGraph model={model} selected={selected} onSelect={select} height={canvasHeight} fitRight={drawerOpen ? DRAWER_WIDTH_PX : 0} />
 
       <div className="brain-tools">
         <div className="brain-tools-bar" role="toolbar" aria-label="Graph tools">
@@ -493,6 +493,8 @@ export function BrainListView({
 
 /** Never smaller than this, whatever the stage measures (jsdom and a not-yet-laid-out box measure 0). */
 const MIN_CANVAS_HEIGHT = 320;
+/** The drawer is 23rem wide (brain.css); the graph fit keeps clear of it. */
+const DRAWER_WIDTH_PX = 368;
 
 /**
  * The canvas takes the height of the box the page gives it (everything under the header), so it
