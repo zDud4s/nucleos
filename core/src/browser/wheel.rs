@@ -2078,18 +2078,17 @@ mod tests {
 
         let chain = give_back(&state, id, None).await.expect("give back");
         assert_eq!(chain.len(), 2);
-        let granted = keep(&state, id, true, true).await.expect("keep");
-        assert!(granted.is_empty(), "a no-project keep granted {granted:?}");
+        // A throwaway's chain is never recorded (`record_chain` keeps project profiles only), so
+        // there is no keep question to answer at all.
+        assert!(matches!(
+            keep(&state, id, true, true).await,
+            Err(WheelError::WrongState(_))
+        ));
         let sites: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM browser_sites")
             .fetch_one(&db.pool)
             .await
             .unwrap();
         assert_eq!(sites, 0, "a no-project keep must grant nothing anywhere");
-        // The question is still closed: it was answered, with nothing.
-        assert!(matches!(
-            keep(&state, id, true, false).await,
-            Err(WheelError::WrongState(_))
-        ));
         db.close().await;
     }
 
