@@ -23,9 +23,17 @@
  * about to decide.
  */
 .contacts-note {
+  max-width: var(--measure-prose);
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
+  color: var(--text-muted);
+}
+
+/* "no name recorded" stands where a name would, so it must not look like one: an
+   absence set in the name's own weight and ink reads as somebody called that. */
+.contacts-missing {
+  font-weight: var(--weight-regular);
   color: var(--text-muted);
 }
 
@@ -40,11 +48,29 @@
   overflow-wrap: anywhere;
 }
 
+/* `RelativeTime` brings `--text-sm` and the faint rung of its own, which is right
+   standing alone and wrong mid-sentence: "last seen 18min ago" had its last two
+   words a size larger than the rest of the line. Inside a line, the line wins. */
+.contacts-meta .ui-reading-time {
+  font-size: inherit;
+  color: inherit;
+}
+
+/* "Same person as …", and the one control that undoes it, on one line. */
 .contacts-sameas {
-  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
   font-size: var(--text-xs);
   color: var(--text-muted);
   overflow-wrap: anywhere;
+}
+
+/* The search and the chips, set off from the grid they filter. They sat flush on
+   the first row of cards, so the filter read as the top edge of a card. */
+.contacts-filter {
+  margin-bottom: var(--space-4);
 }
 
 /* "Show more" under the grid. */
@@ -55,6 +81,7 @@
 }
 
 .contacts-reasoning {
+  max-width: var(--measure-prose);
   margin: 0;
   font-size: var(--text-sm);
   line-height: var(--leading-snug);
@@ -95,8 +122,11 @@
   margin: 0;
 }
 
+/* The question, its reason, the two sides and the doors: four groups, so the row
+   spaces them as groups. At `--space-2` the reason sat closer to "Stays" than
+   "Stays" sat to the name under it, and the sides read as part of the sentence. */
 .contacts-question {
-  gap: var(--space-2);
+  gap: var(--space-3);
 }
 
 .contacts-question-head {
@@ -107,23 +137,47 @@
 }
 
 /**
- * Who the question is about — "Ana Silva ↔ Ana S.", else the first addresses.
+ * The question the two buttons answer — "Are Ana and Ana Silva one person?".
  *
- * It was "question #21", the daemon's number, which told nobody anything: the
- * pair is the question. Body type in the primary rung, since it names people and
- * is not an identifier.
+ * It was "question #21", the daemon's number, which told nobody anything, and
+ * then the pair with "(stays)" and "(merged in)" after each name, which the side
+ * headings below already say. Body type in the primary rung, one step up from
+ * the prose under it: it heads the row and names people, not an identifier.
  */
 .contacts-question-who {
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
   color: var(--text);
   overflow-wrap: anywhere;
 }
 
+/**
+ * The two sides, read across.
+ *
+ * Capped columns rather than halves of the panel: at the design width each half
+ * was ~36rem, so "Merged in" sat a screen's width away from the side it is
+ * being compared with. The hairline between them is a rule, not a box (see
+ * `.contacts-side` for why there is no box).
+ */
 .contacts-merge {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-3);
+  grid-template-columns: repeat(2, minmax(0, 22rem));
+  gap: var(--space-5);
+}
+
+.contacts-merge > * + * {
+  padding-left: var(--space-5);
+  border-left: var(--hairline) solid var(--border);
+}
+
+/* Heading to name is one step, tighter than the gap between the groups above. */
+.contacts-merge .ui-section {
+  gap: var(--space-2);
+}
+
+/* The conflict says one thing about the pair; it is as wide as the pair. */
+.contacts-conflict {
+  max-width: calc(44rem + var(--space-5));
 }
 
 /**
@@ -262,17 +316,23 @@
   gap: var(--space-1);
 }
 
-/* Small and text-weight, so it reads as part of the badge line. The padding is a hit
-   area, not part of the look: the matching negative margin keeps the words themselves
-   on the badge column when the button wraps onto a line of its own. */
-.contacts-unmerge {
-  margin-inline-start: calc(-1 * var(--space-2));
-}
-
+/* Small and text-weight, so it reads as part of the "Same person as" line, flush
+   with its words. The height is the hit area, not part of the look. */
 .contacts-unmerge .ui-button {
   min-height: 1.25rem;
-  padding: 0 var(--space-2);
+  padding: 0;
   font-size: var(--text-xs);
+}
+
+/* `ConfirmButton` reserves the width of its longer, armed label and centres the
+   one showing — right for a button, wrong for words on a line, which then start
+   a few characters in from the sentence above them. */
+.contacts-unmerge .ui-confirm-stack {
+  justify-items: start;
+}
+
+.contacts-unmerge .ui-confirm-stack > * {
+  justify-content: flex-start;
 }
 
 /* A verdict or unmerge that failed, said inside the card it belongs to. */

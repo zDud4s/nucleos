@@ -327,7 +327,7 @@ export function OccurrenceRow({
   const tools = useId();
 
   return (
-    <Row current={expanded} className="calendar-occurrence">
+    <Row current={expanded}>
       <button
         type="button"
         className="calendar-occurrence-head"

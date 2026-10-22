@@ -28,22 +28,11 @@
 
 /* =============================================================== shared == */
 
-.calendar-note,
-.calendar-loading {
+.calendar-note {
   margin: 0 0 var(--space-3);
   font-size: var(--text-sm);
   line-height: var(--leading-normal);
   color: var(--text-muted);
-}
-
-/* Faint and italic because the sentence is about the page's own progress and
-   not about the day — it is a value, not a region with nothing in it. The two
-   absences that used to share this rule are `Quiet` now, which is muted rather
-   than faint on purpose: an answer set fainter than the labels around it reads
-   as a page that failed rather than as one that is empty. */
-.calendar-loading {
-  color: var(--text-faint);
-  font-style: italic;
 }
 
 /* The two groups in the held-notifications panel, stacked.
@@ -135,36 +124,57 @@
   gap: var(--space-2);
 }
 
+/* The chevrons on Prev and Next, sized to the label's x-height and pulled in
+   toward the edge they point at, so the word stays centred in the button. */
+.calendar-step-icon {
+  width: 0.875rem;
+  height: 0.875rem;
+  margin-inline: calc(-1 * var(--space-1));
+}
+
 /* A segmented pair rather than two loose buttons: they are one choice, and the
-   shared border is what says so. */
+   shared border is what says so. Its frame, radius and metrics are `.ui-button`'s
+   — it sat in the same row as Prev, Today and Next on a thinner border, a smaller
+   radius and a shorter line, and read as a different kind of control. */
 .calendar-views {
   display: flex;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
   overflow: hidden;
 }
 
 /* `base.css` resets only `font` and `color` on a button and deliberately never
    `background`, so every control here brings its own ground. */
 .calendar-view {
-  padding: var(--space-1) var(--space-3);
+  padding: 0.34rem var(--space-3);
   border: 0;
   background: var(--surface);
   color: var(--text-muted);
-  font-family: inherit;
+  font-family: var(--font-body);
   font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: 1.4;
   cursor: pointer;
+  transition:
+    background-color var(--dur-quick) var(--ease),
+    color var(--dur-quick) var(--ease);
 }
 
 .calendar-view + .calendar-view {
-  border-left: 1px solid var(--border);
+  border-left: 1px solid var(--border-strong);
 }
 
 .calendar-view:hover {
+  background: var(--surface-raised);
   color: var(--text);
 }
 
-.calendar-view-on {
+.calendar-view:focus-visible {
+  outline-offset: -2px;
+}
+
+.calendar-view-on,
+.calendar-view-on:hover {
   background: var(--solid);
   color: var(--solid-ink);
 }
@@ -193,7 +203,10 @@
   padding: 0 1px;
 }
 
+/* Inset to the day number's own left edge (the cell's padding plus the pill's),
+   so MON stands over 27 and not over the gridline beside it. */
 .calendar-weekday {
+  padding-inline-start: calc(var(--space-2) + var(--space-1));
   font-family: var(--font-display);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-wider);
@@ -487,6 +500,11 @@
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
+  /* The window's edge cuts through an hour label more often than not — at the
+     design size it opened on "08" sliced in half under the day heads. The app's
+     scroll fade says "this continues" instead of looking broken. */
+  mask-image: var(--scroll-fade);
+  -webkit-mask-image: var(--scroll-fade);
 }
 
 .calendar-gutter {
@@ -600,6 +618,25 @@
   text-align: left;
   overflow: hidden;
   cursor: pointer;
+  /* The block measures itself, for the rule below. */
+  container-type: inline-size;
+}
+
+/* Three meetings in one hour split the column into lanes a few characters wide,
+   and every one of them showed "10:15" and no title. The clock is the one fact
+   the block's position already states, so a narrow block gives it up for the
+   name — on screen only. It stays in the button's accessible name (the
+   `.sr-only` recipe), where position says nothing. */
+@container (max-width: 6rem) {
+  .calendar-block-clock {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 
 .calendar-block[draggable="true"] {

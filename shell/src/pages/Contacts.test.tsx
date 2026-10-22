@@ -180,9 +180,9 @@ describe("Contacts — identity questions", () => {
 
     renderWithQuery(<Contacts />);
 
-    // The head names who stays and who is merged in (display names, else the first address)
-    // and no longer carries the proposal number.
-    expect(await screen.findByText("Ana (stays) + Ana Silva (merged in)")).toBeDefined();
+    // The head asks the question the two buttons answer (display names, else the first
+    // address) and no longer carries the proposal number.
+    expect(await screen.findByText("Are Ana and Ana Silva one person?")).toBeDefined();
     expect(screen.queryByText("question #21")).toBeNull();
   });
 

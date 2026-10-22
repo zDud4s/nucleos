@@ -1,6 +1,7 @@
 // §spec calendario-local
 import { useEffect, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { DaySheet } from "../calendar/DaySheet";
 import { MonthGrid } from "../calendar/MonthGrid";
 import { WeekGrid } from "../calendar/WeekGrid";
@@ -361,7 +362,8 @@ export function Calendar() {
               {/* aria-label and not title: a title is no accessible name. Each one still
                   contains its visible word, so the spoken name matches what is on screen. */}
               <Button aria-label={view === "week" ? "Previous week" : "Previous month"} onClick={() => step(-1)}>
-                ‹ Prev
+                <ChevronLeft className="calendar-step-icon" aria-hidden="true" />
+                Prev
               </Button>
               <Button
                 aria-label="Today"
@@ -370,7 +372,8 @@ export function Calendar() {
                 Today
               </Button>
               <Button aria-label={view === "week" ? "Next week" : "Next month"} onClick={() => step(1)}>
-                Next ›
+                Next
+                <ChevronRight className="calendar-step-icon" aria-hidden="true" />
               </Button>
             </div>
           </div>

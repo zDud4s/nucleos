@@ -388,7 +388,9 @@ function Chip({ occurrence, drag }: { occurrence: EventOccurrence; drag: DragHan
       onDragEnd={() => drag.onDragEnd()}
     >
       <span className="calendar-chip-clock">{clock}</span>
-      <span className="calendar-chip-title">{occurrence.title}</span>
+      <span className="calendar-chip-title" title={occurrence.title}>
+        {occurrence.title}
+      </span>
       {/* `sr-only` is the shared recipe in `base.css`, not this page's own copy: the
           tone is the whole of the mark on screen, and colour is not a label. */}
       {proposal && <span className="sr-only">proposed</span>}

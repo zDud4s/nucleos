@@ -202,16 +202,21 @@ function IdentityQuestion({
 }) {
   const conflict = mergeVerdictsConflict(suggestion);
   const noteId = useId();
-  const who = `${sideName(suggestion.keep)} and ${sideName(suggestion.absorb)}`;
+  const [keepName, absorbName] = pairNames(suggestion.keep, suggestion.absorb);
+  const who = `${keepName} and ${absorbName}`;
   const send = (verdict: "approve" | "reject") => {
     onDecide(who);
     decide.mutate({ proposalId: suggestion.proposal_id, verdict });
   };
+  // The head is the question the two buttons answer — "Yes, one person" and "No,
+  // different people" had nothing on screen asking them. Which side stays and
+  // which is merged in is said once, in the headings over the two sides; the
+  // head used to say it a second time in parentheses.
   return (
     <Row className="contacts-question">
       <div className="contacts-question-head">
         <span className="contacts-question-who">
-          {sideName(suggestion.keep)} (stays) + {sideName(suggestion.absorb)} (merged in)
+          Are {keepName} and {absorbName} one person?
         </span>
         <RelativeTime at={suggestion.created_at} />
       </div>
@@ -221,7 +226,7 @@ function IdentityQuestion({
         <MergeSideView side={suggestion.absorb} role="Merged in" />
       </div>
       {conflict && (
-        <div id={noteId}>
+        <div id={noteId} className="contacts-conflict">
           <ConflictNote>
             These two carry standing decisions that disagree, so approving will be refused. Settle one
             of them and decide this again.
@@ -256,6 +261,17 @@ function sideName(side: MergeSide): string {
 }
 
 /**
+ * The two names a question asks about — by address when the names alone are the
+ * same, since "Are Ana and Ana one person?" asks nothing a reader can answer.
+ */
+function pairNames(keep: MergeSide, absorb: MergeSide): [string, string] {
+  const first = sideName(keep);
+  const second = sideName(absorb);
+  if (first !== second) return [first, second];
+  return [keep.addresses[0] ?? first, absorb.addresses[0] ?? second];
+}
+
+/**
  * One side of a suggested merge, under the word for what happens to it.
  *
  * "Stays" and "Merged in" are a heading and not a field label — the whole point
@@ -272,7 +288,9 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
   return (
     <Section label={role} level={3}>
       <div className="contacts-side">
-        <p className="contacts-side-name">{side.display_name ?? "no name recorded"}</p>
+        <p className={side.display_name === null ? "contacts-side-name contacts-missing" : "contacts-side-name"}>
+          {side.display_name ?? "no name recorded"}
+        </p>
         <ul className="contacts-side-addresses">
           {side.addresses.map((address) => (
             <li key={address}>{address}</li>
@@ -415,30 +433,32 @@ function PeopleRoster({ rows }: { rows: Correspondent[] }) {
   // Each card is the inset rank, the one card a Panel is allowed to hold.
   return (
     <>
-      <ListFilter
-        noun="people"
-        query={query}
-        onQueryChange={(next) => {
-          setQuery(next);
-          setShown(PAGE_SIZE);
-        }}
-        chips={chips}
-        selected={selected}
-        onToggleChip={(id) => {
-          setSelected((now) =>
-            now.includes(id as RosterFilter)
-              ? now.filter((key) => key !== id)
-              : [...now, id as RosterFilter],
-          );
-          setShown(PAGE_SIZE);
-        }}
-        resultCount={visible.length}
-        onClear={() => {
-          setQuery("");
-          setSelected([]);
-          setShown(PAGE_SIZE);
-        }}
-      />
+      <div className="contacts-filter">
+        <ListFilter
+          noun="people"
+          query={query}
+          onQueryChange={(next) => {
+            setQuery(next);
+            setShown(PAGE_SIZE);
+          }}
+          chips={chips}
+          selected={selected}
+          onToggleChip={(id) => {
+            setSelected((now) =>
+              now.includes(id as RosterFilter)
+                ? now.filter((key) => key !== id)
+                : [...now, id as RosterFilter],
+            );
+            setShown(PAGE_SIZE);
+          }}
+          resultCount={visible.length}
+          onClear={() => {
+            setQuery("");
+            setSelected([]);
+            setShown(PAGE_SIZE);
+          }}
+        />
+      </div>
       {visible.length === 0 ? (
         <p className="contacts-note">No one matches{needle === "" ? "" : ` "${query.trim()}"`}.</p>
       ) : (
@@ -496,7 +516,10 @@ function PersonCard({
           {initials(row)}
         </span>
         <div className="contacts-card-who">
-          <span className="contacts-card-name" title={row.display_name ?? undefined}>
+          <span
+            className={row.display_name === null ? "contacts-card-name contacts-missing" : "contacts-card-name"}
+            title={row.display_name ?? undefined}
+          >
             {row.display_name ?? "no name recorded"}
           </span>
           <span className="contacts-card-address">{row.address}</span>
@@ -504,19 +527,25 @@ function PersonCard({
       </div>
       {/* §6.13's badges, every one derived from this one row — there is no
           daemon-side rollup to read any of them off instead. */}
-      {/* The unmerge rides beside the badges, not in the action row: an extra
-          control there wrapped to a second line and lifted that card's Pin
-          above every other card's (owner's call, 2026-10-09). */}
-      {(row.verdict !== null || row.outbound_ever === 1 || merged || row.linked_by === "human") && (
+      {(row.verdict !== null || row.outbound_ever === 1 || merged) && (
         <div className="contacts-card-badges">
           {row.verdict === "pin" && <Badge tone="pending">urgent</Badge>}
           {row.verdict === "mute" && <Badge tone="off">noise</Badge>}
           {row.outbound_ever === 1 && <Badge tone="info">you write back</Badge>}
           {merged && <Badge tone="shadow">merged</Badge>}
+        </div>
+      )}
+      {/* The unmerge stays out of the action row: an extra control there wrapped
+          to a second line and lifted that card's Pin above every other card's
+          (owner's call, 2026-10-09). It sits on the line that states the link it
+          undoes — beside the badges it wrapped onto a line of its own, apart from
+          the sentence it answers. */}
+      {(merged || row.linked_by === "human") && (
+        <div className="contacts-sameas">
+          {merged && <span>Same person as {sameAs.join(", ")}</span>}
           <UnmergeButton address={row.address} linkedBy={row.linked_by} onProblem={onProblem} />
         </div>
       )}
-      {merged && <p className="contacts-sameas">Same person as {sameAs.join(", ")}</p>}
       <p className="contacts-meta">
         {plural(row.messages_in, "message")} in · last seen{" "}
         <RelativeTime at={row.last_seen} />

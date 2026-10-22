@@ -374,7 +374,9 @@ function Block({
       onDragEnd={() => drag.onDragEnd()}
     >
       <span className="calendar-block-clock">{placement.clock}</span>
-      <span className="calendar-block-title">{occurrence.title}</span>
+      <span className="calendar-block-title" title={occurrence.title}>
+        {occurrence.title}
+      </span>
       {/* `sr-only` from `base.css`, as the month chip does — the tone is the
           whole of the mark on screen, and colour is not a label. */}
       {occurrence.source === "proposal" && <span className="sr-only">proposed</span>}
