@@ -17,6 +17,7 @@ fn main() {
     watch(std::path::Path::new("../dist"));
     tauri_build::build();
     manifest_the_test_binaries();
+    shadow_the_default_manifest();
 }
 
 /// Hands the Windows resource `tauri_build` just built to the TEST binaries as well.
@@ -60,6 +61,42 @@ fn manifest_the_test_binaries() {
     let resource = std::path::Path::new(&out).join("libresource.a");
     if resource.exists() {
         println!("cargo:rustc-link-arg={}", resource.display());
+    }
+}
+
+/// Keeps mingw's fallback manifest out of every link, so the application's is the only one.
+///
+/// On windows-gnu, gcc's startfile spec appends `default-manifest.o` to every link it drives, a
+/// fallback for programs that bring no manifest of their own. This one does: the resource above
+/// carries it, as `RT_MANIFEST` ID 1, language 1033, and so does mingw's file. GNU ld met the two
+/// with a warning (`.rsrc merge failure: multiple non-default manifests`) and kept going. Rust
+/// 1.97's windows-gnu links with its bundled `rust-lld` (`-fuse-ld=lld` on the gcc line), and lld
+/// refuses outright: `duplicate resource: type MANIFEST (ID 24)/name ID 1/language 1033`, naming
+/// `libresource.a` and mingw 16.1's `default-manifest.o`. Measured on 2026-10-22: that error is
+/// what stopped `cargo test -p shell --lib` from linking, and a two-line C program reproduces it
+/// with nothing of this crate's in it.
+///
+/// gcc finds `default-manifest.o` through its startfile search, and a `-B` directory is searched
+/// first. So the build drops a file of that name into `OUT_DIR` — an empty archive, which a linker
+/// reads and takes nothing from — and points gcc at it. Measured the same day on the C program:
+/// the link succeeds, and the executable carries exactly one manifest, the one it brought. The
+/// instruction is unsuffixed for the reason `manifest_the_test_binaries` gives, so the bins drop
+/// the duplicate too. Any other target never asks for the file, so nothing is written there.
+fn shadow_the_default_manifest() {
+    let windows_gnu = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
+    let Ok(out) = std::env::var("OUT_DIR") else {
+        return;
+    };
+    if !windows_gnu {
+        return;
+    }
+    let dir = std::path::Path::new(&out).join("no-default-manifest");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if std::fs::write(dir.join("default-manifest.o"), b"!<arch>\n").is_ok() {
+        println!("cargo:rustc-link-arg=-B{}", dir.display());
     }
 }
 
