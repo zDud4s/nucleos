@@ -59,6 +59,8 @@ pub(super) fn retried_launch(
                 .pin
                 .as_ref()
                 .and_then(|pin| pin.web_search)
+                // An unpinned node routed to Codex has no pin to read it from.
+                .or(launch.codex_profile.as_ref().and_then(|p| p.web_search))
                 .filter(|_| kind == crate::models::route_advice::RunnerKind::Codex),
         });
     }

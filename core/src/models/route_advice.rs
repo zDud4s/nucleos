@@ -669,6 +669,34 @@ pub struct RouteQuery {
     /// The effort a node asked for with no engine pin: the router still picks runner and model, but
     /// the launch runs at this effort (checked against the model it lands on).
     pub effort: Option<String>,
+    /// What a node's agent needs of Codex, carried even when the node is not pinned: if the router
+    /// moves the run to Codex, the launch gets a runner that pins this, not the shared alternate
+    /// (which pins nothing). `None` for every run that is not an agent node.
+    pub codex_profile: Option<CodexProfile>,
+}
+
+/// The Codex settings an agent's capabilities translate to: the sandbox that is the barrier on Codex
+/// and the `web_search` mode. One value for the pinned and the routed path, so they cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexProfile {
+    /// `read-only` | `workspace-write`.
+    pub sandbox: &'static str,
+    /// `"live"` when the agent declares `web`; `None` leaves Codex's own default.
+    pub web_search: Option<&'static str>,
+}
+
+/// The runner a launch gets when its agent's Codex settings must hold: a fresh `CodexCliRunner`
+/// pinning them, never the shared instance. Both the pin path and the routed path build it here.
+fn codex_runner(
+    model: String,
+    sandbox: &'static str,
+    web_search: Option<&'static str>,
+) -> Arc<dyn CommandRunner> {
+    Arc::new(crate::execution::runner::CodexCliRunner {
+        model,
+        sandbox_mode: Some(sandbox),
+        web_search,
+    })
 }
 
 impl RouteQuery {
@@ -689,6 +717,7 @@ impl RouteQuery {
             pin: None,
             judged_later: false,
             effort: None,
+            codex_profile: None,
         }
     }
 }
@@ -919,6 +948,14 @@ pub async fn resolve(
     // wraps, so nothing downstream can tell a routed-to-primary launch from an unrouted one.
     let chosen_runner = if choice.kind == router.primary.kind {
         runner
+    } else if let (RunnerKind::Codex, Some(profile)) = (choice.kind, query.codex_profile.as_ref()) {
+        // A routed agent node on Codex gets the same sandbox and web search a pinned one would; the
+        // shared alternate pins neither, so Codex would fall back to the user's config.
+        codex_runner(
+            launched.default_model.clone(),
+            profile.sandbox,
+            profile.web_search,
+        )
     } else {
         Arc::clone(&launched.runner)
     };
@@ -1003,11 +1040,9 @@ async fn resolve_pin(
     let chosen_runner: Arc<dyn CommandRunner> = match (pin.runner, pin.sandbox) {
         // The agent's sandbox is the barrier on Codex, so the launch gets a runner that pins it
         // rather than the shared instance, which pins nothing.
-        (RunnerKind::Codex, Some(sandbox)) => Arc::new(crate::execution::runner::CodexCliRunner {
-            model: available.default_model.clone(),
-            sandbox_mode: Some(sandbox),
-            web_search: pin.web_search,
-        }),
+        (RunnerKind::Codex, Some(sandbox)) => {
+            codex_runner(available.default_model.clone(), sandbox, pin.web_search)
+        }
         _ if pin.runner == engines.primary.kind => runner,
         _ => Arc::clone(&available.runner),
     };
@@ -1511,6 +1546,7 @@ mod tests {
             pin: None,
             judged_later: false,
             effort: None,
+            codex_profile: None,
         }
     }
 
@@ -1750,6 +1786,7 @@ mod tests {
                 pin: None,
                 judged_later: false,
                 effort: None,
+                codex_profile: None,
             },
             &router.eligible(shape()),
         );
@@ -2203,6 +2240,72 @@ mod tests {
                 Some("max".into()),
             )
         );
+    }
+
+    /// Resolves an unpinned run under `apply` whose router answers Codex, carrying `profile`.
+    async fn resolve_routed_to_codex(
+        profile: Option<CodexProfile>,
+    ) -> (Resolved, Arc<dyn CommandRunner>) {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, _received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_9", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+        let resolved = resolve(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(RouteQuery {
+                codex_profile: profile,
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await;
+        (resolved, codex)
+    }
+
+    /// The routed path must give an agent node what a Codex pin would: the translated sandbox and,
+    /// when the agent declares `web`, live web search. The shared alternate pins neither.
+    #[tokio::test]
+    async fn a_routed_agent_node_on_codex_gets_its_sandbox_and_web_search() {
+        let (resolved, codex) = resolve_routed_to_codex(Some(CodexProfile {
+            sandbox: "workspace-write",
+            web_search: Some("live"),
+        }))
+        .await;
+        assert!(!Arc::ptr_eq(&resolved.runner, &codex));
+        assert_eq!(
+            resolved.runner.codex_pins(),
+            Some((Some("workspace-write"), Some("live")))
+        );
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[tokio::test]
+    async fn a_routed_agent_node_without_web_leaves_web_search_unpinned() {
+        let (resolved, _) = resolve_routed_to_codex(Some(CodexProfile {
+            sandbox: "read-only",
+            web_search: None,
+        }))
+        .await;
+        assert_eq!(
+            resolved.runner.codex_pins(),
+            Some((Some("read-only"), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_is_not_an_agent_node_routed_to_codex_keeps_the_shared_alternate() {
+        let (resolved, codex) = resolve_routed_to_codex(None).await;
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
     }
 
     /// AC6 through the whole path: a run the classifier governs is offered its primary only, and
@@ -3157,6 +3260,7 @@ mod outcome_tests {
             pin: None,
             judged_later: false,
             effort: None,
+            codex_profile: None,
         };
         assert!(judged_by_a_job_gate(&query(Some("implement"), true)));
         assert!(judged_by_a_job_gate(&query(Some("implement"), false)));

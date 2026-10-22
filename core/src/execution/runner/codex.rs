@@ -510,6 +510,10 @@ impl CodexCliRunner {
 
 #[async_trait]
 impl CommandRunner for CodexCliRunner {
+    fn codex_pins(&self) -> Option<(Option<&'static str>, Option<&'static str>)> {
+        Some((self.sandbox_mode, self.web_search))
+    }
+
     async fn run_prompt(
         &self,
         request: RunRequest,

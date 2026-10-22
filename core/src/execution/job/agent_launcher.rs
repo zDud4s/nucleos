@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::agents::capabilities::{CodexSandbox, Engine};
 use crate::agents::launch::{self, AgentLaunch, LaunchError, Pins};
 use crate::agents::output::{self, OutputShape};
-use crate::models::route_advice::RunnerKind;
+use crate::models::route_advice::{CodexProfile, RunnerKind};
 
 use super::dispatch::{
     AgentNodeLauncher, EnginePin, LaunchRefused, NodeCtx, NodeLaunch, OutputCheck, ProtocolAndBody,
@@ -75,21 +75,29 @@ fn pin_of(
             "{label} is pinned to the local engine, which a workflow node cannot run on"
         )));
     };
+    let profile = codex_profile(sandbox, web_search);
     Ok(Some(EnginePin {
         runner,
         model: Some(model).filter(|model| !model.is_empty()),
         effort: effort
             .filter(|effort| !effort.is_empty())
             .map(str::to_owned),
-        // Only Codex has a sandbox to pin; an agent that asks for no fs/shell/web gets read-only,
-        // the same default the generated Codex prefix states.
-        sandbox: (runner == RunnerKind::Codex)
-            .then(|| sandbox.unwrap_or(CodexSandbox::ReadOnly).as_str()),
-        // The agent's `web` capability turns Codex's own web search on (`"live"`, the counterpart of
-        // the `"disabled"` an `McpOnly` run is given). Claude has no such switch: its web tools are
-        // granted through the loadout.
-        web_search: (runner == RunnerKind::Codex && web_search).then_some("live"),
+        // Only Codex has a sandbox to pin.
+        sandbox: (runner == RunnerKind::Codex).then_some(profile.sandbox),
+        // Claude has no such switch: its web tools are granted through the loadout.
+        web_search: profile.web_search.filter(|_| runner == RunnerKind::Codex),
     }))
+}
+
+/// The Codex settings the agent's capabilities translate to, for the pinned and the routed path
+/// alike. An agent that asks for no fs/shell/web gets read-only, the same default the generated
+/// Codex prefix states; its `web` capability turns Codex's own web search on (`"live"`, the
+/// counterpart of the `"disabled"` an `McpOnly` run is given).
+fn codex_profile(sandbox: Option<CodexSandbox>, web_search: bool) -> CodexProfile {
+    CodexProfile {
+        sandbox: sandbox.unwrap_or(CodexSandbox::ReadOnly).as_str(),
+        web_search: web_search.then_some("live"),
+    }
 }
 
 fn refused(error: LaunchError) -> LaunchRefused {
@@ -120,6 +128,8 @@ fn node_launch(
     let pin = pin_of(launch.pin, effort, label, codex_sandbox, web_search)?;
     Ok(NodeLaunch {
         codex_sandbox,
+        // Set pinned or not: an unpinned node the router moves to Codex needs the same grant.
+        codex_profile: Some(codex_profile(codex_sandbox, web_search)),
         builtin_tools: launch.builtin_tools,
         prompt: launch.prompt,
         // A pin bypasses the router, so there is nothing to restrict then.
@@ -378,6 +388,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(codex_without.pin.and_then(|pin| pin.web_search), None);
+        // Unpinned, the router may still pick Codex: the profile travels without a pin.
+        let routed = node_launch(launch(Vec::new(), None, true), None, "r@1.0.0").unwrap();
+        assert!(routed.pin.is_none());
+        assert_eq!(
+            routed.codex_profile,
+            Some(CodexProfile {
+                sandbox: "read-only",
+                web_search: Some("live"),
+            })
+        );
     }
 
     #[test]

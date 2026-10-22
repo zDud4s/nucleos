@@ -33,6 +33,8 @@ pub struct NodeLaunchRoute {
     pub judged_later: bool,
     /// The node's own effort when it is not pinned; see `RouteQuery::effort`.
     pub effort: Option<String>,
+    /// The agent's Codex settings, for a router that moves the unpinned node to Codex.
+    pub codex_profile: Option<crate::models::route_advice::CodexProfile>,
 }
 
 /// A conflict the daemon is about to hand an agent: which escalated request it came from, and the
@@ -933,6 +935,7 @@ pub(super) async fn create_run_with(
             pin: node.and_then(|node| node.launch.pin.clone()),
             judged_later: node.is_some_and(|node| node.launch.judged_later),
             effort: node.and_then(|node| node.launch.effort.clone()),
+            codex_profile: node.and_then(|node| node.launch.codex_profile.clone()),
         })
     };
     // Folded HERE, where both facts are in hand, rather than in `cli_args` where they used to be

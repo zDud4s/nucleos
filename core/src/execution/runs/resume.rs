@@ -437,6 +437,7 @@ pub async fn resume_for_correction(
             pin: None,
             judged_later: false,
             effort: None,
+            codex_profile: None,
         }),
         // No job MCP: `after_gate_failed` only ever corrects a run outside jobs.
         None,
@@ -1184,6 +1185,7 @@ pub(super) async fn continue_paused_run(
             pin: None,
             judged_later: false,
             effort: None,
+            codex_profile: None,
         }),
         JobNodeMcp::for_run(resume_id, job_id),
         max_turns,

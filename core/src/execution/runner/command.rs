@@ -89,6 +89,13 @@ pub trait CommandRunner: Send + Sync {
         None
     }
 
+    /// The `(sandbox, web_search)` a Codex runner pins on every launch, or `None` for any other
+    /// runner. Lets a caller (and a test) see which grant a resolved launch will run under without
+    /// downcasting a trait object.
+    fn codex_pins(&self) -> Option<(Option<&'static str>, Option<&'static str>)> {
+        None
+    }
+
     /// Whether this runner enforces `RunRequest::max_budget_usd` on the process it launches.
     ///
     /// Defaulted to `false`, and only the Anthropic CLI runner answers `true`: `cli_args` turns the

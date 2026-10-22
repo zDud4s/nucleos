@@ -41,6 +41,7 @@ fn seat_query(prompt: &str) -> RouteQuery {
         pin: None,
         judged_later: false,
         effort: None,
+        codex_profile: None,
     }
 }
 

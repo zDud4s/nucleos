@@ -287,6 +287,7 @@ pub(super) async fn spawn_node(
         pin: launch.pin.clone(),
         judged_later: launch.output.is_some(),
         effort: launch.effort.clone(),
+        codex_profile: launch.codex_profile.clone(),
     };
     let builtin_tools = launch.builtin_tools.clone();
     let prompt = launch.prompt;
