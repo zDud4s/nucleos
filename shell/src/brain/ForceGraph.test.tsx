@@ -91,6 +91,16 @@ describe("ForceGraph", () => {
     expect(onSelect).toHaveBeenCalledWith("n:solo");
   });
 
+  it("draws a job node and an edge to it", async () => {
+    const model: GModel = {
+      nodes: [node("n:1", { degree: 1 }), node("job:42", { kind: "job", ref: "42", degree: 1 })],
+      edges: [{ id: "relates|n:1|job:42", source: "n:1", target: "job:42", type: "relates" }],
+    };
+    render(<ForceGraph model={model} selected={null} onSelect={() => {}} />);
+    expect(screen.getByRole("img", { name: "Brain graph, 2 nodes" })).toBeTruthy();
+    await waitFor(() => expect(recorded).toContain("arc"));
+  });
+
   it("stops the simulation and its frames on unmount", async () => {
     const model: GModel = {
       nodes: [node("n:1", { degree: 1 }), node("k:2", { kind: "knowledge", layer: "semantic", degree: 1 })],

@@ -4,11 +4,11 @@ import type { KnownLayer } from "../data/knowledge";
  * The Brain graph as plain data: what `graph-model.ts` builds and `ForceGraph.tsx` draws.
  *
  * Node ids: `n:<id>` a note, `k:<id>` a knowledge row, `<kind>:<ref>` any other target
- * (`project:<id>`, `contact:<id>`, `mail:<id>`, `file:<ref>`). One thing is one node however
+ * (`project:<id>`, `contact:<id>`, `mail:<id>`, `file:<ref>`, `job:<id>`). One thing is one node however
  * it is reached.
  */
 
-export type GNodeKind = "note" | "knowledge" | "project" | "contact" | "mail" | "file";
+export type GNodeKind = "note" | "knowledge" | "project" | "contact" | "mail" | "file" | "job";
 
 /** Which way an item leans for the shared Estado filter; `unknown` is a status this shell has no word for. */
 export type StateBucket = "in_force" | "proposed" | "out" | "unknown";

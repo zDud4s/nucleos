@@ -8,7 +8,7 @@ import { Segments } from "./Segments";
  * and orphans. A bar, never laid over the nodes.
  */
 
-export const NODE_KINDS: readonly GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file"];
+export const NODE_KINDS: readonly GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file", "job"];
 
 export const EDGE_TYPES: readonly GEdgeType[] = [
   "relates",
@@ -34,6 +34,7 @@ const KIND_LABELS: Record<GNodeKind, string> = {
   contact: "Contact",
   mail: "Mail",
   file: "File",
+  job: "Job",
 };
 
 const STATES: readonly (readonly [GFilters["state"], string])[] = [

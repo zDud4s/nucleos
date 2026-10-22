@@ -17,7 +17,8 @@ export type MarkKey =
   | "project"
   | "contact"
   | "mail"
-  | "file";
+  | "file"
+  | "job";
 
 export const MARK_PATHS: Record<MarkKey, string> = {
   note: "M0 -0.9A0.9 0.9 0 1 1 0 0.9A0.9 0.9 0 1 1 0 -0.9Z",
@@ -29,6 +30,8 @@ export const MARK_PATHS: Record<MarkKey, string> = {
   contact: "M-0.35 -1H0.35V-0.35H1V0.35H0.35V1H-0.35V0.35H-1V-0.35H-0.35Z",
   mail: "M-1 -0.65H1V0.65H-1Z",
   file: "M-0.7 -1H0.3L0.8 -0.5V1H-0.7Z",
+  // A pentagon, point up: the one regular shape no other kind takes.
+  job: "M0 -1L0.95 -0.31L0.59 0.81H-0.59L-0.95 -0.31Z",
 };
 
 /** The mark a graph node takes: a knowledge row by its layer, anything else by its kind. */
