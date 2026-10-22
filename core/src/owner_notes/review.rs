@@ -55,6 +55,8 @@ pub struct Review {
     pub created: Vec<OwnerNote>,
     /// Active notes with no link at all, newest first, at most ten.
     pub unlinked: Vec<OwnerNote>,
+    /// How many active notes have no link at all, uncapped (`unlinked` stops at ten).
+    pub unlinked_total: i64,
     /// Up to three active notes untouched for 30 days, fixed for the whole week.
     pub resurfaced: Vec<OwnerNote>,
     /// Knowledge rows waiting for the owner's decision.
@@ -148,6 +150,13 @@ pub async fn weekly_review(pool: &SqlitePool, now: DateTime<Local>) -> sqlx::Res
     .fetch_all(pool)
     .await?;
 
+    let unlinked_total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM owner_notes WHERE state = 'active' AND NOT EXISTS \
+         (SELECT 1 FROM owner_note_links WHERE owner_note_links.note_id = owner_notes.id)",
+    )
+    .fetch_one(pool)
+    .await?;
+
     let resurfaced = resurfaced(pool, start, now).await?;
 
     let waiting_proposals: i64 =
@@ -160,6 +169,7 @@ pub async fn weekly_review(pool: &SqlitePool, now: DateTime<Local>) -> sqlx::Res
         week_end: end.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         created,
         unlinked,
+        unlinked_total,
         resurfaced,
         waiting_proposals,
     })
@@ -229,7 +239,7 @@ pub fn weekly_message(review: &Review) -> String {
          Notes without a link: {}\n\
          Proposals waiting for you: {}",
         review.created.len(),
-        review.unlinked.len(),
+        review.unlinked_total,
         review.waiting_proposals,
     );
     if !review.resurfaced.is_empty() {
@@ -256,7 +266,10 @@ async fn sent_week(pool: &SqlitePool) -> sqlx::Result<Option<String>> {
 /// Due: at or after Monday 09:00 local of the current ISO week, with a different week in the
 /// marker. Nothing is sent, and no marker written, while the primary channel has no destination
 /// (the next tick tries again). The message and the marker commit together, so a crash between
-/// them neither loses the review nor sends it twice.
+/// them neither loses the review nor sends it twice. The marker is claimed first inside that
+/// transaction, so a second daemon on the same database finds it taken and sends nothing. A week
+/// with nothing to report (no new, unlinked or old notes, no proposals) writes the marker and
+/// sends nothing.
 pub async fn send_weekly_if_due(state: &AppState, now: DateTime<Local>) -> sqlx::Result<bool> {
     let pool = &state.pool;
     if now < due_at(now) {
@@ -279,7 +292,32 @@ pub async fn send_weekly_if_due(state: &AppState, now: DateTime<Local>) -> sqlx:
     let review = weekly_review(pool, now).await?;
     let note_text = weekly_message(&review);
 
+    // Claim the week first, as the transaction's opening write: of two daemons on one database
+    // only one changes the marker, and only that one enqueues.
     let mut tx = pool.begin().await?;
+    let claimed = sqlx::query(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+         WHERE value IS NOT excluded.value",
+    )
+    .bind(SENT_WEEK_KEY)
+    .bind(&week)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if claimed != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if review.created.is_empty()
+        && review.unlinked_total == 0
+        && review.resurfaced.is_empty()
+        && review.waiting_proposals == 0
+    {
+        // An empty review is not worth a message; the week is still marked as done.
+        tx.commit().await?;
+        return Ok(false);
+    }
     outbox::enqueue(
         &mut tx,
         &ConversationKey::new(primary, home),
@@ -294,21 +332,13 @@ pub async fn send_weekly_if_due(state: &AppState, now: DateTime<Local>) -> sqlx:
         now.with_timezone(&Utc),
     )
     .await?;
-    sqlx::query(
-        "INSERT INTO schema_meta (key, value) VALUES (?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(SENT_WEEK_KEY)
-    .bind(&week)
-    .execute(&mut *tx)
-    .await?;
     tx.commit().await?;
     outbox::wake(state, primary);
 
     tracing::info!(
         week = %week,
         created = review.created.len(),
-        unlinked = review.unlinked.len(),
+        unlinked = review.unlinked_total,
         resurfaced = review.resurfaced.len(),
         waiting_proposals = review.waiting_proposals,
         "weekly review sent"
@@ -429,6 +459,12 @@ mod tests {
         ids
     }
 
+    /// One active note written this week, so the review has something to say.
+    async fn seed_note(state: &AppState) {
+        let tuesday = local(2026, 11, 10, 10, 0);
+        note(&state.pool, "seed", "active", tuesday, tuesday).await;
+    }
+
     async fn outbox_texts(state: &AppState) -> Vec<(String, String)> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT conversation, payload FROM channel_outbox ORDER BY id")
@@ -487,11 +523,14 @@ mod tests {
             week_end: String::new(),
             created: Vec::new(),
             unlinked: Vec::new(),
+            unlinked_total: 25,
             resurfaced: Vec::new(),
             waiting_proposals: 4,
         };
         let plain = weekly_message(&review);
         assert!(plain.contains("Proposals waiting for you: 4"));
+        // The count is the total, not the length of the capped list.
+        assert!(plain.contains("Notes without a link: 25"));
         assert!(plain.contains("Brain page"));
         assert!(!plain.contains("Worth another look"));
 
@@ -583,7 +622,66 @@ mod tests {
         }
         let review = weekly_review(&pool, wednesday()).await.unwrap();
         assert_eq!(review.unlinked.len(), 10);
+        assert_eq!(review.unlinked_total, 14);
         assert_eq!(review.created.len(), 14);
+    }
+
+    #[tokio::test]
+    async fn the_sent_message_counts_every_unlinked_note_not_just_the_listed_ten() {
+        let state = ready(true).await;
+        let tuesday = local(2026, 11, 10, 10, 0);
+        for n in 0..14 {
+            note(&state.pool, &format!("n{n}"), "active", tuesday, tuesday).await;
+        }
+        assert!(send_weekly_if_due(&state, wednesday()).await.unwrap());
+        let sent = outbox_texts(&state).await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].1.contains("Notes without a link: 14"));
+    }
+
+    #[tokio::test]
+    async fn two_calls_in_one_week_enqueue_one_row() {
+        let state = ready(true).await;
+        seed_note(&state).await;
+
+        let first = send_weekly_if_due(&state, wednesday()).await.unwrap();
+        let second = send_weekly_if_due(&state, wednesday()).await.unwrap();
+        assert!(first);
+        assert!(!second);
+        assert_eq!(outbox_texts(&state).await.len(), 1);
+        assert_eq!(marker(&state).await.as_deref(), Some("2026-W46"));
+    }
+
+    #[tokio::test]
+    async fn a_taken_marker_enqueues_nothing_and_stays_untouched() {
+        // Another daemon got there first: the marker already names this week, so a call sends
+        // nothing and leaves it as it was. (The in-transaction claim itself, which closes the
+        // window after the early read, is the same statement the first call of the test above runs.)
+        let state = ready(true).await;
+        seed_note(&state).await;
+        sqlx::query("INSERT INTO schema_meta (key, value) VALUES (?, '2026-W46')")
+            .bind(SENT_WEEK_KEY)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(!send_weekly_if_due(&state, wednesday()).await.unwrap());
+        assert!(outbox_texts(&state).await.is_empty());
+        assert_eq!(marker(&state).await.as_deref(), Some("2026-W46"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_week_writes_the_marker_and_sends_nothing() {
+        let state = ready(true).await;
+        assert!(!send_weekly_if_due(&state, wednesday()).await.unwrap());
+        assert!(outbox_texts(&state).await.is_empty());
+        assert_eq!(marker(&state).await.as_deref(), Some("2026-W46"));
+
+        // A note written afterwards waits for the next week's review.
+        seed_note(&state).await;
+        assert!(!send_weekly_if_due(&state, local(2026, 11, 13, 10, 0)).await.unwrap());
+        assert!(outbox_texts(&state).await.is_empty());
+        assert!(send_weekly_if_due(&state, local(2026, 11, 16, 9, 0)).await.unwrap());
+        assert_eq!(outbox_texts(&state).await.len(), 1);
     }
 
     #[tokio::test]
@@ -612,6 +710,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_is_sent_before_monday_nine() {
         let state = ready(true).await;
+        seed_note(&state).await;
         assert!(!send_weekly_if_due(&state, local(2026, 11, 9, 8, 59)).await.unwrap());
         assert!(outbox_texts(&state).await.is_empty());
         assert_eq!(marker(&state).await, None);
@@ -648,6 +747,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_does_not_resend() {
         let state = ready(true).await;
+        seed_note(&state).await;
         assert!(send_weekly_if_due(&state, wednesday()).await.unwrap());
 
         // A restarted daemon has the same database and nothing else: the marker alone decides.
@@ -675,6 +775,7 @@ mod tests {
     #[tokio::test]
     async fn a_home_that_appears_later_gets_the_review_that_week() {
         let state = ready(false).await;
+        seed_note(&state).await;
         assert!(!send_weekly_if_due(&state, wednesday()).await.unwrap());
 
         sqlx::query(
