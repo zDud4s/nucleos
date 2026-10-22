@@ -2749,7 +2749,11 @@ mod tests {
         // The shell's startup prepare: no site yet.
         let startup = project_placement(&db.pool, "acme").await.unwrap();
         assert!(startup.origins.is_empty());
-        runtime.client.embedded_prepare("acme", &startup).await.unwrap();
+        runtime
+            .client
+            .embedded_prepare("acme", &startup)
+            .await
+            .unwrap();
 
         sqlx::query(
             "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable)              VALUES ('acme', 'https://jira.example.org', 'destination', ?, 0)",
