@@ -452,8 +452,14 @@ async fn on_message(
         sender: &event.sender,
         message_ref: &message.reference,
     };
-    if let Some(job) = commands::capture_target(state, &inbound, message).await? {
-        return commands::answer_capture(state, &inbound, job, &input).await;
+    match commands::capture_target(state, &inbound, message).await? {
+        Some(commands::CaptureTarget::Job(job)) => {
+            return commands::answer_capture(state, &inbound, job, &input).await;
+        }
+        Some(commands::CaptureTarget::Ambiguous(jobs)) => {
+            return commands::say_digest_hint(state, &inbound, jobs).await;
+        }
+        None => {}
     }
     if input.text.is_empty() && input.images.is_empty() {
         return Ok(());

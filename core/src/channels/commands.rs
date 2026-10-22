@@ -326,24 +326,61 @@ fn typed_text(message: &contract::InMessage) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// Which capture request a message answers, if any: a reply to a capture request this very
+/// Which capture request a message answers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CaptureTarget {
+    Job(i64),
+    /// A reply to a digest with several questions open: the owner must pick one.
+    Ambiguous(Vec<i64>),
+}
+
+/// Which capture request a message answers, if any: a reply to a capture request or a digest this very
 /// conversation was sent, else the typed `/cap <N> <text>` form. The "open captures" hint of the
 /// Telegram v1 is left out on purpose (Q14).
 pub async fn capture_target(
     state: &AppState,
     at: &ingest::Inbound<'_>,
     message: &contract::InMessage,
-) -> sqlx::Result<Option<i64>> {
+) -> sqlx::Result<Option<CaptureTarget>> {
     if let Some(reply_to) = message.reply_to.as_deref() {
         let sent = outbox::find_by_platform_ref(&state.pool, &at.key, reply_to).await?;
-        if let Some(outbox::Subject::Capture(job)) = sent.and_then(|sent| sent.subject) {
-            return Ok(Some(job));
+        match sent.and_then(|sent| sent.subject) {
+            Some(outbox::Subject::Capture(job)) => return Ok(Some(CaptureTarget::Job(job))),
+            Some(outbox::Subject::CaptureDigest(id)) => {
+                let open: Vec<i64> = sqlx::query_scalar(
+                    "SELECT job_id FROM capture_requests WHERE digest_id = ? AND state = 'open' ORDER BY job_id",
+                )
+                .bind(id)
+                .fetch_all(&state.pool)
+                .await?;
+                return Ok(match open.as_slice() {
+                    [] => None,
+                    [one] => Some(CaptureTarget::Job(*one)),
+                    _ => Some(CaptureTarget::Ambiguous(open)),
+                });
+            }
+            _ => {}
         }
     }
     Ok(match typed_text(message).map(|text| route(&text)) {
-        Some(Intent::Cap { job, .. }) => Some(job),
+        Some(Intent::Cap { job, .. }) => Some(CaptureTarget::Job(job)),
         _ => None,
     })
+}
+
+/// A reply to a digest with several questions open: say which, answer nothing.
+pub async fn say_digest_hint(
+    state: &AppState,
+    at: &ingest::Inbound<'_>,
+    jobs: Vec<i64>,
+) -> sqlx::Result<()> {
+    say(
+        state,
+        &at.key,
+        strings::render(&Text::CaptureDigestHint { jobs }),
+        chrono::Utc::now(),
+    )
+    .await
 }
 
 /// Files `text` as the answer to capture request `job`, with this channel as the note's origin, and
@@ -895,13 +932,90 @@ mod tests {
             let (state, at) = (&state, &at);
             async move { capture_target(state, at, &message).await.unwrap() }
         };
-        assert_eq!(target("p9").await, Some(7));
+        assert_eq!(target("p9").await, Some(CaptureTarget::Job(7)));
         // A reply to a proposal, to another conversation's capture, or to nothing known.
         assert_eq!(target("p8").await, None);
         assert_eq!(target("p7").await, None);
         assert_eq!(target("nope").await, None);
         let plain = text_message(None, "an answer");
         assert_eq!(capture_target(&state, &at, &plain).await.unwrap(), None);
+    }
+
+    async fn digest_request(state: &AppState, job: i64, digest: i64, state_: &str) {
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, \
+             created_at, digest_id) VALUES (?, 'p', '[]', 'q', ?, '2099-01-01T00:00:00Z', 't', ?)",
+        )
+        .bind(job)
+        .bind(state_)
+        .bind(digest)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_digest_with_one_open_request_answers_it() {
+        let state = crate::channels::testkit::state().await;
+        delivered(&state, "c1", "p9", "capture_digest:3").await;
+        digest_request(&state, 7, 3, "open").await;
+        digest_request(&state, 8, 3, "answered").await;
+        let (c, s) = (conversation(), sender());
+        let at = inbound(&c, &s);
+        let found = capture_target(&state, &at, &text_message(Some("p9"), "it was me"))
+            .await
+            .unwrap();
+        assert_eq!(found, Some(CaptureTarget::Job(7)));
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_digest_with_several_open_requests_is_ambiguous_and_none_open_is_nothing()
+    {
+        let state = crate::channels::testkit::state().await;
+        delivered(&state, "c1", "p9", "capture_digest:3").await;
+        delivered(&state, "c1", "p8", "capture_digest:4").await;
+        digest_request(&state, 9, 3, "open").await;
+        digest_request(&state, 7, 3, "open").await;
+        digest_request(&state, 5, 4, "expired").await;
+        let (c, s) = (conversation(), sender());
+        let at = inbound(&c, &s);
+        let found = capture_target(&state, &at, &text_message(Some("p9"), "x"))
+            .await
+            .unwrap();
+        assert_eq!(found, Some(CaptureTarget::Ambiguous(vec![7, 9])));
+        assert_eq!(
+            capture_target(&state, &at, &text_message(Some("p8"), "x"))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_digest_hint_names_the_open_jobs_and_the_cap_form() {
+        assert_eq!(
+            strings::render(&Text::CaptureDigestHint { jobs: vec![7, 9] }),
+            "Several questions are open: #7, #9. Answer one with /cap <N> <text>."
+        );
+    }
+
+    #[tokio::test]
+    async fn run_capture_says_answered_only_when_a_reading_was_scheduled() {
+        let state = crate::channels::testkit::state().await;
+        let (c, s) = (conversation(), sender());
+        let at = inbound(&c, &s);
+        // The job exists: a reading was scheduled.
+        open_request(&state, 7).await;
+        let said = run_capture(&at, &state, 7, "it was me").await;
+        assert_eq!(said, strings::render(&Text::CaptureAnswered { job: 7 }));
+        // The request exists but its job row does not: the answer is kept, no reading follows.
+        digest_request(&state, 8, 3, "open").await;
+        let said = run_capture(&at, &state, 8, "too late").await;
+        let note: i64 = sqlx::query_scalar("SELECT note_id FROM capture_requests WHERE job_id = 8")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(said, strings::render(&Text::CaptureLate { note }));
     }
 
     #[tokio::test]
@@ -912,7 +1026,7 @@ mod tests {
         let found = capture_target(&state, &at, &text_message(None, "/cap 12 it was me"))
             .await
             .unwrap();
-        assert_eq!(found, Some(12));
+        assert_eq!(found, Some(CaptureTarget::Job(12)));
         // Malformed forms are not a capture answer.
         for text in ["/cap", "/cap 12", "/cap x y", "cap 12 hi"] {
             let found = capture_target(&state, &at, &text_message(None, text))

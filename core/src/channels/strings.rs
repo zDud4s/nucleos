@@ -62,6 +62,10 @@ pub enum Text {
         jobs: Vec<i64>,
         reply_to: bool,
     },
+    /// A reply to a digest with several questions open: which ones, answer nothing.
+    CaptureDigestHint {
+        jobs: Vec<i64>,
+    },
     CaptureNeedsText,
     CaptureAnswered {
         job: i64,
@@ -200,6 +204,14 @@ pub fn render(text: &Text) -> String {
             } else {
                 format!("Capture requests waiting: {list}. Answer with /cap <N> <text>.")
             }
+        }
+        Text::CaptureDigestHint { jobs } => {
+            let list = jobs
+                .iter()
+                .map(|j| format!("#{j}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Several questions are open: {list}. Answer one with /cap <N> <text>.")
         }
         Text::CaptureNeedsText => {
             "Capture requests take a typed reply - type your answer instead.".to_string()
@@ -441,6 +453,7 @@ mod tests {
                 jobs: vec![1, 2],
                 reply_to: false,
             },
+            Text::CaptureDigestHint { jobs: vec![1, 2] },
             Text::CaptureNeedsText,
             Text::CaptureAnswered { job: 1 },
             Text::AlreadyHandled,
