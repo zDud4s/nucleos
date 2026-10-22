@@ -100,6 +100,9 @@ mod tests {
                 .expect("quick-capture.json parses");
         assert_eq!(capability["windows"], serde_json::json!([LABEL]));
         let permissions = capability["permissions"].to_string();
-        assert!(permissions.contains("core:window:allow-hide"), "{permissions}");
+        assert!(
+            permissions.contains("core:window:allow-hide"),
+            "{permissions}"
+        );
     }
 }
