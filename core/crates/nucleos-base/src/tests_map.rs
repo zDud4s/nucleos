@@ -26,6 +26,9 @@ pub const MAX_MAP: u64 = 256 * 1024;
 /// language-aware ones (`{modules}`, `{packages}`, `{crates}`) are F4 and refused until then.
 pub const FILES: &str = "{files}";
 pub const DIRS: &str = "{dirs}";
+/// The marker of a group with `filters`: one word, the union of the matched filters' expressions.
+/// It cannot share a template with `{files}`/`{dirs}`.
+pub const FILTER: &str = "{filter}";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +75,22 @@ pub struct Group {
     /// the whole ignored tree, build output included, would be hashed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_ignored: bool,
+    /// Per-module narrowing for iteration runs: when every changed path the group claims matches
+    /// some filter, `select` runs with `{filter}` set to the union of the matched `expr`s.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<Filter>,
+}
+
+/// One slice of a group's tests: the paths that select it and the runner expression (a nextest
+/// filterset, say) that names its tests. `serial` names the runner's test group that must keep
+/// them one at a time; the repository's own config is checked against it by a test.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Filter {
+    pub paths: Vec<String>,
+    pub expr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
 }
 
 /// A verification tool only the daemon may run. `allow` lists the subcommands that stay open to
@@ -313,7 +332,14 @@ fn check_group(name: &str, group: &Group, errors: &mut Vec<String>) {
         }
     }
     if let Some(select) = &group.select {
-        check_select(&at, select, errors);
+        check_select(&at, select, !group.filters.is_empty(), errors);
+    } else if !group.filters.is_empty() {
+        errors.push(format!(
+            "{at}.filters: needs a `select` carrying {FILTER}, or no filter could ever be used"
+        ));
+    }
+    for (index, filter) in group.filters.iter().enumerate() {
+        check_filter(&format!("{at}.filters[{index}]"), group, filter, errors);
     }
     if let Some(reads) = &group.reads {
         for pattern in reads {
@@ -345,7 +371,7 @@ fn check_group(name: &str, group: &Group, errors: &mut Vec<String>) {
 /// A `select` template: splits like a gate command, carries at least one marker, every marker is
 /// a whole word and a known one, and when the template declares `--` every marker comes after it
 /// (spec §3.2, rule 3) — so a path can never be read as a flag.
-fn check_select(at: &str, select: &str, errors: &mut Vec<String>) {
+fn check_select(at: &str, select: &str, has_filters: bool, errors: &mut Vec<String>) {
     let words = match crate::gate::split_command(select) {
         Ok(words) => words,
         Err(error) => {
@@ -355,15 +381,21 @@ fn check_select(at: &str, select: &str, errors: &mut Vec<String>) {
     };
     let separator = words.iter().position(|word| word == "--");
     let mut markers = 0;
+    let (mut paths, mut filter) = (false, false);
     for (index, word) in words.iter().enumerate() {
-        if word == FILES || word == DIRS {
+        if word == FILES || word == DIRS || word == FILTER {
             markers += 1;
+            if word == FILTER {
+                filter = true;
+            } else {
+                paths = true;
+            }
             if separator.is_some_and(|separator| index < separator) {
                 errors.push(format!("{at}.select: `{word}` comes before `--`"));
             }
         } else if word.contains('{') && word.contains('}') {
             errors.push(format!(
-                "{at}.select: `{word}` is not a marker this daemon fills (it fills {FILES} and {DIRS}, each as a whole word)"
+                "{at}.select: `{word}` is not a marker this daemon fills (it fills {FILES}, {DIRS} and {FILTER}, each as a whole word)"
             ));
         }
     }
@@ -371,6 +403,50 @@ fn check_select(at: &str, select: &str, errors: &mut Vec<String>) {
         errors.push(format!(
             "{at}.select: carries no marker, so it would run the same tests as `command`"
         ));
+    }
+    if filter && paths {
+        errors.push(format!(
+            "{at}.select: {FILTER} cannot be combined with {FILES} or {DIRS}"
+        ));
+    }
+    if has_filters && !filter {
+        errors.push(format!(
+            "{at}.select: a group with `filters` needs {FILTER} in its `select`"
+        ));
+    }
+    if filter && !has_filters {
+        errors.push(format!(
+            "{at}.select: {FILTER} needs the group to declare `filters`"
+        ));
+    }
+}
+
+/// A filter: valid patterns inside the group's own `paths` (a filter outside them could never
+/// match a path the group claims), a runner expression, and a plain name for the serial test group.
+fn check_filter(at: &str, group: &Group, filter: &Filter, errors: &mut Vec<String>) {
+    if filter.paths.is_empty() {
+        errors.push(format!("{at}.paths: a filter nothing selects would never run"));
+    }
+    for pattern in &filter.paths {
+        check_pattern(&format!("{at}.paths"), pattern, errors);
+        if !covered_by(pattern, &group.paths) && !under_globbed_dir(pattern, &group.paths) {
+            errors.push(format!(
+                "{at}.paths: `{pattern}` is not inside the group's `paths`"
+            ));
+        }
+    }
+    if filter.expr.trim().is_empty() {
+        errors.push(format!("{at}.expr: empty"));
+    }
+    if let Some(serial) = &filter.serial {
+        let plain = serial
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if serial.is_empty() || !plain {
+            errors.push(format!(
+                "{at}.serial: `{serial}` is not a test-group name (letters, digits, `-` and `_`)"
+            ));
+        }
     }
 }
 
@@ -397,6 +473,14 @@ fn is_env_name(name: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `pattern` starts inside a directory some `dir/**` entry of `paths` covers.
+fn under_globbed_dir(pattern: &str, paths: &[String]) -> bool {
+    paths.iter().any(|path| {
+        path.strip_suffix("**")
+            .is_some_and(|dir| dir.ends_with('/') && !has_wildcard(dir) && pattern.starts_with(dir))
+    })
 }
 
 /// Whether every path `pattern` can match is matched by one of `reads`. Conservative: it proves
@@ -610,5 +694,69 @@ mod tests {
         let text = format!("{MINIMAL}      reads: [core/]\n      include_ignored: true\n");
         let map = parse(&text).unwrap();
         assert!(map.tests.groups["core"].include_ignored);
+    }
+
+    /// MINIMAL plus a `select` and one filter, each overridable by a test.
+    fn filtered(select: &str, filter: &str) -> String {
+        format!("{MINIMAL}      select: {select}\n      filters:\n        - {filter}\n")
+    }
+
+    const GOOD_SELECT: &str = "cargo nextest run -E {filter}";
+    const GOOD_FILTER: &str = "{paths: [core/src/channels/**], expr: 'test(/^channels::/)', serial: wake}";
+
+    #[test]
+    fn a_group_with_filters_parses() {
+        let map = parse(&filtered(GOOD_SELECT, GOOD_FILTER)).unwrap();
+        let filter = &map.tests.groups["core"].filters[0];
+        assert_eq!(filter.paths, ["core/src/channels/**"]);
+        assert_eq!(filter.expr, "test(/^channels::/)");
+        assert_eq!(filter.serial.as_deref(), Some("wake"));
+    }
+
+    #[test]
+    fn a_map_without_filters_parses_as_before_and_serializes_without_the_key() {
+        let map = parse(MINIMAL).unwrap();
+        assert!(map.tests.groups["core"].filters.is_empty());
+        assert!(!serde_yaml::to_string(&map).unwrap().contains("filters"));
+    }
+
+    #[test]
+    fn a_filter_outside_the_groups_paths_is_refused() {
+        let text = filtered(GOOD_SELECT, GOOD_FILTER).replace("[core/]", "[sidecars/]");
+        assert!(errors(&text).iter().any(|e| e.contains("not inside the group's `paths`")));
+        let under_glob = filtered(GOOD_SELECT, GOOD_FILTER).replace("[core/]", "[core/src/**]");
+        assert!(parse(&under_glob).is_ok());
+    }
+
+    #[test]
+    fn an_empty_expr_or_serial_is_refused() {
+        let empty_expr = filtered(GOOD_SELECT, "{paths: [core/a/**], expr: ''}");
+        assert!(errors(&empty_expr).iter().any(|e| e.contains("expr: empty")));
+        let empty_serial = filtered(GOOD_SELECT, "{paths: [core/a/**], expr: x, serial: ''}");
+        assert!(errors(&empty_serial).iter().any(|e| e.contains("serial")));
+        let bad_serial = filtered(GOOD_SELECT, "{paths: [core/a/**], expr: x, serial: 'a b'}");
+        assert!(errors(&bad_serial).iter().any(|e| e.contains("serial")));
+    }
+
+    #[test]
+    fn a_filter_path_must_be_a_relative_pattern() {
+        let text = filtered(GOOD_SELECT, "{paths: ['../x/**'], expr: x}");
+        assert!(errors(&text).iter().any(|e| e.contains("filters[0].paths")));
+    }
+
+    #[test]
+    fn filters_need_a_select_with_the_filter_marker() {
+        let none = format!("{MINIMAL}      filters:\n        - {GOOD_FILTER}\n");
+        assert!(errors(&none).iter().any(|e| e.contains("needs a `select`")));
+        let wrong = filtered("cargo test -- {files}", GOOD_FILTER);
+        assert!(errors(&wrong).iter().any(|e| e.contains("needs {filter}")));
+    }
+
+    #[test]
+    fn the_filter_marker_needs_filters_and_excludes_the_path_markers() {
+        let combined = filtered("cargo test -E {filter} -- {files}", GOOD_FILTER);
+        assert!(errors(&combined).iter().any(|e| e.contains("cannot be combined")));
+        let orphan = format!("{MINIMAL}      select: cargo nextest run -E {{filter}}\n");
+        assert!(errors(&orphan).iter().any(|e| e.contains("declare `filters`")));
     }
 }

@@ -464,6 +464,10 @@ async fn submit_checked(
         &fillable,
         rules.gate_command.as_deref(),
         true,
+        // Filters narrow only a session's own iteration run. A scope run (the daemon's item and
+        // merge gates, the evidence a green run leaves for a tip) and any daemon caller measure
+        // the whole group.
+        args.scope == ScopeArg::Own && matches!(caller, Caller::Owner | Caller::Run(_)),
     )
     .map_err(|error| match error {
         PlanError::InvalidMap(errors) => VerifyError::Unprocessable(format!(

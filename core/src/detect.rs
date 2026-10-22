@@ -512,6 +512,7 @@ fn group(paths: Vec<String>, command: String) -> Group {
         cache: true,
         env: Vec::new(),
         include_ignored: false,
+        filters: Vec::new(),
     }
 }
 

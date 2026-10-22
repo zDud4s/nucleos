@@ -126,7 +126,8 @@ fn why(reason: &Reason) -> String {
 /// The units a request needs.
 ///
 /// `full_allowed` is false while the project gates after landing, where a full run is the gate's
-/// job and not a session's.
+/// job and not a session's. `filters` lets a group's `filters` narrow its `select`; it is for a
+/// session's own iteration runs, never for a gate or evidence run, which measure the whole group.
 pub(crate) fn plan(
     map: &MapState,
     kind: Kind,
@@ -135,6 +136,7 @@ pub(crate) fn plan(
     fillable: &BTreeSet<String>,
     gate_command: Option<&str>,
     full_allowed: bool,
+    filters: bool,
 ) -> Result<Plan, PlanError> {
     if scope == ScopeArg::Full {
         if !full_allowed {
@@ -181,7 +183,7 @@ pub(crate) fn plan(
         });
     }
 
-    let selection = select(map, changed, fillable);
+    let selection = select(map, changed, fillable, filters);
     let mut note = None;
     if selection.full {
         // Every unit carries the same reason when the selection is full, so the first names it.
@@ -418,6 +420,7 @@ tests:
             &fillable(changed),
             gate,
             full_allowed,
+            false,
         )
     }
 
