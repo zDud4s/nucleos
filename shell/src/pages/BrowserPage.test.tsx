@@ -10,7 +10,7 @@ import {
   setTabMap,
   startBrowserBridge,
 } from "../data/browser-store";
-import { addAgentTab, newTab, setTabSessionId } from "../data/browser-tabs";
+import { NO_PROJECT, addAgentTab, newTab, setTabSessionId } from "../data/browser-tabs";
 import { resetAgentControlState } from "./AgentControlBar";
 import { BrowserPage } from "./BrowserPage";
 
@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   unlisten: vi.fn(),
   overlay: { open: false },
   ensureAgentEnv: vi.fn(),
+  projects: [{ project_id: "alpha" }, { project_id: "beta" }] as { project_id: string }[],
   reportAgentTabClosed: vi.fn(),
   embeddedAck: vi.fn(),
   embeddedOwner: vi.fn(),
@@ -48,7 +49,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 vi.mock("../ui/overlay", () => ({ useOverlayOpen: () => mocks.overlay.open }));
 vi.mock("../data/system", () => ({
-  useProjects: () => ({ data: [{ project_id: "alpha" }, { project_id: "beta" }] }),
+  useProjects: () => ({ data: mocks.projects }),
 }));
 
 class FakeResizeObserver {
@@ -99,6 +100,7 @@ beforeEach(() => {
   mocks.listeners.clear();
   mocks.unlisten.mockClear();
   mocks.overlay.open = false;
+  mocks.projects = [{ project_id: "alpha" }, { project_id: "beta" }];
   mocks.ensureAgentEnv.mockReset();
   mocks.ensureAgentEnv.mockResolvedValue({ ok: true, cdpHttp: "http://127.0.0.1:1" });
   resetBrowserStore();
@@ -285,6 +287,45 @@ describe("BrowserPage", () => {
     expect(calls("browser_tabs_show")[0].tabId).toBeNull();
     expect(screen.getByText("No tabs open in this project.")).toBeTruthy();
     expect(last(calls("browser_tabs_show"))?.tabId).toBeNull();
+  });
+
+  describe("no project", () => {
+    beforeEach(() => {
+      mocks.projects = [];
+    });
+
+    it("the project selector lists No project first and picks it when there are no projects", async () => {
+      render(<BrowserPage />);
+      const combo = screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement;
+      expect(combo.options[0].textContent).toBe("No project");
+      expect(combo.options[0].value).toBe(NO_PROJECT);
+      expect(combo.value).toBe(NO_PROJECT);
+      expect(screen.queryByText("No project to browse in yet.")).toBeNull();
+      expect(
+        (screen.getAllByRole("button", { name: "New tab" })[0] as HTMLButtonElement).disabled,
+      ).toBe(false);
+    });
+
+    it("a new tab in No project is an owner tab with a null project", async () => {
+      render(<BrowserPage />);
+      await openTab();
+      expect(calls("browser_tab_create")[0]).toMatchObject({
+        project: null,
+        role: "owner",
+        url: "about:blank",
+      });
+    });
+
+    it("an agent tab under No project shows the agent control bar", async () => {
+      setTabMap((m) =>
+        setTabSessionId(addAgentTab(m, NO_PROJECT, newTab("n-1", "https://a.example/", "agent")), "n-1", "s7"),
+      );
+      markCreated("n-1");
+      render(<BrowserPage />);
+      expect(screen.getByRole("combobox", { name: "Project" })).toHaveProperty("value", NO_PROJECT);
+      expect(screen.getByText("Agent is driving")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
   });
 
   describe("agent tabs", () => {

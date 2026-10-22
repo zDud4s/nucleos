@@ -37,6 +37,15 @@ export interface ProcessFailed {
   kind: string;
 }
 
+// RED stub: the real scope helpers arrive with GREEN.
+export const NO_PROJECT = "@none";
+export function scopeKey(project: string | null): string {
+  return project as string;
+}
+export function scopeProject(key: string): string | null {
+  return key;
+}
+
 export function envEnsure(project: string, role: Role): Promise<{ cdp_http: string | null }> {
   return invoke("browser_env_ensure", { project, role });
 }
