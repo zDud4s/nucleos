@@ -69,6 +69,7 @@ type Core struct {
 	mediaSeq   int
 	mediaLimit int64
 	outbox     *queue // guarded by mu; created by mountOutbox
+	polls      int    // outbox long-polls being served right now; guarded by mu
 	fallback   func(reason string, failed contract.Action)
 }
 

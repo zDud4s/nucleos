@@ -165,6 +165,16 @@ func TestRunnerLateCrashBetweenSendAndAckReexecutesAfterHello(t *testing.T) {
 	if n := g.core.Calls(fakecore.RouteAck); n != 0 {
 		t.Fatalf("ack calls = %d after the crash, want 0", n)
 	}
+	// Process one's long-poll can still be parked in the core: the cancellation
+	// reaches the handler after Run returns. A hello before it leaves would wake
+	// it, and it would lease the entry the hello just released.
+	deadline := time.Now().Add(10 * time.Second)
+	for g.core.OutboxPolls() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("outbox polls = %d after the crash, want 0", g.core.OutboxPolls())
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	// Process two: an empty Inflight, its own adapter, and a hello that tells the
 	// core the previous process's leases are gone (the Runner does not own the hello yet).

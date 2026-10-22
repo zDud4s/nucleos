@@ -43,6 +43,15 @@ func (c *Core) Delivery(id uint64) (state State, attempts int, ok bool) {
 	return e.State, e.Attempts, found
 }
 
+// OutboxPolls reports how many outbox long-polls the core is serving right now.
+// A runner that was stopped can leave its poll parked here for a moment after
+// Run returns: the cancellation reaches the handler asynchronously.
+func (c *Core) OutboxPolls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.polls
+}
+
 // handleOutbox is the long-poll: it answers as soon as Take yields something,
 // otherwise it waits for a change (insertion, ack, renew), for the next instant
 // at which the queue may change by itself (lease deadline, due_at, immediate
@@ -59,7 +68,20 @@ func (c *Core) handleOutbox(w http.ResponseWriter, r *http.Request) {
 		wait = n
 	}
 	deadline := c.clk.Now().Add(time.Duration(wait) * time.Second)
+	c.mu.Lock()
+	c.polls++
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.polls--
+		c.mu.Unlock()
+	}()
 	for {
+		// A caller that has gone takes nothing: leasing to it would strand the
+		// entry in leased until the lease runs out.
+		if r.Context().Err() != nil {
+			return
+		}
 		now := c.clk.Now()
 		c.mu.Lock()
 		taken := c.outbox.Take(now)
