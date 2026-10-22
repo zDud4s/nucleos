@@ -10,6 +10,8 @@ use chrono::{DateTime, Duration, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqliteConnection, SqlitePool};
 
+pub mod digest;
+
 pub const STATE_OPEN: &str = "open";
 pub const STATE_ANSWERED: &str = "answered";
 pub const STATE_DISMISSED: &str = "dismissed";
