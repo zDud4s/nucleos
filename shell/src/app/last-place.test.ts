@@ -31,6 +31,15 @@ describe("where the window opens", () => {
     }
   });
 
+  it("never remembers the quick-capture window's route", () => {
+    rememberPlace("/quick-capture");
+    rememberPlace("/quick-capture?x=1");
+    expect(localStorage.getItem("nucleos.last-place")).toBeNull();
+    rememberPlace("/chats/c-1");
+    rememberPlace("/quick-capture");
+    expect(lastPlace()).toBe("/chats/c-1");
+  });
+
   it("does not write a value it would refuse to read", () => {
     rememberPlace("https://example.com/");
     expect(localStorage.getItem("nucleos.last-place")).toBeNull();

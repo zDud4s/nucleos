@@ -36,6 +36,18 @@ function looksLikeAPath(value: string): boolean {
 }
 
 /**
+ * The quick-capture window's route (`QUICK_CAPTURE_PATH` in `router.tsx`). Repeated here rather than
+ * imported because `router.tsx` pulls in every page and this module is also loaded by the notch.
+ * That window shares this storage, and what it resolves to must never become the place the main
+ * window reopens on.
+ */
+const QUICK_CAPTURE_ROUTE = "/quick-capture";
+
+function isQuickCapturePath(path: string): boolean {
+  return (path.split(/[?#]/, 1)[0] ?? path) === QUICK_CAPTURE_ROUTE;
+}
+
+/**
  * Where to open, or `/` when there is nothing sensible to reopen.
  *
  * A storage that throws — private mode, a locked-down webview, a quota — is not an error path here.
@@ -55,6 +67,7 @@ export function lastPlace(): string {
 /** Remembers where the window is now. Silent on a storage that refuses, for the reason above. */
 export function rememberPlace(path: string): void {
   try {
+    if (isQuickCapturePath(path)) return;
     if (looksLikeAPath(path)) window.localStorage.setItem(KEY, path);
   } catch {
     // Nothing to do and nothing worth saying: the next launch opens on Home, which is where it
