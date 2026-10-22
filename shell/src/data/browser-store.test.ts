@@ -35,7 +35,7 @@ import {
   setTabMap,
   startBrowserBridge,
 } from "./browser-store";
-import { newTab, addAgentTab } from "./browser-tabs";
+import { NO_PROJECT, newTab, addAgentTab } from "./browser-tabs";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -156,6 +156,97 @@ describe("handleEnvRebuilt", () => {
   });
 });
 
+describe("no-project scope", () => {
+  it("an agent open request with a null project lands under the no-project key", async () => {
+    emb.embeddedAck.mockResolvedValue({ session_id: "s1" });
+    await handleAgentOpen({
+      request_id: "r1",
+      kind: "open",
+      project: null,
+      url: "u",
+    } as unknown as Parameters<typeof handleAgentOpen>[0]);
+    const tabs = getBrowserState().tabMap[NO_PROJECT].tabs;
+    expect(tabs).toHaveLength(1);
+    expect(tabs[0].sessionId).toBe("s1");
+    const create = invoke.mock.calls.find((c) => c[0] === "browser_tab_create");
+    expect(create?.[1]).toMatchObject({ project: null, role: "agent" });
+  });
+
+  it("an env-rebuilt event with a null project removes the no-project agent tabs", async () => {
+    emb.embeddedClosed.mockResolvedValue(undefined);
+    emb.embeddedRequests.mockResolvedValue([]);
+    seedAgent(NO_PROJECT, "n1", "ns1");
+    const stop = startBrowserBridge();
+    await vi.advanceTimersByTimeAsync(0);
+    events.handlers.get("browser://env-rebuilt")?.({
+      payload: { project: null, role: "agent", closedTabIds: ["n1"] },
+    });
+    expect(getBrowserState().tabMap[NO_PROJECT].tabs).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(emb.embeddedClosed).toHaveBeenCalledWith("ns1");
+    stop();
+  });
+
+  it("an env-retired event re-ensures the no-project agent environment", async () => {
+    emb.embeddedRequests.mockResolvedValue([]);
+    emb.embeddedPrepare.mockResolvedValue({ proxy_addr: "127.0.0.1:1" });
+    emb.embeddedRegister.mockResolvedValue(undefined);
+    invoke.mockResolvedValue({ cdp_http: "http://127.0.0.1:9" });
+    const stop = startBrowserBridge();
+    await vi.advanceTimersByTimeAsync(0);
+    await ensureProjectAgent(NO_PROJECT);
+    emb.embeddedPrepare.mockClear();
+    events.handlers.get("browser://env-retired")?.({ payload: { project: null, role: "agent" } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(emb.embeddedPrepare).toHaveBeenCalledWith(NO_PROJECT);
+    expect(emb.embeddedRegister).toHaveBeenCalledWith(NO_PROJECT, "http://127.0.0.1:9");
+    stop();
+  });
+
+  it("a focus request for a no-project session carries the no-project key", () => {
+    seedAgent(NO_PROJECT, "n1", "ns1");
+    handleAgentFocus({ session_id: "ns1" });
+    expect(getBrowserState().focusIntent).toMatchObject({ project: NO_PROJECT, sessionId: "ns1" });
+    expect(getBrowserState().tabMap[NO_PROJECT].activeId).toBe("n1");
+  });
+});
+
+describe("env-retired during an in-flight ensure", () => {
+  it("runs a fresh prepare/ensure/register after the in-flight one settles", async () => {
+    emb.embeddedRequests.mockResolvedValue([]);
+    emb.embeddedRegister.mockResolvedValue(undefined);
+    let release!: () => void;
+    emb.embeddedPrepare
+      .mockReturnValueOnce(new Promise((r) => (release = () => r({ proxy_addr: "127.0.0.1:1" }))))
+      .mockResolvedValue({ proxy_addr: "127.0.0.1:2" });
+    let ensures = 0;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd !== "browser_env_ensure") return undefined;
+      ensures += 1;
+      return { cdp_http: ensures === 1 ? "http://dead" : "http://fresh" };
+    });
+    const stop = startBrowserBridge();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const first = ensureProjectAgent(NO_PROJECT);
+    events.handlers.get("browser://env-retired")?.({ payload: { project: null, role: "agent" } });
+    await vi.advanceTimersByTimeAsync(0);
+    // The fresh run waits for the in-flight one instead of starting alongside it.
+    expect(emb.embeddedPrepare).toHaveBeenCalledTimes(1);
+
+    release();
+    await first;
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(emb.embeddedPrepare).toHaveBeenCalledTimes(2);
+    expect(emb.embeddedRegister.mock.calls).toEqual([
+      [NO_PROJECT, "http://dead"],
+      [NO_PROJECT, "http://fresh"],
+    ]);
+    stop();
+  });
+});
+
 describe("startBrowserBridge", () => {
   it("polls at 1 s, dispatches, and stop halts polling and unlistens", async () => {
     emb.embeddedRequests.mockResolvedValue([]);
@@ -166,8 +257,8 @@ describe("startBrowserBridge", () => {
     expect(emb.embeddedRequests).toHaveBeenCalledTimes(1);
     expect(events.handlers.has("browser://env-rebuilt")).toBe(true);
     stop();
-    // env-rebuilt + tab-state + new-window + process-failed + runtime-missing.
-    expect(events.unlisten).toHaveBeenCalledTimes(5);
+    // env-rebuilt + env-retired + tab-state + new-window + process-failed + runtime-missing.
+    expect(events.unlisten).toHaveBeenCalledTimes(6);
     await vi.advanceTimersByTimeAsync(5000);
     expect(emb.embeddedRequests).toHaveBeenCalledTimes(1);
   });
@@ -177,7 +268,7 @@ describe("startBrowserBridge", () => {
     const stop = startBrowserBridge();
     stop();
     await vi.advanceTimersByTimeAsync(0);
-    expect(events.unlisten).toHaveBeenCalledTimes(5);
+    expect(events.unlisten).toHaveBeenCalledTimes(6);
   });
 
   function emit(name: string, payload: unknown) {

@@ -25,7 +25,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::browser_agent::{
     agent_args, free_loopback_port, generation_dir_name, is_keepalive_tab_id, keepalive_label_for,
@@ -55,6 +57,9 @@ const RUNTIME_MISSING_EVENT: &str = "browser://runtime-missing";
 /// `{project, role, closedTabIds}`: the agent environment was rebuilt because `proxyAddr` changed;
 /// the listed tabs were closed (the keepalive webview is not among them).
 const ENV_REBUILT_EVENT: &str = "browser://env-rebuilt";
+/// `{project: null, role: "agent"}`: the no-project agent environment was torn down after its last
+/// tab closed; the next agent tab without a project needs a new `browser_env_ensure`.
+const ENV_RETIRED_EVENT: &str = "browser://env-retired";
 
 /// A tab's webview label is this prefix followed by the tab id the React side minted.
 const LABEL_PREFIX: &str = "browser-";
@@ -97,7 +102,13 @@ impl Role {
     }
 }
 
-/// An environment is one WebView2 data directory with one fixed argument string.
+/// The scope word of the no-project environments: their data directory is `browser/none/<role>`
+/// and their keepalive id `agent-keepalive-none`. Reserved, so no project may carry it (any case:
+/// Windows directory names are case-insensitive), which keeps the scope apart from every project.
+const NO_PROJECT_SCOPE: &str = "none";
+
+/// An environment is one WebView2 data directory with one fixed argument string. Its scope is a
+/// project, or no project at all, held as the reserved word [`NO_PROJECT_SCOPE`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EnvKey {
     project: String,
@@ -105,15 +116,114 @@ pub struct EnvKey {
 }
 
 impl EnvKey {
-    /// Validates both halves; the project becomes a directory name, so it must be path-safe.
+    /// Validates both halves; the project becomes a directory name, so it must be path-safe, and it
+    /// must not be the reserved no-project word.
     fn new(project: &str, role: &str) -> Result<EnvKey, String> {
         let role = Role::parse(role)?;
         check_project(project)?;
-        Ok(EnvKey {
-            project: project.to_string(),
-            role,
-        })
+        if project.eq_ignore_ascii_case(NO_PROJECT_SCOPE) {
+            return Err("invalid_project".to_string());
+        }
+        Ok(EnvKey::scoped(Some(project), role))
     }
+
+    /// The no-project environment of `role`.
+    fn none(role: Role) -> EnvKey {
+        EnvKey {
+            project: NO_PROJECT_SCOPE.to_string(),
+            role,
+        }
+    }
+
+    /// The key of an already validated scope: `None` is the no-project scope. Unchecked; anything
+    /// from outside goes through [`EnvKey::parse`].
+    fn scoped(project: Option<&str>, role: Role) -> EnvKey {
+        match project {
+            Some(project) => EnvKey {
+                project: project.to_string(),
+                role,
+            },
+            None => EnvKey::none(role),
+        }
+    }
+
+    /// The key for a command's `project` (`null` = no project) and `role` words.
+    fn parse(project: Option<&str>, role: &str) -> Result<EnvKey, String> {
+        match project {
+            Some(project) => EnvKey::new(project, role),
+            None => Ok(EnvKey::scoped(None, Role::parse(role)?)),
+        }
+    }
+
+    fn is_no_project(&self) -> bool {
+        self.project == NO_PROJECT_SCOPE
+    }
+
+    /// The project as the events carry it: `null` for the no-project scope.
+    fn wire_project(&self) -> Option<String> {
+        (!self.is_no_project()).then(|| self.project.clone())
+    }
+}
+
+/// Whether the no-project agent environment should be torn down: `key` is that environment, it is
+/// registered, and no tab of it is live or being built. Every other environment is persistent.
+fn should_retire_none_agent(registry: &Registry, key: &EnvKey) -> bool {
+    *key == EnvKey::none(Role::Agent)
+        && registry.envs.contains_key(key)
+        && registry.tabs_and_creating_of(key).is_empty()
+}
+
+/// [`should_retire_none_agent`], and the registered environment is still of `generation` (`None`:
+/// any). A creator whose build failed passes the generation it built against, so a rebuild that
+/// replaced the environment meanwhile (and so has no tabs yet) is never retired by that failure.
+fn should_retire_none_agent_of(registry: &Registry, key: &EnvKey, generation: Option<u32>) -> bool {
+    should_retire_none_agent(registry, key)
+        && match generation {
+            None => true,
+            Some(g) => registry.envs.get(key).is_some_and(|env| env.generation == g),
+        }
+}
+
+/// Prefix of a tombstone: a stale agent directory renamed away before it is deleted. It does not
+/// start with `agent`, so a tombstone is never taken for a generation directory.
+const TOMBSTONE_PREFIX: &str = "dead-";
+
+/// The tombstone name for the agent directory `name`, renamed by process `pid` as its `n`th one.
+fn tombstone_name(name: &str, pid: u32, n: u32) -> String {
+    format!("{TOMBSTONE_PREFIX}{pid}-{n}.{name}")
+}
+
+/// Whether `name` is exactly a [`tombstone_name`] of an agent generation directory.
+fn is_none_agent_tombstone(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix(TOMBSTONE_PREFIX)
+        .and_then(|rest| rest.split_once('.'))
+        .and_then(|(tag, original)| tag.split_once('-').map(|(pid, n)| (pid, n, original)))
+        .is_some_and(|(pid, n, original)| {
+            digits(pid) && digits(n) && agent_generation_of(original).is_some()
+        })
+}
+
+/// The generation of an agent data directory name (`agent` = 0, `agent-N` = N), `None` for any
+/// other name. Only the exact form [`generation_dir_name`] produces is accepted.
+fn agent_generation_of(name: &str) -> Option<u32> {
+    let generation = match name.strip_prefix("agent") {
+        Some("") => 0,
+        Some(rest) => rest.strip_prefix('-')?.parse::<u32>().ok()?,
+        None => return None,
+    };
+    (generation_dir_name(generation) == name).then_some(generation)
+}
+
+/// The directory names under `browser/none` that are agent generations other than the live one,
+/// in the order given. `live_generation` `None` means no agent environment is live: every agent
+/// generation is stale. Anything that is not an agent generation (`owner`) is never stale.
+fn stale_none_agent_dirs(names: &[String], live_generation: Option<u32>) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| agent_generation_of(name).is_some_and(|g| Some(g) != live_generation))
+        .cloned()
+        .collect()
 }
 
 /// Names Windows will not let a directory carry, whatever the extension.
@@ -172,7 +282,8 @@ fn tab_id_of_label(label: &str) -> Option<&str> {
     label.strip_prefix(LABEL_PREFIX).filter(|id| !id.is_empty())
 }
 
-/// `%LOCALAPPDATA%\nucleos\browser\<project>\<role>`; `base` is the local data directory.
+/// `%LOCALAPPDATA%\nucleos\browser\<project>\<role>`, and `...\browser\none\<role>` for the
+/// no-project scope; `base` is the local data directory.
 fn data_dir(base: &Path, key: &EnvKey) -> PathBuf {
     base.join("nucleos")
         .join("browser")
@@ -528,9 +639,16 @@ struct TabState {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EnvRebuilt {
-    project: String,
+    project: Option<String>,
     role: String,
     closed_tab_ids: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvRetired {
+    project: Option<String>,
+    role: String,
 }
 
 /// The tab ids behind the labels of closed webviews, in order. Keepalive webviews and labels that
@@ -775,6 +893,11 @@ fn ensure_env(app: &AppHandle, key: &EnvKey) -> Result<EnvInfo, String> {
 fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<EnvInfo, String> {
     let state = app.state::<Browser>();
     let _gate = state.agent_gate.lock().unwrap_or_else(|e| e.into_inner());
+    let no_project = key.is_no_project();
+    if no_project {
+        // The first no-project agent build of this process is "shell start" for its directories.
+        sweep_none_agent_dirs_once(app);
+    }
 
     let existing = state.registry().env(key);
     let decision = rebuild_decision(
@@ -806,8 +929,15 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
             }
             // Always a fresh directory: WebView2 may refuse the old one with new arguments while
             // the old browser process still lingers.
-            old.generation + 1
+            if no_project {
+                next_none_agent_generation()
+            } else {
+                old.generation + 1
+            }
         }
+        // The no-project agent environment is disposable: every build gets a directory no earlier
+        // build of this process used, since a retired one may still be held by its old process.
+        _ if no_project => next_none_agent_generation(),
         _ => 0,
     };
 
@@ -823,7 +953,7 @@ fn ensure_agent_env(app: &AppHandle, key: &EnvKey, proxy_addr: &str) -> Result<E
             MAIN_LABEL,
             ENV_REBUILT_EVENT,
             EnvRebuilt {
-                project: key.project.clone(),
+                project: key.wire_project(),
                 role: Role::Agent.as_str().to_string(),
                 closed_tab_ids: closed_tab_ids(&closed_labels),
             },
@@ -852,6 +982,148 @@ fn build_agent_env(
     };
     create_keepalive(app, &key.project, &env)?;
     Ok(env)
+}
+
+/// The next generation of the no-project agent environment, process-wide.
+static NONE_AGENT_GENERATION: AtomicU32 = AtomicU32::new(0);
+/// Whether this process already swept the stale no-project agent directories.
+static NONE_AGENT_SWEPT: AtomicBool = AtomicBool::new(false);
+
+fn next_none_agent_generation() -> u32 {
+    NONE_AGENT_GENERATION.fetch_add(1, Ordering::SeqCst)
+}
+
+/// `...\browser\none`, the parent of every no-project data directory.
+fn none_scope_dir(base: &Path) -> PathBuf {
+    base.join("nucleos").join("browser").join(NO_PROJECT_SCOPE)
+}
+
+/// The names of the directories directly under `dir`; empty if it cannot be read.
+fn dir_names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect()
+}
+
+/// The agent generation directories under `none_dir` right now (none of them live: callers hold
+/// `agent_gate` with no no-project agent environment registered).
+fn dead_none_agent_dirs(none_dir: &Path) -> Vec<String> {
+    stale_none_agent_dirs(&dir_names(none_dir), None)
+}
+
+/// Tombstones renamed by this process, for unique tombstone names.
+static TOMBSTONE_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Deletes the directories `names` under `none_dir`. Each is first renamed to a tombstone, tried up
+/// to `attempts` times a short while apart (a closing WebView2 process may still hold it); only
+/// tombstones are deleted. On Windows a directory a browser process still uses cannot be renamed,
+/// so one that stays locked, possibly the live profile of another shell process sharing this data
+/// root, is skipped and never deleted. Tombstones left by an earlier sweep (any process) are
+/// deleted too. Blocking: never call it on the main thread.
+fn remove_none_agent_dirs(none_dir: &Path, names: Vec<String>, attempts: u32) {
+    let pid = std::process::id();
+    for name in names {
+        let path = none_dir.join(&name);
+        for attempt in 0..attempts {
+            let n = TOMBSTONE_SEQ.fetch_add(1, Ordering::SeqCst);
+            let tomb = none_dir.join(tombstone_name(&name, pid, n));
+            if std::fs::rename(&path, &tomb).is_ok() || !path.exists() {
+                break;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    remove_none_agent_tombstones(none_dir, attempts);
+}
+
+/// Deletes every tombstone under `none_dir`, each tried up to `attempts` times a short while apart.
+/// One that cannot be deleted is left for the next sweep. Blocking: never on the main thread.
+fn remove_none_agent_tombstones(none_dir: &Path, attempts: u32) {
+    let tombs = dir_names(none_dir)
+        .into_iter()
+        .filter(|name| is_none_agent_tombstone(name));
+    for name in tombs {
+        let path = none_dir.join(name);
+        for attempt in 0..attempts {
+            if std::fs::remove_dir_all(&path).is_ok() || !path.exists() {
+                break;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+/// Once per process, before the first no-project agent build: deletes the agent directories an
+/// earlier run left behind, and makes the generation counter skip any that is still locked, so a
+/// build never lands on a directory an old browser process may hold. Called under `agent_gate`.
+fn sweep_none_agent_dirs_once(app: &AppHandle) {
+    if NONE_AGENT_SWEPT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Ok(base) = app.path().local_data_dir() else {
+        return;
+    };
+    let none_dir = none_scope_dir(&base);
+    remove_none_agent_dirs(&none_dir, dead_none_agent_dirs(&none_dir), 1);
+    let survivor = dir_names(&none_dir)
+        .iter()
+        .filter_map(|name| agent_generation_of(name))
+        .max();
+    if let Some(max) = survivor {
+        NONE_AGENT_GENERATION.fetch_max(max.saturating_add(1), Ordering::SeqCst);
+    }
+}
+
+/// Tears down the no-project agent environment once its last tab is gone: closes the keepalive,
+/// forgets the environment, tells the shell and deletes its directories. Blocking-thread only: it
+/// takes `agent_gate`, which an agent build holds across `add_child` (a main-thread wait).
+/// `generation` `Some` retires only that generation (see [`should_retire_none_agent_of`]).
+fn retire_none_agent(app: &AppHandle, generation: Option<u32>) {
+    let state = app.state::<Browser>();
+    let key = EnvKey::none(Role::Agent);
+    let none_dir = app.path().local_data_dir().ok().map(|b| none_scope_dir(&b));
+    let dead = {
+        let _gate = state.agent_gate.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-checked under the gate: a tab may have been opened since the close was seen.
+        let env = {
+            let registry = state.registry();
+            if !should_retire_none_agent_of(&registry, &key, generation) {
+                return;
+            }
+            registry.env(&key)
+        };
+        if let Some(env) = env {
+            if let Ok(label) = keepalive_label_for(&key.project, env.generation) {
+                if let Some(webview) = app.get_webview(&label) {
+                    let _ = webview.close();
+                }
+            }
+        }
+        state.registry().remove_env(&key);
+        // Listed under the gate: every generation that exists now is dead, and a later build takes
+        // a higher one that is not in this list.
+        none_dir.as_deref().map(dead_none_agent_dirs).unwrap_or_default()
+    };
+    let _ = app.emit_to(
+        MAIN_LABEL,
+        ENV_RETIRED_EVENT,
+        EnvRetired {
+            project: key.wire_project(),
+            role: Role::Agent.as_str().to_string(),
+        },
+    );
+    if let Some(none_dir) = none_dir {
+        remove_none_agent_dirs(&none_dir, dead, 8);
+    }
 }
 
 /// The hidden `about:blank` webview that keeps the agent environment's browser process (and so its
@@ -963,12 +1235,22 @@ fn create_tab(
         .then(|| state.agent_gate.lock().unwrap_or_else(|e| e.into_inner()));
     let env = ensure_env(app, &key)?;
     // Reserved before `add_child`, so a close that arrives while the webview is being built is seen.
-    state.registry().reserve_tab(&tab_id, key)?;
+    state.registry().reserve_tab(&tab_id, key.clone())?;
     drop(gate);
     let result = create_reserved(app, &tab_id, url, bounds, &env);
     if result.is_err() {
-        // A no-op once `finish_tab` ran; frees the id when the build failed before it.
-        app.state::<Browser>().registry().release_tab(&tab_id);
+        // Covers a failed build and a failed `finish_tab` (closed while being built): a close then
+        // found no live tab, so it did not retire, and this may have been the last tab.
+        let retire = {
+            let mut registry = state.registry();
+            // A no-op once `finish_tab` ran; frees the id when the build failed before it.
+            registry.release_tab(&tab_id);
+            should_retire_none_agent_of(&registry, &key, Some(env.generation))
+        };
+        if retire {
+            // Already on a blocking thread with `agent_gate` released, which the retire takes.
+            retire_none_agent(app, Some(env.generation));
+        }
     }
     result
 }
@@ -1056,14 +1338,15 @@ fn check_proxy_addr(addr: &str) -> Result<(), String> {
 
 /// `async` so tauri runs it off the main thread; the agent build (which calls `add_child`) goes to
 /// `spawn_blocking`. `proxy_addr` is required for the agent environment and refused for the owner.
+/// `project` `null` is the no-project scope.
 #[tauri::command]
 pub async fn browser_env_ensure(
     app: AppHandle,
-    project: String,
+    project: Option<String>,
     role: String,
     proxy_addr: Option<String>,
 ) -> Result<EnsureReply, String> {
-    let key = EnvKey::new(&project, &role)?;
+    let key = EnvKey::parse(project.as_deref(), &role)?;
     match key.role {
         Role::Owner => {
             if proxy_addr.is_some() {
@@ -1078,7 +1361,7 @@ pub async fn browser_env_ensure(
                 .filter(|p| !p.is_empty())
                 .ok_or_else(|| "agent_proxy_required".to_string())?;
             check_proxy_addr(&proxy)?;
-            keepalive_tab_id(&project)?;
+            keepalive_tab_id(&key.project)?;
             let env =
                 tauri::async_runtime::spawn_blocking(move || ensure_agent_env(&app, &key, &proxy))
                     .await
@@ -1094,17 +1377,17 @@ pub async fn browser_env_ensure(
 }
 
 /// `async` so tauri runs it off the main thread, and the build itself on `spawn_blocking`: see the
-/// module docs on `add_child`.
+/// module docs on `add_child`. `project` `null` is the no-project scope.
 #[tauri::command]
 pub async fn browser_tab_create(
     app: AppHandle,
-    project: String,
+    project: Option<String>,
     role: String,
     tab_id: String,
     url: String,
     bounds: Bounds,
 ) -> Result<(), String> {
-    let key = EnvKey::new(&project, &role)?;
+    let key = EnvKey::parse(project.as_deref(), &role)?;
     check_tab_id(&tab_id)?;
     bounds.validate()?;
     let url = checked_url(&app, &url, key.role == Role::Agent)?;
@@ -1235,14 +1518,26 @@ pub fn browser_tabs_show(
     first_error.map_or(Ok(()), Err)
 }
 
+/// Closing the last tab of the no-project agent environment also retires that environment (see
+/// [`retire_none_agent`]); every other environment outlives its tabs.
 #[tauri::command]
 pub fn browser_tab_close(app: AppHandle, tab_id: String) -> Result<(), String> {
     check_tab_id(&tab_id)?;
-    app.state::<Browser>().registry().remove_tab(&tab_id);
-    match app.get_webview(&label_for(&tab_id)) {
+    let state = app.state::<Browser>();
+    let mut registry = state.registry();
+    let removed = registry.remove_tab(&tab_id);
+    let retire = removed.is_some_and(|key| should_retire_none_agent(&registry, &key));
+    drop(registry);
+    let closed = match app.get_webview(&label_for(&tab_id)) {
         Some(webview) => webview.close().map_err(|e| e.to_string()),
         None => Ok(()),
+    };
+    if retire {
+        // Off the main thread: the retire takes `agent_gate` (see `retire_none_agent`).
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || retire_none_agent(&app, None));
     }
+    closed
 }
 
 #[cfg(test)]
@@ -1251,6 +1546,137 @@ mod tests {
 
     fn labels(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn envkey_none_scope_is_distinct_from_every_project() {
+        assert_ne!(
+            EnvKey::none(Role::Owner),
+            EnvKey::new("p", "owner").unwrap()
+        );
+        assert_ne!(
+            EnvKey::none(Role::Agent),
+            EnvKey::new("none", "agent").unwrap_or_else(|_| EnvKey::none(Role::Owner))
+        );
+        assert_eq!(EnvKey::scoped(None, Role::Owner), EnvKey::none(Role::Owner));
+        assert_eq!(EnvKey::scoped(None, Role::Agent), EnvKey::none(Role::Agent));
+        assert_ne!(EnvKey::none(Role::Owner), EnvKey::none(Role::Agent));
+        assert_eq!(
+            EnvKey::scoped(Some("p"), Role::Owner),
+            EnvKey::new("p", "owner").unwrap()
+        );
+    }
+
+    #[test]
+    fn envkey_refuses_a_project_named_none() {
+        assert_eq!(
+            EnvKey::new("none", "owner"),
+            Err("invalid_project".to_string())
+        );
+        assert_eq!(
+            EnvKey::new("none", "agent"),
+            Err("invalid_project".to_string())
+        );
+    }
+
+    #[test]
+    fn data_dir_of_the_no_project_scope_is_browser_none_role() {
+        let base = Path::new("base");
+        let root = base.join("nucleos").join("browser");
+        assert_eq!(
+            data_dir(base, &EnvKey::none(Role::Owner)),
+            root.join("none").join("owner")
+        );
+        assert_eq!(
+            data_dir(base, &EnvKey::none(Role::Agent)),
+            root.join("none").join("agent")
+        );
+        assert_eq!(
+            data_dir(base, &EnvKey::new("proj", "owner").unwrap()),
+            root.join("proj").join("owner")
+        );
+    }
+
+    #[test]
+    fn registry_keeps_no_project_and_project_environments_apart() {
+        let mut reg = Registry::default();
+        let none = EnvKey::none(Role::Agent);
+        let proj = EnvKey::new("proj", "agent").unwrap();
+        reg.ensure_env(&none, || env("none-args"));
+        reg.ensure_env(&proj, || env("proj-args"));
+        assert_eq!(reg.env(&none).unwrap().args, "none-args");
+        assert_eq!(reg.env(&proj).unwrap().args, "proj-args");
+
+        reg.reserve_tab("t-none", none.clone()).unwrap();
+        reg.finish_tab("t-none").unwrap();
+        reg.reserve_tab("t-proj", proj.clone()).unwrap();
+        reg.finish_tab("t-proj").unwrap();
+        assert_eq!(reg.tabs_of(&none), vec!["t-none".to_string()]);
+        assert_eq!(reg.tabs_of(&proj), vec!["t-proj".to_string()]);
+
+        assert_eq!(reg.remove_tab("t-none"), Some(none.clone()));
+        assert!(reg.tabs_of(&none).is_empty());
+        assert_eq!(reg.tabs_of(&proj), vec!["t-proj".to_string()]);
+    }
+
+    #[test]
+    fn the_no_project_agent_env_retires_only_when_its_last_tab_is_gone() {
+        let none = EnvKey::none(Role::Agent);
+        let mut reg = Registry::default();
+        reg.ensure_env(&none, || env("a"));
+        assert!(should_retire_none_agent(&reg, &none));
+
+        reg.reserve_tab("t1", none.clone()).unwrap();
+        assert!(!should_retire_none_agent(&reg, &none), "creating");
+        reg.finish_tab("t1").unwrap();
+        assert!(!should_retire_none_agent(&reg, &none), "live");
+        reg.remove_tab("t1");
+        assert!(should_retire_none_agent(&reg, &none));
+
+        let owner = EnvKey::none(Role::Owner);
+        let proj = EnvKey::new("proj", "agent").unwrap();
+        reg.ensure_env(&owner, || env("o"));
+        reg.ensure_env(&proj, || env("p"));
+        assert!(!should_retire_none_agent(&reg, &owner));
+        assert!(!should_retire_none_agent(&reg, &proj));
+    }
+
+    #[test]
+    fn stale_none_agent_dirs_are_everything_but_the_live_generation() {
+        // generation_dir_name: generation 0 -> `agent`, N -> `agent-N`. `owner` is never touched.
+        let names = labels(&["agent", "agent-1", "agent-2", "owner"]);
+        assert_eq!(
+            stale_none_agent_dirs(&names, Some(1)),
+            labels(&["agent", "agent-2"])
+        );
+        assert_eq!(
+            stale_none_agent_dirs(&names, Some(0)),
+            labels(&["agent-1", "agent-2"])
+        );
+        assert_eq!(
+            stale_none_agent_dirs(&names, None),
+            labels(&["agent", "agent-1", "agent-2"])
+        );
+    }
+
+    #[test]
+    fn env_rebuilt_payload_has_a_null_project_for_the_no_project_scope() {
+        let rebuilt = EnvRebuilt {
+            project: None,
+            role: "agent".to_string(),
+            closed_tab_ids: vec!["a".to_string()],
+        };
+        let json = serde_json::to_string(&rebuilt).unwrap();
+        assert!(json.contains("\"project\":null"), "{json}");
+        assert!(json.contains("\"closedTabIds\":[\"a\"]"), "{json}");
+
+        let retired = EnvRetired {
+            project: None,
+            role: "agent".to_string(),
+        };
+        let json = serde_json::to_string(&retired).unwrap();
+        assert!(json.contains("\"project\":null"), "{json}");
+        assert!(json.contains("\"role\":\"agent\""), "{json}");
     }
 
     #[test]
@@ -1851,5 +2277,60 @@ mod tests {
             json,
             serde_json::json!({"fromTabId": "t1", "url": "https://a.b/"})
         );
+    }
+
+    #[test]
+    fn a_failed_build_retires_only_the_generation_it_built_against() {
+        let none = EnvKey::none(Role::Agent);
+        let mut reg = Registry::default();
+        reg.ensure_env(&none, || EnvInfo {
+            generation: 3,
+            ..env("a")
+        });
+
+        // Closed while being built: the close only flags the reservation, the creator releases it.
+        reg.reserve_tab("t1", none.clone()).unwrap();
+        assert_eq!(reg.remove_tab("t1"), None);
+        assert!(!should_retire_none_agent_of(&reg, &none, Some(3)), "creating");
+        assert!(reg.finish_tab("t1").is_err());
+        reg.release_tab("t1");
+        assert!(should_retire_none_agent_of(&reg, &none, Some(3)));
+        assert!(should_retire_none_agent_of(&reg, &none, None));
+        // A rebuild replaced the environment meanwhile: the old creator must not retire it.
+        assert!(!should_retire_none_agent_of(&reg, &none, Some(2)));
+
+        let owner = EnvKey::none(Role::Owner);
+        reg.ensure_env(&owner, || env("o"));
+        assert!(!should_retire_none_agent_of(&reg, &owner, Some(0)));
+        assert!(!should_retire_none_agent_of(&reg, &owner, None));
+    }
+
+    #[test]
+    fn tombstones_are_recognised_and_never_taken_for_a_generation() {
+        for name in ["agent", "agent-7"] {
+            let tomb = tombstone_name(name, 4242, 9);
+            assert!(!tomb.starts_with("agent"), "{tomb}");
+            assert!(is_none_agent_tombstone(&tomb), "{tomb}");
+            assert_eq!(agent_generation_of(&tomb), None, "{tomb}");
+        }
+        assert_eq!(tombstone_name("agent-1", 12, 3), "dead-12-3.agent-1");
+
+        for name in [
+            "agent",
+            "agent-1",
+            "owner",
+            "dead-1-2.owner",
+            "dead-x-2.agent",
+            "dead-1-.agent",
+            "dead-1.agent",
+            "dead-1-2agent",
+            "dead-1-2.agent-x",
+        ] {
+            assert!(!is_none_agent_tombstone(name), "{name}");
+        }
+
+        // The sweep's stale list never contains a tombstone, so it is never renamed again.
+        let names = labels(&["agent", "dead-5-0.agent-1", "owner"]);
+        assert_eq!(stale_none_agent_dirs(&names, None), labels(&["agent"]));
     }
 }
