@@ -248,7 +248,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         const r = nodeRadius(n.degree);
         const fill = colour(colorToken(n));
         c.globalAlpha = lit && !lit.has(n.id) ? 0.15 : 1;
-        // The node's silhouette is its identity (`marks.tsx`); one neutral fill serves them all.
+        // The silhouette (`marks.tsx`) and the kind's hue (`colorToken`, cached per frame) together.
         const shape = markPath(n);
         if (n.missing) {
           c.setLineDash([3 / k, 2 / k]);
