@@ -1,0 +1,4 @@
+/* "Notes about this" (see NotesAbout.tsx): rows reuse .brain-links; only the missing action cell is handled here. */
+.notes-about-list li:not(:has(.brain-link-act)) {
+  grid-template-columns: 5.5rem minmax(0, 1fr);
+}
