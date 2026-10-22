@@ -50,7 +50,8 @@ pub struct ChannelsRuntime {
     pub outbox: outbox::Waiters,
     /// Who is connected, since when, and the last `hello`. Memory only.
     pub presence: registry::Presence,
-    /// `~/.nucleos/channels/<id>.yaml`, read once at startup.
+    /// `~/.nucleos/channels/<id>.yaml`, read at startup and re-read by [`ChannelsRuntime::reload`]
+    /// when the app writes one (a hand edit on disk still needs a restart).
     pub(crate) configs: RwLock<HashMap<&'static str, registry::ChannelConfig>>,
 }
 
@@ -65,6 +66,16 @@ impl ChannelsRuntime {
         Self {
             configs: RwLock::new(configs),
             ..Self::default()
+        }
+    }
+
+    /// Re-reads every channel's yaml under `root` and swaps the map in, so a settings edit made
+    /// through the app applies to the next turn without a restart. Absent or malformed files read
+    /// as defaults, exactly as at startup. Hand edits on disk are not watched.
+    pub fn reload(&self, root: &Path) {
+        let fresh = registry::load_configs(Some(root));
+        if let Ok(mut configs) = self.configs.write() {
+            *configs = fresh;
         }
     }
 
@@ -116,6 +127,20 @@ mod tests {
     #[test]
     fn the_default_hub_is_inert() {
         assert!(ChannelsRuntime::default().config("telegram").is_none());
+    }
+
+    #[test]
+    fn reload_picks_up_a_changed_yaml() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("channels")).unwrap();
+        let file = temp.path().join("channels/telegram.yaml");
+        std::fs::write(&file, "doctrine: a\n").unwrap();
+        let hub = ChannelsRuntime::load(Some(temp.path()));
+        assert!(hub.config("telegram").unwrap().stream_edits());
+
+        std::fs::write(&file, "stream_edits: false\n").unwrap();
+        hub.reload(temp.path());
+        assert!(!hub.config("telegram").unwrap().stream_edits());
     }
 
     #[test]

@@ -573,6 +573,12 @@ pub(super) async fn post_machine_config(
     })?;
     drop(models_file_write);
 
+    // A channel's yaml is held in memory (`ChannelsRuntime::configs`); re-read so the edit applies
+    // to the next turn rather than at the next restart.
+    if setting.path.starts_with("channels/") {
+        state.channels.reload(&root);
+    }
+
     // `None` for the project, because there is not one — this is the machine's own line. After the
     // write and loudly on failure, for the reason `post_project_write` gives: a feed line about a
     // write that then failed claims something that did not happen.
