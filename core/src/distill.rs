@@ -299,8 +299,10 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
             .await?;
     owner_context.extend(job_notes);
 
+    // A run's stage is its graph node's id: the built-in graph says `review`, the owner's own
+    // graphs say `reviewer` (the same pair as the `distill_review_blocking` trigger, 0239).
     let review_rows: Vec<(i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, stdout FROM runs WHERE job_id = ? AND stage = 'review' ORDER BY id",
+        "SELECT id, stdout FROM runs WHERE job_id = ? AND stage IN ('review', 'reviewer') ORDER BY id",
     )
     .bind(job_id)
     .fetch_all(pool)
@@ -1008,6 +1010,62 @@ mod tests {
             queued_total(&pool).await,
             1,
             "a non-review, non-failed, already-failed or job-less run was queued"
+        );
+    }
+
+    /// A run's stage is its graph node's id, and the owner's workflow graphs name the review node
+    /// `reviewer` (live runs since 2026-10-21), so a failed `reviewer` run is a blocking review too.
+    #[tokio::test]
+    async fn a_failed_reviewer_node_is_queued_as_a_blocking_review() {
+        let pool = test_pool().await;
+        seed_job(&pool, 7, "alpha", 0).await;
+
+        let reviewer = seed_run(&pool, "alpha", "running", Some(7), Some("reviewer")).await;
+        let res = sqlx::query("UPDATE runs SET status = 'failed' WHERE id = ?")
+            .bind(reviewer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(res.rows_affected(), 1, "the run's own write must succeed");
+
+        let rows: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT cause, run_id FROM distill_queue")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(Cause::ReviewBlocking.as_str().to_string(), Some(reviewer))],
+            "a failed reviewer run was not queued as review_blocking"
+        );
+    }
+
+    /// Queuing a `reviewer` run is half the fix: the dossier must also carry what it said.
+    #[tokio::test]
+    async fn the_dossier_carries_a_reviewer_nodes_output() {
+        let pool = test_pool().await;
+        no_capture_wait(&pool).await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        let run = seed_run(&pool, "alpha", "failed", Some(1), Some("reviewer")).await;
+        sqlx::query("UPDATE runs SET stdout = 'REVIEWER-BODY' WHERE id = ?")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_queue(&pool, "review_blocking", 1, Some(run), "pending", 0, None).await;
+
+        let row = claim_next(&pool, noon()).await.unwrap().expect("a due row");
+        let inputs = crate::distill::gather(&pool, &row)
+            .await
+            .unwrap()
+            .expect("the job exists");
+        assert!(
+            inputs
+                .reviews
+                .iter()
+                .any(|(id, text)| *id == run && text.contains("REVIEWER-BODY")),
+            "the reviewer run's output is missing from the dossier: {:?}",
+            inputs.reviews
         );
     }
 
