@@ -221,8 +221,8 @@ describe("startBrowserBridge", () => {
     expect(emb.embeddedRequests).toHaveBeenCalledTimes(1);
     expect(events.handlers.has("browser://env-rebuilt")).toBe(true);
     stop();
-    // env-rebuilt + tab-state + new-window + process-failed + runtime-missing.
-    expect(events.unlisten).toHaveBeenCalledTimes(5);
+    // env-rebuilt + env-retired + tab-state + new-window + process-failed + runtime-missing.
+    expect(events.unlisten).toHaveBeenCalledTimes(6);
     await vi.advanceTimersByTimeAsync(5000);
     expect(emb.embeddedRequests).toHaveBeenCalledTimes(1);
   });
@@ -232,7 +232,7 @@ describe("startBrowserBridge", () => {
     const stop = startBrowserBridge();
     stop();
     await vi.advanceTimersByTimeAsync(0);
-    expect(events.unlisten).toHaveBeenCalledTimes(5);
+    expect(events.unlisten).toHaveBeenCalledTimes(6);
   });
 
   function emit(name: string, payload: unknown) {

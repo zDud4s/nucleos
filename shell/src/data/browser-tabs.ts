@@ -37,27 +37,36 @@ export interface ProcessFailed {
   kind: string;
 }
 
-// RED stub: the real scope helpers arrive with GREEN.
+/**
+ * Tab-map key of the "No project" scope. It starts with `@`, so it can never be a project id;
+ * it is translated to `null` at every `invoke`/`apiFetch` boundary (the wire never carries it).
+ */
 export const NO_PROJECT = "@none";
+
+/** The tab-map key of a scope: the project id, or {@link NO_PROJECT} for no project. */
 export function scopeKey(project: string | null): string {
-  return project as string;
+  return project === null ? NO_PROJECT : project;
 }
+
+/** The wire project of a tab-map key: `null` for {@link NO_PROJECT}, the project id otherwise. */
 export function scopeProject(key: string): string | null {
-  return key;
+  return key === NO_PROJECT ? null : key;
 }
 
-export function envEnsure(project: string, role: Role): Promise<{ cdp_http: string | null }> {
-  return invoke("browser_env_ensure", { project, role });
+/** `key` is a scope key ({@link scopeKey}); the native side receives `null` for no project. */
+export function envEnsure(key: string, role: Role): Promise<{ cdp_http: string | null }> {
+  return invoke("browser_env_ensure", { project: scopeProject(key), role });
 }
 
+/** `key` is a scope key ({@link scopeKey}); the native side receives `null` for no project. */
 export function tabCreate(
-  project: string,
+  key: string,
   role: Role,
   tabId: string,
   url: string,
   bounds: Bounds,
 ): Promise<void> {
-  return invoke("browser_tab_create", { project, role, tabId, url, bounds });
+  return invoke("browser_tab_create", { project: scopeProject(key), role, tabId, url, bounds });
 }
 
 export function tabNavigate(tabId: string, url: string): Promise<void> {

@@ -12,6 +12,7 @@ import {
   listenBrowserEvents,
   newTab,
   removeTabById,
+  scopeKey,
   setTabSessionId,
   tabClose,
   tabCreate,
@@ -31,6 +32,7 @@ import {
 } from "./browser-agent";
 import { embeddedAck, type EmbeddedRequest } from "./browser-embedded";
 
+/** `project` is a scope key: a project id or `NO_PROJECT`, never null. */
 export type FocusIntent = { project: string; sessionId: string; nonce: number };
 
 export type BrowserSnapshot = {
@@ -145,16 +147,18 @@ export async function handleAgentOpen(
   const tabId = crypto.randomUUID();
   const nonce = mintNonce();
   const url = agentTabUrl(nonce);
-  setTabMap((map) => addAgentTab(map, req.project, newTab(tabId, url, "agent")));
+  // The daemon sends `project: null` for the no-project scope; the tab map keys it as NO_PROJECT.
+  const key = scopeKey(req.project);
+  setTabMap((map) => addAgentTab(map, key, newTab(tabId, url, "agent")));
   try {
-    await tabCreate(req.project, "agent", tabId, url, readBounds());
+    await tabCreate(key, "agent", tabId, url, readBounds());
     // Skip a tab closed while it was being created.
     if (findTabById(state.tabMap, tabId) === undefined) return;
     markCreated(tabId);
     const { session_id } = await embeddedAck(req.request_id, nonce);
     setTabMap((map) => setTabSessionId(map, tabId, session_id));
   } catch (e: unknown) {
-    setAgentNotice(req.project, message(e));
+    setAgentNotice(key, message(e));
     setTabMap((map) => removeTabById(map, tabId).map);
     unmarkCreated(tabId);
     void tabClose(tabId).catch(() => {});
@@ -164,14 +168,18 @@ export async function handleAgentOpen(
   }
 }
 
-// Projects whose agent env the shell has prepared; re-run after the daemon drops the registration.
+// Scope keys (project ids and NO_PROJECT) whose agent env the shell has prepared; re-run after
+// the daemon drops the registration.
 const agentProjects = new Set<string>();
 
-/** Prepare (once per call) the agent browser env for a project and surface a failure as a notice. */
-export async function ensureProjectAgent(project: string): Promise<void> {
-  agentProjects.add(project);
-  const result = await ensureAgentEnv(project);
-  setAgentNotice(project, result.ok ? null : result.reason);
+/**
+ * Prepare (once per call) the agent browser env for a scope key (a project id or NO_PROJECT) and
+ * surface a failure as a notice.
+ */
+export async function ensureProjectAgent(key: string): Promise<void> {
+  agentProjects.add(key);
+  const result = await ensureAgentEnv(key);
+  setAgentNotice(key, result.ok ? null : result.reason);
 }
 
 /** The daemon lost our registration (requests failed or 404/409/410): redo prepare/ensure/register. */
@@ -202,7 +210,8 @@ export function handleAgentFocus(req: { session_id: string }): void {
   requestFocus(project, req.session_id);
 }
 
-export type EnvRebuilt = { project: string; role: string; closedTabIds: string[] };
+/** `project` is `null` for the no-project scope. */
+export type EnvRebuilt = { project: string | null; role: string; closedTabIds: string[] };
 
 export function handleEnvRebuilt(ev: EnvRebuilt): void {
   for (const id of ev.closedTabIds) {
@@ -217,6 +226,20 @@ export function handleEnvRebuilt(ev: EnvRebuilt): void {
       void reportAgentTabClosed(removed.tab.sessionId).catch(() => {});
     }
   }
+}
+
+/** The native side tore down the no-project agent env after its last tab closed. */
+export type EnvRetired = { project: string | null; role: string };
+
+/**
+ * A retired agent env is gone together with the cdp endpoint the daemon was told about, so a scope
+ * the shell had prepared is prepared again (a fresh env, registered anew).
+ */
+export function handleEnvRetired(ev: EnvRetired): void {
+  if (ev.role !== "agent") return;
+  const key = scopeKey(ev.project);
+  if (!agentProjects.has(key)) return;
+  void ensureProjectAgent(key).catch(() => {});
 }
 
 /** Merge a patch into the tab with this id, wherever it lives. */
@@ -253,7 +276,7 @@ function clearTabSessionId(tabId: string): void {
 }
 
 /**
- * Open an owner tab in a project and create its native webview. A creation failure removes the
+ * Open an owner tab in a scope (a project id or NO_PROJECT) and create its native webview. A creation failure removes the
  * tab again and rejects, so the caller can surface the message.
  */
 export async function openOwnerTab(project: string, url: string): Promise<void> {
@@ -318,7 +341,8 @@ export function setRuntimeMissing(): void {
 
 /**
  * Start the 1 s request poller and the `browser://` listeners (tab state, new window, process
- * failure, runtime missing, env rebuilt) for the whole shell session; returns a stop function.
+ * failure, runtime missing, env rebuilt, env retired) for the whole shell session; returns a stop
+ * function.
  */
 export function startBrowserBridge(): () => void {
   const stopPoller = startAgentPoller({
@@ -334,6 +358,10 @@ export function startBrowserBridge(): () => void {
     else unlistens.push(un);
   };
   void listen<EnvRebuilt>("browser://env-rebuilt", (e) => handleEnvRebuilt(e.payload)).then(
+    keep,
+    () => {},
+  );
+  void listen<EnvRetired>("browser://env-retired", (e) => handleEnvRetired(e.payload)).then(
     keep,
     () => {},
   );

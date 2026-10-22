@@ -5,6 +5,7 @@ import { useProjects } from "../data/system";
 import {
   EMPTY_PROJECT_TABS as EMPTY,
   findTabBySessionId,
+  NO_PROJECT,
   tabBack,
   tabClose,
   tabForward,
@@ -41,15 +42,18 @@ function message(error: unknown): string {
 
 /**
  * The integrated browser: a tab strip and toolbar in React, and a placeholder that the native
- * WebView2 child window is laid over. Tabs are kept per project; the native webviews survive
+ * WebView2 child window is laid over. Tabs are kept per scope (a project, or "No project"); the
+ * native webviews survive
  * leaving the page, they are only hidden. `actions` (the page's panel toggles) close the address
  * row, so the browser's own bars are the only chrome the page has.
  */
 export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
-  const projects = useProjects().data ?? [];
+  const projectList = useProjects().data;
+  const projects = projectList ?? [];
   const overlayOpen = useOverlayOpen();
   const [picked, setPicked] = useState<string | null>(null);
-  const project = picked ?? projects[0]?.project_id ?? null;
+  // A scope key: a project id, or NO_PROJECT ("No project", always offered). Never null.
+  const project = picked ?? projects[0]?.project_id ?? NO_PROJECT;
 
   const { tabMap, created, focusIntent, agentNotice, runtimeMissing } = useBrowserStore();
   const [highlightControl, setHighlightControl] = useState(false);
@@ -59,7 +63,7 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
   const placeholder = useRef<HTMLDivElement | null>(null);
   const lastBounds = useRef<Bounds>(NO_BOUNDS);
 
-  const current = project === null ? EMPTY : (tabMap[project] ?? EMPTY);
+  const current = tabMap[project] ?? EMPTY;
   const active = current.tabs.find((tab) => tab.id === current.activeId) ?? null;
   // `created` (from the store) holds the tabs whose native webview exists; a tab is only shown
   // once its creation has resolved.
@@ -157,14 +161,16 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
     openOwnerTab(projectId, url).catch((e: unknown) => setError(message(e)));
   }, []);
 
-  // Prepare the agent browser environment once per project; never blocks the owner's tabs.
+  // Prepare the agent browser environment once per scope; never blocks the owner's tabs. While the
+  // project list is still loading the default scope is provisional, so nothing is prepared yet.
   const ensured = useRef<Set<string>>(new Set());
+  const scopeSettled = picked !== null || projectList !== undefined;
   useEffect(() => {
-    if (project === null || ensured.current.has(project)) return;
+    if (!scopeSettled || ensured.current.has(project)) return;
     ensured.current.add(project);
     const target = project;
     void ensureProjectAgent(target);
-  }, [project]);
+  }, [project, scopeSettled]);
 
   function switchProject(next: string) {
     guard(tabsShow(null, readBounds()));
@@ -172,12 +178,10 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
   }
 
   function activate(id: string) {
-    if (project === null) return;
     setTabMap((map) => ({ ...map, [project]: { ...(map[project] ?? EMPTY), activeId: id } }));
   }
 
   function closeTab(id: string) {
-    if (project === null) return;
     const closing = current.tabs.find((tab) => tab.id === id);
     const index = current.tabs.findIndex((tab) => tab.id === id);
     const tabs = current.tabs.filter((tab) => tab.id !== id);
@@ -192,7 +196,6 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
   }
 
   function openInMyTabs(tab: Tab) {
-    if (project === null) return;
     const url = tab.url === "" || tab.url.startsWith("about:blank") ? "about:blank" : tab.url;
     openTab(project, url);
   }
@@ -245,8 +248,7 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
           <IconButton
             label="New tab"
             icon={Plus}
-            disabled={project === null}
-            onClick={() => project !== null && openTab(project, "about:blank")}
+            onClick={() => openTab(project, "about:blank")}
           />
         </div>
         <div className="browser-project">
@@ -254,9 +256,10 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
             density="sm"
             mono
             aria-label="Project"
-            value={project ?? ""}
+            value={project}
             onChange={(e) => switchProject(e.target.value)}
           >
+            <option value={NO_PROJECT}>No project</option>
             {projects.map((p) => (
               <option key={p.project_id} value={p.project_id}>
                 {p.project_id}
@@ -332,7 +335,7 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
           onOpenInMyTabs={openInMyTabs}
         />
       ) : null}
-      {project !== null && agentNotice[project] !== undefined ? (
+      {agentNotice[project] !== undefined ? (
         <p className="browser-agent-notice">
           Agent browser unavailable: {agentNotice[project]}. Your own tabs still work.
         </p>
@@ -349,12 +352,12 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
             <div ref={placeholder} className="browser-placeholder" data-testid="browser-placeholder" />
             {active === null ? (
               <div className="browser-empty">
-                <p>{project === null ? "No project to browse in yet." : "No tabs open in this project."}</p>
-                {project !== null ? (
-                  <Button type="button" onClick={() => openTab(project, "about:blank")}>
-                    New tab
-                  </Button>
-                ) : null}
+                <p>
+                  {project === NO_PROJECT ? "No tabs open outside a project." : "No tabs open in this project."}
+                </p>
+                <Button type="button" onClick={() => openTab(project, "about:blank")}>
+                  New tab
+                </Button>
               </div>
             ) : null}
           </>

@@ -8,6 +8,7 @@ import {
   embeddedRequests,
   type EmbeddedRequest,
 } from "./browser-embedded";
+import { scopeProject } from "./browser-tabs";
 
 export type AgentEnvResult =
   | { ok: true; cdpHttp: string }
@@ -25,22 +26,25 @@ function messageOf(e: unknown): string {
   }
 }
 
-async function runEnsure(project: string): Promise<AgentEnvResult> {
+async function runEnsure(key: string): Promise<AgentEnvResult> {
   try {
-    const { proxy_addr } = await embeddedPrepare(project);
+    const { proxy_addr } = await embeddedPrepare(key);
     const env = await invoke<{ cdp_http: string }>("browser_env_ensure", {
-      project,
+      project: scopeProject(key),
       role: "agent",
       proxyAddr: proxy_addr,
     });
-    await embeddedRegister(project, env.cdp_http);
+    await embeddedRegister(key, env.cdp_http);
     return { ok: true, cdpHttp: env.cdp_http };
   } catch (e) {
     return { ok: false, reason: messageOf(e) };
   }
 }
 
-/** Prepare the agent browser env for a project. Never throws; concurrent calls share one run. */
+/**
+ * Prepare the agent browser env for a scope key (a project id or `NO_PROJECT`). Never throws;
+ * concurrent calls share one run.
+ */
 export function ensureAgentEnv(project: string): Promise<AgentEnvResult> {
   const existing = inFlightEnv.get(project);
   if (existing) return existing;
