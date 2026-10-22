@@ -246,13 +246,14 @@ describe("the preview fixtures", () => {
     }
   });
 
-  it("answers the weekly review with every section filled and more unlinked notes than it lists", () => {
+  it("answers the weekly review with every section filled and an unlinked list capped like the real daemon's", () => {
     const review = answer("/owner-notes/review") as WeeklyReview;
     expect(review.created.length).toBeGreaterThan(0);
     expect(review.unlinked.length).toBeGreaterThan(0);
     expect(review.resurfaced.length).toBeGreaterThan(0);
     expect(review.waiting_proposals).toBeGreaterThan(0);
-    expect(review.unlinked_total).toBeGreaterThan(review.unlinked.length);
+    // The real daemon lists at most UNLINKED_MAX (10) unlinked notes; `unlinked_total` is the full count.
+    expect(review.unlinked.length).toBe(Math.min(review.unlinked_total, 10));
     expect(Date.parse(review.week_end)).toBeGreaterThan(Date.parse(review.week_start));
   });
 

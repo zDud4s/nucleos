@@ -34,10 +34,13 @@ export function RelatedNotes({ id, onItem }: RelatedNotesProps) {
   return (
     <section className="brain-sec related-notes" aria-label="Related notes">
       <h4>Related notes</h4>
-      {related.isError ? (
-        <ErrorNote>the {DAEMON_NAME} is not responding: the related notes are not known</ErrorNote>
-      ) : related.data === undefined ? (
-        <Skeleton label="Loading the related notes" lines={3} />
+      {related.data === undefined ? (
+        // A failed refetch keeps the rows already known; the error shows only when there are none.
+        related.isError ? (
+          <ErrorNote>the {DAEMON_NAME} is not responding: the related notes are not known</ErrorNote>
+        ) : (
+          <Skeleton label="Loading the related notes" lines={3} />
+        )
       ) : related.data.length === 0 ? (
         <Quiet says="No related notes." />
       ) : (
@@ -55,7 +58,7 @@ export function RelatedNotes({ id, onItem }: RelatedNotesProps) {
                     <span>{line}</span>
                   )}
                   {reasons.length > 0 && (
-                    <span className="related-notes-why">{reasons.map((r) => REASON_TEXT[r]).join(", ")}</span>
+                    <span className="related-notes-why">{reasons.map((r) => REASON_TEXT[r] ?? r).join(", ")}</span>
                   )}
                 </span>
               </li>

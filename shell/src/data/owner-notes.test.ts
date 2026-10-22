@@ -190,12 +190,24 @@ describe("owner notes read hooks for the second brain", () => {
     expect(result.current.data).toEqual(review);
   });
 
-  it("the new reads live under the owner-notes key so a write refreshes them", async () => {
-    daemon.apiFetch.mockResolvedValue({});
+  it("a write refreshes the review, related and by-target reads", async () => {
+    daemon.apiFetch.mockResolvedValue({ id: 7 });
     const { client, wrapper } = setup();
-    renderHook(() => useWeeklyReview(), { wrapper });
-    await waitFor(() =>
-      expect(client.getQueryCache().find({ queryKey: [...keys.ownerNotes.all, "review"] })).toBeDefined(),
-    );
+    const reads = [
+      [...keys.ownerNotes.all, "review"],
+      [...keys.ownerNotes.all, "related", 4, null],
+      [...keys.ownerNotes.all, "by-target", "project", "nucleos"],
+    ];
+    for (const queryKey of reads) client.setQueryData(queryKey, []);
+    const { result } = renderHook(() => useCreateNote(), { wrapper });
+
+    result.current.mutate({ text: "hello", origin: "shell" });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    await waitFor(() => {
+      for (const queryKey of reads) {
+        expect(client.getQueryState(queryKey)?.isInvalidated).toBe(true);
+      }
+    });
   });
 });

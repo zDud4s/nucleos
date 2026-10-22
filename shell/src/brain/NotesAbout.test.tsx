@@ -47,6 +47,13 @@ describe("NotesAbout", () => {
     expect(screen.getByRole("alert").textContent).toMatch(/not responding/);
   });
 
+  it("keeps the rows it has when a refetch fails", () => {
+    answer([{ note: note(2, "Ship the picker"), link_id: 11, link_type: "relates" }], true);
+    render(<NotesAbout kind="project" ref="nucleos" />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("Ship the picker")).toBeTruthy();
+  });
+
   it("says so when no note is about the target", () => {
     answer([]);
     render(<NotesAbout kind="project" ref="nucleos" />);

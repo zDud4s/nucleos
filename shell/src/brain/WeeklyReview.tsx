@@ -84,7 +84,8 @@ export function WeeklyReview({ onItem }: { onItem: (item: string) => void }) {
   const bodyId = useId();
 
   if (review.isPending) return <Skeleton label="Loading this week" lines={2} />;
-  if (review.isError || review.data === undefined) {
+  // A failed refetch keeps the data it already has on screen; the error shows only when there is none.
+  if (review.data === undefined) {
     return (
       <ErrorNote onRetry={() => void review.refetch()}>
         the {DAEMON_NAME} is not responding: this week is not available

@@ -6,7 +6,7 @@ import { MotionConfig } from "motion/react";
 import { transition } from "../lib/motion";
 import { lastPlace, rememberPlace } from "./last-place";
 import { installPacing } from "./pacing";
-import { createAppRouter } from "../router";
+import { createAppRouter, QUICK_CAPTURE_PATH } from "../router";
 
 /**
  * The main window: the router, every page, and the pacing that slows the polls of a window
@@ -29,6 +29,8 @@ export function mountMainWindow(root: Root, queryClient: QueryClient): void {
    */
   const router = createAppRouter(lastPlace());
   router.subscribe("onResolved", ({ toLocation }) => {
+    // The quick-capture window shares this storage and must never write the main window's place.
+    if (toLocation.pathname === QUICK_CAPTURE_PATH) return;
     rememberPlace(toLocation.pathname);
   });
 

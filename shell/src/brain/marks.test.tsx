@@ -9,6 +9,7 @@ describe("markKey", () => {
   });
   it("names any other node by its kind", () => {
     expect(markKey({ kind: "project" })).toBe("project");
+    expect(markKey({ kind: "job" })).toBe("job");
   });
 });
 

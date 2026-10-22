@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { OwnerNote, WeeklyReview as Review } from "../data/owner-notes";
+import { keys } from "../data/keys";
 import { renderWithQuery } from "../test/harness";
 import { WeeklyReview, weekRange } from "./WeeklyReview";
 
@@ -114,5 +115,21 @@ describe("WeeklyReview", () => {
     daemon.apiFetch.mockRejectedValue(new Error("down"));
     renderWithQuery(<WeeklyReview onItem={() => {}} />);
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+  });
+
+  it("keeps showing the week when a refetch fails", async () => {
+    serve(review());
+    const { queryClient } = renderWithQuery(<WeeklyReview onItem={() => {}} />);
+    expect(await screen.findByText(/This week: 2 written/)).toBeTruthy();
+
+    daemon.apiFetch.mockRejectedValue(new Error("down"));
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: [...keys.ownerNotes.all, "review"] });
+    });
+
+    const state = queryClient.getQueryState([...keys.ownerNotes.all, "review"]);
+    expect(state?.status).toBe("error");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText(/This week: 2 written/)).toBeTruthy();
   });
 });

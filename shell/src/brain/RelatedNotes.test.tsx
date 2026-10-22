@@ -47,6 +47,21 @@ describe("RelatedNotes", () => {
     expect(screen.getByRole("alert").textContent).toMatch(/not responding/);
   });
 
+  it("keeps the rows it has when a refetch fails", () => {
+    answer([{ note: note(2, "Word match"), score: 0.3, reasons: ["text"] }], true);
+    render(<RelatedNotes id={4} />);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("Word match")).toBeTruthy();
+  });
+
+  it("prints a reason it does not know as it came", () => {
+    // A newer daemon may send a code this build has no words for.
+    const reasons = ["text", "co_cited"] as unknown as RelatedNote["reasons"];
+    answer([{ note: note(2, "Word match"), score: 0.3, reasons }]);
+    render(<RelatedNotes id={4} />);
+    expect(screen.getByRole("listitem").textContent).toContain("shared words, co_cited");
+  });
+
   it("says so when nothing is related", () => {
     answer([]);
     render(<RelatedNotes id={4} />);
