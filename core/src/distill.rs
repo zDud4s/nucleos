@@ -23,14 +23,16 @@ pub enum Cause {
     GateRecovered,
     ReviewBlocking,
     RunExhausted,
+    OwnerAnswered,
 }
 
-pub const CAUSES: [Cause; 5] = [
+pub const CAUSES: [Cause; 6] = [
     Cause::JobLanded,
     Cause::JobFailed,
     Cause::GateRecovered,
     Cause::ReviewBlocking,
     Cause::RunExhausted,
+    Cause::OwnerAnswered,
 ];
 
 impl Cause {
@@ -41,6 +43,7 @@ impl Cause {
             Cause::GateRecovered => "gate_recovered",
             Cause::ReviewBlocking => "review_blocking",
             Cause::RunExhausted => "run_exhausted",
+            Cause::OwnerAnswered => "owner_answered",
         }
     }
 
@@ -139,6 +142,61 @@ pub async fn enqueue_landed_in(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Most readings an owner's late answers can schedule for one job.
+pub const MAX_REQUEUES_PER_JOB: i64 = 3;
+
+/// Schedule a reading of the note `note_id` the owner just wrote about `job_id`. `true` when a
+/// distillation will read it: a row was inserted, or the job already has a `pending` row (the
+/// dossier reads the job's notes when that row is processed). A `running` row does not count: it
+/// is past `gather`, so a note that arrives during the model call would never be read. `item_id`
+/// carries the note id, so each answer is its own row in `distill_queue_once` (0163:24-25).
+pub async fn enqueue_answered_in(
+    conn: &mut SqliteConnection,
+    job_id: i64,
+    note_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if exists.is_none() {
+        return Ok(false);
+    }
+    let pending: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM distill_queue WHERE job_id = ? AND status = ? LIMIT 1",
+    )
+    .bind(job_id)
+    .bind(STATUS_PENDING)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if pending.is_some() {
+        return Ok(true);
+    }
+    let used: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM distill_queue WHERE job_id = ? AND cause = ?",
+    )
+    .bind(job_id)
+    .bind(Cause::OwnerAnswered.as_str())
+    .fetch_one(&mut *conn)
+    .await?;
+    if used >= MAX_REQUEUES_PER_JOB {
+        return Ok(false);
+    }
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO distill_queue
+             (cause, project_id, job_id, item_id, run_id, status, attempts, created_at)
+         SELECT ?, project_id, id, ?, NULL, 'pending', 0, ? FROM jobs WHERE id = ?",
+    )
+    .bind(Cause::OwnerAnswered.as_str())
+    .bind(note_id)
+    .bind(now())
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
 }
 
 // ---- P4: the worker ----
@@ -922,6 +980,81 @@ mod tests {
             .unwrap()
     }
 
+    async fn answered(pool: &SqlitePool, job: i64, note: i64) -> bool {
+        let mut conn = pool.acquire().await.unwrap();
+        super::enqueue_answered_in(&mut conn, job, note).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_a_pending_row_inserts_nothing_and_is_requeued() {
+        let pool = test_pool().await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        sqlx::query(
+            "INSERT INTO distill_queue (cause, project_id, job_id, status, attempts, created_at)
+             VALUES ('job_failed', 'alpha', 1, 'pending', 0, '2026-10-05T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(answered(&pool, 1, 40).await);
+        assert_eq!(queued(&pool, Cause::OwnerAnswered.as_str()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_answer_while_a_row_is_running_inserts_one_because_the_dossier_is_already_read() {
+        let pool = test_pool().await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        sqlx::query(
+            "INSERT INTO distill_queue (cause, project_id, job_id, status, attempts, created_at)
+             VALUES ('job_failed', 'alpha', 1, 'running', 0, '2026-10-05T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(answered(&pool, 1, 40).await);
+        assert_eq!(queued(&pool, Cause::OwnerAnswered.as_str()).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_late_answer_after_done_is_queued_again_but_the_same_note_is_not_doubled() {
+        let pool = test_pool().await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        assert!(answered(&pool, 1, 40).await);
+        sqlx::query("UPDATE distill_queue SET status = 'done'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            answered(&pool, 1, 41).await,
+            "a new note after a done row re-enqueues"
+        );
+        assert_eq!(queued(&pool, Cause::OwnerAnswered.as_str()).await, 2);
+        sqlx::query("UPDATE distill_queue SET status = 'done'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !answered(&pool, 1, 41).await,
+            "the same note twice inserts nothing"
+        );
+        assert_eq!(queued(&pool, Cause::OwnerAnswered.as_str()).await, 2);
+    }
+
+    #[tokio::test]
+    async fn requeues_stop_at_the_ceiling_and_a_missing_job_is_not_requeued() {
+        let pool = test_pool().await;
+        seed_job(&pool, 1, "alpha", 0).await;
+        for note in 1..=super::MAX_REQUEUES_PER_JOB {
+            assert!(answered(&pool, 1, note).await);
+            sqlx::query("UPDATE distill_queue SET status = 'done'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert!(!answered(&pool, 1, 99).await, "past the ceiling");
+        assert!(!answered(&pool, 404, 1).await, "the job is gone");
+    }
+
     /// The unique index treats a missing id as -1, so the same cause for the same subject is one
     /// row whether the ids are set or NULL — SQLite alone would call every NULL distinct.
     #[tokio::test]
@@ -1100,14 +1233,15 @@ mod tests {
 
         let spellings: std::collections::HashSet<&str> =
             CAUSES.iter().map(|c| c.as_str()).collect();
-        assert_eq!(CAUSES.len(), 5);
-        assert_eq!(spellings.len(), 5, "two causes share a spelling");
+        assert_eq!(CAUSES.len(), 6);
+        assert_eq!(spellings.len(), 6, "two causes share a spelling");
         for expected in [
             "job_landed",
             "job_failed",
             "gate_recovered",
             "review_blocking",
             "run_exhausted",
+            "owner_answered",
         ] {
             assert!(spellings.contains(expected), "{expected} is not a cause");
         }
