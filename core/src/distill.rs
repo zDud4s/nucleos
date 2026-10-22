@@ -711,14 +711,15 @@ pub(crate) async fn process_one_with(
         now,
     )
     .await;
+    // Ids and counts only: a pass that wrote nothing must be told apart from a model that
+    // answered `[]`, and never by quoting what the model wrote. The count is taken before the log
+    // call so no mail-derived identifier appears inside a tracing macro.
+    let returned = raw_item_count(&extraction_answer);
     match written {
-        // Ids and counts only: a pass that wrote nothing must be told apart from a model that
-        // answered `[]`, and never by quoting what the model wrote.
         Ok(written) => tracing::info!(
-            "distillation: queue row {} ({}): model returned {}, parsed {}, written {written}",
+            "distillation: queue row {} ({}): model returned {returned}, parsed {}, written {written}",
             row.id,
             cause.as_str(),
-            raw_item_count(&extraction_answer),
             items.len()
         ),
         Err(_) => fail(pool, &row, "db", "writing the learnings failed", now).await,
