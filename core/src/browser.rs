@@ -493,14 +493,30 @@ pub async fn list_writes(
         .collect())
 }
 
-/// `Ask.project_id` for a session opened for no project at all (plan D4).
-// RED stub: the real sentinel, kept as the empty string; GREEN wires it through the rest of the module.
+/// `Ask.project_id` for a session opened for no project at all (plan D4). It never reaches a route
+/// or a response: the row stores NULL, the embedded registry and the sidecar use [`embedded_key`],
+/// and the shell is told `null`.
 pub const NO_PROJECT: &str = "";
 
-/// The key the embedded registry and the sidecar know a scope by.
-// RED stub: returns the input unchanged; GREEN maps `NO_PROJECT` to "(no project)".
+/// The key the embedded registry and the sidecar know the no-project scope by. Not a valid project
+/// id (it has a space and parentheses), so it cannot collide with a real project's key.
+pub const NO_PROJECT_KEY: &str = "(no project)";
+
+/// The key the embedded registry and the sidecar know a scope by: [`NO_PROJECT_KEY`] for
+/// [`NO_PROJECT`], the project id itself otherwise.
 pub fn embedded_key(project: &str) -> &str {
-    project
+    if project == NO_PROJECT {
+        NO_PROJECT_KEY
+    } else {
+        project
+    }
+}
+
+/// The one placement of the no-project embedded scope, for `prepare` and `attach` alike (plan D5).
+/// Stable on purpose: a per-run name would change the sidecar's fingerprint on every open and make
+/// `prepare` refuse while sessions are live.
+pub fn no_project_placement() -> Placement {
+    Placement::ephemeral("embedded-none")
 }
 
 /// Everything about one request to open a session, apart from where it will be sent.
@@ -579,15 +595,23 @@ pub async fn open_with(
         .map_err(|error| BrowserError::Failed(error.to_string()))?;
     let placement = placement_for(profile, project_id, run_id, row_id, &sites);
 
-    // The shell's own browser, when it is registered for this project. Only for the project profile
-    // (the embedded one IS that profile) and never for a visible window; otherwise, or when the
-    // shell does not attach in time, the headless path below runs unchanged.
-    if !visible
-        && profile == Profile::Project
-        && let Some(row) =
-            route_embedded::try_open(pool, runtime, row_id, ask, &sites, &placement).await
-    {
-        return Ok(Opened::Session(Box::new(row)));
+    // The shell's own browser, when it is registered for this scope. For a project only in the
+    // project profile (the embedded one IS that profile); for no project only in a throwaway, which
+    // is all that scope ever has, under its one stable placement. Never for a visible window;
+    // otherwise, or when the shell does not attach in time, the headless path below runs unchanged.
+    let no_project = project_id == NO_PROJECT;
+    if !visible && (profile == Profile::Project || (no_project && profile == Profile::Ephemeral)) {
+        let embedded_placement = if no_project {
+            no_project_placement()
+        } else {
+            placement.clone()
+        };
+        if let Some(row) =
+            route_embedded::try_open(pool, runtime, row_id, ask, &sites, &embedded_placement)
+                .await
+        {
+            return Ok(Opened::Session(Box::new(row)));
+        }
     }
 
     let opened = if visible {
@@ -746,7 +770,8 @@ async fn insert_session(
     // The project the session was opened FOR, whichever profile it lands in. Spec §4.5 needs it for
     // the throwaway case above all: a wheel request from a throwaway is a request to establish a
     // session in the project, and without this the handover would have no project to establish it in.
-    .bind(project_id)
+    // A session opened for no project stores NULL, never the in-memory sentinel.
+    .bind((project_id != NO_PROJECT).then_some(project_id))
     .bind(profile.as_str())
     .bind(url)
     .bind(rule)

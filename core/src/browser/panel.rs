@@ -218,7 +218,13 @@ pub async fn give_back_from_panel(
         Some(note) => format!("the person handed the wheel back: {note}"),
         None => "the person handed the wheel back".to_string(),
     };
-    let project = row.project_id.clone().unwrap_or_default();
+    // A session opened for no project has nowhere to keep a login: settle the chain without asking
+    // and tell the owner straight away.
+    let Some(project) = row.project_id.clone() else {
+        let _ = browser_wheel::keep(state, session_id, false, false).await;
+        announce_return(state, &row, &text).await;
+        return Ok(());
+    };
     let admitted = browser::admitted_origins(&state.pool, &project).await?;
     let hosts: Vec<String> = crate::browser_policy::granted_origins(&returned.chain)
         .into_iter()

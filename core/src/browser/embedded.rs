@@ -71,11 +71,41 @@ pub enum Kind {
 pub struct PendingRequest {
     pub request_id: String,
     pub kind: Kind,
+    /// The scope's registry key (`browser::embedded_key`). On the wire it is the project id, or an
+    /// explicit `null` for the no-project scope: the shell never sees the internal key.
+    #[serde(with = "wire_project")]
     pub project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+}
+
+/// `PendingRequest.project` on the wire: the no-project key travels as `null`, any other key as the
+/// project id it is (contract 3.1, `GET /browser/embedded/requests`).
+mod wire_project {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::browser::NO_PROJECT_KEY;
+
+    pub fn serialize<T, S>(key: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: AsRef<str>,
+        S: Serializer,
+    {
+        match key.as_ref() {
+            NO_PROJECT_KEY => serializer.serialize_none(),
+            project => serializer.serialize_some(project),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<String, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<String>::deserialize(deserializer)?
+            .unwrap_or_else(|| NO_PROJECT_KEY.to_string()))
+    }
 }
 
 /// What the ack hands the waiting `open`: the nonce, and where to report the attach result.
@@ -593,15 +623,29 @@ fn new_id() -> String {
 // Handlers. Control token only (no scope table lists them); mounted in `http/relay.rs`.
 // ---------------------------------------------------------------------------------------------
 
+/// `project` absent or `null` is the no-project scope; any other string is a project id.
 #[derive(Debug, Deserialize)]
 pub struct PrepareBody {
-    pub project: String,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
+/// `project` absent or `null` is the no-project scope; any other string is a project id.
 #[derive(Debug, Deserialize)]
 pub struct RegisterBody {
-    pub project: String,
+    #[serde(default)]
+    pub project: Option<String>,
     pub cdp_http: String,
+}
+
+/// The registry key of a body's `project`: the no-project key for a missing one, the id itself
+/// otherwise. An explicit empty string is not the no-project scope, it is a client error.
+fn scope_key(project: Option<&str>) -> Result<&str, Response> {
+    match project {
+        None => Ok(crate::browser::embedded_key(crate::browser::NO_PROJECT)),
+        Some(project) if project.trim().is_empty() => Err(bad_request("project is empty")),
+        Some(project) => Ok(project),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,19 +717,21 @@ pub async fn post_prepare(
     if !state.browser.enabled {
         return pillar_off();
     }
-    if body.project.trim().is_empty() {
-        return bad_request("project is empty");
-    }
-    // The same placement `browser_open` attaches with, so the sidecar's proxy and the attach agree.
-    let placement = match crate::browser::project_placement(&state.pool, &body.project).await {
-        Ok(placement) => placement,
-        Err(error) => return sidecar_error(error),
+    let key = match scope_key(body.project.as_deref()) {
+        Ok(key) => key,
+        Err(refused) => return refused,
     };
-    match state
-        .browser
-        .client
-        .embedded_prepare(&body.project, &placement)
-        .await
+    // The same placement `browser_open` attaches with, so the sidecar's proxy and the attach agree:
+    // the project's site grants, or the no-project scope's one stable throwaway (plan D5).
+    let placement = if body.project.is_none() {
+        crate::browser::no_project_placement()
+    } else {
+        match crate::browser::project_placement(&state.pool, key).await {
+            Ok(placement) => placement,
+            Err(error) => return sidecar_error(error),
+        }
+    };
+    match state.browser.client.embedded_prepare(key, &placement).await
     {
         Ok(prepared) => Json(prepared).into_response(),
         Err(error) => sidecar_error(error),
@@ -700,16 +746,14 @@ pub async fn post_register(
     if !state.browser.enabled {
         return pillar_off();
     }
-    if body.project.trim().is_empty() {
-        return bad_request("project is empty");
-    }
+    let key = match scope_key(body.project.as_deref()) {
+        Ok(key) => key,
+        Err(refused) => return refused,
+    };
     if !is_loopback_http(&body.cdp_http) {
         return bad_request("cdp_http must be a loopback http address");
     }
-    state
-        .browser
-        .embedded
-        .register(&body.project, &body.cdp_http);
+    state.browser.embedded.register(key, &body.cdp_http);
     state
         .browser
         .embedded
