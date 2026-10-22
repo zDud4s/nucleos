@@ -752,8 +752,9 @@ pub(super) struct CaptureAnswerRequest {
     pub(super) origin: Option<String>,
 }
 
-/// The owner's answer becomes a note linked to the job; it also closes the request and releases the
-/// job when the request is still open. A late answer keeps its note and releases nothing.
+/// The owner's answer becomes a note linked to the job; it also closes the request when it is
+/// still open and re-enqueues the job for a new reading (`requeued`). A late answer keeps its note
+/// and is re-enqueued too, up to the per-job ceiling.
 pub(super) async fn post_capture_answer(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
@@ -761,7 +762,7 @@ pub(super) async fn post_capture_answer(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     use crate::capture::AnswerError;
     let origin = body.origin.as_deref().unwrap_or("shell");
-    let (note_id, released) =
+    let (note_id, requeued) =
         match crate::capture::answer(&state.pool, job_id, &body.note_text, origin).await {
             Ok(done) => done,
             Err(AnswerError::NotFound) => return Err(refusal(StatusCode::NOT_FOUND, "not_found")),
@@ -776,7 +777,7 @@ pub(super) async fn post_capture_answer(
         };
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({ "note_id": note_id, "released": released })),
+        Json(serde_json::json!({ "note_id": note_id, "requeued": requeued })),
     ))
 }
 

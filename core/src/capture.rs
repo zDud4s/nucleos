@@ -424,9 +424,9 @@ impl std::fmt::Display for AnswerError {
     }
 }
 
-/// The owner's answer becomes a note linked to the job; it also closes the request and releases the
-/// job when the request is still open. A late answer keeps its note and releases nothing. Returns
-/// the note's id and whether the request was released.
+/// The owner's answer becomes a note linked to the job; it also closes the request when it is
+/// still open and schedules a new reading of the job. A late answer keeps its note too. Returns the
+/// note's id and whether the owner's reading was scheduled.
 pub async fn answer(
     pool: &SqlitePool,
     job_id: i64,
@@ -455,7 +455,7 @@ pub async fn answer(
 
 /// One attempt at an owner's answer: the note, its link and the request's close commit together or
 /// not at all, so a retry after a busy database never finds half of the previous try. Returns the
-/// note's id and whether the request was released.
+/// note's id and whether the owner's reading was scheduled.
 async fn answer_step(
     pool: &SqlitePool,
     job_id: i64,
@@ -467,11 +467,14 @@ async fn answer_step(
     // `owner_notes.rs`); its error converts through the `From` impl that lives beside `NoteError`.
     let note_id =
         crate::owner_notes::create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
-    let released = close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now())
+    close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now())
+        .await
+        .map_err(AnswerError::Db)?;
+    let requeued = crate::distill::enqueue_answered_in(&mut tx, job_id, note_id)
         .await
         .map_err(AnswerError::Db)?;
     tx.commit().await.map_err(AnswerError::Db)?;
-    Ok((note_id, released))
+    Ok((note_id, requeued))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -771,8 +774,8 @@ mod tests {
     async fn capture_answer_creates_a_linked_note_and_closes_the_request() {
         let pool = pool().await;
         opened(&pool, 7).await;
-        let (note_id, released) = answer(&pool, 7, "only I knew this", "shell").await.unwrap();
-        assert!(released);
+        let (note_id, requeued) = answer(&pool, 7, "only I knew this", "shell").await.unwrap();
+        assert!(requeued);
         let (state, note): (String, Option<i64>) =
             sqlx::query_as("SELECT state, note_id FROM capture_requests WHERE job_id = 7")
                 .fetch_one(&pool)
@@ -780,7 +783,7 @@ mod tests {
                 .unwrap();
         assert_eq!((state.as_str(), note), (STATE_ANSWERED, Some(note_id)));
         let (_, late) = answer(&pool, 7, "a second thought", "shell").await.unwrap();
-        assert!(!late, "a late answer keeps its note and releases nothing");
+        assert!(late, "a late answer keeps its note and rides the row already pending");
     }
 
     #[tokio::test]

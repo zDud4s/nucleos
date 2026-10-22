@@ -849,6 +849,14 @@ mod tests {
 
     async fn open_request(state: &AppState, job: i64) {
         sqlx::query(
+            "INSERT OR IGNORE INTO jobs (id, project_id, project_root, status, max_items, created_at)
+            VALUES (?, 'p', '/tmp', 'failed', 3, 't')",
+        )
+        .bind(job)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, \
              deadline, created_at) VALUES (?, 'p', '[]', 'what happened?', 'open', \
              '2099-01-01T00:00:00Z', '2026-10-20T00:00:00Z')",

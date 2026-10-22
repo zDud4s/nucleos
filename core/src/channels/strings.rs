@@ -204,10 +204,12 @@ pub fn render(text: &Text) -> String {
         Text::CaptureNeedsText => {
             "Capture requests take a typed reply - type your answer instead.".to_string()
         }
-        Text::CaptureAnswered { job } => format!("Answered capture request #{job}."),
+        Text::CaptureAnswered { job } => {
+            format!("Noted for capture request #{job}; the next distillation will read it.")
+        }
         Text::CaptureLate { note } => {
             format!(
-                "Noted (#{note}), but that question has moved on - the answer was kept as a plain note."
+                "Noted (#{note}), but no new reading was scheduled for it (limit reached or the job is gone)."
             )
         }
         Text::AlreadyHandled => "That one was already handled.".to_string(),
@@ -473,6 +475,12 @@ mod tests {
                 assert!(!s.contains(pt), "{t:?} is not English: {s}");
             }
         }
+    }
+
+    #[test]
+    fn a_late_capture_answer_says_no_new_reading_was_scheduled() {
+        let s = render(&Text::CaptureLate { note: 5 });
+        assert!(s.contains("no new reading was scheduled"), "{s}");
     }
 
     #[test]
