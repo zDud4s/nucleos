@@ -15,7 +15,7 @@
 
 .brain-force,
 .brain-stage {
-  --brain-node-note: var(--accent);
+  --brain-node-note: var(--text);
   --brain-node-knowledge: var(--tone-shadow-fg);
   --brain-node-project: var(--tone-active-fg);
   --brain-node-contact: var(--tone-paused-fg);
