@@ -861,20 +861,23 @@ async fn port_reenabling_a_family_replays_nothing() {
 }
 
 #[tokio::test]
-async fn port_the_notifier_reads_the_policy_only_when_there_are_new_feed_items() {
+async fn port_the_notifier_fails_open_when_the_policy_cannot_be_read() {
     let state = routed().await;
-    // A policy store that cannot be read: the pass is fine as long as it never has to look.
+    // A policy store that cannot be read: an idle pass never looks, and a new feed item is still
+    // announced (fail open) rather than swallowed with the error.
     let dropped = sqlx::query("DROP TABLE channel_notify_policy")
         .execute(&state.pool)
         .await
         .is_ok();
     routing::route_once(&state, now(), wanted(true, false, false))
         .await
-        .expect("an idle feed read the policy");
+        .expect("an idle feed pass failed");
     if dropped {
         feed_line(&state, "run", "fresh").await;
-        let outcome = routing::route_once(&state, now(), wanted(true, false, false)).await;
-        assert!(outcome.is_err(), "a new feed item did not read the policy");
+        routing::route_once(&state, now(), wanted(true, false, false))
+            .await
+            .expect("an unreadable policy failed the pass instead of failing open");
+        assert_eq!(answers(&state).await, vec!["run: fresh".to_string()]);
     }
 }
 
