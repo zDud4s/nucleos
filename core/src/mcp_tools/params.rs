@@ -96,6 +96,7 @@ pub(super) struct UrlParams {
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct BrowserOpenParams {
     /// Which project this is for. Call list_projects if you do not know it.
+    // RED stub: still required; GREEN makes it `Option<String>` with `#[serde(default)]`.
     pub(super) project_id: String,
     /// The page to open. https only.
     pub(super) url: String,
@@ -508,4 +509,23 @@ pub(super) struct NodeActiveParams {
     pub(super) session_id: Option<String>,
     /// Find the open tree of this chat.
     pub(super) chat_id: Option<String>,
+}
+
+#[cfg(test)]
+mod browser_open_tests {
+    use super::*;
+
+    #[test]
+    fn browser_open_params_accept_a_missing_project_id() {
+        let params: BrowserOpenParams =
+            serde_json::from_value(serde_json::json!({ "url": "https://example.com" }))
+                .expect("project_id is optional");
+        assert_eq!(params.url, "https://example.com");
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(BrowserOpenParams)).unwrap();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|name| name == "project_id"),
+            "project_id must not be required in the schema: {required:?}"
+        );
+    }
 }

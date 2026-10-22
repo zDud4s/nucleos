@@ -61,6 +61,18 @@ pub struct ActBody {
     pub filename: String,
 }
 
+/// The scope a browser open runs under. // RED stub: the old behaviour, `requested` or empty.
+///
+/// GREEN: an explicit id is kept; an absent one resolves to the calling run's stamped
+/// `runs.project_id`, else [`NO_PROJECT`].
+pub(crate) async fn resolve_scope(
+    _pool: &sqlx::SqlitePool,
+    _run_id: Option<i64>,
+    requested: Option<&str>,
+) -> String {
+    requested.unwrap_or(NO_PROJECT).to_owned()
+}
+
 /// `POST /browser/open`.
 pub async fn post_open(
     State(state): State<AppState>,
@@ -559,4 +571,45 @@ pub fn browser_error(error: BrowserError) -> axum::response::Response {
         BrowserError::Failed(_) => StatusCode::BAD_GATEWAY,
     };
     (status, error.to_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn run_stamped(pool: &sqlx::SqlitePool, project: Option<&str>) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, project_id, created_at)
+             VALUES ('p', 'running', 'worktree', ?, '2026-10-22T10:00:00Z') RETURNING id",
+        )
+        .bind(project)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_absent_project_id_resolves_to_the_calling_turns_stamped_project() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = run_stamped(&pool, Some("acme")).await;
+        assert_eq!(resolve_scope(&pool, Some(run), None).await, "acme");
+    }
+
+    #[tokio::test]
+    async fn an_absent_project_id_with_no_stamped_project_is_the_no_project_scope() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = run_stamped(&pool, None).await;
+        assert_eq!(resolve_scope(&pool, Some(run), None).await, NO_PROJECT);
+        assert_eq!(resolve_scope(&pool, None, None).await, NO_PROJECT);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_project_id_is_kept_as_before() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = run_stamped(&pool, Some("acme")).await;
+        assert_eq!(
+            resolve_scope(&pool, Some(run), Some("other")).await,
+            "other"
+        );
+    }
 }

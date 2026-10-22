@@ -17,6 +17,13 @@ async fn browser_answer(response: reqwest::Response, context: &str) -> Result<Va
     }
 }
 
+/// The JSON body of `POST /browser/open`. // RED stub: always sends `project_id`, "" when absent.
+///
+/// GREEN: a `None` project leaves the key out altogether.
+pub(crate) fn browser_open_body(project_id: Option<&str>, url: &str, visible: bool) -> Value {
+    serde_json::json!({ "project_id": project_id.unwrap_or(""), "url": url, "visible": visible })
+}
+
 impl DaemonClient {
     // The browser pillar's five agent verbs (spec §6.1).
     //
@@ -144,5 +151,20 @@ impl DaemonClient {
             .map_err(|e| e.to_string())?;
         let status = response.status();
         Ok(serde_json::json!({ "closed": status.is_success(), "status": status.as_u16() }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_open_omits_project_id_when_none() {
+        let body = browser_open_body(None, "https://example.com", true);
+        assert!(body.get("project_id").is_none(), "{body}");
+        assert_eq!(body["url"], "https://example.com");
+        assert_eq!(body["visible"], true);
+        let with = browser_open_body(Some("acme"), "https://example.com", false);
+        assert_eq!(with["project_id"], "acme");
     }
 }
