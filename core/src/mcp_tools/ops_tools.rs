@@ -486,7 +486,9 @@ impl NucleosTools {
     #[tool(
         description = "Open a work node: a unit of work in a tree you can hand off and rehydrate. \
                        parent_id absent opens a new root. Limits: depth at most 3, at most 6 open \
-                       siblings, and owned_paths may not overlap a running sibling. A violation \
+                       siblings, and owned_paths may not overlap a running sibling. The \
+                       owned_paths of a child must be contained in its parent's; `..` is \
+                       refused. A violation \
                        is refused with the reason. Returns {id, root_id, depth}."
     )]
     pub(super) async fn node_open(

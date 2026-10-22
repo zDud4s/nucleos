@@ -285,6 +285,142 @@ pub fn sets_overlap(a: &[String], b: &[String]) -> Option<(String, String)> {
     None
 }
 
+/// **Pure.** A path glob in the one form containment compares: `\` read as `/`, empty and `.`
+/// segments dropped (so `./a`, `a//b` and `a/b/` all clean up), and refused when it contains a `..`
+/// segment, is absolute (`/x`, `C:/x`) or is left empty. Case is kept: containment is
+/// case-sensitive, which on Windows can only make it refuse more, never less.
+pub fn normalise_glob(raw: &str) -> Result<String, NodeError> {
+    let unified = raw.trim().replace('\\', "/");
+    if unified.starts_with('/') || unified.as_bytes().get(1) == Some(&b':') {
+        return Err(NodeError::Invalid(format!(
+            "owned path {raw:?} must be relative to the project root"
+        )));
+    }
+    let mut kept = Vec::new();
+    for segment in unified.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                return Err(NodeError::Invalid(format!(
+                    "owned path {raw:?} may not contain a \"..\" segment"
+                )));
+            }
+            other => kept.push(other),
+        }
+    }
+    if kept.is_empty() {
+        return Err(NodeError::Invalid(format!(
+            "owned path {raw:?} names no file or directory"
+        )));
+    }
+    Ok(kept.join("/"))
+}
+
+/// Whether the text carries any glob metacharacter.
+fn has_wildcard(text: &str) -> bool {
+    text.contains(['*', '?', '[', '{'])
+}
+
+/// Whether one path segment matches a segment pattern: `*` is any run of characters, `?` exactly
+/// one. Neither crosses a `/`, because the caller has already split on it.
+fn segment_match(pattern: &[char], text: &[char]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some((&'*', rest)) => (0..=text.len()).any(|skip| segment_match(rest, &text[skip..])),
+        Some((&'?', rest)) => !text.is_empty() && segment_match(rest, &text[1..]),
+        Some((literal, rest)) => text.first() == Some(literal) && segment_match(rest, &text[1..]),
+    }
+}
+
+/// Whether a segment list matches a pattern segment list; a `**` segment takes zero or more whole
+/// segments.
+fn segments_match(pattern: &[&str], text: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => text.is_empty(),
+        Some((head, rest)) if *head == "**" => {
+            (0..=text.len()).any(|skip| segments_match(rest, &text[skip..]))
+        }
+        Some((head, rest)) => match text.split_first() {
+            Some((first, tail)) => {
+                let pattern_chars: Vec<char> = head.chars().collect();
+                let text_chars: Vec<char> = first.chars().collect();
+                segment_match(&pattern_chars, &text_chars) && segments_match(rest, tail)
+            }
+            None => false,
+        },
+    }
+}
+
+/// **Pure.** Whether every file the `child` glob can name is also named by the `parent` glob. Both
+/// arguments must already be `normalise_glob` output. Conservative: when unsure, `false`.
+///
+/// - parent without wildcards: the child must be equal to it;
+/// - parent `<prefix>/**` with a wildcard-free prefix: the child is the prefix itself, or starts
+///   with `<prefix>/` (a segment boundary, so `core/srcx` is not inside `core/src/**`), and may
+///   carry wildcards after that;
+/// - any other wildcard form (`*.rs`, `a*/b`, `**`): the child must be literal and match the parent
+///   glob, where `*` and `?` stay inside a segment and `**` crosses segments. A parent with `[` or
+///   `{` contains nothing, because those forms are not understood here.
+pub fn path_contained(child: &str, parent: &str) -> bool {
+    if !has_wildcard(parent) {
+        return child == parent;
+    }
+    if let Some(prefix) = parent.strip_suffix("/**")
+        && !has_wildcard(prefix)
+    {
+        return child == prefix
+            || child
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'));
+    }
+    if has_wildcard(child) || parent.contains(['[', '{']) {
+        return false;
+    }
+    let pattern: Vec<&str> = parent.split('/').collect();
+    let text: Vec<&str> = child.split('/').collect();
+    segments_match(&pattern, &text)
+}
+
+/// **Pure.** The L1 rule for a child opened under `parent`: every glob the child owns must be
+/// contained in some glob the parent owns. A child with no globs (a reviewer) is always accepted.
+/// A parent with no globs imposes no limit when it is the root, which owns everything, and is
+/// otherwise only allowed children with no globs. A malformed child glob (`..`, absolute, blank) is
+/// `Invalid`; a well-formed one outside the parent is `Conflict`.
+fn check_containment(parent: &Node, child_paths: &[String]) -> Result<(), NodeError> {
+    let children = child_paths
+        .iter()
+        .map(|path| normalise_glob(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    if children.is_empty() {
+        return Ok(());
+    }
+    if parent.owned_paths.is_empty() {
+        if parent.kind == KIND_ROOT {
+            return Ok(());
+        }
+        return Err(NodeError::Conflict(format!(
+            "parent {:?} owns no paths, so it only takes children with no owned_paths",
+            parent.title
+        )));
+    }
+    // A parent glob that does not normalise contains nothing.
+    let owned: Vec<String> = parent
+        .owned_paths
+        .iter()
+        .filter_map(|path| normalise_glob(path).ok())
+        .collect();
+    for (raw, child) in child_paths.iter().zip(&children) {
+        if !owned.iter().any(|glob| path_contained(child, glob)) {
+            return Err(NodeError::Conflict(format!(
+                "owned path {raw:?} is not contained in any owned path of parent {:?} ({})",
+                parent.title,
+                parent.owned_paths.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Open
 // ---------------------------------------------------------------------------------------------
@@ -318,7 +454,9 @@ pub struct Opened {
 }
 
 /// Opens a node. Without `parent_id` it is a root; with one it is a child that inherits the
-/// parent's root, project and task, and starts `running`.
+/// parent's root, project and task, and starts `running`. A child's `owned_paths` must be
+/// contained in its parent's (`check_containment`): a root with no paths is unrestricted, any
+/// other parent with no paths takes only children with none.
 pub async fn open(
     pool: &SqlitePool,
     project_id: Option<&str>,
@@ -386,6 +524,7 @@ pub async fn open(
                         limits.max_width
                     )));
                 }
+                check_containment(&parent, &args.owned_paths)?;
                 for sibling in siblings.into_iter().filter(|s| s.status == "running") {
                     let sibling = Node::from(sibling);
                     if let Some((mine, theirs)) =
@@ -557,6 +696,40 @@ pub async fn close(
     Ok(closed)
 }
 
+/// The longest slice of a node's summary that goes into a feed line.
+const FEED_SUMMARY_CHARS: usize = 200;
+
+/// The feed line a close leaves behind, or `None` when it ends no tree and parks none.
+///
+/// `blocked` on any node is `work_tree_parked`; a root closing `done` or `failed` is
+/// `work_tree_finished`. Pure so the wording is tested without a database: the handler in
+/// `http/nodes.rs` is the only writer and calls this with the node `close` returned.
+pub fn feed_line(root_title: &str, node: &Node) -> Option<(&'static str, String)> {
+    let kind = match (node.status.as_str(), node.kind.as_str()) {
+        ("blocked", _) => "work_tree_parked",
+        ("done" | "failed", "root") => "work_tree_finished",
+        _ => return None,
+    };
+    let mut line = format!("{root_title}: {}", node.status);
+    let summary: String = node
+        .summary
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(FEED_SUMMARY_CHARS)
+        .collect();
+    if !summary.is_empty() {
+        line.push_str(" — ");
+        line.push_str(&summary);
+    }
+    if kind == "work_tree_parked" && !node.decisions.is_empty() {
+        line.push_str(" — precisa de: ");
+        line.push_str(&node.decisions.join("; "));
+    }
+    Some((kind, line))
+}
+
 /// Files the `rework` row that says a node outgrew its context and handed off.
 async fn file_handoff_record(pool: &SqlitePool, node: &Node) -> Result<(), String> {
     let mut payload = Map::new();
@@ -626,6 +799,8 @@ pub struct TreeNode {
     pub title: String,
     pub status: String,
     pub summary: Option<String>,
+    pub owned_paths: Vec<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -693,6 +868,8 @@ pub async fn tree(pool: &SqlitePool, root_id: &str, view: View) -> Result<Tree, 
                 title: node.title.clone(),
                 status: node.status.clone(),
                 summary: node.summary.clone(),
+                owned_paths: node.owned_paths.clone(),
+                updated_at: node.updated_at.clone(),
             })
             .collect(),
         text,
@@ -897,6 +1074,93 @@ mod tests {
     }
 
     #[test]
+    fn normalise_glob_cleans_and_refuses() {
+        assert_eq!(normalise_glob("core/src/**").unwrap(), "core/src/**");
+        assert_eq!(normalise_glob("./core/src/**").unwrap(), "core/src/**");
+        assert_eq!(normalise_glob("core\\src\\x.rs").unwrap(), "core/src/x.rs");
+        assert_eq!(
+            normalise_glob("core//src/./x.rs/").unwrap(),
+            "core/src/x.rs"
+        );
+        assert_eq!(normalise_glob("  a/b  ").unwrap(), "a/b");
+
+        for bad in [
+            "core/../etc/**",
+            "../x",
+            "a/..",
+            "a\\..\\b",
+            "/etc/**",
+            "C:/Windows/**",
+            "",
+            "./",
+            "   ",
+        ] {
+            assert!(
+                matches!(normalise_glob(bad), Err(NodeError::Invalid(_))),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn path_contained_literal_parent_needs_equality() {
+        assert!(path_contained("core/src/a.rs", "core/src/a.rs"));
+        assert!(!path_contained("core/src/b.rs", "core/src/a.rs"));
+        // A wildcard child is wider than a literal parent.
+        assert!(!path_contained("core/src/*.rs", "core/src/a.rs"));
+        assert!(!path_contained("core/src/a.rs/x", "core/src/a.rs"));
+    }
+
+    #[test]
+    fn path_contained_dir_glob_parent_respects_segment_boundary() {
+        assert!(path_contained("core/src/a.rs", "core/src/**"));
+        assert!(path_contained("core/src/deep/er/a.rs", "core/src/**"));
+        assert!(path_contained("core/src/**", "core/src/**"));
+        assert!(path_contained("core/src/*.rs", "core/src/**"));
+        assert!(path_contained("core/src/a/**", "core/src/**"));
+        // The prefix itself is contained: `core/src/**` covers the directory it names.
+        assert!(path_contained("core/src", "core/src/**"));
+        // Segment boundary: `srcx` is not `src`.
+        assert!(!path_contained("core/srcx/a.rs", "core/src/**"));
+        assert!(!path_contained("core/srcx", "core/src/**"));
+        assert!(!path_contained("core/src*", "core/src/**"));
+        // A wildcard before the end of the prefix is wider than the parent.
+        assert!(!path_contained("core/*/a.rs", "core/src/**"));
+        assert!(!path_contained("core/**", "core/src/**"));
+        assert!(!path_contained("other/src/a.rs", "core/src/**"));
+    }
+
+    #[test]
+    fn path_contained_other_wildcard_parent_needs_literal_matching_child() {
+        // `*` stays inside one segment.
+        assert!(path_contained("src/lib.rs", "src/*.rs"));
+        assert!(!path_contained("src/a/lib.rs", "src/*.rs"));
+        assert!(!path_contained("src/lib.txt", "src/*.rs"));
+        // `?` is exactly one character of a segment.
+        assert!(path_contained("src/a.rs", "src/?.rs"));
+        assert!(!path_contained("src/ab.rs", "src/?.rs"));
+        // A wildcard in a middle segment.
+        assert!(path_contained("a1/b", "a*/b"));
+        assert!(!path_contained("a1/c", "a*/b"));
+        // `**` crosses segments, including zero of them.
+        assert!(path_contained("src/deep/x.rs", "**/x.rs"));
+        assert!(path_contained("x.rs", "**/x.rs"));
+        assert!(!path_contained("src/deep/y.rs", "**/x.rs"));
+        // A lone `**` is not a `/**` suffix: only literal children are accepted.
+        assert!(path_contained("a/b.rs", "**"));
+        assert!(!path_contained("a/**", "**"));
+        // A wildcard child is never contained in this form.
+        assert!(!path_contained("src/*.rs", "src/*.rs"));
+        assert!(!path_contained("src/l?b.rs", "src/*.rs"));
+        // Classes and alternatives are not understood, so they contain nothing.
+        assert!(!path_contained("a/x", "[ab]/x"));
+        assert!(!path_contained("a/x", "{a,b}/x"));
+        // A wildcard inside a `/**` prefix also takes this form.
+        assert!(path_contained("a1/b/c.rs", "a*/**"));
+        assert!(!path_contained("b1/b/c.rs", "a*/**"));
+    }
+
+    #[test]
     fn render_includes_goal_decisions_status() {
         let mut root = node(0, "running", None);
         root.decisions = vec!["use sqlite".into()];
@@ -1057,6 +1321,184 @@ mod tests {
         open(&pool, None, &limits, &clash).await.unwrap();
     }
 
+    fn owning(kind: &str, paths: &[&str]) -> Node {
+        let mut parent = node(0, "running", None);
+        parent.kind = kind.into();
+        parent.owned_paths = paths.iter().map(|p| (*p).to_owned()).collect();
+        parent
+    }
+
+    fn strings(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    #[test]
+    fn check_containment_literal_and_dir_glob_parents() {
+        let parent = owning("orchestrator", &["core/src/a.rs", "shell/**"]);
+        assert!(check_containment(&parent, &strings(&["core/src/a.rs"])).is_ok());
+        assert!(check_containment(&parent, &strings(&["shell/src/x.tsx", "./shell/**"])).is_ok());
+        let refused = check_containment(&parent, &strings(&["core/src/b.rs"]));
+        assert!(
+            matches!(refused, Err(NodeError::Conflict(_))),
+            "{refused:?}"
+        );
+        // One contained glob does not excuse another that is not.
+        let mixed = check_containment(&parent, &strings(&["shell/x.rs", "core/src/b.rs"]));
+        assert!(matches!(mixed, Err(NodeError::Conflict(_))), "{mixed:?}");
+        let message = mixed.unwrap_err().to_string();
+        assert!(message.contains("core/src/b.rs"), "{message}");
+    }
+
+    #[test]
+    fn check_containment_other_wildcard_parent() {
+        let parent = owning("orchestrator", &["src/*.rs"]);
+        assert!(check_containment(&parent, &strings(&["src/lib.rs"])).is_ok());
+        let deep = check_containment(&parent, &strings(&["src/a/lib.rs"]));
+        assert!(matches!(deep, Err(NodeError::Conflict(_))), "{deep:?}");
+        let wild = check_containment(&parent, &strings(&["src/*.rs"]));
+        assert!(matches!(wild, Err(NodeError::Conflict(_))), "{wild:?}");
+    }
+
+    #[test]
+    fn check_containment_refuses_dotdot_as_invalid() {
+        let parent = owning("root", &["core/**"]);
+        let refused = check_containment(&parent, &strings(&["core/../etc/x"]));
+        assert!(matches!(refused, Err(NodeError::Invalid(_))), "{refused:?}");
+        // Even an unrestricted root refuses a `..` child.
+        let free = owning("root", &[]);
+        let refused = check_containment(&free, &strings(&["a/../b"]));
+        assert!(matches!(refused, Err(NodeError::Invalid(_))), "{refused:?}");
+    }
+
+    #[test]
+    fn check_containment_empty_parent_rules() {
+        // A root with no paths owns everything.
+        let root = owning("root", &[]);
+        assert!(check_containment(&root, &strings(&["any/where/**", "x.rs"])).is_ok());
+        // Any other role with no paths takes only children without paths.
+        for kind in ["orchestrator", "leaf"] {
+            let parent = owning(kind, &[]);
+            assert!(check_containment(&parent, &[]).is_ok());
+            let refused = check_containment(&parent, &strings(&["a/**"]));
+            assert!(
+                matches!(refused, Err(NodeError::Conflict(_))),
+                "{kind}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_containment_child_without_paths_is_always_accepted() {
+        let parent = owning("orchestrator", &["core/**"]);
+        assert!(check_containment(&parent, &[]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_accepts_children_contained_in_a_parent_with_paths() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let orch = child_args(&root.id, "orchestrator", "Core", &["core/src/**"]);
+        let orch = open(&pool, None, &limits, &orch).await.unwrap();
+        for (title, paths) in [
+            ("leaf-a", vec!["core/src/a/**"]),
+            ("leaf-b", vec!["core/src/b.rs"]),
+            ("reviewer", vec![]),
+        ] {
+            let args = child_args(&orch.id, "leaf", title, &paths);
+            open(&pool, None, &limits, &args)
+                .await
+                .unwrap_or_else(|e| panic!("{title}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn open_accepts_a_dotted_child_path_equal_to_the_parent_directory() {
+        // Single child, no running siblings: `./core/src` normalises to `core/src`,
+        // which is contained in the parent's `core/src/**`.
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let orch = child_args(&root.id, "orchestrator", "Core", &["core/src/**"]);
+        let orch = open(&pool, None, &limits, &orch).await.unwrap();
+        let args = child_args(&orch.id, "leaf", "dotted", &["./core/src"]);
+        open(&pool, None, &limits, &args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_refuses_child_outside_the_parent_paths() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let orch = child_args(&root.id, "orchestrator", "Core", &["core/src/**"]);
+        let orch = open(&pool, None, &limits, &orch).await.unwrap();
+
+        for outside in ["shell/src/x.tsx", "core/srcx/a.rs", "core/**"] {
+            let args = child_args(&orch.id, "leaf", "stray", &[outside]);
+            let refused = open(&pool, None, &limits, &args).await;
+            assert!(
+                matches!(refused, Err(NodeError::Conflict(_))),
+                "{outside}: {refused:?}"
+            );
+        }
+        // Nothing was inserted by the refusals.
+        let kids: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes WHERE parent_id = ?")
+            .bind(&orch.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kids, 0);
+    }
+
+    #[tokio::test]
+    async fn open_refuses_dotdot_in_a_child_path() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let args = child_args(&root.id, "leaf", "sneaky", &["core/../etc/**"]);
+        let refused = open(&pool, None, &limits, &args).await;
+        assert!(matches!(refused, Err(NodeError::Invalid(_))), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn open_empty_parent_unrestricted_for_root_reviewers_only_otherwise() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        // The root has no paths: it owns everything, so a child may name any.
+        let orch = child_args(&root.id, "orchestrator", "Free", &[]);
+        let orch = open(&pool, None, &limits, &orch).await.unwrap();
+        let anywhere = child_args(&root.id, "leaf", "Anywhere", &["x/**"]);
+        open(&pool, None, &limits, &anywhere).await.unwrap();
+
+        // The orchestrator has no paths either, but it is not a root.
+        let with_paths = child_args(&orch.id, "leaf", "Paths", &["y/**"]);
+        let refused = open(&pool, None, &limits, &with_paths).await;
+        assert!(
+            matches!(refused, Err(NodeError::Conflict(_))),
+            "{refused:?}"
+        );
+        let reviewer = child_args(&orch.id, "leaf", "Reviewer", &[]);
+        open(&pool, None, &limits, &reviewer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_root_with_paths_restricts_its_children() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let mut args = root_args();
+        args.owned_paths = strings(&["core/**"]);
+        let root = open(&pool, None, &limits, &args).await.unwrap();
+        let inside = child_args(&root.id, "leaf", "In", &["core/a.rs"]);
+        open(&pool, None, &limits, &inside).await.unwrap();
+        let outside = child_args(&root.id, "leaf", "Out", &["shell/a.rs"]);
+        let refused = open(&pool, None, &limits, &outside).await;
+        assert!(
+            matches!(refused, Err(NodeError::Conflict(_))),
+            "{refused:?}"
+        );
+    }
+
     #[tokio::test]
     async fn close_validates_summary_and_handoff_file() {
         let pool = test_pool().await;
@@ -1172,6 +1614,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tree_nodes_carry_owned_paths_and_updated_at() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let leaf_args = child_args(&root.id, "leaf", "Leaf", &["core/src/a.rs"]);
+        open(&pool, None, &limits, &leaf_args).await.unwrap();
+
+        let built = tree(&pool, &root.id, View::Brief).await.unwrap();
+        assert_eq!(
+            built.nodes[1].owned_paths,
+            vec!["core/src/a.rs".to_string()]
+        );
+        assert!(!built.nodes[1].updated_at.is_empty());
+    }
+
+    #[tokio::test]
     async fn tree_brief_has_nodes_and_text() {
         let pool = test_pool().await;
         let limits = NodeLimits::default();
@@ -1192,5 +1650,81 @@ mod tests {
             tree(&pool, "nope", View::Full).await,
             Err(NodeError::NotFound)
         ));
+    }
+
+    #[test]
+    fn a_done_or_failed_root_is_a_finished_line() {
+        let root = node(0, "done", Some("All merged.".into()));
+        let (kind, summary) = feed_line("Ship the tree", &root).unwrap();
+        assert_eq!(kind, "work_tree_finished");
+        assert_eq!(summary, "Ship the tree: done — All merged.");
+
+        let root = node(0, "failed", Some("Gate stayed red.".into()));
+        let (kind, summary) = feed_line("Ship the tree", &root).unwrap();
+        assert_eq!(kind, "work_tree_finished");
+        assert_eq!(summary, "Ship the tree: failed — Gate stayed red.");
+    }
+
+    #[test]
+    fn a_blocked_node_is_a_parked_line_with_what_it_needs() {
+        let mut leaf = node(1, "blocked", Some("Cannot pick a store.".into()));
+        leaf.decisions = vec!["use sqlite".into(), "or a file".into()];
+        let (kind, summary) = feed_line("Ship the tree", &leaf).unwrap();
+        assert_eq!(kind, "work_tree_parked");
+        assert_eq!(
+            summary,
+            "Ship the tree: blocked — Cannot pick a store. — precisa de: use sqlite; or a file"
+        );
+
+        // No decisions: no suffix.
+        let leaf = node(1, "blocked", Some("Waiting.".into()));
+        let (_, summary) = feed_line("Ship the tree", &leaf).unwrap();
+        assert_eq!(summary, "Ship the tree: blocked — Waiting.");
+    }
+
+    #[test]
+    fn a_blocked_root_is_parked_not_finished() {
+        let root = node(0, "blocked", Some("Stopped.".into()));
+        let (kind, _) = feed_line("Ship the tree", &root).unwrap();
+        assert_eq!(kind, "work_tree_parked");
+    }
+
+    #[test]
+    fn closes_that_do_not_end_or_park_a_tree_write_nothing() {
+        assert!(feed_line("T", &node(1, "done", Some("ok".into()))).is_none());
+        assert!(feed_line("T", &node(1, "failed", Some("no".into()))).is_none());
+        assert!(feed_line("T", &node(0, "handoff", Some("next".into()))).is_none());
+        assert!(feed_line("T", &node(1, "handoff", Some("next".into()))).is_none());
+        assert!(feed_line("T", &node(1, "running", None)).is_none());
+    }
+
+    #[test]
+    fn the_node_summary_is_cut_at_200_chars_on_a_char_boundary() {
+        // 300 multi-byte chars: a byte slice at 200 would panic mid-codepoint.
+        let long = "é".repeat(300);
+        let root = node(0, "done", Some(long));
+        let (_, summary) = feed_line("T", &root).unwrap();
+        assert_eq!(summary, format!("T: done — {}", "é".repeat(200)));
+
+        let exact = "x".repeat(200);
+        let root = node(0, "done", Some(exact.clone()));
+        let (_, summary) = feed_line("T", &root).unwrap();
+        assert_eq!(summary, format!("T: done — {exact}"));
+    }
+
+    #[test]
+    fn a_missing_or_blank_summary_leaves_no_dangling_dash() {
+        let root = node(0, "done", None);
+        let (_, summary) = feed_line("T", &root).unwrap();
+        assert_eq!(summary, "T: done");
+
+        let root = node(0, "failed", Some("   ".into()));
+        let (_, summary) = feed_line("T", &root).unwrap();
+        assert_eq!(summary, "T: failed");
+
+        let mut leaf = node(1, "blocked", None);
+        leaf.decisions = vec!["pick one".into()];
+        let (_, summary) = feed_line("T", &leaf).unwrap();
+        assert_eq!(summary, "T: blocked — precisa de: pick one");
     }
 }
