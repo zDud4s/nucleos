@@ -15,6 +15,19 @@ mod serve;
 mod slots;
 mod spontaneous;
 mod turn;
+mod turns_impl;
+
+// The vocabulary the lib shares with the assistant lives in `nucleos-core` (`assistant_types`), so
+// the lib's own modules can name it; re-exported here so every `assistant::X` path stays valid.
+pub use self::turns_impl::install_turns;
+#[cfg(test)]
+pub use crate::assistant_types::{HeldProcess, hold_process_serving};
+pub use crate::assistant_types::{
+    LOCAL_AGENT_ANSWERED_BY, NO_HOSTED_MODEL, NO_LOCAL_MODEL, Origin, PROCESS_BARRIERS,
+    ProcessBarrier, Sent, TURN_IN_PROGRESS, answered_by_a_local_agent_loop,
+    build_job_node_mcp_config, build_mcp_config, build_team_mcp_config, live_process_served,
+    note_served, upsert_session,
+};
 
 pub use self::live::*;
 pub use self::send::*;
@@ -116,27 +129,6 @@ pub async fn forget_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()
         .map(|_| ())
 }
 
-pub async fn upsert_session(
-    pool: &SqlitePool,
-    chat_id: &str,
-    session_id: &str,
-    updated_at: &str,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO assistant_sessions (chat_id, session_id, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(chat_id) DO UPDATE SET
-             session_id = excluded.session_id,
-             updated_at = excluded.updated_at",
-    )
-    .bind(chat_id)
-    .bind(session_id)
-    .bind(updated_at)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 /// Where a chat's throwaway MCP config lives, with `chat_id` encoded rather than interpolated.
 ///
 /// `chat_id` arrives from a sidecar and is an opaque string to us, so it cannot be trusted to be a
@@ -170,60 +162,6 @@ fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
 fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(config).map_err(std::io::Error::other)?;
     crate::storage::write_atomic(path, &bytes)
-}
-
-/// The throwaway MCP config a turn is launched with.
-pub fn build_mcp_config(exe_path: &str) -> serde_json::Value {
-    let args = vec!["--mcp-tools".to_string()];
-    serde_json::json!({
-        "mcpServers": {
-            "nucleos": {
-                "type": "stdio",
-                "command": exe_path,
-                "args": args
-            }
-        }
-    })
-}
-
-/// The throwaway MCP config a job node is launched with.
-pub fn build_job_node_mcp_config(exe_path: &str, job_id: i64) -> serde_json::Value {
-    let args = vec![
-        "--mcp-tools".to_string(),
-        "--box".to_string(),
-        "job-node".to_string(),
-        "--job".to_string(),
-        job_id.to_string(),
-    ];
-    serde_json::json!({
-        "mcpServers": {
-            "nucleos": {
-                "type": "stdio",
-                "command": exe_path,
-                "args": args
-            }
-        }
-    })
-}
-
-/// The throwaway MCP config a team agent's node run is launched with.
-pub fn build_team_mcp_config(exe_path: &str, run_id: i64) -> serde_json::Value {
-    let args = vec![
-        "--mcp-tools".to_string(),
-        "--box".to_string(),
-        "team".to_string(),
-        "--run".to_string(),
-        run_id.to_string(),
-    ];
-    serde_json::json!({
-        "mcpServers": {
-            "nucleos": {
-                "type": "stdio",
-                "command": exe_path,
-                "args": args
-            }
-        }
-    })
 }
 
 #[cfg(test)]
@@ -373,6 +311,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,

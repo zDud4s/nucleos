@@ -171,7 +171,7 @@ pub fn render(text: &Text) -> String {
         Text::QueuePaused { waiting } => {
             format!("The queue is paused; {waiting} message(s) waiting.")
         }
-        Text::NotSent { refusal } if refusal == crate::assistant::TURN_IN_PROGRESS => {
+        Text::NotSent { refusal } if refusal == crate::assistant_types::TURN_IN_PROGRESS => {
             format!("Not sent: {refusal}. Wait for it to finish, or send /cancel.")
         }
         Text::NotSent { refusal } => format!("Not sent: {refusal}."),
@@ -414,7 +414,7 @@ mod tests {
                 refusal: "kill switch".into(),
             },
             Text::NotSent {
-                refusal: crate::assistant::TURN_IN_PROGRESS.into(),
+                refusal: crate::assistant_types::TURN_IN_PROGRESS.into(),
             },
             Text::TurnNotStarted {
                 reason: "spawn failed".into(),

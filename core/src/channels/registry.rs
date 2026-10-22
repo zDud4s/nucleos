@@ -64,8 +64,10 @@ pub const TELEGRAM: Manifest = Manifest {
     redact_patterns: &[],
 };
 
-/// The manifest the contract scenarios and the isolation tests use. Never part of production.
-#[cfg(test)]
+/// The manifest the contract scenarios and the isolation tests use. Never part of production: also
+/// under `testkit`, because those scenarios run in `nucleos-app`'s tests, where this crate is built
+/// without `cfg(test)`.
+#[cfg(any(test, feature = "testkit"))]
 pub const FAKE: Manifest = Manifest {
     id: "fake",
     kind: "fake",
@@ -83,10 +85,10 @@ pub const FAKE: Manifest = Manifest {
 /// Production manifests. Deliberately not behind `cfg`, so a test can assert `fake` is absent.
 pub const PROD_MANIFESTS: &[&Manifest] = &[&TELEGRAM];
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 pub const MANIFESTS: &[&Manifest] = PROD_MANIFESTS;
 /// Production manifests plus the fake one under test.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub const MANIFESTS: &[&Manifest] = &[&TELEGRAM, &FAKE];
 
 pub fn all() -> &'static [&'static Manifest] {

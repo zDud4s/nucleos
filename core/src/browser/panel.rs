@@ -3,7 +3,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::assistant::Origin;
+use crate::assistant_types::Origin;
 use crate::browser::wheel::{self as browser_wheel, SeatChoice, WheelError};
 use crate::browser::{self, SessionRow, mode};
 use crate::state::AppState;
@@ -71,9 +71,13 @@ pub async fn deliver(state: &AppState, row: &SessionRow, text: &str) -> Result<(
                 "[browser panel · session {} · {}] {text}",
                 row.id, row.final_url
             );
-            crate::assistant::say_now_from(state, &chat, &sent, Origin::BrowserPanel)
+            // The assistant lives above this crate, so the text goes through the installed hook.
+            let Some(turns) = crate::assistant_types::turns(state) else {
+                return Err(crate::assistant_types::NOT_WIRED.to_string());
+            };
+            turns
+                .say_now_from(state, &chat, &sent, Origin::BrowserPanel)
                 .await
-                .map(|_| ())
         }
         Owner::Run(_) => {
             state.browser.seats.push_panel_message(row.id, text);
@@ -642,6 +646,7 @@ mod tests {
             )),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -764,6 +769,7 @@ mod tests {
     async fn a_panel_say_is_delivered_through_say_now_with_the_browser_panel_origin() {
         let db = TempDb::new().await;
         let state = state_over(db.pool.clone(), BrowserRuntime::disabled());
+        let turns = crate::assistant_types::RecordingTurns::install(&state);
         a_chat(&db.pool, "panel-say").await;
         run_seven(&db.pool, "completed", Some("panel-say")).await;
         let row = session_of(&db.pool, Some(7)).await;
@@ -776,15 +782,10 @@ mod tests {
             "[browser panel · session {} · https://jira.example.org/login] hello from the panel",
             row.id
         );
-        let (origin, prompt): (Option<String>, String) = sqlx::query_as(
-            "SELECT origin, prompt FROM runs WHERE chat_id = ? AND origin = 'browser-panel'",
-        )
-        .bind("panel-say")
-        .fetch_one(&db.pool)
-        .await
-        .expect("a turn recorded as the panel");
-        assert_eq!(origin.as_deref(), Some("browser-panel"));
-        assert!(prompt.contains(&sent), "{prompt}");
+        assert_eq!(
+            turns.calls(),
+            vec![("panel-say".to_owned(), sent, Origin::BrowserPanel)]
+        );
         db.close().await;
     }
 
@@ -911,6 +912,7 @@ mod tests {
         ));
         let (runtime, pushed) = panel_sidecar(stream).await;
         let state = state_over(db.pool.clone(), runtime);
+        crate::assistant_types::RecordingTurns::install(&state);
 
         start(state.clone(), row.id);
 
@@ -935,13 +937,13 @@ mod tests {
                 .any(|message| message["id"] == 12),
             "nothing after the end record is dispatched"
         );
-        let turns: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM runs WHERE chat_id = 'pump-chat' AND origin = 'browser-panel'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        assert_eq!(turns, 1, "only the say before the end reached the chat");
+        let turns = crate::assistant_types::RecordingTurns::of(&state).calls();
+        assert_eq!(
+            turns.len(),
+            1,
+            "only the say before the end reached the chat"
+        );
+        assert_eq!(turns[0].0, "pump-chat");
         db.close().await;
     }
 

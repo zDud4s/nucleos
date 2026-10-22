@@ -1058,7 +1058,7 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
         .ok()?;
         return launchers
             .into_iter()
-            .find(|&launcher| crate::assistant::live_process_served(chat_id, launcher))
+            .find(|&launcher| crate::assistant_types::live_process_served(chat_id, launcher))
             .map(Scope::Run);
     }
 
@@ -1286,6 +1286,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -4281,7 +4282,7 @@ mod tests {
         let key = mint_chat_token(&state.pool, chat).await.unwrap();
         let turn = running_turn_of(&state, chat).await;
         live_task_of(&state, chat, turn, "toolu_live").await;
-        let _held = crate::assistant::hold_process_serving(chat, turn);
+        let _held = crate::assistant_types::hold_process_serving(chat, turn);
         finish_turn(&state, turn).await;
 
         assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
@@ -4296,7 +4297,7 @@ mod tests {
         let key = mint_chat_token(&state.pool, chat).await.unwrap();
         let turn = running_turn_of(&state, chat).await;
         live_task_of(&state, chat, turn, "toolu_ends").await;
-        let held = crate::assistant::hold_process_serving(chat, turn);
+        let held = crate::assistant_types::hold_process_serving(chat, turn);
         finish_turn(&state, turn).await;
         assert_eq!(resolve(&state, &key).await, Some(Scope::Run(turn)));
 
@@ -4331,7 +4332,7 @@ mod tests {
         let chat = "no-live-task-chat";
         let key = mint_chat_token(&state.pool, chat).await.unwrap();
         let turn = running_turn_of(&state, chat).await;
-        let _held = crate::assistant::hold_process_serving(chat, turn);
+        let _held = crate::assistant_types::hold_process_serving(chat, turn);
         finish_turn(&state, turn).await;
 
         assert_eq!(resolve(&state, &key).await, None);
@@ -4345,7 +4346,7 @@ mod tests {
         let key = mint_chat_token(&state.pool, chat).await.unwrap();
         let first = running_turn_of(&state, chat).await;
         live_task_of(&state, chat, first, "toolu_first").await;
-        let _held = crate::assistant::hold_process_serving(chat, first);
+        let _held = crate::assistant_types::hold_process_serving(chat, first);
         finish_turn(&state, first).await;
         let second = running_turn_of(&state, chat).await;
 
@@ -4361,12 +4362,12 @@ mod tests {
         let my_key = mint_chat_token(&state.pool, mine).await.unwrap();
         let their_turn = running_turn_of(&state, theirs).await;
         live_task_of(&state, theirs, their_turn, "toolu_theirs").await;
-        let _their_process = crate::assistant::hold_process_serving(theirs, their_turn);
+        let _their_process = crate::assistant_types::hold_process_serving(theirs, their_turn);
         finish_turn(&state, their_turn).await;
         assert_eq!(resolve(&state, &my_key).await, None);
 
         live_task_of(&state, mine, their_turn, "toolu_crossed").await;
-        let _my_process = crate::assistant::hold_process_serving(mine, their_turn);
+        let _my_process = crate::assistant_types::hold_process_serving(mine, their_turn);
         assert_eq!(
             resolve(&state, &my_key).await,
             None,
@@ -4382,7 +4383,7 @@ mod tests {
         let key = mint_chat_token(&state.pool, chat).await.unwrap();
         let turn = running_turn_of(&state, chat).await;
         live_task_of(&state, chat, turn, "toolu_secret").await;
-        let _held = crate::assistant::hold_process_serving(chat, turn);
+        let _held = crate::assistant_types::hold_process_serving(chat, turn);
         finish_turn(&state, turn).await;
 
         assert_eq!(
