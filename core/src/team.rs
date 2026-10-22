@@ -2648,8 +2648,9 @@ mod tests {
             },
             Vec::new(),
         ));
-        state.runner =
-            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
+        state.runner = std::sync::Arc::new(crate::models::route_advice::RoutedRunner::routed(
+            inner, router,
+        ));
         sent
     }
 
@@ -4157,10 +4158,7 @@ mod tests {
                 models: vec!["gpt-*".into()],
             }],
         ));
-        state.runner = std::sync::Arc::new(RoutedRunner {
-            inner: claude.clone(),
-            router,
-        });
+        state.runner = std::sync::Arc::new(RoutedRunner::routed(claude.clone(), router));
         (claude, codex, sent)
     }
 
@@ -4679,8 +4677,9 @@ mod tests {
             },
             Vec::new(),
         ));
-        state.runner =
-            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
+        state.runner = std::sync::Arc::new(crate::models::route_advice::RoutedRunner::routed(
+            inner, router,
+        ));
         marketing(&state).await;
         let id = start(&state, "marketing", "write the launch post", None)
             .await

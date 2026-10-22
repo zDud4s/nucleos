@@ -81,6 +81,14 @@ pub trait CommandRunner: Send + Sync {
         None
     }
 
+    /// The engines a node's pin may name, or `None` for a bare runner that holds only itself.
+    ///
+    /// Independent of `router()`: a pin is an explicit choice, so it works with routing off, and
+    /// only `route_advice::RoutedRunner` answers `Some`.
+    fn engines(&self) -> Option<std::sync::Arc<crate::models::route_advice::Engines>> {
+        None
+    }
+
     /// Whether this runner enforces `RunRequest::max_budget_usd` on the process it launches.
     ///
     /// Defaulted to `false`, and only the Anthropic CLI runner answers `true`: `cli_args` turns the

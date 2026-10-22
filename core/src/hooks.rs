@@ -1881,6 +1881,94 @@ mod tests {
         );
     }
 
+    async fn list_in_loadout(state: &crate::state::AppState, run_id: i64, tools: &str) {
+        sqlx::query(
+            "INSERT INTO run_loadout (run_id, agent_id, team_id, tools, resolved_at)
+             VALUES (?, NULL, NULL, ?, '2026-10-21T00:00:00Z')",
+        )
+        .bind(run_id)
+        .bind(tools)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// An agent that declares `web` has WebSearch and WebFetch in its node's loadout: the hook
+    /// allows each, and because they bring third-party text the run is marked.
+    #[tokio::test]
+    async fn loadout_job_node_web_builtins_listed_are_allowed_and_mark_the_run() {
+        for tool in ["WebSearch", "WebFetch"] {
+            let state = test_state().await;
+            let (_job_id, run_id) = in_flight_job_node(&state).await;
+            list_in_loadout(&state, run_id, r#"["WebFetch","WebSearch","verify"]"#).await;
+            let app = test_router(state.clone());
+            assert!(
+                !crate::execution::runs::read_untrusted_context(&state.pool, run_id)
+                    .await
+                    .unwrap()
+            );
+            let verdict = decide(&app, &call(run_id, tool, serde_json::json!({}))).await;
+            assert_eq!(verdict.decision, "allow", "{tool}: {}", verdict.reason);
+            assert!(
+                crate::execution::runs::read_untrusted_context(&state.pool, run_id)
+                    .await
+                    .unwrap(),
+                "{tool} must mark the run as having read untrusted text"
+            );
+        }
+    }
+
+    /// An agent without `web` has neither tool in its loadout, so the classifier's refusal stands.
+    #[tokio::test]
+    async fn loadout_job_node_web_builtins_not_listed_are_refused_as_unrecognized() {
+        let state = test_state().await;
+        let (_job_id, run_id) = in_flight_job_node(&state).await;
+        list_in_loadout(&state, run_id, r#"["verify"]"#).await;
+        let app = test_router(state.clone());
+        for tool in ["WebSearch", "WebFetch"] {
+            let verdict = decide(&app, &call(run_id, tool, serde_json::json!({}))).await;
+            assert_eq!(verdict.decision, "deny", "{tool}");
+            assert!(verdict.reason.contains(tool), "{}", verdict.reason);
+        }
+        assert!(
+            !crate::execution::runs::read_untrusted_context(&state.pool, run_id)
+                .await
+                .unwrap(),
+            "a refused read marks nothing"
+        );
+    }
+
+    /// The grant is for an unattended job node only: the same loadout row on a run that belongs to
+    /// no job, or on an attended run, opens nothing.
+    #[tokio::test]
+    async fn loadout_web_builtins_are_not_allowed_off_a_job_node_or_when_attended() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let no_job = in_flight_run(
+            &state,
+            "worktree",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-x"),
+        )
+        .await;
+        list_in_loadout(&state, no_job, r#"["WebSearch"]"#).await;
+        let verdict = decide(&app, &call(no_job, "WebSearch", serde_json::json!({}))).await;
+        assert_eq!(verdict.decision, "deny", "{}", verdict.reason);
+
+        let attended = in_flight_run(
+            &state,
+            "real",
+            Some("proj"),
+            Some("C:\\work\\repo"),
+            Some("sess-y"),
+        )
+        .await;
+        list_in_loadout(&state, attended, r#"["WebSearch"]"#).await;
+        let verdict = decide(&app, &call(attended, "WebSearch", serde_json::json!({}))).await;
+        assert_ne!(verdict.decision, "allow", "{}", verdict.reason);
+    }
+
     /// `read_context` is a job-node BASE tool, so it needs no `run_loadout` row at the hook, and
     /// because the file it returns is a third party's text, the run is marked all the same.
     #[tokio::test]

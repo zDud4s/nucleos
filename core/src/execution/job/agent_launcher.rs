@@ -65,6 +65,7 @@ fn pin_of(
     effort: Option<&str>,
     label: &str,
     sandbox: Option<CodexSandbox>,
+    web_search: bool,
 ) -> Result<Option<EnginePin>, LaunchRefused> {
     let Some((engine, model)) = pin else {
         return Ok(None);
@@ -84,6 +85,10 @@ fn pin_of(
         // the same default the generated Codex prefix states.
         sandbox: (runner == RunnerKind::Codex)
             .then(|| sandbox.unwrap_or(CodexSandbox::ReadOnly).as_str()),
+        // The agent's `web` capability turns Codex's own web search on (`"live"`, the counterpart of
+        // the `"disabled"` an `McpOnly` run is given). Claude has no such switch: its web tools are
+        // granted through the loadout.
+        web_search: (runner == RunnerKind::Codex && web_search).then_some("live"),
     }))
 }
 
@@ -108,9 +113,14 @@ fn node_launch(
     label: &str,
 ) -> Result<NodeLaunch, LaunchRefused> {
     let codex_sandbox = launch.tools.as_ref().and_then(|tools| tools.codex_sandbox);
-    let pin = pin_of(launch.pin, effort, label, codex_sandbox)?;
+    let web_search = launch
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.codex_web_search);
+    let pin = pin_of(launch.pin, effort, label, codex_sandbox, web_search)?;
     Ok(NodeLaunch {
         codex_sandbox,
+        builtin_tools: launch.builtin_tools,
         prompt: launch.prompt,
         // A pin bypasses the router, so there is nothing to restrict then.
         restrict_runners: pin.is_none().then_some(launch.runners),
@@ -213,6 +223,7 @@ mod tests {
             Some("high"),
             "r@1.0.0",
             None,
+            false,
         )
         .unwrap()
         .expect("a pin");
@@ -226,6 +237,7 @@ mod tests {
             None,
             "r@1.0.0",
             Some(CodexSandbox::WorkspaceWrite),
+            false,
         )
         .unwrap()
         .expect("a pin");
@@ -233,7 +245,7 @@ mod tests {
         assert_eq!((bare.model, bare.effort), (None, None));
         assert_eq!(bare.sandbox, None, "a Claude pin has no sandbox to pin");
         assert!(
-            pin_of(None, Some("high"), "r@1.0.0", None)
+            pin_of(None, Some("high"), "r@1.0.0", None, false)
                 .unwrap()
                 .is_none()
         );
@@ -255,6 +267,7 @@ mod tests {
                 local_tools: Vec::new(),
                 mcp: false,
             }),
+            builtin_tools: Vec::new(),
         };
         let writing =
             node_launch(launch(Some(CodexSandbox::WorkspaceWrite)), None, "r@1.0.0").unwrap();
@@ -280,6 +293,7 @@ mod tests {
             output: OutputShape::free("anything"),
             tool_policy: crate::execution::runner::ToolPolicy::McpOnly,
             tools: None,
+            builtin_tools: Vec::new(),
         };
         let unpinned = node_launch(launch(None), Some("high"), "r@1.0.0").unwrap();
         assert!(unpinned.pin.is_none());
@@ -300,10 +314,81 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_pin_turns_web_search_live_only_when_the_agent_declares_web() {
+        let pin = |runner: Engine, web: bool| {
+            pin_of(Some((runner, String::new())), None, "r@1.0.0", None, web)
+                .unwrap()
+                .expect("a pin")
+        };
+        assert_eq!(pin(Engine::Codex, true).web_search, Some("live"));
+        assert_eq!(pin(Engine::Codex, false).web_search, None);
+        assert_eq!(
+            pin(Engine::Claude, true).web_search,
+            None,
+            "Claude's web tools come through the loadout, not a pin"
+        );
+    }
+
+    #[test]
+    fn a_launch_carries_the_builtin_tools_its_agent_was_granted_and_codex_gets_web_search() {
+        let launch =
+            |builtin_tools: Vec<String>, pin: Option<(Engine, String)>, web: bool| AgentLaunch {
+                prompt: "p".to_owned(),
+                runners: vec![RunnerKind::Claude, RunnerKind::Codex],
+                pin,
+                output: OutputShape::free("anything"),
+                tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
+                tools: Some(crate::agents::capabilities::EngineTools {
+                    tool_policy: crate::execution::runner::ToolPolicy::Unrestricted,
+                    claude_allowed_tools: Vec::new(),
+                    codex_sandbox: Some(CodexSandbox::ReadOnly),
+                    codex_web_search: web,
+                    local_tools: Vec::new(),
+                    mcp: false,
+                }),
+                builtin_tools,
+            };
+        let web = || vec!["WebSearch".to_owned(), "WebFetch".to_owned()];
+        let claude = node_launch(
+            launch(web(), Some((Engine::Claude, "m".to_owned())), true),
+            None,
+            "r@1.0.0",
+        )
+        .unwrap();
+        assert_eq!(claude.builtin_tools, web());
+        assert_eq!(claude.pin.and_then(|pin| pin.web_search), None);
+        let without = node_launch(
+            launch(Vec::new(), Some((Engine::Claude, "m".to_owned())), false),
+            None,
+            "r@1.0.0",
+        )
+        .unwrap();
+        assert!(without.builtin_tools.is_empty());
+        let codex = node_launch(
+            launch(Vec::new(), Some((Engine::Codex, "gpt-5".to_owned())), true),
+            None,
+            "r@1.0.0",
+        )
+        .unwrap();
+        assert_eq!(codex.pin.and_then(|pin| pin.web_search), Some("live"));
+        let codex_without = node_launch(
+            launch(Vec::new(), Some((Engine::Codex, "gpt-5".to_owned())), false),
+            None,
+            "r@1.0.0",
+        )
+        .unwrap();
+        assert_eq!(codex_without.pin.and_then(|pin| pin.web_search), None);
+    }
+
+    #[test]
     fn a_local_pin_is_unavailable_for_a_node() {
-        let Err(LaunchRefused::Unavailable(why)) =
-            pin_of(Some((Engine::Local, "m".to_owned())), None, "r@1.0.0", None)
-        else {
+        let Err(LaunchRefused::Unavailable(why)) = pin_of(
+            Some((Engine::Local, "m".to_owned())),
+            None,
+            "r@1.0.0",
+            None,
+            false,
+        ) else {
             panic!("a local pin is Unavailable");
         };
         assert!(why.contains("r@1.0.0") && why.contains("local"), "{why}");

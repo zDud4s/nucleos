@@ -288,6 +288,7 @@ pub(super) async fn spawn_node(
         judged_later: launch.output.is_some(),
         effort: launch.effort.clone(),
     };
+    let builtin_tools = launch.builtin_tools.clone();
     let prompt = launch.prompt;
 
     // Claimed BEFORE the run exists, so a creation that succeeds and a bookkeeping write that fails
@@ -398,7 +399,13 @@ pub(super) async fn spawn_node(
     .await;
     prompt.push_str(&loadout.block);
     let briefing = loadout.brief;
-    let run_tools = loadout.run.clone();
+    let mut run_tools = loadout.run.clone();
+    // The engine built-ins the agent's `web` capability grants join the recorded list here, where
+    // both the node path and the item path below read it: the hook finds them in `run_loadout`, and
+    // `JobNodeMcp::with_loadout` keeps them out of the `--allowedTools` it builds from the same list.
+    if let Some(run) = run_tools.as_mut() {
+        crate::loadout::grant_builtins(run, &builtin_tools);
+    }
 
     // An item of a job a team directs gets a checkout of its own; everything else — every node of
     // every job without a team, and this job's own plan, replan and review nodes — works in the

@@ -1249,6 +1249,7 @@ mod tests {
         let codex = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
             sandbox_mode: None,
+            web_search: None,
         };
         assert!(!codex.reports_model_request());
         assert!(!FakeCommandRunner::default().reports_model_request());
@@ -4081,6 +4082,7 @@ mod tests {
                 PathBuf::from("C:/stage/two.jpg"),
             ],
             sandbox_mode: None,
+            web_search: None,
         };
         let args = codex_cli_args(&request, "gpt-5.6-terra", &staged).unwrap();
         for image in ["C:/stage/one.png", "C:/stage/two.jpg"] {
@@ -4106,6 +4108,7 @@ mod tests {
             mcp_overrides: Vec::new(),
             images: vec![PathBuf::from("C:/stage/one.png")],
             sandbox_mode: None,
+            web_search: None,
         };
         let error = codex_cli_args(&request, "gpt-5.6-terra", &too_few).unwrap_err();
         assert!(error.contains("images"), "{error}");
@@ -4142,6 +4145,7 @@ mod tests {
                 mcp_overrides: overrides.clone(),
                 images: Vec::new(),
                 sandbox_mode: None,
+                web_search: None,
             },
         )
         .unwrap();
@@ -4203,6 +4207,7 @@ mod tests {
         let runner = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
             sandbox_mode: None,
+            web_search: None,
         };
         let mut request = baseline_run_request();
         request.mcp_config = Some(PathBuf::from("C:/does-not-exist/mcp.json"));
@@ -4339,6 +4344,7 @@ mod tests {
         let runner = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
             sandbox_mode: None,
+            web_search: None,
         };
 
         // `McpOnly` left this list: a Codex chat turn applies it with feature flags and a deny
@@ -4553,6 +4559,41 @@ mod tests {
         }
     }
 
+    /// An agent that declares `web` pins `web_search="live"` on its Codex launch, and only then;
+    /// an `McpOnly` turn stays `"disabled"` whatever the stage says.
+    #[test]
+    fn codex_web_search_is_live_only_when_the_launch_pins_it() {
+        let live = r#"web_search="live""#;
+        let pins = |args: &[String], value: &str| {
+            args.windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == value)
+        };
+        let staged = CodexStaged {
+            web_search: Some("live"),
+            ..CodexStaged::default()
+        };
+        let pinned = codex_cli_args(&baseline_run_request(), "gpt-5.5", &staged).unwrap();
+        assert!(pins(&pinned, live), "{pinned:?}");
+        assert_eq!(
+            pinned.last().map(String::as_str),
+            Some("test prompt"),
+            "the prompt stays the trailing positional"
+        );
+
+        let bare =
+            codex_cli_args(&baseline_run_request(), "gpt-5.5", &CodexStaged::default()).unwrap();
+        assert!(
+            !bare.iter().any(|arg| arg.starts_with("web_search")),
+            "{bare:?}"
+        );
+
+        let mut restricted = baseline_run_request();
+        restricted.tool_policy = ToolPolicy::McpOnly;
+        let args = codex_cli_args(&restricted, "gpt-5.5", &staged).unwrap();
+        assert!(pins(&args, r#"web_search="disabled""#), "{args:?}");
+        assert!(!pins(&args, live), "McpOnly wins over the pin: {args:?}");
+    }
+
     /// The deny hook is a regex over tool names. Codex names an MCP tool `mcp__<server>__<tool>`, so
     /// the matcher must hit everything that is not under the daemon's own prefix and miss every
     /// daemon tool. It is built without lookahead, so it behaves the same under search and under
@@ -4703,6 +4744,7 @@ mod tests {
         let runner = CodexCliRunner {
             model: "gpt-5.6-terra".to_string(),
             sandbox_mode: None,
+            web_search: None,
         };
 
         let mut restrained = baseline_run_request();

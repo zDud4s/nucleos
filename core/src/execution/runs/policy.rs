@@ -64,7 +64,14 @@ impl JobNodeMcp {
     /// Launches with the tools and directories the node's resolved loadout names, instead of the
     /// fixed list.
     pub fn with_loadout(mut self, run: &crate::loadout::RunTools) -> Self {
-        self.allowed = run.tools.clone();
+        // Only NucleOS tools: the engine built-ins a loadout can list (`WebFetch`, `WebSearch`) are
+        // the hook's business, and `--allowedTools` would otherwise read them as `mcp__nucleos__WebFetch`.
+        self.allowed = run
+            .tools
+            .iter()
+            .filter(|tool| !crate::loadout::is_engine_builtin(tool))
+            .cloned()
+            .collect();
         self.add_dirs = run.add_dirs.clone();
         self
     }
@@ -411,5 +418,29 @@ pub fn progress_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::
         base * crate::state::AUTONOMOUS_PROGRESS_TIMEOUT_MULTIPLIER
     } else {
         base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_loadout_with_engine_builtins_never_turns_them_into_nucleos_tool_names() {
+        let mcp = JobNodeMcp {
+            path: std::env::temp_dir().join("nucleos-policy-test-missing.json"),
+            job_id: 1,
+            allowed: Vec::new(),
+            add_dirs: Vec::new(),
+        }
+        .with_loadout(&crate::loadout::RunTools {
+            tools: vec![
+                "WebFetch".to_owned(),
+                "WebSearch".to_owned(),
+                "verify".to_owned(),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(mcp.allowed, vec!["verify".to_owned()]);
     }
 }

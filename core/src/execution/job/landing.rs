@@ -54,6 +54,12 @@ pub(super) fn retried_launch(
             model,
             effort,
             sandbox,
+            // Kept with the sandbox: the retry runs on the same engine, with the same grant.
+            web_search: launch
+                .pin
+                .as_ref()
+                .and_then(|pin| pin.web_search)
+                .filter(|_| kind == crate::models::route_advice::RunnerKind::Codex),
         });
     }
     launch.prompt = super::dispatch::retry_prompt(&launch.prompt, report);

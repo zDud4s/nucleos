@@ -703,6 +703,9 @@ pub struct EnginePinRoute {
     /// from the agent's capabilities. On Codex this sandbox is the barrier, since `codex exec` has no
     /// permission modes and no `PreToolUse` hook. `None` keeps the runner the daemon already holds.
     pub sandbox: Option<&'static str>,
+    /// Codex only: the `web_search` mode to pin (`"live"`), set when the agent declares `web`.
+    /// `None` leaves Codex's own default, and an `McpOnly` run's `"disabled"` still wins over it.
+    pub web_search: Option<&'static str>,
 }
 
 /// The runners the quota brake is holding right now, by the stored readings only.
@@ -768,9 +771,16 @@ pub async fn resolve(
         .and_then(|query| query.effort.clone())
         .filter(|effort| EFFORT_ORDER.contains(&effort.as_str()));
     let effort = hint.clone().or(effort);
+    // A pin goes to the pin path whenever the daemon holds engines, router or not: it bypasses the
+    // router entirely, whatever mode the runs surface is in (no HTTP, no decision id, and
+    // `route_mode` and the `advised_*` columns stay NULL).
+    if let (Some(pin), Some(engines)) = (pin.clone(), runner.engines()) {
+        let router = runner.router();
+        return resolve_pin(pool, run_id, runner, router, &engines, pin, shape).await;
+    }
     let (Some(router), Some(query)) = (runner.router(), route) else {
-        // No router to hold the pin's runner against, so only its model and effort are applied to
-        // the runner the run already has. A pin is never silently dropped.
+        // No engines to hold the pin's runner against (a bare runner), so only its model and effort
+        // are applied to the runner the run already has. A pin is never silently dropped.
         let (model, effort) = match pin {
             Some(pin) => (pin.model, pin.effort),
             None => (model, effort),
@@ -784,11 +794,6 @@ pub async fn resolve(
             refused: None,
         };
     };
-    // A pin bypasses the router entirely, whatever mode the runs surface is in: no HTTP, no
-    // decision id, and `route_mode` and the `advised_*` columns stay NULL.
-    if let Some(pin) = pin {
-        return resolve_pin(pool, run_id, runner, router, pin, shape).await;
-    }
     let mode = router.runs_mode();
     if mode == Mode::Off {
         return Resolved {
@@ -941,18 +946,19 @@ pub fn narrowed_runners(
 }
 
 /// A pinned launch: the runner the pin names (the wrapper `runner` when it is the primary), its
-/// model and effort, written in one UPDATE. A runner the router does not hold is refused, and so is
+/// model and effort, written in one UPDATE. An engine the daemon does not hold is refused, and so is
 /// a Codex pin on a run of a shape Codex cannot take (the sentence names why, instead of leaving it
 /// to the runner's generic error).
 async fn resolve_pin(
     pool: &SqlitePool,
     run_id: i64,
     runner: Arc<dyn CommandRunner>,
-    router: Arc<Router>,
+    router: Option<Arc<Router>>,
+    engines: &Engines,
     pin: EnginePinRoute,
     shape: RunShape,
 ) -> Resolved {
-    let Some(available) = router.available(pin.runner) else {
+    let Some(available) = engines.available(pin.runner) else {
         return Resolved {
             runner,
             model: pin.model,
@@ -1000,8 +1006,9 @@ async fn resolve_pin(
         (RunnerKind::Codex, Some(sandbox)) => Arc::new(crate::execution::runner::CodexCliRunner {
             model: available.default_model.clone(),
             sandbox_mode: Some(sandbox),
+            web_search: pin.web_search,
         }),
-        _ if pin.runner == router.primary.kind => runner,
+        _ if pin.runner == engines.primary.kind => runner,
         _ => Arc::clone(&available.runner),
     };
     Resolved {
@@ -1009,24 +1016,75 @@ async fn resolve_pin(
         model: pin.model,
         effort: pin.effort,
         decision_id: None,
-        router: Some(router),
+        router,
         refused: None,
     }
 }
 
-/// The primary runner, fronted by the router — or the very same `Arc` when every surface is off.
+/// The primary runner, fronted by the router — or the very same `Arc` when every surface is off and
+/// no other engine is known.
 ///
 /// The only call `main.rs` makes. It builds the alternates `config.runners` names from the models
-/// file, exactly as `main.rs` builds the primary, and never the primary's own kind twice.
+/// file, exactly as `main.rs` builds the primary, and never the primary's own kind twice. The engines
+/// a node may be pinned to are wider than that: every kind `config.runners` names plus every CLI
+/// installed on this machine, because a pin is an explicit choice and `runners:` is only the
+/// router's consent to move a routed run.
 pub fn front(
     primary: Arc<dyn CommandRunner>,
     models: &crate::config::ModelsConfig,
     config: RouterConfig,
 ) -> Arc<dyn CommandRunner> {
-    if config.is_off() {
-        return primary;
+    front_with(primary, models, config, &installed_engines())
+}
+
+/// Which engines' CLIs are installed on this machine, by resolving their programs (nothing is run).
+pub fn installed_engines() -> Vec<RunnerKind> {
+    [RunnerKind::Claude, RunnerKind::Codex]
+        .into_iter()
+        .filter(|kind| match kind {
+            RunnerKind::Claude => {
+                let configured =
+                    std::env::var_os("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|| "claude".into());
+                crate::health::resolve_program(&configured).is_some()
+            }
+            RunnerKind::Codex => crate::execution::runner::codex_program().is_some(),
+        })
+        .collect()
+}
+
+/// The runner a kind launches, built from the models file as `main.rs` builds the primary.
+fn engine_runner(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Arc<dyn CommandRunner> {
+    match kind {
+        RunnerKind::Claude => Arc::new(crate::execution::runner::ClaudeCliRunner {
+            model: models.claude_model.clone(),
+            plan_model: models.plan_model.clone(),
+            review_model: models.review_model.clone(),
+            resolve_model: models.resolve_model.clone(),
+            resolve_effort: models.resolve_effort.clone(),
+        }),
+        RunnerKind::Codex => Arc::new(crate::execution::runner::CodexCliRunner {
+            model: models.codex_model.clone(),
+            sandbox_mode: None,
+            web_search: None,
+        }),
     }
+}
+
+/// `front` with the installed engines given, so a test does not depend on this machine's PATH.
+pub fn front_with(
+    primary: Arc<dyn CommandRunner>,
+    models: &crate::config::ModelsConfig,
+    config: RouterConfig,
+    installed: &[RunnerKind],
+) -> Arc<dyn CommandRunner> {
     let primary_kind = RunnerKind::parse(models.active_runner()).unwrap_or(RunnerKind::Claude);
+    let make = |kind: RunnerKind, runner: Arc<dyn CommandRunner>| Available {
+        kind,
+        runner,
+        default_model: default_model(models, kind),
+        models: allowed_models(models, &config, kind),
+    };
+    // What the router may route to: only what `config.runners` names, never widened.
     let mut alternates: Vec<Available> = Vec::new();
     for name in &config.runners {
         let Some(kind) = RunnerKind::parse(name) else {
@@ -1036,32 +1094,33 @@ pub fn front(
         if kind == primary_kind || alternates.iter().any(|available| available.kind == kind) {
             continue;
         }
-        let runner: Arc<dyn CommandRunner> = match kind {
-            RunnerKind::Claude => Arc::new(crate::execution::runner::ClaudeCliRunner {
-                model: models.claude_model.clone(),
-                plan_model: models.plan_model.clone(),
-                review_model: models.review_model.clone(),
-                resolve_model: models.resolve_model.clone(),
-                resolve_effort: models.resolve_effort.clone(),
-            }),
-            RunnerKind::Codex => Arc::new(crate::execution::runner::CodexCliRunner {
-                model: models.codex_model.clone(),
-                sandbox_mode: None,
-            }),
-        };
-        alternates.push(Available {
-            kind,
-            runner,
-            default_model: default_model(models, kind),
-            models: allowed_models(models, &config, kind),
+        alternates.push(make(kind, engine_runner(models, kind)));
+    }
+    // What a pin may name: the router's alternates plus every installed CLI.
+    let mut others: Vec<Available> = alternates
+        .iter()
+        .map(|alternate| make(alternate.kind, Arc::clone(&alternate.runner)))
+        .collect();
+    for kind in installed {
+        if *kind != primary_kind && !others.iter().any(|available| available.kind == *kind) {
+            others.push(make(*kind, engine_runner(models, *kind)));
+        }
+    }
+    let engines = Arc::new(Engines {
+        primary: make(primary_kind, Arc::clone(&primary)),
+        others,
+    });
+    if config.is_off() {
+        if engines.others.is_empty() {
+            return primary;
+        }
+        return Arc::new(RoutedRunner {
+            inner: primary,
+            router: None,
+            engines: Some(engines),
         });
     }
-    let primary_available = Available {
-        kind: primary_kind,
-        runner: Arc::clone(&primary),
-        default_model: default_model(models, primary_kind),
-        models: allowed_models(models, &config, primary_kind),
-    };
+    let primary_available = make(primary_kind, Arc::clone(&primary));
     tracing::info!(
         mode = config.mode.as_str(),
         url = %config.url,
@@ -1082,7 +1141,8 @@ pub fn front(
     }
     Arc::new(RoutedRunner {
         inner: primary,
-        router,
+        router: Some(router),
+        engines: Some(engines),
     })
 }
 
@@ -1127,7 +1187,53 @@ pub fn allowed_models(
 /// is what `the_fronted_runner_answers_exactly_as_the_runner_it_fronts` holds shut.
 pub struct RoutedRunner {
     pub inner: Arc<dyn CommandRunner>,
-    pub router: Arc<Router>,
+    /// `None` when routing is off but the daemon still holds engines a node may be pinned to.
+    pub router: Option<Arc<Router>>,
+    pub engines: Option<Arc<Engines>>,
+}
+
+impl RoutedRunner {
+    /// A runner fronted by `router`, whose engines are exactly the router's own runners.
+    pub fn routed(inner: Arc<dyn CommandRunner>, router: Arc<Router>) -> Self {
+        let engines = Arc::new(Engines::from_router(&router));
+        Self {
+            inner,
+            router: Some(router),
+            engines: Some(engines),
+        }
+    }
+}
+
+/// The engines a node's pin may name, independent of whether the router is on. A pin is an explicit
+/// choice, so it needs no `runners:` consent; the router's own alternates stay what `config.runners`
+/// names.
+pub struct Engines {
+    /// The runner the daemon launches by default.
+    pub primary: Available,
+    /// Every other engine: named in `config.runners` or installed on this machine.
+    pub others: Vec<Available>,
+}
+
+impl Engines {
+    /// The engine of `kind`, the primary included.
+    pub fn available(&self, kind: RunnerKind) -> Option<&Available> {
+        std::iter::once(&self.primary)
+            .chain(self.others.iter())
+            .find(|available| available.kind == kind)
+    }
+
+    fn from_router(router: &Router) -> Self {
+        let copy = |available: &Available| Available {
+            kind: available.kind,
+            runner: Arc::clone(&available.runner),
+            default_model: available.default_model.clone(),
+            models: available.models.clone(),
+        };
+        Self {
+            primary: copy(&router.primary),
+            others: router.alternates.iter().map(copy).collect(),
+        }
+    }
 }
 
 #[async_trait]
@@ -1190,7 +1296,11 @@ impl CommandRunner for RoutedRunner {
     }
 
     fn router(&self) -> Option<Arc<Router>> {
-        Some(Arc::clone(&self.router))
+        self.router.clone()
+    }
+
+    fn engines(&self) -> Option<Arc<Engines>> {
+        self.engines.clone()
     }
 }
 
@@ -1379,7 +1489,7 @@ mod tests {
             available(RunnerKind::Claude, Arc::clone(&inner), &["claude-*"]),
             vec![available(RunnerKind::Codex, Arc::clone(&codex), &["gpt-*"])],
         ));
-        (Arc::new(RoutedRunner { inner, router }), codex)
+        (Arc::new(RoutedRunner::routed(inner, router)), codex)
     }
 
     fn shape() -> RunShape {
@@ -1448,10 +1558,11 @@ mod tests {
         assert!(config.is_off());
 
         let primary: Arc<dyn CommandRunner> = Arc::new(Probe);
-        let fronted = front(
+        let fronted = front_with(
             Arc::clone(&primary),
             &crate::config::ModelsConfig::default(),
             config,
+            &[],
         );
         assert!(Arc::ptr_eq(&primary, &fronted), "off must be the same Arc");
         assert!(fronted.router().is_none());
@@ -2353,6 +2464,7 @@ mod tests {
                     model: Some("gpt-5.6-terra".into()),
                     effort: Some("low".into()),
                     sandbox: None,
+                    web_search: None,
                 }),
                 ..query()
             }),
@@ -2399,6 +2511,7 @@ mod tests {
                     model: None,
                     effort: None,
                     sandbox: None,
+                    web_search: None,
                 }),
                 ..query()
             }),
@@ -2425,7 +2538,7 @@ mod tests {
             available(RunnerKind::Claude, Arc::clone(&inner), &["claude-*"]),
             Vec::new(),
         ));
-        let runner: Arc<dyn CommandRunner> = Arc::new(RoutedRunner { inner, router });
+        let runner: Arc<dyn CommandRunner> = Arc::new(RoutedRunner::routed(inner, router));
 
         let resolved = resolve(
             &pool,
@@ -2439,6 +2552,7 @@ mod tests {
                     model: Some("gpt-5.6-terra".into()),
                     effort: None,
                     sandbox: None,
+                    web_search: None,
                 }),
                 ..query()
             }),
@@ -2473,6 +2587,7 @@ mod tests {
                     model: Some("gpt-5.6-terra".into()),
                     effort: None,
                     sandbox,
+                    web_search: None,
                 }),
                 ..query()
             }),
@@ -2525,6 +2640,124 @@ mod tests {
             assert!(why.contains("codex") && why.contains(said), "{why}");
             assert!(Arc::ptr_eq(&resolved.runner, &runner));
         }
+    }
+
+    /// A pin-only runner: routing off, Codex installed.
+    fn engines_only_runner() -> Arc<dyn CommandRunner> {
+        front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            RouterConfig::off(),
+            &[RunnerKind::Claude, RunnerKind::Codex],
+        )
+    }
+
+    async fn resolve_pin_only(
+        runner: Arc<dyn CommandRunner>,
+        kind: RunnerKind,
+        sandbox: Option<&'static str>,
+    ) -> Resolved {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        resolve(
+            &pool,
+            run_id,
+            runner,
+            None,
+            None,
+            Some(RouteQuery {
+                pin: Some(EnginePinRoute {
+                    runner: kind,
+                    model: Some("gpt-5.6-terra".into()),
+                    effort: None,
+                    sandbox,
+                    web_search: None,
+                }),
+                ..query()
+            }),
+            shape(),
+            Speed::Normal,
+        )
+        .await
+    }
+
+    #[test]
+    fn routing_off_with_another_engine_installed_still_holds_it_for_pins() {
+        let runner = engines_only_runner();
+        assert!(runner.router().is_none());
+        let engines = runner.engines().expect("the engines are held");
+        assert_eq!(engines.primary.kind, RunnerKind::Claude);
+        assert_eq!(engines.others.len(), 1);
+        assert_eq!(engines.others[0].kind, RunnerKind::Codex);
+    }
+
+    #[test]
+    fn routing_off_does_not_widen_what_the_router_may_route_to() {
+        let mut config = config(Mode::Shadow, DEFAULT_URL);
+        config.runners = Vec::new();
+        let runner = front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            config,
+            &[RunnerKind::Codex],
+        );
+        let router = runner.router().expect("routing is on");
+        assert!(router.alternates.is_empty(), "installed is not consent");
+        assert!(
+            runner
+                .engines()
+                .unwrap()
+                .available(RunnerKind::Codex)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_codex_pin_without_a_router_launches_codex_instead_of_being_refused() {
+        let runner = engines_only_runner();
+        let resolved =
+            resolve_pin_only(Arc::clone(&runner), RunnerKind::Codex, Some("read-only")).await;
+        assert!(resolved.refused.is_none(), "{:?}", resolved.refused);
+        assert!(resolved.router.is_none());
+        assert!(
+            !Arc::ptr_eq(&resolved.runner, &runner),
+            "a Codex pin must not run on the primary"
+        );
+        assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_the_primary_without_a_router_keeps_the_runs_own_runner() {
+        let runner = engines_only_runner();
+        let resolved = resolve_pin_only(Arc::clone(&runner), RunnerKind::Claude, None).await;
+        assert!(resolved.refused.is_none());
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_an_engine_that_is_not_installed_is_refused_without_a_router() {
+        let runner = front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            RouterConfig::off(),
+            &[RunnerKind::Claude],
+        );
+        // Nothing but the primary: the very same bare runner, holding no engines.
+        assert!(runner.engines().is_none());
+        let runner: Arc<dyn CommandRunner> = Arc::new(RoutedRunner {
+            inner: runner,
+            router: None,
+            engines: Some(Arc::new(Engines {
+                primary: available(RunnerKind::Claude, Arc::new(Probe), &[]),
+                others: Vec::new(),
+            })),
+        });
+        let resolved = resolve_pin_only(runner, RunnerKind::Codex, None).await;
+        let why = resolved.refused.expect("the launch is refused");
+        assert!(
+            why.contains("codex") && why.contains("cannot launch"),
+            "{why}"
+        );
     }
 
     #[test]

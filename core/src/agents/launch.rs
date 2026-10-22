@@ -36,6 +36,11 @@ pub struct AgentLaunch {
     /// What the pinned engine needs; `None` when nothing is pinned (translate for the chosen
     /// engine with `capabilities::translate` once the router has answered).
     pub tools: Option<EngineTools>,
+    /// The Claude built-in tools the agent's capabilities grant (`WebSearch`, `WebFetch` for `web`).
+    /// Derived from the capabilities even when nothing is pinned, because the router may still land
+    /// the launch on Claude and the grant must be there when it does; empty when the pin names
+    /// another engine, which has no such tools.
+    pub builtin_tools: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -162,6 +167,20 @@ fn plan_launch(
     })
 }
 
+/// The Claude built-ins `caps` grant that a loadout can list, or none when `pin` names another
+/// engine.
+fn claude_builtins(caps: &[Capability], pin: Option<&(Engine, String)>) -> Vec<String> {
+    if pin.is_some_and(|(engine, _)| *engine != Engine::Claude) {
+        return Vec::new();
+    }
+    capabilities::translate(Engine::Claude, caps)
+        .map(|tools| tools.claude_allowed_tools)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|tool| crate::loadout::is_engine_builtin(tool))
+        .collect()
+}
+
 /// The launch of `agent` for `task`, with no project context (see [`resolve_agent_launch_with`]).
 pub async fn resolve_agent_launch(
     state: &AppState,
@@ -256,6 +275,7 @@ pub async fn resolve_agent_launch_with(
         (prompt, output)
     };
 
+    let builtin_tools = claude_builtins(&caps, plan.pin.as_ref());
     Ok(AgentLaunch {
         prompt,
         runners: plan.runners,
@@ -263,6 +283,7 @@ pub async fn resolve_agent_launch_with(
         output,
         tool_policy,
         tools: plan.tools,
+        builtin_tools,
     })
 }
 
@@ -291,6 +312,22 @@ mod tests {
             Vec::<RunnerKind>::new()
         );
         assert!(narrow_runners(vec![Claude, Codex], &[Claude, Codex], &[Claude, Codex]).is_empty());
+    }
+
+    #[test]
+    fn web_grants_the_claude_builtins_even_unpinned_and_nothing_else_does() {
+        let names = |caps: &[Capability], pin: Option<(Engine, String)>| {
+            let mut names = claude_builtins(caps, pin.as_ref());
+            names.sort();
+            names
+        };
+        assert_eq!(names(&[FsRead, Web], None), vec!["WebFetch", "WebSearch"]);
+        assert_eq!(
+            names(&[Web], Some((Engine::Claude, String::new()))),
+            vec!["WebFetch", "WebSearch"]
+        );
+        assert!(names(&[FsRead, FsWrite, Shell], None).is_empty());
+        assert!(names(&[Web], Some((Engine::Codex, "m".to_owned()))).is_empty());
     }
 
     #[test]

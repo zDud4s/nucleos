@@ -90,6 +90,13 @@ pub(super) fn job_node_extra(tool_name: &str) -> Option<&str> {
         .filter(|name| crate::mcp_tools::JOB_NODE_EXTRAS.contains(name))
 }
 
+/// Whether `tool_name` is a Claude built-in web tool an agent's `web` capability can grant: a WHOLE
+/// name match on `WebFetch` or `WebSearch`. Unlike `job_node_extra` these are the engine's own
+/// tools, not `mcp__nucleos__` ones, so the grant lives in the run's loadout under the bare name.
+pub(super) fn job_node_web_builtin(tool_name: &str) -> bool {
+    crate::loadout::is_engine_builtin(tool_name)
+}
+
 /// The job a run belongs to, `None` for a run that is not a job's node (or whose row is gone).
 pub(super) async fn job_id_of(
     pool: &sqlx::SqlitePool,
@@ -447,6 +454,81 @@ pub(super) async fn pretooluse_decision_from(
                             ),
                         });
                     }
+                    Err(error) => {
+                        tracing::warn!(
+                            run_id = run_id,
+                            %error,
+                            "pretooluse-decision: failed to read the run's loadout — failing closed"
+                        );
+                        return Json(Decision {
+                            decision: "deny".to_owned(),
+                            reason: "could not read the run's loadout — failing closed".to_owned(),
+                        });
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    run_id = run_id,
+                    %error,
+                    "pretooluse-decision: failed to resolve the run's job — failing closed"
+                );
+                return Json(Decision {
+                    decision: "deny".to_owned(),
+                    reason: "could not resolve the run's job — failing closed".to_owned(),
+                });
+            }
+        }
+    }
+
+    // A job node whose agent declares `web` holds Claude's `WebFetch`/`WebSearch`: its loadout lists
+    // them (`loadout::grant_builtins`). Everything else keeps falling through to the classifier,
+    // which refuses these as an `unrecognized-tool` - an attended run, a team run, a run that is
+    // not a job's node, or a node whose loadout does not list the tool.
+    //
+    // Both tools bring third-party text into the run, so the read is recorded first, exactly as for
+    // a `ReadsUntrusted` extra above, and a failure to record it refuses the call: a read that
+    // cannot be marked would let the run's later writes go ungoverned by that mark.
+    if job_node_web_builtin(&payload.tool_name)
+        && is_in_flight
+        && crate::execution::runs::runs_unattended(&mode)
+    {
+        match job_id_of(&state.pool, run_id).await {
+            Ok(Some(job_id)) => {
+                match crate::tool_loadout::run_lists_tool(&state.pool, run_id, &payload.tool_name)
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(error) =
+                            crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
+                                .await
+                        {
+                            tracing::warn!(
+                                run_id = run_id,
+                                tool = %payload.tool_name,
+                                %error,
+                                "pretooluse-decision: could not record that a job node read third-party content - refusing the read"
+                            );
+                            return Json(Decision {
+                                decision: "deny".to_owned(),
+                                reason: "could not record that this run read third-party content"
+                                    .to_owned(),
+                            });
+                        }
+                        tracing::info!(
+                            run_id = run_id,
+                            job_id = job_id,
+                            tool = %payload.tool_name,
+                            "pretooluse-decision: allowed a web tool the agent's loadout lists"
+                        );
+                        return Json(Decision {
+                            decision: "allow".to_owned(),
+                            reason: "this run's loadout lists it".to_owned(),
+                        });
+                    }
+                    // Not listed: the classifier's own refusal below says it, unchanged.
+                    Ok(false) => {}
                     Err(error) => {
                         tracing::warn!(
                             run_id = run_id,

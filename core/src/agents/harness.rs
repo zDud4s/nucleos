@@ -91,8 +91,9 @@ fn context_refs(pkg: &Package) -> ContextRefs {
 /// The full text of `<name>.md` for Claude Code. Pure given the installed package files.
 pub fn render_claude_agent(pkg: &Package) -> Result<String, super::capabilities::Unsupported> {
     let tools = translate(Engine::Claude, &pkg.capabilities)?;
-    // NEEDS A REAL-SESSION CHECK: `mcp__nucleos__*` is assumed to be accepted in a subagent's
-    // `tools` line (plan C1, open question Q3).
+    // Verified in a real session on 2026-10-21 (plan C1, open question Q3): a subagent defined
+    // with `tools: Read, mcp__nucleos__*` received `mcp__nucleos__record`, `verify` and
+    // `verify_status`, so the wildcard is accepted in a subagent's `tools` line.
     let tools_line = tools.claude_allowed_tools.join(", ");
     let can_read = pkg.capabilities.contains(&Capability::FsRead);
     let refs = if can_read {

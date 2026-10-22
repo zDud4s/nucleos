@@ -423,6 +423,7 @@ async fn main() {
                 model: models_config.codex_model.clone(),
                 // A run keeps the user's Codex config; only chats pin a sandbox (`for_chat`).
                 sandbox_mode: None,
+                web_search: None,
             })
         }
         Some(other) => {

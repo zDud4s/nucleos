@@ -1,6 +1,7 @@
 //! The Codex CLI backend: its arguments, MCP overrides, staged images, usage and `CodexCliRunner`.
 
 use super::*;
+use std::path::Path;
 
 /// What `run_prompt` prepared before building argv: MCP overrides, staged image paths and the
 /// sandbox the runner pins.
@@ -10,6 +11,71 @@ pub struct CodexStaged {
     pub images: Vec<std::path::PathBuf>,
     /// The sandbox this launch pins, or `None` to leave Codex's own resolution.
     pub sandbox_mode: Option<&'static str>,
+    /// The `web_search` mode this launch pins (`"live"`), or `None` to leave Codex's own default.
+    /// An `McpOnly` run is always `"disabled"`, whatever this says.
+    pub web_search: Option<&'static str>,
+}
+
+/// The npm package that ships the native Codex binary for this platform, and its target triple, as
+/// `@openai/codex/bin/codex.js` picks them. `None` on a platform this resolver does not know.
+fn codex_native_target() -> Option<(&'static str, &'static str)> {
+    if cfg!(target_arch = "x86_64") {
+        Some(("@openai/codex-win32-x64", "x86_64-pc-windows-msvc"))
+    } else if cfg!(target_arch = "aarch64") {
+        Some(("@openai/codex-win32-arm64", "aarch64-pc-windows-msvc"))
+    } else {
+        None
+    }
+}
+
+/// PURE (filesystem reads only): the native `codex.exe` an npm shim in `shim_dir` wraps, or `None`
+/// when `shim_dir` holds no `node_modules/@openai/codex` or the binary is not under it.
+///
+/// Mirrors `node_modules/@openai/codex/bin/codex.js`: the platform package nested under the codex
+/// package first, then the `vendor` directory shipped inside the codex package itself.
+pub fn codex_native_from_shim(shim_dir: &Path) -> Option<std::path::PathBuf> {
+    let (package, triple) = codex_native_target()?;
+    let root = shim_dir.join("node_modules").join("@openai").join("codex");
+    let tail = Path::new("vendor")
+        .join(triple)
+        .join("bin")
+        .join("codex.exe");
+    [
+        root.join("node_modules").join(package).join(&tail),
+        root.join(&tail),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+/// The first `codex` along `path_var` (`codex.exe`, then the npm `codex.cmd`, then the bare script).
+fn find_codex_on(path_var: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path_var).find_map(|directory| {
+        ["codex.exe", "codex.cmd", "codex"]
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+/// The program that launches Codex: `NUCLEOS_CODEX_BIN` when set (an override, taken as given), else
+/// the `codex` found on `PATH`, looking past an npm shim to the native binary it wraps. `None` when
+/// Codex is not installed. Resolves only; nothing is run.
+pub fn codex_program() -> Option<std::path::PathBuf> {
+    if let Some(configured) = std::env::var_os("NUCLEOS_CODEX_BIN") {
+        return Some(std::path::PathBuf::from(configured));
+    }
+    let found = find_codex_on(&std::env::var_os("PATH")?)?;
+    let is_exe = found
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+    if is_exe {
+        return Some(found);
+    }
+    match found.parent().and_then(codex_native_from_shim) {
+        Some(native) => Some(native),
+        None => Some(found),
+    }
 }
 
 /// The prefix Codex gives the daemon's own MCP tools: `mcp__<server>__<tool>`, server `nucleos`.
@@ -265,6 +331,13 @@ pub fn codex_cli_args(
         args.push(r#"web_search="disabled""#.to_string());
         args.push("-c".to_string());
         args.push(codex_deny_hook_override(DAEMON_MCP_TOOL_PREFIX));
+    } else if let Some(mode) = staged.web_search {
+        // An agent that declares `web` asks for it; `McpOnly` above stays the stricter word.
+        args.push("-c".to_string());
+        args.push(format!(
+            "web_search={}",
+            serde_json::to_string(mode).expect("serializing a string cannot fail")
+        ));
     }
     for image in &staged.images {
         args.push("-i".to_string());
@@ -416,6 +489,8 @@ pub struct CodexCliRunner {
     /// The sandbox every launch of this runner pins; `None` leaves Codex's own resolution (the
     /// user's config, else exec's read-only default).
     pub sandbox_mode: Option<&'static str>,
+    /// The `web_search` mode every launch of this runner pins; `None` leaves Codex's own default.
+    pub web_search: Option<&'static str>,
 }
 
 impl CodexCliRunner {
@@ -428,6 +503,7 @@ impl CodexCliRunner {
         Self {
             model,
             sandbox_mode: Some("read-only"),
+            web_search: None,
         }
     }
 }
@@ -593,15 +669,16 @@ impl CommandRunner for CodexCliRunner {
             mcp_overrides,
             images: staged_files.0.clone(),
             sandbox_mode: self.sandbox_mode,
+            web_search: self.web_search,
         };
         let args = codex_cli_args(&request, codex_model(&request, &self.model), &staged)
             .map_err(std::io::Error::other)?;
 
-        // The Codex CLI binary. Overridable via `NUCLEOS_CODEX_BIN` for the same reason
-        // `NUCLEOS_CLAUDE_BIN` exists: on Windows the npm-installed `codex` is a `.cmd` shim that
-        // Rust's `Command` can't spawn by name, so the daemon points this at the real executable.
-        // Defaults to `codex` where it's on PATH.
-        let codex_bin = std::env::var("NUCLEOS_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+        // The Codex CLI binary, resolved by `codex_program`: `NUCLEOS_CODEX_BIN` when set, else the
+        // `codex` on PATH. On Windows the npm-installed `codex` is a `.cmd` shim that Rust's `Command`
+        // can't spawn by name, so the resolver looks past it to the native executable the shim
+        // wraps. Falls back to the bare name when nothing is found, so the spawn error names it.
+        let codex_bin = codex_program().unwrap_or_else(|| std::path::PathBuf::from("codex"));
         let mut cmd = Command::new(&codex_bin);
         cmd.args(args);
         for (k, v) in &request.env {
@@ -772,6 +849,62 @@ impl CommandRunner for CodexCliRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn a_shim_dir_resolves_to_the_native_binary_in_the_nested_platform_package() {
+        let Some((package, triple)) = codex_native_target() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir
+            .path()
+            .join("node_modules/@openai/codex/node_modules")
+            .join(package)
+            .join("vendor")
+            .join(triple)
+            .join("bin/codex.exe");
+        touch(&native);
+        assert_eq!(codex_native_from_shim(dir.path()), Some(native));
+    }
+
+    #[test]
+    fn a_shim_dir_falls_back_to_the_vendor_dir_inside_the_codex_package() {
+        let Some((_, triple)) = codex_native_target() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir
+            .path()
+            .join("node_modules/@openai/codex/vendor")
+            .join(triple)
+            .join("bin/codex.exe");
+        touch(&native);
+        assert_eq!(codex_native_from_shim(dir.path()), Some(native));
+    }
+
+    #[test]
+    fn a_shim_dir_without_the_native_binary_resolves_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(codex_native_from_shim(dir.path()), None);
+        std::fs::create_dir_all(dir.path().join("node_modules/@openai/codex")).unwrap();
+        assert_eq!(codex_native_from_shim(dir.path()), None);
+    }
+
+    #[test]
+    fn codex_is_found_along_a_path_by_its_shim_or_executable_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(find_codex_on(dir.path().as_os_str()), None);
+        touch(&dir.path().join("codex.cmd"));
+        assert_eq!(
+            find_codex_on(dir.path().as_os_str()),
+            Some(dir.path().join("codex.cmd"))
+        );
+    }
 
     fn request_with(tool_policy: ToolPolicy, env: Vec<(String, String)>) -> RunRequest {
         RunRequest {

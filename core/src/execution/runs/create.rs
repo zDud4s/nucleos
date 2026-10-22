@@ -852,15 +852,15 @@ pub(super) async fn create_run_with(
     // A node pinned to Codex is shaped for Codex up front: `codex exec` has no `PreToolUse` hook and
     // no permission modes, so the classifier does not govern it and `Bypass` would be refused. Its
     // barrier is the sandbox the pin carries (derived from the agent's capabilities). Only when the
-    // router holds Codex, since otherwise the pin never reaches a Codex runner and the run keeps the
+    // daemon holds Codex, since otherwise the pin never reaches a Codex runner and the run keeps the
     // shape it would have had.
     let pinned_to_codex = node.is_some_and(|node| {
         node.launch
             .pin
             .as_ref()
             .is_some_and(|pin| pin.runner == crate::models::route_advice::RunnerKind::Codex)
-    }) && state.runner.router().is_some_and(|router| {
-        router
+    }) && state.runner.engines().is_some_and(|engines| {
+        engines
             .available(crate::models::route_advice::RunnerKind::Codex)
             .is_some()
     });

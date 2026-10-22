@@ -1027,8 +1027,9 @@ mod tests {
             Vec::new(),
         ));
         let mut state = council_state(runner.clone(), Some(roster(3))).await;
-        state.runner =
-            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
+        state.runner = std::sync::Arc::new(crate::models::route_advice::RoutedRunner::routed(
+            inner, router,
+        ));
 
         let id = start(&state, "why?", None).await.unwrap();
         assert_eq!(settled(&state, &id).await.status, STATUS_DONE);
@@ -4902,8 +4903,9 @@ mod tests {
             Vec::new(),
         ));
         let mut state = council_state(runner.clone(), Some(roster(3))).await;
-        state.runner =
-            std::sync::Arc::new(crate::models::route_advice::RoutedRunner { inner, router });
+        state.runner = std::sync::Arc::new(crate::models::route_advice::RoutedRunner::routed(
+            inner, router,
+        ));
 
         let id = start_with(&state, "why?", None, Some(2), BTreeMap::new())
             .await

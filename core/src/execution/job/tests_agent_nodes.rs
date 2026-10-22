@@ -287,6 +287,7 @@ fn the_retry_is_pinned_to_the_refused_runs_engine_and_model_with_the_report_appe
             model: Some("m1".into()),
             effort: Some("high".into()),
             sandbox: None,
+            web_search: None,
         })
     );
     assert!(retry.prompt.starts_with("ORIGINAL\n\n"), "{}", retry.prompt);

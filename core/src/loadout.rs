@@ -234,6 +234,30 @@ async fn equip(
     }
 }
 
+/// The Claude built-in tools an agent package's `web` capability can grant a node. They are the
+/// engine's own, not NucleOS MCP tools: the loadout lists them so the `PreToolUse` hook can prove a
+/// run holds one, and they must never be turned into an `mcp__nucleos__` name.
+pub const CLAUDE_WEB_BUILTINS: [&str; 2] = ["WebFetch", "WebSearch"];
+
+/// Whether `tool` is an engine built-in a loadout can list, rather than a NucleOS MCP tool.
+pub fn is_engine_builtin(tool: &str) -> bool {
+    CLAUDE_WEB_BUILTINS.contains(&tool)
+}
+
+/// Lists `builtins` (engine built-ins an agent's capabilities grant) in `run`'s tools, keeping the
+/// list sorted and free of duplicates. Names that are not engine built-ins are ignored, so a caller
+/// cannot widen a run with an arbitrary string through this door.
+pub fn grant_builtins(run: &mut RunTools, builtins: &[String]) {
+    run.tools.extend(
+        builtins
+            .iter()
+            .filter(|tool| is_engine_builtin(tool))
+            .cloned(),
+    );
+    run.tools.sort();
+    run.tools.dedup();
+}
+
 /// Writes the tools a run was started with, frozen at launch; the routes and the hook read it.
 /// Recording a run again replaces its row.
 pub async fn record(pool: &sqlx::SqlitePool, run_id: i64, run: &RunTools) -> sqlx::Result<()> {
@@ -1311,5 +1335,52 @@ mod tests {
             "the linked rows still render a block"
         );
         assert_eq!(resolved.block, unbriefed.block);
+    }
+
+    #[test]
+    fn granting_builtins_sorts_dedupes_and_ignores_anything_that_is_not_a_builtin() {
+        let mut run = RunTools {
+            tools: vec!["verify".to_owned(), "WebSearch".to_owned()],
+            ..RunTools::default()
+        };
+        super::grant_builtins(
+            &mut run,
+            &[
+                "WebSearch".to_owned(),
+                "WebFetch".to_owned(),
+                "Bash".to_owned(),
+            ],
+        );
+        assert_eq!(run.tools, vec!["WebFetch", "WebSearch", "verify"]);
+        let mut none = RunTools::default();
+        super::grant_builtins(&mut none, &[]);
+        assert!(none.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_granted_builtin_is_recorded_and_found_by_the_hooks_lookup() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('t', 'running', 'real', '2026-10-21T00:00:00Z') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut run = RunTools {
+            tools: sorted(&["verify"]),
+            ..RunTools::default()
+        };
+        super::grant_builtins(&mut run, &["WebSearch".to_owned(), "WebFetch".to_owned()]);
+        record(&pool, run_id, &run).await.unwrap();
+        for (tool, listed) in [("WebSearch", true), ("WebFetch", true), ("Bash", false)] {
+            assert_eq!(
+                crate::tool_loadout::run_lists_tool(&pool, run_id, tool)
+                    .await
+                    .unwrap(),
+                listed,
+                "{tool}"
+            );
+        }
     }
 }

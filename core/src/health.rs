@@ -1012,7 +1012,7 @@ fn resolve_cli_binary() -> Option<PathBuf> {
 ///
 /// Extracted from `resolve_cli_binary` when the voice transcriber became a second configured program
 /// needing the same lookup. Both probes report configuration readiness only — neither runs anything.
-fn resolve_program(program: &std::ffi::OsStr) -> Option<PathBuf> {
+pub(crate) fn resolve_program(program: &std::ffi::OsStr) -> Option<PathBuf> {
     let path = PathBuf::from(program);
 
     if path.components().count() > 1 || path.is_absolute() {

@@ -62,6 +62,10 @@ pub struct NodeLaunch {
     /// It is also carried by the pin itself (`EnginePin::sandbox`), which is what the runner is built
     /// from; this is the same fact at the launch level.
     pub codex_sandbox: Option<crate::agents::capabilities::CodexSandbox>,
+    /// The Claude built-in tools (`WebSearch`, `WebFetch`) the agent's `web` capability grants. They
+    /// are listed in the run's loadout, which is what lets the `PreToolUse` hook allow them on an
+    /// autonomous node; empty for an agent without `web`, and for a launch pinned to another engine.
+    pub builtin_tools: Vec<String>,
 }
 
 impl NodeLaunch {
@@ -74,6 +78,7 @@ impl NodeLaunch {
             effort: None,
             output: None,
             codex_sandbox: None,
+            builtin_tools: Vec::new(),
         }
     }
 }
