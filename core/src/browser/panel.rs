@@ -39,6 +39,11 @@ pub async fn owner_of(pool: &SqlitePool, row: &SessionRow) -> Owner {
     }
 }
 
+/// The chat a session answers to: `owner_of` when it is a chat, else `None`.
+pub async fn chat_of(_pool: &SqlitePool, _row: &SessionRow) -> Option<String> {
+    None // RED stub
+}
+
 /// Whether the owner is still there to hear: an unarchived chat, or a run still going.
 pub async fn owner_alive(pool: &SqlitePool, owner: &Owner) -> bool {
     match owner {

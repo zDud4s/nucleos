@@ -4653,6 +4653,156 @@ mod tests {
         }
     }
 
+    // ---- The browser-agents door (plan browser-agent-linked, D2) ----------------------------
+
+    /// The assistant routes a chat turn might reach for, mounted with stand-ins and layered with
+    /// `require_token` exactly like `protected_router`. `POST /assistant/browser-agents` echoes its
+    /// body, so a 200 shows the body reached the handler intact.
+    fn browser_agents_door_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/assistant/browser-agents",
+                post(|b: String| async move { b }).get(|| async {}),
+            )
+            .route("/assistant/chats/{id}/relay", post(|| async {}))
+            .route("/assistant/chats/{id}/link", post(|| async {}))
+            .route("/assistant/message", post(|| async {}))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_token,
+            ))
+            .with_state(state)
+    }
+
+    const BROWSER_AGENT_BODY: &str = "{\"task\":\"find the opening hours\"}";
+
+    /// A chat turn's key may start a linked browser agent, and that is the only assistant route
+    /// the door opens: relaying, linking and messaging stay Control-only. The door is for a chat
+    /// turn, so a chatless run's key, a read-only key and a run-creating key are all refused (the
+    /// route is in neither fixed table).
+    #[tokio::test]
+    async fn a_chat_turns_run_key_may_post_browser_agents_and_no_other_assistant_route() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "c-mother").await.unwrap();
+        running_turn_of(&state, "c-mother").await;
+        let (_, chatless) = running_run_with_token(&state).await;
+        let reader = stored_api_token(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let launcher = stored_api_token(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let app = browser_agents_door_router(state);
+
+        let (status, echoed) =
+            post_body_status(&app, "/assistant/browser-agents", &key, BROWSER_AGENT_BODY).await;
+        assert_eq!(status, StatusCode::OK, "a chat turn may start a browser agent");
+        assert_eq!(echoed, BROWSER_AGENT_BODY, "the handler must still get the body");
+
+        for route in [
+            "/assistant/chats/c-other/relay",
+            "/assistant/chats/c-mother/relay",
+            "/assistant/chats/c-other/link",
+            "/assistant/message",
+        ] {
+            assert_eq!(
+                post_body_status(&app, route, &key, "{}").await.0,
+                StatusCode::FORBIDDEN,
+                "{route} stays closed to a chat key"
+            );
+        }
+        assert_eq!(
+            status_of(&app, "GET", "/assistant/browser-agents", &key).await,
+            StatusCode::FORBIDDEN,
+            "the door is POST only; the listing stays Control-only"
+        );
+
+        for (who, bearer) in [
+            ("a run with no chat", &chatless),
+            ("a read-only key", &reader),
+            ("a run-creating key", &launcher),
+        ] {
+            assert_eq!(
+                post_body_status(&app, "/assistant/browser-agents", bearer, BROWSER_AGENT_BODY)
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{who} may not start a browser agent"
+            );
+        }
+        assert_eq!(
+            post_body_status(
+                &app,
+                "/assistant/browser-agents",
+                "control-token",
+                BROWSER_AGENT_BODY
+            )
+            .await
+            .0,
+            StatusCode::OK,
+            "the control token still reaches it"
+        );
+    }
+
+    /// The door needs a chat turn that is running now. Once the turn ends its key authenticates
+    /// nothing (the `resolve` rule), and a run whose `chat_id` is NULL or empty is refused even
+    /// while it runs.
+    #[tokio::test]
+    async fn the_browser_agents_door_needs_a_running_chat_turn() {
+        let state = test_state("control-token").await;
+        let key = mint_chat_token(&state.pool, "c-mother").await.unwrap();
+        let turn = running_turn_of(&state, "c-mother").await;
+        let (_, null_chat) = running_run_with_token(&state).await;
+        let empty_chat_run = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('x', 'running', 'assistant', '', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let (empty_chat, secret) = mint_run_token(empty_chat_run);
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(&secret)
+            .bind(empty_chat_run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let pool = state.pool.clone();
+        let app = browser_agents_door_router(state);
+
+        // While the turn runs, its key is admitted: the refusals below are about the turn, not
+        // about a door that is shut for everyone.
+        assert_eq!(
+            post_body_status(&app, "/assistant/browser-agents", &key, BROWSER_AGENT_BODY)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        for (who, bearer) in [
+            ("a run whose chat_id is NULL", &null_chat),
+            ("a run whose chat_id is empty", &empty_chat),
+        ] {
+            assert_eq!(
+                post_body_status(&app, "/assistant/browser-agents", bearer, BROWSER_AGENT_BODY)
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{who} is not a chat turn"
+            );
+        }
+
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(turn)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            post_body_status(&app, "/assistant/browser-agents", &key, BROWSER_AGENT_BODY)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED,
+            "a finished turn's key is dead"
+        );
+    }
+
     // ---- messaging channel keys (D.15.1, §7.3) ------------------------------------------------
 
     /// The seven contract routes of a channel, as concrete (method, suffix) pairs under

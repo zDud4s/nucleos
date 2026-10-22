@@ -1139,6 +1139,27 @@ pub async fn open_sessions(pool: &SqlitePool) -> sqlx::Result<Vec<SessionRow>> {
     Ok(sessions)
 }
 
+/// One item of `GET /browser/sessions`: the session row plus the chat it answers to (the
+/// `panel::owner_of` chat), or `null` when its owner is a chatless run or nobody.
+#[derive(Debug, Clone, Serialize)]
+// RED stub
+pub struct OpenSessionView {
+    #[serde(flatten)]
+    pub row: SessionRow,
+    pub chat_id: Option<String>,
+}
+
+/// The open sessions, oldest first, each with the chat it answers to.
+// RED stub (the chat comes from `panel::chat_of`, itself a stub)
+pub async fn open_session_views(pool: &SqlitePool) -> sqlx::Result<Vec<OpenSessionView>> {
+    let mut views = Vec::new();
+    for row in open_sessions(pool).await? {
+        let chat_id = panel::chat_of(pool, &row).await;
+        views.push(OpenSessionView { row, chat_id });
+    }
+    Ok(views)
+}
+
 /// Close one session, over there and here.
 pub async fn close(
     pool: &SqlitePool,
@@ -3315,6 +3336,80 @@ mod tests {
             .map(|call| call["body"]["session_id"].clone())
             .collect();
         assert_eq!(closed, [serde_json::json!("e1")]);
+        db.close().await;
+    }
+
+    /// `GET /browser/sessions` tells the shell which conversation each open session answers to:
+    /// the stamped `owner_chat_id` first, else the chat of the run that opened it, else `null` for
+    /// a chatless run and for a session nobody opened. The row's own fields stay flat beside it.
+    #[tokio::test]
+    async fn open_sessions_view_gives_chat_id_for_the_owner_chat_for_the_runs_chat_and_null_for_a_chatless_run() {
+        let db = TempDb::new().await;
+        for (id, chat) in [(41_i64, Some("c-run")), (42, None)] {
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, mode, chat_id, created_at) \
+                 VALUES (?, 'browse', 'running', 'assistant', ?, ?)",
+            )
+            .bind(id)
+            .bind(chat)
+            .bind(NOW)
+            .execute(&db.pool)
+            .await
+            .expect("insert run");
+        }
+        let mut ids = Vec::new();
+        for (sidecar, run_id, owner_chat_id) in [
+            ("by-stamp", None, Some("c-web")),
+            ("by-run", Some(41_i64), None),
+            ("chatless-run", Some(42), None),
+            ("nobody", None, None),
+            ("stamp-beats-run", Some(41), Some("c-stamp")),
+        ] {
+            let id = sqlx::query(
+                "INSERT INTO browser_sessions \
+                    (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                     final_url, rule, mode, owner_chat_id, opened_at) \
+                 VALUES (?, ?, 'acme', 'project', 'acme', 'https://example.org/', \
+                         'https://example.org/', 'project-site', 'agent', ?, ?)",
+            )
+            .bind(sidecar)
+            .bind(run_id)
+            .bind(owner_chat_id)
+            .bind(NOW)
+            .execute(&db.pool)
+            .await
+            .expect("insert session")
+            .last_insert_rowid();
+            ids.push((sidecar, id));
+        }
+
+        let views = open_session_views(&db.pool).await.expect("views");
+        let chat_of = |sidecar: &str| {
+            let id = ids.iter().find(|(s, _)| *s == sidecar).unwrap().1;
+            views
+                .iter()
+                .find(|v| v.row.id == id)
+                .unwrap_or_else(|| panic!("{sidecar} must be listed"))
+                .chat_id
+                .clone()
+        };
+        assert_eq!(views.len(), 5);
+        assert_eq!(chat_of("by-stamp").as_deref(), Some("c-web"));
+        assert_eq!(chat_of("by-run").as_deref(), Some("c-run"));
+        assert_eq!(chat_of("chatless-run"), None);
+        assert_eq!(chat_of("nobody"), None);
+        assert_eq!(chat_of("stamp-beats-run").as_deref(), Some("c-stamp"));
+
+        // The wire shape: the row's fields flat, `chat_id` beside them, `null` when there is none.
+        let by_run = views.iter().find(|v| v.row.sidecar_id == "by-run").unwrap();
+        let json = serde_json::to_value(by_run).expect("serialize");
+        assert_eq!(json["sidecar_id"], "by-run");
+        assert_eq!(json["run_id"], 41);
+        assert_eq!(json["chat_id"], "c-run");
+        assert!(json.get("row").is_none(), "the row is flattened, not nested");
+        let nobody = views.iter().find(|v| v.row.sidecar_id == "nobody").unwrap();
+        let json = serde_json::to_value(nobody).expect("serialize");
+        assert!(json["chat_id"].is_null(), "no owner chat is an explicit null");
         db.close().await;
     }
 }
