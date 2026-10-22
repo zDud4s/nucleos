@@ -18,6 +18,9 @@ import { keys } from "./keys";
  * | remove a link        | `DELETE /owner-notes/links/{link_id}` |
  * | the whole graph      | `GET /owner-notes/graph`              |
  * | teach to the agent   | `POST /owner-notes/{id}/teach`        |
+ * | notes about a target | `GET /owner-notes/by-target?kind=&ref=` |
+ * | related notes        | `GET /owner-notes/{id}/related?limit=`  |
+ * | this week's review   | `GET /owner-notes/review`               |
  */
 
 /* ----------------------------------------------------------------- shapes -- */
@@ -90,6 +93,26 @@ export interface NotesGraph {
   targets: NoteTarget[];
 }
 
+/** A note that links to a given target, with the link that ties them — `GET /owner-notes/by-target`. */
+export type TargetNote = { note: OwnerNote; link_id: number; link_type: string };
+
+/** Why a note was suggested as related to another. */
+export type RelatedReason = "embedding" | "shared_target" | "text";
+
+/** A note related to another one, highest score first — `GET /owner-notes/{id}/related`. */
+export type RelatedNote = { note: OwnerNote; score: number; reasons: RelatedReason[] };
+
+/** The current ISO week's review; `week_*` are rfc3339 — `GET /owner-notes/review`. */
+export interface WeeklyReview {
+  week_start: string;
+  week_end: string;
+  created: OwnerNote[];
+  unlinked: OwnerNote[];
+  unlinked_total: number;
+  resurfaced: OwnerNote[];
+  waiting_proposals: number;
+}
+
 /* ------------------------------------------------------------------ reads -- */
 
 export function useOwnerNotes(state: NoteState | "all") {
@@ -121,6 +144,38 @@ export function useNotesGraph(includeArchived: boolean) {
   return useQuery({
     queryKey: keys.ownerNotes.graph(includeArchived),
     queryFn: () => apiFetch<NotesGraph>(`/owner-notes/graph?include_archived=${includeArchived}`),
+  });
+}
+
+/** Notes linked to one target; idle until both the kind and the ref are known. */
+export function useNotesAbout(kind: TargetKind | null, ref: string | null) {
+  return useQuery({
+    queryKey: [...keys.ownerNotes.all, "by-target", kind, ref],
+    queryFn: () =>
+      apiFetch<TargetNote[]>(
+        `/owner-notes/by-target?kind=${encodeURIComponent(kind ?? "")}&ref=${encodeURIComponent(ref ?? "")}`,
+      ),
+    enabled: kind !== null && ref !== null,
+  });
+}
+
+/** Notes related to one note; `limit` is sent only when given (the daemon defaults to 8). */
+export function useRelatedNotes(id: number | null, limit?: number) {
+  return useQuery({
+    queryKey: [...keys.ownerNotes.all, "related", id, limit ?? null],
+    queryFn: () =>
+      apiFetch<RelatedNote[]>(
+        `/owner-notes/${id}/related${limit === undefined ? "" : `?limit=${limit}`}`,
+      ),
+    enabled: id !== null,
+  });
+}
+
+/** The current week's review. */
+export function useWeeklyReview() {
+  return useQuery({
+    queryKey: [...keys.ownerNotes.all, "review"],
+    queryFn: () => apiFetch<WeeklyReview>("/owner-notes/review"),
   });
 }
 
