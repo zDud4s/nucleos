@@ -1,6 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { render } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render } from "@testing-library/react";
 import { NoteText } from "./NoteText";
+
+const opener = vi.hoisted(() => ({ openUrl: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => opener);
+
+beforeEach(() => {
+  opener.openUrl.mockReset();
+  opener.openUrl.mockResolvedValue(undefined);
+});
 
 describe("NoteText", () => {
   it("renders headings, lists and code", () => {
@@ -29,17 +37,35 @@ describe("NoteText", () => {
     expect(container.querySelector("img")).toBeNull();
   });
 
-  it("opens links safely", () => {
-    const { container } = render(<NoteText text="[site](https://example.com)" />);
-    const link = container.querySelector("a");
-    expect(link?.getAttribute("href")).toBe("https://example.com");
-    expect(link?.getAttribute("target")).toBe("_blank");
-    expect(link?.getAttribute("rel")).toBe("noreferrer noopener");
+  it("keeps the alt text of an image-only note", () => {
+    const { container } = render(<NoteText text="![a diagram](https://example.com/a.png)" />);
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.textContent).toContain("a diagram");
   });
 
-  it("drops a javascript: link target", () => {
+  it("renders a link as a button that hands the URL to the opener, never as an href", () => {
+    const { container } = render(<NoteText text="[site](https://example.com)" />);
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("[href]")).toBeNull();
+    const button = container.querySelector("button");
+    expect(button?.textContent).toBe("site");
+    expect(button?.getAttribute("title")).toBe("https://example.com");
+    fireEvent.click(button as HTMLButtonElement);
+    expect(opener.openUrl).toHaveBeenCalledWith("https://example.com");
+  });
+
+  it("renders a link with a stripped javascript: target as plain text", () => {
     const { container } = render(<NoteText text="[bad](javascript:alert(1))" />);
-    expect(container.querySelector("a")?.getAttribute("href") ?? "").not.toContain("javascript");
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.querySelector("button")).toBeNull();
+    expect(container.textContent).toContain("bad");
+    expect(container.innerHTML).not.toContain("javascript");
+  });
+
+  it("does not open a relative link", () => {
+    const { container } = render(<NoteText text="[rel](/some/path)" />);
+    expect(container.querySelector("button")).toBeNull();
+    expect(container.textContent).toContain("rel");
   });
 
   it("emits no style attribute", () => {

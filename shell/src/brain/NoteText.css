@@ -1,4 +1,22 @@
 /* Markdown inside a note: spacing only; colours and type come from the design tokens. */
+
+/*
+ * `.brain-text` (pages/brain.css) is `pre-wrap`, which would keep the "\n" text nodes react-markdown
+ * emits between blocks and render stray blank lines. Reset it here, and give it back to paragraphs
+ * so soft line breaks inside one still show, as the old plain-text view did.
+ */
+.brain-markdown {
+  white-space: normal;
+}
+
+.brain-markdown p {
+  white-space: pre-wrap;
+}
+
+.brain-markdown pre {
+  white-space: pre;
+}
+
 .brain-markdown > :first-child {
   margin-top: 0;
 }
@@ -59,9 +77,25 @@
   color: var(--text-muted);
 }
 
-.brain-markdown a {
+.brain-note-link {
+  padding: 0;
+  border: 0;
+  background: none;
   color: inherit;
+  font: inherit;
+  text-align: left;
   text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.brain-note-link:hover {
+  color: var(--accent);
+}
+
+.brain-note-link:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 /* Editing a note's text (NoteTextEdit). */

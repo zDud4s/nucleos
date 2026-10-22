@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { NoteTextEdit } from "./NoteTextEdit";
 import { renderWithQuery } from "../test/harness";
+import { keys } from "../data/keys";
+import type { NoteDetail, NotesGraph, OwnerNote } from "../data/owner-notes";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -44,6 +46,38 @@ describe("NoteTextEdit", () => {
     );
     await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
     expect(screen.getByRole("button", { name: "Edit" })).toBeTruthy();
+  });
+
+  it("writes the saved note into the detail and graph caches", async () => {
+    const note = (text: string): OwnerNote => ({
+      id: 4,
+      text,
+      origin: "shell",
+      state: "active",
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-01T00:00:00Z",
+    });
+    const saved = note("new text");
+    daemon.apiFetch.mockResolvedValue(saved);
+    const { queryClient } = renderWithQuery(<NoteTextEdit id={4} text="old" />);
+    queryClient.setQueryData<NoteDetail>(keys.ownerNotes.detail(4), {
+      note: note("old"),
+      links_out: [],
+      links_in: [],
+      events: [],
+    });
+    queryClient.setQueryData<NotesGraph>(keys.ownerNotes.graph(false), {
+      notes: [note("old"), { ...note("other"), id: 5 }],
+      links: [],
+      targets: [],
+    });
+    edit();
+    fireEvent.change(area(), { target: { value: "new text" } });
+    fireEvent.click(save());
+    await waitFor(() => expect(screen.queryByRole("textbox")).toBeNull());
+    expect(queryClient.getQueryData<NoteDetail>(keys.ownerNotes.detail(4))?.note.text).toBe("new text");
+    const graph = queryClient.getQueryData<NotesGraph>(keys.ownerNotes.graph(false));
+    expect(graph?.notes.map((n) => n.text)).toEqual(["new text", "other"]);
   });
 
   it("Esc cancels without saving", () => {

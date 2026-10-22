@@ -1,9 +1,28 @@
 import { useEffect, useRef, useState } from "react";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { DAEMON_NAME } from "../copy";
 import { ApiRefusal } from "../data/client";
-import { useUpdateNote } from "../data/owner-notes";
+import { keys } from "../data/keys";
+import {
+  useUpdateNote,
+  type NoteDetail,
+  type NotesGraph,
+  type OwnerNote,
+} from "../data/owner-notes";
 import { Button, ErrorNote, RefusalNote } from "../ui";
 import { NoteText } from "./NoteText";
+
+/** Put an updated note into the detail and graph caches, leaving every other cached shape alone. */
+function writeSavedNote(queryClient: QueryClient, saved: OwnerNote) {
+  queryClient.setQueryData<NoteDetail>(keys.ownerNotes.detail(saved.id), (old) =>
+    old ? { ...old, note: saved } : old,
+  );
+  for (const archived of [false, true]) {
+    queryClient.setQueryData<NotesGraph>(keys.ownerNotes.graph(archived), (old) =>
+      old ? { ...old, notes: old.notes.map((n) => (n.id === saved.id ? saved : n)) } : old,
+    );
+  }
+}
 
 /** A refusal as the daemon's own text; anything else means there was no answer. */
 function Failure({ error }: { error: unknown }) {
@@ -18,6 +37,7 @@ function Failure({ error }: { error: unknown }) {
  */
 export function NoteTextEdit({ id, text, disabled }: { id: number; text: string; disabled?: boolean }) {
   const update = useUpdateNote();
+  const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(text);
   const area = useRef<HTMLTextAreaElement>(null);
@@ -34,7 +54,17 @@ export function NoteTextEdit({ id, text, disabled }: { id: number; text: string;
   const unchanged = draft === text;
   const save = () => {
     if (blank || unchanged || update.isPending) return;
-    update.mutate({ id, text: draft }, { onSuccess: () => setEditing(false) });
+    update.mutate(
+      { id, text: draft },
+      {
+        onSuccess: (saved) => {
+          // Write the saved note into the caches before leaving edit mode, so the view never
+          // flashes the old text, and keeps the new one if the refetch that follows fails.
+          writeSavedNote(queryClient, saved);
+          setEditing(false);
+        },
+      },
+    );
   };
 
   if (!editing) {
