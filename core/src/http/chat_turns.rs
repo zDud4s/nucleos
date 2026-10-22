@@ -1157,7 +1157,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn count(state: &AppState, sql: &str) -> i64 {
+    async fn count(state: &AppState, sql: &'static str) -> i64 {
         sqlx::query_scalar(sql)
             .fetch_one(&state.pool)
             .await
