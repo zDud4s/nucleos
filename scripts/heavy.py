@@ -1909,11 +1909,31 @@ def _git(root: str, *args: str) -> bytes:
 
 
 def compute_fingerprint(argv: list[str], crate: Path, root: str, target_dir: str) -> str:
+    return fingerprint_pair(argv, crate, root, target_dir)[0]
+
+
+class _Both:
+    """Feeds two hashes at once: the fingerprint, and the same input without its argv part."""
+
+    def __init__(self) -> None:
+        self.full, self.state = hashlib.sha256(), hashlib.sha256()
+
+    def update(self, data: bytes, argv: bool = False) -> None:
+        self.full.update(data)
+        if not argv:
+            self.state.update(data)
+
+
+def fingerprint_pair(argv: list[str], crate: Path, root: str,
+                     target_dir: str) -> tuple[str, str]:
+    """(fingerprint, state). The state is everything the fingerprint covers but the argv: runs
+    at one state differ only in what they asked cargo for, and each one's artifacts stay valid
+    beside the others'. The fingerprint is the same digest it was before the split."""
     rel = os.path.relpath(_real(crate), _real(root)).replace("\\", "/")
     if rel.startswith(".."):
         raise ValueError("crate outside the worktree")
     paths = [rel, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo", "scripts"]
-    h = hashlib.sha256()
+    h = _Both()
     h.update(_git(root, "rev-parse", "HEAD").strip())
     h.update(b"\0diff\0")
     h.update(_git(root, "diff", "HEAD", "--binary", "--no-ext-diff", "--", *paths))
@@ -1926,12 +1946,12 @@ def compute_fingerprint(argv: list[str], crate: Path, root: str, target_dir: str
         except OSError:
             pass
         h.update(b"\0")
-    h.update(b"\0argv\0" + json.dumps(_fp_argv(argv)).encode("utf-8"))
+    h.update(b"\0argv\0" + json.dumps(_fp_argv(argv)).encode("utf-8"), argv=True)
     envs = {k: v for k, v in os.environ.items()
             if k == "RUSTFLAGS" or k.startswith(("CARGO_PROFILE_", "CARGO_FEATURES"))}
     h.update(b"\0env\0" + json.dumps(envs, sort_keys=True).encode("utf-8"))
     h.update(b"\0target\0" + target_dir.encode("utf-8"))
-    return h.hexdigest()
+    return h.full.hexdigest(), h.state.hexdigest()
 
 
 def _td_path(directory: Path, target_dir: str) -> Path:
@@ -1939,21 +1959,46 @@ def _td_path(directory: Path, target_dir: str) -> Path:
     return directory / "td" / (key + ".json")
 
 
-def registry_hit(directory: Path, target_dir: str, fingerprint: str, worktree: str) -> bool:
-    """The target dir was last written by this worktree at exactly this fingerprint."""
+# How many fingerprints a target dir keeps for its current state (one per argv run there).
+REGISTRY_KEEP = 16
+
+
+def _registry_read(directory: Path, target_dir: str) -> dict:
     try:
         rec = json.loads(_td_path(directory, target_dir).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
-    return (rec.get("fingerprint") == fingerprint
-            and _real(rec.get("worktree", "")) == _real(worktree))
+        return {}
+    return rec if isinstance(rec, dict) else {}
 
 
-def registry_write(directory: Path, target_dir: str, fingerprint: str, worktree: str) -> None:
+def registry_hit(directory: Path, target_dir: str, fingerprint: str, worktree: str) -> bool:
+    """The target dir was last written by this worktree, and a run there since its current
+    state began had exactly this fingerprint."""
+    rec = _registry_read(directory, target_dir)
+    prints = rec.get("fingerprints")
+    known = prints if isinstance(prints, list) else [rec.get("fingerprint")]
+    return fingerprint in known and _real(rec.get("worktree", "")) == _real(worktree)
+
+
+def registry_write(directory: Path, target_dir: str, fingerprint: str, worktree: str,
+                   state: str | None = None) -> None:
+    """Register a run. Same worktree and same state: its fingerprint joins the ones already
+    there (measured 2026-10-22: with one entry per target dir, a `test --lib` rerun after a
+    clippy in an unchanged tree missed and queued minutes at full weight). Anything else
+    starts the list over: a new state rebuilt what the old entries vouched for, and a revert
+    to an earlier state does not un-rebuild it."""
     path = _td_path(directory, target_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    prints = [fingerprint]
+    old = _registry_read(directory, target_dir)
+    if (state is not None and old.get("state") == state
+            and _real(old.get("worktree", "")) == _real(worktree)
+            and isinstance(old.get("fingerprints"), list)):
+        prints = [f for f in old["fingerprints"] if f != fingerprint][-(REGISTRY_KEEP - 1):]
+        prints.append(fingerprint)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps({"fingerprint": fingerprint, "worktree": worktree,
+    tmp.write_text(json.dumps({"fingerprint": fingerprint, "fingerprints": prints,
+                               "state": state, "worktree": worktree,
                                "target_dir": target_dir}), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -2316,7 +2361,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             try:
                 tdir = resolve_target_dir(argv, crate, root, os.getcwd(),
                                           str(slot_dir(cand)) if cand is not None else None)
-                fp = (crate, tdir, compute_fingerprint(argv, crate, root, tdir))
+                fp = (crate, tdir, *fingerprint_pair(argv, crate, root, tdir))
                 hit = registry_hit(directory, tdir, fp[2], root)
                 if hit and lock_hash is None and not in_held:
                     # A hit runs at weight 0, but it still touches the worktree's target dir:
@@ -2465,7 +2510,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                         fp is None or fp[1] != _real(inject)):
                     try:
                         tdir = resolve_target_dir(argv, crate, root, os.getcwd(), inject)
-                        fp = (crate, tdir, compute_fingerprint(argv, crate, root, tdir))
+                        fp = (crate, tdir, *fingerprint_pair(argv, crate, root, tdir))
                     except Exception as exc:
                         fp = None
                         sys.stderr.write(f"heavy: no fingerprint: {exc}\n")
@@ -2590,10 +2635,10 @@ def _record_fingerprint(directory: Path, fp, root: str, code: int, stats: dict) 
     """Register the fingerprint after a run that left a usable target dir: exit 0, or a
     test-only failure. Any other failure may have half-rewritten it, so the entry goes."""
     try:
-        _, tdir, fingerprint = fp
+        _, tdir, fingerprint, state = fp
         test_only = stats["test_failed"] and not stats["compile_error"]
         if code == 0 or test_only:
-            registry_write(directory, tdir, fingerprint, root)
+            registry_write(directory, tdir, fingerprint, root, state)
         else:
             registry_forget(directory, tdir)
     except Exception as exc:
