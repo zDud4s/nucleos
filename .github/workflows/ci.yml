@@ -179,9 +179,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Node 24 ships npm 11, the npm the lockfile is written with locally. npm 10 (Node 22) reads
-      # an npm 11 lockfile as out of sync -- bundled deps of @tailwindcss/oxide-wasm32-wasi -- and
-      # `npm ci` refuses it.
+      # Node 24, the major the shell is developed on. `npm ci` needs a lockfile written by a
+      # current npm: older npm 11 releases (11.6) drop the nested @emnapi entries of
+      # @tailwindcss/oxide-wasm32-wasi, and every newer npm then reads the lock as out of sync.
       - uses: actions/setup-node@v4
         with:
           node-version: 24
