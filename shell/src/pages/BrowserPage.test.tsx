@@ -146,6 +146,14 @@ function deferCreate(): () => void {
 }
 
 describe("BrowserPage", () => {
+  it("draws the page's actions at the end of the address row", async () => {
+    render(<BrowserPage actions={<button type="button">Archive</button>} />);
+    const address = await screen.findByRole("textbox", { name: "Address" });
+    const row = address.closest(".browser-toolbar");
+    expect(row).not.toBeNull();
+    expect(row!.lastElementChild!.textContent).toBe("Archive");
+  });
+
   it("creates an owner tab with a uuid and the placeholder bounds", async () => {
     render(<BrowserPage />);
     const tabId = await openTab();

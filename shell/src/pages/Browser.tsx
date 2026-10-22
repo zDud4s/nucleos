@@ -114,10 +114,10 @@ export function Browser({ embedded = false }: { embedded?: boolean } = {}) {
 }
 
 /**
- * The sessions tab's header (headline plus the sidecar's badge), for `WebTabs`, which keeps the
- * tab list outside both tabs. React Query dedups the queries it shares with the body.
+ * The standalone page's header (headline plus the sidecar's badge). React Query dedups the queries
+ * it shares with the body.
  */
-export function SessionsHeader() {
+function SessionsHeader() {
   const sessions = useBrowserSessions();
   const health = useBrowserHealth();
 

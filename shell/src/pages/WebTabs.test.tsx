@@ -22,17 +22,25 @@ beforeEach(() => {
   daemon.apiFetch.mockImplementation(daemonFetch(daemonState()));
 });
 
-vi.mock("./BrowserPage", () => ({ BrowserPage: () => <div data-testid="browser-page" /> }));
+// The page hands its panel toggles to the browser, which draws them at the end of its address row.
+vi.mock("./BrowserPage", () => ({
+  BrowserPage: ({ actions }: { actions?: import("react").ReactNode }) => (
+    <div data-testid="browser-page">{actions}</div>
+  ),
+}));
 
 const archiveToggle = () => screen.getByRole("button", { name: "Archive" });
 
 describe("the Web page split", () => {
-  it("renders one Web header with the browser as the main surface and no panel", async () => {
+  it("is the browser alone: a title for assistive technology, no header band, no panel", async () => {
     await renderApp({ initialPath: "/web" });
 
-    expect(await screen.findAllByRole("heading", { level: 1, name: "Web" })).toHaveLength(1);
+    const title = await screen.findByRole("heading", { level: 1, name: "Web" });
+    expect(title.classList.contains("sr-only")).toBe(true);
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    expect(await screen.findByTestId("browser-page")).toBeDefined();
+    expect(document.querySelector(".web-split .ui-page-header")).toBeNull();
+    const browser = await screen.findByTestId("browser-page");
+    expect(within(browser).getByRole("toolbar", { name: "Web panels" })).toBeDefined();
     expect(archiveToggle().getAttribute("aria-pressed")).toBe("false");
     expect(screen.queryByRole("complementary", { name: "Side panel" })).toBeNull();
   });

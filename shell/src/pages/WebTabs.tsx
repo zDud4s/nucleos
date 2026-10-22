@@ -1,14 +1,18 @@
 import { Navigate, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useState } from "react";
-import { useBrowserSessions } from "../data/browser";
-import { Count } from "../ui";
-import { Browser, SessionsHeader } from "./Browser";
+import { useBrowserHealth, useBrowserSessions } from "../data/browser";
+import { Count, StateBadge } from "../ui";
+import { Browser } from "./Browser";
 import { BrowserPage } from "./BrowserPage";
-import { Web, WebHeader } from "./Web";
+import { Web } from "./Web";
 
 /**
- * The Web page: the integrated browser is the main surface and the Archive (or the legacy
- * Sessions view) is a side panel beside it.
+ * The Web page: the integrated browser IS the page, and the Archive (or the legacy Sessions view)
+ * is a side panel beside it.
+ *
+ * There is no header band: the browser's tab strip is the first row, and the panel toggles sit at
+ * the end of its address bar. The page title stays for assistive technology only. The sidecar's
+ * state is drawn only when it is not `ok`, since a healthy pillar has nothing to say there.
  *
  * Routes are unchanged: /web is the browser alone, /web/archive and /web/pages/$pageId open the
  * browser with the Archive panel shown (the detail selected as before). /browser and
@@ -34,6 +38,8 @@ export function WebTabs() {
   const archiveOpen = webPanelOf(pathname) === "archive";
   const showSessions = sessionsOpen && !archiveOpen;
   const asking = (useBrowserSessions().data ?? []).filter((row) => row.mode === "wheel-requested").length;
+  const subsystem = useBrowserHealth().data?.subsystem ?? null;
+  const unwell = subsystem !== null && subsystem.status !== "ok";
 
   const toggleArchive = () => {
     setSessionsOpen(false);
@@ -44,26 +50,30 @@ export function WebTabs() {
     if (archiveOpen) void navigate({ to: "/web" });
   };
 
+  const panels = (
+    <div className="web-panel-toggles" role="toolbar" aria-label="Web panels">
+      {unwell ? <StateBadge domain="pillar" state={subsystem.status} /> : null}
+      <button type="button" className="web-panel-toggle" aria-pressed={archiveOpen} onClick={toggleArchive}>
+        Archive
+      </button>
+      <button type="button" className="web-panel-toggle" aria-pressed={showSessions} onClick={toggleSessions}>
+        Sessions
+        {asking > 0 && (
+          <>
+            {" "}
+            <Count n={asking} noun="asking" />
+          </>
+        )}
+      </button>
+    </div>
+  );
+
   return (
     <div className="web-split">
-      {archiveOpen ? <WebHeader /> : <SessionsHeader />}
-      <div className="web-split-toolbar" role="toolbar" aria-label="Web panels">
-        <button type="button" className="web-panel-toggle" aria-pressed={archiveOpen} onClick={toggleArchive}>
-          Archive
-        </button>
-        <button type="button" className="web-panel-toggle" aria-pressed={showSessions} onClick={toggleSessions}>
-          Sessions
-          {asking > 0 && (
-            <>
-              {" "}
-              <Count n={asking} noun="asking" />
-            </>
-          )}
-        </button>
-      </div>
+      <h1 className="sr-only">Web</h1>
       <div className="web-split-row">
         <div className="web-split-main">
-          <BrowserPage />
+          <BrowserPage actions={panels} />
         </div>
         <aside className="web-side" aria-label="Side panel" hidden={!archiveOpen && !showSessions}>
           <div hidden={!showSessions}>

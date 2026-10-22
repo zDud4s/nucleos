@@ -638,6 +638,9 @@ const SHOTS_TO_TAKE = [
   ["96-system-limits", { path: "/system/limits" }],
   ["97-system-backups", { path: "/system/backups" }],
   ["98-system-tokens", { path: "/system/tokens" }],
+  // The browser is the page: no native webview here, so the placeholder shows the area it gets.
+  ["99-web-browser", { path: "/web" }],
+  ["99a-web-browser-archive", { path: "/web/archive" }],
 ];
 
 const wanted = SHOTS_TO_TAKE.filter(([name]) => ONLY === undefined || name.includes(ONLY));

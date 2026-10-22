@@ -1,5 +1,5 @@
 // §spec pilar-de-browser
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ArrowLeft, ArrowRight, Bot, Lock, LockOpen, Plus, RotateCw, Square, X } from "lucide-react";
 import { useProjects } from "../data/system";
 import {
@@ -42,9 +42,10 @@ function message(error: unknown): string {
 /**
  * The integrated browser: a tab strip and toolbar in React, and a placeholder that the native
  * WebView2 child window is laid over. Tabs are kept per project; the native webviews survive
- * leaving the page, they are only hidden.
+ * leaving the page, they are only hidden. `actions` (the page's panel toggles) close the address
+ * row, so the browser's own bars are the only chrome the page has.
  */
-export function BrowserPage() {
+export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
   const projects = useProjects().data ?? [];
   const overlayOpen = useOverlayOpen();
   const [picked, setPicked] = useState<string | null>(null);
@@ -212,17 +213,6 @@ export function BrowserPage() {
   return (
     <section className="browser-page">
       <header className="browser-bar">
-        <Select
-          aria-label="Project"
-          value={project ?? ""}
-          onChange={(e) => switchProject(e.target.value)}
-        >
-          {projects.map((p) => (
-            <option key={p.project_id} value={p.project_id}>
-              {p.project_id}
-            </option>
-          ))}
-        </Select>
         <div className="browser-tabs" role="tablist">
           {current.tabs.map((tab) => (
             <div
@@ -258,6 +248,21 @@ export function BrowserPage() {
             disabled={project === null}
             onClick={() => project !== null && openTab(project, "about:blank")}
           />
+        </div>
+        <div className="browser-project">
+          <Select
+            density="sm"
+            mono
+            aria-label="Project"
+            value={project ?? ""}
+            onChange={(e) => switchProject(e.target.value)}
+          >
+            {projects.map((p) => (
+              <option key={p.project_id} value={p.project_id}>
+                {p.project_id}
+              </option>
+            ))}
+          </Select>
         </div>
       </header>
 
@@ -304,6 +309,7 @@ export function BrowserPage() {
             onChange={(e) => setDraft(e.target.value)}
           />
         </form>
+        {actions}
       </div>
 
       {error !== null ? <ErrorNote>{error}</ErrorNote> : null}
