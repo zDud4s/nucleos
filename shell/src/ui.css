@@ -1616,6 +1616,12 @@ ol.ui-well {
   border-bottom: 1px solid var(--border);
 }
 
+/* A header sitting directly on a tab strip: the strip's own bottom rule is the page's one rule. */
+.ui-page-header-unruled {
+  margin-bottom: 0;
+  border-bottom: 0;
+}
+
 .ui-page-header-text {
   display: flex;
   flex-direction: column;

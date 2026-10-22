@@ -283,10 +283,24 @@
   background: none;
 }
 
+/* A section title with its meta and links on the trailing side of the same line. */
+.ws-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+}
+
+.ws-section-head > :last-child {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding-inline: var(--space-4);
+}
+
 /* The way from the State readings to their trends; the bare anchor's colour, a quiet size. */
-.ws-trends {
-  display: inline-block;
-  margin-top: var(--space-2);
+.ws-trends-link {
   font-size: var(--text-sm);
 }
 
@@ -424,25 +438,6 @@ a.ws-lead-door:hover {
 
 .ws-lead .ws-foot {
   padding: 0 0 0 calc(var(--space-2) + var(--space-3));
-}
-
-/**
- * The exits, as two rows of one group: the reversible one, then the permanent one. They were bare
- * words under a title, the sentence between them at a different indent from either button.
- */
-.ws-leaving > * {
-  position: relative;
-  padding: var(--space-3) var(--space-4);
-}
-
-.ws-leaving > * + *::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: var(--space-4);
-  right: 0;
-  height: 1px;
-  background: var(--border);
 }
 
 /* ------------------------------------------------------------------ authority -- */
@@ -621,6 +616,25 @@ a.ws-lead-door:hover {
   min-height: 2rem;
 }
 
+/* The text `gh` printed: mono, scrolling at the cap, with no sunken fill of its own. */
+.ws-gh {
+  margin: 0;
+  max-height: var(--well-cap);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--text);
+  white-space: pre;
+}
+
+/* The one quiet line for operations this build does not allow. */
+.ws-outside {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 /* ------------------------------------------------------------------- controls -- */
 
 /*
@@ -628,6 +642,16 @@ a.ws-lead-door:hover {
   Each sits in a `Tip` root, so the rule is on that wrapper; it stretches so the tab's rule still
   reaches the strip's bottom line.
 */
+.ws-tabs {
+  /* The scroll container is `main.app-main`; the strip stays under the top edge, like `.ui-section-nav`. */
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  background: var(--bg);
+  /* The gap to the first panel; the header above has no margin of its own (`ruled={false}`). */
+  margin-bottom: var(--space-6);
+}
+
 .ws-tabs > .ws-tab-tip {
   flex: 0 0 auto;
   align-self: stretch;
@@ -1414,4 +1438,9 @@ button.ws-lead-door:hover {
 .ws-canvas-panel > .ws-atlas-detail {
   padding-right: var(--space-6);
   background: none;
+}
+
+/* An empty state sits flush with the section heading above it: the same double indent that `.ui-panel-body > .ui-teach` removes. */
+.ws-teach > .ui-teach {
+  padding-inline: 0;
 }

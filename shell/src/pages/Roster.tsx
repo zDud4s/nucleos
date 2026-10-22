@@ -52,8 +52,8 @@ import { plural } from "../lib/plural";
  * on the argument that the roster is where somebody compares projects and realises they are done
  * with one. A row that is one link has no room for a second control, and the stronger argument was
  * always the one `DeleteFolder` makes: the way out of a project belongs inside it, reached by
- * somebody who has already opened the one they mean. It lives in State's *Leaving* section now,
- * and the acknowledgement still lands here, because this is where the project is missing from.
+ * somebody who has already opened the one they mean. It lives in the project header's *More
+ * actions* menu now (`LeavingDialog`), and the acknowledgement still lands here, because this is where the project is missing from.
  */
 export function Roster() {
   const projects = useProjects();

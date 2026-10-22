@@ -146,9 +146,9 @@ export function Workflows({ projectId }: WorkflowsProps) {
  * opened (the daemon does not serve its absolute path, and the webview is not the authority on
  * where home is), so its path is offered to copy instead.
  *
- * The wrapper strips the teach block's inline padding. It is there for a Teach that is the whole of
- * a page; here it sits over a section whose heading starts flush, and the title began 20px to the
- * right of it — the same double indent `.ui-panel-body > .ui-teach` removes inside a panel.
+ * The `ws-teach` wrapper strips the teach block's inline padding (the shared rule in
+ * `workspace.css`, also used by Review): a Teach is built for a whole page, and here it sits over a
+ * section whose heading starts flush.
  */
 function NothingInstalled({ library }: { library: Bundle[] | undefined }) {
   const root = libraryRootOf(library);
@@ -162,7 +162,7 @@ function NothingInstalled({ library }: { library: Bundle[] | undefined }) {
     ) : undefined;
 
   return (
-    <div className="[&>.ui-teach]:px-0!">
+    <div className="ws-teach">
       <Teach title="No workflow is installed here" action={action}>
         {NO_WORKFLOW_MEANS}{" "}
         {empty ? (

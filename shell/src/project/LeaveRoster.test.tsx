@@ -51,10 +51,18 @@ async function openState(
   return { state, rendered };
 }
 
-/** The Leaving section's remove control, opened. */
+/** The header's `More actions` menu, opened (Radix opens on pointerdown, not on click). */
+async function openMenu() {
+  const trigger = await screen.findByRole("button", { name: "More actions" });
+  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+  fireEvent.click(trigger);
+  return trigger;
+}
+
+/** The remove panel, reached through the menu item and drawn in the shared modal. */
 async function openRemove(id: string) {
-  const leaving = await screen.findByRole("region", { name: "Leaving" });
-  fireEvent.click(await within(leaving).findByRole("button", { name: "remove from NucleOS…" }));
+  await openMenu();
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from NucleOS…" }));
   return within(await screen.findByRole("group", { name: `Remove ${id} from NucleOS` }));
 }
 
@@ -170,24 +178,16 @@ describe("leaving the roster, from inside the project", () => {
   });
 
   /**
-   * The toggle keeps its name, points at the panel it opened, leaves one `cancel` on screen, and gets focus back
-   * when the panel closes by `cancel` or Escape — a panel that unmounts with focus inside drops it
-   * to the body at the foot of the page.
+   * The panel leaves one `cancel` on screen, and focus goes back to the `More actions` button when
+   * it closes by `cancel` or Escape — a panel that unmounts with focus inside drops it to the body.
    */
   it("keeps one cancel on screen, and hands focus back on cancel and Escape", async () => {
     await openState("one", [fine("one")]);
-    const leaving = await screen.findByRole("region", { name: "Leaving" });
 
     await openRemove("one");
-    // The panel is a modal now, so the page under it, toggle included, is hidden from the a11y tree.
-    const toggle = within(leaving).getByRole("button", {
-      name: "remove from NucleOS…",
-      expanded: true,
-      hidden: true,
-    });
-    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    // The panel is a modal, so the page under it, the trigger included, is hidden from the a11y tree.
+    const trigger = screen.getByRole("button", { name: "More actions", hidden: true });
     const panel = screen.getByRole("group", { name: "Remove one from NucleOS" });
-    expect(toggle.getAttribute("aria-controls")).toBe(panel.id);
     // Exactly one `cancel` on screen, and it is the panel's.
     expect(screen.getAllByRole("button", { name: "cancel" })).toEqual([
       within(panel).getByRole("button", { name: "cancel" }),
@@ -199,20 +199,21 @@ describe("leaving the roster, from inside the project", () => {
 
     fireEvent.click(within(panel).getByRole("button", { name: "cancel" }));
     expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
-    await waitFor(() =>
-      expect(document.activeElement).toBe(
-        within(leaving).getByRole("button", { name: "remove from NucleOS…" }),
-      ),
-    );
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
 
     const again = await openRemove("one");
     fireEvent.keyDown(again.getByRole("button", { name: "cancel" }), { key: "Escape" });
     expect(screen.queryByRole("group", { name: "Remove one from NucleOS" })).toBeNull();
-    await waitFor(() =>
-      expect(document.activeElement).toBe(
-        within(leaving).getByRole("button", { name: "remove from NucleOS…" }),
-      ),
-    );
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  /** The panel is drawn by the shared modal, titled for what it does. */
+  it("opens the remove panel from the more actions menu, in the shared modal", async () => {
+    await openState("one", [fine("one")]);
+
+    await openRemove("one");
+    const dialog = await screen.findByRole("dialog", { name: "Remove from NucleOS" });
+    expect(within(dialog).getByRole("group", { name: "Remove one from NucleOS" })).toBeTruthy();
   });
 
   /** Gone, not disabled, over a roster nobody can vouch for. */
@@ -224,17 +225,17 @@ describe("leaving the roster, from inside the project", () => {
       }
       return undefined;
     });
-    const leaving = await screen.findByRole("region", { name: "Leaving" });
-    await within(leaving).findByRole("button", { name: "remove from NucleOS…" });
+    await screen.findByRole("button", { name: "More actions" });
 
     answering = false;
     await act(async () => {
       await rendered.queryClient.refetchQueries({ queryKey: keys.projects.all, exact: true });
     });
+    await openMenu();
     await waitFor(() =>
-      expect(within(leaving).queryByRole("button", { name: "remove from NucleOS…" })).toBeNull(),
+      expect(screen.queryByRole("menuitem", { name: "Remove from NucleOS…" })).toBeNull(),
     );
-    // The folder deletion is its own control and keeps its own rules.
-    expect(within(leaving).getByRole("button", { name: "delete this folder…" })).toBeTruthy();
+    // The folder deletion is its own item and keeps its own rules.
+    expect(screen.getAllByRole("menuitem", { name: "Delete this folder…" })).toHaveLength(1);
   });
 });

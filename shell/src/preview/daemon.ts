@@ -4012,7 +4012,7 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (route === "/vcs/declarable-ops") {
     return [
       { kind: "push", declarable: true },
-      { kind: "branch_delete", declarable: true },
+      { kind: "branch-delete", declarable: true },
     ] satisfies DeclarableGitOp[];
   }
 

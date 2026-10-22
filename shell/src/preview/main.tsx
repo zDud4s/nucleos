@@ -249,18 +249,30 @@ function shownText(node: Node): string {
  * stack as visible and takes both labels with it. A button with nothing visible
  * in it at all — an icon on its own — falls back to `textContent`, which is what
  * this always read.
+ *
+ * `[role="menuitem"]` reaches the entries of an open Radix menu (the workspace header's
+ * "More actions"). A trigger with `aria-haspopup="menu"` gets a `pointerdown` first,
+ * because Radix menus open on pointerdown and ignore a bare click.
  */
 function pressButton(name: string): boolean {
   // `[role="button"]` reaches a node of an SVG graph, which has no `<button>` to be.
-  const buttons = [...document.querySelectorAll('button, [role="button"]')];
+  const buttons = [...document.querySelectorAll('button, [role="button"], [role="menuitem"]')];
   const label = (one: Element) => {
     const shown = shownText(one).trim();
-    return shown === "" ? (one.textContent ?? "").trim() : shown;
+    if (shown !== "") return shown;
+    // An icon-only control (the header's `More actions`) shows no text: its accessible name is the label.
+    const aria = (one.getAttribute("aria-label") ?? "").trim();
+    return aria !== "" ? aria : (one.textContent ?? "").trim();
   };
   const wanted =
     buttons.find((one) => label(one) === name) ??
     buttons.find((one) => label(one).startsWith(name));
   if (wanted === undefined) return false;
+  if (wanted.getAttribute("aria-haspopup") === "menu") {
+    wanted.dispatchEvent(
+      new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerType: "mouse" }),
+    );
+  }
   // An SVG element has no `.click()`; a dispatched click reaches React the same way.
   wanted.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   return true;

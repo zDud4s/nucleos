@@ -6,11 +6,12 @@ import {
   useAnalytics,
   useQuotaHistory,
   type AnalyticsDays,
+  type AnalyticsSection,
   type AnalyticsReport,
   type QuotaHistory,
 } from "../data/analytics";
 import { clockText } from "../lib/when";
-import { ErrorNote, SectionNav, Segmented, Skeleton, StaleNote, StatCard } from "../ui";
+import { ErrorNote, Segmented, Skeleton, StaleNote, StatCard } from "../ui";
 import { DetailPanel, MetricCard, QuotaSection, TopRunsSection, metrics, unreachable, type MetricKey } from "./sections";
 import { PipelineSection } from "./PipelineSection";
 import { DevtimeSection } from "./DevtimeSection";
@@ -23,8 +24,9 @@ import "./analytics.css";
  * Analytics mode (`projectId` set, window in local state). Global breaks cost down by project and
  * adds quota; a project breaks it down by mode and has no quota (§9.8).
  *
- * The window is controlled when `days` and `onDaysChange` are passed (the page) and local otherwise
- * (the Workspace mode).
+ * The window and the section are each controlled when their value and change handler are passed
+ * (the page, which keeps both in the address) and local otherwise (the Workspace mode). One section
+ * is drawn at a time: Summary, Pipeline or Development time, chosen in the toolbar.
  *
  * Numbers first: four metric cards, each a button that opens its chart in the one detail panel
  * under them (spend by default, and always exactly one), then the costliest sessions and quota.
@@ -34,7 +36,15 @@ export interface AnalyticsViewProps {
   projectId?: string;
   days?: AnalyticsDays;
   onDaysChange?: (days: AnalyticsDays) => void;
+  section?: AnalyticsSection;
+  onSectionChange?: (section: AnalyticsSection) => void;
 }
+
+const SECTION_OPTIONS: { value: AnalyticsSection; label: string }[] = [
+  { value: "summary", label: "Summary" },
+  { value: "pipeline", label: "Pipeline" },
+  { value: "devtime", label: "Development time" },
+];
 
 /**
  * §9.6. The totals here and the autonomy ceiling's are built differently, on purpose. Behind the
@@ -43,33 +53,42 @@ export interface AnalyticsViewProps {
 const COVERAGE =
   "Every run counts here, in every mode. The global autonomy ceiling counts only some modes, so these totals can be higher than its. Run cost is dated by when a run finished; the ceiling dates it by when it started. The judge's cost is included as its own part, dated by its verdict.";
 
-export function AnalyticsView({ projectId, days: asked, onDaysChange }: AnalyticsViewProps) {
+export function AnalyticsView({ projectId, days: asked, onDaysChange, section: askedSection, onSectionChange }: AnalyticsViewProps) {
   const [local, setLocal] = useState<AnalyticsDays>(DEFAULT_DAYS);
   // Kept across a window change and a refetch: switching 30 to 7 days keeps the chart being read.
   const [open, setOpen] = useState<MetricKey>("cost");
   const days = asked ?? local;
   const choose = onDaysChange ?? setLocal;
+  const [localSection, setLocalSection] = useState<AnalyticsSection>("summary");
+  const section = askedSection ?? localSection;
+  const chooseSection = onSectionChange ?? setLocalSection;
   const global = projectId === undefined;
   const report = useAnalytics(projectId, days);
   const quota = useQuotaHistory(days, global);
   const data = report.data;
   const base = `an-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   const runsId = `${base}-runs`;
-  const pipelineId = `${base}-pipeline`;
-  const devtimeId = `${base}-devtime`;
 
   return (
     <div className="an-view">
       <div className="an-head">
         <Segmented
-          label="Window"
-          value={days}
-          options={WINDOWS.map((option) => ({ value: option, label: `${option} days` }))}
+          label="Section"
+          value={section}
+          options={SECTION_OPTIONS}
           onChange={(option) => {
-            if (option !== days) choose(option);
+            if (option !== section) chooseSection(option);
           }}
         />
         <div className="an-range">
+          <Segmented
+            label="Window"
+            value={days}
+            options={WINDOWS.map((option) => ({ value: option, label: `${option} days` }))}
+            onChange={(option) => {
+              if (option !== days) choose(option);
+            }}
+          />
           <p className="an-head-note">
             {data === undefined
               ? "days in UTC"
@@ -83,37 +102,31 @@ export function AnalyticsView({ projectId, days: asked, onDaysChange }: Analytic
           ) : null}
         </div>
       </div>
-      <SectionNav
-        label="Sections"
-        items={[
-          { id: runsId, label: "Summary" },
-          { id: pipelineId, label: "Pipeline" },
-          { id: devtimeId, label: "Development time" },
-        ]}
-      />
-      <section id={runsId} className="an-runs" aria-labelledby={`${runsId}-title`}>
-        <h2 id={`${runsId}-title`} className="an-runs-title">
-          Summary
-        </h2>
-        <Readout
-          data={data}
-          failed={report.isError}
-          missing={isApiRefusal(report.error) && report.error.status === 404}
-          updatedAt={report.dataUpdatedAt}
-          global={global}
-          quota={quota.data}
-          quotaFailed={quota.isError}
-          quotaUpdatedAt={quota.dataUpdatedAt}
-          open={open}
-          onOpen={setOpen}
-          onRetry={() => void report.refetch()}
-          onRetryQuota={() => void quota.refetch()}
-        />
-      </section>
+      {section === "summary" ? (
+        <section className="an-runs" aria-labelledby={`${runsId}-title`}>
+          <h2 id={`${runsId}-title`} className="an-runs-title">
+            Summary
+          </h2>
+          <Readout
+            data={data}
+            failed={report.isError}
+            missing={isApiRefusal(report.error) && report.error.status === 404}
+            updatedAt={report.dataUpdatedAt}
+            global={global}
+            quota={quota.data}
+            quotaFailed={quota.isError}
+            quotaUpdatedAt={quota.dataUpdatedAt}
+            open={open}
+            onOpen={setOpen}
+            onRetry={() => void report.refetch()}
+            onRetryQuota={() => void quota.refetch()}
+          />
+        </section>
+      ) : null}
       {/* Its own query and its own failure: the pipeline never goes down with the run analytics. */}
-      <PipelineSection projectId={projectId} days={days} anchor={pipelineId} />
+      {section === "pipeline" ? <PipelineSection projectId={projectId} days={days} /> : null}
       {/* Likewise development time. */}
-      <DevtimeSection projectId={projectId} days={days} anchor={devtimeId} />
+      {section === "devtime" ? <DevtimeSection projectId={projectId} days={days} /> : null}
     </div>
   );
 }

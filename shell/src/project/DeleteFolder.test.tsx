@@ -37,9 +37,18 @@ async function openEstado(overrides: Partial<DaemonState> = {}) {
   return { state, rendered };
 }
 
-/** The delete control, opened. */
+/** The header's `More actions` menu, opened (Radix opens on pointerdown, not on click). */
+async function openMenu() {
+  const trigger = await screen.findByRole("button", { name: "More actions" });
+  fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+  fireEvent.click(trigger);
+  return trigger;
+}
+
+/** The delete panel, reached through the menu item and drawn in the shared modal. */
 async function openDelete() {
-  fireEvent.click(await screen.findByRole("button", { name: "delete this folder…" }));
+  await openMenu();
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Delete this folder…" }));
   return within(await screen.findByRole("group", { name: "Delete nucleos's folder" }));
 }
 
@@ -258,12 +267,17 @@ describe("deleting a project's folder", () => {
     // `beforeEach`, because this is the only test in the file that reads the list at all.
     daemon.apiFetch.mockClear();
     await openEstado();
-    await screen.findByRole("button", { name: "delete this folder…" });
+    await screen.findByRole("button", { name: "More actions" });
 
     const asked = () => daemon.apiFetch.mock.calls.some((call) => String(call[0]).endsWith("/folder"));
     expect(asked()).toBe(false);
 
-    await openDelete();
+    // Opening the menu is not choosing the item: still nothing asked.
+    await openMenu();
+    await screen.findByRole("menuitem", { name: "Delete this folder…" });
+    expect(asked()).toBe(false);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete this folder…" }));
+    await screen.findByRole("group", { name: "Delete nucleos's folder" });
     await waitFor(() => expect(asked()).toBe(true));
   });
 
@@ -278,25 +292,34 @@ describe("deleting a project's folder", () => {
   it("moves focus to the warning on opening and back to the trigger on cancel", async () => {
     await openEstado();
     const panel = await openDelete();
+    const trigger = screen.getByRole("button", { name: "More actions", hidden: true });
 
     await waitFor(() =>
       expect(document.activeElement?.textContent).toMatch(/^This deletes .* Nothing here can undo it\.$/),
     );
 
     fireEvent.click(panel.getByRole("button", { name: "cancel" }));
-    await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "delete this folder…" })),
-    );
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
   });
 
   it("closes on Escape and hands focus back", async () => {
     await openEstado();
     const panel = await openDelete();
+    const trigger = screen.getByRole("button", { name: "More actions", hidden: true });
 
     fireEvent.keyDown(panel.getByLabelText("Type nucleos to confirm"), { key: "Escape" });
     await waitFor(() =>
       expect(screen.queryByRole("group", { name: "Delete nucleos's folder" })).toBeNull(),
     );
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "delete this folder…" }));
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
+  /** The panel is drawn by the shared modal, titled for what it does. */
+  it("opens the delete panel from the more actions menu, in the shared modal", async () => {
+    await openEstado();
+    await openDelete();
+
+    const dialog = await screen.findByRole("dialog", { name: "Delete this folder" });
+    expect(within(dialog).getByRole("group", { name: "Delete nucleos's folder" })).toBeTruthy();
   });
 });

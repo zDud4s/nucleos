@@ -30,6 +30,8 @@ export interface ModalProps {
    * body, else the first button in the footer, else Radix's own choice.
    */
   initialFocus?: RefObject<HTMLElement | null>;
+  /** Called as the dialog closes and focus would return to the trigger; `preventDefault()` to take it over. */
+  onCloseAutoFocus?: (event: Event) => void;
   children?: ReactNode;
 }
 
@@ -59,6 +61,7 @@ export function Modal({
   footer,
   size = "sm",
   initialFocus,
+  onCloseAutoFocus,
   children,
 }: ModalProps) {
   const content = useRef<HTMLDivElement>(null);
@@ -83,6 +86,7 @@ export function Modal({
           ref={content}
           className={`ui-modal ui-modal-${size}`}
           onOpenAutoFocus={focusFirst}
+          onCloseAutoFocus={onCloseAutoFocus}
           // Radix warns when there is no Description; omitting it is a legitimate choice here.
           {...(description === undefined ? { "aria-describedby": undefined } : {})}
         >

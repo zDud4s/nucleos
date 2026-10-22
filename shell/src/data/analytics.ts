@@ -230,7 +230,24 @@ export function useQuotaHistory(days: AnalyticsDays, enabled: boolean) {
  * The `/analytics` page's search params: `?days=` when it is a window the route serves, nothing
  * otherwise. Here rather than in the page so `router.tsx` can import it without loading the page.
  */
-export function validateAnalyticsSearch(search: Record<string, unknown>): { days?: AnalyticsDays } {
+export function validateAnalyticsSearch(search: Record<string, unknown>): {
+  days?: AnalyticsDays;
+  section?: AnalyticsSection;
+} {
   const days = parseDays(search.days);
-  return days === undefined ? {} : { days };
+  const section = parseSection(search.section);
+  return {
+    ...(days === undefined ? {} : { days }),
+    ...(section === undefined ? {} : { section }),
+  };
+}
+
+/** The sections the Analytics view draws, one at a time; the first is the one it opens on. */
+export const SECTIONS = ["summary", "pipeline", "devtime"] as const;
+export type AnalyticsSection = (typeof SECTIONS)[number];
+
+export function parseSection(value: unknown): AnalyticsSection | undefined {
+  return typeof value === "string" && (SECTIONS as readonly string[]).includes(value)
+    ? (value as AnalyticsSection)
+    : undefined;
 }

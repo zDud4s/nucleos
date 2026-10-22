@@ -481,6 +481,9 @@ const SHOTS_TO_TAKE = [
   /* The fourth mode, so the workspace can be looked at as the set of four it
      actually is rather than one page at a time. */
   ["35-workflows", { path: "/projects/alpha/workflows" }],
+  /* The fifth, which the set above left out: four tables of what this project's
+     autonomous runs may do, each with its own controls. */
+  ["35b-permissions", { path: "/projects/alpha/authority" }],
 
   /* The roster — every project at once, which is the page the workspace is
      reached from and the one surface of this pillar nothing had photographed. */
@@ -498,19 +501,21 @@ const SHOTS_TO_TAKE = [
      and the rail's own project rows, which the route opens inside a workspace. */
   ["37a-switcher-open", { path: "/fleet", press: "NucleOS" }],
   ["37b-rail-in-project", { path: "/projects/alpha/state" }],
-  /* The way out, open — inside the project now, in State's Leaving section, since
-     the roster's cards are one link each and carry no control. `bravo` because
-     it is the fixture with a record and nothing in flight, so the shot carries
-     the ordinary case: the folder reassurance, the counts, and the checkbox left
-     unticked. The name is kept so the before/after pair stays comparable. */
-  ["39-roster-remove", { path: "/projects/bravo/state", press: "remove from NucleOS…" }],
-  /* The other exit, just below it: the folder delete, at the foot of the same
-     State mode. `alpha` because it is the fixture
-     with work in flight AND uncommitted work — the panel says what would be
-     lost and why the button is off, which is the pair worth a picture. */
+  /* The way out, open — the workspace header's "More actions" menu, then its
+     "Remove from NucleOS…" entry. `bravo` because it is the fixture with a record
+     and nothing in flight, so the shot carries the ordinary case: the folder
+     reassurance, the counts, and the checkbox left unticked. The name is kept so
+     the before/after pair stays comparable. */
+  [
+    "39-roster-remove",
+    { path: "/projects/bravo/state", press: "More actions|Remove from NucleOS…" },
+  ],
+  /* The other exit, from the same header menu: the folder delete. `alpha` because
+     it is the fixture with work in flight AND uncommitted work — the panel says
+     what would be lost and why the button is off, which is the pair worth a picture. */
   [
     "40-delete-folder",
-    { path: "/projects/alpha/state", press: "delete this folder…" },
+    { path: "/projects/alpha/state", press: "More actions|Delete this folder…" },
   ],
 
   /* A door that is not the picture, which is what the row of views exists for:

@@ -30,7 +30,11 @@ import {
  * `failing` is read on every call rather than captured, so a test can let a route answer once and
  * then break it — which is the only way to reach "stale": a last good read, then a refusal.
  */
-async function openState(state: DaemonState, failing: Set<string> = new Set()) {
+async function openState(
+  state: DaemonState,
+  failing: Set<string> = new Set(),
+  path = "/projects/nucleos/state",
+) {
   const answer = daemonFetch(state);
   daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
     for (const prefix of failing) {
@@ -40,8 +44,11 @@ async function openState(state: DaemonState, failing: Set<string> = new Set()) {
   });
   daemon.apiText.mockImplementation(daemonText(state));
   daemon.probeHealth.mockResolvedValue(true);
-  return renderApp({ initialPath: "/projects/nucleos/state" });
+  return renderApp({ initialPath: path });
 }
+
+/** Where Mode, the ceiling and the action classes live now. */
+const AUTHORITY = "/projects/nucleos/authority";
 
 function settingsState(overrides: Partial<ReturnType<typeof project>> = {}): DaemonState {
   return daemonState({
@@ -84,7 +91,7 @@ describe("the mode switch says which mode is set", () => {
    */
   it("keeps focus on the segment that was pressed once it becomes the setting", async () => {
     const state = settingsState();
-    await openState(state);
+    await openState(state, new Set(), AUTHORITY);
 
     const off = await screen.findByRole("button", { name: "Turn off" });
     off.focus();
@@ -97,7 +104,11 @@ describe("the mode switch says which mode is set", () => {
   });
 
   it("a locked offer stays reachable and is described by why it is locked", async () => {
-    await openState(settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }));
+    await openState(
+      settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
+      new Set(),
+      AUTHORITY,
+    );
 
     const locked = await screen.findByRole("button", { name: "Let it act" });
     expect(locked.getAttribute("aria-disabled")).toBe("true");
@@ -106,7 +117,7 @@ describe("the mode switch says which mode is set", () => {
   });
 
   it("the three blocks are headings a screen reader can walk to", async () => {
-    await openState(settingsState());
+    await openState(settingsState(), new Set(), AUTHORITY);
     for (const name of ["Mode", "Open-proposal ceiling", "Action classes"]) {
       expect(await screen.findByRole("heading", { level: 3, name })).toBeTruthy();
     }
@@ -117,7 +128,7 @@ describe("the open-proposal ceiling", () => {
   /** The house pattern for a control that cannot be pressed now: reachable, described, inert. */
   it("an unavailable step is aria-disabled, described by the reading, and does nothing", async () => {
     const state = settingsState({ wip_limit: null, open_review_items: 2 });
-    await openState(state);
+    await openState(state, new Set(), AUTHORITY);
 
     const clear = await screen.findByRole("button", { name: "no ceiling" });
     expect((clear as HTMLButtonElement).disabled).toBe(false);
@@ -133,7 +144,7 @@ describe("the open-proposal ceiling", () => {
 
   it("keeps focus on the step that lowered the ceiling to zero", async () => {
     const state = settingsState({ wip_limit: 1, open_review_items: 0 });
-    await openState(state);
+    await openState(state, new Set(), AUTHORITY);
 
     const lower = await screen.findByRole("button", { name: "Lower the ceiling" });
     lower.focus();
@@ -145,14 +156,18 @@ describe("the open-proposal ceiling", () => {
   });
 
   it("says a write failed instead of leaving the old number to speak for it", async () => {
-    await openState(settingsState({ wip_limit: 3 }), new Set(["/projects/nucleos/wip-limit"]));
+    await openState(
+      settingsState({ wip_limit: 3 }),
+      new Set(["/projects/nucleos/wip-limit"]),
+      AUTHORITY,
+    );
 
     fireEvent.click(await screen.findByRole("button", { name: "Raise the ceiling" }));
     expect(await screen.findByText(/The ceiling was not changed/)).toBeTruthy();
   });
 
   it("names what it bounds, so it cannot be read as the worktree ceiling", async () => {
-    await openState(settingsState({ wip_limit: 3 }));
+    await openState(settingsState({ wip_limit: 3 }), new Set(), AUTHORITY);
     expect(await screen.findByText(/How many proposals may wait on you/)).toBeTruthy();
   });
 });
@@ -183,7 +198,7 @@ describe("the action classes", () => {
         },
       ],
     });
-    await openState(state);
+    await openState(state, new Set(), AUTHORITY);
 
     expect(await screen.findByText("5 of 5 classes clear the bar.")).toBeTruthy();
 
@@ -245,6 +260,19 @@ describe("the readings", () => {
 
     // Read once and not polled, so it says when.
     expect(within(readingsSection).getByText(/^Last 30 days, read at \d\d:\d\d\.$/)).toBeTruthy();
+  });
+
+  it("puts the reading time and the trends link on the Readings title line", async () => {
+    await openState(daemonState({ projects: [project({ project_id: "nucleos", mode: "shadow" })] }));
+
+    const region = await screen.findByRole("region", { name: "Readings" });
+    const heading = within(region).getByRole("heading", { level: 2, name: "Readings" });
+    const head = heading.closest(".ws-section-head") as HTMLElement | null;
+    expect(head).not.toBeNull();
+    expect(within(head as HTMLElement).getByRole("link", { name: "See trends" })).toBeTruthy();
+    expect(
+      await within(head as HTMLElement).findByText(/^Last 30 days, read at \d\d:\d\d\.$/),
+    ).toBeTruthy();
   });
 
   it("leads from the readings to their trends, in this project's Analytics mode", async () => {

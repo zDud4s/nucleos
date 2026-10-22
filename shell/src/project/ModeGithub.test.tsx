@@ -6,6 +6,7 @@ import {
   DECLARED_ON,
   daemonFetch,
   daemonState,
+  project,
   readOutcome,
   renderWithQuery,
   shellRule,
@@ -59,6 +60,22 @@ async function pressTwice(scope: HTMLElement, name: string, armed: string | RegE
   fireEvent.click(within(scope).getByRole("button", { name }));
   await afterDwell();
   fireEvent.click(within(scope).getByRole("button", { name: armed }));
+}
+
+/**
+ * Open the rule form, which stays closed behind `add a rule` until it is asked for.
+ *
+ * Waits for the button, because the section draws it only once its lists have been read.
+ */
+async function openRuleForm(): Promise<HTMLElement> {
+  fireEvent.click(await screen.findByRole("button", { name: "add a rule" }));
+  return screen.getByRole("form", { name: "Add a rule" });
+}
+
+/** Open the landing target form, closed behind `add a landing target` until asked for. */
+async function openTargetForm(): Promise<HTMLElement> {
+  fireEvent.click(await screen.findByRole("button", { name: "add a landing target" }));
+  return screen.getByRole("form", { name: "Add a landing target" });
 }
 
 /** Mount the mode over a daemon holding exactly these declarations. */
@@ -118,27 +135,75 @@ describe("what runs on its own", () => {
    * rule forbids. A disabled control still says "this is a switch, and it is off" — the truth is
    * that there is no switch.
    */
-  it("draws an operation outside the ceiling as a fact with no control at all", async () => {
+  it("folds the operations this build does not allow into one quiet line", async () => {
     open();
 
-    const row = await screen.findByRole("listitem", { name: "operation api_read" });
+    const admitted = await screen.findByRole("listitem", { name: "operation run_list" });
 
-    // Its name is there — omitting it would claim this daemon cannot do it at all, which is the
-    // other bad answer the catalogue's `declarable` flag exists to avoid.
-    expect(row.textContent).toContain("api_read");
-    expect(row.textContent).toContain("not allowed by this build");
+    // Neither undeclared operation outside the ceiling keeps a row of its own: a row is a place to
+    // act, and there is nothing to do with these.
+    expect(screen.queryByRole("listitem", { name: "operation api_read" })).toBeNull();
+    expect(screen.queryByRole("listitem", { name: "operation run_logs" })).toBeNull();
 
-    // And nothing in it can be pressed, ticked or focused. Not "is disabled" — absent.
-    expect(within(row).queryByRole("checkbox")).toBeNull();
-    expect(within(row).queryByRole("button")).toBeNull();
-    expect(within(row).queryByRole("switch")).toBeNull();
-    expect(row.querySelector("input")).toBeNull();
-    expect(row.querySelector("button")).toBeNull();
+    // They become one line at the end of the group, ids in mono and nothing inside it to press.
+    const region = screen.getByRole("region", { name: "GitHub operations without asking" });
+    const outside = region.querySelectorAll(".ws-outside");
+    expect(outside).toHaveLength(1);
+    const line = outside[0] as HTMLElement;
+    expect(line.textContent).toContain("not allowed by this build");
+    const mono = [...line.querySelectorAll("span.font-mono")].map((span) => span.textContent);
+    expect(mono).toContain("run_logs");
+    expect(mono).toContain("api_read");
+    expect(line.querySelector("button")).toBeNull();
+    expect(line.querySelector("input")).toBeNull();
 
-    // The comparison that gives the assertion its teeth: an operation the ceilings DO admit gets
-    // the control this one is denied, from the same list and the same renderer.
-    const admitted = screen.getByRole("listitem", { name: "operation run_list" });
+    // The comparison that gives the assertion its teeth: an operation the ceilings DO admit keeps
+    // the control the folded ones are denied, from the same list.
     expect(within(admitted).getByRole("button", { name: "grant" })).toBeDefined();
+  });
+
+  /**
+   * Operations the page names in words, not by their ids.
+   *
+   * The two kinds added to the fixtures are the ones a person would otherwise meet as
+   * `pr_merge` and `branch_delete`.
+   */
+  it("names every operation in words, merge a pull request and delete a branch included", async () => {
+    open({
+      declarableOps: [
+        { kind: "pr_list", half: "read", declarable: true },
+        { kind: "run_list", half: "read", declarable: true },
+        { kind: "run_logs", half: "read", declarable: false },
+        { kind: "pr_comment", half: "action", declarable: true },
+        { kind: "api_read", half: "action", declarable: false },
+        { kind: "pr_merge", half: "action", declarable: true },
+      ],
+      declarableGitOps: [...GIT_CATALOGUE, { kind: "branch_delete", declarable: true }],
+    });
+
+    const merge = await screen.findByRole("listitem", { name: "operation pr_merge" });
+    const del = await screen.findByRole("listitem", { name: "git operation branch_delete" });
+    const mergeName = merge.querySelector(".ws-item-name") as HTMLElement;
+    const delName = del.querySelector(".ws-item-name") as HTMLElement;
+    expect(mergeName.textContent).toBe("merge a pull request");
+    expect(delName.textContent).toBe("delete a branch");
+    // A person's words, so not the mono face the ids are set in.
+    expect(mergeName.classList.contains("font-mono")).toBe(false);
+    expect(delName.classList.contains("font-mono")).toBe(false);
+
+    // And every other row of the two lists carries a name of the same kind.
+    const rows = [
+      ...screen.getAllByRole("listitem", { name: /^operation / }),
+      ...screen.getAllByRole("listitem", { name: /^git operation / }),
+    ];
+    expect(rows.length).toBeGreaterThan(2);
+    for (const row of rows) {
+      const name = row.querySelector(".ws-item-name") as HTMLElement | null;
+      expect(name, row.getAttribute("aria-label") ?? "").not.toBeNull();
+      // A sentence of words: never an id, and an id is what carries the underscore.
+      expect(name?.textContent ?? "").toMatch(/^[^_]+$/);
+      expect(name?.classList.contains("font-mono")).toBe(false);
+    }
   });
 
   /**
@@ -424,7 +489,7 @@ describe("what the worktrees may run", () => {
 
     // The section's heading is on screen before its query answers, so the rule is read only once
     // the lists themselves are — otherwise this asserts against "Reading this project's rules…".
-    await screen.findByLabelText("Command prefix");
+    await openRuleForm();
     const said =
       screen.getByRole("region", { name: "What the worktrees may run" }).textContent ?? "";
 
@@ -451,7 +516,8 @@ describe("what the worktrees may run", () => {
   it("previews what the núcleo will store for a prefix somebody is typing", async () => {
     open();
 
-    const box = await screen.findByLabelText("Command prefix");
+    await openRuleForm();
+    const box = screen.getByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "Remove-Item  -Recurse" } });
 
     const preview = screen.getByText(/stored and enforced as/i);
@@ -537,7 +603,8 @@ describe("what the worktrees may run", () => {
   it("warns that re-declaring with an empty note erases the one on the rule", async () => {
     open({ shellRules: [shellRule({ prefix: "npm ci", note: "the gate needs it" })] });
 
-    const box = await screen.findByLabelText("Command prefix");
+    await openRuleForm();
+    const box = screen.getByLabelText("Command prefix");
     // Typed in the spelling the table does NOT hold: identity is the folded prefix, so the form
     // has to fold before it looks or it offers to "create" a rule that already exists.
     fireEvent.change(box, { target: { value: "NPM  CI" } });
@@ -565,7 +632,8 @@ describe("what the worktrees may run", () => {
       "as a `deny` it would be enforced.";
     open({ policyRefusal: { status: 422, code: "unmatchable_prefix", detail } });
 
-    const box = await screen.findByLabelText("Command prefix");
+    await openRuleForm();
+    const box = screen.getByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "ls | sh" } });
     await pressTwice(document.body, "allow it here", "allow without asking · ls | sh");
 
@@ -587,7 +655,8 @@ describe("what the worktrees may run", () => {
   it("says a refusal would still land when the stop blocks an allow", async () => {
     open({ policyRefusal: { status: 423, code: "kill_switch", detail: "" } });
 
-    const box = await screen.findByLabelText("Command prefix");
+    await openRuleForm();
+    const box = screen.getByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "bash scripts/gates.sh" } });
     await pressTwice(document.body, "allow it here", "allow without asking · bash scripts/gates.sh");
 
@@ -619,7 +688,8 @@ describe("what the worktrees may run", () => {
       ],
     });
 
-    fireEvent.change(await screen.findByLabelText("What this rule is about"), {
+    await openRuleForm();
+    fireEvent.change(screen.getByLabelText("What this rule is about"), {
       target: { value: "Edit" },
     });
     fireEvent.change(screen.getByLabelText("Path prefix"), { target: { value: "migrations" } });
@@ -682,7 +752,8 @@ describe("what the worktrees may run", () => {
   it("takes the allow away when the rule is about a tool, and says why", async () => {
     open();
 
-    const kind = await screen.findByLabelText("What this rule is about");
+    await openRuleForm();
+    const kind = screen.getByLabelText("What this rule is about");
     expect(screen.getByRole("button", { name: "allow it here" })).toBeDefined();
 
     fireEvent.change(kind, { target: { value: "Edit" } });
@@ -709,7 +780,8 @@ describe("what the worktrees may run", () => {
   it("previews a path in the spelling it will be stored under, case and all", async () => {
     open();
 
-    fireEvent.change(await screen.findByLabelText("What this rule is about"), {
+    await openRuleForm();
+    fireEvent.change(screen.getByLabelText("What this rule is about"), {
       target: { value: "Write" },
     });
     fireEvent.change(screen.getByLabelText("Path prefix"), {
@@ -735,7 +807,8 @@ describe("what the worktrees may run", () => {
       "is no allow side for it to reach. Declared as a `deny` the same path WOULD be enforced.";
     open({ policyRefusal: { status: 422, code: "unenforceable_allow", detail } });
 
-    fireEvent.change(await screen.findByLabelText("What this rule is about"), {
+    await openRuleForm();
+    fireEvent.change(screen.getByLabelText("What this rule is about"), {
       target: { value: "Edit" },
     });
     fireEvent.change(screen.getByLabelText("Path prefix"), { target: { value: ".ai" } });
@@ -874,7 +947,8 @@ describe("where the work lands", () => {
   it("adds a target and reads it back", async () => {
     const state = open();
 
-    const box = await screen.findByLabelText("Branch");
+    await openTargetForm();
+    const box = screen.getByLabelText("Branch");
     fireEvent.change(box, { target: { value: "release/next" } });
     fireEvent.click(screen.getByRole("button", { name: "add" }));
 
@@ -885,7 +959,8 @@ describe("where the work lands", () => {
   it("adds a target when Enter is pressed in the field", async () => {
     const state = open();
 
-    const box = await screen.findByLabelText("Branch");
+    await openTargetForm();
+    const box = screen.getByLabelText("Branch");
     fireEvent.change(box, { target: { value: "release/next" } });
     fireEvent.submit(box.closest("form") as HTMLFormElement);
 
@@ -1022,6 +1097,20 @@ describe("the remote", () => {
     expect(printed[0].textContent).toBe("#41\tthe queue lands\tfeat/land\tabout 2 hours ago");
     expect(printed[1].textContent).toBe(
       "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s",
+    );
+  });
+
+  /** The listings are plain text on the page, not output in a dark terminal well. */
+  it("draws the gh listings without a terminal well", async () => {
+    open();
+
+    const section = await remote();
+    expect(document.body.querySelectorAll(".ui-well")).toHaveLength(0);
+    expect(section.querySelectorAll(".ui-well")).toHaveLength(0);
+    expect(section.querySelectorAll("pre.ws-gh")).toHaveLength(2);
+    // The text itself is unchanged by the new container.
+    expect(section.querySelectorAll("pre.ws-gh")[0].textContent).toBe(
+      "#41\tthe queue lands\tfeat/land\tabout 2 hours ago",
     );
   });
 
@@ -1300,12 +1389,14 @@ describe("the page as a whole", () => {
     expect(standing.textContent).toMatch(/no cache and no restart/i);
   });
 
-  it("draws the five sections in the order the designs fix", async () => {
-    open();
+  it("draws Autonomy first, then the five sections in the order the designs fix", async () => {
+    open({ projects: [project({ project_id: "nucleos", mode: "shadow" })] });
 
     await screen.findByRole("region", { name: "The remote" });
+    await screen.findByRole("region", { name: "Autonomy" });
     expect(screen.getAllByRole("region").map((region) => region.getAttribute("aria-label"))).toEqual(
       [
+        "Autonomy",
         "The remote",
         "GitHub operations without asking",
         "Git operations the queue may perform",
@@ -1313,6 +1404,164 @@ describe("the page as a whole", () => {
         "Where the work lands",
       ],
     );
+  });
+});
+
+describe("Autonomy, on top of the page", () => {
+  /** The mode, the open-proposal ceiling and the action classes are authored here now. */
+  it("Autonomy holds the mode, the open-proposal ceiling and the action classes", async () => {
+    open({ projects: [project({ project_id: "nucleos", mode: "shadow" })] });
+
+    const region = await screen.findByRole("region", { name: "Autonomy" });
+    expect(await within(region).findByRole("button", { name: "Let it act" })).toBeDefined();
+    expect(within(region).getByRole("heading", { name: /Mode/ })).toBeDefined();
+    expect(within(region).getByRole("heading", { name: /ceiling/i })).toBeDefined();
+    expect(within(region).getByRole("heading", { name: "Action classes" })).toBeDefined();
+  });
+});
+
+describe("the forms stay closed until they are asked for", () => {
+  it("keeps the add a rule form closed until it is asked for", async () => {
+    open();
+
+    const button = await screen.findByRole("button", { name: "add a rule" });
+    expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull();
+
+    fireEvent.click(button);
+    const form = screen.getByRole("form", { name: "Add a rule" });
+
+    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
+    expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull();
+    expect(screen.getByRole("button", { name: "add a rule" })).toBeDefined();
+  });
+
+  it("keeps the add a landing target form closed until it is asked for", async () => {
+    open();
+
+    const button = await screen.findByRole("button", { name: "add a landing target" });
+    expect(screen.queryByRole("form", { name: "Add a landing target" })).toBeNull();
+
+    fireEvent.click(button);
+    const form = screen.getByRole("form", { name: "Add a landing target" });
+
+    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
+    expect(screen.queryByRole("form", { name: "Add a landing target" })).toBeNull();
+    expect(screen.getByRole("button", { name: "add a landing target" })).toBeDefined();
+  });
+
+  /** What was typed is the owner's work, and a refusal must not throw it away. */
+  it("keeps the rule form open, with what was typed, when the núcleo refuses it", async () => {
+    const detail = "`ls | sh` can never be allowed: the permission would be stored and never fire.";
+    open({ policyRefusal: { status: 422, code: "unmatchable_prefix", detail } });
+
+    await openRuleForm();
+    const box = screen.getByLabelText<HTMLInputElement>("Command prefix");
+    fireEvent.change(box, { target: { value: "ls | sh" } });
+    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+
+    expect(await screen.findByText(detail)).toBeDefined();
+    expect(screen.getByRole("form", { name: "Add a rule" })).toBeDefined();
+    expect(screen.getByLabelText<HTMLInputElement>("Command prefix").value).toBe("ls | sh");
+  });
+
+  it("closes the rule form once the rule is stored", async () => {
+    const state = open();
+
+    await openRuleForm();
+    fireEvent.change(screen.getByLabelText("Command prefix"), { target: { value: "git push" } });
+    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+
+    await waitFor(() => expect(state.shellRules).toHaveLength(1));
+    await waitFor(() => expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull());
+
+    // And the rule is in the list it belongs in.
+    const refused = await screen.findByRole("listitem", { name: "rule git push" });
+    expect(refused.closest("div")?.textContent).toContain("Refused");
+  });
+
+  it("moves focus into the rule form when it opens, and back to add a rule when it is cancelled", async () => {
+    open();
+
+    const form = await openRuleForm();
+    await waitFor(() => expect(form.contains(document.activeElement)).toBe(true));
+    expect(document.activeElement).not.toBe(document.body);
+
+    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
+    const back = await screen.findByRole("button", { name: "add a rule" });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+  });
+
+  it("hands focus back to add a rule once the rule is stored", async () => {
+    const state = open();
+
+    await openRuleForm();
+    fireEvent.change(screen.getByLabelText("Command prefix"), { target: { value: "git push" } });
+    fireEvent.click(screen.getByRole("button", { name: "refuse it here" }));
+
+    await waitFor(() => expect(state.shellRules).toHaveLength(1));
+    await waitFor(() => expect(screen.queryByRole("form", { name: "Add a rule" })).toBeNull());
+    const back = await screen.findByRole("button", { name: "add a rule" });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+  });
+
+  it("moves focus into the landing target form when it opens, and back when it is cancelled", async () => {
+    open();
+
+    const form = await openTargetForm();
+    await waitFor(() => expect(form.contains(document.activeElement)).toBe(true));
+    expect(document.activeElement).not.toBe(document.body);
+
+    fireEvent.click(within(form).getByRole("button", { name: "cancel" }));
+    const back = await screen.findByRole("button", { name: "add a landing target" });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+  });
+
+  it("hands focus back to add a landing target once the target is added", async () => {
+    const state = open();
+
+    await openTargetForm();
+    fireEvent.change(screen.getByLabelText("Branch"), { target: { value: "release/next" } });
+    fireEvent.click(screen.getByRole("button", { name: "add" }));
+
+    await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: "Add a landing target" })).toBeNull(),
+    );
+    const back = await screen.findByRole("button", { name: "add a landing target" });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+  });
+
+  it("says so when every operation of a group is outside this build, instead of an empty group", async () => {
+    open({
+      declarableOps: [
+        { kind: "pr_list", half: "read", declarable: false },
+        { kind: "run_list", half: "read", declarable: false },
+        { kind: "pr_comment", half: "action", declarable: true },
+      ],
+    });
+
+    // The Actions group still has a row, so the section has drawn by the time it is found.
+    await screen.findByRole("listitem", { name: "operation pr_comment" });
+    const title = screen.getByRole("heading", { name: "Reads" });
+    const group = title.closest(".ui-panel-inset") as HTMLElement;
+
+    // The group keeps its title, holds no row, and says why in one quiet sentence of its own.
+    expect(within(group).queryAllByRole("listitem")).toHaveLength(0);
+    expect(group.textContent).toMatch(/none of these is allowed by this build/i);
+  });
+
+  it("closes the landing target form once the target is added", async () => {
+    const state = open();
+
+    await openTargetForm();
+    fireEvent.change(screen.getByLabelText("Branch"), { target: { value: "release/next" } });
+    fireEvent.click(screen.getByRole("button", { name: "add" }));
+
+    await waitFor(() => expect(state.landTargets).toEqual(["release/next"]));
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: "Add a landing target" })).toBeNull(),
+    );
+    expect(await screen.findByRole("listitem", { name: "land target release/next" })).toBeDefined();
   });
 });
 
@@ -1364,7 +1613,7 @@ describe("the answer at the top, and the gestures that widen", () => {
    * The listing is still `gh`'s text, byte for byte — the line is marked, never re-laid out — and
    * the verdict is said once above it and once on the status line.
    */
-  it("makes a CI run that did not succeed stand out, without rewriting gh's text", async () => {
+  it("says how many CI runs did not succeed in the group title, with no banner", async () => {
     const printed =
       "completed\tfailure\tCI\tmaster\tpush\t9812346\t2m02s\n" +
       "completed\tsuccess\tCI\tmaster\tpush\t9812345\t1m20s";
@@ -1376,9 +1625,16 @@ describe("the answer at the top, and the gestures that widen", () => {
     });
 
     const section = await screen.findByRole("region", { name: "The remote" });
-    await waitFor(() => expect(section.textContent).toMatch(/1 of the 2 listed runs did not succeed/));
+    // The count lives in the group's own title, and nowhere else as a banner.
+    expect(
+      await within(section).findByRole("heading", {
+        level: 3,
+        name: "The last CI runs · 1 of 2 did not succeed",
+      }),
+    ).toBeDefined();
+    expect(section.textContent).not.toMatch(/listed runs did not succeed/);
 
-    const pres = section.querySelectorAll("pre");
+    const pres = section.querySelectorAll("pre.ws-gh");
     expect(pres[1].textContent).toBe(printed);
     const marked = pres[1].querySelectorAll("mark");
     expect(marked).toHaveLength(1);
@@ -1409,7 +1665,8 @@ describe("the answer at the top, and the gestures that widen", () => {
   it("declares a refusal when Enter is pressed in the prefix", async () => {
     const state = open();
 
-    const box = await screen.findByLabelText("Command prefix");
+    await openRuleForm();
+    const box = screen.getByLabelText("Command prefix");
     fireEvent.change(box, { target: { value: "git push --force" } });
     fireEvent.submit(box.closest("form") as HTMLFormElement);
 

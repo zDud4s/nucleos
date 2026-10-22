@@ -40,4 +40,17 @@ describe("validateAnalyticsSearch", () => {
     expect(validateAnalyticsSearch({ days: "14" })).toEqual({});
     expect(validateAnalyticsSearch({})).toEqual({});
   });
+
+  it("keeps a section the page knows and drops anything else", () => {
+    expect(validateAnalyticsSearch({ section: "pipeline" })).toEqual({ section: "pipeline" });
+    expect(validateAnalyticsSearch({ section: "summary" })).toEqual({ section: "summary" });
+    expect(validateAnalyticsSearch({ section: "devtime" })).toEqual({ section: "devtime" });
+    expect(validateAnalyticsSearch({ section: "bogus" })).toEqual({});
+    expect(validateAnalyticsSearch({ section: 3 })).toEqual({});
+  });
+
+  it("validates the section and the window independently", () => {
+    expect(validateAnalyticsSearch({ days: "7", section: "devtime" })).toEqual({ days: 7, section: "devtime" });
+    expect(validateAnalyticsSearch({ days: "14", section: "pipeline" })).toEqual({ section: "pipeline" });
+  });
 });
