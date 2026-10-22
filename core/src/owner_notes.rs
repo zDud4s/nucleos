@@ -12,6 +12,10 @@
 
 use sqlx::SqlitePool;
 
+pub mod embeddings;
+pub mod related;
+pub mod review;
+
 /// Where a note was written from. Checked before the insert.
 pub const ORIGINS: [&str; 1] = ["shell"];
 
@@ -96,6 +100,8 @@ pub async fn create(pool: &SqlitePool, text: &str, origin: &str) -> Result<i64, 
     let mut tx = pool.begin().await?;
     let id = insert_note_in(&mut tx, text, origin).await?;
     tx.commit().await?;
+    // Best-effort and asynchronous: the embedder is woken, never awaited.
+    embeddings::nudge();
     Ok(id)
 }
 
@@ -244,6 +250,9 @@ pub async fn update(
         record(&mut tx, id, kind, None, &at).await?;
     }
     tx.commit().await?;
+    if new_text.is_some() {
+        embeddings::nudge();
+    }
     get(pool, id).await
 }
 
@@ -1343,6 +1352,25 @@ mod tests {
         assert!(production_code(&helper_first).contains(&needle));
     }
 
+    /// Whether a `source_scan::module_path` names a file below this module's own directory. The
+    /// sweep skips these by that prefix and nothing else.
+    fn is_owner_notes_submodule(module_path: &str) -> bool {
+        module_path.starts_with("owner_notes/")
+    }
+
+    #[test]
+    fn the_sweep_skips_owner_notes_submodules_by_prefix_only() {
+        assert!(is_owner_notes_submodule("owner_notes/embeddings.rs"));
+        assert!(is_owner_notes_submodule("owner_notes/deeper/x.rs"));
+        // The module file itself is allowed by name, not by this prefix.
+        assert!(!is_owner_notes_submodule("owner_notes.rs"));
+        // A look-alike sibling, or the name further down a path, is scanned like any other file.
+        assert!(!is_owner_notes_submodule("owner_notes_extra/x.rs"));
+        assert!(!is_owner_notes_submodule("owner_notes_x.rs"));
+        assert!(!is_owner_notes_submodule("council/owner_notes/x.rs"));
+        assert!(!is_owner_notes_submodule("brief.rs"));
+    }
+
     /// The guard below scans production code only: a test module may read the notes table to
     /// assert behaviour (D4 is about production reach, not about what a test inspects).
     #[test]
@@ -1381,6 +1409,10 @@ mod tests {
             }
             // `http.rs`'s children are the same door, split by route family.
             if crate::source_scan::module_path(&path).starts_with("http/") {
+                continue;
+            }
+            // The submodules of this module (`owner_notes/embeddings.rs`, ...) are this module.
+            if is_owner_notes_submodule(&crate::source_scan::module_path(&path)) {
                 continue;
             }
             // An out-of-line `#[cfg(test)] mod x;` is test code from its first line.

@@ -991,6 +991,10 @@ async fn main() {
     ));
     // The distiller: turns closed jobs queued by the job loop and the vcs queue into learnings.
     tokio::spawn(distill::run_distill_loop(state.clone()));
+    // The owner's notes: the embedding backfill (best-effort, woken by every create/edit) and the
+    // once-a-week review message. Neither blocks a note write or reaches a prompt.
+    tokio::spawn(owner_notes::embeddings::run_loop(state.clone()));
+    tokio::spawn(owner_notes::review::run_weekly_loop(state.clone()));
     // Its own loop: the cadence is file I/O over the transcripts directory, independent of runs.
     let devtime_projects_dir = if devtime_config.projects_dir.trim().is_empty() {
         commands::home().map(|home| home.join(".claude").join("projects"))
