@@ -113,6 +113,9 @@ windows-sys = { version = "0.61.2", features = [
 libc = "0.2"
 
 [dev-dependencies]
+# The fixtures this crate's own tests read from the base (`testdb`, `storage::TempDb`). A crate above
+# turning `testkit` on hides a missing line here, so `cargo test -p nucleos-core` alone is the check.
+nucleos-base = { path = "crates/nucleos-base", features = ["testkit"] }
 tempfile = "3.27.0"
 sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
 # `tokio::time::pause` / `start_paused` for the admission book's clock tests.
