@@ -38,8 +38,8 @@ func TestIndexLoads(t *testing.T) {
 	if idx.ContractVersion != "1.0.0" {
 		t.Errorf("contract_version = %q, want 1.0.0", idx.ContractVersion)
 	}
-	if got := len(idx.Fixtures); got != 115 {
-		t.Errorf("fixtures = %d, want 115", got)
+	if got := len(idx.Fixtures); got != 116 {
+		t.Errorf("fixtures = %d, want 116", got)
 	}
 	if got := len(idx.Tags); got != 28 {
 		t.Errorf("tags = %d, want 28", got)
