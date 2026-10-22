@@ -1049,3 +1049,639 @@ pub(super) async fn get_assistant_live_stream(
     )
         .into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Browser agents and chat links (`/assistant/browser-agents`, `/assistant/chats/{id}/link`).
+    //!
+    //! The mother's turn is a `running` row written by SQL, never sent through
+    //! `assistant::send_message`: that would hold the mother's `ChatSlot` for a turn nobody
+    //! finishes, and these routes only need the row the header names.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    async fn state() -> AppState {
+        super::super::tests::test_state().await
+    }
+
+    /// One request through the real router: optional `RUN_ID_HEADER`, optional JSON body.
+    async fn call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        run_id: Option<i64>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", "Bearer test-token");
+        if let Some(run_id) = run_id {
+            request = request.header(crate::daemon_client::RUN_ID_HEADER, run_id.to_string());
+        }
+        let body = match body {
+            Some(body) => {
+                request = request.header("content-type", "application/json");
+                Body::from(body.to_string())
+            }
+            None => Body::empty(),
+        };
+        let response = super::super::build_router(state.clone())
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The one row `attention::owner_is_present` reads, as the relay route tests seed it.
+    async fn owner_present(state: &AppState) {
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('global', '', ?)",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn chat(state: &AppState) -> String {
+        crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap()
+    }
+
+    /// A `running` turn of `chat_id` with `origin` (`None` = not recorded), written by SQL.
+    async fn running_turn(state: &AppState, chat_id: &str, origin: Option<&str>) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('ola', 'running', 'assistant', ?, ?, ?) RETURNING id",
+        )
+        .bind(chat_id)
+        .bind(origin)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    /// Every `chat_links` row whose parent is `parent`, oldest first:
+    /// `(child_chat_id, kind, created_by_run, unlinked_at)`.
+    async fn links_under(
+        state: &AppState,
+        parent: &str,
+    ) -> Vec<(String, String, Option<i64>, Option<String>)> {
+        sqlx::query_as(
+            "SELECT child_chat_id, kind, created_by_run, unlinked_at
+               FROM chat_links WHERE parent_chat_id = ? ORDER BY id",
+        )
+        .bind(parent)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn archived_at(state: &AppState, chat_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT archived_at FROM chats WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn count(state: &AppState, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn link(
+        state: &AppState,
+        child: &str,
+        parent: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        call(
+            state,
+            "POST",
+            &format!("/assistant/chats/{child}/link"),
+            None,
+            Some(serde_json::json!({ "parent_chat_id": parent })),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn browser_agent_creates_a_linked_child_and_delivers_the_task_as_a_relay() {
+        let state = state().await;
+        owner_present(&state).await;
+        let mother = chat(&state).await;
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        crate::chats::set_cwd(&state.pool, &mother, &cwd)
+            .await
+            .unwrap();
+        let mother_turn = running_turn(&state, &mother, Some("shell")).await;
+        let task = "Compare the prices of three laptops on the shop and report back";
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/assistant/browser-agents",
+            Some(mother_turn),
+            Some(serde_json::json!({ "task": task, "url": "https://shop.example.com/" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let child = body["chat_id"]
+            .as_str()
+            .expect("the answer names the new child conversation")
+            .to_string();
+        assert_ne!(child, mother);
+
+        let links = links_under(&state, &mother).await;
+        assert_eq!(links.len(), 1, "one active link to the mother");
+        let (linked_child, kind, created_by_run, unlinked_at) = &links[0];
+        assert_eq!(linked_child, &child);
+        assert_eq!(kind, "browser");
+        assert_eq!(*created_by_run, Some(mother_turn));
+        assert_eq!(*unlinked_at, None);
+
+        assert_eq!(
+            crate::chats::cwd_of(&state.pool, &child)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(cwd.as_str()),
+            "the child works in the mother's folder"
+        );
+        let title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM chats WHERE chat_id = ?")
+                .bind(&child)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let first_forty: String = task.chars().take(40).collect();
+        assert_eq!(title, Some(format!("Browser · {first_forty}")));
+
+        let relays: Vec<(String, String, i64, String)> = sqlx::query_as(
+            "SELECT from_chat_id, to_chat_id, sending_run_id, body FROM chat_relays",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            relays,
+            vec![(
+                mother.clone(),
+                child.clone(),
+                mother_turn,
+                format!("{task}\n\nStart page: https://shop.example.com/"),
+            )],
+            "the task travels as a relay from the mother's turn"
+        );
+
+        let turn_id = body["turn_id"]
+            .as_i64()
+            .expect("a free child answers with the turn the task opened");
+        let (from_relay_id, turn_chat): (Option<i64>, String) =
+            sqlx::query_as("SELECT from_relay_id, chat_id FROM runs WHERE id = ?")
+                .bind(turn_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(
+            from_relay_id.is_some(),
+            "the child's turn records the relay that bore it"
+        );
+        assert_eq!(turn_chat, child);
+        assert_eq!(
+            crate::relay::chain_of(&state.pool, turn_id).await.unwrap(),
+            vec![mother.clone(), child.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_agent_refused_by_the_gate_archives_the_child_and_closes_the_link() {
+        let state = state().await;
+        // No heartbeat: the owner is away.
+        let mother = chat(&state).await;
+        let mother_turn = running_turn(&state, &mother, Some("shell")).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/assistant/browser-agents",
+            Some(mother_turn),
+            Some(serde_json::json!({ "task": "look something up" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["refusal"], "owner_away");
+        let links = links_under(&state, &mother).await;
+        assert_eq!(links.len(), 1, "the link is closed, not deleted");
+        let (child, _, _, unlinked_at) = &links[0];
+        assert!(
+            unlinked_at.is_some(),
+            "a refused task leaves no active link"
+        );
+        assert!(
+            archived_at(&state, child).await.is_some(),
+            "the child the refusal orphaned is archived"
+        );
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM chat_relays").await,
+            0,
+            "a refused relay leaves no row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_agent_from_a_remote_channel_turn_is_refused() {
+        let state = state().await;
+        owner_present(&state).await;
+        let mother = chat(&state).await;
+        let mother_turn = running_turn(&state, &mother, Some("channel:telegram")).await;
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/assistant/browser-agents",
+            Some(mother_turn),
+            Some(serde_json::json!({ "task": "look something up" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["refusal"], "remote_origin");
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM chat_relays").await, 0);
+        for (child, _, _, unlinked_at) in links_under(&state, &mother).await {
+            assert!(unlinked_at.is_some(), "no active link survives a refusal");
+            assert!(archived_at(&state, &child).await.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_agent_needs_a_run_header_a_task_and_a_web_address() {
+        let state = state().await;
+        owner_present(&state).await;
+        let mother = chat(&state).await;
+        let mother_turn = running_turn(&state, &mother, Some("shell")).await;
+        let uri = "/assistant/browser-agents";
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            uri,
+            None,
+            Some(serde_json::json!({ "task": "look" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["refusal"], "missing_run_id");
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            uri,
+            Some(mother_turn),
+            Some(serde_json::json!({ "task": "  \n " })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["refusal"], "empty_task");
+
+        for url in [
+            "ftp://example.com/",
+            "javascript:alert(1)",
+            "file:///C:/secret",
+            "not a url",
+        ] {
+            let (status, body) = call(
+                &state,
+                "POST",
+                uri,
+                Some(mother_turn),
+                Some(serde_json::json!({ "task": "look", "url": url })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+            assert_eq!(body["refusal"], "bad_url", "{url}");
+        }
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            uri,
+            Some(987_654),
+            Some(serde_json::json!({ "task": "look" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["refusal"], "unknown_sender");
+
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM chats").await,
+            1,
+            "a malformed request creates no conversation"
+        );
+        assert_eq!(count(&state, "SELECT COUNT(*) FROM chat_links").await, 0);
+    }
+
+    #[tokio::test]
+    async fn relinking_a_chat_closes_the_old_link_and_opens_the_new_one() {
+        let state = state().await;
+        let child = chat(&state).await;
+        let first_mother = chat(&state).await;
+        let second_mother = chat(&state).await;
+
+        let (status, first) = link(&state, &child, Some(&first_mother)).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["link"]["child_chat_id"], child.as_str());
+        assert_eq!(first["link"]["parent_chat_id"], first_mother.as_str());
+        assert_eq!(first["link"]["kind"], "browser", "kind defaults to browser");
+        assert!(first["link"]["unlinked_at"].is_null());
+
+        let (status, second) = call(
+            &state,
+            "POST",
+            &format!("/assistant/chats/{child}/link"),
+            None,
+            Some(serde_json::json!({ "parent_chat_id": second_mother, "kind": "browser" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["link"]["parent_chat_id"], second_mother.as_str());
+        assert_ne!(second["link"]["id"], first["link"]["id"]);
+
+        let history: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT parent_chat_id, unlinked_at FROM chat_links WHERE child_chat_id = ? ORDER BY id",
+        )
+        .bind(&child)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(history.len(), 2, "relinking keeps the old row");
+        assert_eq!(history[0].0.as_deref(), Some(first_mother.as_str()));
+        assert!(history[0].1.is_some(), "the old link is closed");
+        assert_eq!(history[1].0.as_deref(), Some(second_mother.as_str()));
+        assert!(history[1].1.is_none(), "the new link is the active one");
+    }
+
+    #[tokio::test]
+    async fn a_link_to_itself_a_missing_parent_or_a_cycle_is_refused() {
+        let state = state().await;
+        let a = chat(&state).await;
+        let b = chat(&state).await;
+        let archived = chat(&state).await;
+        crate::chats::archive(&state.pool, &archived).await.unwrap();
+
+        let (status, body) = link(&state, "never-created", Some(&a)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["refusal"], "chat_not_found");
+
+        let (status, body) = link(&state, &a, Some(&a)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["refusal"], "link_to_self");
+
+        for parent in ["never-created", archived.as_str()] {
+            let (status, body) = link(&state, &a, Some(parent)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{parent}: {body}");
+            assert_eq!(body["refusal"], "parent_not_found", "{parent}");
+        }
+
+        // b answers to a; a answering to b would close a loop at a.
+        let (status, body) = link(&state, &b, Some(&a)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = link(&state, &a, Some(&b)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["refusal"], "link_cycle");
+        assert_eq!(body["at"], a.as_str(), "the loop closes at the child");
+
+        let a_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_links WHERE child_chat_id = ?")
+                .bind(&a)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(a_rows, 0, "a refused link writes nothing");
+    }
+
+    #[tokio::test]
+    async fn linking_with_a_null_parent_opens_a_panel_only_link() {
+        let state = state().await;
+        let child = chat(&state).await;
+
+        let (status, body) = link(&state, &child, None).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["link"]["child_chat_id"], child.as_str());
+        assert!(body["link"]["parent_chat_id"].is_null(), "{body}");
+        assert_eq!(body["link"]["kind"], "browser");
+        assert!(body["link"]["created_by_run"].is_null());
+        assert!(body["link"]["unlinked_at"].is_null());
+        assert!(body["link"]["id"].is_i64());
+        assert!(body["link"]["created_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn get_link_returns_the_active_link_and_the_last_delivery() {
+        let state = state().await;
+        let child = chat(&state).await;
+        let mother = chat(&state).await;
+        let uri = format!("/assistant/chats/{child}/link");
+
+        let (status, body) = call(&state, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "link": null, "last_delivery": null }),
+            "an unlinked chat has neither"
+        );
+
+        let (status, posted) = link(&state, &child, Some(&mother)).await;
+        assert_eq!(status, StatusCode::OK, "{posted}");
+        let link_id = posted["link"]["id"].as_i64().expect("a link id");
+
+        let (_, body) = call(&state, "GET", &uri, None, None).await;
+        assert_eq!(
+            body["link"], posted["link"],
+            "GET reads back the link POST wrote"
+        );
+        assert!(body["last_delivery"].is_null(), "nothing delivered yet");
+
+        for (run_id, outcome, reason, at) in [
+            (
+                11_i64,
+                "refused",
+                Some("owner_away"),
+                "2026-10-22T10:00:00+00:00",
+            ),
+            (12_i64, "delivered", None, "2026-10-22T10:05:00+00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_link_deliveries (link_id, run_id, relay_id, outcome, reason, created_at)
+                 VALUES (?, ?, NULL, ?, ?, ?)",
+            )
+            .bind(link_id)
+            .bind(run_id)
+            .bind(outcome)
+            .bind(reason)
+            .bind(at)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let (status, body) = call(&state, "GET", &uri, None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["link"]["id"], link_id);
+        assert_eq!(
+            body["last_delivery"],
+            serde_json::json!({
+                "run_id": 12,
+                "outcome": "delivered",
+                "reason": null,
+                "created_at": "2026-10-22T10:05:00+00:00",
+            }),
+            "the newest delivery, not the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_browser_agents_lists_active_links_newest_first_filtered_by_scope() {
+        let state = state().await;
+        let mother = chat(&state).await;
+        crate::chats::rename(&state.pool, &mother, Some("Mother"))
+            .await
+            .unwrap();
+        let in_project = chat(&state).await;
+        crate::chats::rename(&state.pool, &in_project, Some("Browser · one"))
+            .await
+            .unwrap();
+        let panel_only = chat(&state).await;
+        let closed = chat(&state).await;
+        let oldest = chat(&state).await;
+
+        // (child, parent, link created_at, unlinked_at)
+        for (child, parent, created_at, unlinked_at) in [
+            (&oldest, Some(&mother), "2026-10-22T09:00:00+00:00", None),
+            (&in_project, Some(&mother), "2026-10-22T10:00:00+00:00", None),
+            (&panel_only, None, "2026-10-22T11:00:00+00:00", None),
+            (
+                &closed,
+                Some(&mother),
+                "2026-10-22T12:00:00+00:00",
+                Some("2026-10-22T12:30:00+00:00"),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_links (child_chat_id, parent_chat_id, kind, created_by_run, created_at, unlinked_at)
+                 VALUES (?, ?, 'browser', NULL, ?, ?)",
+            )
+            .bind(child)
+            .bind(parent)
+            .bind(created_at)
+            .bind(unlinked_at)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        // A child's project is its NEWEST run's: `in_project` moved from p-old to p1.
+        for (chat_id, project, created_at) in [
+            (&in_project, "p-old", "2026-10-22T10:01:00+00:00"),
+            (&in_project, "p1", "2026-10-22T10:02:00+00:00"),
+            (&oldest, "p2", "2026-10-22T09:01:00+00:00"),
+            (&closed, "p1", "2026-10-22T12:01:00+00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, chat_id, project_id, origin, created_at)
+                 VALUES ('t', 'completed', 'assistant', ?, ?, 'shell', ?)",
+            )
+            .bind(chat_id)
+            .bind(project)
+            .bind(created_at)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let ids = |body: &serde_json::Value| -> Vec<String> {
+            body.as_array()
+                .unwrap_or_else(|| panic!("a list, got {body}"))
+                .iter()
+                .map(|item| item["chat_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let (status, all) = call(
+            &state,
+            "GET",
+            "/assistant/browser-agents?limit=20",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(
+            ids(&all),
+            vec![panel_only.clone(), in_project.clone(), oldest.clone()],
+            "active links only, newest link first"
+        );
+        let item = &all[1];
+        assert_eq!(item["title"], "Browser · one");
+        assert_eq!(item["parent_chat_id"], mother.as_str());
+        assert_eq!(item["parent_title"], "Mother");
+        assert_eq!(item["project_id"], "p1", "the newest run decides the project");
+        assert!(item["created_at"].is_string());
+        let panel = &all[0];
+        assert!(panel["title"].is_null());
+        assert!(panel["parent_chat_id"].is_null());
+        assert!(panel["parent_title"].is_null());
+        assert!(panel["project_id"].is_null(), "no run, no project");
+
+        let (_, limited) = call(
+            &state,
+            "GET",
+            "/assistant/browser-agents?limit=1",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(ids(&limited), vec![panel_only.clone()]);
+
+        let (status, p1) = call(
+            &state,
+            "GET",
+            "/assistant/browser-agents?limit=20&project_id=p1",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{p1}");
+        assert_eq!(
+            ids(&p1),
+            vec![in_project.clone()],
+            "a closed link is not listed"
+        );
+
+        let (status, none) = call(
+            &state,
+            "GET",
+            "/assistant/browser-agents?limit=20&no_project=1",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{none}");
+        assert_eq!(ids(&none), vec![panel_only.clone()]);
+    }
+}

@@ -997,6 +997,15 @@ impl DaemonClient {
         json_or_refusal(response, "relaying a message to another conversation").await
     }
 
+    /// Opens a new browser agent conversation linked to the one this run answers in and hands it
+    /// `task` (and the optional start page `url`). The mother is never named here: the daemon
+    /// reads it off `RUN_ID_HEADER`, as for `send_to_chat`.
+    // RED stub
+    pub async fn browser_agent(&self, task: &str, url: Option<&str>) -> Result<Value, String> {
+        let _ = (task, url);
+        todo!("RED stub")
+    }
+
     /// What is in the files folder. Reading only — there is deliberately no client method here for
     /// creating, writing, moving, deleting or downloading, so an agent cannot reach those even by
     /// mistake. The folder grew a whole file manager on the shell side; this stayed one verb.
@@ -1705,6 +1714,68 @@ mod tests {
             query.split('&').count(),
             1,
             "an unescaped & in the path started a second query parameter: {uri}"
+        );
+    }
+
+    /// `browser_agent` posts `{task, url}` to `/assistant/browser-agents` and names the mother
+    /// only through `RUN_ID_HEADER`: no chat id travels in the path or the body, so a model
+    /// cannot open a browser agent on behalf of a conversation it is not answering in. A missing
+    /// start page travels as an absent or null `url`, never as an empty string.
+    #[tokio::test]
+    async fn browser_agent_posts_task_and_url_with_the_run_header() {
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>, Value)>>>;
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  axum::Json(body): axum::Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    let run = headers
+                        .get(RUN_ID_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    recorded.lock().unwrap().push((uri.to_string(), run, body));
+                    axum::Json(serde_json::json!({ "chat_id": "child-1", "turn_id": 9 }))
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = DaemonClient::as_run(format!("http://{address}"), "test-token".into(), 42);
+
+        let answer = client
+            .browser_agent("find the cheapest flight", Some("https://flights.example.com/"))
+            .await
+            .expect("the stub daemon answers 200");
+        assert_eq!(answer["chat_id"], "child-1");
+        assert_eq!(answer["turn_id"], 9);
+
+        client
+            .browser_agent("summarise the news", None)
+            .await
+            .expect("the stub daemon answers 200");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        let (uri, run, body) = &seen[0];
+        assert_eq!(uri, "/assistant/browser-agents");
+        assert_eq!(run.as_deref(), Some("42"));
+        assert_eq!(body["task"], "find the cheapest flight");
+        assert_eq!(body["url"], "https://flights.example.com/");
+        assert!(body.get("chat_id").is_none(), "the mother is never in the body");
+
+        let (uri, run, body) = &seen[1];
+        assert_eq!(uri, "/assistant/browser-agents");
+        assert_eq!(run.as_deref(), Some("42"));
+        assert_eq!(body["task"], "summarise the news");
+        assert!(
+            body.get("url").is_none_or(Value::is_null),
+            "no start page travels as an absent or null url: {body}"
         );
     }
 
