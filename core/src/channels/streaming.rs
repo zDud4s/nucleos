@@ -24,13 +24,13 @@ use crate::channels::strings::{self, Text};
 use crate::state::AppState;
 
 /// A turn stops getting progress edits this long after it was first seen running.
-pub(crate) const STREAM_CAP: Duration = Duration::from_secs(10 * 60);
+pub const STREAM_CAP: Duration = Duration::from_secs(10 * 60);
 
 /// Longest tail of the live text offered as a snippet, in chars.
 const SNIPPET_CHARS: usize = 600;
 
 /// The last `SNIPPET_CHARS` chars of `text`, cut on a char boundary and trimmed.
-pub(crate) fn tail_snippet(text: &str) -> String {
+pub fn tail_snippet(text: &str) -> String {
     let text = text.trim();
     let skip = text.chars().count().saturating_sub(SNIPPET_CHARS);
     let start = text.char_indices().nth(skip).map_or(0, |(at, _)| at);
@@ -53,7 +53,7 @@ struct Entry {
 /// Decides when a turn may be edited again. Pure: the caller hands in the clock, so the minimum gap
 /// and the cap are testable without sleeping.
 #[derive(Default)]
-pub(crate) struct Throttle(BTreeMap<i64, Entry>);
+pub struct Throttle(BTreeMap<i64, Entry>);
 
 impl Throttle {
     /// Forgets the runs that left `running`.
@@ -90,7 +90,7 @@ impl Throttle {
 
 /// Whether the ack of a turn in this conversation may be edited: the channel declares `edit` and
 /// its yaml does not turn `stream_edits` off.
-pub(crate) fn enabled(state: &AppState, key: &contract::ConversationKey) -> bool {
+pub fn enabled(state: &AppState, key: &contract::ConversationKey) -> bool {
     let declared = state
         .channels
         .presence
@@ -188,7 +188,7 @@ async fn enqueue_progress(
 /// One streaming tick: for every acknowledged, unanswered, `running` turn that is not a task run
 /// and whose channel allows it, enqueues an edit of the ack with the tail of the live text when the
 /// throttle permits. A failure is logged; the next tick repeats with newer text.
-pub(crate) async fn stream_progress(
+pub async fn stream_progress(
     state: &AppState,
     throttle: &mut Throttle,
     now: Instant,
@@ -242,7 +242,7 @@ pub(crate) async fn stream_progress(
 /// At the end of a turn, inside the transaction that enqueues its final reply: drops the progress
 /// edits still waiting and, when streaming applies, edits the ack to "Turn N finished.". Both
 /// precede the final `send` on the ordered lane. Nothing is enqueued without an ack.
-pub(crate) async fn finish_progress(
+pub async fn finish_progress(
     conn: &mut SqliteConnection,
     state: &AppState,
     key: &contract::ConversationKey,

@@ -3,7 +3,15 @@
 use serde_json::Value;
 use std::path::Path;
 
-use crate::hooks::Decision;
+/// What a pre-tool-use hook answers, and what the rule walk and the classifier return.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Decision {
+    // "allow" | "deny" | "pending_approval" (spec §3.3). To the CLI, both "deny" and
+    // "pending_approval" are just "block" (the hook script maps them, Step 6); the core treats them
+    // differently — see `hooks::rules`.
+    pub decision: String,
+    pub reason: String,
+}
 
 mod area;
 mod grammar;

@@ -17,7 +17,7 @@ pub use identities::{
     ConversationRow, ForgetError, Forgotten, HomeSet, IdentitiesReadout, ProjectConversation,
     SenderIdentities, SetHomeError, forget, identities, set_home, set_primary,
 };
-pub(crate) use identities::{home_identity, identity_counts};
+pub use identities::{home_identity, identity_counts};
 pub use pairing::{
     MintedCode, PairOutcome, PairedIdentity, PairingStatus, cancel_pairing, mint_pairing_code,
     pair, pairing_status,

@@ -132,7 +132,7 @@ pub fn time_approx_usd(created_at: DateTime<Utc>, end: DateTime<Utc>, rate_per_h
 /// - armed, no request, `terminal`: nothing was ever sent, so 0.
 /// - armed, no request, still open: the estimate, because the marker write may lag the request.
 ///   A late marker also flips an ended run back to the estimate, since this is recomputed on read.
-pub(crate) fn unmeasured_usd(
+pub fn unmeasured_usd(
     created_at: DateTime<Utc>,
     end: DateTime<Utc>,
     model_watch: Option<&str>,
@@ -498,9 +498,9 @@ pub async fn judge_spend(
     }
 }
 
-/// One run timestamp, parsed the way every spend reader parses it. `pub(crate)` so the analytics
+/// One run timestamp, parsed the way every spend reader parses it. `pub` so the analytics
 /// read (`analytics/sessions.rs`) prices runs from the same instants the ceiling does.
-pub(crate) fn parse_run_timestamp(value: &str) -> sqlx::Result<DateTime<Utc>> {
+pub fn parse_run_timestamp(value: &str) -> sqlx::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|error| sqlx::Error::Protocol(format!("invalid run timestamp {value}: {error}")))

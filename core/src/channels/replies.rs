@@ -94,7 +94,7 @@ fn is_running(status: &str) -> bool {
 }
 
 /// What a finished turn answers: its stdout when it completed, otherwise the status sentence.
-pub(crate) fn final_text(run_id: i64, status: &str, stdout: Option<&str>) -> String {
+pub fn final_text(run_id: i64, status: &str, stdout: Option<&str>) -> String {
     match stdout.map(str::trim).filter(|text| !text.is_empty()) {
         Some(text) if status == "completed" => text.to_owned(),
         _ => strings::render(&Text::TurnEnded {
@@ -246,7 +246,7 @@ struct TypingEntry {
 /// Which running turns are due a typing refresh. Pure: the caller hands in the running set and the
 /// clock, so the cadence and the cap are testable without sleeping.
 #[derive(Default)]
-pub(crate) struct TypingRefresh(std::collections::BTreeMap<i64, TypingEntry>);
+pub struct TypingRefresh(std::collections::BTreeMap<i64, TypingEntry>);
 
 impl TypingRefresh {
     /// The runs of `running` due a refresh at `now`. A run that left `running` is forgotten (and
@@ -272,7 +272,7 @@ impl TypingRefresh {
 /// Re-emits "typing" for every acknowledged, unanswered turn that is still `running`. The status is
 /// read each time, so a turn that finished (or whose reply, and any pause notice after it, went out)
 /// stops at once. `outbox::typing` is a no-op for a channel that does not declare the capability.
-pub(crate) async fn refresh_typing(state: &AppState, tracker: &mut TypingRefresh, now: Instant) {
+pub async fn refresh_typing(state: &AppState, tracker: &mut TypingRefresh, now: Instant) {
     let rows: sqlx::Result<Vec<(i64, String, String)>> = sqlx::query_as(
         "SELECT t.run_id, t.channel, t.conversation \
          FROM channel_turn_replies t JOIN runs r ON r.id = t.run_id \
@@ -540,7 +540,7 @@ pub async fn open_pass(state: &AppState, now: DateTime<Utc>) -> sqlx::Result<Ope
 /// Answers `run_id` now if it is finished and not yet answered, by the same compare-and-set as
 /// `open_pass`, so calling both is safe. Used to put the final reply ahead of a pause notice. Never
 /// fails the caller: an error is logged and the sweep answers the turn later.
-pub(crate) async fn reply_now(state: &AppState, run_id: i64) {
+pub async fn reply_now(state: &AppState, run_id: i64) {
     let row: sqlx::Result<Option<OpenRow>> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "{OPEN_TURNS} AND t.run_id = ?"
     )))

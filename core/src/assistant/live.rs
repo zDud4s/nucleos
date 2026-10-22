@@ -304,7 +304,7 @@ pub(super) fn stop_tasks_of(ended: ProcessBarrier) {
 /// Whether a kept process of `chat_id`, alive now, served run `run_id`. This, not the
 /// `chat_tasks` row, is what lets a task act after its turn: a row can be written `running` after
 /// its process is gone.
-pub(crate) fn live_process_served(chat_id: &str, run_id: i64) -> bool {
+pub fn live_process_served(chat_id: &str, run_id: i64) -> bool {
     relock(&PROCESS_BARRIERS)
         .values()
         .any(|p| p.chat_id == chat_id && p.served.contains(&run_id))
@@ -312,7 +312,7 @@ pub(crate) fn live_process_served(chat_id: &str, run_id: i64) -> bool {
 
 /// Test-only stand-in for a kept process that served `run_id`; dropping it ends the vouching.
 #[cfg(test)]
-pub(crate) struct HeldProcess(usize);
+pub struct HeldProcess(usize);
 
 #[cfg(test)]
 impl Drop for HeldProcess {
@@ -323,7 +323,7 @@ impl Drop for HeldProcess {
 
 /// Keys are odd, so they never equal a real (aligned) `process_key`.
 #[cfg(test)]
-pub(crate) fn hold_process_serving(chat_id: &str, run_id: i64) -> HeldProcess {
+pub fn hold_process_serving(chat_id: &str, run_id: i64) -> HeldProcess {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     let key = NEXT.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
     relock(&PROCESS_BARRIERS).insert(

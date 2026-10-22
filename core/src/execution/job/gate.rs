@@ -205,7 +205,7 @@ pub(super) fn item_gate(
 /// which tests judge it, and one that rewrote `scripts/gates.sh` (what a map's commands run) would
 /// pick what they mean: the full gate refuses that, so a scoped one must not be easier to fool.
 /// Blocking: reads files from disk.
-pub(crate) fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
+pub fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
     let crate::tests_map::MapState::Valid(map) = crate::tests_map::load(worktree) else {
         return false;
     };

@@ -18,18 +18,18 @@ use sha2::{Digest, Sha256};
 use crate::tests_map::{self, Group};
 
 /// The fingerprint scheme; bumping it orphans every cached green, which is the point of a bump.
-pub(crate) const SCHEME: &str = "fp1";
+pub const SCHEME: &str = "fp1";
 
 /// Listing a large tree is the slow part of a fingerprint, so it gets more room than the usual
 /// git operation.
-pub(crate) const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const LIST_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn hex(hasher: Sha256) -> String {
     format!("{:x}", hasher.finalize())
 }
 
 /// Hex sha256 of the group's serialised entry: any edit to the map entry changes it.
-pub(crate) fn entry_hash(group: &Group) -> String {
+pub fn entry_hash(group: &Group) -> String {
     // A `Group` always serialises; the fallback only keeps this infallible.
     let json = serde_json::to_string(group).unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -39,7 +39,7 @@ pub(crate) fn entry_hash(group: &Group) -> String {
 
 /// The value of each named variable (`None` when unset), sorted by name so the order a map lists
 /// them in never changes the fingerprint.
-pub(crate) fn env_values(
+pub fn env_values(
     names: &[String],
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Vec<(String, Option<String>)> {
@@ -53,7 +53,7 @@ pub(crate) fn env_values(
 
 /// Folds the parts into `fp1:<hex>`. Every part is `\0`-terminated so two different splits of the
 /// same bytes cannot collide, and an unset variable (`\x01unset`) differs from an empty one.
-pub(crate) fn combine(
+pub fn combine(
     map_version: u32,
     entry_hash: &str,
     env: &[(String, Option<String>)],
@@ -88,7 +88,7 @@ impl std::io::Write for HashWriter<'_> {
 /// Each path is followed by a marker saying what it is, so a file that became a symlink or a
 /// directory changes the hash: `-` missing, `l<target>` symlink, `d` directory or gitlink,
 /// `f<size>` then the bytes for a file.
-pub(crate) fn hash_files(worktree: &Path, paths: &[String]) -> String {
+pub fn hash_files(worktree: &Path, paths: &[String]) -> String {
     let mut hasher = Sha256::new();
     for path in paths {
         hasher.update(path.as_bytes());
@@ -155,7 +155,7 @@ async fn list(
 
 /// The content hash of what a group reads: tracked and untracked-but-not-ignored files, plus
 /// ignored ones when `include_ignored` and `reads` say so. Without `reads` it is the whole tree.
-pub(crate) async fn content_hash(
+pub async fn content_hash(
     worktree: &Path,
     reads: Option<&[String]>,
     include_ignored: bool,
@@ -195,7 +195,7 @@ pub(crate) async fn content_hash(
 
 /// The group's fingerprint from an already computed content hash; the environment comes from the
 /// daemon's own process.
-pub(crate) fn group_fingerprint_from(map_version: u32, group: &Group, content: &str) -> String {
+pub fn group_fingerprint_from(map_version: u32, group: &Group, content: &str) -> String {
     combine(
         map_version,
         &entry_hash(group),
@@ -204,7 +204,7 @@ pub(crate) fn group_fingerprint_from(map_version: u32, group: &Group, content: &
     )
 }
 
-pub(crate) async fn group_fingerprint(
+pub async fn group_fingerprint(
     worktree: &Path,
     map_version: u32,
     group: &Group,
@@ -215,7 +215,7 @@ pub(crate) async fn group_fingerprint(
 
 /// The fingerprint of the project's `gate_command` unit, which has no map entry: the command text
 /// and the content of the whole tree.
-pub(crate) fn gate_fingerprint_from(command: &str, content: &str) -> String {
+pub fn gate_fingerprint_from(command: &str, content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("gate\0{command}\0content\0{content}").as_bytes());
     format!("{SCHEME}:{}", hex(hasher))

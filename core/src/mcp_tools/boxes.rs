@@ -294,10 +294,7 @@ pub(super) fn fence_key(path: &str) -> String {
 /// The worktree box fills in its own path when none was asked and refuses any other before the
 /// call reaches the daemon (the daemon validates again as the owner, so this is the first fence
 /// and not the only one). The other boxes hand the argument through untouched.
-pub(crate) fn worktree_for_call(
-    served: &McpBox,
-    asked: Option<&str>,
-) -> Result<Option<String>, String> {
+pub fn worktree_for_call(served: &McpBox, asked: Option<&str>) -> Result<Option<String>, String> {
     let McpBox::Worktree(own) = served else {
         return Ok(asked.map(str::to_owned));
     };
@@ -316,7 +313,7 @@ pub(crate) fn worktree_for_call(
 /// own worktree: a ticket of another worktree, or one that names none, is refused with the same
 /// words as a ticket that does not exist, so the refusal does not reveal that it does. The other
 /// boxes hand the answer through untouched.
-pub(crate) fn ticket_for_box(
+pub fn ticket_for_box(
     served: &McpBox,
     ticket: i64,
     answer: serde_json::Value,

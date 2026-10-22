@@ -188,7 +188,7 @@ impl Scope {
     ///
     /// `machine` → `project` → `job` inherits downwards, and the most specific wins where they
     /// contradict.
-    pub(crate) fn chain(&self) -> Vec<(&'static str, Option<String>)> {
+    pub fn chain(&self) -> Vec<(&'static str, Option<String>)> {
         let mut chain = vec![("machine", None)];
         match self {
             Scope::Machine => {}
@@ -414,7 +414,7 @@ pub struct Brief {
 /// One constant and not five copies: [`FromRow`] matches by name, so a query that forgets a column
 /// fails at runtime on the row rather than at the call site, and the five readers below would each
 /// have to be corrected separately every time the table grows.
-pub(crate) const COLUMNS: &str =
+pub const COLUMNS: &str =
     "id, layer, scope_kind, scope_id, source, generator, evidence, observations,
                        fingerprint, points_at, expires_after_runs, last_confirmed_at, shown_count,
                        outcome_count, green_count, last_shown_at, kind, title, body, status,

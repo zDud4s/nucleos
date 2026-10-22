@@ -329,10 +329,10 @@ pub async fn nudged() {
 }
 
 #[cfg(test)]
-pub(crate) use fake::FakeEmbedder;
+pub use fake::FakeEmbedder;
 
 #[cfg(test)]
-pub(crate) mod fake {
+pub mod fake {
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -340,7 +340,7 @@ pub(crate) mod fake {
 
     /// A scripted embedder for tests: the first `vectors` entry whose key the text STARTS WITH
     /// wins, else `default`, else an error.
-    pub(crate) struct FakeEmbedder {
+    pub struct FakeEmbedder {
         pub model: String,
         pub vectors: Vec<(String, Vec<f32>)>,
         pub default: Option<Vec<f32>>,
@@ -350,7 +350,7 @@ pub(crate) mod fake {
     }
 
     impl FakeEmbedder {
-        pub(crate) fn new(
+        pub fn new(
             model: &str,
             vectors: Vec<(String, Vec<f32>)>,
             default: Option<Vec<f32>>,
@@ -365,14 +365,14 @@ pub(crate) mod fake {
             }
         }
 
-        pub(crate) fn failing() -> Self {
+        pub fn failing() -> Self {
             Self {
                 fail: true,
                 ..Self::new("fake", Vec::new(), None)
             }
         }
 
-        pub(crate) fn slow(delay: Duration) -> Self {
+        pub fn slow(delay: Duration) -> Self {
             Self {
                 delay: Some(delay),
                 ..Self::new("fake", Vec::new(), Some(vec![1.0, 0.0]))

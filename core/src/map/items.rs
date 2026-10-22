@@ -101,7 +101,7 @@ pub struct Item {
     pub kind: ItemKind,
     /// `pub` in any of its forms, or `export` in TypeScript.
     ///
-    /// **One flag and not the full lattice.** Rust has `pub`, `pub(crate)`, `pub(super)` and
+    /// **One flag and not the full lattice.** Rust has `pub`, `pub`, `pub(super)` and
     /// `pub(in path)`; the question this screen asks is *can anything outside this file reach it*,
     /// and all four answer yes. A drawing that distinguished them would be reporting a fact about
     /// Rust rather than a fact about the project.
@@ -597,7 +597,7 @@ pub fn match_brace(masked: &[char], open: usize) -> Option<usize> {
     None
 }
 
-/// Whether `pub` (or `pub(crate)`, or `export`) sits immediately before `at`.
+/// Whether `pub` (or `pub`, or `export`) sits immediately before `at`.
 fn exported_before(masked: &[char], at: usize, word: &str) -> bool {
     let mut end = at;
     // Step back over whitespace, and over a `(crate)` / `(super)` / `(in path)` qualifier.

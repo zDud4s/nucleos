@@ -461,12 +461,78 @@ fn router_plan(text: Option<&str>) -> RouterPlan {
     }
 }
 
+/// The summary `devtime`'s ingestion loop writes after every cycle and this readout reads back.
+/// Kept here rather than in `devtime::store` (which re-exports it) because `devtime` lives in
+/// `nucleos-app`, above this crate.
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
+pub struct IngestStatus {
+    pub enabled: bool,
+    pub cycle_at: String,
+    pub files_seen: i64,
+    pub files_failed: i64,
+    pub lines_read: i64,
+    pub lines_failed: i64,
+    pub unknown_records: i64,
+    pub unmapped_sessions: i64,
+    pub skipped_daemon_sessions: i64,
+    pub failure_amber_rate: f64,
+    pub failure_min_lines: i64,
+}
+
+/// The one-row summary of the latest ingestion cycle (`id = 1`).
+pub async fn write_ingest_status(
+    pool: &sqlx::SqlitePool,
+    status: &IngestStatus,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO devtime_ingest_status
+            (id, enabled, cycle_at, files_seen, files_failed, lines_read, lines_failed,
+             unknown_records, unmapped_sessions, skipped_daemon_sessions, failure_amber_rate,
+             failure_min_lines)
+         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+            enabled = excluded.enabled, cycle_at = excluded.cycle_at,
+            files_seen = excluded.files_seen, files_failed = excluded.files_failed,
+            lines_read = excluded.lines_read, lines_failed = excluded.lines_failed,
+            unknown_records = excluded.unknown_records,
+            unmapped_sessions = excluded.unmapped_sessions,
+            skipped_daemon_sessions = excluded.skipped_daemon_sessions,
+            failure_amber_rate = excluded.failure_amber_rate,
+            failure_min_lines = excluded.failure_min_lines",
+    )
+    .bind(status.enabled)
+    .bind(&status.cycle_at)
+    .bind(status.files_seen)
+    .bind(status.files_failed)
+    .bind(status.lines_read)
+    .bind(status.lines_failed)
+    .bind(status.unknown_records)
+    .bind(status.unmapped_sessions)
+    .bind(status.skipped_daemon_sessions)
+    .bind(status.failure_amber_rate)
+    .bind(status.failure_min_lines)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn read_ingest_status(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<IngestStatus>> {
+    sqlx::query_as::<_, IngestStatus>(
+        "SELECT enabled, cycle_at, files_seen, files_failed, lines_read, lines_failed,
+                unknown_records, unmapped_sessions, skipped_daemon_sessions, failure_amber_rate,
+                failure_min_lines
+         FROM devtime_ingest_status WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// PURE: the devtime ingestion row, from the status the ingestion loop last wrote.
 ///
 /// `None` means nothing has run yet, which is green: a daemon that has just started has not failed
 /// at anything. Past the failure rate is `degraded` and never `down`, because ingestion only feeds
 /// a reading and stops nothing else.
-fn devtime_row(status: Option<crate::devtime::store::IngestStatus>) -> SubsystemReadout {
+fn devtime_row(status: Option<IngestStatus>) -> SubsystemReadout {
     let Some(status) = status else {
         return SubsystemReadout::ok("devtime_ingest");
     };
@@ -492,7 +558,7 @@ fn devtime_row(status: Option<crate::devtime::store::IngestStatus>) -> Subsystem
 }
 
 async fn devtime_probe(pool: sqlx::SqlitePool) -> SubsystemReadout {
-    match crate::devtime::store::read_ingest_status(&pool).await {
+    match read_ingest_status(&pool).await {
         Ok(status) => devtime_row(status),
         Err(_) => SubsystemReadout::down("devtime_ingest", FailureCategory::Unknown),
     }
@@ -1012,7 +1078,7 @@ fn resolve_cli_binary() -> Option<PathBuf> {
 ///
 /// Extracted from `resolve_cli_binary` when the voice transcriber became a second configured program
 /// needing the same lookup. Both probes report configuration readiness only — neither runs anything.
-pub(crate) fn resolve_program(program: &std::ffi::OsStr) -> Option<PathBuf> {
+pub fn resolve_program(program: &std::ffi::OsStr) -> Option<PathBuf> {
     let path = PathBuf::from(program);
 
     if path.components().count() > 1 || path.is_absolute() {
@@ -1960,12 +2026,8 @@ url: http://127.0.0.1:{port}
         );
     }
 
-    fn devtime_status(
-        enabled: bool,
-        lines_read: i64,
-        lines_failed: i64,
-    ) -> crate::devtime::store::IngestStatus {
-        crate::devtime::store::IngestStatus {
+    fn devtime_status(enabled: bool, lines_read: i64, lines_failed: i64) -> IngestStatus {
+        IngestStatus {
             enabled,
             cycle_at: "2026-10-04T10:00:00.000Z".to_string(),
             lines_read,

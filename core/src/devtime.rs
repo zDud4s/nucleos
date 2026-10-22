@@ -1044,6 +1044,12 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
 
 #[cfg(test)]
 mod tests {
+    /// `core/testdata`. This module compiles in `nucleos-app`, whose manifest is two levels below
+    /// `core/` (`crates/nucleos-app`), so the path climbs back to it.
+    fn testdata_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
+    }
+
     use super::*;
     use crate::config::DevtimeConfig;
     use crate::devtime::store as devtime_store;
@@ -1137,10 +1143,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let projects = dir.path().join("projects");
         for case in cases {
-            let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("testdata")
-                .join("devtime")
-                .join(case);
+            let src = testdata_dir().join("devtime").join(case);
             copy_dir(&src, &projects);
         }
         Harness {
@@ -1577,8 +1580,7 @@ mod tests {
                 out.push('\n');
             }
         }
-        let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("testdata")
+        let target = testdata_dir()
             .join("devtime")
             .join("replay")
             .join("projects")
@@ -1665,8 +1667,7 @@ mod tests {
         );
         let rendered = render(&h.pool).await;
         if std::env::var("DEVTIME_BLESS").as_deref() == Ok("1") {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("testdata")
+            let path = testdata_dir()
                 .join("devtime")
                 .join("replay")
                 .join("golden.txt");

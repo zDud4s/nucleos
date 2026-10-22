@@ -155,7 +155,7 @@ pub const SIM_SAME: f32 = 0.92;
 /// guess until real data exists (spec 5.3).
 pub const SIM_NEAR: f32 = 0.80;
 /// Rows embedded per idle tick once the queue is served.
-pub(crate) const BACKFILL_PER_TICK: i64 = 20;
+pub const BACKFILL_PER_TICK: i64 = 20;
 
 /// What the nearest stored vector says about a new learning.
 pub enum Dedup {
@@ -623,7 +623,7 @@ pub async fn process_one(
 
 /// [`process_one`] with the embedder given: items are embedded, deduplicated by similarity and
 /// stored with their vector.
-pub(crate) async fn process_one_with(
+pub async fn process_one_with(
     pool: &SqlitePool,
     asked: Extractor<'_>,
     embedder: Option<&dyn Embedder>,
@@ -756,7 +756,7 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
 
 /// One pass of the worker: drain the queue, and only when it ended empty spend the idle time
 /// embedding rows that lack a vector.
-pub(crate) async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn Embedder>) {
+pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn Embedder>) {
     let drained = loop {
         let row = match claim_next(pool, Utc::now()).await {
             Ok(Some(row)) => row,

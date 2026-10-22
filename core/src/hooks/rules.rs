@@ -42,14 +42,8 @@ pub struct PostToolUsePayload {
     pub event: String,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct Decision {
-    // "allow" | "deny" | "pending_approval" (spec §3.3). To the CLI, both "deny" and
-    // "pending_approval" are just "block" (the hook script maps them, Step 6); the core treats them
-    // differently — see below.
-    pub decision: String,
-    pub reason: String,
-}
+// Defined beside the classifier, which builds it, so the lib does not depend on `hooks` above it.
+pub use crate::governance::classifier::Decision;
 
 /// What `/hooks/pretooluse-decision` answers: a [`Decision`] and, optionally, a replacement tool
 /// input. The CLI reads `updatedInput` only on an allow. New answer fields go here, never on

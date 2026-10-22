@@ -302,7 +302,9 @@ class FingerprintTests(unittest.TestCase):
     # 35
     def test_crate_resolution(self) -> None:
         # root + -p nucleos-core, and root + no -p, both mean core/.
-        for args in (["test", "-p", "nucleos-core"], ["test"]):
+        # The core/ packages nucleos-app and nucleos-daemon (and a mix) resolve to core/ too.
+        for args in (["test", "-p", "nucleos-core"], ["test"], ["test", "-p", "nucleos-daemon"],
+                     ["test", "-p", "nucleos-core", "-p", "nucleos-app"]):
             self.assert_mutation_misses(
                 lambda: self.write("core/src/main.rs", f"fn main() {{ /* {args} */ }}\n"),
                 f"core via {args}", cargo_args=args)

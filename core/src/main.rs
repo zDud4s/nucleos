@@ -2,6 +2,7 @@ mod cli;
 mod http;
 mod startup;
 
+use nucleos_app::*;
 use nucleos_core::*;
 
 use auth::Token;

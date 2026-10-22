@@ -27,7 +27,7 @@ pub(super) async fn git(
 /// project's own commands, so naming another worktree would run them over code this run does not
 /// own. The owner may name any worktree, but it has to be a registered worktree of a known
 /// project — a path that merely holds a `.git` is not something the daemon has agreed to run.
-pub(crate) async fn resolve_worktree(
+pub async fn resolve_worktree(
     pool: &SqlitePool,
     caller: Caller,
     asked: Option<&str>,
@@ -148,11 +148,7 @@ pub(crate) async fn resolve_worktree(
 }
 
 /// The full object id `rev` names in `repo`, or why git would not resolve it to a commit.
-pub(crate) async fn resolve_commit(
-    repo: &Path,
-    rev: &str,
-    deadline: Instant,
-) -> Result<String, String> {
+pub async fn resolve_commit(repo: &Path, rev: &str, deadline: Instant) -> Result<String, String> {
     let spec = format!("{rev}^{{commit}}");
     let resolved = git(repo, &["rev-parse", "--verify", "--quiet", &spec], deadline).await?;
     let sha = resolved.stdout.trim();
@@ -163,7 +159,7 @@ pub(crate) async fn resolve_commit(
 }
 
 /// The tree object `rev` names in `repo`: what a commit's content is, whatever its history.
-pub(crate) async fn tree_of(repo: &Path, rev: &str, deadline: Instant) -> Result<String, String> {
+pub async fn tree_of(repo: &Path, rev: &str, deadline: Instant) -> Result<String, String> {
     let spec = format!("{rev}^{{tree}}");
     let resolved = git(repo, &["rev-parse", "--verify", "--quiet", &spec], deadline).await?;
     let tree = resolved.stdout.trim();
@@ -202,7 +198,7 @@ pub(super) async fn clean_tree(
 /// In order: what the caller named; the base the daemon recorded when it created this worktree
 /// (exact, survives the integration branch moving on); else the merge base with the project's
 /// integration branch, which is what a hand-made worktree branched from.
-pub(crate) async fn resolve_base(
+pub async fn resolve_base(
     pool: &SqlitePool,
     project_id: &str,
     project_root: &Path,
@@ -411,7 +407,7 @@ pub(super) fn nul_separated(stdout: &str) -> impl Iterator<Item = &str> {
 
 /// Every path that differs from `base`: committed or not, and untracked files too, because a new
 /// file nobody has added yet is still code the caller is about to hand in.
-pub(crate) async fn changed_paths(
+pub async fn changed_paths(
     worktree_root: &Path,
     base: &str,
     deadline: Instant,

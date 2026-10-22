@@ -7,11 +7,11 @@ tests:
     core:
       # .nucleos/flows.yaml: the declared flows map::flows checks against core/.
       paths: [core/, Cargo.toml, Cargo.lock, rust-toolchain.toml, .config/, .nucleos/flows.yaml, sidecars/lib/channelkit/contract/**]
-      check: cargo clippy -p nucleos-core --all-targets -- -D warnings
+      check: cargo clippy -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --all-targets -- -D warnings
       command: bash scripts/gates.sh core
       # An iteration run whose changes all sit in one module below: the same nextest invocation as
       # the gate, narrowed to that module's tests (their names start with the module path).
-      select: cargo nextest run -p nucleos-base -p nucleos-core --no-fail-fast -E {filter}
+      select: cargo nextest run -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --no-fail-fast -E {filter}
       filters:
         - paths: [core/src/channels/**]
           expr: 'test(/^channels::/)'

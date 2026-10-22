@@ -378,7 +378,7 @@ pub async fn post_answer(
 /// Test helper: register `sidecar_id` as an embedded session through the registry's real open
 /// path (a live registration, the shell's ack, an injected attach), so `is_embedded` is true.
 #[cfg(test)]
-pub(crate) async fn embed_for_test(runtime: &crate::browser::BrowserRuntime, sidecar_id: &str) {
+pub async fn embed_for_test(runtime: &crate::browser::BrowserRuntime, sidecar_id: &str) {
     let registry = runtime.embedded.clone();
     registry.register("acme", "http://127.0.0.1:7");
     let opener = registry.clone();

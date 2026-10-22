@@ -33,7 +33,7 @@ mod reconcile;
 mod repo;
 mod tickets;
 
-pub(crate) use self::command::*;
+pub use self::command::*;
 pub use self::drain::*;
 #[cfg(any(test, feature = "testkit"))]
 use self::fake::*;

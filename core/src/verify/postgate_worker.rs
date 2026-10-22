@@ -176,7 +176,7 @@ async fn target_tip(
 }
 
 /// Names a failing unit that has no group: the project's `gate_command`.
-pub(crate) const GATE_UNIT: &str = "gate_command";
+pub const GATE_UNIT: &str = "gate_command";
 
 /// What one tick did for one project.
 #[derive(Debug, PartialEq, Eq)]

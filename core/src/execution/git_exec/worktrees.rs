@@ -53,7 +53,7 @@ pub(super) async fn prepare_integration_worktree(
 /// The directory is the daemon's property exactly like the integration tree, so it takes the same
 /// guard and the same reset; the checkout then moves it to the tip the gate is about to measure.
 /// It never goes through the vcs queue: no branch ref is touched.
-pub(crate) async fn prepare_postgate_worktree(
+pub async fn prepare_postgate_worktree(
     project_root: &Path,
     sha: &str,
     deadline: std::time::Instant,
@@ -104,7 +104,7 @@ pub(super) fn outcome_reason(outcome: Outcome) -> String {
 /// `revert_sha`, and returns that tip; any other branch under the name is an error and is left
 /// exactly as it was. The work is done in the daemon's `postgate-` worktree, which is idle while no
 /// gate runs; the integration worktree belongs to the queue.
-pub(crate) async fn prepare_fix_branch(
+pub async fn prepare_fix_branch(
     project_root: &Path,
     revert_sha: &str,
     branch: &str,

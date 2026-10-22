@@ -231,7 +231,7 @@ pub(super) fn classification(
 
 /// PURE: a shell line's words, with quotes stripped.
 ///
-/// `pub(crate)` for `github::Policy::read_is_autonomous`, which compares `gh` flags against
+/// `pub` for `github::Policy::read_is_autonomous`, which compares `gh` flags against
 /// these tokens. Shared rather than copied on purpose: a second tokenizer would drift from this
 /// one, and the two would disagree about the same command line — which is the class of bug this
 /// file exists to keep out.

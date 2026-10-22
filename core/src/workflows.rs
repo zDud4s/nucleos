@@ -166,7 +166,7 @@ pub fn file_hashes(dir: &Path) -> std::io::Result<BTreeMap<String, String>> {
 /// `__pycache__/` beside every module it imports. Neither the hash nor a packaged copy may see it:
 /// counted, it made a version read as drifted once any session had run it, and copied, it made the
 /// hash depend on which Python ran there last.
-pub(crate) fn is_cache(name: &std::ffi::OsStr) -> bool {
+pub fn is_cache(name: &std::ffi::OsStr) -> bool {
     name == "__pycache__" || Path::new(name).extension().is_some_and(|ext| ext == "pyc")
 }
 

@@ -780,7 +780,7 @@ pub mod tests {
             .success()
     }
 
-    pub(crate) fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
+    pub fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
         let base = std::env::current_dir().expect("resolve current directory");
         assert!(
             !base.to_string_lossy().contains(' '),
@@ -799,13 +799,13 @@ pub mod tests {
     /// runs. `an_item_run_gets_its_own_tree_and_pays_one_slot_for_every_attempt` opens an item's
     /// checkout through this guard and would have been refused the same way. The one test that
     /// wants the floor sets it after this, and this puts back what stood before either.
-    pub(crate) struct WorktreeRootEnv {
+    pub struct WorktreeRootEnv {
         root: Option<OsString>,
         floor: Option<OsString>,
     }
 
     impl WorktreeRootEnv {
-        pub(crate) fn set(path: &FsPath) -> Self {
+        pub fn set(path: &FsPath) -> Self {
             let root = std::env::var_os("NUCLEOS_WORKTREE_ROOT");
             let floor = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
             unsafe {
@@ -859,7 +859,7 @@ pub mod tests {
         ));
     }
 
-    pub(crate) fn init_contained_repo(prefix: &str) -> (tempfile::TempDir, PathBuf) {
+    pub fn init_contained_repo(prefix: &str) -> (tempfile::TempDir, PathBuf) {
         let container = space_free_tempdir(prefix);
         let repo = container.path().join("repo");
         initialize_repo(&repo);
