@@ -63,12 +63,12 @@ describe("Chain", () => {
     it("stays silent for a proposed row with another note", async () => {
       const row = known({ id: 4, status: "proposed" });
       daemon.apiFetch.mockImplementation(
-        daemonWith([row], { events: [event("near_duplicate", "proposed")] }),
+        daemonWith([row], { events: [event("near_duplicate:3", "proposed")] }),
       );
 
       await renderWithRouter(<Chain id={4} />);
 
-      expect(await screen.findByText("near_duplicate")).toBeDefined();
+      expect(await screen.findByText("near_duplicate:3")).toBeDefined();
       expect(screen.queryByText(REASON)).toBeNull();
     });
 

@@ -31,10 +31,13 @@ export function NotesAbout({ kind, ref, onItem }: NotesAboutProps) {
   return (
     <section className="brain-sec notes-about" aria-label="Notes about this">
       <h4>Notes about this</h4>
-      {about.isError ? (
-        <ErrorNote>the {DAEMON_NAME} is not responding: the notes are not known</ErrorNote>
-      ) : about.data === undefined ? (
-        <Skeleton label="Loading the notes" lines={3} />
+      {about.data === undefined ? (
+        // A failed refetch keeps the rows already known; the error shows only when there are none.
+        about.isError ? (
+          <ErrorNote>the {DAEMON_NAME} is not responding: the notes are not known</ErrorNote>
+        ) : (
+          <Skeleton label="Loading the notes" lines={3} />
+        )
       ) : about.data.length === 0 ? (
         <Quiet says="No notes about this yet." />
       ) : (

@@ -1151,13 +1151,20 @@ function relatedNotes(id: number): RelatedNote[] | null {
   ].sort((a, b) => b.score - a.score);
 }
 
-/* `GET /owner-notes/review`: this week's notes, ten unlinked at most (of more), one old note brought back. */
+/*
+  `GET /owner-notes/review`: the notes written since `week_start`, the unlinked ones (the daemon lists ten
+  at most and reports the full count beside them), one old note brought back.
+*/
+const WEEK_START = "2026-08-24T00:00:00+00:00";
+const UNLINKED_NOTES = OWNER_NOTES.filter(
+  (note) => note.state === "active" && !NOTE_LINKS.some((link) => link.note_id === note.id),
+);
 const WEEKLY_REVIEW: WeeklyReview = {
-  week_start: "2026-08-24T00:00:00+00:00",
+  week_start: WEEK_START,
   week_end: "2026-08-31T00:00:00+00:00",
-  created: OWNER_NOTES.filter((note) => note.state === "active" && NOW - Date.parse(note.created_at) < 7 * DAY),
-  unlinked: OWNER_NOTES.filter((note) => note.state === "active" && !NOTE_LINKS.some((link) => link.note_id === note.id)),
-  unlinked_total: 14,
+  created: OWNER_NOTES.filter((note) => note.state === "active" && Date.parse(note.created_at) >= Date.parse(WEEK_START)),
+  unlinked: UNLINKED_NOTES.slice(0, 10),
+  unlinked_total: UNLINKED_NOTES.length,
   resurfaced: OWNER_NOTES.filter((note) => note.state === "active" && NOW - Date.parse(note.updated_at) > 30 * DAY),
   waiting_proposals: 2,
 };
