@@ -85,8 +85,7 @@ const STOPWORDS: &[&str] = &[
     "them", "these", "those", "some", "such", "only", "also", "over", "your", "its", "does", "did",
     "should", "could", "just", "how", "why", "who", "whom", "while", "where", "after", "before",
     "each", "other", "more", "most", "very", "here", "being", "because", "between", "his", "him",
-    "she", "too", "may", "might", "must", "shall", "per", "via",
-    // Portuguese
+    "she", "too", "may", "might", "must", "shall", "per", "via", // Portuguese
     "que", "para", "com", "uma", "uns", "umas", "por", "como", "mais", "mas", "dos", "das", "nos",
     "nas", "não", "nao", "são", "sao", "foi", "ser", "ter", "tem", "está", "esta", "este", "isso",
     "isto", "esse", "essa", "seu", "sua", "seus", "suas", "pelo", "pela", "pelos", "pelas", "num",
@@ -1358,7 +1357,11 @@ mod tests {
         assert_eq!(strong_row.s_fts, 1.0);
         for id in &weak {
             let row = trace_row(&brief, *id);
-            assert!(row.s_fts >= crate::knowledge::MIN_RELEVANCE, "{}", row.s_fts);
+            assert!(
+                row.s_fts >= crate::knowledge::MIN_RELEVANCE,
+                "{}",
+                row.s_fts
+            );
             assert!(row.s_fts < strong_row.s_fts);
             assert!(row.shown, "a weak but real match is briefed");
         }
@@ -1405,7 +1408,10 @@ mod tests {
         // From the floor up the map is strictly increasing and lands on `[MIN_RELEVANCE, 1.0]`.
         let samples = [LIFT_FLOOR, 0.0915, 0.1, 0.25, 0.5, 0.9, 1.0];
         let lifted: Vec<f64> = samples.iter().map(|s| lift_fts(*s)).collect();
-        assert!(lifted.windows(2).all(|pair| pair[0] < pair[1]), "{lifted:?}");
+        assert!(
+            lifted.windows(2).all(|pair| pair[0] < pair[1]),
+            "{lifted:?}"
+        );
         assert!(lifted.iter().all(|s| (floor..=1.0).contains(s)));
         assert_eq!(lifted[lifted.len() - 1], 1.0);
     }
@@ -1431,8 +1437,8 @@ mod tests {
     /// path. Before the stopword filter, `the`/`to` were ORed into the expression and the row
     /// matched, then rode the lift over the relevance gate and was credited.
     #[tokio::test]
-    async fn a_row_matching_only_stopwords_is_not_briefed_without_an_embedder()
-    -> sqlx::Result<()> {
+    async fn a_row_matching_only_stopwords_is_not_briefed_without_an_embedder() -> sqlx::Result<()>
+    {
         let pool = test_pool().await;
         let real = seed(&pool, "project", Some("p1"), "zanzibar rollout migration").await?;
         let noise = seed(
@@ -1917,10 +1923,8 @@ mod tests {
 
         // An item node: its rows carry the item id and belong to `credit_item` alone.
         let item_knowledge = seed(&pool, "machine", None, "item row").await?;
-        let item_run =
-            seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
-        let item_id =
-            seed_item(&pool, job_id, "passed", Some("passed"), 0, Some(item_run)).await?;
+        let item_run = seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
+        let item_id = seed_item(&pool, job_id, "passed", Some("passed"), 0, Some(item_run)).await?;
         record(
             &pool,
             item_run,
@@ -1934,13 +1938,7 @@ mod tests {
         let direct_knowledge = seed(&pool, "machine", None, "singleton direct").await?;
         let direct_run =
             seed_run(&pool, "completed", Some(0), Some("passed"), Some(job_id)).await?;
-        record(
-            &pool,
-            direct_run,
-            None,
-            &[scored(direct_knowledge, true)],
-        )
-        .await?;
+        record(&pool, direct_run, None, &[scored(direct_knowledge, true)]).await?;
         let swept_knowledge = seed(&pool, "machine", None, "singleton swept").await?;
         let swept_run = seed_run(&pool, "failed", Some(1), None, Some(job_id)).await?;
         record(&pool, swept_run, None, &[scored(swept_knowledge, true)]).await?;
