@@ -102,7 +102,7 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
     "Text::PairInvalid": [],
     "Text::Unsupported{label:label.clone(),}": [],
     "Text::Queued{position}": [],
-    "Text::NotSent{refusal}": [],
+    "turn_refusal(refusal)": [],
   },
   // The fake channel's `feed_row` stimulus writes whatever kind the test script supplies.
   "channels/fake.rs": { 'text_of(stimulus,"kind")?': [] },

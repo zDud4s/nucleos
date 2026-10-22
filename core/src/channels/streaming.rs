@@ -434,7 +434,12 @@ mod tests {
         set_tail(&state, run, "one");
         tick(&state, &mut throttle, t0).await;
         set_tail(&state, run, "two");
-        tick(&state, &mut throttle, t0 + STREAM_CAP - Duration::from_secs(1)).await;
+        tick(
+            &state,
+            &mut throttle,
+            t0 + STREAM_CAP - Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(edits(&rows(&state).await).len(), 2);
         set_tail(&state, run, "three");
         tick(&state, &mut throttle, t0 + STREAM_CAP).await;
@@ -478,7 +483,10 @@ mod tests {
         assert_eq!(actions, ["send", "edit", "send"]);
         assert_eq!(all[1].2, "progress");
         assert_eq!(all[1].6["target"], all[0].0);
-        assert_eq!(all[1].6["parts"][0]["text"], format!("Turn {run} finished."));
+        assert_eq!(
+            all[1].6["parts"][0]["text"],
+            format!("Turn {run} finished.")
+        );
     }
 
     #[tokio::test]

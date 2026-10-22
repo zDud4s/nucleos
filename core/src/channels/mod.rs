@@ -92,7 +92,10 @@ pub async fn run_housekeeping(state: AppState) {
         let pool = &state.pool;
         let results = [
             ("ingest", ingest::prune(pool, now).await),
-            ("media", media::prune(pool, now).await),
+            (
+                "media",
+                media::prune(pool, state.files_root.as_deref(), now).await,
+            ),
             ("access", access::prune(pool, now).await),
             ("outbox", outbox::prune(pool, now).await),
             ("tokens", tokens::prune(pool, now).await),

@@ -86,7 +86,10 @@ fn port_run_reply() {
         replies::final_text(1, "completed", Some("  ")),
         ended("completed")
     );
-    assert_eq!(replies::final_text(1, "completed", None), ended("completed"));
+    assert_eq!(
+        replies::final_text(1, "completed", None),
+        ended("completed")
+    );
     // A failed turn answers with the status sentence, never with its partial output.
     assert_eq!(
         replies::final_text(1, "failed", Some("boom")),
@@ -125,7 +128,10 @@ fn port_chat_key() {
         let key = ConversationKey::new("telegram", reference);
         assert_eq!(key.chat_id(), format!("telegram:{reference}"));
         let back = ConversationKey::parse(&key.chat_id()).unwrap();
-        assert_eq!((back.channel, back.reference.as_str()), ("telegram", reference));
+        assert_eq!(
+            (back.channel, back.reference.as_str()),
+            ("telegram", reference)
+        );
     }
 }
 
@@ -154,7 +160,10 @@ async fn port_the_tracker_keeps_one_turn_per_topic() {
     let rows = sent(&state.pool).await;
     assert!(rows.contains(&("-100123:7".to_owned(), "answer seven".to_owned())));
     assert!(rows.contains(&("-100123:9".to_owned(), "answer nine".to_owned())));
-    assert!(rows.iter().all(|(conversation, _)| conversation != "-100123"));
+    assert!(
+        rows.iter()
+            .all(|(conversation, _)| conversation != "-100123")
+    );
 }
 
 #[tokio::test]

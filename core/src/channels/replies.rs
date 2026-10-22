@@ -246,7 +246,7 @@ struct TypingEntry {
 /// Which running turns are due a typing refresh. Pure: the caller hands in the running set and the
 /// clock, so the cadence and the cap are testable without sleeping.
 #[derive(Default)]
-struct TypingRefresh(std::collections::BTreeMap<i64, TypingEntry>);
+pub(crate) struct TypingRefresh(std::collections::BTreeMap<i64, TypingEntry>);
 
 impl TypingRefresh {
     /// The runs of `running` due a refresh at `now`. A run that left `running` is forgotten (and
@@ -272,7 +272,7 @@ impl TypingRefresh {
 /// Re-emits "typing" for every acknowledged, unanswered turn that is still `running`. The status is
 /// read each time, so a turn that finished (or whose reply, and any pause notice after it, went out)
 /// stops at once. `outbox::typing` is a no-op for a channel that does not declare the capability.
-async fn refresh_typing(state: &AppState, tracker: &mut TypingRefresh, now: Instant) {
+pub(crate) async fn refresh_typing(state: &AppState, tracker: &mut TypingRefresh, now: Instant) {
     let rows: sqlx::Result<Vec<(i64, String, String)>> = sqlx::query_as(
         "SELECT t.run_id, t.channel, t.conversation \
          FROM channel_turn_replies t JOIN runs r ON r.id = t.run_id \

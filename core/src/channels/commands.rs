@@ -351,7 +351,8 @@ pub async fn capture_target(
 async fn run_capture(at: &ingest::Inbound<'_>, state: &AppState, job: i64, text: &str) -> String {
     let origin = crate::assistant::Origin::Channel(at.channel).as_wire();
     match crate::capture::answer(&state.pool, job, text, origin).await {
-        Ok(_) => strings::render(&Text::CaptureAnswered { job }),
+        Ok((_, true)) => strings::render(&Text::CaptureAnswered { job }),
+        Ok((note, false)) => strings::render(&Text::CaptureLate { note }),
         Err(error) => {
             tracing::warn!(channel = at.channel, job, %error, "a capture answer was not recorded");
             strings::render(&Text::NotSent {

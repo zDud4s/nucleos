@@ -324,8 +324,20 @@ async fn migration_0237_still_rejects_unknown_class() {
     assert!(!ok(&pool, &outbox_insert("ordered", "send", "pending", "")).await);
     // The other CHECKs survived the rebuild.
     assert!(!ok(&pool, &outbox_insert("fast", "send", "pending", "progress")).await);
-    assert!(!ok(&pool, &outbox_insert("ordered", "delete", "pending", "progress")).await);
-    assert!(!ok(&pool, &outbox_insert("ordered", "send", "queued", "progress")).await);
+    assert!(
+        !ok(
+            &pool,
+            &outbox_insert("ordered", "delete", "pending", "progress")
+        )
+        .await
+    );
+    assert!(
+        !ok(
+            &pool,
+            &outbox_insert("ordered", "send", "queued", "progress")
+        )
+        .await
+    );
 }
 
 #[tokio::test]
@@ -361,7 +373,10 @@ async fn migration_0237_keeps_existing_rows_and_indexes() {
     .unwrap();
     assert_eq!(names, ["channel_outbox_due", "channel_outbox_settled"]);
     let due = index_sql(&pool, "channel_outbox_due").await.unwrap();
-    assert!(due.contains("WHERE state IN ('pending', 'leased')"), "{due}");
+    assert!(
+        due.contains("WHERE state IN ('pending', 'leased')"),
+        "{due}"
+    );
     let settled = index_sql(&pool, "channel_outbox_settled").await.unwrap();
     assert!(settled.contains("settled_at IS NOT NULL"), "{settled}");
 

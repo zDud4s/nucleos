@@ -136,7 +136,19 @@ pub(super) async fn announce_feed(
         };
         // Read only when there are new lines, once per pass.
         if policy.is_none() {
-            policy = Some(resolved_policy(pool, Some(primary)).await?);
+            // Fail open: a policy that cannot be read must not swallow a notification, so the
+            // empty policy (everything passes) stands in and the failure is logged.
+            policy = Some(
+                resolved_policy(pool, Some(primary))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, primary, "policy unreadable, notifying");
+                        Policy {
+                            families: Vec::new(),
+                            kinds: Vec::new(),
+                        }
+                    }),
+            );
         }
         let policy = policy.as_ref().expect("policy was just loaded");
 
@@ -660,6 +672,23 @@ mod tests {
         assert_eq!(rows[0].1, "job_failed: loud");
         // The muted line still moved the cursor.
         assert_eq!(feed_cursor(&state).await, last);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_policy_fails_open_and_still_notifies() {
+        let state = ready(false, &[], true).await;
+        sqlx::query("DROP TABLE channel_notify_policy")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        line(&state, None, "job_done", "still sent", None).await;
+        let report = routing::route_once(&state, now(), feed_only())
+            .await
+            .unwrap();
+        assert_eq!(report.feed, 1);
+        let rows = sent(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "job_done: still sent");
     }
 
     #[tokio::test]

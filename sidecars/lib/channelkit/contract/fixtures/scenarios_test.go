@@ -18,8 +18,8 @@ func loadScenarios(t *testing.T) []Scenario {
 
 func TestScenariosShape(t *testing.T) {
 	sc := loadScenarios(t)
-	if len(sc) != 7 {
-		t.Fatalf("got %d scenarios, want 7", len(sc))
+	if len(sc) != 8 {
+		t.Fatalf("got %d scenarios, want 8", len(sc))
 	}
 	for _, s := range sc {
 		if len(s.Hello) == 0 || len(s.Steps) == 0 {

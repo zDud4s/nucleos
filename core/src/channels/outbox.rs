@@ -796,12 +796,7 @@ mod tests {
         }
     }
 
-    async fn progress(
-        conn: &mut SqliteConnection,
-        conversation: &str,
-        run: i64,
-        secs: i64,
-    ) -> i64 {
+    async fn progress(conn: &mut SqliteConnection, conversation: &str, run: i64, secs: i64) -> i64 {
         enqueue(
             conn,
             &key(conversation),
@@ -857,10 +852,10 @@ mod tests {
         sqlx::query(
             "UPDATE channel_outbox SET state = 'leased', lease_until = 'later' WHERE id = ?",
         )
-            .bind(first)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+        .bind(first)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         let second = progress(&mut conn, "c1", 7, 1).await;
         drop(conn);
 
@@ -898,7 +893,13 @@ mod tests {
         let newest = progress(&mut conn, "c1", 7, 1).await;
         drop(conn);
 
-        for untouched in [other_run, other_conversation, turn_edit, progress_send, newest] {
+        for untouched in [
+            other_run,
+            other_conversation,
+            turn_edit,
+            progress_send,
+            newest,
+        ] {
             assert_eq!(state_and_reason(pool, untouched).await.0, "pending");
         }
     }
@@ -913,23 +914,30 @@ mod tests {
         sqlx::query(
             "UPDATE channel_outbox SET state = 'leased', lease_until = 'later' WHERE id = ?",
         )
-            .bind(leased)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+        .bind(leased)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         let leased_same_run = progress(&mut conn, "c1", 7, 1).await;
         sqlx::query(
             "UPDATE channel_outbox SET state = 'leased', lease_until = 'later' WHERE id = ?",
         )
-            .bind(leased_same_run)
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+        .bind(leased_same_run)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         let waiting = progress(&mut conn, "c1", 7, 2).await;
         let other_run = progress(&mut conn, "c1", 9, 2).await;
-        let reply = enqueue(&mut conn, &key("c1"), plain_send(), Class::Turn, None, at(2))
-            .await
-            .unwrap();
+        let reply = enqueue(
+            &mut conn,
+            &key("c1"),
+            plain_send(),
+            Class::Turn,
+            None,
+            at(2),
+        )
+        .await
+        .unwrap();
 
         let dropped = cancel_pending_progress(&mut conn, &key("c1"), &Subject::Run(7), at(3))
             .await
@@ -938,8 +946,14 @@ mod tests {
 
         assert_eq!(dropped, 1);
         let (st, reason) = state_and_reason(pool, waiting).await;
-        assert_eq!((st.as_str(), reason.as_deref()), ("done", Some("cancelled")));
-        assert_eq!(state_and_reason(pool, pending).await.1.as_deref(), Some("superseded"));
+        assert_eq!(
+            (st.as_str(), reason.as_deref()),
+            ("done", Some("cancelled"))
+        );
+        assert_eq!(
+            state_and_reason(pool, pending).await.1.as_deref(),
+            Some("superseded")
+        );
         for untouched in [leased, leased_same_run] {
             assert_eq!(state_and_reason(pool, untouched).await.0, "leased");
         }

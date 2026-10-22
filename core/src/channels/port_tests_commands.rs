@@ -173,7 +173,10 @@ async fn port_proj_shortcut_is_deterministic_no_llm() {
     run(&state, Intent::Proj { filter: None }).await;
     let said = answers(&state).await;
     assert_eq!(said.len(), 1, "{said:?}");
-    assert!(said[0].contains("**a**") && said[0].contains("**b**"), "{said:?}");
+    assert!(
+        said[0].contains("**a**") && said[0].contains("**b**"),
+        "{said:?}"
+    );
     // A shortcut never goes through the model: no turn was recorded for it.
     assert_eq!(count(&state, "runs").await, 0);
 }
@@ -214,7 +217,10 @@ fn a_proposal(project: Option<&str>) -> crate::proposals::Proposal {
 fn port_a_proposal_without_a_project_does_not_invent_one() {
     let got = strings::render_proposals(&[a_proposal(None)]);
     assert!(!got.contains("project"), "{got}");
-    assert!(!got.contains("nil") && !got.contains("null") && !got.contains("None"), "{got}");
+    assert!(
+        !got.contains("nil") && !got.contains("null") && !got.contains("None"),
+        "{got}"
+    );
     // The counterpart: a proposal that has one names it.
     let named = strings::render_proposals(&[a_proposal(Some("nucleos"))]);
     assert!(named.contains("project: nucleos"), "{named}");
@@ -240,7 +246,15 @@ fn port_a_turn_that_failed_for_no_stated_reason_still_says_so() {
     });
     assert!(got.contains("connection refused"), "{got}");
     // No remedy is invented for a failure that stated none.
-    assert!(!got.contains("/cancel") && !got.contains("/resume"), "{got}");
+    assert!(
+        !got.contains("/cancel") && !got.contains("/resume"),
+        "{got}"
+    );
+    // A busy turn does name the way out.
+    let busy = strings::render(&Text::NotSent {
+        refusal: crate::assistant::TURN_IN_PROGRESS.to_string(),
+    });
+    assert!(busy.contains("/cancel"), "{busy}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -307,14 +321,29 @@ async fn port_only_the_configured_sender_can_command_the_bot() {
     owner(&state, "7", "42", "private").await;
 
     let unknown = Verdict::Drop(DropReason::UnknownSender);
-    assert_eq!(verdict(&state, group, ConversationKind::Group, "9").await, Verdict::Admit);
-    assert_eq!(verdict(&state, group, ConversationKind::Group, "7").await, Verdict::Admit);
+    assert_eq!(
+        verdict(&state, group, ConversationKind::Group, "9").await,
+        Verdict::Admit
+    );
+    assert_eq!(
+        verdict(&state, group, ConversationKind::Group, "7").await,
+        Verdict::Admit
+    );
     // A member who is not on the list.
-    assert_eq!(verdict(&state, group, ConversationKind::Group, "8").await, unknown);
+    assert_eq!(
+        verdict(&state, group, ConversationKind::Group, "8").await,
+        unknown
+    );
     // No sender attributed.
-    assert_eq!(verdict(&state, "42", ConversationKind::Private, "").await, unknown);
+    assert_eq!(
+        verdict(&state, "42", ConversationKind::Private, "").await,
+        unknown
+    );
     // The allowlist overrides the private-chat shortcut: the chat id is not a sender.
-    assert_eq!(verdict(&state, "42", ConversationKind::Private, "42").await, unknown);
+    assert_eq!(
+        verdict(&state, "42", ConversationKind::Private, "42").await,
+        unknown
+    );
 }
 
 fn event(id: &str, who: &str, kind: ConversationKind, chat: &str, body: EventBody) -> InboundEvent {
@@ -364,11 +393,30 @@ async fn port_only_an_authorised_sender_reaches_the_daemon() {
     owner(&state, "7", group, "group").await;
     let engaged = || crate::governance::autopilot::kill_switch_engaged(&state.pool);
 
-    let reply = send(&state, "e1", "8", ConversationKind::Group, group, typed(None, "/kill on")).await;
+    let reply = send(
+        &state,
+        "e1",
+        "8",
+        ConversationKind::Group,
+        group,
+        typed(None, "/kill on"),
+    )
+    .await;
     assert_eq!(reply, IngestReply::Dropped);
-    assert!(!engaged().await.unwrap(), "an unlisted member engaged the kill switch");
+    assert!(
+        !engaged().await.unwrap(),
+        "an unlisted member engaged the kill switch"
+    );
 
-    let reply = send(&state, "e2", "7", ConversationKind::Group, group, typed(None, "/kill on")).await;
+    let reply = send(
+        &state,
+        "e2",
+        "7",
+        ConversationKind::Group,
+        group,
+        typed(None, "/kill on"),
+    )
+    .await;
     assert_eq!(reply, IngestReply::Accepted);
     assert!(engaged().await.unwrap());
 }
@@ -424,7 +472,15 @@ async fn port_an_unauthorised_press_cannot_approve_a_proposal() {
 async fn port_note_from_an_unauthorised_chat_is_ignored() {
     let state = testkit::state().await;
     owner(&state, "42", "42", "private").await;
-    let reply = send(&state, "e1", "99", ConversationKind::Private, "99", typed(None, "/note buy milk")).await;
+    let reply = send(
+        &state,
+        "e1",
+        "99",
+        ConversationKind::Private,
+        "99",
+        typed(None, "/note buy milk"),
+    )
+    .await;
     assert_eq!(reply, IngestReply::Dropped);
     assert_eq!(count(&state, "owner_notes").await, 0);
 }
@@ -440,10 +496,16 @@ async fn port_note_text_never_reaches_the_log() {
 
     // The failing path: a store that cannot take the note. If the drop is refused the second half
     // simply repeats the first, which the assertion below tolerates.
-    let _ = sqlx::query("DROP TABLE owner_notes").execute(&state.pool).await;
+    let _ = sqlx::query("DROP TABLE owner_notes")
+        .execute(&state.pool)
+        .await;
     run(&state, Intent::Note(SECRET.to_string())).await;
 
-    assert!(!log.text().contains(SECRET), "the log carries the note text: {}", log.text());
+    assert!(
+        !log.text().contains(SECRET),
+        "the log carries the note text: {}",
+        log.text()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -497,8 +559,15 @@ async fn port_a_reply_to_a_capture_request_answers_it_without_a_turn() {
     assert_eq!(reply, IngestReply::Accepted);
 
     assert_eq!(request_state(&state, 7).await, "answered");
-    assert_eq!(answers(&state).await, vec![strings::render(&Text::CaptureAnswered { job: 7 })]);
-    assert_eq!(count(&state, "runs").await, 0, "a capture answer started a turn");
+    assert_eq!(
+        answers(&state).await,
+        vec![strings::render(&Text::CaptureAnswered { job: 7 })]
+    );
+    assert_eq!(
+        count(&state, "runs").await,
+        0,
+        "a capture answer started a turn"
+    );
     let note: String = sqlx::query_scalar("SELECT note_text FROM owner_notes")
         .fetch_one(&state.pool)
         .await
@@ -508,7 +577,7 @@ async fn port_a_reply_to_a_capture_request_answers_it_without_a_turn() {
 
 #[tokio::test]
 async fn port_a_late_answer_says_the_distiller_moved_on() {
-    // Adapted: the late answer keeps its note and is acknowledged; it releases nothing.
+    // The late answer keeps its note and says the question has moved on; it releases nothing.
     let state = testkit::state().await;
     open_request(&state, 7).await;
     let (c, s) = (conversation(), sender());
@@ -518,12 +587,19 @@ async fn port_a_late_answer_says_the_distiller_moved_on() {
             text: text.to_string(),
             ..Default::default()
         };
-        commands::answer_capture(&state, &at, 7, &input).await.unwrap();
+        commands::answer_capture(&state, &at, 7, &input)
+            .await
+            .unwrap();
     }
     assert_eq!(request_state(&state, 7).await, "answered");
     assert_eq!(count(&state, "owner_notes").await, 2);
     let said = answers(&state).await;
-    assert_eq!(said, vec![strings::render(&Text::CaptureAnswered { job: 7 }); 2]);
+    let late = strings::render(&Text::CaptureLate { note: 2 });
+    assert!(late.contains("moved on"), "{late}");
+    assert_eq!(
+        said,
+        vec![strings::render(&Text::CaptureAnswered { job: 7 }), late]
+    );
 }
 
 #[tokio::test]
@@ -573,9 +649,17 @@ async fn port_a_capture_answer_never_reaches_the_log() {
     };
     // A request that exists, then one that does not (the failing path).
     open_request(&state, 7).await;
-    commands::answer_capture(&state, &at, 7, &input).await.unwrap();
-    commands::answer_capture(&state, &at, 99, &input).await.unwrap();
-    assert!(!log.text().contains(SECRET), "the log carries the answer: {}", log.text());
+    commands::answer_capture(&state, &at, 7, &input)
+        .await
+        .unwrap();
+    commands::answer_capture(&state, &at, 99, &input)
+        .await
+        .unwrap();
+    assert!(
+        !log.text().contains(SECRET),
+        "the log carries the answer: {}",
+        log.text()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -610,7 +694,10 @@ async fn port_inbox_shortcut_spends_nothing() {
     let text = &said[0];
     assert!(text.contains("Waiting to be read (1)"), "{text}");
     assert!(text.contains("production is down"), "{text}");
-    assert!(text.contains("[info]") && text.contains("no action"), "{text}");
+    assert!(
+        text.contains("[info]") && text.contains("no action"),
+        "{text}"
+    );
     // Looking costs nothing: no triage run was started.
     assert_eq!(count(&state, "runs").await, 0);
 }
@@ -619,7 +706,10 @@ async fn port_inbox_shortcut_spends_nothing() {
 async fn port_inbox_with_nothing_says_so() {
     let state = testkit::state().await;
     run(&state, Intent::Inbox).await;
-    assert_eq!(answers(&state).await, vec!["Nothing in the mailbox yet.".to_string()]);
+    assert_eq!(
+        answers(&state).await,
+        vec!["Nothing in the mailbox yet.".to_string()]
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -634,7 +724,10 @@ async fn routed() -> AppState {
     let mut configs = HashMap::new();
     configs.insert("telegram", ChannelConfig::default());
     state.channels = Arc::new(ChannelsRuntime::with_configs(configs));
-    state.channels.presence.set_secrets_present("telegram", Vec::new());
+    state
+        .channels
+        .presence
+        .set_secrets_present("telegram", Vec::new());
     sqlx::query("UPDATE channels_global SET primary_channel = 'telegram'")
         .execute(&state.pool)
         .await
@@ -672,7 +765,9 @@ fn wanted(feed: bool, proposals: bool, kill: bool) -> Wanted {
 async fn port_feed_notifications_are_sent_as_plain_text() {
     let state = routed().await;
     feed_line(&state, "mail_triaged", "<b>bold</b> & <script>x</script>").await;
-    routing::route_once(&state, now(), wanted(true, false, false)).await.unwrap();
+    routing::route_once(&state, now(), wanted(true, false, false))
+        .await
+        .unwrap();
 
     let payload: String = sqlx::query_scalar("SELECT payload FROM channel_outbox")
         .fetch_one(&state.pool)
@@ -713,12 +808,20 @@ async fn port_governance_is_never_silenced() {
         .await
         .unwrap();
 
-    routing::route_once(&state, now(), wanted(true, true, true)).await.unwrap();
+    routing::route_once(&state, now(), wanted(true, true, true))
+        .await
+        .unwrap();
 
     let joined = answers(&state).await.join("\n---\n");
-    assert!(!joined.contains("a job failed"), "the silenced line was sent: {joined}");
+    assert!(
+        !joined.contains("a job failed"),
+        "the silenced line was sent: {joined}"
+    );
     for wanted in ["git push", "Kill switch ENGAGED"] {
-        assert!(joined.contains(wanted), "governance went quiet, {wanted:?} missing: {joined}");
+        assert!(
+            joined.contains(wanted),
+            "governance went quiet, {wanted:?} missing: {joined}"
+        );
     }
 }
 
@@ -733,7 +836,9 @@ async fn port_reenabling_a_family_replays_nothing() {
         .await
         .unwrap();
     feed_line(&state, "job_failed", "missed while off").await;
-    routing::route_once(&state, now(), wanted(true, false, false)).await.unwrap();
+    routing::route_once(&state, now(), wanted(true, false, false))
+        .await
+        .unwrap();
     assert!(answers(&state).await.is_empty());
 
     let on = Policy {
@@ -744,34 +849,46 @@ async fn port_reenabling_a_family_replays_nothing() {
         .await
         .unwrap();
     feed_line(&state, "job_failed", "arrived while on").await;
-    routing::route_once(&state, now(), wanted(true, false, false)).await.unwrap();
+    routing::route_once(&state, now(), wanted(true, false, false))
+        .await
+        .unwrap();
 
     // The muted line moved the cursor with it: only what came after is announced.
-    assert_eq!(answers(&state).await, vec!["job_failed: arrived while on".to_string()]);
+    assert_eq!(
+        answers(&state).await,
+        vec!["job_failed: arrived while on".to_string()]
+    );
 }
 
 #[tokio::test]
-async fn port_the_notifier_reads_the_policy_only_when_there_are_new_feed_items() {
+async fn port_the_notifier_fails_open_when_the_policy_cannot_be_read() {
     let state = routed().await;
-    // A policy store that cannot be read: the pass is fine as long as it never has to look.
+    // A policy store that cannot be read: an idle pass never looks, and a new feed item is still
+    // announced (fail open) rather than swallowed with the error.
     let dropped = sqlx::query("DROP TABLE channel_notify_policy")
         .execute(&state.pool)
         .await
         .is_ok();
     routing::route_once(&state, now(), wanted(true, false, false))
         .await
-        .expect("an idle feed read the policy");
+        .expect("an idle feed pass failed");
     if dropped {
         feed_line(&state, "run", "fresh").await;
-        let outcome = routing::route_once(&state, now(), wanted(true, false, false)).await;
-        assert!(outcome.is_err(), "a new feed item did not read the policy");
+        routing::route_once(&state, now(), wanted(true, false, false))
+            .await
+            .expect("an unreadable policy failed the pass instead of failing open");
+        assert_eq!(answers(&state).await, vec!["run: fresh".to_string()]);
     }
 }
 
 #[test]
 fn port_allows_resolution() {
     let policy = Policy {
-        families: vec![rule("job_", false), rule("job_item_", true), rule("worktree_", true)],
+        families: vec![
+            rule("job_", false),
+            rule("job_item_", true),
+            rule("worktree_", true),
+        ],
         kinds: vec![rule("job_failed", true), rule("worktree_gc", false)],
     };
     for (kind, want) in [

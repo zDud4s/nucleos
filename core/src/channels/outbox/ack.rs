@@ -454,7 +454,13 @@ mod tests {
         let behind = push(&state).await;
 
         deliver(&state, at(2)).await;
-        let got = settle(&state, retryable, failed(true, Some(500), "rate_limited"), at(3)).await;
+        let got = settle(
+            &state,
+            retryable,
+            failed(true, Some(500), "rate_limited"),
+            at(3),
+        )
+        .await;
         assert_eq!(got, outcome(ActionState::Failed, false));
         let (st, attempts, reason, lease, settled, _) = row(&state.pool, retryable).await;
         assert_eq!((st.as_str(), attempts), ("failed", 1));
@@ -469,7 +475,13 @@ mod tests {
         settle(&state, behind, ok(&["p2"]), at(4)).await;
         let permanent = push_progress_edit(&state, "c1", target).await;
         deliver(&state, at(5)).await;
-        let got = settle(&state, permanent, failed(false, None, "message_gone"), at(6)).await;
+        let got = settle(
+            &state,
+            permanent,
+            failed(false, None, "message_gone"),
+            at(6),
+        )
+        .await;
         assert_eq!(got, outcome(ActionState::Failed, false));
         assert_eq!(row(&state.pool, permanent).await.0, "failed");
     }

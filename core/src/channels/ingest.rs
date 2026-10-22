@@ -490,7 +490,18 @@ async fn on_message(
             let position = crate::chats::queued(&state.pool, &chat_id).await?.len();
             say(state, key, Text::Queued { position }, now).await
         }
-        Err(refusal) => say(state, key, Text::NotSent { refusal }, now).await,
+        Err(refusal) => say(state, key, turn_refusal(refusal), now).await,
+    }
+}
+
+/// The reply to a refused turn start: the refusals the assistant names on purpose are "not sent";
+/// anything else is a start that failed, said as such rather than as a policy refusal.
+fn turn_refusal(refusal: String) -> Text {
+    use crate::assistant::{NO_HOSTED_MODEL, NO_LOCAL_MODEL, TURN_IN_PROGRESS};
+    if [TURN_IN_PROGRESS, NO_LOCAL_MODEL, NO_HOSTED_MODEL].contains(&refusal.as_str()) {
+        Text::NotSent { refusal }
+    } else {
+        Text::TurnNotStarted { reason: refusal }
     }
 }
 
@@ -513,6 +524,18 @@ mod tests {
     use crate::channels::testkit::state;
 
     const NOW: &str = "2026-10-20T10:00:00Z";
+
+    #[test]
+    fn a_refused_turn_start_is_not_sent_only_for_the_named_refusals() {
+        let busy = crate::assistant::TURN_IN_PROGRESS.to_string();
+        assert_eq!(turn_refusal(busy.clone()), Text::NotSent { refusal: busy });
+        assert_eq!(
+            turn_refusal("spawn failed".to_string()),
+            Text::TurnNotStarted {
+                reason: "spawn failed".to_string()
+            }
+        );
+    }
 
     fn now() -> DateTime<Utc> {
         NOW.parse().unwrap()

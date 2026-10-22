@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::auth::Service;
 use crate::channels::contract::{ConversationKey, OutPart};
 use crate::channels::outbox::{self, Class, NewAction};
-use crate::channels::{replies, routing};
+use crate::channels::{replies, routing, streaming};
 use crate::state::AppState;
 
 /// What one request answered.
@@ -367,6 +367,38 @@ async fn turn_finished(state: &AppState, stdout: &str) -> Stimulated {
     Ok(())
 }
 
+/// Gives the newest turn of a `fake` conversation `text` as its live output so far and runs one
+/// streaming tick, as the replies loop would: the ack gets a progress edit when the channel can edit.
+async fn stream_text(state: &AppState, text: &str) -> Stimulated {
+    let run: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM runs WHERE chat_id LIKE 'fake:%' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db)?;
+    let run = run.ok_or("no turn of a fake conversation is open")?;
+    let line = serde_json::json!({
+        "type": "assistant",
+        "message": { "content": [{ "type": "text", "text": text }] },
+    });
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(line.to_string()));
+    state
+        .run_tails
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(run, tail);
+    // A fresh throttle per tick: the scenario drives the cadence, not the wall clock.
+    streaming::stream_progress(
+        state,
+        &mut streaming::Throttle::default(),
+        tokio::time::Instant::now(),
+        Duration::ZERO,
+        Utc::now(),
+    )
+    .await;
+    Ok(())
+}
+
 /// Queues a `send` of `parts` the common way, where degradation happens at lease time.
 async fn send_parts(state: &AppState, conversation: &str, parts: &Value) -> Stimulated {
     let parts: Vec<OutPart> = serde_json::from_value(parts.clone())
@@ -417,6 +449,7 @@ pub(crate) async fn stimulate(state: &AppState, stimulus: &Value) -> Stimulated 
             capture_requested(state, job, text_of(stimulus, "summary")?).await
         }
         Some("turn_finished") => turn_finished(state, text_of(stimulus, "stdout")?).await,
+        Some("stream_text") => stream_text(state, text_of(stimulus, "text")?).await,
         Some("send_parts") => {
             send_parts(
                 state,

@@ -32,8 +32,13 @@ pub enum Text {
     QueuePaused {
         waiting: usize,
     },
+    /// A refusal. A busy-turn refusal also names `/cancel`, the one gesture that frees the slot.
     NotSent {
         refusal: String,
+    },
+    /// Starting an assistant turn failed for a reason that is not a known refusal.
+    TurnNotStarted {
+        reason: String,
     },
     KillEngaged,
     KillDisengaged,
@@ -60,6 +65,10 @@ pub enum Text {
     CaptureNeedsText,
     CaptureAnswered {
         job: i64,
+    },
+    /// The note was kept, but the distiller had already moved on for this job.
+    CaptureLate {
+        note: i64,
     },
     AlreadyHandled,
     Approved {
@@ -162,7 +171,11 @@ pub fn render(text: &Text) -> String {
         Text::QueuePaused { waiting } => {
             format!("The queue is paused; {waiting} message(s) waiting.")
         }
+        Text::NotSent { refusal } if refusal == crate::assistant::TURN_IN_PROGRESS => {
+            format!("Not sent: {refusal}. Wait for it to finish, or send /cancel.")
+        }
         Text::NotSent { refusal } => format!("Not sent: {refusal}."),
+        Text::TurnNotStarted { reason } => format!("Couldn't start the turn: {reason}."),
         Text::KillEngaged => "Kill switch ENGAGED".to_string(),
         Text::KillDisengaged => "Kill switch DISENGAGED".to_string(),
         Text::NothingToCancel => "Nothing to stop.".to_string(),
@@ -192,6 +205,11 @@ pub fn render(text: &Text) -> String {
             "Capture requests take a typed reply - type your answer instead.".to_string()
         }
         Text::CaptureAnswered { job } => format!("Answered capture request #{job}."),
+        Text::CaptureLate { note } => {
+            format!(
+                "Noted (#{note}), but that question has moved on - the answer was kept as a plain note."
+            )
+        }
         Text::AlreadyHandled => "That one was already handled.".to_string(),
         Text::Approved { id } => format!("Approved #{id}."),
         Text::Rejected { id } => format!("Rejected #{id}."),
@@ -395,6 +413,13 @@ mod tests {
             Text::NotSent {
                 refusal: "kill switch".into(),
             },
+            Text::NotSent {
+                refusal: crate::assistant::TURN_IN_PROGRESS.into(),
+            },
+            Text::TurnNotStarted {
+                reason: "spawn failed".into(),
+            },
+            Text::CaptureLate { note: 5 },
             Text::KillEngaged,
             Text::KillDisengaged,
             Text::NothingToCancel,
