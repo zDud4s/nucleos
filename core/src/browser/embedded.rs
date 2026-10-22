@@ -877,6 +877,40 @@ mod tests {
         assert!(registry.lock().requests.is_empty(), "gone once listed");
     }
 
+    /// The no-project scope is keyed by `embedded_key(NO_PROJECT)` inside the daemon, but the shell
+    /// is told `null`: the listing never leaks the internal key.
+    #[tokio::test]
+    async fn a_request_queued_for_the_no_project_scope_is_listed_with_a_null_project() {
+        use crate::browser::{NO_PROJECT, embedded_key};
+
+        let (registry, _clock) = registry(Duration::from_secs(5));
+        registry.register(embedded_key(NO_PROJECT), "http://127.0.0.1:7");
+        let opener = registry.clone();
+        let open = tokio::spawn(async move {
+            opener
+                .open_with(
+                    embedded_key(NO_PROJECT),
+                    "https://x.test/a",
+                    |_, _, _| async { Ok(session("sess-1")) },
+                )
+                .await
+        });
+        let request = loop {
+            if let Some(request) = registry.poll().pop() {
+                break request;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let listed = serde_json::to_value(&request).unwrap();
+        assert_eq!(listed["kind"], "open");
+        assert!(
+            listed["project"].is_null(),
+            "the wire carries null, got {listed}"
+        );
+        registry.ack(&request.request_id, "n0nce").await;
+        open.await.unwrap();
+    }
+
     #[test]
     fn the_owner_flag_round_trips_and_dies_with_the_session() {
         let (registry, _clock) = registry(OPEN_WAIT);

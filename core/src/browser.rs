@@ -493,6 +493,16 @@ pub async fn list_writes(
         .collect())
 }
 
+/// `Ask.project_id` for a session opened for no project at all (plan D4).
+// RED stub: the real sentinel, kept as the empty string; GREEN wires it through the rest of the module.
+pub const NO_PROJECT: &str = "";
+
+/// The key the embedded registry and the sidecar know a scope by.
+// RED stub: returns the input unchanged; GREEN maps `NO_PROJECT` to "(no project)".
+pub fn embedded_key(project: &str) -> &str {
+    project
+}
+
 /// Everything about one request to open a session, apart from where it will be sent.
 ///
 /// A struct rather than six arguments, and the grouping is the point: `surface` and `requester` are
@@ -2783,6 +2793,160 @@ mod tests {
             calls[2]["body"]["placement"]["origins"],
             serde_json::json!(["https://jira.example.org"])
         );
+        db.close().await;
+    }
+
+    fn none_ask(url: &str) -> Ask<'_> {
+        Ask {
+            project_id: NO_PROJECT,
+            run_id: None,
+            url,
+            surface: Surface::Assistant,
+            requester: Requester::Owner,
+            now: NOW,
+        }
+    }
+
+    /// Like `shell_acks_the_open`, but reports whether an open was queued instead of panicking, so a
+    /// scope that is not embedded fails on an assertion.
+    async fn shell_acks_if_queued(runtime: &BrowserRuntime) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(request) = runtime.embedded.poll().pop() {
+                runtime.embedded.ack(&request.request_id, "n0nce").await;
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// No project: the row carries NULL (not an empty string) and the profile is a throwaway.
+    #[tokio::test]
+    async fn an_open_with_no_project_records_a_null_project_and_a_throwaway_profile() {
+        let db = TempDb::new().await;
+        let (runtime, _seen) = stub_sidecar("https://news.example.net/").await;
+        let opened = open(&db.pool, &runtime, none_ask("https://news.example.net/"))
+            .await
+            .expect("opens");
+        let Opened::Session(row) = opened else {
+            panic!("expected a session, got {opened:?}");
+        };
+        assert_eq!(row.project_id, None);
+        assert_eq!(row.profile_kind, "ephemeral");
+        db.close().await;
+    }
+
+    /// The no-project scope is served by the shell's none registration, with ONE stable ephemeral
+    /// placement for `prepare` and `attach` (plan D5) under the sidecar key "(no project)".
+    #[tokio::test]
+    async fn a_no_project_open_goes_embedded_when_the_shell_registered_that_scope() {
+        let db = TempDb::new().await;
+        let (runtime, seen) = stub_embedded_sidecar("https://news.example.net/").await;
+        runtime.force_embedded(true);
+        runtime
+            .embedded
+            .register(embedded_key(NO_PROJECT), "http://127.0.0.1:9333");
+        let none = Placement::ephemeral("embedded-none");
+        runtime
+            .client
+            .embedded_prepare(embedded_key(NO_PROJECT), &none)
+            .await
+            .unwrap();
+
+        let url = "https://news.example.net/";
+        let (opened, acked) = tokio::join!(
+            open(&db.pool, &runtime, none_ask(url)),
+            shell_acks_if_queued(&runtime)
+        );
+        assert!(acked, "the open was queued for the shell");
+        let Opened::Session(row) = opened.expect("opens") else {
+            panic!("expected a session");
+        };
+        assert_eq!(row.sidecar_id, "e1");
+        assert_eq!(row.project_id, None);
+        assert!(runtime.embedded.is_embedded("e1"));
+
+        let calls = seen.lock().unwrap().clone();
+        let verbs: Vec<_> = calls.iter().map(|c| c["verb"].as_str().unwrap()).collect();
+        assert_eq!(verbs, ["prepare", "prepare", "attach"]);
+        let expected = serde_json::to_value(&none).unwrap();
+        assert_eq!(calls[1]["body"]["placement"], expected);
+        assert_eq!(calls[2]["body"]["placement"], expected);
+        for call in &calls[..2] {
+            assert_eq!(call["body"]["project"], "(no project)");
+        }
+        db.close().await;
+    }
+
+    /// A registration serves its own scope only: the none registration does not take a project's
+    /// open, and a project's registration does not take a no-project open.
+    #[tokio::test]
+    async fn a_no_project_registration_does_not_serve_a_project_open_and_vice_versa() {
+        let db = TempDb::new().await;
+        sqlx::query(
+            "INSERT INTO browser_sites (project_id, origin, kind, granted_at, writable) \
+             VALUES ('acme', 'https://news.example.net', 'destination', ?, 0)",
+        )
+        .bind(NOW)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let url = "https://news.example.net/";
+
+        // Only the none scope registered: the project open goes headless.
+        let (runtime, seen) = stub_sidecar(url).await;
+        runtime.force_embedded(true);
+        runtime
+            .embedded
+            .register(embedded_key(NO_PROJECT), "http://127.0.0.1:9333");
+        let opened = open(&db.pool, &runtime, embedded_ask(url))
+            .await
+            .expect("opens");
+        assert!(matches!(opened, Opened::Session(_)), "{opened:?}");
+        assert_eq!(placements(&seen).len(), 1, "the project open stayed headless");
+        assert!(runtime.embedded.poll().is_empty(), "nothing queued for the shell");
+
+        // Only the project registered: the no-project open goes headless, and is recorded as such.
+        let (runtime, seen) = stub_sidecar(url).await;
+        runtime.force_embedded(true);
+        runtime.embedded.register("acme", "http://127.0.0.1:9333");
+        let opened = open(&db.pool, &runtime, none_ask(url))
+            .await
+            .expect("opens");
+        let Opened::Session(row) = opened else {
+            panic!("expected a session, got {opened:?}");
+        };
+        assert_eq!(placements(&seen).len(), 1, "the no-project open stayed headless");
+        assert!(runtime.embedded.poll().is_empty(), "nothing queued for the shell");
+        assert_eq!(row.project_id, None);
+        db.close().await;
+    }
+
+    /// The scope is already ephemeral, so a landing on another host downgrades nothing: the embedded
+    /// session stays embedded.
+    #[tokio::test]
+    async fn a_no_project_embedded_session_is_not_downgraded_by_the_redirect_trap() {
+        let db = TempDb::new().await;
+        let (runtime, _seen) = stub_embedded_sidecar("https://elsewhere.example.org/landed").await;
+        runtime.force_embedded(true);
+        runtime
+            .embedded
+            .register(embedded_key(NO_PROJECT), "http://127.0.0.1:9333");
+
+        let url = "https://news.example.net/";
+        let (opened, acked) = tokio::join!(
+            open(&db.pool, &runtime, none_ask(url)),
+            shell_acks_if_queued(&runtime)
+        );
+        assert!(acked, "the open was queued for the shell");
+        let Opened::Session(row) = opened.expect("opens") else {
+            panic!("expected a session");
+        };
+        assert_eq!(row.final_url, "https://elsewhere.example.org/landed");
+        assert!(runtime.embedded.is_embedded(&row.sidecar_id));
         db.close().await;
     }
 
