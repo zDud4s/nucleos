@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -225,6 +226,63 @@ def decide(payload, main, broker_ok, py):
     }}
 
 
+def _deny_kind(out, command):
+    """Why `decide` denied: cargo | gate | warm | isolation, or None when it did not deny."""
+    try:
+        spec = out["hookSpecificOutput"]
+        if spec.get("permissionDecision") != "deny":
+            return None
+        reason = spec.get("permissionDecisionReason")
+    except Exception:
+        return None
+    if reason == DENY_ISOLATION:
+        return "isolation"
+    if reason == DENY_REASON:
+        return "gate"
+    if reason == DENY_CARGO:
+        # decide() answers DENY_CARGO for a warm too; tell them apart by the raw command.
+        if _WARM.search(command) and not _runs_cargo(command, True):
+            return "warm"
+        return "cargo"
+    return None
+
+
+def _guard_log_path():
+    # Same resolution as heavy.py state_dir().
+    override = os.environ.get("NUCLEOS_HEAVY_DIR")
+    base = Path(override) if override else Path.home() / ".nucleos" / "heavy"
+    return base / "guard.jsonl"
+
+
+def _log_deny(payload, out):
+    """Append one JSON line per denial handed to a subagent. Evidence only: it must never
+    change the decision, so every failure is swallowed."""
+    try:
+        if not payload.get("agent_id"):
+            return
+        tool_input = payload.get("tool_input")
+        raw = tool_input.get("command") if isinstance(tool_input, dict) else None
+        command = raw if isinstance(raw, str) else ""
+        kind = _deny_kind(out, command)
+        if kind is None:
+            return
+        line = json.dumps({
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "session": payload.get("session_id"),
+            "agent": payload.get("agent_id"),
+            "agent_type": payload.get("agent_type"),
+            "tool": payload.get("tool_name"),
+            "command": command[:500],
+            "reason": kind,
+        }, ensure_ascii=False)
+        path = _guard_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
 def main():
     try:
         payload = json.loads(sys.stdin.read())
@@ -241,6 +299,7 @@ def main():
         broker_ok = bool(main_dir) and (Path(main_dir) / "scripts" / "heavy.py").is_file()
         out = decide(payload, main_dir, broker_ok, sys.executable.replace("\\", "/"))
         if out is not None:
+            _log_deny(payload, out)
             sys.stdout.write(json.dumps(out))
     except Exception as exc:  # fail-open: a hook bug must never block a command
         print(f"heavy_guard: {exc}", file=sys.stderr)

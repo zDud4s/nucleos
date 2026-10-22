@@ -2674,6 +2674,47 @@ def _line(rec: dict, extra: str) -> str:
             f"agent={rec.get('agent')} worktree={rec.get('worktree')} argv={argv}")
 
 
+def status_snapshot() -> dict:
+    """The broker state as plain data (`status --json`; shape fixed by the tree plan §3.4)."""
+    d = state_dir()
+    order = _queue_order(_entries(d / "queue", reap=False), d)
+    held = _entries(d / "held", reap=False)
+    try:
+        total = target_slots()
+        free = sum(1 for k in range(1, total + 1) if not _slot_busy(_read_slot(d, k)))
+        slots = {"total": total, "free": free}
+    except Exception:
+        slots = {"total": 0, "free": 0}
+    wt = d / "wt"
+    locks = []
+    for lock in (sorted(wt.glob("*.lock")) if wt.is_dir() else []):
+        try:
+            rec = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        locks.append({
+            "hash": lock.name[: -len(".lock")],
+            "worktree": str(rec.get("worktree") or "").replace("\\", "/"),
+            "pid": rec.get("pid"),
+            "alive": bool(is_alive(rec.get("pid"), rec.get("ctime"))),
+            "acquired": rec.get("acquired"),
+        })
+    return {
+        "capacity": capacity(),
+        "held_weight": sum(int(r.get("weight") or 1) for _, r in held),
+        "queue": len(order),
+        "slots": slots,
+        "locks": locks,
+    }
+
+
+def cmd_status_json() -> int:
+    print(json.dumps(status_snapshot()))
+    return 0
+
+
 def cmd_status() -> int:
     d = state_dir()
     print(f"state: {d}  capacity: {capacity()}")
@@ -2936,7 +2977,7 @@ def cmd_report(args: list[str]) -> int:
 def main(argv: list[str]) -> int:
     try:
         if argv and argv[0] == "status":
-            return cmd_status()
+            return cmd_status_json() if argv[1:] == ["--json"] else cmd_status()
         if argv and argv[0] == "report":
             return cmd_report(argv[1:])
         if argv and argv[0] == "warm":

@@ -114,17 +114,44 @@ For `TDD-able: no` code tasks, stay in normal orchestrate flow with no formal TD
 
 If `auto_select.enabled: true`, after receiving the planner output: locate the `## Selected models` block. Missing or malformed → STOP per the auto-select rows in dispatch.md's error table. Parse each line into `(phase, tool, model, reasoning_effort?, reason)`; header followed by zero lines = "no match", fall back to `models.yaml` for every downstream phase. Verify each parsed tool is locally available; if not, STOP `auto-selected tool unavailable: <tool> for phase <phase>` — do NOT silently fall back. Record `auto_overrides = { phase: (tool, model, effort, reason) }` for Phases 2-4. If `auto_select.enabled` is `false` or absent, set `auto_overrides = {}`.
 
-### Large tasks: become the root node
+### Large tasks: run a node tree
 
-When Size is `large`, or the plan would not fit one controller within `nodes.orchestrator_budget` (speed.yaml), you are the **root node** of a node tree. Small and medium tasks skip this section and run Phase 2 unchanged.
+When Size is `large`, or the plan would not fit one controller within `nodes.orchestrator_budget` (speed.yaml), you are the **controller** and the root node of a tree. Small and medium tasks skip this section and run Phase 2 unchanged.
 
-1. Open the root: `mcp__nucleos__node_open` without `parent_id`, with the task's `task_id`.
-2. Decompose breadth-first into child nodes under the decomposition rules in workflow.md ("Decomposition (node trees)") and the `orchestrate-node` skill (discovery path); `nodes.max_depth`/`max_width` bound the tree. Open each child with `node_open` (`parent_id` = the root).
-3. Dispatch each sub-orchestrator through the `wf-orchestrator` cockpit, phase `orchestrate_node`, routed per dispatch.md ("Node tree"). Sub-orchestrators dispatch only their own children; you read only the summary each returns, never its leaves' output.
-4. Keep the tree written through: `node_update` on every state change, `node_close` as each node settles, `node_tree`/`node_active` to resume after a compaction.
-5. You still own what no node may own: the intent, RED (orchestrate-tdd), the single final verification (Rule 3), review (Rule 6) and maintenance. Nodes run no tests; they return the commands.
+**Who does what.** Only you run cargo, gates, commits and merges, and only you write the contract. Every other node edits (a leaf, inside its own files) or splits (an orchestrator, without editing). The engine is `python <bundle_dir>/scripts/tree.py <verb>`: `init`, `branch add|bind|drop`, `budget`, `open`, `prompt`, `record`, `gate`, `review`, `merge`, `close`, `park`, `status`, `finish`. Each verb has `--help`. `--tree <id>` or the env var `NUCLEOS_TREE_ID` selects the tree for every verb except `init`. It prints JSON; exit 2 is a refusal, so read its `error` and fix the input instead of retrying. It never calls MCP: when a verb returns `{"mcp": [...]}`, make those calls in that order. The tree's state is `tree.json` and `node_tree`, never your context. Node-side rules live in `orchestrate-node`; the decomposition rules are in workflow.md ("Decomposition (node trees)").
 
-Do not restate the node mechanics here; the `orchestrate-node` skill is their single home.
+**The cycle**
+
+1. **Open.** `node_open` the root (no `parent_id`), then `tree.py init <root_id> --feature-branch <b> --goal <g>`. Its `dirty_owner_files` lists the owner's uncommitted files in the main checkout: tell the user now that a feature touching them will be Blocked at the land. Never stash them.
+2. **Plan the top branches** by layer or surface and `branch add <name> --paths ... --layer ...` each one (`--base <branch>` when it needs another branch merged first). Write the shared contract sections **before** any branch opens. A spike, if needed, is branch 0, alone.
+3. **Wave.** `tree.py budget` says how many branches open now and why. For each: `open <branch>`, `node_open` the branch node under the root with the branch paths, `branch bind <branch> --node-id <id>`, then `prompt <node_id> --branch <b> --kind orchestrator --goal <g> [--paths ... --pointers ...]` for the branch orchestrator and launch it (modes below). A branch you give up on is `branch drop <branch> --reason <r>`. A branch with `--base` opens as soon as its base is `merged`, without waiting for the wave.
+4. **Record.** Save the root's `mcp__nucleos__node_tree` output to a file (it carries each node's `owned_paths` and `updated_at`), then run `tree.py record <node_id> --branch <b> --nodes <node_tree.json> [--report-file <f>]` (the report is read from stdin without `--report-file`) **one node at a time**: when a branch orchestrator returns (direct mode) or as each leaf returns (partition mode). A leaf owns its files until its own `record`, even if it already closed itself. `refused` or `reverted` files fail the node; an invalid report gets one retry with the error attached, a second failure marks it `failed`.
+5. **WIP commit.** Right after each accepted `record`, before the next one, commit exactly the files it returns in `wip_commit.paths` in the branch worktree, with its `wip_commit.message`. A recorded leaf owns nothing any more, so its uncommitted files would read as a foreign write in the next `record` and be reverted. Never use `git add -A`.
+6. **Gate the branch.** Run the branch's commands through the project's heavy-command broker (and `mcp__nucleos__verify` with `scope` on the branch worktree when it matches the project's test groups), then `tree.py gate <branch> --exit N --log F --sha S`. Red: a small fix tree (below), then back here.
+7. **Review the branch** with a fresh read-only `reviewer` over the branch diff and the contract. Triage the findings and submit them as a JSON list with `tree.py review <branch> [--findings F]` (stdin otherwise; integration findings: `review --integration`). `keep` findings become a fix tree under the branch node; back to step 6.
+8. **Merge.** `git merge --no-ff <branch>` through the VCS queue, then `tree.py merge <branch> [--sha <merge commit>]` (make the `node_close` it returns: that closes the branch node and frees its paths for a branch based on it) and `tree.py close <branch>`. An `unreviewed` warning means step 7 was skipped. A conflict goes to the existing resolver.
+9. **Integrate.** When every branch is `merged`: **one** `mcp__nucleos__verify` with `scope: "scope"` on the feature branch (Rule 3), then an integration review (Rule 6) over the whole diff. Fixes hang under the root.
+10. **Land and finish.** Land on master through the queue, then `tree.py finish` and make its `node_close` call. If the land is Blocked by the owner's files: `tree.py park tree --needs "clean <files> in the main checkout"`.
+
+**Launch modes.** Same protocol in both; pick by the harness resolved for `orchestrate_node`, and use the report mode when in doubt.
+- *Direct* (Claude Code): launch the branch orchestrators in one message, in the background, through the `wf-orchestrator` cockpit (`Agent`), prompt from `tree.py prompt`. They launch their own children and return one aggregated report. This is the one exception to the synchronous rule in Phase 2: dispatched phases stay synchronous; tree orchestrators are not phases.
+- *Partition by report* (any harness): the orchestrator launches nothing and returns `outcome: split` with the children's pieces; you open and launch them, and `record` each as it returns. Same shape in phase 2 of the roadmap, where the daemon launches.
+
+**Fix trees.** Group the `keep` findings by file; each group is a piece owned by those files. One group is a leaf, several are an orchestrator with leaves. Hang them under the branch node (branch review) or under the root (integration review). The reviewer who found them never fixes them.
+
+**Contract.** A node needing something the contract lacks returns `contract_request`; it never decides. You decide, write `E<n>` (date, branch, reason), relaunch the asker with the new section, and open an adjustment piece in any running branch the decision affects. A product decision only the owner can take is a `park`, not a question.
+
+**Shared resources.** `tree.py budget` and `gate` record disk samples. Disk below the floor mid-run: open no branch and start no gate, `close` only your own `merged` branches' target dirs, and if that is not enough `park tree --needs "disk"`; never delete caches that are not yours. A foreign lock held for more than `tree.lock_wait_minutes`: move to another branch with work, come back later. The project's heavy-command broker answering "busy": retry with the longer timeout.
+
+**Never ask the owner mid-run.** Nothing in a tree is a question to the user. A blocker is `park node <id> --role <leaf|orchestrator|review> --needs ...`, `park branch <b> --needs ...` or `park tree --needs ...`, which reaches the channel through the feed; `park branch` and `park tree` run in two steps (the first returns a `node_open` payload, make it, then rerun the same command with `--marker-id <id>`). Then carry on with the other branches. After a compaction or a dead session: `tree.py status --nodes <node_tree.json>` plus `node_tree`, close the dead `running` node as `handoff` and relaunch the same piece. A parked branch whose decision arrived resumes with `tree.py park branch <b> --resume`.
+
+You still own what no node may own: the intent, RED (orchestrate-tdd), the single final verification (Rule 3), review (Rule 6) and maintenance. Do not restate node mechanics here; the `orchestrate-node` skill is their single home.
+
+| Rationalization | Reality |
+|---|---|
+| "The leaf can run its own tests to save a round trip" | Only the controller runs cargo and gates; a node that builds is unmeasured and the guard denies it and logs it. |
+| "The owner is watching, so ask them about the disk" | A tree never asks mid-run; park with `--needs` and continue the other branches. |
+| "Commit once at the end, when both branches are done" | WIP commit after every accepted `record`; a closed leaf owns nothing, so its uncommitted files are reverted as foreign writes by the next `record`. |
 
 ## Phase 2 - Execute
 
@@ -136,7 +163,7 @@ The orchestrator does not make code changes itself unless `execute` resolves to 
 
 ### Hard rule: synchronous dispatch only
 
-Every dispatched phase MUST be launched synchronously — the orchestrator blocks until the subprocess exits or its timeout fires. Never use background-launch flags (`run_in_background: true`, shell `&`, `nohup`, `Start-Process` without `-Wait`, etc.). Background mode returns immediately with metadata instead of the phase output, which breaks the Handoff check, dispatch tracker, and metric row. If a phase needs more than the default timeout, raise `<phase>.timeout_seconds` in `<state_dir>/models.yaml`. See dispatch.md "Synchronous-call invariant".
+Every dispatched phase MUST be launched synchronously — the orchestrator blocks until the subprocess exits or its timeout fires. Never use background-launch flags (`run_in_background: true`, shell `&`, `nohup`, `Start-Process` without `-Wait`, etc.). Background mode returns immediately with metadata instead of the phase output, which breaks the Handoff check, dispatch tracker, and metric row. If a phase needs more than the default timeout, raise `<phase>.timeout_seconds` in `<state_dir>/models.yaml`. See dispatch.md "Synchronous-call invariant". The one exception is the branch orchestrators of a node tree in direct mode (see "Large tasks: run a node tree"): they are launched through `Agent` in one message and recorded afterwards by `tree.py record`.
 
 If the executor fails (timeout, non-zero exit, environment/permission block), only allowed responses: report the exact error; suggest `<state_dir>/models.yaml` or executor-environment fixes; dispatch rescue (`auto_overrides["rescue"]` if set, else `rescue.tool`/`rescue.model` from `<state_dir>/models.yaml`); STOP and wait for user direction.
 

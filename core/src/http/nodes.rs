@@ -160,10 +160,37 @@ async fn post_close(
     };
     let node = work_nodes::get(&state.pool, &id).await.map_err(refused)?;
     let limits = limits_for(&state, node.project_id.as_deref()).await;
-    work_nodes::close(&state.pool, &id, &limits, &args)
+    let closed = work_nodes::close(&state.pool, &id, &limits, &args)
         .await
-        .map(Json)
-        .map_err(refused)
+        .map_err(refused)?;
+    announce_close(&state.pool, &closed).await;
+    Ok(Json(closed))
+}
+
+/// Leaves the feed line a close earns (`work_nodes::feed_line`), if any.
+///
+/// Best effort, like the handoff `rework` record in `work_nodes::close`: the close is already
+/// committed and is the source of truth, so a feed failure is logged and never undoes it.
+async fn announce_close(pool: &sqlx::SqlitePool, node: &work_nodes::Node) {
+    let root_title = if node.kind == "root" {
+        node.title.clone()
+    } else {
+        match work_nodes::get(pool, &node.root_id).await {
+            Ok(root) => root.title,
+            Err(error) => {
+                tracing::warn!(node = %node.id, %error, "could not read the root title for the feed");
+                node.title.clone()
+            }
+        }
+    };
+    let Some((kind, summary)) = work_nodes::feed_line(&root_title, node) else {
+        return;
+    };
+    if let Err(error) =
+        crate::feed::append(pool, node.project_id.as_deref(), kind, &summary, None, None).await
+    {
+        tracing::warn!(node = %node.id, %error, "could not write the work tree feed line");
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -226,13 +253,46 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    async fn app() -> Router {
+    async fn app_and_pool() -> (Router, sqlx::SqlitePool) {
         let (state, _) = crate::execution::runs::testkit::test_state_with_runner(
             None,
             crate::state::DEFAULT_RUN_TIMEOUT,
         )
         .await;
-        crate::http::build_router(state)
+        let pool = state.pool.clone();
+        (crate::http::build_router(state), pool)
+    }
+
+    async fn app() -> Router {
+        app_and_pool().await.0
+    }
+
+    /// Every tree line in the feed, oldest first: `(kind, summary, project_id, run_id)`.
+    async fn tree_lines(
+        pool: &sqlx::SqlitePool,
+    ) -> Vec<(String, String, Option<String>, Option<i64>)> {
+        sqlx::query_as(
+            "SELECT kind, summary, project_id, run_id FROM feed \
+             WHERE kind LIKE 'work_tree_%' ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn close_node(
+        app: &Router,
+        id: &str,
+        status: &str,
+        summary: &str,
+    ) -> (StatusCode, Value) {
+        call(
+            app,
+            "POST",
+            &format!("/nodes/{id}/close"),
+            Some(json!({ "status": status, "summary": summary, "handoff_path": handoff_file() })),
+        )
+        .await
     }
 
     async fn call(
@@ -414,5 +474,83 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = call(&app, "GET", "/nodes/tree/missing", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn closing_a_root_done_writes_one_finished_line() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-feed-done").await;
+
+        let (status, body) = close_node(&app, &root, "done", "Everything merged.").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let lines = tree_lines(&pool).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let (kind, summary, _project, run_id) = &lines[0];
+        assert_eq!(kind, "work_tree_finished");
+        assert_eq!(summary, "Root: done — Everything merged.");
+        assert_eq!(*run_id, None);
+    }
+
+    #[tokio::test]
+    async fn closing_a_leaf_blocked_writes_a_parked_line_with_its_decisions() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-feed-parked").await;
+        let (status, leaf) = open_leaf(&app, &root, "Leaf", &["core/src/a/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{leaf}");
+        let leaf_id = leaf["id"].as_str().unwrap().to_owned();
+        let (status, node) = call(
+            &app,
+            "PATCH",
+            &format!("/nodes/{leaf_id}"),
+            Some(json!({ "status": null, "decision": "pick A or B", "context_peak": null })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{node}");
+
+        let (status, body) = close_node(&app, &leaf_id, "blocked", "Needs a call.").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let lines = tree_lines(&pool).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, "work_tree_parked");
+        // The title is the root's, not the leaf's.
+        assert_eq!(
+            lines[0].1,
+            "Root: blocked — Needs a call. — precisa de: pick A or B"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_leaf_done_writes_nothing() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-feed-leaf").await;
+        let (status, leaf) = open_leaf(&app, &root, "Leaf", &["core/src/a/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{leaf}");
+        let leaf_id = leaf["id"].as_str().unwrap().to_owned();
+
+        let (status, body) = close_node(&app, &leaf_id, "done", "Done.").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(tree_lines(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_a_root_handoff_writes_nothing() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-feed-handoff").await;
+
+        let (status, body) = close_node(&app, &root, "handoff", "Context is full.").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(tree_lines(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_close_writes_nothing() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-feed-refused").await;
+
+        let (status, _) = close_node(&app, &root, "done", &"x".repeat(1501)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(tree_lines(&pool).await.is_empty());
     }
 }
