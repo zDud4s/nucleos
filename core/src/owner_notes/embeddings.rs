@@ -53,9 +53,11 @@ impl FailureLog {
 
     /// Whether the passes skip this note: it failed `NOTE_FAILURES` times on this very text, lately.
     fn is_parked(&self, id: i64, hash: &str) -> bool {
-        self.lock().get(&id).is_some_and(|(failed_hash, count, at)| {
-            failed_hash == hash && *count >= NOTE_FAILURES && at.elapsed() < PARK_FOR
-        })
+        self.lock()
+            .get(&id)
+            .is_some_and(|(failed_hash, count, at)| {
+                failed_hash == hash && *count >= NOTE_FAILURES && at.elapsed() < PARK_FOR
+            })
     }
 
     fn record_failure(&self, id: i64, hash: &str) {
