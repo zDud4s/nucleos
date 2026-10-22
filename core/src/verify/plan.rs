@@ -128,6 +128,7 @@ fn why(reason: &Reason) -> String {
 /// `full_allowed` is false while the project gates after landing, where a full run is the gate's
 /// job and not a session's. `filters` lets a group's `filters` narrow its `select`; it is for a
 /// session's own iteration runs, never for a gate or evidence run, which measure the whole group.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan(
     map: &MapState,
     kind: Kind,
