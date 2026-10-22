@@ -1,4 +1,5 @@
 pub mod groups;
+pub mod links;
 pub mod notices;
 pub mod seed;
 pub mod tasks;

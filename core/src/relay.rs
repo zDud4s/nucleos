@@ -62,7 +62,11 @@ pub enum Verdict {
 /// nothing does — and inventing a fifth `Verdict` for a shape that never occurs would be a case to
 /// maintain forever against a bug that has never shown up. Zero relays is, truthfully, not a cycle,
 /// not a relay to itself, and not too deep.
-pub fn admits(chain: &[&str], to: &str) -> Verdict {
+pub fn admits(chain: &[&str], to: &str, linked: bool) -> Verdict {
+    // RED stub: the linked exception is not written yet; a linked hop must fail its tests.
+    if linked {
+        todo!("RED stub");
+    }
     // `Itself` and `Cycle` are decided before length is even considered — a chain that has looped
     // back on itself is a wrong chain, not merely a long one, and that is the more useful thing to
     // say even when the chain is also past `MAX_RELAY_DEPTH` (see the second pinned test below).
@@ -213,6 +217,14 @@ pub enum Refusal {
     Unreadable { step: &'static str, error: String },
 }
 
+impl Refusal {
+    /// The word `http::chat_turns::relay_refusal_response` answers this refusal with.
+    // RED stub
+    pub fn slug(&self) -> &'static str {
+        todo!("RED stub")
+    }
+}
+
 /// The gate: whether a message may travel from `from_chat_id`, sent by the turn `sending_run_id`,
 /// on into `to_chat_id` — and, if so, the id of the `chat_relays` row recording that it did.
 ///
@@ -300,7 +312,8 @@ pub async fn admit(
             error: error.to_string(),
         })?;
     let chain_refs: Vec<&str> = links.iter().map(|(_, chat_id)| chat_id.as_str()).collect();
-    let verdict = admits(&chain_refs, to_chat_id);
+    // RED stub: `admit` does not read `chat_links` yet.
+    let verdict = admits(&chain_refs, to_chat_id, false);
     if verdict != Verdict::Ok {
         return Err(Refusal::Chain(verdict));
     }
@@ -534,7 +547,7 @@ mod tests {
                 "a fourth relay exceeds MAX_RELAY_DEPTH and closes nothing",
             ),
         ] {
-            assert_eq!(admits(&chain, to), expected, "{why}");
+            assert_eq!(admits(&chain, to, false), expected, "{why}");
         }
     }
 
@@ -544,7 +557,7 @@ mod tests {
     #[test]
     fn a_cycle_is_named_even_in_a_chain_that_is_also_too_deep() {
         assert_eq!(
-            admits(&["A", "B", "C", "D"], "B"),
+            admits(&["A", "B", "C", "D"], "B", false),
             Verdict::Cycle {
                 at: "B".to_string()
             }
@@ -1092,5 +1105,154 @@ mod tests {
             chain_has_room(&pool, root, now).await,
             Err(Refusal::ChainOverBudget { .. })
         ));
+    }
+
+    // -- linked pairs (spec 4.4) ---------------------------------------------------------------
+    //
+    // A browser agent and the conversation that called it may hand messages back and forth: the
+    // answer of the child travels back to the mother, and a woken mother may ask the child again.
+    // Both hops revisit a conversation already in the chain, so without the linked exception every
+    // one of them would be a `Cycle`. The exception lifts only that; the self relay and the depth
+    // limit stay exactly where they were.
+
+    /// Spec 4.4 steps 2 and 3: the child answers the mother (`[M, F]` -> M), and the woken mother
+    /// asks the child again (`[M, F, M]` -> F). Both are admitted because the pair is linked.
+    #[test]
+    fn a_linked_pair_may_hop_back_to_a_conversation_already_in_the_chain() {
+        assert_eq!(
+            admits(&["M", "F"], "M", true),
+            Verdict::Ok,
+            "the child's answer reaches its mother"
+        );
+        assert_eq!(
+            admits(&["M", "F", "M"], "F", true),
+            Verdict::Ok,
+            "the woken mother may ask her child once more"
+        );
+    }
+
+    /// The exception belongs to the link, not to the hop: the same chain without a link is the
+    /// cycle it always was.
+    #[test]
+    fn the_same_hop_without_a_link_is_still_a_cycle() {
+        assert_eq!(
+            admits(&["M", "F"], "M", false),
+            Verdict::Cycle {
+                at: "M".to_string()
+            }
+        );
+    }
+
+    /// A link never lets a conversation relay to itself, and never lets a chain grow past
+    /// `MAX_RELAY_DEPTH`: spec 4.4 step 4, the child's second answer, is `TooDeep`.
+    #[test]
+    fn a_link_lifts_neither_the_self_relay_nor_the_depth_limit() {
+        assert_eq!(admits(&["M", "F"], "F", true), Verdict::Itself);
+        assert_eq!(admits(&["M", "F", "M", "F"], "M", true), Verdict::TooDeep);
+    }
+
+    /// `admit` reads the link itself, in either direction: a mother whose child is linked to her
+    /// may send it a message, and the child may answer. Once the link is closed both hops are the
+    /// plain cycles they would be between any two conversations.
+    #[tokio::test]
+    async fn admit_treats_an_active_link_as_linked_in_both_directions() {
+        let pool = test_pool().await;
+        let now = timestamp("2026-08-22T00:00:00Z");
+        seed_chat(&pool, "M", false).await;
+        seed_chat(&pool, "F", false).await;
+        seed_owner_present(&pool, now).await;
+        crate::chats::links::open(&pool, "F", Some("M"), "browser", None)
+            .await
+            .expect("link the child to its mother");
+
+        let mother_turn = seed_chain(&pool, &["M", "F", "M"]).await;
+        admit(&pool, "M", "F", mother_turn, Origin::Shell, "one more thing", now)
+            .await
+            .expect("mother -> child is admitted for a linked pair");
+
+        let child_turn = seed_chain(&pool, &["M", "F"]).await;
+        admit(&pool, "F", "M", child_turn, Origin::Shell, "the answer", now)
+            .await
+            .expect("child -> mother is admitted for a linked pair");
+
+        crate::chats::links::unlink(&pool, "F")
+            .await
+            .expect("close the link");
+
+        assert_eq!(
+            admit(&pool, "M", "F", mother_turn, Origin::Shell, "one more thing", now).await,
+            Err(Refusal::Chain(Verdict::Cycle {
+                at: "F".to_string()
+            })),
+            "an unlinked mother -> child hop is a cycle again"
+        );
+        assert_eq!(
+            admit(&pool, "F", "M", child_turn, Origin::Shell, "the answer", now).await,
+            Err(Refusal::Chain(Verdict::Cycle {
+                at: "M".to_string()
+            })),
+            "an unlinked child -> mother hop is a cycle again"
+        );
+    }
+
+    /// Spec 4.4, the ceiling counted: the child's SECOND answer travels on `[M, F, M, F]`, four
+    /// conversations, and is refused for length even though the pair is linked.
+    #[tokio::test]
+    async fn the_second_reply_of_a_linked_child_is_too_deep() {
+        let pool = test_pool().await;
+        let now = timestamp("2026-08-22T00:00:00Z");
+        seed_chat(&pool, "M", false).await;
+        seed_chat(&pool, "F", false).await;
+        seed_owner_present(&pool, now).await;
+        crate::chats::links::open(&pool, "F", Some("M"), "browser", None)
+            .await
+            .expect("link the child to its mother");
+
+        let child_turn = seed_chain(&pool, &["M", "F", "M", "F"]).await;
+        assert_eq!(
+            admit(&pool, "F", "M", child_turn, Origin::Shell, "the second answer", now).await,
+            Err(Refusal::Chain(Verdict::TooDeep))
+        );
+    }
+
+    /// `Refusal::slug` speaks the same words `/relay` answers with (`relay_refusal_response`), so
+    /// a delivery recorded for the panel and a refusal returned over HTTP never disagree.
+    #[test]
+    fn refusal_slugs_match_the_http_vocabulary() {
+        for (refusal, slug) in [
+            (
+                Refusal::NoSuchDestination {
+                    to_chat_id: "X".to_string(),
+                },
+                "no_such_destination",
+            ),
+            (Refusal::RemoteOrigin, "remote_origin"),
+            (Refusal::Chain(Verdict::Itself), "relay_to_self"),
+            (
+                Refusal::Chain(Verdict::Cycle {
+                    at: "X".to_string(),
+                }),
+                "relay_cycle",
+            ),
+            (Refusal::Chain(Verdict::TooDeep), "relay_too_deep"),
+            (Refusal::Chain(Verdict::Ok), "internal"),
+            (
+                Refusal::ChainOverBudget {
+                    spent_usd: 6.0,
+                    limit_usd: 5.0,
+                },
+                "relay_chain_over_budget",
+            ),
+            (Refusal::OwnerAway, "owner_away"),
+            (
+                Refusal::Unreadable {
+                    step: "chain walk",
+                    error: "broken".to_string(),
+                },
+                "internal",
+            ),
+        ] {
+            assert_eq!(refusal.slug(), slug, "{refusal:?}");
+        }
     }
 }
