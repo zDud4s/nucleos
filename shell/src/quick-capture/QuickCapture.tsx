@@ -41,11 +41,20 @@ export function QuickCapture() {
     const take = () => area.current?.focus();
     take();
     const leave = () => void hideWindow();
+    // Esc on the window, not on the textarea: with focus on the padding or the hint the textarea
+    // never sees the key, and the box would stay up, focused, ignoring it.
+    const onEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      void hideWindow();
+    };
     window.addEventListener("focus", take);
     window.addEventListener("blur", leave);
+    window.addEventListener("keydown", onEscape);
     return () => {
       window.removeEventListener("focus", take);
       window.removeEventListener("blur", leave);
+      window.removeEventListener("keydown", onEscape);
     };
   }, []);
 
@@ -64,10 +73,7 @@ export function QuickCapture() {
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      void hideWindow();
-    } else if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       save();
     }

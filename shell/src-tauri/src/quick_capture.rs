@@ -5,7 +5,8 @@
 //! this module owns only the window and the one decision of whether to create it or reveal the one
 //! that already exists. Unlike the notch window, this one holds a capability
 //! (`capabilities/quick-capture.json`): it hides itself from the page on Enter, Esc and blur, and
-//! that is a window API, which the ACL only answers for a window that was granted it.
+//! that is a window API, which the ACL only answers for a window that was granted it. The grant is
+//! exactly `core:window:allow-hide`; focus and blur are plain DOM events and need none.
 
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -37,10 +38,34 @@ fn plan(exists: bool) -> Plan {
     }
 }
 
+/// Builds the window. It blocks until the main thread has created it, so it must never run on the
+/// main thread itself: see the "Threading" note in `browser.rs`.
+fn build(app: &AppHandle) -> tauri::Result<()> {
+    WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App(URL.into()))
+        .title("NucleOS quick capture")
+        .inner_size(WIDTH, HEIGHT)
+        .center()
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(true)
+        // Same origin as the main window (`useHttpsScheme` in tauri.conf.json): the
+        // daemon's CORS allows `https://tauri.localhost` only.
+        .use_https_scheme(true)
+        .build()?;
+    Ok(())
+}
+
 /// Opens the quick-capture window, or shows and focuses it when it already exists.
 ///
-/// Errors are returned for the caller to log; there is nothing else useful to do with one, and the
-/// main window is deliberately left alone either way.
+/// The chord's handler may run on the main thread, and on Windows building a window from there can
+/// deadlock (`browser.rs` records the same hazard for its own build). The first press therefore
+/// hands the build to `spawn_blocking` and returns at once; a failed build is logged from there,
+/// because the caller has already moved on. Revealing an existing window only queues messages to the
+/// main thread, so it stays inline and its errors are returned.
+///
+/// The main window is deliberately left alone either way.
 pub fn open(app: &AppHandle) -> tauri::Result<()> {
     match plan(app.get_webview_window(LABEL).is_some()) {
         Plan::Reveal => {
@@ -52,19 +77,12 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
             Ok(())
         }
         Plan::Create => {
-            WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App(URL.into()))
-                .title("NucleOS quick capture")
-                .inner_size(WIDTH, HEIGHT)
-                .center()
-                .decorations(false)
-                .always_on_top(true)
-                .skip_taskbar(true)
-                .resizable(false)
-                .focused(true)
-                // Same origin as the main window (`useHttpsScheme` in tauri.conf.json): the
-                // daemon's CORS allows `https://tauri.localhost` only.
-                .use_https_scheme(true)
-                .build()?;
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = build(&app) {
+                    eprintln!("[quick-capture] could not build the window: {error}");
+                }
+            });
             Ok(())
         }
     }
@@ -86,23 +104,43 @@ mod tests {
         assert!(URL.ends_with(LABEL));
     }
 
+    // Compile-time checks: the sizes are constants, so a runtime `assert!` on them is a constant
+    // assertion (clippy `assertions_on_constants`).
+    const _: () = assert!(WIDTH > HEIGHT, "the box is wider than tall");
+    const _: () = assert!(WIDTH <= 600.0 && HEIGHT <= 300.0, "the box is small");
+
+    /// The first press runs on the chord's handler thread, which may be the main one, where building
+    /// a window can deadlock on Windows. There is no app here to raise the chord, so the source is
+    /// read: the create arm must hand the build to `spawn_blocking` and not build inline.
     #[test]
-    fn the_box_is_small_and_wider_than_tall() {
-        assert!(WIDTH > HEIGHT);
-        assert!(WIDTH <= 600.0 && HEIGHT <= 300.0);
+    fn the_build_is_not_inlined_into_the_first_press() {
+        let source = include_str!("quick_capture.rs");
+        let create = source
+            .split("Plan::Create => {")
+            .nth(1)
+            .expect("the create arm exists")
+            .split("\n        }")
+            .next()
+            .expect("the create arm ends");
+        assert!(
+            create.contains("tauri::async_runtime::spawn_blocking"),
+            "{create}"
+        );
+        assert!(!create.contains("WebviewWindowBuilder"), "{create}");
     }
 
     /// The capability is scoped by label, so a renamed label would silently lose its permissions.
+    /// The permission list is exact: the page needs `hide` and nothing else, and `core:default`
+    /// would add event, webview, window-read, app, path and resource APIs it never calls.
     #[test]
     fn the_capability_names_this_window_and_nothing_else() {
         let capability: serde_json::Value =
             serde_json::from_str(include_str!("../capabilities/quick-capture.json"))
                 .expect("quick-capture.json parses");
         assert_eq!(capability["windows"], serde_json::json!([LABEL]));
-        let permissions = capability["permissions"].to_string();
-        assert!(
-            permissions.contains("core:window:allow-hide"),
-            "{permissions}"
+        assert_eq!(
+            capability["permissions"],
+            serde_json::json!(["core:window:allow-hide"])
         );
     }
 }

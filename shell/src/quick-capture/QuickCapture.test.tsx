@@ -86,6 +86,19 @@ describe("QuickCapture", () => {
     expect(box().value).toBe("half a thought");
   });
 
+  it("hides on Escape even when focus is not in the textarea", async () => {
+    renderWithQuery(<QuickCapture />);
+    type("kept anyway");
+    box().blur();
+    expect(document.activeElement).not.toBe(box());
+
+    fireEvent.keyDown(screen.getByRole("main"), { key: "Escape" });
+
+    await waitFor(() => expect(tauri.hide).toHaveBeenCalledTimes(1));
+    expect(daemon.apiFetch).not.toHaveBeenCalled();
+    expect(box().value).toBe("kept anyway");
+  });
+
   it("hides when the window loses focus", async () => {
     renderWithQuery(<QuickCapture />);
 
