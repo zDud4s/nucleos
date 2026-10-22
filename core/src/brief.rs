@@ -91,6 +91,12 @@ fn match_expression(query: &str) -> Option<String> {
 }
 
 /// Turn SQLite's negative bm25 ranks into one signal on the unit scale for this pass.
+///
+/// This divides by the best of the pass, so a real but weaker match can land far under
+/// `knowledge::MIN_RELEVANCE` (one common term against a long strong row). The embedder path
+/// keeps that value, because `s_sim` can carry such a row. When no query vector was computed,
+/// [`of_with`] lifts every matched row through [`lift_fts`] afterwards; this function itself does
+/// not change.
 fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
     let raw: Vec<Option<f64>> = bm25
         .iter()
@@ -118,6 +124,21 @@ fn normalise_fts(bm25: &[Option<f64>]) -> Vec<f64> {
     raw.iter()
         .map(|value| value.map_or(0.0, |value| (value - lo) / (hi - lo)))
         .collect()
+}
+
+/// Lift a matched row's pass-normalised FTS signal onto `[MIN_RELEVANCE, 1.0]`.
+///
+/// Used only when no query vector exists, so FTS is the only textual signal and
+/// [`normalise_fts`]'s division by the pass best would otherwise drop every real-but-weaker match
+/// under the gate. The map `MIN_RELEVANCE + (1 - MIN_RELEVANCE) * s` is affine and increasing, so
+/// ordering and ties are unchanged and a best match stays `1.0`. A row with no FTS hit (`0.0`,
+/// negative or not finite) stays `0.0` and is still dropped by the gate.
+fn lift_fts(s_fts: f64) -> f64 {
+    if !s_fts.is_finite() || s_fts <= 0.0 {
+        return 0.0;
+    }
+    let floor = knowledge::MIN_RELEVANCE;
+    (floor + (1.0 - floor) * s_fts.clamp(0.0, 1.0)).clamp(floor, 1.0)
 }
 
 async fn fts_ranks(
@@ -254,6 +275,8 @@ pub async fn of(pool: &SqlitePool, context: &Context, query: &str) -> sqlx::Resu
 
 /// [`of`] with the embedder and its deadline injected. One query embedding per briefing; a
 /// timeout, an error or a missing vector leaves every `s_sim` at zero and the weights as before.
+/// With no query vector, matched rows' `s_fts` is lifted onto `[MIN_RELEVANCE, 1.0]` (see
+/// [`lift_fts`]); with one, `s_fts` is the plain pass-normalised value.
 /// Only the error kind is logged, never the query, a title, a body or a vector.
 pub(crate) async fn of_with(
     pool: &SqlitePool,
@@ -321,6 +344,11 @@ pub(crate) async fn of_with(
             ..context.clone()
         };
         return Ok(knowledge::select(&known, &context, &Budget::default()));
+    }
+    // FTS is the only textual signal here: lift every matched row over the relevance gate, see
+    // `lift_fts`. Unmatched rows stay at 0.0 and are still dropped.
+    for candidate in known.iter_mut() {
+        candidate.s_fts = lift_fts(candidate.s_fts);
     }
     Ok(knowledge::select(&known, context, &Budget::default()))
 }
@@ -876,8 +904,9 @@ mod tests {
     use sqlx::{Row, SqlitePool};
 
     use super::{
-        SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, match_expression,
-        normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most, trace_of,
+        SWEEP_BATCH, Verdict, credit_item, credit_run, fts_ranks, item_verdict, lift_fts,
+        match_expression, normalise_fts, of, prune, record, run_verdict, sweep, sweep_at_most,
+        trace_of,
     };
     use crate::execution::job::ItemState;
     use crate::knowledge::{Context, Scope, Scored};
@@ -1144,6 +1173,193 @@ mod tests {
         let ranks = fts_ranks(&pool, "\"zanzibar\"", &[a]).await?;
         assert_eq!(ranks.keys().copied().collect::<Vec<_>>(), vec![a]);
         assert!(fts_ranks(&pool, "\"zanzibar\"", &[]).await?.is_empty());
+        Ok(())
+    }
+
+    const LIFT_QUERY: &str = "zanzibar rollout migration shared";
+
+    /// One long strong match, five rows sharing only the common term `shared`, two rows that
+    /// match nothing. Returns `(strong, weak, unmatched)` ids; every row is active and in `p1`.
+    async fn seed_lift_corpus(pool: &SqlitePool) -> sqlx::Result<(i64, Vec<i64>, Vec<i64>)> {
+        async fn row(pool: &SqlitePool, title: &str, body: &str) -> sqlx::Result<i64> {
+            let result = sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('semantic', 'project', 'p1', 'owner', 'memory', ?, ?, 'active',
+                         '2026-08-19T00:00:00+00:00')",
+            )
+            .bind(title)
+            .bind(body)
+            .execute(pool)
+            .await?;
+            Ok(result.last_insert_rowid())
+        }
+
+        let strong = row(
+            pool,
+            "zanzibar rollout migration",
+            "zanzibar rollout migration shared plan: the zanzibar rollout needs the migration              before the shared cache moves; zanzibar migration, rollout order, shared owner.",
+        )
+        .await?;
+        let mut weak = Vec::new();
+        for n in 0..5 {
+            weak.push(
+                row(
+                    pool,
+                    &format!("weak note {n}"),
+                    &format!("a shared remark number {n} about something else entirely"),
+                )
+                .await?,
+            );
+        }
+        let mut unmatched = Vec::new();
+        for n in 0..2 {
+            unmatched.push(
+                row(
+                    pool,
+                    &format!("unrelated note {n}"),
+                    &format!("lunch menu number {n}"),
+                )
+                .await?,
+            );
+        }
+        Ok((strong, weak, unmatched))
+    }
+
+    /// The pass-normalised FTS value each candidate would carry without the lift.
+    async fn plain_fts(pool: &SqlitePool, ids: &[i64]) -> sqlx::Result<Vec<f64>> {
+        let expression = match_expression(LIFT_QUERY).expect("the query has terms");
+        let ranks = fts_ranks(pool, &expression, ids).await?;
+        let bm25: Vec<Option<f64>> = ids.iter().map(|id| ranks.get(id).copied()).collect();
+        Ok(normalise_fts(&bm25))
+    }
+
+    fn trace_row(brief: &crate::knowledge::Brief, id: i64) -> &Scored {
+        brief
+            .trace
+            .iter()
+            .find(|row| row.knowledge_id == id)
+            .expect("every admitted candidate is traced")
+    }
+
+    #[tokio::test]
+    async fn fts_lift_keeps_weak_but_real_matches_in_the_briefing_without_an_embedder()
+    -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let (strong, weak, _unmatched) = seed_lift_corpus(&pool).await?;
+
+        // The collapse this lift answers: every weak match is real (> 0) yet under the gate.
+        let mut ids = vec![strong];
+        ids.extend(&weak);
+        let plain = plain_fts(&pool, &ids).await?;
+        assert_eq!(plain[0], 1.0);
+        assert!(
+            plain[1..]
+                .iter()
+                .all(|s| *s > 0.0 && *s < crate::knowledge::MIN_RELEVANCE),
+            "{plain:?}"
+        );
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            LIFT_QUERY,
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        let strong_row = trace_row(&brief, strong);
+        assert!(strong_row.shown);
+        assert_eq!(strong_row.s_fts, 1.0);
+        for id in &weak {
+            let row = trace_row(&brief, *id);
+            assert!(row.s_fts >= crate::knowledge::MIN_RELEVANCE, "{}", row.s_fts);
+            assert!(row.s_fts < strong_row.s_fts);
+            assert!(row.shown, "a weak but real match is briefed");
+        }
+        let block = brief.block.as_deref().unwrap_or_default();
+        assert!(block.contains("weak note 0") && block.contains("zanzibar rollout migration"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fts_lift_still_drops_a_row_with_no_match() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let (_strong, _weak, unmatched) = seed_lift_corpus(&pool).await?;
+
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            LIFT_QUERY,
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        for id in unmatched {
+            let row = trace_row(&brief, id);
+            assert_eq!(row.s_fts, 0.0);
+            assert!(!row.shown);
+        }
+        let block = brief.block.as_deref().unwrap_or_default();
+        assert!(!block.contains("unrelated note"));
+        Ok(())
+    }
+
+    #[test]
+    fn fts_lift_is_an_order_preserving_map_onto_the_gate_and_one() {
+        let floor = crate::knowledge::MIN_RELEVANCE;
+        assert_eq!(lift_fts(0.0), 0.0);
+        assert_eq!(lift_fts(-0.5), 0.0);
+        assert_eq!(lift_fts(-0.0), 0.0);
+        assert_eq!(lift_fts(f64::NAN), 0.0);
+        assert_eq!(lift_fts(f64::INFINITY), 0.0);
+        assert_eq!(lift_fts(f64::NEG_INFINITY), 0.0);
+        assert_eq!(lift_fts(1.0), 1.0);
+        assert_eq!(lift_fts(2.0), 1.0);
+        assert!(lift_fts(1e-8) >= floor);
+
+        let samples = [1e-8, 1e-6, 0.01, 0.0915, 0.1, 0.25, 0.5, 0.9, 1.0];
+        let lifted: Vec<f64> = samples.iter().map(|s| lift_fts(*s)).collect();
+        assert!(lifted.windows(2).all(|pair| pair[0] < pair[1]), "{lifted:?}");
+        assert!(lifted.iter().all(|s| (floor..=1.0).contains(s)));
+    }
+
+    #[tokio::test]
+    async fn fts_lift_leaves_the_embedder_path_untouched() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let (strong, weak, unmatched) = seed_lift_corpus(&pool).await?;
+        let mut ids = vec![strong];
+        ids.extend(&weak);
+        let plain = plain_fts(&pool, &ids).await?;
+
+        // A query vector orthogonal to every stored one: `s_sim` is 0, so only `s_fts` can pass.
+        for id in ids.iter().chain(&unmatched) {
+            seed_vector(&pool, *id, &[0.0, 1.0]).await?;
+        }
+        let fake = crate::embed::FakeEmbedder::new("fake", vec![], Some(vec![1.0, 0.0]));
+        let brief = super::of_with(
+            &pool,
+            &context(),
+            LIFT_QUERY,
+            Some(&fake),
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+
+        for (id, expected) in ids.iter().zip(&plain) {
+            let row = trace_row(&brief, *id);
+            assert_eq!(row.s_fts, *expected, "the embedder path is not lifted");
+        }
+        assert!(trace_row(&brief, strong).shown);
+        for id in &weak {
+            let row = trace_row(&brief, *id);
+            assert!(row.s_fts < crate::knowledge::MIN_RELEVANCE);
+            assert_eq!(row.s_sim, 0.0);
+            assert!(!row.shown, "under the gate with the old normalisation");
+        }
+        for id in &unmatched {
+            assert_eq!(trace_row(&brief, *id).s_fts, 0.0);
+        }
         Ok(())
     }
 
