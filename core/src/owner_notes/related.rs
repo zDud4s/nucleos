@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use sqlx::SqlitePool;
 
-use super::{LinkError, NoteError, OwnerNote, NOTE_COLUMNS, TARGET_KINDS};
+use super::{LinkError, NOTE_COLUMNS, NoteError, OwnerNote, TARGET_KINDS};
 
 /// Weight of the embedding signal: the cosine itself, once it clears [`EMBEDDING_FLOOR`].
 const EMBEDDING_WEIGHT: f64 = 0.5;
@@ -131,11 +131,7 @@ impl Signals {
 /// The active notes most like note `id`, best first, at most `limit` of them (clamping `limit` to the
 /// public maximum is the handler's job). The note itself and archived notes never appear. Ties break
 /// on the lower id so the answer is the same on every call.
-pub async fn related(
-    pool: &SqlitePool,
-    id: i64,
-    limit: usize,
-) -> Result<Vec<Related>, NoteError> {
+pub async fn related(pool: &SqlitePool, id: i64, limit: usize) -> Result<Vec<Related>, NoteError> {
     let source = sqlx::query_as::<_, OwnerNote>(sqlx::AssertSqlSafe(format!(
         "SELECT {NOTE_COLUMNS} FROM owner_notes WHERE id = ?"
     )))
@@ -430,10 +426,7 @@ mod tests {
         let found = related(&pool, a, 10).await.unwrap();
         let ids: Vec<i64> = found.iter().map(|r| r.note.id).collect();
         assert_eq!(ids, vec![live]);
-        assert_eq!(
-            found[0].reasons,
-            vec!["embedding", "shared_target", "text"]
-        );
+        assert_eq!(found[0].reasons, vec!["embedding", "shared_target", "text"]);
 
         // An archived source still answers, and still never returns itself.
         let from_archived = related(&pool, gone, 10).await.unwrap();

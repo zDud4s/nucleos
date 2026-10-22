@@ -89,10 +89,7 @@ fn monday_of(now: DateTime<Local>) -> NaiveDate {
 /// `[Monday 00:00, next Monday 00:00)` of the ISO week of `now`, in local time.
 pub fn week_bounds(now: DateTime<Local>) -> (DateTime<Local>, DateTime<Local>) {
     let monday = monday_of(now);
-    (
-        local_at(monday, 0),
-        local_at(monday + Duration::days(7), 0),
-    )
+    (local_at(monday, 0), local_at(monday + Duration::days(7), 0))
 }
 
 /// `2026-W46`: the ISO year and week, which is also what the sent marker stores.
@@ -189,12 +186,11 @@ async fn resurfaced(
     now: DateTime<Local>,
 ) -> sqlx::Result<Vec<OwnerNote>> {
     let cutoff = stamp(week_start - Duration::days(RESURFACE_AFTER_DAYS));
-    let candidates: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM owner_notes WHERE state = 'active' AND updated_at < ?",
-    )
-    .bind(&cutoff)
-    .fetch_all(pool)
-    .await?;
+    let candidates: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM owner_notes WHERE state = 'active' AND updated_at < ?")
+            .bind(&cutoff)
+            .fetch_all(pool)
+            .await?;
 
     let week = now.iso_week();
     let mut ranked: Vec<(u64, i64)> = candidates
@@ -207,9 +203,9 @@ async fn resurfaced(
     let mut picked = Vec::with_capacity(ranked.len());
     for (_, id) in ranked {
         let note: Option<OwnerNote> = sqlx::query_as(note_query(" WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
         picked.extend(note);
     }
     Ok(picked)
@@ -557,7 +553,14 @@ mod tests {
 
         let this_week = note(&pool, "this week", "active", tuesday, tuesday).await;
         let last_week = note(&pool, "last week", "active", recent, recent).await;
-        let next_week = note(&pool, "next week", "active", local(2026, 11, 16, 0, 0), tuesday).await;
+        let next_week = note(
+            &pool,
+            "next week",
+            "active",
+            local(2026, 11, 16, 0, 0),
+            tuesday,
+        )
+        .await;
         let archived = note(&pool, "archived", "archived", tuesday, tuesday).await;
         let linked = note(&pool, "linked", "active", long_ago, long_ago).await;
         link(&pool, linked).await;
@@ -678,9 +681,17 @@ mod tests {
 
         // A note written afterwards waits for the next week's review.
         seed_note(&state).await;
-        assert!(!send_weekly_if_due(&state, local(2026, 11, 13, 10, 0)).await.unwrap());
+        assert!(
+            !send_weekly_if_due(&state, local(2026, 11, 13, 10, 0))
+                .await
+                .unwrap()
+        );
         assert!(outbox_texts(&state).await.is_empty());
-        assert!(send_weekly_if_due(&state, local(2026, 11, 16, 9, 0)).await.unwrap());
+        assert!(
+            send_weekly_if_due(&state, local(2026, 11, 16, 9, 0))
+                .await
+                .unwrap()
+        );
         assert_eq!(outbox_texts(&state).await.len(), 1);
     }
 
@@ -691,15 +702,21 @@ mod tests {
         old_notes(&pool, 9).await;
 
         let ids = |review: &Review| review.resurfaced.iter().map(|n| n.id).collect::<Vec<_>>();
-        let monday = weekly_review(&pool, local(2026, 11, 9, 0, 0)).await.unwrap();
-        let sunday = weekly_review(&pool, local(2026, 11, 15, 23, 59)).await.unwrap();
+        let monday = weekly_review(&pool, local(2026, 11, 9, 0, 0))
+            .await
+            .unwrap();
+        let sunday = weekly_review(&pool, local(2026, 11, 15, 23, 59))
+            .await
+            .unwrap();
         assert_eq!(monday.resurfaced.len(), 3);
         assert_eq!(ids(&monday), ids(&sunday));
 
         // Other weeks pick other notes, or the pick would not be a rotation at all.
         let mut picks = vec![ids(&monday)];
         for day in [16, 23, 30] {
-            let later = weekly_review(&pool, local(2026, 11, day, 12, 0)).await.unwrap();
+            let later = weekly_review(&pool, local(2026, 11, day, 12, 0))
+                .await
+                .unwrap();
             picks.push(ids(&later));
         }
         picks.sort();
@@ -711,11 +728,19 @@ mod tests {
     async fn nothing_is_sent_before_monday_nine() {
         let state = ready(true).await;
         seed_note(&state).await;
-        assert!(!send_weekly_if_due(&state, local(2026, 11, 9, 8, 59)).await.unwrap());
+        assert!(
+            !send_weekly_if_due(&state, local(2026, 11, 9, 8, 59))
+                .await
+                .unwrap()
+        );
         assert!(outbox_texts(&state).await.is_empty());
         assert_eq!(marker(&state).await, None);
 
-        assert!(send_weekly_if_due(&state, local(2026, 11, 9, 9, 0)).await.unwrap());
+        assert!(
+            send_weekly_if_due(&state, local(2026, 11, 9, 9, 0))
+                .await
+                .unwrap()
+        );
         assert_eq!(outbox_texts(&state).await.len(), 1);
     }
 
@@ -724,7 +749,11 @@ mod tests {
         let state = ready(true).await;
         old_notes(&state.pool, 1).await;
 
-        assert!(send_weekly_if_due(&state, local(2026, 11, 9, 9, 5)).await.unwrap());
+        assert!(
+            send_weekly_if_due(&state, local(2026, 11, 9, 9, 5))
+                .await
+                .unwrap()
+        );
         let sent = outbox_texts(&state).await;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, HOME);
@@ -733,13 +762,25 @@ mod tests {
         assert_eq!(marker(&state).await.as_deref(), Some("2026-W46"));
 
         // The same week, later: nothing more.
-        assert!(!send_weekly_if_due(&state, local(2026, 11, 9, 9, 10)).await.unwrap());
+        assert!(
+            !send_weekly_if_due(&state, local(2026, 11, 9, 9, 10))
+                .await
+                .unwrap()
+        );
         assert!(!send_weekly_if_due(&state, wednesday()).await.unwrap());
-        assert!(!send_weekly_if_due(&state, local(2026, 11, 15, 23, 59)).await.unwrap());
+        assert!(
+            !send_weekly_if_due(&state, local(2026, 11, 15, 23, 59))
+                .await
+                .unwrap()
+        );
         assert_eq!(outbox_texts(&state).await.len(), 1);
 
         // The next week's Monday sends again.
-        assert!(send_weekly_if_due(&state, local(2026, 11, 16, 9, 0)).await.unwrap());
+        assert!(
+            send_weekly_if_due(&state, local(2026, 11, 16, 9, 0))
+                .await
+                .unwrap()
+        );
         assert_eq!(outbox_texts(&state).await.len(), 2);
         assert_eq!(marker(&state).await.as_deref(), Some("2026-W47"));
     }
@@ -753,7 +794,11 @@ mod tests {
         // A restarted daemon has the same database and nothing else: the marker alone decides.
         let restarted = state.clone();
         assert!(!send_weekly_if_due(&restarted, wednesday()).await.unwrap());
-        assert!(!send_weekly_if_due(&restarted, local(2026, 11, 12, 8, 0)).await.unwrap());
+        assert!(
+            !send_weekly_if_due(&restarted, local(2026, 11, 12, 8, 0))
+                .await
+                .unwrap()
+        );
         assert_eq!(outbox_texts(&state).await.len(), 1);
     }
 
@@ -786,7 +831,11 @@ mod tests {
         .execute(&state.pool)
         .await
         .unwrap();
-        assert!(send_weekly_if_due(&state, local(2026, 11, 12, 10, 0)).await.unwrap());
+        assert!(
+            send_weekly_if_due(&state, local(2026, 11, 12, 10, 0))
+                .await
+                .unwrap()
+        );
         assert_eq!(outbox_texts(&state).await.len(), 1);
     }
 }

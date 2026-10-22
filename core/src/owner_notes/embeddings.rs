@@ -142,11 +142,7 @@ async fn store(
 /// `false` (never an error) when the note is missing or not active, when its stored vector is
 /// already current for this model and text, or when the embedder failed: the row is then left as
 /// it was and the periodic pass tries again. Only a database error is returned.
-pub async fn embed_note(
-    pool: &SqlitePool,
-    embedder: &dyn Embedder,
-    id: i64,
-) -> sqlx::Result<bool> {
+pub async fn embed_note(pool: &SqlitePool, embedder: &dyn Embedder, id: i64) -> sqlx::Result<bool> {
     let Some(note) = sqlx::query(
         "SELECT n.note_text, e.model AS stored_model, e.text_hash AS stored_hash
            FROM owner_notes n
