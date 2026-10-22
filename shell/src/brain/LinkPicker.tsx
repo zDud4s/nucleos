@@ -12,7 +12,6 @@ import {
   type LinkType,
   type TargetKind,
 } from "../data/owner-notes";
-import { useRuns } from "../data/runs";
 import { useProjects } from "../data/system";
 import { Button, ErrorNote, Quiet, RefusalNote, Select, Skeleton } from "../ui";
 import "./LinkPicker.css";
@@ -30,15 +29,24 @@ import "./LinkPicker.css";
  * | `project`   | `useProjects()`, filtered  | the project id            |
  * | `contact`   | `useContacts()`, filtered  | the contact id (not the address) |
  * | `mail`      | `useMailQueue(q)`          | the email id              |
- * | `job`       | `useRuns({ q })`           | the run id (a job is a run) |
+ * | `job`       | none: free text            | the job id (`jobs.id`), digits only |
  * | `file`      | none: free text            | a path relative to the files root |
  *
  * `file` stays free text: its only search is a recursive walk of the whole tree on the daemon,
  * too heavy to fire at every keystroke for a field whose value is a path the owner already knows.
  *
+ * `job` stays free text too, and is NOT a run: a job is a row of the `jobs` table, a sequence of
+ * runs that point back at it through `runs.job_id`, and the daemon checks `target_ref` against
+ * `jobs.id`. The only job listing the shell has (`useLiveJobs`) holds the jobs in flight, so a
+ * finished job could not be linked from it; the owner types the id they already see on the job.
+ *
  * Only the active kind's hook is mounted: each source is its own component, rendered under a
- * `key` of the kind, so the other kinds never fetch. A typed value that matches nothing is still
- * a valid ref (submit takes it as typed), so a gone or unlisted target can still be linked.
+ * `key` of the kind, so the other kinds never fetch.
+ *
+ * A typed value is not a link target by itself: the daemon answers 404 "that target does not
+ * exist" for any ref it cannot find, and `note`, `knowledge`, `contact`, `mail` and `job` refs
+ * are numeric ids, so a phrase can never succeed. The form therefore submits those kinds only
+ * with a row picked from the list or a bare number typed by hand (see `refAllowed`).
  */
 
 /** One row of the picker's list. */
@@ -163,21 +171,6 @@ function MailSource({ query, children }: SourceProps) {
   });
 }
 
-function JobSource({ query, children }: SourceProps) {
-  const settled = useDebounced(query);
-  const runs = useRuns({ q: settled });
-  const choices = (runs.data ?? EMPTY).map((run) => ({
-    ref: String(run.id),
-    label: firstLine(run.prompt_excerpt, `run ${run.id}`),
-    detail: `#${run.id} · ${run.status}${run.project_id !== null ? ` · ${run.project_id}` : ""}`,
-  }));
-  return children({
-    choices: settled === query ? choices : [],
-    loading: runs.isLoading || settled !== query,
-    failed: runs.isError,
-  });
-}
-
 /** The kinds with a searchable source; a kind missing here keeps the plain field. */
 const SOURCES: Partial<Record<TargetKind, (props: SourceProps) => ReactNode>> = {
   note: NoteSource,
@@ -185,8 +178,21 @@ const SOURCES: Partial<Record<TargetKind, (props: SourceProps) => ReactNode>> = 
   project: ProjectSource,
   contact: ContactSource,
   mail: MailSource,
-  job: JobSource,
 };
+
+/** The kinds whose `target_ref` is a row id: a typed phrase can never name one. */
+const NUMERIC_KINDS: readonly TargetKind[] = ["note", "knowledge", "contact", "mail", "job"];
+
+/**
+ * Whether `ref` may be sent for `kind`. A picked row always passes (its ref came from the list);
+ * a typed value must be a bare number for the id kinds, and non-blank for `project` and `file`.
+ */
+function refAllowed(kind: TargetKind, ref: string, picked: boolean): boolean {
+  const value = ref.trim();
+  if (value === "") return false;
+  if (picked || !NUMERIC_KINDS.includes(kind)) return true;
+  return /^\d+$/.test(value);
+}
 
 const PLACEHOLDERS: Record<TargetKind, string> = {
   note: "Search notes",
@@ -194,8 +200,8 @@ const PLACEHOLDERS: Record<TargetKind, string> = {
   project: "Search projects",
   contact: "Search contacts",
   mail: "Search mail",
-  file: "id or path",
-  job: "Search runs",
+  file: "path relative to the files root",
+  job: "job id (a number)",
 };
 
 /* --------------------------------------------------------------- combobox -- */
@@ -255,10 +261,12 @@ function Combobox({ found, kind, text, picked, onType, onPick }: ComboboxProps) 
 
   let note: ReactNode = null;
   if (showing && choices.length === 0) {
-    if (found.failed) note = <Quiet compact says="Search is unavailable: type the ref." />;
-    else if (found.loading) note = <Skeleton label="Searching" />;
+    if (found.failed) {
+      const hand = NUMERIC_KINDS.includes(kind) ? "type the numeric id" : "type the ref";
+      note = <Quiet compact says={`Search is unavailable: ${hand}.`} />;
+    } else if (found.loading) note = <Skeleton label="Searching" />;
     else if (text.trim() === "" && found.idle !== undefined) note = <Quiet compact says={found.idle} />;
-    else note = <Quiet compact says="No match: the typed value is used as the ref." />;
+    else note = <Quiet compact says="No match: pick a result." />;
   }
 
   return (
@@ -320,7 +328,7 @@ export function AddLinkForm({ id }: { id: number }) {
   const [text, setText] = useState("");
   const [ref, setRef] = useState("");
   const [picked, setPicked] = useState(false);
-  const blank = ref.trim() === "";
+  const blank = !refAllowed(kind, ref, picked);
 
   function clear() {
     setText("");
@@ -376,6 +384,9 @@ export function AddLinkForm({ id }: { id: number }) {
           aria-label="Target ref"
           placeholder={PLACEHOLDERS[kind]}
           value={text}
+          // A job ref is its numeric id: a phrase is held back rather than sent to a 404.
+          aria-invalid={text.trim() !== "" && blank}
+          title={kind === "job" ? "The job id, digits only" : undefined}
           onChange={(event) => typed(event.target.value)}
         />
       ) : (
