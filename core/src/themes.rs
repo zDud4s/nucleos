@@ -456,6 +456,282 @@ pub async fn run_weekly(pool: &SqlitePool, model: &str, now: DateTime<Utc>) {
     }
 }
 
+// ---- Phase 6: the synthesis of an accepted theme (spec 2026-10-22 section 6.3, section 10) ----
+
+/// The standing instruction of a synthesis. The note lines are owner context: summarised, never copied.
+pub const SYNTHESIS_STANDING: &str = "You write a short plain-text synthesis (at most 2000 characters) \
+of a theme in the owner's second brain. Lines marked 'owner context, do not quote' are the owner's \
+private notes: summarise what they say about the theme, never copy their wording.";
+
+pub const MAX_SYNTHESIS_CHARS: usize = 2000;
+const REFRESH_AFTER: chrono::Duration = chrono::Duration::days(7);
+const FORCE_EVERY: chrono::Duration = chrono::Duration::hours(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynthesisError {
+    /// The theme is not `accepted` (or does not exist): only an accepted theme is synthesised.
+    NotAllowed,
+    /// The model or the database failed; the previous text, if any, is untouched.
+    Failed,
+}
+
+pub struct KnowledgeText<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+}
+
+/// Only live knowledge feeds a synthesis: `active` and `observed`.
+pub fn feeds_synthesis(status: &str) -> bool {
+    matches!(status, "active" | "observed")
+}
+
+/// At most `MAX_SYNTHESIS_CHARS` characters, cut on a character boundary.
+pub fn clip_synthesis(text: &str) -> String {
+    text.trim().chars().take(MAX_SYNTHESIS_CHARS).collect()
+}
+
+/// The model input: every text is scrubbed, and the note text sits under the do-not-quote marker.
+pub fn synthesis_prompt(knowledge: &[KnowledgeText<'_>], notes: &[(i64, String)]) -> String {
+    let mut out = String::from("## Knowledge rows of the theme\n");
+    for row in knowledge {
+        out.push_str(&format!(
+            "- {}: {}\n",
+            crate::distill::scrub(row.title),
+            crate::distill::scrub(row.body)
+        ));
+    }
+    if !notes.is_empty() {
+        out.push_str("\n## Notes (owner context, do not quote)\n");
+        for (_, text) in notes {
+            out.push_str(&format!("- {}\n", crate::distill::scrub(text)));
+        }
+    }
+    out.push_str("\nWrite the synthesis now.");
+    out
+}
+
+/// Whether a stored synthesis is stale: the basis changed by 3 members or 20% (an entry plus an exit
+/// counts as one swap) AND a week passed since it was written. Never written: due.
+pub fn refresh_due(
+    basis: &[String],
+    current: &[String],
+    synthesis_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(at) = synthesis_at else {
+        return true;
+    };
+    let before: HashSet<&String> = basis.iter().collect();
+    let after: HashSet<&String> = current.iter().collect();
+    let changes = before.symmetric_difference(&after).count() / 2;
+    changes > 0
+        && (changes >= 3 || changes * 5 >= basis.len().max(1))
+        && now - at >= REFRESH_AFTER
+}
+
+/// The owner's "force" route is limited to one synthesis an hour.
+pub fn force_allowed(synthesis_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    synthesis_at.is_none_or(|at| now - at >= FORCE_EVERY)
+}
+
+fn model_label(asked: &crate::map::intent::Extractor<'_>) -> String {
+    match asked {
+        crate::map::intent::Extractor::Cli(_) => "hosted".to_owned(),
+        crate::map::intent::Extractor::Loopback { model, .. } => (*model).to_owned(),
+    }
+}
+
+/// One plain-text question to the distiller's brain (no schema: the answer is prose).
+async fn ask_plain(
+    asked: &crate::map::intent::Extractor<'_>,
+    prompt: String,
+) -> std::io::Result<String> {
+    match asked {
+        crate::map::intent::Extractor::Cli(runner) => {
+            crate::map::intent::ask_once(*runner, prompt, "distillation", Some(SYNTHESIS_STANDING))
+                .await
+        }
+        crate::map::intent::Extractor::Loopback {
+            client,
+            base_url,
+            model,
+        } => {
+            crate::execution::runner::ollama_chat(
+                client,
+                base_url,
+                model,
+                &format!("{SYNTHESIS_STANDING}\n\n{prompt}"),
+                serde_json::json!({"num_ctx": 32_768, "temperature": 0}),
+                None,
+                false,
+            )
+            .await
+        }
+    }
+}
+
+/// The non-excluded members of a theme, as `(kind, id)`.
+async fn live_members(pool: &SqlitePool, theme: i64) -> sqlx::Result<Vec<(String, i64)>> {
+    sqlx::query_as(
+        "SELECT member_kind, member_id FROM theme_members
+          WHERE theme_id = ? AND excluded = 0 ORDER BY member_kind, member_id",
+    )
+    .bind(theme)
+    .fetch_all(pool)
+    .await
+}
+
+/// Knowledge members that feed a synthesis, as `(id, title, body)`.
+async fn feeding_knowledge(
+    pool: &SqlitePool,
+    members: &[(String, i64)],
+) -> sqlx::Result<Vec<(i64, String, String)>> {
+    let mut out = Vec::new();
+    for (_, id) in members.iter().filter(|(k, _)| k == "knowledge") {
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT title, body, status FROM knowledge WHERE id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        if let Some((title, body, _)) = row.filter(|(_, _, st)| feeds_synthesis(st)) {
+            out.push((*id, title, body));
+        }
+    }
+    Ok(out)
+}
+
+/// The basis a synthesis is written against: the fed knowledge rows and every note member, sorted.
+fn basis_of(knowledge: &[(i64, String, String)], members: &[(String, i64)]) -> Vec<String> {
+    let mut basis: Vec<String> = knowledge
+        .iter()
+        .map(|(id, _, _)| format!("knowledge:{id}"))
+        .chain(
+            members
+                .iter()
+                .filter(|(k, _)| k == "note")
+                .map(|(_, id)| format!("note:{id}")),
+        )
+        .collect();
+    basis.sort();
+    basis
+}
+
+/// Synthesise an `accepted` theme and store the text with its basis. Owner-only: the text goes to the
+/// theme row and nowhere else (never knowledge, the feed, the outbox, a channel or a log). A failure
+/// logs the error kind only and keeps the previous text.
+pub async fn synthesise(
+    pool: &SqlitePool,
+    asked: crate::map::intent::Extractor<'_>,
+    id: i64,
+    now: DateTime<Utc>,
+) -> Result<(), SynthesisError> {
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM themes WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| SynthesisError::Failed)?;
+    if state.as_deref() != Some("accepted") {
+        return Err(SynthesisError::NotAllowed);
+    }
+    let fail = |kind: &str| {
+        tracing::warn!("themes: synthesis failed: {kind}");
+        SynthesisError::Failed
+    };
+    let members = live_members(pool, id).await.map_err(|_| fail("sql"))?;
+    let knowledge = feeding_knowledge(pool, &members)
+        .await
+        .map_err(|_| fail("sql"))?;
+    let note_ids: Vec<i64> = members
+        .iter()
+        .filter(|(k, _)| k == "note")
+        .map(|(_, id)| *id)
+        .collect();
+    let notes = crate::owner_notes::texts_for_ids(pool, &note_ids)
+        .await
+        .map_err(|_| fail("sql"))?;
+    let rows: Vec<KnowledgeText<'_>> = knowledge
+        .iter()
+        .map(|(_, title, body)| KnowledgeText { title, body })
+        .collect();
+    let prompt = synthesis_prompt(&rows, &notes);
+    let model = model_label(&asked);
+    let answer = ask_plain(&asked, prompt)
+        .await
+        .map_err(|e| fail(&format!("{:?}", e.kind())))?;
+    let text = clip_synthesis(&answer);
+    if text.is_empty() {
+        return Err(fail("empty"));
+    }
+    let basis = serde_json::to_string(&basis_of(&knowledge, &members)).map_err(|_| fail("json"))?;
+    sqlx::query(
+        "UPDATE themes SET synthesis = ?, synthesis_at = ?, synthesis_model = ?, synthesis_basis = ?
+          WHERE id = ? AND state = 'accepted'",
+    )
+    .bind(&text)
+    .bind(now.to_rfc3339())
+    .bind(&model)
+    .bind(&basis)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|_| fail("sql"))?;
+    Ok(())
+}
+
+fn reborrow<'a>(asked: &'a crate::map::intent::Extractor<'_>) -> crate::map::intent::Extractor<'a> {
+    match asked {
+        crate::map::intent::Extractor::Cli(runner) => crate::map::intent::Extractor::Cli(*runner),
+        crate::map::intent::Extractor::Loopback {
+            client,
+            base_url,
+            model,
+        } => crate::map::intent::Extractor::Loopback {
+            client,
+            base_url,
+            model,
+        },
+    }
+}
+
+/// The weekly refresh: every accepted theme whose synthesis is due is synthesised again. Called by
+/// the distiller's tick after `run_weekly` (integration point: pass the tick's `asked`).
+pub async fn refresh_syntheses(
+    pool: &SqlitePool,
+    asked: crate::map::intent::Extractor<'_>,
+    now: DateTime<Utc>,
+) {
+    let accepted: Vec<(i64, Option<String>, Option<String>)> = match sqlx::query_as(
+        "SELECT id, synthesis_basis, synthesis_at FROM themes WHERE state = 'accepted' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!("themes: could not list accepted themes: {error}");
+            return;
+        }
+    };
+    for (id, basis, at) in accepted {
+        let Ok(members) = live_members(pool, id).await else {
+            continue;
+        };
+        let Ok(knowledge) = feeding_knowledge(pool, &members).await else {
+            continue;
+        };
+        let current = basis_of(&knowledge, &members);
+        let before: Vec<String> = basis
+            .and_then(|b| serde_json::from_str(&b).ok())
+            .unwrap_or_default();
+        let at = at
+            .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
+            .map(|t| t.with_timezone(&Utc));
+        if refresh_due(&before, &current, at, now) {
+            let _ = synthesise(pool, reborrow(&asked), id, now).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +1057,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(null, 0);
+    }
+
+    // ---- Phase 6: synthesis ----
+
+    fn canned(stdout: &str) -> crate::execution::runner::FakeCommandRunner {
+        crate::execution::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::execution::runner::RunOutcome {
+                exit_code: 0,
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                session_id: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+                model_requested: false,
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn canned_err() -> crate::execution::runner::FakeCommandRunner {
+        crate::execution::runner::FakeCommandRunner {
+            fail_times: std::sync::Mutex::new(1),
+            ..Default::default()
+        }
+    }
+
+    async fn synth_theme(pool: &SqlitePool, state: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO themes (name, state, model, dim, created_at) VALUES ('t', ?, 'm', 3, 't')
+             RETURNING id",
+        )
+        .bind(state)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn synth_member(pool: &SqlitePool, theme: i64, kind: &str, id: i64) {
+        sqlx::query(
+            "INSERT INTO theme_members (theme_id, member_kind, member_id, added_at) VALUES (?, ?, ?, 't')",
+        )
+        .bind(theme)
+        .bind(kind)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn the_synthesis_input_scrubs_and_marks_note_text_as_owner_context() {
+        let input = synthesis_prompt(
+            &[KnowledgeText {
+                title: "Sleep rule",
+                body: "token sk-ABCDEF1234567890XYZ here",
+            }],
+            &[(4, "my note body".to_owned())],
+        );
+        assert!(!input.contains("sk-ABCDEF1234567890XYZ"), "scrubbed");
+        assert!(input.contains("owner context, do not quote"));
+        assert!(input.contains("my note body"));
+        assert!(input.contains("Sleep rule"));
+    }
+
+    #[test]
+    fn only_active_or_observed_knowledge_feeds_a_synthesis() {
+        for (status, feeds) in [
+            ("active", true),
+            ("observed", true),
+            ("archived", false),
+            ("reverted", false),
+            ("rejected", false),
+            ("expired", false),
+        ] {
+            assert_eq!(feeds_synthesis(status), feeds, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesise_runs_only_for_accepted_themes_and_stores_text_with_its_basis() {
+        use crate::map::intent::Extractor;
+        let pool = crate::testdb::fresh_pool().await;
+        let now = chrono::Utc::now();
+        let proposed = synth_theme(&pool, "proposed").await;
+        let runner = canned("A summary.");
+        assert_eq!(
+            synthesise(&pool, Extractor::Cli(&runner), proposed, now).await,
+            Err(SynthesisError::NotAllowed)
+        );
+        let t = synth_theme(&pool, "accepted").await;
+        let k = knowledge_row(&pool, "Row", "distiller", "active", [1.0, 0.0, 0.0]).await;
+        synth_member(&pool, t, "knowledge", k).await;
+        synthesise(&pool, Extractor::Cli(&runner), t, now)
+            .await
+            .unwrap();
+        let (s, basis, model): (String, String, String) = sqlx::query_as(
+            "SELECT synthesis, synthesis_basis, synthesis_model FROM themes WHERE id = ?",
+        )
+        .bind(t)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(s, "A summary.");
+        assert_eq!(basis, format!("[\"knowledge:{k}\"]"));
+        assert!(!model.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_synthesis_keeps_the_previous_text() {
+        use crate::map::intent::Extractor;
+        let pool = crate::testdb::fresh_pool().await;
+        let t = synth_theme(&pool, "accepted").await;
+        sqlx::query("UPDATE themes SET synthesis = 'old' WHERE id = ?")
+            .bind(t)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let runner = canned_err();
+        assert_eq!(
+            synthesise(&pool, Extractor::Cli(&runner), t, chrono::Utc::now()).await,
+            Err(SynthesisError::Failed)
+        );
+        let kept: String = sqlx::query_scalar("SELECT synthesis FROM themes WHERE id = ?")
+            .bind(t)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, "old");
+    }
+
+    #[test]
+    fn the_output_is_cut_at_2000_chars_on_a_char_boundary() {
+        assert_eq!(clip_synthesis(&"\u{e9}".repeat(2500)).chars().count(), 2000);
+    }
+
+    #[test]
+    fn a_synthesis_is_refreshed_after_3_member_changes_or_20_percent_and_a_week() {
+        let week = chrono::Duration::days(7);
+        let now = chrono::Utc::now();
+        let old = Some(now - week - chrono::Duration::hours(1));
+        let basis: Vec<String> = (1..=30).map(|i| format!("knowledge:{i}")).collect();
+        let mut now_members = basis.clone();
+        now_members[0] = "knowledge:100".into();
+        now_members[1] = "knowledge:101".into();
+        assert!(!refresh_due(&basis, &now_members, old, now));
+        now_members[2] = "knowledge:102".into();
+        assert!(refresh_due(&basis, &now_members, old, now));
+        assert!(!refresh_due(
+            &basis,
+            &now_members,
+            Some(now - chrono::Duration::days(6)),
+            now
+        ));
+        let small: Vec<String> = (1..=5).map(|i| format!("note:{i}")).collect();
+        let mut changed = small.clone();
+        changed[0] = "note:50".into();
+        assert!(refresh_due(&small, &changed, old, now));
+        assert!(!refresh_due(&small, &small, old, now), "no change, no refresh");
+        assert!(refresh_due(&[], &small, None, now));
+    }
+
+    #[test]
+    fn the_force_route_is_limited_to_one_synthesis_per_hour() {
+        let now = chrono::Utc::now();
+        assert!(!force_allowed(Some(now - chrono::Duration::minutes(10)), now));
+        assert!(force_allowed(Some(now - chrono::Duration::minutes(61)), now));
+        assert!(force_allowed(None, now));
     }
 }
 

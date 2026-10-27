@@ -1306,12 +1306,32 @@ mod tests {
         one_call_is_sanctioned(source, &format!("{needle}s::create("))
     }
 
-    /// `themes.rs` may name the notes module in exactly one place: the call that reads the vectors of
-    /// the active notes for the theme grouping. Grouping needs vectors, never text (spec
-    /// 2026-10-22 section 10).
+    /// `themes.rs` may name the notes module in exactly two places: the call that reads the vectors of
+    /// the active notes for the theme grouping, and the call that reads the text of the member notes
+    /// for the synthesis of an accepted theme. Both are owner-only readers (spec 2026-10-22
+    /// section 10): grouping needs vectors, never text; the synthesis text never leaves the Brain.
     fn themes_mentions_are_sanctioned(source: &str) -> bool {
         let needle = ["owner", "note"].join("_");
-        calls_are_sanctioned(source, &[&format!("{needle}s::vectors_for_clustering")])
+        calls_are_sanctioned(
+            source,
+            &[
+                &format!("{needle}s::vectors_for_clustering"),
+                &format!("{needle}s::texts_for_ids"),
+            ],
+        )
+    }
+
+    /// `distill/generalise.rs` may name the notes module in exactly two places: the nearest-notes lookup
+    /// (ids and cosines) and the text of those notes as owner context (spec 2026-10-22 section 10).
+    fn generalise_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        calls_are_sanctioned(
+            source,
+            &[
+                &format!("{needle}s::nearest_to_vector"),
+                &format!("{needle}s::texts_for_ids"),
+            ],
+        )
     }
 
     /// True when the production code of `source` names the notes module only inside the listed
@@ -1485,34 +1505,52 @@ use crate::{needle}s;"),
     }
 
     #[test]
-    fn the_themes_rule_holds_one_call_and_nothing_else() {
-        let needle = ["owner", "note"].join("_");
-        let call = format!("let v = {needle}s::vectors_for_clustering(&pool, m).await;");
-        assert!(themes_mentions_are_sanctioned(&call));
-        assert!(!themes_mentions_are_sanctioned(&format!("{call}
-{call}")));
-        assert!(!themes_mentions_are_sanctioned(&format!(
-            "use crate::{needle}s;
-{call}"
-        )));
+    fn the_themes_rule_holds_its_two_calls_and_nothing_else() {
+        let n = ["owner", "note"].join("_");
+        let vecs = format!("let v = {n}s::vectors_for_clustering(&pool, m).await;");
+        let texts = format!("let t = {n}s::texts_for_ids(&pool, &ids).await?;");
+        assert!(themes_mentions_are_sanctioned(&format!("{vecs}\n{texts}")));
+        assert!(!themes_mentions_are_sanctioned(&vecs), "both calls must occur");
+        assert!(!themes_mentions_are_sanctioned(&texts), "both calls must occur");
+        assert!(!themes_mentions_are_sanctioned(&format!("{vecs}\n{texts}\n{texts}")));
         assert!(!themes_mentions_are_sanctioned("fn nothing() {}"));
-        assert!(themes_mentions_are_sanctioned(&format!(
-            "{call}
-// mentions {needle}s"
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "use crate::{n}s;\n{vecs}\n{texts}"
+        )));
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "{vecs}\n{texts}\nlet x = {n}s::list(&pool, f).await;"
         )));
         assert!(themes_mentions_are_sanctioned(&format!(
-            "{call}
-#[cfg(test)]
-mod tests {{
-{needle}s::create(&pool, \"x\", \"y\");
-}}"
+            "{vecs}\n{texts}\n// mentions {n}s"
+        )));
+        assert!(themes_mentions_are_sanctioned(&format!(
+            "{vecs}\n{texts}\n#[cfg(test)]\nmod tests {{\n{n}s::create(&pool, \"x\", \"y\");\n}}"
         )));
         // A test-only helper above production code does not end the sweep.
         assert!(!themes_mentions_are_sanctioned(&format!(
-            "#[cfg(test)]
-fn helper() {{}}
-{call}
-use crate::{needle}s;"
+            "#[cfg(test)]\nfn helper() {{}}\n{vecs}\n{texts}\nuse crate::{n}s;"
+        )));
+    }
+
+    #[test]
+    fn the_generalise_rule_holds_its_two_calls_and_nothing_else() {
+        let n = ["owner", "note"].join("_");
+        let near = format!("let ids = {n}s::nearest_to_vector(&pool, m, &c, 0.80, 5).await?;");
+        let texts = format!("let t = {n}s::texts_for_ids(&pool, &ids).await?;");
+        assert!(generalise_mentions_are_sanctioned(&format!("{near}\n{texts}")));
+        assert!(!generalise_mentions_are_sanctioned(&near), "both calls must occur");
+        assert!(!generalise_mentions_are_sanctioned(&format!("{near}\n{texts}\n{texts}")));
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "use crate::{n}s;\n{near}\n{texts}"
+        )));
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}\nlet x = {n}s::list(&pool, f).await;"
+        )));
+        assert!(generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}\n#[cfg(test)]\nmod tests {{\n{n}s::create(&pool, \"x\", \"y\");\n}}"
+        )));
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "#[cfg(test)]\nfn helper() {{}}\n{near}\n{texts}\nuse crate::{n}s;"
         )));
     }
 
@@ -1701,7 +1739,7 @@ use crate::{needle}s;"
     /// The guard below scans production code only: a test module may read the notes table to
     /// assert behaviour (D4 is about production reach, not about what a test inspects).
     #[test]
-    fn no_core_module_but_seven_mentions_owner_notes() {
+    fn no_core_module_but_eight_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1781,7 +1819,18 @@ use crate::{needle}s;"
             if crate::source_scan::is_top_level(&path) && name == "themes.rs" {
                 assert!(
                     themes_mentions_are_sanctioned(&source),
-                    "themes.rs may name the notes only in its one call to vectors_for_clustering                      (spec 2026-10-22 section 10: grouping needs vectors, never text)"
+                    "themes.rs may name the notes only in its calls to vectors_for_clustering \
+                     and texts_for_ids (spec 2026-10-22 section 10: grouping needs vectors, \
+                     never text; the synthesis text never leaves the Brain)"
+                );
+                continue;
+            }
+            if crate::source_scan::module_path(&path) == "distill/generalise.rs" {
+                assert!(
+                    generalise_mentions_are_sanctioned(&source),
+                    "distill/generalise.rs may name the notes only in its calls to nearest_to_vector \
+                     and texts_for_ids (spec 2026-10-22 section 10: nearby notes are owner context, \
+                     never quoted)"
                 );
                 continue;
             }
@@ -1789,7 +1838,7 @@ use crate::{needle}s;"
                 !production_code(&source).contains(&needle),
                 "{} mentions `{needle}` in production code (test modules are not scanned): the \
                  owner's notes are reachable from owner_notes.rs, \
-                 http.rs and main.rs (spec D4), from distill.rs and themes.rs through one read call each, and from \
+                 http.rs and main.rs (spec D4), from distill.rs, themes.rs and distill/generalise.rs through their sanctioned read calls, and from \
                  capture.rs and channels/commands.rs through one write call each, only, so that \
                  nothing in the agent's memory can read them",
                 path.display()
