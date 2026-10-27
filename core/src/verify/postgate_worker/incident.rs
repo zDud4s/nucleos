@@ -130,7 +130,7 @@ pub(super) fn merge_detail(base: &Value, patch: &Value) -> Value {
 /// callers that have no `project_root` at hand (a failed revert) need none.
 pub(super) async fn live_master_red(pool: &sqlx::SqlitePool, project_id: &str) -> Option<TaskRow> {
     match task_claims::store::list_live(pool, project_id, Utc::now()).await {
-        Ok(rows) => rows.into_iter().find(|row| row.task_key == MASTER_RED_KEY),
+        Ok(rows) => rows.into_iter().find(|row| row.key.as_str() == MASTER_RED_KEY),
         Err(error) => {
             tracing::warn!(project = project_id, %error, "postgate: cannot list the live incidents");
             None

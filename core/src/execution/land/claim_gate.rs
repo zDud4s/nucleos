@@ -63,7 +63,7 @@ impl From<&TaskRow> for Guard {
         let id = row.holder_id.clone().unwrap_or_default();
         Guard {
             id: row.id,
-            key: row.task_key.clone(),
+            key: row.key.as_str().to_owned(),
             holder_label: format!(
                 "{} {id}",
                 row.holder_kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_default()
