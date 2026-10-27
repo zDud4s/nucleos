@@ -2537,6 +2537,10 @@ mod tests {
         let pool = test_pool().await;
         let (_container, repo) = repo_parked_off_target("nucleos-claims-revert-", "chore/other");
         seed_project(&pool, "alpha", &repo, None).await;
+        // A postgate claim is live only while the project's `postgate_state` is red (spec §2
+        // `is_live`), so the incident below guards nothing unless master is red.
+        sqlx::query("INSERT INTO postgate_state (project_id, target, red_groups) VALUES ('alpha', 'master', '[\"core\"]')")
+            .execute(&pool).await.unwrap();
         let postgate = crate::verify::postgate::postgate_worktree(&repo).to_string_lossy().into_owned();
         claimed_task(&pool, &repo, "file:feature.txt", &["feature.txt"], &[], holder(HolderKind::Postgate, "alpha", &postgate)).await;
 
