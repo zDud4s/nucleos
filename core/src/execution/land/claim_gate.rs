@@ -93,41 +93,41 @@ fn same_path(a: &str, b: &str) -> bool {
     !a.is_empty() && fold(a) == fold(b)
 }
 
-/// True when `child` is `root` or lies beneath it (same folding as [`same_path`]).
-fn path_within(child: &str, root: &str) -> bool {
-    let fold = |p: &str| {
-        let p = p.replace('\\', "/");
-        let p = p.trim_end_matches('/').to_owned();
-        if cfg!(windows) { p.to_lowercase() } else { p }
-    };
-    if child.is_empty() || root.is_empty() {
-        return false;
-    }
-    let (child, root) = (fold(child), fold(root));
-    child == root
-        || child
-            .strip_prefix(&root)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// The guards `landing` is not entitled to cross: the owner (the worktree that holds the branch is
-/// the task's `holder_worktree`, or the run that owns it is the one asking) passes.
+/// The guards `landing` is not entitled to cross: the owner passes. The owner is the worktree that
+/// holds the branch when it is exactly the task's `holder_worktree` (spec §3 Land: "cujo
+/// `holder_worktree` não é a worktree do branch"), the run that owns the task, or a node of the job
+/// that owns it (`job_id` is the asking run's `runs.job_id`).
+///
+/// Exact match only: every daemon worktree and every `.claude/worktrees/<name>` lives beneath the
+/// main checkout, so "the holder's worktree lies beneath the branch's" would make a branch checked
+/// out in the main checkout the owner of every claim. The writers store the canonical toplevel.
 pub fn blocking<'a>(
     guards: &'a [Guard],
     owner_worktree: Option<&str>,
     run_id: Option<i64>,
+    job_id: Option<i64>,
 ) -> Vec<&'a Guard> {
     guards
         .iter()
         .filter(|guard| {
-            let by_worktree = owner_worktree.is_some_and(|w| {
-                same_path(w, &guard.holder_worktree) || path_within(&guard.holder_worktree, w)
-            });
+            let by_worktree = owner_worktree.is_some_and(|w| same_path(w, &guard.holder_worktree));
             let by_run = matches!(guard.holder_kind, Some(HolderKind::Run))
                 && run_id.is_some_and(|id| guard.holder_id == id.to_string());
-            !(by_worktree || by_run)
+            let by_job = matches!(guard.holder_kind, Some(HolderKind::Job))
+                && job_id.is_some_and(|id| guard.holder_id == id.to_string());
+            !(by_worktree || by_run || by_job)
         })
         .collect()
+}
+
+/// The job the run belongs to (`runs.job_id`), as `holder_for` (`http/tasks.rs`) reads it when a
+/// job node claims: such a claim is held by the job, not by the node's run.
+async fn job_of_run(pool: &sqlx::SqlitePool, run_id: i64) -> Result<Option<i64>, sqlx::Error> {
+    let job: Option<Option<i64>> = sqlx::query_scalar("SELECT job_id FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(job.flatten())
 }
 
 /// The refusal text. It never mentions the owner's override: an agent reading this must not learn
@@ -219,9 +219,32 @@ pub async fn check(
         }
     };
     let guards: Vec<Guard> = rows.iter().map(Guard::from).collect();
+    // A job node's claim is held by its job, so a landing from any node of that job is the owner's.
+    // Read only when a job holds one of the guards. Fail-open like the owner lookup above: a read
+    // error leaves the owner unknown, and the landing goes ahead.
+    let job_id = match landing.run_id {
+        Some(run_id)
+            if guards
+                .iter()
+                .any(|g| g.holder_kind == Some(HolderKind::Job)) =>
+        {
+            match job_of_run(pool, run_id).await {
+                Ok(job) => job,
+                Err(error) => {
+                    tracing::warn!(
+                        project = landing.project_id,
+                        %error,
+                        "land: claims gate cannot read the run's job"
+                    );
+                    return Verdict::Clear;
+                }
+            }
+        }
+        _ => None,
+    };
     let note = override_note(landing.source, landing.target);
     let mut still = Vec::new();
-    for guard in blocking(&guards, owner.as_deref(), landing.run_id) {
+    for guard in blocking(&guards, owner.as_deref(), landing.run_id, job_id) {
         // An override recorded when this branch was admitted holds for the claim in force
         // (`override_recorded` is true only for an `override_land` event after the current
         // `claimed_at`, so a new owner's claim is not covered by an old override). A read error
@@ -326,43 +349,98 @@ mod pure_tests {
     fn the_owner_is_recognised_by_worktree_whatever_the_slashes_or_case() {
         let guards = [guard(1, HolderKind::Session, "s1", "C:/Work/Repo-wt")];
         // Slashes and a trailing separator never matter, on any platform.
-        assert!(blocking(&guards, Some("C:\\Work\\Repo-wt\\"), None).is_empty());
-        assert_eq!(blocking(&guards, Some("C:/Work/Other"), None).len(), 1);
+        assert!(blocking(&guards, Some("C:\\Work\\Repo-wt\\"), None, None).is_empty());
         assert_eq!(
-            blocking(&guards, None, None).len(),
+            blocking(&guards, Some("C:/Work/Other"), None, None).len(),
+            1
+        );
+        assert_eq!(
+            blocking(&guards, None, None, None).len(),
             1,
             "no worktree, no ownership"
         );
         // Case folds only where the filesystem does (`same_path`): on Linux `Repo-wt` and
         // `repo-wt` are two directories.
         #[cfg(windows)]
-        assert!(blocking(&guards, Some("c:\\work\\repo-wt\\"), None).is_empty());
+        assert!(blocking(&guards, Some("c:\\work\\repo-wt\\"), None, None).is_empty());
         #[cfg(not(windows))]
-        assert_eq!(blocking(&guards, Some("c:/work/repo-wt"), None).len(), 1);
+        assert_eq!(
+            blocking(&guards, Some("c:/work/repo-wt"), None, None).len(),
+            1
+        );
     }
 
     #[test]
-    fn a_holder_worktree_beneath_the_branchs_worktree_is_the_owner_too() {
-        let guards = [guard(
-            1,
-            HolderKind::Session,
-            "s1",
-            "C:/Work/Repo-wt/sub/dir",
-        )];
-        assert!(blocking(&guards, Some("C:\\Work\\Repo-wt\\"), None).is_empty());
+    fn a_branch_in_the_main_checkout_does_not_own_a_claim_held_in_a_worktree_beneath_it() {
+        // Every daemon worktree and every `.claude/worktrees/<name>` lives beneath the main
+        // checkout: a branch checked out there is a stranger to their claims.
+        let nested = [
+            guard(1, HolderKind::Session, "s1", "C:/Repo/.claude/worktrees/a"),
+            guard(2, HolderKind::Run, "9", "C:/Repo/.nucleos/worktrees/run-9"),
+        ];
+        assert_eq!(blocking(&nested, Some("C:\\Repo\\"), None, None).len(), 2);
         // A sibling that merely shares the prefix is a stranger.
-        let sibling = [guard(2, HolderKind::Session, "s1", "C:/Work/Repo-wt2")];
-        assert_eq!(blocking(&sibling, Some("C:/Work/Repo-wt"), None).len(), 1);
-        // The reverse (the claim holds a parent of the branch's worktree) is not ownership.
-        let parent = [guard(3, HolderKind::Session, "s1", "C:/Work")];
-        assert_eq!(blocking(&parent, Some("C:/Work/Repo-wt"), None).len(), 1);
+        let sibling = [guard(3, HolderKind::Session, "s1", "C:/Work/Repo-wt2")];
+        assert_eq!(
+            blocking(&sibling, Some("C:/Work/Repo-wt"), None, None).len(),
+            1
+        );
+        // Nor does the claim on a parent of the branch's worktree make it the owner.
+        let parent = [guard(4, HolderKind::Session, "s1", "C:/Work")];
+        assert_eq!(
+            blocking(&parent, Some("C:/Work/Repo-wt"), None, None).len(),
+            1
+        );
     }
 
     #[test]
     fn the_run_that_owns_the_task_passes_by_its_run_id() {
         let guards = [guard(2, HolderKind::Run, "7", "C:/gone")];
-        assert!(blocking(&guards, None, Some(7)).is_empty());
-        assert_eq!(blocking(&guards, None, Some(8)).len(), 1);
+        assert!(blocking(&guards, None, Some(7), None).is_empty());
+        assert_eq!(blocking(&guards, None, Some(8), None).len(), 1);
+    }
+
+    #[test]
+    fn a_node_of_the_job_that_owns_the_task_passes_by_its_job_id() {
+        let guards = [guard(5, HolderKind::Job, "3", "C:/gone")];
+        // Another node (run 11) of job 3 lands: the job's claim is its own.
+        assert!(blocking(&guards, None, Some(11), Some(3)).is_empty());
+        assert_eq!(blocking(&guards, None, Some(11), Some(4)).len(), 1);
+        assert_eq!(blocking(&guards, None, Some(11), None).len(), 1);
+        // A run whose id happens to equal the job's id is not a node of it.
+        assert_eq!(blocking(&guards, None, Some(3), None).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_runs_job_is_read_from_its_row() {
+        let pool = crate::testdb::fresh_pool().await;
+        let job: i64 = sqlx::query_scalar(
+            "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
+             VALUES ('alpha', '/r', 'running', 3, '2026-10-22T00:00:00+00:00') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let insert_run = |job: Option<i64>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO runs (prompt, status, mode, project_id, cwd, job_id, created_at)
+                     VALUES ('x', 'running', 'worktree', 'alpha', '/r', ?, \
+                     '2026-10-22T00:00:00Z')",
+                )
+                .bind(job)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let node = insert_run(Some(job)).await;
+        let plain = insert_run(None).await;
+        assert_eq!(job_of_run(&pool, node).await.unwrap(), Some(job));
+        assert_eq!(job_of_run(&pool, plain).await.unwrap(), None);
+        assert_eq!(job_of_run(&pool, plain + 100).await.unwrap(), None);
     }
 
     #[test]
