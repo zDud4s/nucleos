@@ -503,19 +503,117 @@ enum ProbeStep {
     Incident(TaskRow),
 }
 
-/// Task 4 body; Task 6 replaces it with the real re-proof.
+/// `Fresh`: `checked_sha` is today's master `head`. Otherwise a re-proof is the single flight of
+/// `probe_lease_until`: if one is running the caller waits for it; if none is, the caller starts it
+/// unless it already tried once (`already_tried`) -- then it gives up and reads the incident as it
+/// stands, so a re-proof that keeps failing to run can never pin a ticket as `pending` for good.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn ensure_fresh(
-    _pool: &SqlitePool,
-    _executor: Option<&Arc<Executor>>,
-    _project_id: &str,
-    _project_root: &Path,
-    _incident: &TaskRow,
-    _head: &str,
-    _already_tried: bool,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    executor: Option<&Arc<Executor>>,
+    project_id: &str,
+    project_root: &Path,
+    incident: &TaskRow,
+    head: &str,
+    already_tried: bool,
+    now: DateTime<Utc>,
 ) -> Result<Freshness, String> {
-    Ok(Freshness::Fresh)
+    if incident.checked_sha.as_deref() == Some(head) {
+        return Ok(Freshness::Fresh);
+    }
+    let flying = incident
+        .probe_lease_until
+        .as_deref()
+        .is_some_and(|until| until > crate::execution::wave::stamp(now).as_str());
+    if flying {
+        return Ok(Freshness::InFlight { started: false });
+    }
+    let Some(executor) = executor.filter(|_| !already_tried) else { return Ok(Freshness::GaveUp) };
+    if !store::begin_reprobe(pool, incident.id, now).await.map_err(|error| error.to_string())? {
+        return Ok(Freshness::InFlight { started: false }); // somebody else got the flight
+    }
+    probe::spawn_proof(
+        executor.clone(),
+        probe::ProofJob::Reprobe {
+            project_id: project_id.to_owned(),
+            project_root: project_root.to_path_buf(),
+            task: incident.clone(),
+        },
+    );
+    Ok(Freshness::InFlight { started: true })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// No live open/claimed `master-red` (a `probing` row is not an incident yet).
+    NoIncident,
+    /// `checked_sha` already was today's master head.
+    Fresh,
+    /// The re-proof passed: the incident is closed.
+    Closed { sha: String },
+    /// The re-proof ran and the incident is still red (`checked_sha` moved to the head).
+    StillRed,
+    /// A re-proof is running and `wait` ran out; list the incident as it stands.
+    InFlight,
+    Unavailable(String),
+}
+
+/// SessionStart: make sure the live `master-red` of `project_id` was checked against today's master
+/// head before a session is told about it. Waits at most `wait` for a re-proof it started or found
+/// running.
+pub async fn refresh_master_red(
+    pool: &SqlitePool,
+    executor: &Arc<Executor>,
+    project_id: &str,
+    wait: Duration,
+    now: DateTime<Utc>,
+) -> Refresh {
+    match refresh(pool, executor, project_id, wait, now).await {
+        Ok(refresh) => refresh,
+        Err(error) => Refresh::Unavailable(error),
+    }
+}
+
+async fn refresh(
+    pool: &SqlitePool,
+    executor: &Arc<Executor>,
+    project_id: &str,
+    wait: Duration,
+    now: DateTime<Utc>,
+) -> Result<Refresh, String> {
+    let key = TaskKey::master_red();
+    let open = |row: &TaskRow| matches!(row.status, Status::Open | Status::Claimed);
+    let live = store::live_by_key(pool, project_id, &key, now).await.map_err(|error| error.to_string())?;
+    let Some(row) = live.filter(open) else { return Ok(Refresh::NoIncident) };
+    let project_root = crate::inspect::project_root(pool, project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("project {project_id} has no root recorded"))?;
+    let head = probe::master_head(pool, project_id, &project_root, Instant::now() + GIT_BUDGET).await?;
+    match ensure_fresh(pool, Some(executor), project_id, &project_root, &row, &head, false, now).await? {
+        Freshness::Fresh => Ok(Refresh::Fresh),
+        Freshness::GaveUp => Ok(Refresh::Unavailable("the incident could not be re-proved".to_owned())),
+        Freshness::InFlight { .. } => {
+            let started = Instant::now();
+            loop {
+                let now = Utc::now();
+                match store::live_by_key(pool, project_id, &key, now).await.map_err(|error| error.to_string())? {
+                    Some(row) if open(&row) => {
+                        if row.checked_sha.as_deref() == Some(head.as_str()) {
+                            return Ok(Refresh::StillRed);
+                        }
+                    }
+                    // Gone from the live set: the re-proof closed it by green at `head`.
+                    _ => return Ok(Refresh::Closed { sha: head }),
+                }
+                if started.elapsed() >= wait {
+                    return Ok(Refresh::InFlight);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
 }
 
 /// Case 2: the suspect groups need a proof on the master head. One proof per project serves every

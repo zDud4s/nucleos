@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::execution::{git_exec, land};
-use crate::task_claims::{FailedProbe, PROBE_LEASE_SECONDS, store};
+use crate::task_claims::{FailedProbe, PROBE_LEASE_SECONDS, TaskRow, store};
 use crate::verify::exec::Executor;
 use crate::verify::failures::Failures;
+use crate::verify::inherit::detail_strings;
 use crate::verify::plan::{Kind, ScopeArg, Ticket};
 use crate::verify::postgate_worker::GATE_UNIT;
 use crate::verify::resolve;
@@ -155,8 +156,6 @@ fn tree_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 
 // ---- the proof itself -----------------------------------------------------------------------------
 
-// `Incident` and `ids_missing` are read by case 3 (Task 6).
-#[allow(dead_code)]
 pub(super) enum What {
     /// Case 2: these groups, run whole.
     Groups(Vec<String>),
@@ -165,7 +164,6 @@ pub(super) enum What {
     Incident { guard_paths: Vec<String>, red_groups: Vec<String> },
 }
 
-#[allow(dead_code)]
 pub(super) struct Proof {
     pub head: String,
     pub tree: PathBuf,
@@ -178,14 +176,14 @@ pub(super) struct Proof {
 
 pub(super) enum ProofJob {
     Probe { project_id: String, project_root: PathBuf, task_id: i64, ticket_id: i64, groups: Vec<String> },
-    // Task 6 adds `Reprobe { project_id, project_root, task: TaskRow }` here, to `task_id()` and to
-    // the `match` below.
+    Reprobe { project_id: String, project_root: PathBuf, task: TaskRow },
 }
 
 impl ProofJob {
     fn task_id(&self) -> i64 {
         match self {
             ProofJob::Probe { task_id, .. } => *task_id,
+            ProofJob::Reprobe { task, .. } => task.id,
         }
     }
 }
@@ -198,6 +196,9 @@ pub(super) fn spawn_proof(executor: Arc<Executor>, job: ProofJob) -> bool {
         match job {
             ProofJob::Probe { project_id, project_root, task_id, ticket_id, groups } => {
                 run_probe(&executor, &project_id, &project_root, task_id, ticket_id, groups).await
+            }
+            ProofJob::Reprobe { project_id, project_root, task } => {
+                run_reprobe(&executor, &project_id, &project_root, task).await
             }
         }
     });
@@ -352,6 +353,33 @@ async fn run_probe(
     if let Err(error) = store::finish_probe(&executor.pool, task_id, &ticket_id.to_string(), failed, Utc::now()).await
     {
         tracing::warn!(%error, task_id, "verify probe: cannot settle the probing row");
+    }
+}
+
+/// Case 3's proof: the incident's red tests on the master head.
+async fn run_reprobe(executor: &Arc<Executor>, project_id: &str, project_root: &Path, task: TaskRow) {
+    let red_tests = detail_strings(&task.detail, "red_tests");
+    let what = What::Incident {
+        guard_paths: task.guard_paths.clone(),
+        red_groups: detail_strings(&task.detail, "red_groups"),
+    };
+    match prove(executor, project_id, project_root, what).await {
+        Ok(proof) => {
+            // Still red when something failed AND (the incident names no tests, or a failed unit gave
+            // no ids so we cannot say it is another test, or one of the red tests failed again).
+            let still_red = proof.any_failed
+                && (red_tests.is_empty()
+                    || proof.ids_missing
+                    || red_tests.iter().any(|test| proof.failures.tests.contains(test)));
+            if let Err(error) =
+                store::finish_reprobe(&executor.pool, task.id, &proof.head, still_red, Utc::now()).await
+            {
+                tracing::warn!(%error, task = task.id, "verify probe: cannot settle the re-proof");
+            }
+        }
+        // No `finish_reprobe`: the flight lapses by itself and a later read repeats the proof, at
+        // most once per PROBE_LEASE_SECONDS.
+        Err(error) => tracing::warn!(%error, task = task.id, "verify probe: the re-proof did not finish"),
     }
 }
 
