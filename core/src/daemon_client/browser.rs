@@ -17,6 +17,18 @@ async fn browser_answer(response: reqwest::Response, context: &str) -> Result<Va
     }
 }
 
+/// The JSON body of `POST /browser/open`.
+///
+/// A `None` project leaves the key out altogether, so the daemon resolves the scope from the
+/// calling turn rather than from an empty string a caller might mean as something.
+pub(crate) fn browser_open_body(project_id: Option<&str>, url: &str, visible: bool) -> Value {
+    let mut body = serde_json::json!({ "url": url, "visible": visible });
+    if let Some(project_id) = project_id {
+        body["project_id"] = Value::from(project_id);
+    }
+    body
+}
+
 impl DaemonClient {
     // The browser pillar's five agent verbs (spec §6.1).
     //
@@ -47,13 +59,13 @@ impl DaemonClient {
     /// Open a browsing session. The profile is chosen by the daemon, never named here.
     pub async fn browser_open(
         &self,
-        project_id: &str,
+        project_id: Option<&str>,
         url: &str,
         visible: bool,
     ) -> Result<Value, String> {
         let response = self
             .request(reqwest::Method::POST, "/browser/open")
-            .json(&serde_json::json!({ "project_id": project_id, "url": url, "visible": visible }))
+            .json(&browser_open_body(project_id, url, visible))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -144,5 +156,20 @@ impl DaemonClient {
             .map_err(|e| e.to_string())?;
         let status = response.status();
         Ok(serde_json::json!({ "closed": status.is_success(), "status": status.as_u16() }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_open_omits_project_id_when_none() {
+        let body = browser_open_body(None, "https://example.com", true);
+        assert!(body.get("project_id").is_none(), "{body}");
+        assert_eq!(body["url"], "https://example.com");
+        assert_eq!(body["visible"], true);
+        let with = browser_open_body(Some("acme"), "https://example.com", false);
+        assert_eq!(with["project_id"], "acme");
     }
 }

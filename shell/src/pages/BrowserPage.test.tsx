@@ -10,7 +10,7 @@ import {
   setTabMap,
   startBrowserBridge,
 } from "../data/browser-store";
-import { addAgentTab, newTab, setTabSessionId } from "../data/browser-tabs";
+import { NO_PROJECT, addAgentTab, newTab, setTabSessionId } from "../data/browser-tabs";
 import { resetAgentControlState } from "./AgentControlBar";
 import { BrowserPage } from "./BrowserPage";
 
@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   unlisten: vi.fn(),
   overlay: { open: false },
   ensureAgentEnv: vi.fn(),
+  projects: [{ project_id: "alpha" }, { project_id: "beta" }] as { project_id: string }[],
   reportAgentTabClosed: vi.fn(),
   embeddedAck: vi.fn(),
   embeddedOwner: vi.fn(),
@@ -48,7 +49,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 vi.mock("../ui/overlay", () => ({ useOverlayOpen: () => mocks.overlay.open }));
 vi.mock("../data/system", () => ({
-  useProjects: () => ({ data: [{ project_id: "alpha" }, { project_id: "beta" }] }),
+  useProjects: () => ({ data: mocks.projects }),
 }));
 
 class FakeResizeObserver {
@@ -99,6 +100,7 @@ beforeEach(() => {
   mocks.listeners.clear();
   mocks.unlisten.mockClear();
   mocks.overlay.open = false;
+  mocks.projects = [{ project_id: "alpha" }, { project_id: "beta" }];
   mocks.ensureAgentEnv.mockReset();
   mocks.ensureAgentEnv.mockResolvedValue({ ok: true, cdpHttp: "http://127.0.0.1:1" });
   resetBrowserStore();
@@ -146,6 +148,14 @@ function deferCreate(): () => void {
 }
 
 describe("BrowserPage", () => {
+  it("draws the page's actions at the end of the address row", async () => {
+    render(<BrowserPage actions={<button type="button">Archive</button>} />);
+    const address = await screen.findByRole("textbox", { name: "Address" });
+    const row = address.closest(".browser-toolbar");
+    expect(row).not.toBeNull();
+    expect(row!.lastElementChild!.textContent).toBe("Archive");
+  });
+
   it("creates an owner tab with a uuid and the placeholder bounds", async () => {
     render(<BrowserPage />);
     const tabId = await openTab();
@@ -241,7 +251,7 @@ describe("BrowserPage", () => {
   it("opens a new tab for a new-window event", async () => {
     render(<BrowserPage />);
     const tabId = await openTab();
-    await waitFor(() => expect(mocks.listeners.size).toBe(5));
+    await waitFor(() => expect(mocks.listeners.size).toBe(6));
     emit("new-window", { fromTabId: tabId, url: "https://popup.example/" });
     await waitFor(() => expect(calls("browser_tab_create")).toHaveLength(2));
     expect(calls("browser_tab_create")[1]).toMatchObject({
@@ -263,7 +273,7 @@ describe("BrowserPage", () => {
 
   it("explains a missing WebView2 Runtime", async () => {
     render(<BrowserPage />);
-    await waitFor(() => expect(mocks.listeners.size).toBe(5));
+    await waitFor(() => expect(mocks.listeners.size).toBe(6));
     emit("runtime-missing", {});
     expect(screen.getByText(/WebView2 Runtime is missing/)).toBeTruthy();
   });
@@ -279,11 +289,50 @@ describe("BrowserPage", () => {
     expect(last(calls("browser_tabs_show"))?.tabId).toBeNull();
   });
 
+  describe("no project", () => {
+    beforeEach(() => {
+      mocks.projects = [];
+    });
+
+    it("the project selector lists No project first and picks it when there are no projects", async () => {
+      render(<BrowserPage />);
+      const combo = screen.getByRole("combobox", { name: "Project" }) as HTMLSelectElement;
+      expect(combo.options[0].textContent).toBe("No project");
+      expect(combo.options[0].value).toBe(NO_PROJECT);
+      expect(combo.value).toBe(NO_PROJECT);
+      expect(screen.queryByText("No project to browse in yet.")).toBeNull();
+      expect(
+        (screen.getAllByRole("button", { name: "New tab" })[0] as HTMLButtonElement).disabled,
+      ).toBe(false);
+    });
+
+    it("a new tab in No project is an owner tab with a null project", async () => {
+      render(<BrowserPage />);
+      await openTab();
+      expect(calls("browser_tab_create")[0]).toMatchObject({
+        project: null,
+        role: "owner",
+        url: "about:blank",
+      });
+    });
+
+    it("an agent tab under No project shows the agent control bar", async () => {
+      setTabMap((m) =>
+        setTabSessionId(addAgentTab(m, NO_PROJECT, newTab("n-1", "https://a.example/", "agent")), "n-1", "s7"),
+      );
+      markCreated("n-1");
+      render(<BrowserPage />);
+      expect(screen.getByRole("combobox", { name: "Project" })).toHaveProperty("value", NO_PROJECT);
+      expect(screen.getByText("Agent is driving")).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Take control" })).toBeTruthy();
+    });
+  });
+
   describe("agent tabs", () => {
     const openReq = { request_id: "r1", project: "alpha", url: "https://a.example/", kind: "embedded" };
 
     async function openAgent(): Promise<string> {
-      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      await waitFor(() => expect(mocks.listeners.size).toBe(6));
       act(() => {
         void handleAgentOpen(openReq);
       });
@@ -353,7 +402,7 @@ describe("BrowserPage", () => {
     it("reports a process failure of an agent tab", async () => {
       render(<BrowserPage />);
       const tabId = await openAgent();
-      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      await waitFor(() => expect(mocks.listeners.size).toBe(6));
       emit("process-failed", { tabId, kind: "crashed" });
       expect(mocks.reportAgentTabClosed).toHaveBeenCalledWith("s1");
     });
@@ -386,7 +435,7 @@ describe("BrowserPage", () => {
     it("opens an agent tab in my tabs as an owner tab", async () => {
       seedAgent("alpha", "a-1", "s9");
       render(<BrowserPage />);
-      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      await waitFor(() => expect(mocks.listeners.size).toBe(6));
       emit("tab-state", state("a-1", { url: "https://deep.example/page" }));
       fireEvent.click(screen.getByRole("button", { name: "Take control" }));
       fireEvent.click(await screen.findByRole("button", { name: "Open in my tabs" }));
@@ -403,7 +452,7 @@ describe("BrowserPage", () => {
     it("disables the omnibox and navigation while the agent drives, enables them after Take control", async () => {
       seedAgent("alpha", "a-1", "s-ctl");
       render(<BrowserPage />);
-      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      await waitFor(() => expect(mocks.listeners.size).toBe(6));
       emit("tab-state", state("a-1", { canGoBack: true, canGoForward: true }));
       const disabled = (name: string) => (screen.getByRole("button", { name }) as HTMLButtonElement).disabled;
       expect((screen.getByRole("textbox", { name: "Address" }) as HTMLInputElement).disabled).toBe(true);
@@ -421,7 +470,7 @@ describe("BrowserPage", () => {
     it("cannot revive a detached agent tab after a process failure", async () => {
       seedAgent("alpha", "a-1", "s-dead");
       render(<BrowserPage />);
-      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      await waitFor(() => expect(mocks.listeners.size).toBe(6));
       fireEvent.click(screen.getByRole("button", { name: "Take control" }));
       await screen.findByText("You are driving");
       emit("process-failed", { tabId: "a-1", kind: "crashed" });
@@ -438,7 +487,7 @@ describe("BrowserPage", () => {
     it("drops a new-window event from an agent tab", async () => {
       render(<BrowserPage />);
       const tabId = await openAgent();
-      await waitFor(() => expect(mocks.listeners.size).toBe(5));
+      await waitFor(() => expect(mocks.listeners.size).toBe(6));
       emit("new-window", { fromTabId: tabId, url: "https://popup.example/" });
       expect(calls("browser_tab_create")).toHaveLength(1);
     });
@@ -446,10 +495,10 @@ describe("BrowserPage", () => {
 
   it("keeps the event listeners on unmount; stopping the bridge unlistens", async () => {
     const { unmount } = render(<BrowserPage />);
-    await waitFor(() => expect(mocks.listeners.size).toBe(5));
+    await waitFor(() => expect(mocks.listeners.size).toBe(6));
     unmount();
     expect(mocks.unlisten).not.toHaveBeenCalled();
     stopBridge();
-    await waitFor(() => expect(mocks.unlisten).toHaveBeenCalledTimes(5));
+    await waitFor(() => expect(mocks.unlisten).toHaveBeenCalledTimes(6));
   });
 });

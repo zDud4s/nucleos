@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
+import { NO_PROJECT } from "./browser-tabs";
+
 type Mod = typeof import("./browser-embedded");
 
 // The token promise is module state, so each test gets a fresh module.
@@ -148,5 +150,18 @@ describe("browser-embedded", () => {
     const m = await fresh();
     expect(m.isPillarOff(new Error("x"))).toBe(false);
     expect(m.isRequestGone(undefined)).toBe(false);
+  });
+
+  it("prepare and register post a null project for the no-project scope", async () => {
+    const m = await fresh();
+    fetchMock.mockResolvedValue(res(200, { proxy_addr: "127.0.0.1:9" }));
+    await m.embeddedPrepare(NO_PROJECT);
+    expect(JSON.parse(lastCall().body as string)).toEqual({ project: null });
+    fetchMock.mockResolvedValue(res(204));
+    await m.embeddedRegister(NO_PROJECT, "http://127.0.0.1:1234");
+    expect(JSON.parse(lastCall().body as string)).toEqual({
+      project: null,
+      cdp_http: "http://127.0.0.1:1234",
+    });
   });
 });

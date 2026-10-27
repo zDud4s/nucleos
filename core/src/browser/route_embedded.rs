@@ -25,7 +25,8 @@ impl BrowserRuntime {
 /// Try to open `ask.url` in the shell's embedded browser. `Some(row)` when the shell attached
 /// within the registry's bound; `None` when embedding does not apply or did not happen (no
 /// registration, timeout, redirect off the list, row update failed), and the caller then opens
-/// headless on the same row. `placement` is the project's real one, the same value `prepare` used.
+/// headless on the same row. `placement` is the project's real one, the same value `prepare` used
+/// (for the no-project scope, `no_project_placement()`). The registry is keyed by `embedded_key`.
 pub(super) async fn try_open(
     pool: &SqlitePool,
     runtime: &BrowserRuntime,
@@ -34,16 +35,18 @@ pub(super) async fn try_open(
     sites: &Allowed,
     placement: &Placement,
 ) -> Option<SessionRow> {
-    if !runtime.embedded_supported() || !runtime.embedded.has_live(ask.project_id) {
+    let key = embedded_key(ask.project_id);
+    if !runtime.embedded_supported() || !runtime.embedded.has_live(key) {
         return None;
     }
     let session = runtime
         .embedded
-        .open(&runtime.client, ask.project_id, ask.url, placement)
+        .open(&runtime.client, key, ask.url, placement)
         .await?;
     // The same redirect trap as the headless path: the fence refused a document that landed off the
     // list, so the shell's tab holds nothing. An embedded tab cannot be re-profiled, so it is closed
-    // and the caller reopens through the headless path, which downgrades to a throwaway.
+    // and the caller reopens through the headless path, which downgrades to a throwaway. The
+    // no-project scope is a throwaway already, so there is nothing to downgrade it to.
     let after = browser_policy::decide(
         ask.url,
         &session.final_url,
@@ -51,7 +54,7 @@ pub(super) async fn try_open(
         ask.requester,
         &sites.read,
     );
-    if matches!(after.outcome, Outcome::Open(Profile::Ephemeral)) {
+    if ask.project_id != NO_PROJECT && matches!(after.outcome, Outcome::Open(Profile::Ephemeral)) {
         runtime.embedded.queue_close(&session.id);
         close_attached_target(runtime, &session.id).await;
         return None;

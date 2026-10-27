@@ -29,6 +29,12 @@
 /// conversations, three relays deep, is still admitted. Three, the same number as
 /// `team_trigger::MAX_TRIGGER_DEPTH` and for the same reason: a chain of three conversations
 /// relaying into each other is a workflow; a fourth hop is the shape of a loop nobody drew.
+///
+/// A linked pair (a browser agent and its mother, `chats::links`) is held by this same ceiling,
+/// which is what makes lifting `Cycle` for it safe (spec 4.4): the mother's task to the child is
+/// `[M, F]`, the child's answer `[M, F]` -> M, a woken mother's follow-up `[M, F, M]` -> F, and the
+/// child's second answer `[M, F, M, F]` -> M is `TooDeep`. At most three hops past the typed turn,
+/// so at most two turns of the child and one woken turn of the mother per typed message.
 pub const MAX_RELAY_DEPTH: usize = 3;
 
 /// What a proposed relay was decided to be, and why, when it is refused.
@@ -62,7 +68,12 @@ pub enum Verdict {
 /// nothing does — and inventing a fifth `Verdict` for a shape that never occurs would be a case to
 /// maintain forever against a bug that has never shown up. Zero relays is, truthfully, not a cycle,
 /// not a relay to itself, and not too deep.
-pub fn admits(chain: &[&str], to: &str) -> Verdict {
+///
+/// `linked` says that the sender and `to` are a linked pair (`chats::links::are_linked`): a child
+/// answering its mother, or a mother asking her child again, revisits a conversation already in
+/// the chain by design, so for that pair alone `Cycle` is not decided. `Itself` and `TooDeep` are
+/// unchanged, and `MAX_RELAY_DEPTH` is what bounds the back-and-forth (see its doc comment).
+pub fn admits(chain: &[&str], to: &str, linked: bool) -> Verdict {
     // `Itself` and `Cycle` are decided before length is even considered — a chain that has looped
     // back on itself is a wrong chain, not merely a long one, and that is the more useful thing to
     // say even when the chain is also past `MAX_RELAY_DEPTH` (see the second pinned test below).
@@ -71,7 +82,7 @@ pub fn admits(chain: &[&str], to: &str) -> Verdict {
             return Verdict::Itself;
         }
         for &link in &chain[..chain.len() - 1] {
-            if link == to {
+            if !linked && link == to {
                 return Verdict::Cycle {
                     at: link.to_string(),
                 };
@@ -213,6 +224,25 @@ pub enum Refusal {
     Unreadable { step: &'static str, error: String },
 }
 
+impl Refusal {
+    /// The word `http::chat_turns::relay_refusal_response` answers this refusal with, for callers
+    /// that record a refusal rather than answer an HTTP request with it (a browser agent's reply
+    /// that could not be delivered, `chat_link_deliveries.reason`).
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Refusal::NoSuchDestination { .. } => "no_such_destination",
+            Refusal::RemoteOrigin => "remote_origin",
+            Refusal::Chain(Verdict::Itself) => "relay_to_self",
+            Refusal::Chain(Verdict::Cycle { .. }) => "relay_cycle",
+            Refusal::Chain(Verdict::TooDeep) => "relay_too_deep",
+            Refusal::Chain(Verdict::Ok) => "internal",
+            Refusal::ChainOverBudget { .. } => "relay_chain_over_budget",
+            Refusal::OwnerAway => "owner_away",
+            Refusal::Unreadable { .. } => "internal",
+        }
+    }
+}
+
 /// The gate: whether a message may travel from `from_chat_id`, sent by the turn `sending_run_id`,
 /// on into `to_chat_id` — and, if so, the id of the `chat_relays` row recording that it did.
 ///
@@ -300,7 +330,15 @@ pub async fn admit(
             error: error.to_string(),
         })?;
     let chain_refs: Vec<&str> = links.iter().map(|(_, chat_id)| chat_id.as_str()).collect();
-    let verdict = admits(&chain_refs, to_chat_id);
+    // A linked pair may hand messages back and forth; only `Cycle` is lifted for it, and only for
+    // an ACTIVE link in either direction. A failed read fails closed, like the walk above.
+    let linked = crate::chats::links::are_linked(pool, from_chat_id, to_chat_id)
+        .await
+        .map_err(|error| Refusal::Unreadable {
+            step: "link lookup",
+            error: error.to_string(),
+        })?;
+    let verdict = admits(&chain_refs, to_chat_id, linked);
     if verdict != Verdict::Ok {
         return Err(Refusal::Chain(verdict));
     }
@@ -455,9 +493,47 @@ pub async fn handover_of(pool: &sqlx::SqlitePool, relay_id: Option<i64>) -> Hand
     let Some(relay_id) = relay_id else {
         return Handover::Typed;
     };
-    let row: sqlx::Result<Option<(Option<i64>, i64)>> = sqlx::query_as(
-        "SELECT s.from_relay_id,
-                (SELECT COALESCE(MAX(r.read_untrusted), 1) FROM runs r
+    let row: sqlx::Result<Option<Option<i64>>> = sqlx::query_scalar(
+        "SELECT s.from_relay_id
+           FROM chat_relays c
+           JOIN runs s ON s.id = c.sending_run_id
+          WHERE c.id = ?",
+    )
+    .bind(relay_id)
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some(None)) => {
+            if sender_read_untrusted(pool, relay_id).await {
+                Handover::Withheld
+            } else {
+                Handover::FirstHop
+            }
+        }
+        Ok(_) => Handover::Withheld,
+        Err(error) => {
+            tracing::warn!(%error, relay_id, "a relayed turn's chain could not be read; it keeps McpOnly");
+            Handover::Withheld
+        }
+    }
+}
+
+/// Whether the conversation that sent `relay_id` has third-party text behind the words: its sending
+/// run, or any run of that run's session, read untrusted context. The reach is `handover_of`'s, and
+/// for its reason — a live process carries what every earlier turn of its session read.
+///
+/// Two readers, one question. `handover_of` uses it to withhold the shell; `send_message_inner` and
+/// `spawn_local_turn` use it to mark the run the relay starts `read_untrusted` before it is spawned.
+/// The second is what keeps the taint from being laundered by one hop: a turn whose prompt IS a
+/// tainted sender's words holds that text exactly as if it had read it, so left clean it would leave
+/// a resumable session behind (`turn.rs` resumes any session whose run reads clean), and the next
+/// typed turn would resume web text with full tools — and a relay out of that session would read
+/// clean to `handover_of` in turn. Marked, the taint travels the chain hop by hop.
+///
+/// Fails closed: a relay, a sending run, or a session that cannot be read answers `true`.
+pub async fn sender_read_untrusted(pool: &sqlx::SqlitePool, relay_id: i64) -> bool {
+    let row: sqlx::Result<Option<i64>> = sqlx::query_scalar(
+        "SELECT (SELECT COALESCE(MAX(r.read_untrusted), 1) FROM runs r
                   WHERE r.id = s.id
                      OR (s.session_id IS NOT NULL AND r.session_id = s.session_id))
            FROM chat_relays c
@@ -468,11 +544,11 @@ pub async fn handover_of(pool: &sqlx::SqlitePool, relay_id: Option<i64>) -> Hand
     .fetch_optional(pool)
     .await;
     match row {
-        Ok(Some((None, 0))) => Handover::FirstHop,
-        Ok(_) => Handover::Withheld,
+        Ok(Some(0)) => false,
+        Ok(_) => true,
         Err(error) => {
-            tracing::warn!(%error, relay_id, "a relayed turn's chain could not be read; it keeps McpOnly");
-            Handover::Withheld
+            tracing::warn!(%error, relay_id, "a relay's sender could not be read; it counts as tainted");
+            true
         }
     }
 }
@@ -534,7 +610,7 @@ mod tests {
                 "a fourth relay exceeds MAX_RELAY_DEPTH and closes nothing",
             ),
         ] {
-            assert_eq!(admits(&chain, to), expected, "{why}");
+            assert_eq!(admits(&chain, to, false), expected, "{why}");
         }
     }
 
@@ -544,7 +620,7 @@ mod tests {
     #[test]
     fn a_cycle_is_named_even_in_a_chain_that_is_also_too_deep() {
         assert_eq!(
-            admits(&["A", "B", "C", "D"], "B"),
+            admits(&["A", "B", "C", "D"], "B", false),
             Verdict::Cycle {
                 at: "B".to_string()
             }
@@ -1016,6 +1092,52 @@ mod tests {
         assert_eq!(handover_of(&pool, Some(9_999)).await, Handover::Withheld);
     }
 
+    /// The taint `send_message_inner` carries onto a relay-born run: a clean sender is clean, a
+    /// sender whose own row or whose session read untrusted text is not, and a relay that names no
+    /// row fails closed. Depth is not taint — a clean second hop is still clean here.
+    #[tokio::test]
+    async fn a_relays_sender_is_tainted_by_its_own_row_or_its_session_and_by_nothing_else() {
+        let pool = test_pool().await;
+
+        let clean = seed_chain(&pool, &["A", "B"]).await;
+        assert!(!sender_read_untrusted(&pool, relay_of(&pool, clean).await).await);
+        let deep = seed_chain(&pool, &["C", "D", "E"]).await;
+        assert!(!sender_read_untrusted(&pool, relay_of(&pool, deep).await).await);
+
+        let tainted = seed_chain(&pool, &["F", "G"]).await;
+        let relay = relay_of(&pool, tainted).await;
+        sqlx::query(
+            "UPDATE runs SET read_untrusted = 1
+              WHERE id = (SELECT sending_run_id FROM chat_relays WHERE id = ?)",
+        )
+        .bind(relay)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sender_read_untrusted(&pool, relay).await);
+
+        let session = seed_chain(&pool, &["H", "I"]).await;
+        let relay = relay_of(&pool, session).await;
+        sqlx::query(
+            "UPDATE runs SET session_id = 'shared-taint'
+              WHERE id = (SELECT sending_run_id FROM chat_relays WHERE id = ?)",
+        )
+        .bind(relay)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at, chat_id, session_id, read_untrusted)
+             VALUES ('read the page', 'completed', '2026-08-22T00:00:00Z', 'H', 'shared-taint', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sender_read_untrusted(&pool, relay).await);
+
+        assert!(sender_read_untrusted(&pool, 9_999).await);
+    }
+
     /// The third brake: a chain that has spent its ceiling is refused another hop, and both figures
     /// travel with the refusal. Raising the ceiling lets the same hop through.
     #[tokio::test]
@@ -1092,5 +1214,197 @@ mod tests {
             chain_has_room(&pool, root, now).await,
             Err(Refusal::ChainOverBudget { .. })
         ));
+    }
+
+    // -- linked pairs (spec 4.4) ---------------------------------------------------------------
+    //
+    // A browser agent and the conversation that called it may hand messages back and forth: the
+    // answer of the child travels back to the mother, and a woken mother may ask the child again.
+    // Both hops revisit a conversation already in the chain, so without the linked exception every
+    // one of them would be a `Cycle`. The exception lifts only that; the self relay and the depth
+    // limit stay exactly where they were.
+
+    /// Spec 4.4 steps 2 and 3: the child answers the mother (`[M, F]` -> M), and the woken mother
+    /// asks the child again (`[M, F, M]` -> F). Both are admitted because the pair is linked.
+    #[test]
+    fn a_linked_pair_may_hop_back_to_a_conversation_already_in_the_chain() {
+        assert_eq!(
+            admits(&["M", "F"], "M", true),
+            Verdict::Ok,
+            "the child's answer reaches its mother"
+        );
+        assert_eq!(
+            admits(&["M", "F", "M"], "F", true),
+            Verdict::Ok,
+            "the woken mother may ask her child once more"
+        );
+    }
+
+    /// The exception belongs to the link, not to the hop: the same chain without a link is the
+    /// cycle it always was.
+    #[test]
+    fn the_same_hop_without_a_link_is_still_a_cycle() {
+        assert_eq!(
+            admits(&["M", "F"], "M", false),
+            Verdict::Cycle {
+                at: "M".to_string()
+            }
+        );
+    }
+
+    /// A link never lets a conversation relay to itself, and never lets a chain grow past
+    /// `MAX_RELAY_DEPTH`: spec 4.4 step 4, the child's second answer, is `TooDeep`.
+    #[test]
+    fn a_link_lifts_neither_the_self_relay_nor_the_depth_limit() {
+        assert_eq!(admits(&["M", "F"], "F", true), Verdict::Itself);
+        assert_eq!(admits(&["M", "F", "M", "F"], "M", true), Verdict::TooDeep);
+    }
+
+    /// `admit` reads the link itself, in either direction: a mother whose child is linked to her
+    /// may send it a message, and the child may answer. Once the link is closed both hops are the
+    /// plain cycles they would be between any two conversations.
+    #[tokio::test]
+    async fn admit_treats_an_active_link_as_linked_in_both_directions() {
+        let pool = test_pool().await;
+        let now = timestamp("2026-08-22T00:00:00Z");
+        seed_chat(&pool, "M", false).await;
+        seed_chat(&pool, "F", false).await;
+        seed_owner_present(&pool, now).await;
+        crate::chats::links::open(&pool, "F", Some("M"), "browser", None)
+            .await
+            .expect("link the child to its mother");
+
+        let mother_turn = seed_chain(&pool, &["M", "F", "M"]).await;
+        admit(
+            &pool,
+            "M",
+            "F",
+            mother_turn,
+            Origin::Shell,
+            "one more thing",
+            now,
+        )
+        .await
+        .expect("mother -> child is admitted for a linked pair");
+
+        let child_turn = seed_chain(&pool, &["M", "F"]).await;
+        admit(
+            &pool,
+            "F",
+            "M",
+            child_turn,
+            Origin::Shell,
+            "the answer",
+            now,
+        )
+        .await
+        .expect("child -> mother is admitted for a linked pair");
+
+        crate::chats::links::unlink(&pool, "F")
+            .await
+            .expect("close the link");
+
+        assert_eq!(
+            admit(
+                &pool,
+                "M",
+                "F",
+                mother_turn,
+                Origin::Shell,
+                "one more thing",
+                now
+            )
+            .await,
+            Err(Refusal::Chain(Verdict::Cycle {
+                at: "F".to_string()
+            })),
+            "an unlinked mother -> child hop is a cycle again"
+        );
+        assert_eq!(
+            admit(
+                &pool,
+                "F",
+                "M",
+                child_turn,
+                Origin::Shell,
+                "the answer",
+                now
+            )
+            .await,
+            Err(Refusal::Chain(Verdict::Cycle {
+                at: "M".to_string()
+            })),
+            "an unlinked child -> mother hop is a cycle again"
+        );
+    }
+
+    /// Spec 4.4, the ceiling counted: the child's SECOND answer travels on `[M, F, M, F]`, four
+    /// conversations, and is refused for length even though the pair is linked.
+    #[tokio::test]
+    async fn the_second_reply_of_a_linked_child_is_too_deep() {
+        let pool = test_pool().await;
+        let now = timestamp("2026-08-22T00:00:00Z");
+        seed_chat(&pool, "M", false).await;
+        seed_chat(&pool, "F", false).await;
+        seed_owner_present(&pool, now).await;
+        crate::chats::links::open(&pool, "F", Some("M"), "browser", None)
+            .await
+            .expect("link the child to its mother");
+
+        let child_turn = seed_chain(&pool, &["M", "F", "M", "F"]).await;
+        assert_eq!(
+            admit(
+                &pool,
+                "F",
+                "M",
+                child_turn,
+                Origin::Shell,
+                "the second answer",
+                now
+            )
+            .await,
+            Err(Refusal::Chain(Verdict::TooDeep))
+        );
+    }
+
+    /// `Refusal::slug` speaks the same words `/relay` answers with (`relay_refusal_response`), so
+    /// a delivery recorded for the panel and a refusal returned over HTTP never disagree.
+    #[test]
+    fn refusal_slugs_match_the_http_vocabulary() {
+        for (refusal, slug) in [
+            (
+                Refusal::NoSuchDestination {
+                    to_chat_id: "X".to_string(),
+                },
+                "no_such_destination",
+            ),
+            (Refusal::RemoteOrigin, "remote_origin"),
+            (Refusal::Chain(Verdict::Itself), "relay_to_self"),
+            (
+                Refusal::Chain(Verdict::Cycle {
+                    at: "X".to_string(),
+                }),
+                "relay_cycle",
+            ),
+            (Refusal::Chain(Verdict::TooDeep), "relay_too_deep"),
+            (Refusal::Chain(Verdict::Ok), "internal"),
+            (
+                Refusal::ChainOverBudget {
+                    spent_usd: 6.0,
+                    limit_usd: 5.0,
+                },
+                "relay_chain_over_budget",
+            ),
+            (Refusal::OwnerAway, "owner_away"),
+            (
+                Refusal::Unreadable {
+                    step: "chain walk",
+                    error: "broken".to_string(),
+                },
+                "internal",
+            ),
+        ] {
+            assert_eq!(refusal.slug(), slug, "{refusal:?}");
+        }
     }
 }

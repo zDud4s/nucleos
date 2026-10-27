@@ -351,11 +351,13 @@
   overflow: hidden;
 }
 
+/* The browser is the page: no measure, no padding. Its own bars carry their air, and the webview
+   runs to the window's edges (the notch's strip on the right is the shell's, see `app.css`). */
 .app-page:has(> .web-split) {
   max-width: none;
   height: 100%;
   min-height: 0;
-  padding-bottom: var(--space-4);
+  padding: 0;
 }
 
 .web-split {
@@ -365,14 +367,12 @@
   min-height: 0;
 }
 
-.web-split > .ui-page-header {
-  margin-bottom: 0;
-}
-
-.web-split-toolbar {
+/* The panel toggles close the browser's address row. */
+.web-panel-toggles {
   display: flex;
+  flex: none;
+  align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) 0;
 }
 
 .web-panel-toggle {
@@ -396,7 +396,6 @@
   display: flex;
   flex: 1;
   min-height: 0;
-  gap: var(--space-4);
 }
 
 .web-split-main {
@@ -405,10 +404,13 @@
   min-height: 0;
 }
 
+/* Glued to the right edge and running the page's full height, like the Chats list. */
 .web-side {
   flex: 0 0 26rem;
   min-width: 0;
   overflow-y: auto;
+  padding: var(--space-3);
+  border-left: 1px solid var(--border);
 }
 
 .web-side[hidden] {
