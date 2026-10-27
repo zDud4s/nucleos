@@ -1263,6 +1263,14 @@ mod tests {
         one_call_is_sanctioned(source, &format!("{needle}s::create("))
     }
 
+    /// `themes.rs` may name the notes module in exactly one place: the call that reads the vectors of
+    /// the active notes for the theme grouping. Grouping needs vectors, never text (spec
+    /// 2026-10-22 section 10).
+    fn themes_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        calls_are_sanctioned(source, &[&format!("{needle}s::vectors_for_clustering")])
+    }
+
     /// True when the production code of `source` names the notes module only inside the listed
     /// `calls`, and each of them exactly once.
     fn calls_are_sanctioned(source: &str, calls: &[&str]) -> bool {
@@ -1374,6 +1382,38 @@ use crate::{needle}s;"),
         // A test-only helper above production code does not end the sweep.
         assert!(!distill_mentions_are_sanctioned(&format!(
             "#[cfg(test)]\nfn helper() {{}}\n{call}\nuse crate::{needle}s;"
+        )));
+    }
+
+    #[test]
+    fn the_themes_rule_holds_one_call_and_nothing_else() {
+        let needle = ["owner", "note"].join("_");
+        let call = format!("let v = {needle}s::vectors_for_clustering(&pool, m).await;");
+        assert!(themes_mentions_are_sanctioned(&call));
+        assert!(!themes_mentions_are_sanctioned(&format!("{call}
+{call}")));
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "use crate::{needle}s;
+{call}"
+        )));
+        assert!(!themes_mentions_are_sanctioned("fn nothing() {}"));
+        assert!(themes_mentions_are_sanctioned(&format!(
+            "{call}
+// mentions {needle}s"
+        )));
+        assert!(themes_mentions_are_sanctioned(&format!(
+            "{call}
+#[cfg(test)]
+mod tests {{
+{needle}s::create(&pool, \"x\", \"y\");
+}}"
+        )));
+        // A test-only helper above production code does not end the sweep.
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "#[cfg(test)]
+fn helper() {{}}
+{call}
+use crate::{needle}s;"
         )));
     }
 
@@ -1562,7 +1602,7 @@ use crate::{needle}s;"),
     /// The guard below scans production code only: a test module may read the notes table to
     /// assert behaviour (D4 is about production reach, not about what a test inspects).
     #[test]
-    fn no_core_module_but_six_mentions_owner_notes() {
+    fn no_core_module_but_seven_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1639,11 +1679,18 @@ use crate::{needle}s;"),
                 );
                 continue;
             }
+            if crate::source_scan::is_top_level(&path) && name == "themes.rs" {
+                assert!(
+                    themes_mentions_are_sanctioned(&source),
+                    "themes.rs may name the notes only in its one call to vectors_for_clustering                      (spec 2026-10-22 section 10: grouping needs vectors, never text)"
+                );
+                continue;
+            }
             assert!(
                 !production_code(&source).contains(&needle),
                 "{} mentions `{needle}` in production code (test modules are not scanned): the \
                  owner's notes are reachable from owner_notes.rs, \
-                 http.rs and main.rs (spec D4), from distill.rs through one read call, and from \
+                 http.rs and main.rs (spec D4), from distill.rs and themes.rs through one read call each, and from \
                  capture.rs and channels/commands.rs through one write call each, only, so that \
                  nothing in the agent's memory can read them",
                 path.display()

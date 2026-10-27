@@ -2,6 +2,9 @@
 //! Phase 6) is owner-only text and never enters a prompt, the feed, the outbox or a log.
 use std::collections::HashSet;
 
+use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
+
 pub const STATES: [&str; 4] = ["proposed", "accepted", "refused", "merged"];
 pub const ORIGINS: [&str; 2] = ["system", "owner"];
 
@@ -141,6 +144,235 @@ pub fn provisional_name(rows: &[NameRow]) -> String {
         .map(|r| r.title.trim().chars().take(80).collect::<String>())
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "Untitled theme".to_owned())
+}
+
+pub const MAX_PASS_ATTEMPTS: i64 = 3;
+const PERIOD: chrono::Duration = chrono::Duration::days(7);
+const SEAL_KEY: &str = "themes.clustered_at";
+const ATTEMPTS_KEY: &str = "themes.clustered_attempts";
+
+/// Seal at the START of an attempt (spec 5.1): a failing pass is not retried every 30 s tick.
+pub fn pass_due(now: DateTime<Utc>, sealed: Option<DateTime<Utc>>, attempts: i64) -> bool {
+    let Some(sealed) = sealed else { return true };
+    if attempts > 0 && attempts < MAX_PASS_ATTEMPTS {
+        return crate::distill::extract::retry_at(attempts, sealed).is_some_and(|at| now >= at);
+    }
+    now - sealed >= PERIOD
+}
+
+/// Mean of equally long vectors; vectors of another length than the first are skipped.
+pub fn centroid(vectors: &[Vec<f32>]) -> Vec<f32> {
+    let Some(first) = vectors.first() else {
+        return Vec::new();
+    };
+    let dim = first.len();
+    let mut sum = vec![0.0_f64; dim];
+    let mut n = 0usize;
+    for v in vectors.iter().filter(|v| v.len() == dim) {
+        for (s, x) in sum.iter_mut().zip(v) {
+            *s += f64::from(*x);
+        }
+        n += 1;
+    }
+    sum.into_iter().map(|s| (s / n as f64) as f32).collect()
+}
+
+/// The vectors the grouping runs over: active notes (ids and vectors only) and the live knowledge rows
+/// the distiller or the owner wrote. The consolidator's counter-observations are not themes material.
+async fn candidates(pool: &SqlitePool, model: &str) -> sqlx::Result<Vec<Candidate>> {
+    let mut out: Vec<Candidate> = crate::owner_notes::vectors_for_clustering(pool, model)
+        .await?
+        .into_iter()
+        .map(|(id, vector)| Candidate {
+            key: (MemberKind::Note, id),
+            vector,
+        })
+        .collect();
+    let rows: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT e.knowledge_id, e.dim, e.vector
+           FROM knowledge_embeddings e JOIN knowledge k ON k.id = e.knowledge_id
+          WHERE e.model = ? AND k.status IN ('active', 'proposed', 'observed')
+            AND k.source IN ('distiller', 'owner')
+          ORDER BY e.knowledge_id",
+    )
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+    out.extend(rows.into_iter().filter_map(|(id, dim, blob)| {
+        crate::embed::decode(&blob, dim).map(|vector| Candidate {
+            key: (MemberKind::Knowledge, id),
+            vector,
+        })
+    }));
+    Ok(out)
+}
+
+/// Member sets that block a new proposal: every `refused`, `proposed` and `accepted` theme, minus the
+/// members the owner took out.
+async fn blocking_sets(pool: &SqlitePool) -> sqlx::Result<Vec<HashSet<MemberKey>>> {
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT m.theme_id, m.member_kind, m.member_id
+           FROM theme_members m JOIN themes t ON t.id = m.theme_id
+          WHERE t.state IN ('refused', 'proposed', 'accepted') AND m.excluded = 0
+          ORDER BY m.theme_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut by_theme: std::collections::BTreeMap<i64, HashSet<MemberKey>> = Default::default();
+    for (theme_id, kind, id) in rows {
+        if let Some(kind) = MemberKind::parse(&kind) {
+            by_theme.entry(theme_id).or_default().insert((kind, id));
+        }
+    }
+    Ok(by_theme.into_values().collect())
+}
+
+/// The theme the planner proposed, written in one transaction. The name comes from the closest
+/// knowledge member that did not quote the owner.
+async fn insert_theme(
+    pool: &SqlitePool,
+    model: &str,
+    keys: &[MemberKey],
+    by_key: &std::collections::HashMap<MemberKey, &Vec<f32>>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    let vectors: Vec<Vec<f32>> = keys
+        .iter()
+        .filter_map(|k| by_key.get(k).map(|v| (*v).clone()))
+        .collect();
+    let center = centroid(&vectors);
+    let mut titled: Vec<(String, bool, f32)> = Vec::new();
+    for (kind, id) in keys {
+        if *kind != MemberKind::Knowledge {
+            continue;
+        }
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT k.title,
+                    EXISTS (SELECT 1 FROM knowledge_events e
+                             WHERE e.knowledge_id = k.id AND e.note = 'quoted_owner_text')
+               FROM knowledge k WHERE k.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        if let Some((title, quoted)) = row {
+            let cosine = by_key
+                .get(&(*kind, *id))
+                .and_then(|v| crate::embed::cosine(v, &center))
+                .unwrap_or(0.0);
+            titled.push((title, quoted != 0, cosine));
+        }
+    }
+    let rows: Vec<NameRow> = titled
+        .iter()
+        .map(|(title, quoted, cosine)| NameRow {
+            title,
+            quoted: *quoted,
+            cosine: *cosine,
+        })
+        .collect();
+    let name = provisional_name(&rows);
+    let stamp = now.to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let theme_id: i64 = sqlx::query_scalar(
+        "INSERT INTO themes (name, state, model, dim, centroid, created_at)
+         VALUES (?, 'proposed', ?, ?, ?, ?) RETURNING id",
+    )
+    .bind(name)
+    .bind(model)
+    .bind(center.len() as i64)
+    .bind(crate::embed::encode(&center))
+    .bind(&stamp)
+    .fetch_one(&mut *tx)
+    .await?;
+    for (kind, id) in keys {
+        sqlx::query(
+            "INSERT INTO theme_members (theme_id, member_kind, member_id, origin, added_at)
+             VALUES (?, ?, ?, 'system', ?)",
+        )
+        .bind(theme_id)
+        .bind(kind.as_str())
+        .bind(id)
+        .bind(&stamp)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// One clustering pass: absorb close members into `accepted` themes, recompute centroids, then propose
+/// at most `MAX_NEW_THEMES_PER_RUN` new themes. Returns how many new themes it proposed.
+pub async fn cluster_pass(
+    pool: &SqlitePool,
+    model: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<usize> {
+    let found = candidates(pool, model).await?;
+    let blocking = blocking_sets(pool).await?;
+    let planned = plan_new_themes(&found, &blocking);
+    let by_key: std::collections::HashMap<MemberKey, &Vec<f32>> =
+        found.iter().map(|c| (c.key, &c.vector)).collect();
+    for keys in &planned {
+        insert_theme(pool, model, keys, &by_key, now).await?;
+    }
+    Ok(planned.len())
+}
+
+async fn meta(pool: &SqlitePool, key: &str) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+}
+
+async fn set_meta(pool: &SqlitePool, key: &str, value: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The weekly step the distiller's tick calls. Seals at the start of an attempt, retries a failure with
+/// the distiller's backoff up to `MAX_PASS_ATTEMPTS`, then waits the normal week. A failure logs the
+/// SQL error text and nothing else.
+pub async fn run_weekly(pool: &SqlitePool, model: &str, now: DateTime<Utc>) {
+    let sealed = match meta(pool, SEAL_KEY).await {
+        Ok(value) => value
+            .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
+            .map(|t| t.with_timezone(&Utc)),
+        Err(error) => {
+            tracing::warn!("themes: could not read its seal: {error}");
+            return;
+        }
+    };
+    let attempts: i64 = meta(pool, ATTEMPTS_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if !pass_due(now, sealed, attempts) {
+        return;
+    }
+    // A pass that starts after the attempts were spent begins a fresh round.
+    let next = if attempts >= MAX_PASS_ATTEMPTS { 1 } else { attempts + 1 };
+    if set_meta(pool, SEAL_KEY, &now.to_rfc3339()).await.is_err()
+        || set_meta(pool, ATTEMPTS_KEY, &next.to_string()).await.is_err()
+    {
+        tracing::warn!("themes: could not seal the pass");
+        return;
+    }
+    match cluster_pass(pool, model, now).await {
+        Ok(_) => {
+            let _ = set_meta(pool, ATTEMPTS_KEY, "0").await;
+        }
+        Err(error) => tracing::warn!("themes: clustering failed: {error}"),
+    }
 }
 
 #[cfg(test)]
@@ -321,5 +553,113 @@ mod tests {
         for banned in ["INSERT INTO knowledge", "feed::append", "outbox"] {
             assert!(!production.contains(banned), "themes.rs names `{banned}`");
         }
+    }
+
+    #[test]
+    fn the_pass_is_due_weekly_and_retries_with_backoff_until_spent() {
+        let now = chrono::Utc::now();
+        let wk = chrono::Duration::days(7);
+        assert!(pass_due(now, None, 0));
+        assert!(
+            !pass_due(now, Some(now - chrono::Duration::days(3)), 0),
+            "sealed for the week"
+        );
+        assert!(pass_due(now, Some(now - wk - chrono::Duration::minutes(1)), 0));
+        // One failed attempt just now: not yet; after the backoff: yes.
+        assert!(!pass_due(now, Some(now), 1));
+        assert!(pass_due(now, Some(now - chrono::Duration::hours(24)), 1));
+        // Attempts spent: wait the normal week.
+        assert!(!pass_due(
+            now,
+            Some(now - chrono::Duration::days(2)),
+            MAX_PASS_ATTEMPTS
+        ));
+    }
+
+    #[test]
+    fn the_centroid_is_the_mean() {
+        assert_eq!(
+            centroid(&[vec![1.0, 0.0], vec![3.0, 2.0]]),
+            vec![2.0_f32, 1.0]
+        );
+        assert!(centroid(&[]).is_empty());
+    }
+
+    use super::tests_support::knowledge_row;
+
+    #[tokio::test]
+    async fn the_pass_proposes_a_theme_from_distiller_and_owner_rows_but_not_the_consolidator() {
+        let pool = crate::testdb::fresh_pool().await;
+        for (i, (src, st)) in [
+            ("distiller", "active"),
+            ("owner", "proposed"),
+            ("distiller", "observed"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            knowledge_row(&pool, &format!("t{i}"), src, st, [1.0, 0.01 * i as f32, 0.0]).await;
+        }
+        knowledge_row(&pool, "counter", "consolidator", "active", [1.0, 0.0, 0.0]).await;
+        knowledge_row(&pool, "old", "distiller", "archived", [1.0, 0.0, 0.0]).await;
+        let made = cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
+        assert_eq!(made, 1);
+        let (state, name, members): (String, String, i64) = sqlx::query_as(
+            "SELECT t.state, t.name, (SELECT COUNT(*) FROM theme_members m WHERE m.theme_id = t.id)
+               FROM themes t",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((state.as_str(), members), ("proposed", 3));
+        assert!(name.starts_with('t'), "named after a member title, got {name}");
+        // A second run on the same data proposes nothing (the blocking sets cover the group).
+        assert_eq!(
+            cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_theme_does_not_come_back() {
+        let pool = crate::testdb::fresh_pool().await;
+        for i in 0..3 {
+            knowledge_row(&pool, "x", "distiller", "active", [1.0, 0.01 * i as f32, 0.0]).await;
+        }
+        cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
+        sqlx::query("UPDATE themes SET state = 'refused'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap(),
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// A knowledge row of `source` and `status` with a stored vector for model `m`.
+    pub(crate) async fn knowledge_row(
+        pool: &sqlx::SqlitePool,
+        title: &str,
+        source: &str,
+        status: &str,
+        v: [f32; 3],
+    ) -> i64 {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'machine', NULL, ?, 'memory', ?, 'b', ?, 't') RETURNING id",
+        )
+        .bind(source)
+        .bind(title)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        crate::embed::store_in(&mut conn, id, "m", &v).await.unwrap();
+        id
     }
 }
