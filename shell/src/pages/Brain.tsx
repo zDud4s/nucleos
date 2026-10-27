@@ -5,6 +5,7 @@ import { X } from "lucide-react";
 import { BrainPanel } from "../brain/BrainPanel";
 import { CapturePanel } from "../brain/CapturePanel";
 import { CapturesWaiting } from "../brain/CapturesWaiting";
+import { AboutYou } from "../brain/knowledge/AboutYou";
 import { KnowledgePanel } from "../brain/knowledge/KnowledgePanel";
 import { ToolRequests } from "../brain/knowledge/ToolRequests";
 import { WaitingPanel } from "../brain/knowledge/WaitingPanel";
@@ -470,6 +471,7 @@ export function BrainListView({
             <CapturesWaiting onSelect={onItem} selected={selected} />
             <WaitingPanel rows={proposed} />
             <ToolRequests />
+            <AboutYou />
           </>
         ) : queueFailed ? (
           <ErrorNote
@@ -482,9 +484,12 @@ export function BrainListView({
             Part of what is asked of you could not be read, so an empty queue is not certain.
           </ErrorNote>
         ) : (
-          <Quiet compact says="Nothing open.">
-            Pick a row to read it whole, see what it links to, or teach it to the agent.
-          </Quiet>
+          <>
+            <Quiet compact says="Nothing open.">
+              Pick a row to read it whole, see what it links to, or teach it to the agent.
+            </Quiet>
+            <AboutYou />
+          </>
         )}
       </aside>
     </div>

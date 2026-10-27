@@ -16,6 +16,7 @@ export function known(over: Partial<Known> = {}): Known {
     scope_kind: "project",
     scope_id: "nucleos",
     source: "run",
+    about: null,
     generator: null,
     kind: "memory",
     title: "The suite needs Git's usr/bin on PATH",

@@ -27,6 +27,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 
+mod cover;
 mod decide;
 mod history;
 mod propose;
@@ -34,6 +35,7 @@ mod select;
 mod signature;
 mod store;
 
+pub use self::cover::*;
 pub use self::decide::*;
 pub use self::history::*;
 pub use self::propose::*;

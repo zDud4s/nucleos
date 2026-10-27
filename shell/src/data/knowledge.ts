@@ -88,6 +88,7 @@ export const EVIDENCE_TAGS = [
   "job_item",
   "proposal",
   "knowledge",
+  "chat",
   "project",
   "command",
   "gate",
@@ -109,6 +110,8 @@ export interface Known {
   scope_id: string | null;
   /** Who knocked at the door — never read from the body. */
   source: "owner" | "run" | "consolidator" | "distiller";
+  /** Who the lesson is about: `owner` is the person, `null` the code, the work, the project. */
+  about?: "owner" | null;
   generator: string | null;
   kind: KnownKind;
   title: string;
@@ -166,12 +169,17 @@ export const DISTILL_CAUSE_LABELS: Record<string, string> = {
   gate_recovered: "a red gate recovered",
   review_blocking: "a review blocked it",
   run_exhausted: "a run ran out of attempts",
+  generalised: "seen across several places",
 };
 
 /** Where a distilled row came from: its job, the runs behind it, and why it was written. */
 export interface DistilledOrigin {
   job: number | string | null;
   runs: (number | string)[];
+  /** The conversation behind a chat lesson (first `chat` reference), `null` when none. */
+  chat: number | string | null;
+  /** How many `knowledge` rows a general lesson rests on. */
+  members: number;
   /** The raw cause as the daemon answered it, `null` when none is on record. */
   cause: string | null;
   /** The cause in words; the raw cause itself when this shell does not know it. */
@@ -196,9 +204,22 @@ export function distilledOrigin(
   return {
     job: refs.find((ref) => ref.t === "job")?.id ?? null,
     runs: refs.filter((ref) => ref.t === "run").map((ref) => ref.id),
+    chat: refs.find((ref) => ref.t === "chat")?.id ?? null,
+    members: refs.filter((ref) => ref.t === "knowledge").length,
     cause,
     causeLabel: cause === null ? null : (DISTILL_CAUSE_LABELS[cause] ?? cause),
   };
+}
+
+/** What the agent holds about the owner or the whole machine, in force: the "About you" section. */
+export function aboutYou(rows: Known[]): Known[] {
+  return rows
+    .filter(
+      (row) =>
+        row.status === "active" &&
+        (row.about === "owner" || (row.scope_kind === "machine" && row.source === "distiller")),
+    )
+    .sort((a, b) => a.id - b.id);
 }
 
 export interface MeasuredScope {

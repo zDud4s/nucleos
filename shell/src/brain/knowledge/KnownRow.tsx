@@ -60,11 +60,15 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
       <p className="learned-title">{row.title}</p>
       {origin !== null && (
         <p className="learned-origin">
-          distilled from{" "}
-          {origin.job === null ? (
-            "a job"
+          {origin.cause === "generalised" ? (
+            <>distilled from {origin.members} similar rows</>
+          ) : origin.chat !== null ? (
+            <>distilled from a conversation</>
           ) : (
-            <Link to="/fleet">job #{origin.job}</Link>
+            <>
+              distilled from{" "}
+              {origin.job === null ? "a job" : <Link to="/fleet">job #{origin.job}</Link>}
+            </>
           )}
           {origin.causeLabel !== null && <> · {origin.causeLabel}</>}
         </p>

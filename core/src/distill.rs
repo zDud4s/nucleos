@@ -9,6 +9,7 @@ pub mod model;
 pub mod origin;
 
 mod extract;
+mod generalise;
 pub use extract::*;
 
 use sqlx::SqliteConnection;
@@ -397,7 +398,7 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
 }
 
 /// Ask the configured brain once.
-async fn ask(
+pub(crate) async fn ask(
     asked: Extractor<'_>,
     prompt: String,
     standing: &str,
@@ -788,6 +789,9 @@ pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn
         && let Err(error) = crate::embed::backfill(pool, embedder, BACKFILL_PER_TICK).await
     {
         tracing::warn!("distillation: embedding backfill failed: {error}");
+    }
+    if drained {
+        generalise::run_if_due(pool, asked, embedder, Utc::now()).await;
     }
 }
 
@@ -2537,6 +2541,33 @@ mod tests {
             )),
             "the embedded text is title and body: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_idle_tick_runs_the_generalisation_pass_only_with_an_embedder() {
+        let (with, without) = (test_pool().await, test_pool().await);
+        let embedder = FakeEmbedder::new("fake-model", Vec::new(), Some(vec![1.0, 0.0]));
+        let runner = fake_answering("[]");
+        tick(
+            &with,
+            Extractor::Cli(&runner),
+            Some(&embedder as &dyn Embedder),
+        )
+        .await;
+        tick(&without, Extractor::Cli(&runner), None).await;
+        let sealed = |pool: SqlitePool| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT value FROM schema_meta WHERE key = 'distiller.generalised_at'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+        };
+        assert!(
+            sealed(with).await.is_some(),
+            "an empty queue leaves time for the pass"
+        );
+        assert!(sealed(without).await.is_none());
     }
 
     #[tokio::test]
