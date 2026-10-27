@@ -9,7 +9,7 @@ pub mod model;
 pub mod origin;
 mod week;
 pub mod sources;
-pub(crate) mod chats;
+pub mod chats;
 
 mod extract;
 mod generalise;
@@ -2485,7 +2485,7 @@ mod tests {
 
     // ---- phase B: cosine dedup, stored vectors, backfill ----
 
-    use super::{Dedup, SIM_NEAR, SIM_SAME, dedup_verdict, process_one_with, tick};
+    use super::{Dedup, SIM_NEAR, SIM_SAME, dedup_verdict, tick};
     use crate::embed::{Embedder, FakeEmbedder};
 
     async fn embedding_count(pool: &SqlitePool) -> i64 {
@@ -2933,7 +2933,8 @@ mod tests {
         chat_row(&pool, "alpha", &chat, last).await;
         distil(&pool, SEMANTIC_THREE, None).await;
 
-        let cands: Vec<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        type CandRow = (String, String, Option<String>, Option<String>, String);
+        let cands: Vec<CandRow> = sqlx::query_as(
             "SELECT scope_kind, status, scope_id, about, evidence FROM knowledge
               WHERE distill_cause = 'chat_exchanges' AND scope_kind = 'project'",
         )

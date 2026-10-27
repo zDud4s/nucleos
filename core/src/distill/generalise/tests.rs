@@ -38,7 +38,7 @@ pub(super) async fn seed(
     .await
     .unwrap()
     .last_insert_rowid();
-    crate::embed::store_in(&mut *pool.acquire().await.unwrap(), id, MODEL, vector)
+    crate::embed::store_in(&mut pool.acquire().await.unwrap(), id, MODEL, vector)
         .await
         .unwrap();
     id
@@ -221,7 +221,8 @@ async fn three_near_identical_candidates_in_three_projects_make_one_machine_prop
         Outcome::Done
     );
 
-    let rows: Vec<(String, Option<String>, String, Option<String>, Option<String>)> = sqlx::query_as(
+    type Row = (String, Option<String>, String, Option<String>, Option<String>);
+    let rows: Vec<Row> = sqlx::query_as(
         "SELECT scope_kind, scope_id, status, evidence, about FROM knowledge WHERE distill_cause = 'generalised'",
     )
     .fetch_all(&pool)

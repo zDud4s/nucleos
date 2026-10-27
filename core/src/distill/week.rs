@@ -354,7 +354,6 @@ pub(super) async fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn occ(
         title: &str,
@@ -701,7 +700,8 @@ mod tests {
         );
         super::super::process_one_with(&pool, Extractor::Cli(&runner), None, row, noon()).await;
         assert_eq!(queue_state(&pool, id).await, ("done".to_owned(), None));
-        let rows: Vec<(String, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        type Row = (String, String, String, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
             "SELECT scope_kind, scope_id, status, about, distill_cause FROM knowledge",
         )
         .fetch_all(&pool)
