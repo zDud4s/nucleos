@@ -62,7 +62,8 @@ mod tests {
     fn the_threshold_is_inclusive_and_groups_are_ordered_by_smallest_id() {
         let items: Vec<(i64, &[f32])> = vec![(9, &Y), (2, &X), (5, &NEAR), (4, &Y)];
         assert_eq!(cluster(&items, p(0.6, 2, 10)), vec![vec![2, 5], vec![4, 9]]);
-        assert_eq!(cluster(&items, p(0.61, 2, 10)), vec![vec![4, 9]]);
+        // NEAR is 0.8 against Y, so once X cannot take it (0.61 > 0.6) seed 4 does.
+        assert_eq!(cluster(&items, p(0.61, 2, 10)), vec![vec![4, 5, 9]]);
     }
     #[test]
     fn the_result_does_not_depend_on_the_input_order() {

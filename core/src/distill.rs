@@ -3075,8 +3075,13 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(
-            evidence.starts_with(&format!(r#"[{{"t":"chat","id":{key}}}"#)),
+        // Compared as JSON: the object's key order is the serializer's, not part of the contract.
+        let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        let wanted: serde_json::Value =
+            serde_json::from_str(&format!(r#"{{"t":"chat","id":{key}}}"#)).unwrap();
+        assert_eq!(
+            parsed.get(0),
+            Some(&wanted),
             "the evidence names the chat by its key, not its uuid: {evidence}"
         );
         assert_eq!(queue_state_of_chat(&pool).await, ("done".into(), None));

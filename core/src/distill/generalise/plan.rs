@@ -194,7 +194,8 @@ impl Candidate {
         let Some(m) = &self.memory else {
             return Novelty::Fresh;
         };
-        if m.h == self.hash || self.subjects.iter().all(|s| m.s.contains(s)) {
+        // The same members are not enough: a new near note is a new subject (notes are not in the hash).
+        if self.subjects.iter().all(|s| m.s.contains(s)) {
             Novelty::Known
         } else {
             Novelty::NewSubjects

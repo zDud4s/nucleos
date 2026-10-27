@@ -7,8 +7,6 @@
 //! table.
 
 mod plan;
-#[cfg(test)]
-mod tests;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -645,3 +643,6 @@ pub(crate) async fn run_if_due(
         tracing::warn!("generalisation: could not settle its seal: {error}");
     }
 }
+
+#[cfg(test)]
+mod tests;

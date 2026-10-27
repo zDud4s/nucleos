@@ -1,5 +1,5 @@
 //! Themes above the entities (spec 2026-10-22 section 6). Proposes, never decides; the synthesis (B6,
-//! Phase 6) is owner-only text and never enters a prompt, the feed, the outbox or a log.
+//! Phase 6) is owner-only text and never enters a prompt, the feed, the send queue or a log.
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
@@ -595,7 +595,7 @@ fn basis_of(knowledge: &[(i64, String, String)], members: &[(String, i64)]) -> V
 }
 
 /// Synthesise an `accepted` theme and store the text with its basis. Owner-only: the text goes to the
-/// theme row and nowhere else (never knowledge, the feed, the outbox, a channel or a log). A failure
+/// theme row and nowhere else (never knowledge, the feed, the send queue, a channel or a log). A failure
 /// logs the error kind only and keeps the previous text.
 pub async fn synthesise(
     pool: &SqlitePool,
@@ -1449,11 +1449,11 @@ mod tests {
         let input = synthesis_prompt(
             &[KnowledgeText {
                 title: "Sleep rule",
-                body: "token sk-ABCDEF1234567890XYZ here",
+                body: "token sk-ABCDEF1234567890XYZabcd here",
             }],
             &[(4, "my note body".to_owned())],
         );
-        assert!(!input.contains("sk-ABCDEF1234567890XYZ"), "scrubbed");
+        assert!(!input.contains("sk-ABCDEF1234567890XYZabcd"), "scrubbed");
         assert!(input.contains("owner context, do not quote"));
         assert!(input.contains("my note body"));
         assert!(input.contains("Sleep rule"));

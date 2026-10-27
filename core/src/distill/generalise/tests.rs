@@ -335,6 +335,10 @@ async fn a_lesson_the_owner_refused_or_reverted_does_not_come_back_and_a_live_on
                 .execute(&pool)
                 .await
                 .unwrap();
+            // Changing the title drops the vector (trigger `knowledge_embedding_stale`): store it again.
+            crate::embed::store_in(&mut pool.acquire().await.unwrap(), old, MODEL, &[1.0, 0.0])
+                .await
+                .unwrap();
         } else {
             sqlx::query("DELETE FROM knowledge_embeddings WHERE knowledge_id = ?")
                 .bind(old)
@@ -720,9 +724,9 @@ fn evidence_carries_note_ids_without_text_and_stays_within_20_entries() {
 #[test]
 fn the_note_text_is_scrubbed_and_sits_under_do_not_quote() {
     let group = group_of(&[Subject::Job(1)]);
-    let with = dossier(&group, &["call me at sk-ABCDEF1234567890XYZ".to_owned()]);
+    let with = dossier(&group, &["call me at sk-ABCDEF1234567890XYZabcd".to_owned()]);
     assert!(with.contains("do not quote"));
-    assert!(!with.contains("sk-ABCDEF1234567890XYZ"));
+    assert!(!with.contains("sk-ABCDEF1234567890XYZabcd"));
     assert!(!dossier(&group, &[]).contains("OWNER CONTEXT"));
 }
 
