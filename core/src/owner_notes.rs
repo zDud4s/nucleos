@@ -769,6 +769,7 @@ pub async fn resolve_sql_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_scan::production_code;
 
     async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await
@@ -1242,37 +1243,65 @@ mod tests {
         one_call_is_sanctioned(source, &format!("{needle}s::create("))
     }
 
-    /// `source` up to its test module. Cut at the test module itself, not at any `#[cfg(test)]`:
-    /// a test-only helper above it would otherwise hide the production code that follows from
-    /// the sweep.
-    fn production_code(source: &str) -> String {
-        let lines: Vec<&str> = source.lines().collect();
-        let end = lines
-            .windows(2)
-            .position(|w| {
-                w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
-            })
-            .unwrap_or(lines.len());
-        lines[..end].join("\n")
-    }
-
-    /// True when the production code of `source` names the notes module only inside `call`, and
-    /// exactly once.
-    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
+    /// True when the production code of `source` names the notes module only inside the listed
+    /// `calls`, and each of them exactly once.
+    fn calls_are_sanctioned(source: &str, calls: &[&str]) -> bool {
         let needle = ["owner", "note"].join("_");
-        let mut calls = 0;
-        let production = production_code(source);
-        for line in production.lines() {
+        let mut seen = vec![0usize; calls.len()];
+        for line in production_code(source).lines() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            let here = line.matches(call).count();
+            let mut here = 0;
+            for (i, call) in calls.iter().enumerate() {
+                let n = line.matches(call).count();
+                seen[i] += n;
+                here += n;
+            }
             if line.matches(needle.as_str()).count() != here {
                 return false;
             }
-            calls += here;
         }
-        calls == 1
+        seen.iter().all(|n| *n == 1)
+    }
+
+    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
+        calls_are_sanctioned(source, &[call])
+    }
+
+    #[test]
+    fn calls_are_sanctioned_takes_a_list_and_counts_each_call_once() {
+        let needle = ["owner", "note"].join("_");
+        let a = format!("let v = {needle}s::vectors_for_clustering(&pool, m).await;");
+        let b = format!("let t = {needle}s::texts_for_ids(&pool, &ids).await;");
+        let calls = [
+            format!("{needle}s::vectors_for_clustering"),
+            format!("{needle}s::texts_for_ids"),
+        ];
+        let calls: Vec<&str> = calls.iter().map(String::as_str).collect();
+        assert!(calls_are_sanctioned(&format!("{a}
+{b}"), &calls));
+        assert!(
+            !calls_are_sanctioned(&a, &calls),
+            "every listed call must occur once"
+        );
+        assert!(!calls_are_sanctioned(&format!("{a}
+{a}
+{b}"), &calls));
+        assert!(!calls_are_sanctioned(
+            &format!("{a}
+{b}
+use crate::{needle}s;"),
+            &calls
+        ));
+        assert!(calls_are_sanctioned(
+            &format!("{a}
+{b}
+// mentions {needle}s"),
+            &calls
+        ));
+        // The one-call helper keeps its meaning.
+        assert!(one_call_is_sanctioned(&a, calls[0]));
     }
 
     #[test]

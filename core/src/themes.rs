@@ -79,4 +79,38 @@ mod tests {
         assert_eq!(MemberKind::Knowledge.as_str(), "knowledge");
         assert_eq!(ORIGINS, ["system", "owner"]);
     }
+
+    /// Only `themes.rs`, its routes and the project-forget statement name the theme tables (spec 10).
+    #[test]
+    fn only_themes_its_routes_and_project_exit_name_the_theme_tables() {
+        let mut scanned = 0;
+        for path in crate::source_scan::rust_files() {
+            scanned += 1;
+            let module = crate::source_scan::module_path(&path);
+            if matches!(
+                module.as_str(),
+                "themes.rs" | "http/themes.rs" | "project_exit.rs"
+            ) {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let production = crate::source_scan::production_code(&source);
+            for table in ["theme_members", "FROM themes", "INTO themes", "UPDATE themes"] {
+                assert!(!production.contains(table), "{module} names `{table}`");
+            }
+        }
+        assert!(scanned > 20);
+    }
+
+    #[test]
+    fn themes_rs_cannot_write_knowledge_the_feed_or_the_outbox() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/themes.rs"),
+        )
+        .unwrap();
+        let production = crate::source_scan::production_code(&source);
+        for banned in ["INSERT INTO knowledge", "feed::append", "outbox"] {
+            assert!(!production.contains(banned), "themes.rs names `{banned}`");
+        }
+    }
 }
