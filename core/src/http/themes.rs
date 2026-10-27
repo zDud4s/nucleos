@@ -10,6 +10,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/themes", get(list_themes))
         .route("/themes/{id}", get(get_theme))
         .route("/themes/{id}/accept", post(accept_theme))
+        .route("/themes/{id}/synthesise", post(synthesise_theme))
         .route("/themes/{id}/refuse", post(refuse_theme))
         .route("/themes/{id}/rename", post(rename_theme))
         .route("/themes/{id}/merge", post(merge_theme))
@@ -158,7 +159,7 @@ pub(super) async fn get_theme(
         "name": name,
         "state": theme_state,
         "merged_into": merged_into,
-        "synthesis": synthesis,
+        "synthesis": if theme_state == "accepted" { synthesis } else { None },
         "created_at": created_at,
         "decided_at": decided_at,
         "members": members,
@@ -171,7 +172,72 @@ pub(super) async fn accept_theme(
     body: Option<Json<AcceptBody>>,
 ) -> StatusCode {
     let name = body.and_then(|Json(body)| body.name);
-    done(themes::accept(&state.pool, id, name.as_deref()).await)
+    let status = done(themes::accept(&state.pool, id, name.as_deref()).await);
+    if status == StatusCode::OK {
+        spawn_first_synthesis(state, id);
+    }
+    status
+}
+
+/// The acceptance schedules the first synthesis, but only if the distiller's model can be served now;
+/// a refused route leaves it to the weekly run. The text never leaves the theme row.
+fn spawn_first_synthesis(state: AppState, id: i64) {
+    tokio::spawn(async move {
+        let Ok(route) = crate::distill::model::route_for(&state).await else {
+            return;
+        };
+        let asked = route.extractor(state.runner.as_ref(), &state.web.http);
+        let _ = themes::synthesise(&state.pool, asked, id, chrono::Utc::now()).await;
+    });
+}
+
+/// Force a synthesis now: only an `accepted` theme (409), at most once an hour (429), and only when
+/// the distiller's model can be served (503, fixed text).
+pub(super) async fn synthesise_theme(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    let row: Option<(String, Option<String>)> =
+        match sqlx::query_as("SELECT state, synthesis_at FROM themes WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    let Some((theme_state, synthesis_at)) = row else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if theme_state != "accepted" {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let now = chrono::Utc::now();
+    let at = synthesis_at
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    if !themes::force_allowed(at, now) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let Ok(route) = crate::distill::model::route_for(&state).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "the distiller model cannot be served" })),
+        )
+            .into_response();
+    };
+    let asked = route.extractor(state.runner.as_ref(), &state.web.http);
+    if themes::synthesise(&state.pool, asked, id, now).await.is_err() {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    match sqlx::query_scalar::<_, Option<String>>("SELECT synthesis FROM themes WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await
+    {
+        Ok(synthesis) => Json(serde_json::json!({ "synthesis": synthesis })).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 pub(super) async fn refuse_theme(State(state): State<AppState>, Path(id): Path<i64>) -> StatusCode {
@@ -295,5 +361,77 @@ mod tests {
         assert_eq!(s, StatusCode::CONFLICT, "accepted -> accepted is not in the table");
         let (s, _) = call(state, "POST", "/themes/999/refuse", Some("{}")).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    fn canned_runner(stdout: &str) -> std::sync::Arc<crate::execution::runner::FakeCommandRunner> {
+        std::sync::Arc::new(crate::execution::runner::FakeCommandRunner {
+            canned: std::sync::Mutex::new(Some(crate::execution::runner::RunOutcome {
+                exit_code: 0,
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+                session_id: None,
+                cost_usd: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                num_turns: None,
+                compacted: false,
+                model_requested: false,
+            })),
+            ..Default::default()
+        })
+    }
+
+    async fn theme_in(state: &AppState, theme_state: &str, synthesis_at: Option<&str>) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO themes (name, state, model, dim, synthesis, synthesis_at, created_at)
+             VALUES ('T', ?, 'm', 3, 'old', ?, 't') RETURNING id",
+        )
+        .bind(theme_state)
+        .bind(synthesis_at)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forcing_a_synthesis_is_for_accepted_themes_and_once_an_hour() {
+        let mut state = super::super::tests::test_state().await;
+        state.runner = canned_runner("A fresh synthesis.");
+        let proposed = theme_in(&state, "proposed", None).await;
+        let (s, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/themes/{proposed}/synthesise"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        let recent = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let busy = theme_in(&state, "accepted", Some(&recent)).await;
+        let (s, _) = call(
+            state.clone(),
+            "POST",
+            &format!("/themes/{busy}/synthesise"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let due = theme_in(&state, "accepted", Some(&old)).await;
+        let (s, body) = call(
+            state.clone(),
+            "POST",
+            &format!("/themes/{due}/synthesise"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body["synthesis"], "A fresh synthesis.");
+        let (_, detail) = call(state.clone(), "GET", &format!("/themes/{proposed}"), None).await;
+        assert!(detail["synthesis"].is_null(), "only an accepted theme shows it");
+        let (_, list) = call(state, "GET", "/themes", None).await;
+        assert!(list.as_array().unwrap().iter().all(|t| t.get("synthesis").is_none()));
     }
 }
