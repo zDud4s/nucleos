@@ -1,4 +1,4 @@
-//! Sending a message and following its turn (`/assistant/message`, `/assistant/turns/*`, `/assistant/{turn_id}/live*`, relay and forward).
+//! Sending a message and following its turn (`/assistant/message`, `/assistant/turns/*`, `/assistant/{turn_id}/live*`, relay, forward, browser agents and chat links).
 
 use super::*;
 
@@ -43,6 +43,18 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/assistant/chats/{chat_id}/turns/{turn_id}/chain",
             get(get_relay_chain),
+        )
+        // A model asks for a NEW browser-agent conversation; the sender is read off
+        // `RUN_ID_HEADER` exactly as `/relay` does, and the task travels as a relay.
+        .route(
+            "/assistant/browser-agents",
+            get(get_browser_agents).post(post_browser_agent),
+        )
+        // Which conversation a chat answers to (a browser agent's mother), and the newest delivery
+        // recorded on that link.
+        .route(
+            "/assistant/chats/{chat_id}/link",
+            get(get_chat_link).post(post_chat_link),
         )
         // A turn in flight, as words. The literal is a segment deeper than `{turn_id}` above, so
         // the two cannot shadow each other whatever a turn id looks like.
@@ -1050,6 +1062,331 @@ pub(super) async fn get_assistant_live_stream(
         .into_response())
 }
 
+/// The body `POST /assistant/browser-agents` takes: what the agent is to do, and optionally the
+/// page to start on. The mother is never in the body; it is read off `RUN_ID_HEADER`, like `/relay`.
+#[derive(Deserialize)]
+pub(super) struct BrowserAgentRequest {
+    pub(super) task: String,
+    #[serde(default)]
+    pub(super) url: Option<String>,
+}
+
+/// How a browser-agent creation can end short of a delivered task.
+enum BrowserAgentFailure {
+    /// The relay path's own failures, answered exactly as `/relay` answers them.
+    Relay(RelayAttempt),
+    /// Creating the child or its link failed outright.
+    Internal,
+}
+
+/// `POST /assistant/browser-agents`. A model asks for a NEW browser-agent conversation.
+///
+/// The task travels as a relay from the asking turn to the new child, so every brake `/relay`
+/// has (remote origin, owner away, chain budget) applies unchanged; the child is created and linked
+/// first because `admit` wants a destination that exists, and is archived again when the gate or
+/// the send says no, so a refusal leaves no live conversation behind.
+pub(super) async fn post_browser_agent(
+    State(state): State<AppState>,
+    scope: Option<axum::Extension<crate::auth::Scope>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<BrowserAgentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(sending_run_id) = sending_run_id_of(&headers) else {
+        return Err(refusal(StatusCode::BAD_REQUEST, "missing_run_id"));
+    };
+    // A chat turn's key (the `require_token` door) speaks for its own turn only: the header may
+    // not name another conversation's turn and so borrow that turn's chat, cwd and origin. The
+    // control token names whatever turn it acts for, as on `/relay`.
+    if let Some(axum::Extension(crate::auth::Scope::Run(own_run))) = &scope
+        && *own_run != sending_run_id
+    {
+        return Err(refusal(StatusCode::FORBIDDEN, "run_mismatch"));
+    }
+    // The chat key lives in a rooted turn's environment (`NUCLEOS_DAEMON_TOKEN`), so a turn that
+    // read untrusted text could reach this route with curl and skip the classification the MCP
+    // `browser_agent` tool goes through. On that door a tainted sender is refused outright; a
+    // failed read refuses too, since it is no evidence the turn is clean.
+    if let Some(axum::Extension(crate::auth::Scope::Run(own_run))) = &scope {
+        match crate::execution::runs::read_untrusted_context(&state.pool, *own_run).await {
+            Ok(false) => {}
+            Ok(true) => return Err(refusal(StatusCode::FORBIDDEN, "untrusted_context")),
+            Err(error) => {
+                tracing::warn!(%error, run_id = *own_run, "could not read a sender's taint");
+                return Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
+            }
+        }
+    }
+    let task = body.task.trim().to_string();
+    if task.is_empty() {
+        return Err(refusal(StatusCode::BAD_REQUEST, "empty_task"));
+    }
+    let start_page = match body.url.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match reqwest::Url::parse(raw) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Some(raw.to_string()),
+            _ => return Err(refusal(StatusCode::BAD_REQUEST, "bad_url")),
+        },
+    };
+    let message = match &start_page {
+        Some(page) => format!("{task}\n\nStart page: {page}"),
+        None => task.clone(),
+    };
+
+    // Uncancellable for the reason `relay_send_to_chat` is: the child is created in several steps
+    // and the send writes a `running` row before spawning its task.
+    let outcome = uncancellable(async move {
+        let Some((mother, sending_origin)) = sending_turn_of(&state.pool, sending_run_id).await
+        else {
+            return Err(BrowserAgentFailure::Relay(RelayAttempt::UnknownSender));
+        };
+        let Some(sending_origin) = sending_origin else {
+            return Err(BrowserAgentFailure::Relay(RelayAttempt::UnknownOrigin));
+        };
+
+        let child = crate::chats::create_on(
+            &state.pool,
+            crate::chats::Brain::Cloud,
+            None,
+            crate::chats::PermissionMode::Auto,
+        )
+        .await
+        .map_err(|_| BrowserAgentFailure::Internal)?;
+        let first_chars: String = task.chars().take(40).collect();
+        let prepared: sqlx::Result<()> = async {
+            crate::chats::rename(
+                &state.pool,
+                &child,
+                Some(&format!("Browser · {first_chars}")),
+            )
+            .await?;
+            if let Some(cwd) = crate::chats::cwd_of(&state.pool, &mother).await? {
+                crate::chats::set_cwd(&state.pool, &child, &cwd).await?;
+            }
+            Ok(())
+        }
+        .await;
+        let opened = match prepared {
+            Ok(()) => crate::chats::links::open(
+                &state.pool,
+                &child,
+                Some(&mother),
+                "browser",
+                Some(sending_run_id),
+            )
+            .await
+            .is_ok(),
+            Err(_) => false,
+        };
+        if !opened {
+            let _ = crate::chats::archive(&state.pool, &child).await;
+            return Err(BrowserAgentFailure::Internal);
+        }
+
+        let attempt = match crate::relay::admit(
+            &state.pool,
+            &mother,
+            &child,
+            sending_run_id,
+            sending_origin,
+            &message,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            // `Origin::Shell` on the delivery for the reason `/relay` gives.
+            Ok(relay_id) => crate::assistant::send_relayed_or_queue(
+                &state,
+                &child,
+                &message,
+                crate::assistant::Origin::Shell,
+                relay_id,
+            )
+            .await
+            .map_err(RelayAttempt::NotSent),
+            Err(cause) => Err(RelayAttempt::Refused(cause)),
+        };
+        match attempt {
+            Ok(sent) => Ok((child, sent)),
+            Err(failure) => {
+                // Archiving closes the link too; `unlink` is the explicit half in case the
+                // archive found the chat already archived.
+                let _ = crate::chats::archive(&state.pool, &child).await;
+                let _ = crate::chats::links::unlink(&state.pool, &child).await;
+                Err(BrowserAgentFailure::Relay(failure))
+            }
+        }
+    })
+    .await
+    .map_err(|status| refusal(status, "internal"))?;
+
+    match outcome {
+        Ok((child, crate::assistant::Sent::Turn(turn_id))) => Ok(Json(
+            serde_json::json!({ "chat_id": child, "turn_id": turn_id }),
+        )),
+        Ok((child, crate::assistant::Sent::Queued)) => Ok(Json(
+            serde_json::json!({ "chat_id": child, "queued": true }),
+        )),
+        Err(BrowserAgentFailure::Relay(attempt)) => {
+            relay_outcome_response(Err(attempt)).map(|_| Json(serde_json::Value::Null))
+        }
+        Err(BrowserAgentFailure::Internal) => {
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+/// The body `POST /assistant/chats/{chat_id}/link` takes. `parent_chat_id: null` is a link to
+/// nobody: only the panel talks to that child.
+#[derive(Deserialize)]
+pub(super) struct ChatLinkRequest {
+    pub(super) parent_chat_id: Option<String>,
+    #[serde(default)]
+    pub(super) kind: Option<String>,
+}
+
+/// `POST /assistant/chats/{chat_id}/link`. Closes the child's active link and opens a new one.
+pub(super) async fn post_chat_link(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<ChatLinkRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::chats::links::LinkError;
+    let kind = body.kind.as_deref().unwrap_or("browser");
+    match crate::chats::links::open(
+        &state.pool,
+        &chat_id,
+        body.parent_chat_id.as_deref(),
+        kind,
+        None,
+    )
+    .await
+    {
+        Ok(link) => Ok(Json(serde_json::json!({ "link": link }))),
+        Err(LinkError::ChildNotFound) => Err(refusal(StatusCode::NOT_FOUND, "chat_not_found")),
+        Err(LinkError::ToSelf) => Err(refusal(StatusCode::CONFLICT, "link_to_self")),
+        Err(LinkError::ParentNotFound) => Err(refusal(StatusCode::CONFLICT, "parent_not_found")),
+        Err(LinkError::Cycle { at }) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "refusal": "link_cycle", "at": at })),
+        )),
+        Err(LinkError::Db(error)) => {
+            tracing::warn!(%error, "a chat link could not be written");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+/// `GET /assistant/chats/{chat_id}/link`: the active link and the newest delivery recorded on it.
+pub(super) async fn get_chat_link(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let internal = |error: sqlx::Error| {
+        tracing::warn!(%error, "a chat link could not be read");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    };
+    let link = crate::chats::links::active(&state.pool, &chat_id)
+        .await
+        .map_err(internal)?;
+    let last_delivery = match &link {
+        Some(link) => {
+            let row: Option<(Option<i64>, String, Option<String>, String)> = sqlx::query_as(
+                "SELECT run_id, outcome, reason, created_at FROM chat_link_deliveries
+                  WHERE link_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(link.id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(internal)?;
+            row.map(|(run_id, outcome, reason, created_at)| {
+                serde_json::json!({
+                    "run_id": run_id,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "created_at": created_at,
+                })
+            })
+        }
+        None => None,
+    };
+    Ok(Json(
+        serde_json::json!({ "link": link, "last_delivery": last_delivery }),
+    ))
+}
+
+#[derive(Deserialize)]
+pub(super) struct BrowserAgentsQuery {
+    #[serde(default)]
+    pub(super) limit: Option<i64>,
+    #[serde(default)]
+    pub(super) project_id: Option<String>,
+    #[serde(default)]
+    pub(super) no_project: Option<String>,
+}
+
+/// `GET /assistant/browser-agents`: children with an active link, newest link first. A child's
+/// project is the project of its newest run, and none when it has no run yet.
+pub(super) async fn get_browser_agents(
+    State(state): State<AppState>,
+    Query(query): Query<BrowserAgentsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let no_project = query
+        .no_project
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "" | "0" | "false"));
+    type Row = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT chat_id, title, parent_chat_id, parent_title, project_id, created_at FROM (
+             SELECT l.child_chat_id AS chat_id, c.title AS title,
+                    l.parent_chat_id AS parent_chat_id, p.title AS parent_title,
+                    (SELECT r.project_id FROM runs r WHERE r.chat_id = l.child_chat_id
+                      ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS project_id,
+                    l.created_at AS created_at, l.id AS link_id
+               FROM chat_links l
+               JOIN chats c ON c.chat_id = l.child_chat_id
+               LEFT JOIN chats p ON p.chat_id = l.parent_chat_id
+              WHERE l.unlinked_at IS NULL
+         )
+          WHERE (? = 0 OR project_id IS NULL) AND (? IS NULL OR project_id = ?)
+          ORDER BY created_at DESC, link_id DESC
+          LIMIT ?",
+    )
+    .bind(no_project as i64)
+    .bind(query.project_id.clone())
+    .bind(query.project_id)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "the browser agents could not be listed");
+        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+    })?;
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(
+            |(chat_id, title, parent_chat_id, parent_title, project_id, created_at)| {
+                serde_json::json!({
+                    "chat_id": chat_id,
+                    "title": title,
+                    "parent_chat_id": parent_chat_id,
+                    "parent_title": parent_title,
+                    "project_id": project_id,
+                    "created_at": created_at,
+                })
+            },
+        )
+        .collect();
+    Ok(Json(serde_json::Value::Array(items)))
+}
+
 #[cfg(test)]
 mod tests {
     //! Browser agents and chat links (`/assistant/browser-agents`, `/assistant/chats/{id}/link`).
@@ -1683,5 +2020,94 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{none}");
         assert_eq!(ids(&none), vec![panel_only.clone()]);
+    }
+
+    /// One POST to `/assistant/browser-agents` with `bearer` instead of the control token.
+    async fn post_browser_agents_as(
+        state: &AppState,
+        bearer: &str,
+        run_id: i64,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/assistant/browser-agents")
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header(crate::daemon_client::RUN_ID_HEADER, run_id.to_string())
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "task": "find the opening hours" }).to_string(),
+            ))
+            .unwrap();
+        let response = super::super::build_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// The door is for a conversation's key only. A chat turn's own run token (`runs.token`) is
+    /// what a rooted turn's shell could read from its environment and replay, so it must not open
+    /// it, even for a running turn that belongs to a conversation. And a chat key may only speak
+    /// for its own turn: naming another conversation's turn in the header is refused.
+    #[tokio::test]
+    async fn a_chat_runs_own_run_token_may_not_post_browser_agents() {
+        let state = state().await;
+        owner_present(&state).await;
+        let mother = chat(&state).await;
+        let turn = running_turn(&state, &mother, Some("shell")).await;
+        let (run_bearer, secret) = crate::auth::mint_run_token(turn);
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(&secret)
+            .bind(turn)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = post_browser_agents_as(&state, &run_bearer, turn).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a run token is not a chat key: {body}");
+
+        let other = chat(&state).await;
+        let other_turn = running_turn(&state, &other, Some("shell")).await;
+        let key = crate::auth::mint_chat_token(&state.pool, &mother).await.unwrap();
+        let (status, body) = post_browser_agents_as(&state, &key, other_turn).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["refusal"], "run_mismatch");
+
+        let (status, body) = post_browser_agents_as(&state, &key, turn).await;
+        assert_eq!(status, StatusCode::OK, "the chat key of the running turn is admitted: {body}");
+        assert!(body["chat_id"].is_string(), "{body}");
+    }
+
+    /// The chat key is in a rooted turn's environment, so a turn that read untrusted text could
+    /// call the route itself and skip the MCP tool's classification. A tainted sender is refused
+    /// on the chat-key door, and no child conversation is left behind.
+    #[tokio::test]
+    async fn a_tainted_chat_turn_may_not_post_browser_agents_with_its_chat_key() {
+        let state = state().await;
+        owner_present(&state).await;
+        let mother = chat(&state).await;
+        let turn = running_turn(&state, &mother, Some("shell")).await;
+        crate::execution::runs::mark_untrusted_context(&state.pool, turn)
+            .await
+            .unwrap();
+        let chats_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let key = crate::auth::mint_chat_token(&state.pool, &mother).await.unwrap();
+
+        let (status, body) = post_browser_agents_as(&state, &key, turn).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["refusal"], "untrusted_context");
+        let chats_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chats")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(chats_after, chats_before, "a refused sender creates no child");
     }
 }

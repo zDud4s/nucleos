@@ -22,15 +22,159 @@ pub enum DeliveryOutcome {
 }
 
 /// Delivers `reply`, the final answer of the child turn `child_run_id`, to the child's parent.
-// RED stub
 pub async fn deliver_reply(
     state: &crate::state::AppState,
     child_chat_id: &str,
     child_run_id: i64,
     reply: &str,
 ) -> DeliveryOutcome {
-    let _ = (state, child_chat_id, child_run_id, reply);
-    todo!("RED stub")
+    use crate::assistant::Origin;
+    use crate::assistant::send::{Sent, send_relayed_or_queue};
+    use crate::chats::notices;
+
+    if reply.trim().is_empty() {
+        return DeliveryOutcome::Empty;
+    }
+    let pool = &state.pool;
+    let link = match crate::chats::links::active(pool, child_chat_id).await {
+        Ok(Some(link)) => link,
+        Ok(None) => return DeliveryOutcome::NotLinked,
+        Err(error) => {
+            tracing::warn!(%error, child_chat_id, "could not read the chat link; reply not delivered");
+            return DeliveryOutcome::NotLinked;
+        }
+    };
+    let Some(parent) = link.parent_chat_id.clone() else {
+        return DeliveryOutcome::NotLinked;
+    };
+
+    let title: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT title FROM chats WHERE chat_id = ?")
+            .bind(child_chat_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    let title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("browser agent");
+    let text = format!("[browser agent · {title}] {reply}");
+
+    // The same exact matching `http::chat_turns::sending_turn_of` does: an unreadable origin is
+    // refused, never read as local.
+    let origin_wire: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT origin FROM runs WHERE id = ?")
+            .bind(child_run_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+    let origin = match origin_wire.as_deref() {
+        Some("telegram") => Some(Origin::Channel(crate::channels::registry::TELEGRAM.id)),
+        Some("shell") => Some(Origin::Shell),
+        Some(wire) if wire.starts_with("channel:") => match Origin::from_wire(Some(wire)) {
+            Origin::Channel(id) => Some(Origin::Channel(id)),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let (relay_id, outcome, reason, result) = match origin {
+        None => (
+            None,
+            "refused",
+            Some("unknown_origin".to_string()),
+            DeliveryOutcome::Refused {
+                reason: "unknown_origin".to_string(),
+            },
+        ),
+        Some(origin) => {
+            match crate::relay::admit(
+                pool,
+                child_chat_id,
+                &parent,
+                child_run_id,
+                origin,
+                &text,
+                chrono::Utc::now(),
+            )
+            .await
+            {
+                Ok(relay_id) => {
+                    match send_relayed_or_queue(state, &parent, &text, Origin::Shell, relay_id)
+                        .await
+                    {
+                        Ok(Sent::Turn(turn_id)) => (
+                            Some(relay_id),
+                            "delivered",
+                            None,
+                            DeliveryOutcome::Delivered { turn_id },
+                        ),
+                        Ok(Sent::Queued) => {
+                            (Some(relay_id), "queued", None, DeliveryOutcome::Queued)
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %parent, "could not send the browser reply");
+                            (
+                                Some(relay_id),
+                                "refused",
+                                Some("internal".to_string()),
+                                DeliveryOutcome::Refused {
+                                    reason: "internal".to_string(),
+                                },
+                            )
+                        }
+                    }
+                }
+                Err(refusal) => {
+                    let slug = refusal.slug();
+                    (
+                        None,
+                        "refused",
+                        Some(slug.to_string()),
+                        DeliveryOutcome::Refused {
+                            reason: slug.to_string(),
+                        },
+                    )
+                }
+            }
+        }
+    };
+
+    if let DeliveryOutcome::Refused { reason } = &result {
+        let body = format!("Not delivered ({reason}): {reply}");
+        if let Err(error) = notices::post_system(
+            pool,
+            &parent,
+            notices::KIND_BROWSER_REPLY,
+            child_run_id,
+            &body,
+        )
+        .await
+        {
+            tracing::warn!(%error, %parent, "could not file the undelivered browser reply");
+        }
+    }
+    if let Err(error) = sqlx::query(
+        "INSERT INTO chat_link_deliveries (link_id, run_id, relay_id, outcome, reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(link.id)
+    .bind(child_run_id)
+    .bind(relay_id)
+    .bind(outcome)
+    .bind(reason)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(%error, "could not record the link delivery");
+    }
+    result
 }
 
 #[cfg(test)]
@@ -128,7 +272,10 @@ mod tests {
 
     /// A mother `M` whose typed turn handed a task to its linked child `F`: chain `[M, F]`. Returns
     /// `(mother, child, link_id, child_run_id)`.
-    async fn a_linked_pair(pool: &SqlitePool, child_title: Option<&str>) -> (String, String, i64, i64) {
+    async fn a_linked_pair(
+        pool: &SqlitePool,
+        child_title: Option<&str>,
+    ) -> (String, String, i64, i64) {
         let mother = a_conversation(pool, Some("Trip planning")).await;
         let child = a_conversation(pool, child_title).await;
         let link = crate::chats::links::open(pool, &child, Some(&mother), "browser", None)
@@ -216,7 +363,10 @@ mod tests {
         .fetch_one(&state.pool)
         .await
         .expect("a chat_relays row child -> parent");
-        assert_eq!(sending_run_id, child_run, "the relay is sent by the child's turn");
+        assert_eq!(
+            sending_run_id, child_run,
+            "the relay is sent by the child's turn"
+        );
         assert_eq!(body, "[browser agent · Hotels] Found three hotels.");
         let (chat_id, from_relay_id, prompt): (String, Option<i64>, String) =
             sqlx::query_as("SELECT chat_id, from_relay_id, prompt FROM runs WHERE id = ?")
@@ -225,7 +375,11 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(chat_id, mother);
-        assert_eq!(from_relay_id, Some(relay_id), "the mother's turn records its relay");
+        assert_eq!(
+            from_relay_id,
+            Some(relay_id),
+            "the mother's turn records its relay"
+        );
         assert_eq!(prompt, "[browser agent · Hotels] Found three hotels.");
         assert_eq!(
             deliveries(&state.pool, link_id).await,
@@ -262,14 +416,13 @@ mod tests {
         drop(held);
         crate::assistant::send::drain_queued(&state, &mother).await;
 
-        let (turn_id, prompt): (i64, String) = sqlx::query_as(
-            "SELECT id, prompt FROM runs WHERE chat_id = ? AND from_relay_id = ?",
-        )
-        .bind(&mother)
-        .bind(relay_id)
-        .fetch_one(&state.pool)
-        .await
-        .expect("the drain sent the waiting reply");
+        let (turn_id, prompt): (i64, String) =
+            sqlx::query_as("SELECT id, prompt FROM runs WHERE chat_id = ? AND from_relay_id = ?")
+                .bind(&mother)
+                .bind(relay_id)
+                .fetch_one(&state.pool)
+                .await
+                .expect("the drain sent the waiting reply");
         assert_eq!(prompt, "[browser agent · browser agent] Booked.");
         settled(&state.pool, turn_id).await;
     }
@@ -289,7 +442,11 @@ mod tests {
                 reason: "owner_away".to_string()
             }
         );
-        assert_eq!(runs_in(&state.pool, &mother).await, 1, "only the typed turn");
+        assert_eq!(
+            runs_in(&state.pool, &mother).await,
+            1,
+            "only the typed turn"
+        );
         let notices = browser_reply_notices(&state.pool, &mother).await;
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(
@@ -382,11 +539,12 @@ mod tests {
             DeliveryOutcome::Delivered { turn_id } => turn_id,
             other => panic!("the reply should have opened a turn in the mother: {other:?}"),
         };
-        let relay_id: Option<i64> = sqlx::query_scalar("SELECT from_relay_id FROM runs WHERE id = ?")
-            .bind(turn_id)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let relay_id: Option<i64> =
+            sqlx::query_scalar("SELECT from_relay_id FROM runs WHERE id = ?")
+                .bind(turn_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         let handover = crate::relay::handover_of(&state.pool, relay_id).await;
         assert_eq!(handover, crate::relay::Handover::Withheld);
         assert_eq!(
@@ -429,14 +587,19 @@ mod tests {
             DeliveryOutcome::NotLinked
         );
 
-        let relays: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays WHERE from_chat_id IN (?, ?)")
-            .bind(&child)
-            .bind(&loner)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let relays: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays WHERE from_chat_id IN (?, ?)")
+                .bind(&child)
+                .bind(&loner)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(relays, 0);
-        assert_eq!(runs_in(&state.pool, &mother).await, 1, "only the typed turn");
+        assert_eq!(
+            runs_in(&state.pool, &mother).await,
+            1,
+            "only the typed turn"
+        );
         assert!(browser_reply_notices(&state.pool, &mother).await.is_empty());
         assert!(deliveries(&state.pool, link_id).await.is_empty());
         let all_deliveries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_link_deliveries")

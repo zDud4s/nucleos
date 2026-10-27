@@ -62,7 +62,6 @@ impl From<sqlx::Error> for LinkError {
 /// Closes `child`'s active link (if any) and opens a new one to `parent` (`None` = no mother,
 /// only the panel), in one transaction. Refuses a link to itself, to a missing or archived
 /// parent, from a missing or archived child, and one that would close a cycle of links.
-// RED stub
 pub async fn open(
     pool: &SqlitePool,
     child: &str,
@@ -70,49 +69,137 @@ pub async fn open(
     kind: &str,
     created_by_run: Option<i64>,
 ) -> Result<Link, LinkError> {
-    let _ = (pool, child, parent, kind, created_by_run);
-    todo!("RED stub")
+    if parent == Some(child) {
+        return Err(LinkError::ToSelf);
+    }
+    let mut tx = pool.begin().await?;
+    if !is_live(&mut *tx, child).await? {
+        return Err(LinkError::ChildNotFound);
+    }
+    if let Some(parent) = parent {
+        if !is_live(&mut *tx, parent).await? {
+            return Err(LinkError::ParentNotFound);
+        }
+        // Walk the active parents up from the new parent; reaching the child closes a loop. The
+        // visited set bounds the walk even if a loop already exists among other conversations.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(parent.to_string());
+        while let Some(current) = cursor {
+            if current == child {
+                return Err(LinkError::Cycle {
+                    at: child.to_string(),
+                });
+            }
+            if !seen.insert(current.clone()) {
+                break;
+            }
+            cursor = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT parent_chat_id FROM chat_links
+                  WHERE child_chat_id = ? AND unlinked_at IS NULL",
+            )
+            .bind(&current)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE chat_links SET unlinked_at = ? WHERE child_chat_id = ? AND unlinked_at IS NULL",
+    )
+    .bind(&now)
+    .bind(child)
+    .execute(&mut *tx)
+    .await?;
+    let link = sqlx::query_as::<_, Link>(
+        "INSERT INTO chat_links (child_chat_id, parent_chat_id, kind, created_by_run, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING id, child_chat_id, parent_chat_id, kind, created_by_run, created_at, unlinked_at",
+    )
+    .bind(child)
+    .bind(parent)
+    .bind(kind)
+    .bind(created_by_run)
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(link)
+}
+
+/// Whether `chat_id` names a conversation that exists and is not archived.
+async fn is_live(conn: &mut sqlx::SqliteConnection, chat_id: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM chats WHERE chat_id = ? AND archived_at IS NULL",
+    )
+    .bind(chat_id)
+    .fetch_one(conn)
+    .await
+    .map(|n| n > 0)
 }
 
 /// Closes `child`'s active link, if it has one. The row stays, with `unlinked_at` set.
-// RED stub
 pub async fn unlink(pool: &SqlitePool, child: &str) -> sqlx::Result<()> {
-    let _ = (pool, child);
-    todo!("RED stub")
+    sqlx::query(
+        "UPDATE chat_links SET unlinked_at = ? WHERE child_chat_id = ? AND unlinked_at IS NULL",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(child)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 /// `child`'s active link, if any.
-// RED stub
 pub async fn active(pool: &SqlitePool, child: &str) -> sqlx::Result<Option<Link>> {
-    let _ = (pool, child);
-    todo!("RED stub")
+    sqlx::query_as::<_, Link>(
+        "SELECT id, child_chat_id, parent_chat_id, kind, created_by_run, created_at, unlinked_at
+           FROM chat_links WHERE child_chat_id = ? AND unlinked_at IS NULL",
+    )
+    .bind(child)
+    .fetch_optional(pool)
+    .await
 }
 
 /// The parent of `child`'s active link; `None` when there is no active link or it has no parent.
-// RED stub
 pub async fn active_parent_of(pool: &SqlitePool, child: &str) -> sqlx::Result<Option<String>> {
-    let _ = (pool, child);
-    todo!("RED stub")
+    Ok(active(pool, child)
+        .await?
+        .and_then(|link| link.parent_chat_id))
 }
 
 /// Whether `a` and `b` are a linked pair, in either direction, through an ACTIVE link only.
-// RED stub
 pub async fn are_linked(pool: &SqlitePool, a: &str, b: &str) -> sqlx::Result<bool> {
-    let _ = (pool, a, b);
-    todo!("RED stub")
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM chat_links
+          WHERE unlinked_at IS NULL
+            AND ((child_chat_id = ?1 AND parent_chat_id = ?2)
+              OR (child_chat_id = ?2 AND parent_chat_id = ?1))",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .map(|n| n > 0)
 }
 
 /// Closes every active link `chat_id` is an end of, as child or as parent (archiving).
-// RED stub
 pub async fn close_all_for(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
-    let _ = (pool, chat_id);
-    todo!("RED stub")
+    sqlx::query(
+        "UPDATE chat_links SET unlinked_at = ?1
+          WHERE unlinked_at IS NULL AND (child_chat_id = ?2 OR parent_chat_id = ?2)",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(chat_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chats::{create, Brain};
+    use crate::chats::{Brain, create};
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
@@ -139,7 +226,8 @@ mod tests {
     #[tokio::test]
     async fn a_chat_has_at_most_one_active_link() {
         let pool = test_pool().await;
-        let insert = "INSERT INTO chat_links (child_chat_id, parent_chat_id, kind, created_at, unlinked_at)
+        let insert =
+            "INSERT INTO chat_links (child_chat_id, parent_chat_id, kind, created_at, unlinked_at)
                       VALUES (?, ?, 'browser', '2026-10-22T00:00:00Z', ?)";
 
         sqlx::query(insert)
@@ -198,7 +286,10 @@ mod tests {
             .expect("relink to another mother");
         assert_ne!(second.id, first.id);
 
-        let active_now = active(&pool, &child).await.unwrap().expect("an active link");
+        let active_now = active(&pool, &child)
+            .await
+            .unwrap()
+            .expect("an active link");
         assert_eq!(active_now, second);
         assert_eq!(
             active_parent_of(&pool, &child).await.unwrap().as_deref(),
@@ -208,7 +299,10 @@ mod tests {
         let history = rows_of(&pool, &child).await;
         assert_eq!(history.len(), 2, "the previous link is kept, not deleted");
         assert_eq!(history[0].id, first.id);
-        assert!(history[0].unlinked_at.is_some(), "the previous link is closed");
+        assert!(
+            history[0].unlinked_at.is_some(),
+            "the previous link is closed"
+        );
         assert_eq!(history[1].id, second.id);
         assert!(history[1].unlinked_at.is_none());
 
@@ -221,7 +315,11 @@ mod tests {
 
         unlink(&pool, &child).await.unwrap();
         assert_eq!(active(&pool, &child).await.unwrap(), None);
-        assert_eq!(rows_of(&pool, &child).await.len(), 3, "unlink closes, never deletes");
+        assert_eq!(
+            rows_of(&pool, &child).await.len(),
+            3,
+            "unlink closes, never deletes"
+        );
     }
 
     #[tokio::test]
@@ -249,7 +347,11 @@ mod tests {
             open(&pool, "ghost", Some(&a), "browser", None).await,
             Err(LinkError::ChildNotFound)
         ));
-        assert_eq!(active(&pool, &a).await.unwrap(), None, "a refusal writes nothing");
+        assert_eq!(
+            active(&pool, &a).await.unwrap(),
+            None,
+            "a refusal writes nothing"
+        );
 
         // b answers to a, c answers to b; a answering to c would close a -> c -> b -> a.
         open(&pool, &b, Some(&a), "browser", None).await.unwrap();
@@ -262,7 +364,11 @@ mod tests {
             open(&pool, &a, Some(&b), "browser", None).await,
             Err(LinkError::Cycle { .. })
         ));
-        assert_eq!(active(&pool, &a).await.unwrap(), None, "a refused cycle writes nothing");
+        assert_eq!(
+            active(&pool, &a).await.unwrap(),
+            None,
+            "a refused cycle writes nothing"
+        );
 
         // A closed link is no longer a path: once c is unlinked, a may answer to c.
         unlink(&pool, &c).await.unwrap();
@@ -276,7 +382,9 @@ mod tests {
         let pool = test_pool().await;
         let mother = chat(&pool).await;
         let child = chat(&pool).await;
-        open(&pool, &child, Some(&mother), "browser", None).await.unwrap();
+        open(&pool, &child, Some(&mother), "browser", None)
+            .await
+            .unwrap();
         crate::chats::archive(&pool, &mother).await.unwrap();
         assert_eq!(
             active(&pool, &child).await.unwrap(),
@@ -296,7 +404,11 @@ mod tests {
             None,
             "archiving the child closes its own link"
         );
-        assert_eq!(rows_of(&pool, &other_child).await.len(), 1, "closed, not deleted");
+        assert_eq!(
+            rows_of(&pool, &other_child).await.len(),
+            1,
+            "closed, not deleted"
+        );
     }
 
     #[tokio::test]
@@ -305,7 +417,9 @@ mod tests {
         let mother = chat(&pool).await;
         let child = chat(&pool).await;
         let stranger = chat(&pool).await;
-        open(&pool, &child, Some(&mother), "browser", None).await.unwrap();
+        open(&pool, &child, Some(&mother), "browser", None)
+            .await
+            .unwrap();
 
         assert!(are_linked(&pool, &child, &mother).await.unwrap());
         assert!(are_linked(&pool, &mother, &child).await.unwrap());

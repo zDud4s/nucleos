@@ -1221,6 +1221,10 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // already wrote its status can still be followed by one last wake-up here, and an unguarded
         // write would report a completed turn for a CLI that was killed. First writer wins; no rows
         // means the turn was finalised elsewhere, which is an outcome, not an error.
+        //
+        // What a linked browser agent's completed turn answered, handed to its parent once the slot
+        // below is free. Failed, cancelled and timed-out turns leave it `None`: they deliver nothing.
+        let mut linked_reply: Option<String> = None;
         match result {
             // A turn's product is the `result` event, and a CLI that exited without one answered
             // nothing. That is a failed turn, not a completed one — and emphatically not a turn
@@ -1310,6 +1314,13 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     .execute(&pool)
                     .await;
                     crate::execution::runs::warn_on_terminal_write_err(&completed, id, status);
+                    if status == "completed"
+                        && completed
+                            .as_ref()
+                            .is_ok_and(|written| written.rows_affected() > 0)
+                    {
+                        linked_reply = reply.clone();
+                    }
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
                         // runs that produced it. Dropping the row here as well closes the one case that
@@ -1443,6 +1454,11 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // cannot set another aside before this one is written.
         record_set_aside(&after, &drained_chat).await;
         drop(turn);
+        // A linked child's answer travels to its parent now that this chat's slot is free. An
+        // unlinked chat costs one read inside `deliver_reply`.
+        if let Some(reply) = linked_reply {
+            super::linked::deliver_reply(&after, &drained_chat, id, &reply).await;
+        }
         // The process this turn kept is read from here on, so a background task's own answer is not
         // left waiting for the next person's turn.
         watch_between_turns(&after, &drained_chat);
@@ -1586,7 +1602,10 @@ mod tests {
         evict_live(&child);
         let (parent_turn, prompt, sending_run_id) =
             delivered.expect("the child's finished turn was never delivered to its mother");
-        assert_eq!(sending_run_id, child_turn, "the relay is sent by the child's turn");
+        assert_eq!(
+            sending_run_id, child_turn,
+            "the relay is sent by the child's turn"
+        );
         assert_eq!(prompt, "[browser agent · Flights] fake output");
         for _ in 0..500 {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")

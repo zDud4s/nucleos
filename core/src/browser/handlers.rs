@@ -463,9 +463,9 @@ pub async fn post_close(
     }
 }
 
-/// `GET /browser/sessions` — what is open right now.
+/// `GET /browser/sessions` — what is open right now, each with the chat it answers to.
 pub async fn list_open_sessions(State(state): State<AppState>) -> axum::response::Response {
-    match open_sessions(&state.pool).await {
+    match open_session_views(&state.pool).await {
         Ok(sessions) => axum::Json(sessions).into_response(),
         Err(error) => db_error(error),
     }

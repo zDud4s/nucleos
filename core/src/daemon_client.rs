@@ -1000,10 +1000,14 @@ impl DaemonClient {
     /// Opens a new browser agent conversation linked to the one this run answers in and hands it
     /// `task` (and the optional start page `url`). The mother is never named here: the daemon
     /// reads it off `RUN_ID_HEADER`, as for `send_to_chat`.
-    // RED stub
     pub async fn browser_agent(&self, task: &str, url: Option<&str>) -> Result<Value, String> {
-        let _ = (task, url);
-        todo!("RED stub")
+        let response = self
+            .request(reqwest::Method::POST, "/assistant/browser-agents")
+            .json(&serde_json::json!({ "task": task, "url": url }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, "opening a browser agent conversation").await
     }
 
     /// What is in the files folder. Reading only — there is deliberately no client method here for
@@ -1749,7 +1753,10 @@ mod tests {
         let client = DaemonClient::as_run(format!("http://{address}"), "test-token".into(), 42);
 
         let answer = client
-            .browser_agent("find the cheapest flight", Some("https://flights.example.com/"))
+            .browser_agent(
+                "find the cheapest flight",
+                Some("https://flights.example.com/"),
+            )
             .await
             .expect("the stub daemon answers 200");
         assert_eq!(answer["chat_id"], "child-1");
@@ -1767,7 +1774,10 @@ mod tests {
         assert_eq!(run.as_deref(), Some("42"));
         assert_eq!(body["task"], "find the cheapest flight");
         assert_eq!(body["url"], "https://flights.example.com/");
-        assert!(body.get("chat_id").is_none(), "the mother is never in the body");
+        assert!(
+            body.get("chat_id").is_none(),
+            "the mother is never in the body"
+        );
 
         let (uri, run, body) = &seen[1];
         assert_eq!(uri, "/assistant/browser-agents");

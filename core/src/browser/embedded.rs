@@ -735,8 +735,7 @@ pub async fn post_prepare(
             Err(error) => return sidecar_error(error),
         }
     };
-    match state.browser.client.embedded_prepare(key, &placement).await
-    {
+    match state.browser.client.embedded_prepare(key, &placement).await {
         Ok(prepared) => Json(prepared).into_response(),
         Err(error) => sidecar_error(error),
     }

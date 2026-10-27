@@ -607,8 +607,7 @@ pub async fn open_with(
             placement.clone()
         };
         if let Some(row) =
-            route_embedded::try_open(pool, runtime, row_id, ask, &sites, &embedded_placement)
-                .await
+            route_embedded::try_open(pool, runtime, row_id, ask, &sites, &embedded_placement).await
         {
             return Ok(Opened::Session(Box::new(row)));
         }
@@ -1142,7 +1141,6 @@ pub async fn open_sessions(pool: &SqlitePool) -> sqlx::Result<Vec<SessionRow>> {
 /// One item of `GET /browser/sessions`: the session row plus the chat it answers to (the
 /// `panel::owner_of` chat), or `null` when its owner is a chatless run or nobody.
 #[derive(Debug, Clone, Serialize)]
-// RED stub
 pub struct OpenSessionView {
     #[serde(flatten)]
     pub row: SessionRow,
@@ -1150,7 +1148,6 @@ pub struct OpenSessionView {
 }
 
 /// The open sessions, oldest first, each with the chat it answers to.
-// RED stub (the chat comes from `panel::chat_of`, itself a stub)
 pub async fn open_session_views(pool: &SqlitePool) -> sqlx::Result<Vec<OpenSessionView>> {
     let mut views = Vec::new();
     for row in open_sessions(pool).await? {
@@ -2952,8 +2949,15 @@ mod tests {
             .await
             .expect("opens");
         assert!(matches!(opened, Opened::Session(_)), "{opened:?}");
-        assert_eq!(placements(&seen).len(), 1, "the project open stayed headless");
-        assert!(runtime.embedded.poll().is_empty(), "nothing queued for the shell");
+        assert_eq!(
+            placements(&seen).len(),
+            1,
+            "the project open stayed headless"
+        );
+        assert!(
+            runtime.embedded.poll().is_empty(),
+            "nothing queued for the shell"
+        );
 
         // Only the project registered: the no-project open goes headless, and is recorded as such.
         let (runtime, seen) = stub_sidecar(url).await;
@@ -2965,8 +2969,15 @@ mod tests {
         let Opened::Session(row) = opened else {
             panic!("expected a session, got {opened:?}");
         };
-        assert_eq!(placements(&seen).len(), 1, "the no-project open stayed headless");
-        assert!(runtime.embedded.poll().is_empty(), "nothing queued for the shell");
+        assert_eq!(
+            placements(&seen).len(),
+            1,
+            "the no-project open stayed headless"
+        );
+        assert!(
+            runtime.embedded.poll().is_empty(),
+            "nothing queued for the shell"
+        );
         assert_eq!(row.project_id, None);
         db.close().await;
     }
@@ -3343,7 +3354,8 @@ mod tests {
     /// the stamped `owner_chat_id` first, else the chat of the run that opened it, else `null` for
     /// a chatless run and for a session nobody opened. The row's own fields stay flat beside it.
     #[tokio::test]
-    async fn open_sessions_view_gives_chat_id_for_the_owner_chat_for_the_runs_chat_and_null_for_a_chatless_run() {
+    async fn open_sessions_view_gives_chat_id_for_the_owner_chat_for_the_runs_chat_and_null_for_a_chatless_run()
+     {
         let db = TempDb::new().await;
         for (id, chat) in [(41_i64, Some("c-run")), (42, None)] {
             sqlx::query(
@@ -3406,10 +3418,16 @@ mod tests {
         assert_eq!(json["sidecar_id"], "by-run");
         assert_eq!(json["run_id"], 41);
         assert_eq!(json["chat_id"], "c-run");
-        assert!(json.get("row").is_none(), "the row is flattened, not nested");
+        assert!(
+            json.get("row").is_none(),
+            "the row is flattened, not nested"
+        );
         let nobody = views.iter().find(|v| v.row.sidecar_id == "nobody").unwrap();
         let json = serde_json::to_value(nobody).expect("serialize");
-        assert!(json["chat_id"].is_null(), "no owner chat is an explicit null");
+        assert!(
+            json["chat_id"].is_null(),
+            "no owner chat is an explicit null"
+        );
         db.close().await;
     }
 }

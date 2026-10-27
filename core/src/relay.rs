@@ -29,6 +29,12 @@
 /// conversations, three relays deep, is still admitted. Three, the same number as
 /// `team_trigger::MAX_TRIGGER_DEPTH` and for the same reason: a chain of three conversations
 /// relaying into each other is a workflow; a fourth hop is the shape of a loop nobody drew.
+///
+/// A linked pair (a browser agent and its mother, `chats::links`) is held by this same ceiling,
+/// which is what makes lifting `Cycle` for it safe (spec 4.4): the mother's task to the child is
+/// `[M, F]`, the child's answer `[M, F]` -> M, a woken mother's follow-up `[M, F, M]` -> F, and the
+/// child's second answer `[M, F, M, F]` -> M is `TooDeep`. At most three hops past the typed turn,
+/// so at most two turns of the child and one woken turn of the mother per typed message.
 pub const MAX_RELAY_DEPTH: usize = 3;
 
 /// What a proposed relay was decided to be, and why, when it is refused.
@@ -62,11 +68,12 @@ pub enum Verdict {
 /// nothing does — and inventing a fifth `Verdict` for a shape that never occurs would be a case to
 /// maintain forever against a bug that has never shown up. Zero relays is, truthfully, not a cycle,
 /// not a relay to itself, and not too deep.
+///
+/// `linked` says that the sender and `to` are a linked pair (`chats::links::are_linked`): a child
+/// answering its mother, or a mother asking her child again, revisits a conversation already in
+/// the chain by design, so for that pair alone `Cycle` is not decided. `Itself` and `TooDeep` are
+/// unchanged, and `MAX_RELAY_DEPTH` is what bounds the back-and-forth (see its doc comment).
 pub fn admits(chain: &[&str], to: &str, linked: bool) -> Verdict {
-    // RED stub: the linked exception is not written yet; a linked hop must fail its tests.
-    if linked {
-        todo!("RED stub");
-    }
     // `Itself` and `Cycle` are decided before length is even considered — a chain that has looped
     // back on itself is a wrong chain, not merely a long one, and that is the more useful thing to
     // say even when the chain is also past `MAX_RELAY_DEPTH` (see the second pinned test below).
@@ -75,7 +82,7 @@ pub fn admits(chain: &[&str], to: &str, linked: bool) -> Verdict {
             return Verdict::Itself;
         }
         for &link in &chain[..chain.len() - 1] {
-            if link == to {
+            if !linked && link == to {
                 return Verdict::Cycle {
                     at: link.to_string(),
                 };
@@ -218,10 +225,21 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// The word `http::chat_turns::relay_refusal_response` answers this refusal with.
-    // RED stub
+    /// The word `http::chat_turns::relay_refusal_response` answers this refusal with, for callers
+    /// that record a refusal rather than answer an HTTP request with it (a browser agent's reply
+    /// that could not be delivered, `chat_link_deliveries.reason`).
     pub fn slug(&self) -> &'static str {
-        todo!("RED stub")
+        match self {
+            Refusal::NoSuchDestination { .. } => "no_such_destination",
+            Refusal::RemoteOrigin => "remote_origin",
+            Refusal::Chain(Verdict::Itself) => "relay_to_self",
+            Refusal::Chain(Verdict::Cycle { .. }) => "relay_cycle",
+            Refusal::Chain(Verdict::TooDeep) => "relay_too_deep",
+            Refusal::Chain(Verdict::Ok) => "internal",
+            Refusal::ChainOverBudget { .. } => "relay_chain_over_budget",
+            Refusal::OwnerAway => "owner_away",
+            Refusal::Unreadable { .. } => "internal",
+        }
     }
 }
 
@@ -312,8 +330,15 @@ pub async fn admit(
             error: error.to_string(),
         })?;
     let chain_refs: Vec<&str> = links.iter().map(|(_, chat_id)| chat_id.as_str()).collect();
-    // RED stub: `admit` does not read `chat_links` yet.
-    let verdict = admits(&chain_refs, to_chat_id, false);
+    // A linked pair may hand messages back and forth; only `Cycle` is lifted for it, and only for
+    // an ACTIVE link in either direction. A failed read fails closed, like the walk above.
+    let linked = crate::chats::links::are_linked(pool, from_chat_id, to_chat_id)
+        .await
+        .map_err(|error| Refusal::Unreadable {
+            step: "link lookup",
+            error: error.to_string(),
+        })?;
+    let verdict = admits(&chain_refs, to_chat_id, linked);
     if verdict != Verdict::Ok {
         return Err(Refusal::Chain(verdict));
     }
@@ -1166,28 +1191,62 @@ mod tests {
             .expect("link the child to its mother");
 
         let mother_turn = seed_chain(&pool, &["M", "F", "M"]).await;
-        admit(&pool, "M", "F", mother_turn, Origin::Shell, "one more thing", now)
-            .await
-            .expect("mother -> child is admitted for a linked pair");
+        admit(
+            &pool,
+            "M",
+            "F",
+            mother_turn,
+            Origin::Shell,
+            "one more thing",
+            now,
+        )
+        .await
+        .expect("mother -> child is admitted for a linked pair");
 
         let child_turn = seed_chain(&pool, &["M", "F"]).await;
-        admit(&pool, "F", "M", child_turn, Origin::Shell, "the answer", now)
-            .await
-            .expect("child -> mother is admitted for a linked pair");
+        admit(
+            &pool,
+            "F",
+            "M",
+            child_turn,
+            Origin::Shell,
+            "the answer",
+            now,
+        )
+        .await
+        .expect("child -> mother is admitted for a linked pair");
 
         crate::chats::links::unlink(&pool, "F")
             .await
             .expect("close the link");
 
         assert_eq!(
-            admit(&pool, "M", "F", mother_turn, Origin::Shell, "one more thing", now).await,
+            admit(
+                &pool,
+                "M",
+                "F",
+                mother_turn,
+                Origin::Shell,
+                "one more thing",
+                now
+            )
+            .await,
             Err(Refusal::Chain(Verdict::Cycle {
                 at: "F".to_string()
             })),
             "an unlinked mother -> child hop is a cycle again"
         );
         assert_eq!(
-            admit(&pool, "F", "M", child_turn, Origin::Shell, "the answer", now).await,
+            admit(
+                &pool,
+                "F",
+                "M",
+                child_turn,
+                Origin::Shell,
+                "the answer",
+                now
+            )
+            .await,
             Err(Refusal::Chain(Verdict::Cycle {
                 at: "M".to_string()
             })),
@@ -1210,7 +1269,16 @@ mod tests {
 
         let child_turn = seed_chain(&pool, &["M", "F", "M", "F"]).await;
         assert_eq!(
-            admit(&pool, "F", "M", child_turn, Origin::Shell, "the second answer", now).await,
+            admit(
+                &pool,
+                "F",
+                "M",
+                child_turn,
+                Origin::Shell,
+                "the second answer",
+                now
+            )
+            .await,
             Err(Refusal::Chain(Verdict::TooDeep))
         );
     }

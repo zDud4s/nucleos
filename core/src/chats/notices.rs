@@ -169,15 +169,30 @@ pub async fn for_chat_since(
 
 /// The bodies of this conversation's notices of `kind` that no turn has consumed yet, oldest
 /// first, stamped `consumed_by_run = run_id` so the next turn does not see them again.
-// RED stub
 pub async fn take_unconsumed(
     pool: &SqlitePool,
     chat_id: &str,
     kind: &str,
     run_id: i64,
 ) -> sqlx::Result<Vec<String>> {
-    let _ = (pool, chat_id, kind, run_id);
-    todo!("RED stub")
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, body FROM chat_notices
+          WHERE chat_id = ? AND kind = ? AND consumed_by_run IS NULL ORDER BY id",
+    )
+    .bind(chat_id)
+    .bind(kind)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (id, _) in &rows {
+        sqlx::query("UPDATE chat_notices SET consumed_by_run = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(rows.into_iter().map(|(_, body)| body).collect())
 }
 
 #[cfg(test)]

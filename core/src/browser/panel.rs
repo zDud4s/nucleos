@@ -40,8 +40,11 @@ pub async fn owner_of(pool: &SqlitePool, row: &SessionRow) -> Owner {
 }
 
 /// The chat a session answers to: `owner_of` when it is a chat, else `None`.
-pub async fn chat_of(_pool: &SqlitePool, _row: &SessionRow) -> Option<String> {
-    None // RED stub
+pub async fn chat_of(pool: &SqlitePool, row: &SessionRow) -> Option<String> {
+    match owner_of(pool, row).await {
+        Owner::Chat(chat) => Some(chat),
+        Owner::Run(_) | Owner::None => None,
+    }
 }
 
 /// Whether the owner is still there to hear: an unarchived chat, or a run still going.
@@ -940,7 +943,10 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(told, 1, "the owner heard the wheel came back, straight away");
+        assert_eq!(
+            told, 1,
+            "the owner heard the wheel came back, straight away"
+        );
         db.close().await;
     }
 

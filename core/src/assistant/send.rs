@@ -1085,6 +1085,38 @@ pub(super) async fn send_message_inner(
             },
         },
     };
+    // A browser agent's reply that could not be delivered is said to the model once, in front of
+    // whatever else this turn sends (resumed or replayed alike); `runs.prompt` keeps what the person
+    // typed, so a later replay of the history cannot repeat it. A read failure sends no prefix.
+    // The bodies are the browser agent's own output, web text it read included, so the turn that
+    // sees them is marked `read_untrusted` before it is spawned; a mark that fails sends no prefix.
+    let prompt = match crate::chats::notices::take_unconsumed(
+        &state.pool,
+        chat_id,
+        crate::chats::notices::KIND_BROWSER_REPLY,
+        id,
+    )
+    .await
+    {
+        Ok(bodies) if !bodies.is_empty() => {
+            match crate::execution::runs::mark_untrusted_context(&state.pool, id).await {
+                Ok(()) => format!("{}\n\n{prompt}", bodies.join("\n\n")),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        run_id = id,
+                        "could not mark a turn carrying browser replies; dropping them"
+                    );
+                    prompt
+                }
+            }
+        }
+        Ok(_) => prompt,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "could not read the pending browser replies");
+            prompt
+        }
+    };
     let cwd = cwd.map(std::path::PathBuf::from);
 
     let mut slot = slot;
@@ -1661,7 +1693,10 @@ mod tests {
         settled(&state.pool, first).await;
 
         let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
-        assert!(handed.contains(refused), "the notice did not reach the turn: {handed:?}");
+        assert!(
+            handed.contains(refused),
+            "the notice did not reach the turn: {handed:?}"
+        );
         assert!(handed.contains("what next?"), "{handed:?}");
         assert!(
             handed.find(refused) < handed.find("what next?"),
@@ -1676,14 +1711,30 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(stored, "what next?", "runs.prompt keeps what the person typed");
+        assert_eq!(
+            stored, "what next?",
+            "runs.prompt keeps what the person typed"
+        );
         let consumed: Option<i64> =
             sqlx::query_scalar("SELECT consumed_by_run FROM chat_notices WHERE id = ?")
                 .bind(notice_id)
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(consumed, Some(first), "the notice names the turn that saw it");
+        assert_eq!(
+            consumed,
+            Some(first),
+            "the notice names the turn that saw it"
+        );
+        let marked: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(first)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            marked, 1,
+            "a turn handed a browser agent's reply has read untrusted text"
+        );
 
         *fake.last_prompt.lock().unwrap() = None;
         fake.later_turns.lock().unwrap().clear();
@@ -1692,7 +1743,8 @@ mod tests {
             .unwrap();
         settled(&state.pool, second).await;
 
-        let mut handed_again: Vec<String> = fake.last_prompt.lock().unwrap().iter().cloned().collect();
+        let mut handed_again: Vec<String> =
+            fake.last_prompt.lock().unwrap().iter().cloned().collect();
         handed_again.extend(
             fake.later_turns
                 .lock()

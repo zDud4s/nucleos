@@ -1352,8 +1352,9 @@ pub async fn archive(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(chat_id)
         .execute(pool)
-        .await
-        .map(|_| ())
+        .await?;
+    // An archived conversation answers to nobody and nobody answers to it.
+    links::close_all_for(pool, chat_id).await
 }
 
 #[cfg(test)]
