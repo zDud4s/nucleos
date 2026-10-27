@@ -9921,9 +9921,9 @@ tests:
              leave the tree building, and do not run the whole suite yourself. While you work, \
              check your change with the verify tool: kind test (or check for a quick compile), \
              scope own, and files set to the paths you changed. It runs only the tests those \
-             files select, and answers within about 45 seconds with the result or a ticket and \
-             its progress. While a ticket is not done, call verify_status with it instead of \
-             starting the same check again. If the project has no test map, own runs nothing and \
+             files select, and answers within seconds with the result or a ticket. An unfinished \
+             ticket is not yours to wait on: the daemon verifies your files after you finish, so \
+             never poll verify_status, and do not start the same check again. If the project has no test map, own runs nothing and \
              says so; then run the narrowest test that tells you your change works. If you hand \
              part of this item to subagents, tell each one to call verify with scope own and the \
              files it changed. A command of yours that prints nothing for long is taken for a \

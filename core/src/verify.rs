@@ -19,11 +19,13 @@ pub mod plan;
 pub mod postgate;
 pub mod postgate_worker;
 pub mod provision;
+pub mod render;
 pub mod runs;
 pub mod store;
 
 mod resolve;
 mod scope_gate;
+pub(crate) mod wake;
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -41,7 +43,6 @@ use crate::auth::{ApiTokenLevel, Scope};
 use crate::config;
 use crate::execution::git_exec::{self, CommandResult, OPERATION_TIMEOUT};
 use crate::execution::land;
-use crate::execution::vcs;
 use crate::inspect;
 use crate::state::AppState;
 use crate::test_select;
@@ -70,6 +71,16 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How often `wait_ticket` re-reads a ticket that is not done yet.
 const WAIT_POLL: Duration = Duration::from_millis(250);
+
+/// How long `POST /verify` and `POST /verify/status` hold a caller that asked to wait.
+///
+/// Short on purpose: the verdict of a ticket is pushed when it is done (see `wake.rs`), so a
+/// caller no longer needs a long hold to avoid polling. `vcs::DEFAULT_WAIT` keeps bounding vcs
+/// ticket waits only.
+pub const HOLD: Duration = Duration::from_secs(5);
+
+/// The longest a `wait_secs` request on `POST /verify/status` is held.
+const MAX_STATUS_WAIT: Duration = Duration::from_secs(60);
 
 fn yes() -> bool {
     true
@@ -111,6 +122,10 @@ pub struct StatusArgs {
     pub ticket: i64,
     #[serde(default = "yes")]
     pub wait: bool,
+    /// How long to hold the answer when `wait` is true, instead of `HOLD`; capped at
+    /// `MAX_STATUS_WAIT`.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
 }
 
 /// Who asked, as far as verification cares: the owner, one autonomous run, or the daemon gating
@@ -985,7 +1000,25 @@ fn database_error(error: sqlx::Error) -> (StatusCode, String) {
     )
 }
 
-/// `POST /verify`: plans and queues, then waits up to `vcs::DEFAULT_WAIT` for the verdict.
+/// How long a `wait` request is held for the status the caller asked for: `wait_secs` capped at
+/// `MAX_STATUS_WAIT` when given, `HOLD` otherwise, nothing when `wait` is false.
+fn status_hold(wait: bool, wait_secs: Option<u64>) -> Duration {
+    if !wait {
+        return Duration::ZERO;
+    }
+    wait_secs.map_or(HOLD, |secs| Duration::from_secs(secs).min(MAX_STATUS_WAIT))
+}
+
+/// The run to push `ticket`'s verdict to once it is done, if any: only a run that asked for it and
+/// was not handed the verdict by the hold. The owner and the daemon's own callers read theirs.
+fn watcher_for(caller: Caller, ticket: &Ticket) -> Option<i64> {
+    match caller {
+        Caller::Run(run_id) if !ticket.done => Some(run_id),
+        _ => None,
+    }
+}
+
+/// `POST /verify`: plans and queues, then waits up to `HOLD` for the verdict.
 pub async fn post_verify(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
@@ -1001,11 +1034,7 @@ pub async fn post_verify(
             "the verify executor is not running".to_owned(),
         ))
     })?;
-    let wait = if args.wait {
-        vcs::DEFAULT_WAIT
-    } else {
-        Duration::ZERO
-    };
+    let wait = if args.wait { HOLD } else { Duration::ZERO };
     // Its own task: a dropped connection cancels this handler's future, and a request cut off
     // between queuing units and recording its plan would leave work nobody can see.
     let id = tokio::spawn(async move { submit(&executor, caller, &args).await })
@@ -1018,7 +1047,15 @@ pub async fn post_verify(
         })?
         .map_err(|error| refused(&error))?;
     match wait_ticket(&state.pool, id, wait).await {
-        Ok(Some((ticket, _))) => Ok(Json(ticket)),
+        Ok(Some((ticket, _))) => {
+            mark_seen(&state.pool, caller, &ticket).await;
+            // The verdict of a ticket the hold left unfinished is pushed once it is done, not
+            // polled for. One that finished within the hold is in this response already.
+            if let Some(run_id) = watcher_for(caller, &ticket) {
+                wake::spawn_watch(state.clone(), id, run_id);
+            }
+            Ok(Json(ticket))
+        }
         Ok(None) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("ticket {id} vanished after it was created"),
@@ -1049,17 +1086,33 @@ pub async fn post_verify_status(
         Some((_, owner)) if may_read(caller, &owner) => {}
         _ => return Err(not_found()),
     }
-    let wait = if args.wait {
-        vcs::DEFAULT_WAIT
-    } else {
-        Duration::ZERO
-    };
+    let wait = status_hold(args.wait, args.wait_secs);
     match wait_ticket(&state.pool, args.ticket, wait)
         .await
         .map_err(database_error)?
     {
-        Some((ticket, _)) => Ok(Json(ticket)),
+        Some((ticket, _)) => {
+            mark_seen(&state.pool, caller, &ticket).await;
+            Ok(Json(ticket))
+        }
         None => Err(not_found()),
+    }
+}
+
+/// A finished ticket handed back to the run that asked for it is a verdict that run has seen, so
+/// the daemon does not wake it for that ticket (`seen_at`, read by `verify_wake::deliver`).
+async fn mark_seen(pool: &SqlitePool, caller: Caller, ticket: &Ticket) {
+    if !ticket.done || !matches!(caller, Caller::Run(_)) {
+        return;
+    }
+    if let Err(error) =
+        sqlx::query("UPDATE verify_requests SET seen_at = ? WHERE id = ? AND seen_at IS NULL")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(ticket.ticket)
+            .execute(pool)
+            .await
+    {
+        tracing::warn!(%error, ticket = ticket.ticket, "could not record that a verdict was read");
     }
 }
 
@@ -1067,6 +1120,7 @@ pub async fn post_verify_status(
 mod tests {
     use super::*;
     use crate::config::VerifyConfig;
+    use crate::execution::vcs;
     use crate::verify::exec as verify_exec;
     use crate::verify::plan::NO_MAP_OWN_NOTE;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -2154,6 +2208,105 @@ tests:
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn verify_hold_is_short_and_default_wait_unchanged() {
+        assert_eq!(HOLD, Duration::from_secs(5));
+        assert!(HOLD < vcs::DEFAULT_WAIT);
+        assert_eq!(vcs::DEFAULT_WAIT, Duration::from_secs(45));
+        assert_eq!(status_hold(true, None), HOLD);
+        assert_eq!(status_hold(false, None), Duration::ZERO);
+    }
+
+    #[test]
+    fn status_wait_secs_is_capped_at_60() {
+        assert_eq!(status_hold(true, Some(20)), Duration::from_secs(20));
+        assert_eq!(status_hold(true, Some(60)), Duration::from_secs(60));
+        assert_eq!(status_hold(true, Some(600)), MAX_STATUS_WAIT);
+        assert_eq!(status_hold(false, Some(30)), Duration::ZERO);
+        let args: StatusArgs = serde_json::from_str(r#"{"ticket": 1, "wait_secs": 90}"#).unwrap();
+        assert_eq!(args.wait_secs, Some(90));
+        let args: StatusArgs = serde_json::from_str(r#"{"ticket": 1}"#).unwrap();
+        assert_eq!(args.wait_secs, None);
+    }
+
+    #[tokio::test]
+    async fn cached_ticket_gets_no_watcher() {
+        let f = fixture(Some(&plain_map()), None, true).await;
+        let id = submit(&f.ex, Caller::Owner, &own_core(&f)).await.unwrap();
+        let (done, _) = finished(&f.pool, id).await;
+        assert!(done.done);
+        // A verdict handed back within the hold is not pushed a second time.
+        assert_eq!(watcher_for(Caller::Run(7), &done), None);
+        assert_eq!(watcher_for(Caller::Owner, &done), None);
+        // A ticket the hold left open is watched for a run, and for nobody else.
+        let open = Ticket {
+            done: false,
+            ..done
+        };
+        assert_eq!(watcher_for(Caller::Run(7), &open), Some(7));
+        assert_eq!(watcher_for(Caller::Owner, &open), None);
+        assert_eq!(watcher_for(Caller::Postgate, &open), None);
+    }
+
+    #[tokio::test]
+    async fn watcher_delivers_once_when_ticket_done() {
+        use crate::execution::runs::verify_wake::DELIVERED;
+        // A run id no other test uses: `DELIVERED` is shared by the whole test binary.
+        const RUN: i64 = 987_001;
+        let f = fixture(Some(&plain_map()), None, true).await;
+        let id = submit(&f.ex, Caller::Owner, &own_core(&f)).await.unwrap();
+        let state = AppState {
+            startup_config: Default::default(),
+            token: crate::auth::Token("test-token".into()),
+            pool: f.pool.clone(),
+            channels: Default::default(),
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            utility_model: None,
+            assistants: Arc::new(crate::assistants::NoAssistants),
+            run_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: Arc::new(crate::state::EmailRuntime::default()),
+            voice: Arc::new(crate::integrations::voice::VoiceRuntime::default()),
+            browser: Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: Arc::new(crate::integrations::web::WebRuntime::disabled()),
+            quota: Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
+            council: Arc::new(crate::council::CouncilRuntime::default()),
+            run_tails: Default::default(),
+            fleet: Default::default(),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        };
+        wake::spawn_watch(state, id, RUN);
+        finished(&f.pool, id).await;
+
+        let delivered = || {
+            DELIVERED
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| **entry == (RUN, id))
+                .count()
+        };
+        let started = Instant::now();
+        while delivered() == 0 {
+            assert!(started.elapsed() < WAIT, "the verdict was never delivered");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Long enough for a second delivery, were the watcher to loop past a done ticket.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(delivered(), 1);
     }
 
     async fn insert_run(pool: &SqlitePool, project: &str, cwd: Option<&str>) -> i64 {

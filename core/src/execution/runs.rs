@@ -13,6 +13,7 @@ mod lifecycle;
 mod policy;
 mod resume;
 mod spawn;
+pub(crate) mod verify_wake;
 
 pub use self::api::*;
 pub use self::create::*;

@@ -632,7 +632,9 @@ HINTS_FILE = "ide-verify-hints.json"  # equals verify_box::HINTS_FILE
 HINT_VALUE_FLAGS = ("-C", "--manifest-path", "--config", "--color", "-Z", "--prefix", "--cwd")
 VERIFY_HINT = (
     "this project verifies through the daemon: call mcp__nucleos__verify to run this "
-    "worktree's build, test and gate commands in its queue and cache, and wait on it with "
+    "worktree's build, test and gate commands in its queue and cache; it answers within "
+    "seconds with the verdict or a ticket, which you wait on in the background with "
+    "`nucleos-core --verify-ticket <id>` (Monitor or Bash run_in_background); never poll "
     "mcp__nucleos__verify_status. Nothing was refused; this command runs as written."
 )
 

@@ -1008,7 +1008,9 @@ def run_rewrite_cases():
 
 HINT_TEXT = (
     "this project verifies through the daemon: call mcp__nucleos__verify to run this "
-    "worktree's build, test and gate commands in its queue and cache, and wait on it with "
+    "worktree's build, test and gate commands in its queue and cache; it answers within "
+    "seconds with the verdict or a ticket, which you wait on in the background with "
+    "`nucleos-core --verify-ticket <id>` (Monitor or Bash run_in_background); never poll "
     "mcp__nucleos__verify_status. Nothing was refused; this command runs as written."
 )
 HINTS_ENV = "NUCLEOS_VERIFY_HINTS_FILE"
@@ -1103,6 +1105,21 @@ def verify_hint_cases():
         return "; ".join(failures)
 
     cases.append(_guarded("with no live hint the interactive output is byte-identical", identical))
+
+    def hint_never_invites_polling():
+        text = hook.VERIFY_HINT
+        failures = []
+        if text != HINT_TEXT:
+            failures.append(f"hint text drifted from the pinned one: {text!r}")
+        if "nucleos-core --verify-ticket" not in text:
+            failures.append("the hint does not name the background wait command")
+        if "never poll mcp__nucleos__verify_status" not in text:
+            failures.append("the hint does not say never to poll verify_status")
+        if "wait on it with" in text or text.count("verify_status") != 1:
+            failures.append("the hint still invites waiting on verify_status")
+        return "; ".join(failures)
+
+    cases.append(_guarded("the verify hint says push or background wait, never poll", hint_never_invites_polling))
 
     def adds_nothing():
         now = int(clock.time())

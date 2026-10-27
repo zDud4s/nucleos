@@ -1147,6 +1147,81 @@ pub enum Unrecognized {
     MayBeConfined,
 }
 
+/// Whether `command` is exactly `nucleos-core --verify-ticket <digits>` or `nucleos-core --verify`,
+/// each optionally followed by `--verify-wait <digits>` (and the `=` spellings of both flags).
+///
+/// Both ask the RUNNING daemon about a worktree or an existing ticket and print its verdict: they
+/// never start a daemon, never submit anything the daemon would not accept from the session's own
+/// worktree, and write nothing. Every other word after `nucleos-core` (`--land`, `--set-*`, a
+/// second flag, a path) is left to the rest of the classifier, which asks a person.
+///
+/// The program word is the bare `nucleos-core` or the full path of THIS daemon's own executable
+/// (`std::env::current_exe`), which is what the IDE box's `wait_with` names because the binary is
+/// not on PATH; a double-quoted path may hold spaces. Any other path, even to a file with the same
+/// name, is not the daemon and is left to the rest of the classifier.
+fn is_verify_client_call(command: &str) -> bool {
+    fn digits(text: &str) -> bool {
+        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+    }
+    let Some((program, arguments)) = split_program(command) else {
+        return false;
+    };
+    if program != "nucleos-core" && !is_daemon_exe(&program) {
+        return false;
+    }
+    let words = flag_words(arguments);
+    let mut rest: &[String] = &words;
+    // The command proper: `--verify`, `--verify-ticket <n>` or `--verify-ticket=<n>`.
+    rest = match rest {
+        [flag, tail @ ..] if flag == "--verify" => tail,
+        [flag, id, tail @ ..] if flag == "--verify-ticket" && digits(id) => tail,
+        [flag, tail @ ..] if flag.strip_prefix("--verify-ticket=").is_some_and(digits) => tail,
+        _ => return false,
+    };
+    // An optional wait limit, then nothing.
+    match rest {
+        [] => true,
+        [flag, secs] => flag == "--verify-wait" && digits(secs),
+        [flag] => flag.strip_prefix("--verify-wait=").is_some_and(digits),
+        _ => false,
+    }
+}
+
+/// PURE: the program word of `command` and the text after it. A word opening with a quote ends at
+/// the next one of the same kind and must be followed by a space or the end; its backslashes are
+/// kept as written, which `flag_words` would have eaten as escapes.
+fn split_program(command: &str) -> Option<(String, &str)> {
+    let command = command.trim_start();
+    if let Some(quote @ ('"' | '\'')) = command.chars().next() {
+        let quoted = &command[1..];
+        let end = quoted.find(quote)?;
+        let rest = &quoted[end + 1..];
+        if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+            return None;
+        }
+        return Some((quoted[..end].to_owned(), rest));
+    }
+    let end = command.find(char::is_whitespace).unwrap_or(command.len());
+    Some((command[..end].to_owned(), &command[end..]))
+}
+
+/// Whether `program` (already lower-cased, as the classifier normalizes a command) names the
+/// running daemon's own executable.
+fn is_daemon_exe(program: &str) -> bool {
+    std::env::current_exe().is_ok_and(|exe| same_executable(program, &exe.to_string_lossy()))
+}
+
+/// PURE: `program` is the path `exe`. Windows compares without case and with `/` for `\`, as the
+/// file system does; elsewhere the paths must be identical, so a case-variant is not accepted.
+fn same_executable(program: &str, exe: &str) -> bool {
+    if cfg!(windows) {
+        let fold = |path: &str| path.replace('\\', "/").to_ascii_lowercase();
+        !program.is_empty() && fold(program) == fold(exe)
+    } else {
+        !program.is_empty() && program == exe
+    }
+}
+
 fn classify_segment(
     segment: &str,
     cwd: Option<&Path>,
@@ -1189,6 +1264,11 @@ fn classify_segment(
         return Segment::VcsLocal;
     }
     if is_safe_command(&normalized) {
+        return Segment::ReadLocal;
+    }
+    // The daemon's own verification client: it only asks the running daemon and waits. Beside
+    // `is_safe_command` and behind the same shape guards, so nothing extra rides on the line.
+    if shell_form_is_readable(&normalized) && is_verify_client_call(&normalized) {
         return Segment::ReadLocal;
     }
     // Spec A D13: PowerShell's output shapers, and only under PowerShell — under Bash these names
@@ -1913,6 +1993,118 @@ mod tests {
                     .decision
                     .decision,
                 decision,
+                "{command}"
+            );
+        }
+    }
+
+    /// **The daemon's own verification client is a safe read**, so an IDE session can wait on a
+    /// ticket in the background without a person approving each command.
+    #[test]
+    fn nucleos_core_verify_ticket_is_allowed() {
+        for command in [
+            "nucleos-core --verify-ticket 42",
+            "nucleos-core --verify-ticket=42",
+            "nucleos-core --verify-ticket 42 --verify-wait 600",
+            "nucleos-core --verify-ticket 42 --verify-wait=600",
+            "nucleos-core --verify-ticket=42 --verify-wait 600",
+            "nucleos-core --verify",
+            "nucleos-core --verify --verify-wait 600",
+            "nucleos-core --verify --verify-wait=600",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({ "command": command }), None)
+                    .decision
+                    .decision,
+                "allow",
+                "{command}"
+            );
+        }
+    }
+
+    /// The daemon's own full path, which the IDE box's `wait_with` names, is the same client.
+    #[test]
+    fn full_exe_path_verify_ticket_is_allowed() {
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // The classifier reads a lower-cased command, so a case-sensitive file system with capitals
+        // in the path (rare) cannot match and asks a person instead: nothing to assert there.
+        if cfg!(not(windows)) && exe != exe.to_ascii_lowercase() {
+            return;
+        }
+        let decision = |command: &str| {
+            classify("Bash", &json!({ "command": command }), None)
+                .decision
+                .decision
+        };
+        for command in [
+            format!("\"{exe}\" --verify-ticket 5"),
+            format!("\"{exe}\" --verify-ticket=5 --verify-wait 600"),
+        ] {
+            assert_eq!(decision(&command), "allow", "{command}");
+        }
+        if !exe.contains(' ') {
+            let command = format!("{exe} --verify-ticket 5");
+            assert_eq!(decision(&command), "allow", "{command}");
+        }
+        // Another program, even one named like the daemon, is not it.
+        for command in [
+            r"C:\other\nucleos-core.exe --verify-ticket 5".to_owned(),
+            r#""C:\other\nucleos-core.exe" --verify-ticket 5"#.to_owned(),
+            "/tmp/other/nucleos-core --verify-ticket 5".to_owned(),
+            format!("\"{exe}\" --land"),
+            format!("\"{exe}\"--verify-ticket 5"),
+        ] {
+            assert_ne!(decision(&command), "allow", "{command}");
+        }
+    }
+
+    #[test]
+    fn executable_paths_compare_as_the_platform_does() {
+        assert!(same_executable(
+            "/opt/n/nucleos-core",
+            "/opt/n/nucleos-core"
+        ));
+        assert!(!same_executable(
+            "/opt/n/nucleos-core",
+            "/opt/m/nucleos-core"
+        ));
+        assert!(!same_executable("", ""));
+        assert_eq!(
+            same_executable(r"c:\x\nucleos-core.exe", r"C:\X\nucleos-core.exe"),
+            cfg!(windows)
+        );
+        assert_eq!(
+            same_executable("c:/x/nucleos-core.exe", r"C:\X\nucleos-core.exe"),
+            cfg!(windows)
+        );
+    }
+
+    /// **Anything beyond the two exact shapes still asks**: another flag, a non-numeric id, a
+    /// second command, a redirection or a substitution is not the verification client any more.
+    #[test]
+    fn nucleos_core_verify_ticket_with_extra_words_still_asks() {
+        for command in [
+            "nucleos-core --verify-ticket 42 extra",
+            "nucleos-core --verify-ticket abc",
+            "nucleos-core --verify-ticket",
+            "nucleos-core --verify-ticket 42 --land",
+            "nucleos-core --verify-ticket 42 --verify-wait",
+            "nucleos-core --verify-ticket 42 --verify-wait soon",
+            "nucleos-core --verify extra",
+            "nucleos-core --verify --land",
+            "nucleos-core --land",
+            "nucleos-core --verify-ticket 42; rm x",
+            "nucleos-core --verify-ticket 42 > out.txt",
+            "nucleos-core --verify-ticket $(echo 1)",
+        ] {
+            assert_eq!(
+                classify("Bash", &json!({ "command": command }), None)
+                    .decision
+                    .decision,
+                "pending_approval",
                 "{command}"
             );
         }

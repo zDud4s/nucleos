@@ -1060,6 +1060,7 @@ async fn main() {
     // for every project there is never one, and a pass reads an empty query.
     tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
     tokio::spawn(verify::exec::run_executor(verify_executor));
+    startup::rearm_verify_wakes(&state).await;
     tokio::spawn(execution::vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(execution::git_exec::GitExecutor {

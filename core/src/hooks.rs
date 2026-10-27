@@ -8616,6 +8616,37 @@ mod tests {
         assert_eq!(kind, "gate_command");
     }
 
+    /// Contract C4: the refusal points at `verify` and names the push and the background wait,
+    /// and the only place it still says `verify_status` is the instruction not to poll it.
+    #[test]
+    fn refusal_does_not_invite_polling() {
+        let text = VERIFY_GUARD_REFUSAL;
+        assert!(text.contains("mcp__nucleos__verify"), "{text}");
+        assert!(text.contains("nucleos-core --verify-ticket"), "{text}");
+        assert!(text.contains("never poll verify_status"), "{text}");
+        assert!(!text.contains("wait on it with"), "{text}");
+        // Only a daemon worktree run is resumed with the verdict; a job node is not.
+        assert!(text.contains("a job node is not resumed"), "{text}");
+        assert_eq!(text.matches("verify_status").count(), 1, "{text}");
+    }
+
+    /// Rule 3 of the shipped workflow bundle tells a session not to poll `verify_status`.
+    #[test]
+    fn bundle_rule3_has_no_poll_instruction() {
+        let rules = include_str!("../assets/nucleos-dev/.nucleos/workflow/workflow.md");
+        let rule3 = rules
+            .lines()
+            .find(|line| line.starts_with("3. **Verification.**"))
+            .expect("workflow.md has a Rule 3");
+        assert!(!rule3.contains("until it settles"), "{rule3}");
+        assert_eq!(rule3.matches("verify_status").count(), 1, "{rule3}");
+        assert!(
+            rule3.contains("never poll `mcp__nucleos__verify_status`"),
+            "{rule3}"
+        );
+        assert!(rule3.contains("nucleos-core --verify-ticket"), "{rule3}");
+    }
+
     // F2b step 2: the refuse switch.
 
     fn write_rules(root: &Path, project: &str, text: &str) {
