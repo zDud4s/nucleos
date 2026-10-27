@@ -50,46 +50,18 @@ pub struct NameRow<'a> {
     pub cosine: f32,
 }
 
-/// The only grouping call. Items are `(position, vector)`; the result is deterministic, lists
-/// positions, and is ordered by each group's smallest position.
-///
-/// Greedy seeding: the lowest unassigned position seeds a group made of every unassigned item whose
-/// cosine to the seed reaches the threshold (closest first, capped at `MAX_MEMBERS`); a seed that
-/// gathers fewer than `MIN_MEMBERS` stays unassigned. The shared grouper of the chat-observation
-/// phase (`embed::cluster`) is not on this branch; if it lands with the same shape, only this
-/// adapter changes.
+/// The only grouping call: the shared `embed::cluster` (spec B12) at the themes' threshold. Items are
+/// `(position, vector)`; the result lists positions, ordered by each group's smallest position.
 fn cluster_groups(items: &[(i64, Vec<f32>)]) -> Vec<Vec<i64>> {
-    let mut assigned = vec![false; items.len()];
-    let mut groups: Vec<Vec<i64>> = Vec::new();
-    for seed in 0..items.len() {
-        if assigned[seed] {
-            continue;
-        }
-        let mut near: Vec<(usize, f32)> = (0..items.len())
-            .filter(|i| *i != seed && !assigned[*i])
-            .filter_map(|i| {
-                crate::embed::cosine(&items[seed].1, &items[i].1)
-                    .filter(|c| *c >= CLUSTER_THRESHOLD)
-                    .map(|c| (i, c))
-            })
-            .collect();
-        near.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        near.truncate(MAX_MEMBERS - 1);
-        if near.len() + 1 < MIN_MEMBERS {
-            continue;
-        }
-        let members: Vec<usize> = std::iter::once(seed)
-            .chain(near.iter().map(|(i, _)| *i))
-            .collect();
-        let mut group: Vec<i64> = members.iter().map(|i| items[*i].0).collect();
-        for member in members {
-            assigned[member] = true;
-        }
-        group.sort_unstable();
-        groups.push(group);
-    }
-    groups.sort_by_key(|g| g[0]);
-    groups
+    let refs: Vec<(i64, &[f32])> = items.iter().map(|(i, v)| (*i, v.as_slice())).collect();
+    crate::embed::cluster::cluster(
+        &refs,
+        crate::embed::cluster::Params {
+            threshold: CLUSTER_THRESHOLD,
+            min_size: MIN_MEMBERS,
+            max_size: MAX_MEMBERS,
+        },
+    )
 }
 
 fn jaccard(a: &HashSet<MemberKey>, b: &HashSet<MemberKey>) -> f64 {
