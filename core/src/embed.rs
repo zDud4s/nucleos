@@ -234,10 +234,62 @@ pub async fn nearest_in(
     Ok(best)
 }
 
+/// The row of one scope closest to `vector` among those embedded by `model`, whose status is one
+/// of `statuses`, skipping `exclude_ids` (a group's own members are evidence, not duplicates).
+/// A tie goes to the lowest id. An empty `statuses` matches nothing.
+pub async fn nearest_in_scope(
+    conn: &mut SqliteConnection,
+    scope_kind: &str,
+    scope_id: Option<&str>,
+    statuses: &[&str],
+    model: &str,
+    vector: &[f32],
+    exclude_ids: &[i64],
+) -> sqlx::Result<Option<(i64, f32)>> {
+    if statuses.is_empty() {
+        return Ok(None);
+    }
+    // The placeholders are the only text built here; every value is bound.
+    let marks = vec!["?"; statuses.len()].join(", ");
+    let sql = format!(
+        "SELECT e.knowledge_id, e.dim, e.vector
+           FROM knowledge_embeddings e
+           JOIN knowledge k ON k.id = e.knowledge_id
+          WHERE k.scope_kind = ? AND k.scope_id IS ?
+            AND k.status IN ({marks})
+            AND e.model = ?
+          ORDER BY e.knowledge_id"
+    );
+    let mut query = sqlx::query(&sql).bind(scope_kind).bind(scope_id);
+    for status in statuses {
+        query = query.bind(*status);
+    }
+    let rows = query.bind(model).fetch_all(conn).await?;
+    let mut best: Option<(i64, f32)> = None;
+    for row in rows {
+        let id: i64 = row.get("knowledge_id");
+        if exclude_ids.contains(&id) {
+            continue;
+        }
+        let dim: i64 = row.get("dim");
+        let blob: Vec<u8> = row.get("vector");
+        let Some(stored) = decode(&blob, dim) else {
+            continue;
+        };
+        let Some(similarity) = cosine(vector, &stored) else {
+            continue;
+        };
+        if best.is_none_or(|(_, top)| similarity > top) {
+            best = Some((id, similarity));
+        }
+    }
+    Ok(best)
+}
+
 /// Consecutive embed errors after which a backfill pass takes the embedder for down and stops.
 const DOWN_AFTER: usize = 3;
 
-/// Embeds up to `limit` live rows that lack a vector from this embedder's model, oldest first,
+/// Embeds up to `limit` live (active, proposed or observed) rows that lack a vector from this embedder's model, oldest first,
 /// and returns how many it embedded.
 ///
 /// One error does not end the pass: the row is passed over and the next one tried. An error is
@@ -255,7 +307,7 @@ pub async fn backfill(
            FROM knowledge k
            LEFT JOIN knowledge_embeddings e ON e.knowledge_id = k.id
            LEFT JOIN knowledge_embed_failures f ON f.knowledge_id = k.id AND f.model = ?
-          WHERE k.status IN ('active', 'proposed')
+          WHERE k.status IN ('active', 'proposed', 'observed')
             AND (e.knowledge_id IS NULL OR e.model <> ?)
             AND f.knowledge_id IS NULL
           ORDER BY k.id
@@ -411,7 +463,10 @@ mod tests {
     use sqlx::SqlitePool;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-    use super::{Embedder, OllamaEmbedder, backfill, cosine, decode, encode, nearest_in, store_in};
+    use super::{
+        Embedder, OllamaEmbedder, backfill, cosine, decode, encode, nearest_in, nearest_in_scope,
+        store_in,
+    };
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -454,6 +509,90 @@ mod tests {
             .fetch_optional(pool)
             .await
             .unwrap()
+    }
+
+    async fn seed_in(
+        pool: &SqlitePool,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        status: &str,
+        title: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', ?, ?, 'owner', 'memory', ?, 'body', ?,
+                     '2026-08-19T00:00:00+00:00')",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(title)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn nearest_in_scope_skips_excluded_ids_and_other_scopes_and_statuses() {
+        let pool = test_pool().await;
+        let query = [1.0_f32, 0.0];
+        let member = seed_in(&pool, "machine", None, "active", "member").await;
+        let other = seed_in(&pool, "machine", None, "active", "second best").await;
+        let rejected = seed_in(&pool, "machine", None, "rejected", "rejected").await;
+        let elsewhere = seed_in(&pool, "project", Some("alpha"), "active", "other scope").await;
+        for (id, v) in [
+            (member, [1.0, 0.0]),
+            (other, [2.0, 1.0]),
+            (rejected, [1.0, 0.0]),
+            (elsewhere, [1.0, 0.0]),
+        ] {
+            store(&pool, id, "m", &v).await;
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        let live = ["active", "proposed"];
+        let top = nearest_in_scope(&mut conn, "machine", None, &live, "m", &query, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(top.0, member);
+        let next = nearest_in_scope(&mut conn, "machine", None, &live, "m", &query, &[member])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.0, other, "the group's own member is evidence, not a duplicate");
+        let dead = nearest_in_scope(&mut conn, "machine", None, &["rejected"], "m", &query, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dead.0, rejected);
+        assert_eq!(
+            nearest_in_scope(&mut conn, "machine", None, &[], "m", &query, &[])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            nearest_in_scope(&mut conn, "project", Some("alpha"), &live, "m", &query, &[elsewhere])
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_embeds_observed_rows_but_not_archived_ones() {
+        let pool = test_pool().await;
+        let observed = seed(&pool, "alpha", "observed", "an observation").await;
+        let archived = seed(&pool, "alpha", "archived", "archived").await;
+        let embedder = Constant {
+            model: "m".to_string(),
+            calls: Mutex::default(),
+        };
+        assert_eq!(backfill(&pool, &embedder, 10).await.unwrap(), 1);
+        assert_eq!(stored_model(&pool, observed).await.as_deref(), Some("m"));
+        assert_eq!(stored_model(&pool, archived).await, None);
     }
 
     /// An embedder that answers the same vector for every text and records what it was asked.
