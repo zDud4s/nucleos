@@ -124,6 +124,12 @@ describe("the desktop notifier's decision", () => {
     expect(out.toasts.map((t) => t.to)).toEqual(["/feed"]);
   });
 
+  it("a capture digest opens the Brain, not the feed", () => {
+    const seen = seeded({ feed: [line(1, "worktree_gc")] });
+    const out = toastsFor(inputs({ feed: [line(1, "worktree_gc"), line(2, "capture_digest")], seen }));
+    expect(out.toasts.map((t) => t.to)).toEqual(["/brain"]);
+  });
+
   it("more than three new things become three toasts and a summary", () => {
     const seen = seeded({ proposals: [proposal(1)] });
     const news = [proposal(2), proposal(3), proposal(4), proposal(5), proposal(6)];

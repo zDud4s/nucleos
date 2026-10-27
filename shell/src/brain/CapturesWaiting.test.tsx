@@ -26,6 +26,7 @@ function request(over: Partial<CaptureRequest> = {}): CaptureRequest {
     note_id: null,
     created_at: "2026-10-08T10:00:00+00:00",
     closed_at: null,
+    digest_id: null,
     ...over,
   };
 }
@@ -34,7 +35,7 @@ function serve(rows: CaptureRequest[]) {
   daemon.apiFetch.mockImplementation((path: string) => {
     if (path === "/capture-requests") return Promise.resolve(rows.filter((r) => r.state === "open"));
     if (path === "/capture-requests?state=all") return Promise.resolve(rows);
-    return Promise.resolve({ note_id: 1, released: true });
+    return Promise.resolve({ note_id: 1, requeued: true });
   });
 }
 
@@ -61,6 +62,17 @@ describe("CapturesWaiting", () => {
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalled());
     expect(container.querySelector("section")).toBeNull();
     expect(screen.queryByText("Questions for you")).toBeNull();
+  });
+
+  it("groups the open questions under their digest and leaves the old ones ungrouped", async () => {
+    serve([
+      request({ job_id: 7, digest_id: 3 }),
+      request({ job_id: 9, digest_id: 3 }),
+      request({ job_id: 4, digest_id: null }),
+    ]);
+    await renderWithRouter(<CapturesWaiting onSelect={() => {}} />);
+    expect(await screen.findByText("Daily questions · 2 open")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Job #4 · alpha" })).toBeTruthy();
   });
 
   it("orders requests by deadline", async () => {

@@ -514,6 +514,14 @@ async fn port_note_text_never_reaches_the_log() {
 
 async fn open_request(state: &AppState, job: i64) {
     sqlx::query(
+        "INSERT OR IGNORE INTO jobs (id, project_id, project_root, status, max_items, created_at)
+            VALUES (?, 'p', '/tmp', 'failed', 3, 't')",
+    )
+    .bind(job)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, \
          deadline, created_at) VALUES (?, 'p', '[]', 'what happened?', 'open', \
          '2099-01-01T00:00:00Z', '2026-10-20T00:00:00Z')",
@@ -576,8 +584,9 @@ async fn port_a_reply_to_a_capture_request_answers_it_without_a_turn() {
 }
 
 #[tokio::test]
-async fn port_a_late_answer_says_the_distiller_moved_on() {
-    // The late answer keeps its note and says the question has moved on; it releases nothing.
+async fn port_a_late_answer_says_no_new_reading_was_scheduled() {
+    // A late answer keeps its note; when no new reading can be scheduled (here the job is gone) it
+    // says so.
     let state = testkit::state().await;
     open_request(&state, 7).await;
     let (c, s) = (conversation(), sender());
@@ -590,12 +599,16 @@ async fn port_a_late_answer_says_the_distiller_moved_on() {
         commands::answer_capture(&state, &at, 7, &input)
             .await
             .unwrap();
+        sqlx::query("DELETE FROM jobs WHERE id = 7")
+            .execute(&state.pool)
+            .await
+            .unwrap();
     }
     assert_eq!(request_state(&state, 7).await, "answered");
     assert_eq!(count(&state, "owner_notes").await, 2);
     let said = answers(&state).await;
     let late = strings::render(&Text::CaptureLate { note: 2 });
-    assert!(late.contains("moved on"), "{late}");
+    assert!(late.contains("no new reading was scheduled"), "{late}");
     assert_eq!(
         said,
         vec![strings::render(&Text::CaptureAnswered { job: 7 }), late]

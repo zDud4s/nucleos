@@ -326,6 +326,14 @@ async fn proposal_pending(state: &AppState, id: i64, title: &str) -> Stimulated 
 /// An open capture request for job `job`, announced through the feed like the distiller's.
 async fn capture_requested(state: &AppState, job: i64, summary: &str) -> Stimulated {
     sqlx::query(
+        "INSERT OR IGNORE INTO jobs (id, project_id, project_root, status, max_items, created_at)
+            VALUES (?, 'p', '/tmp', 'failed', 3, 't')",
+    )
+    .bind(job)
+    .execute(&state.pool)
+    .await
+    .map_err(db)?;
+    sqlx::query(
         "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, \
          deadline, created_at) VALUES (?, 'p', '[]', ?, 'open', '2099-01-01T00:00:00Z', ?)",
     )
