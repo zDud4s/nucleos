@@ -18,6 +18,7 @@ use nucleos_core::*;
 pub mod analytics;
 pub mod analytics_pipeline;
 pub mod assistant;
+pub mod consolidate;
 pub mod devtime;
 pub mod fleet;
 pub mod hooks;

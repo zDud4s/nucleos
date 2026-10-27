@@ -605,6 +605,20 @@ pub(super) async fn run_auto_backup_step(
     }
 }
 
+/// The consolidation sweep of [`run_retention_loop`]. The consolidator (`consolidate.rs`) lives in
+/// `nucleos-app`, which this crate cannot name, so the loop reaches it through this hook.
+#[async_trait::async_trait]
+pub trait Consolidation: Send + Sync {
+    /// Runs one pass if one is due since `last`, and moves `last` when it does. Best-effort: logs
+    /// what the pass did or why it failed, and returns nothing for the loop to act on.
+    async fn step_if_due(
+        &self,
+        pool: &sqlx::SqlitePool,
+        now: chrono::DateTime<chrono::Utc>,
+        last: &mut Option<std::time::Instant>,
+    );
+}
+
 /// Retention for everything finished work leaves behind: a run's transcript and events, its
 /// entries in the activity feed, councils that are over, queued VCS output tails, and briefing
 /// traces. The filtered command-output logs of a run go with its transcript, on the same window. The sixth sweep consolidates durable gate and refused-action histories on its own
@@ -618,7 +632,14 @@ pub(super) async fn run_auto_backup_step(
 /// `auto_backup` switches on the weekly database copy, the one step here that writes outside the
 /// database. Only the primary daemon asks for it: a secondary instance (a test daemon on its own
 /// data directory) has no business filling the disk with snapshots of a throwaway database.
-pub async fn run_retention_loop(state: AppState, auto_backup: bool) {
+///
+/// `consolidation` is the sixth sweep. The consolidator compiles in `nucleos-app`, above this
+/// crate, so the daemon hands it in; `None` skips the sweep (a test of the other five).
+pub async fn run_retention_loop(
+    state: AppState,
+    auto_backup: bool,
+    consolidation: Option<std::sync::Arc<dyn Consolidation>>,
+) {
     let mut ticker = tokio::time::interval(RETENTION_INTERVAL);
     let mut last_consolidated: Option<std::time::Instant> = None;
     let mut backup_failing = false;
@@ -696,21 +717,10 @@ pub async fn run_retention_loop(state: AppState, auto_backup: bool) {
             Ok(closed) => tracing::info!(closed, "knowledge: orphaned working findings closed"),
             Err(error) => tracing::warn!(%error, "knowledge: orphaned finding sweep failed"),
         }
-        if crate::consolidate::due(last_consolidated, std::time::Instant::now()) {
-            last_consolidated = Some(std::time::Instant::now());
-            match crate::consolidate::run_pass(&state.pool, now).await {
-                Ok(report) if report.is_quiet() => {}
-                Ok(report) => tracing::info!(
-                    created = report.created,
-                    remeasured = report.remeasured,
-                    pending = report.pending,
-                    refused = report.refused,
-                    successors = report.successors,
-                    skipped_busy = report.skipped_busy,
-                    "consolidate: pass finished"
-                ),
-                Err(error) => tracing::warn!(%error, "consolidate: pass failed"),
-            }
+        if let Some(consolidation) = &consolidation {
+            consolidation
+                .step_if_due(&state.pool, now, &mut last_consolidated)
+                .await;
         }
         // Last, so the pass's deletes are in the file before the log is folded back into it.
         // Best-effort: a reader holding the log open just means the next hour tries again.

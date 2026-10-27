@@ -167,6 +167,33 @@ pub async fn run_pass(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<Pas
     Ok(report)
 }
 
+/// The consolidator as the retention loop (`execution::runs::run_retention_loop`, in
+/// `nucleos-core`) runs it: `main.rs` hands one in, since that loop cannot name this module.
+pub struct Consolidator;
+
+#[async_trait::async_trait]
+impl crate::execution::runs::Consolidation for Consolidator {
+    async fn step_if_due(&self, pool: &SqlitePool, now: DateTime<Utc>, last: &mut Option<Instant>) {
+        if !due(*last, Instant::now()) {
+            return;
+        }
+        *last = Some(Instant::now());
+        match run_pass(pool, now).await {
+            Ok(report) if report.is_quiet() => {}
+            Ok(report) => tracing::info!(
+                created = report.created,
+                remeasured = report.remeasured,
+                pending = report.pending,
+                refused = report.refused,
+                successors = report.successors,
+                skipped_busy = report.skipped_busy,
+                "consolidate: pass finished"
+            ),
+            Err(error) => tracing::warn!(%error, "consolidate: pass failed"),
+        }
+    }
+}
+
 async fn write_measurement(
     pool: &SqlitePool,
     project: &str,
@@ -1071,7 +1098,7 @@ mod tests {
             built_in.display(),
             running_in.display(),
         );
-        let source = fs::read_to_string(running_in.join("src/consolidate.rs"))
+        let source = fs::read_to_string(running_in.join("../../src/consolidate.rs"))
             .expect("consolidate source must be readable")
             .replace("\r\n", "\n");
         let production = source
