@@ -180,7 +180,10 @@ fn should_retire_none_agent_of(registry: &Registry, key: &EnvKey, generation: Op
     should_retire_none_agent(registry, key)
         && match generation {
             None => true,
-            Some(g) => registry.envs.get(key).is_some_and(|env| env.generation == g),
+            Some(g) => registry
+                .envs
+                .get(key)
+                .is_some_and(|env| env.generation == g),
         }
 }
 
@@ -1111,7 +1114,10 @@ fn retire_none_agent(app: &AppHandle, generation: Option<u32>) {
         state.registry().remove_env(&key);
         // Listed under the gate: every generation that exists now is dead, and a later build takes
         // a higher one that is not in this list.
-        none_dir.as_deref().map(dead_none_agent_dirs).unwrap_or_default()
+        none_dir
+            .as_deref()
+            .map(dead_none_agent_dirs)
+            .unwrap_or_default()
     };
     let _ = app.emit_to(
         MAIN_LABEL,
@@ -2291,7 +2297,10 @@ mod tests {
         // Closed while being built: the close only flags the reservation, the creator releases it.
         reg.reserve_tab("t1", none.clone()).unwrap();
         assert_eq!(reg.remove_tab("t1"), None);
-        assert!(!should_retire_none_agent_of(&reg, &none, Some(3)), "creating");
+        assert!(
+            !should_retire_none_agent_of(&reg, &none, Some(3)),
+            "creating"
+        );
         assert!(reg.finish_tab("t1").is_err());
         reg.release_tab("t1");
         assert!(should_retire_none_agent_of(&reg, &none, Some(3)));
