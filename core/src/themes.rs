@@ -623,13 +623,14 @@ async fn set_member(
         "INSERT INTO theme_members (theme_id, member_kind, member_id, origin, excluded, added_at)
          VALUES (?, ?, ?, 'owner', ?, ?)
          ON CONFLICT(theme_id, member_kind, member_id)
-         DO UPDATE SET excluded = excluded.excluded, origin = 'owner'",
+         DO UPDATE SET excluded = ?, origin = 'owner'",
     )
     .bind(theme_id)
     .bind(kind.as_str())
     .bind(member_id)
     .bind(i64::from(excluded))
     .bind(Utc::now().to_rfc3339())
+    .bind(i64::from(excluded))
     .execute(pool)
     .await?;
     Ok(())
