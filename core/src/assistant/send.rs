@@ -885,6 +885,12 @@ pub(super) async fn send_message_inner(
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+    // A relay whose sender read third-party text hands this turn that text as its prompt, so the
+    // run is marked here, before the turn is spawned: `handover_of` above only keeps THIS turn
+    // `McpOnly`, and an unmarked row would let it leave a resumable session that the next typed turn
+    // picks up with full tools. A mark that fails ends the run as failed and returns the refusal;
+    // the slot and the MCP file are released by their own drops, as for every early return here.
+    inherit_relay_taint(&state.pool, id, relay_id).await?;
     crate::chats::stamp_project(&state.pool, id, chat_id).await;
     // A channel conversation sees "working" as soon as its turn exists. A no-op for any other chat.
     crate::channels::replies::turn_started(state, id, chat_id).await;
@@ -971,6 +977,57 @@ pub(super) async fn send_message_inner(
                 }
             },
         },
+    };
+    // A browser agent's reply that could not be delivered is said to the model once, in front of
+    // whatever else this turn sends (resumed or replayed alike); `runs.prompt` keeps what the person
+    // typed, so a later replay of the history cannot repeat it. A read failure sends no prefix.
+    // The bodies are the browser agent's own output, web text it read included, so the turn that
+    // sees them is marked `read_untrusted` before it is spawned; a mark that fails sends no prefix.
+    //
+    // Peek, mark, THEN take: taking stamps the notices consumed by this run, so taking before the
+    // mark would lose them whenever the mark failed — consumed by a turn that never saw them. A
+    // failed mark leaves them unconsumed for the next turn. A notice posted between the peek and
+    // the take is taken too, which is safe: the run is already marked by then.
+    let pending = crate::chats::notices::has_unconsumed(
+        &state.pool,
+        chat_id,
+        crate::chats::notices::KIND_BROWSER_REPLY,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, chat_id, "could not read the pending browser replies");
+        false
+    });
+    let marked = pending
+        && match crate::execution::runs::mark_untrusted_context(&state.pool, id).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    run_id = id,
+                    "could not mark a turn carrying browser replies; leaving them for the next turn"
+                );
+                false
+            }
+        };
+    let prompt = if !marked {
+        prompt
+    } else {
+        match crate::chats::notices::take_unconsumed(
+            &state.pool,
+            chat_id,
+            crate::chats::notices::KIND_BROWSER_REPLY,
+            id,
+        )
+        .await
+        {
+            Ok(bodies) if !bodies.is_empty() => format!("{}\n\n{prompt}", bodies.join("\n\n")),
+            Ok(_) => prompt,
+            Err(error) => {
+                tracing::warn!(%error, chat_id, "could not read the pending browser replies");
+                prompt
+            }
+        }
     };
     let cwd = cwd.map(std::path::PathBuf::from);
 
@@ -1510,6 +1567,166 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("turn {id} never settled");
+    }
+
+    /// A browser agent's reply that could not be delivered reaches the mother's NEXT turn: once,
+    /// in front of what the person typed, and only the `browser_reply` kind. `runs.prompt` keeps
+    /// the typed words, so a later replay of the history cannot repeat the notice.
+    #[tokio::test]
+    async fn a_pending_browser_reply_notice_prefixes_the_parents_next_turn_exactly_once() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = AppState {
+            runner: fake.clone(),
+            ..test_state().await
+        };
+        let chat = a_chat("browser-reply-parent");
+        let refused = "Not delivered (owner_away): [browser agent · Hotels] Found three hotels.";
+        let notice_id = crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_BROWSER_REPLY,
+            0,
+            refused,
+        )
+        .await
+        .unwrap();
+        crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_RESTART,
+            0,
+            crate::chats::notices::RESTART_NOTICE,
+        )
+        .await
+        .unwrap();
+
+        let first = send_message(&state, &chat, "what next?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, first).await;
+
+        let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            handed.contains(refused),
+            "the notice did not reach the turn: {handed:?}"
+        );
+        assert!(handed.contains("what next?"), "{handed:?}");
+        assert!(
+            handed.find(refused) < handed.find("what next?"),
+            "the notice comes before the typed words: {handed:?}"
+        );
+        assert!(
+            !handed.contains(crate::chats::notices::RESTART_NOTICE),
+            "only browser_reply notices reach the model: {handed:?}"
+        );
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(first)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, "what next?",
+            "runs.prompt keeps what the person typed"
+        );
+        let consumed: Option<i64> =
+            sqlx::query_scalar("SELECT consumed_by_run FROM chat_notices WHERE id = ?")
+                .bind(notice_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            consumed,
+            Some(first),
+            "the notice names the turn that saw it"
+        );
+        let marked: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(first)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            marked, 1,
+            "a turn handed a browser agent's reply has read untrusted text"
+        );
+
+        *fake.last_prompt.lock().unwrap() = None;
+        fake.later_turns.lock().unwrap().clear();
+        let second = send_message(&state, &chat, "and then?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, second).await;
+
+        let mut handed_again: Vec<String> =
+            fake.last_prompt.lock().unwrap().iter().cloned().collect();
+        handed_again.extend(
+            fake.later_turns
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|turn| turn.text.clone()),
+        );
+        assert!(
+            handed_again.iter().any(|text| text.contains("and then?")),
+            "the second turn was never handed over: {handed_again:?}"
+        );
+        assert!(
+            handed_again.iter().all(|text| !text.contains(refused)),
+            "a consumed notice reached a second turn: {handed_again:?}"
+        );
+        crate::assistant::evict_live(&chat);
+    }
+
+    /// A turn whose `read_untrusted` mark cannot be written is handed no browser reply AND takes
+    /// none: the notice stays unconsumed for the next turn instead of being stamped consumed by a
+    /// turn that never saw it.
+    #[tokio::test]
+    async fn a_browser_reply_notice_outlives_a_turn_whose_mark_failed() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = AppState {
+            runner: fake.clone(),
+            ..test_state().await
+        };
+        let chat = a_chat("browser-reply-unmarkable");
+        let refused = "Not delivered (owner_away): [browser agent · Flights] Two flights found.";
+        let notice_id = crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_BROWSER_REPLY,
+            0,
+            refused,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_untrusted_marks BEFORE UPDATE OF read_untrusted ON runs
+             BEGIN SELECT RAISE(ABORT, 'marks refused for this test'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let first = send_message(&state, &chat, "what next?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, first).await;
+
+        let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+        assert!(handed.contains("what next?"), "{handed:?}");
+        assert!(
+            !handed.contains(refused),
+            "an unmarked turn was handed a browser reply: {handed:?}"
+        );
+        let consumed: Option<i64> =
+            sqlx::query_scalar("SELECT consumed_by_run FROM chat_notices WHERE id = ?")
+                .bind(notice_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            consumed, None,
+            "the notice waits for a turn that can be marked"
+        );
+        crate::assistant::evict_live(&chat);
     }
 
     /// A state whose `telegram` channel has a routing row and was launched, so its turns are acked.

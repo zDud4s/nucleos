@@ -503,8 +503,13 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({ "project": null }),
         ] {
-            let (status, answer) =
-                call(&state, "POST", "/browser/embedded/prepare", Some(body.clone())).await;
+            let (status, answer) = call(
+                &state,
+                "POST",
+                "/browser/embedded/prepare",
+                Some(body.clone()),
+            )
+            .await;
             assert_eq!(status, StatusCode::OK, "prepare {body}");
             assert_eq!(answer["proxy_addr"], "127.0.0.1:9911");
         }
@@ -539,7 +544,8 @@ mod tests {
         let shell = async {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
-                let (status, listed) = call(&state, "GET", "/browser/embedded/requests", None).await;
+                let (status, listed) =
+                    call(&state, "GET", "/browser/embedded/requests", None).await;
                 assert_eq!(status, StatusCode::OK);
                 if let Some(request) = listed.as_array().and_then(|list| list.first()) {
                     let request_id = request["request_id"].as_str().unwrap().to_string();
@@ -559,7 +565,9 @@ mod tests {
         let listed = listed.expect("the no-project open was listed for the shell");
         assert_eq!(listed["kind"], "open");
         assert!(
-            listed.get("project").is_some_and(serde_json::Value::is_null),
+            listed
+                .get("project")
+                .is_some_and(serde_json::Value::is_null),
             "project is an explicit null on the wire: {listed}"
         );
 

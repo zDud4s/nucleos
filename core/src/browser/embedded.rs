@@ -641,6 +641,7 @@ pub struct RegisterBody {
 /// The registry key of a body's `project`: the no-project key for a missing one, the id itself
 /// otherwise. An explicit empty string is not the no-project scope, it is a client error, and so is
 /// the internal no-project key named explicitly: the no-project scope is reached only by omitting it.
+#[allow(clippy::result_large_err)] // the error is the ready-made axum response, as in access::resolve_channel
 fn scope_key(project: Option<&str>) -> Result<&str, Response> {
     match project {
         None => Ok(crate::browser::embedded_key(crate::browser::NO_PROJECT)),
@@ -735,8 +736,7 @@ pub async fn post_prepare(
             Err(error) => return sidecar_error(error),
         }
     };
-    match state.browser.client.embedded_prepare(key, &placement).await
-    {
+    match state.browser.client.embedded_prepare(key, &placement).await {
         Ok(prepared) => Json(prepared).into_response(),
         Err(error) => sidecar_error(error),
     }

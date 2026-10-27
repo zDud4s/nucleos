@@ -449,6 +449,16 @@ pub(super) struct SendToChatParams {
     pub(super) text: String,
 }
 
+/// What the model chooses for `browser_agent`; the mother conversation is never a parameter.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct BrowserAgentParams {
+    /// What the browser agent is to do, written so it can work without asking you anything.
+    pub(super) task: String,
+    /// The page to start on, an http or https address. Leave out to let the agent choose.
+    #[serde(default)]
+    pub(super) url: Option<String>,
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct NodeOpenParams {
     /// The node to open this one under. Absent opens a new root.

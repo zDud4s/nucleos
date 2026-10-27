@@ -2044,10 +2044,7 @@ mod tests {
     #[tokio::test]
     async fn a_no_project_session_stays_ephemeral_and_keeps_nothing() {
         let (db, state, seen) = wheeled(
-            vec![
-                "https://login.example.org/",
-                "https://app.example.org/home",
-            ],
+            vec!["https://login.example.org/", "https://app.example.org/home"],
             false,
         )
         .await;
@@ -2077,7 +2074,10 @@ mod tests {
         assert_eq!(row.profile_id, "run-7");
         assert_eq!(row.project_id, None);
         assert!(volante_saw(&seen, "wheel/take"));
-        assert!(!volante_saw(&seen, "open"), "no promotion into a visible project profile");
+        assert!(
+            !volante_saw(&seen, "open"),
+            "no promotion into a visible project profile"
+        );
 
         let chain = give_back(&state, id, None).await.expect("give back");
         assert_eq!(chain.len(), 2);
