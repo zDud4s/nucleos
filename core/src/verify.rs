@@ -1135,8 +1135,9 @@ mod tests {
     use crate::verify::plan::NO_MAP_OWN_NOTE;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-    /// Long enough for a `git --version` unit on a loaded machine, short enough to bound a test.
-    const WAIT: Duration = Duration::from_secs(20);
+    /// Long enough for a `git --version` unit, or a master proof (a fresh probe worktree plus its
+    /// units), on a loaded machine; short enough to bound a test. Only a failing test waits it out.
+    const WAIT: Duration = Duration::from_secs(60);
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -3474,6 +3475,10 @@ tests:
         let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
         let holder = tempfile::tempdir().unwrap();
         let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+        let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
+        // A master head no other test has: the aborted proof is remembered in process memory per
+        // project and head, and every fixture is project `alpha`.
+        master_gains_flag(&f);
 
         let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side))
             .await
@@ -3509,6 +3514,34 @@ tests:
             0,
             "and a second read starts no second probe"
         );
+
+        // Another session with the same suspect group on the same master head: the aborted proof is
+        // remembered, so no proof starts for this ticket (it would stop the same way).
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&two))
+            .await
+            .unwrap();
+        let (second, _) = finished_with(&f, id).await;
+        assert_eq!(second.verdict.as_deref(), Some("failed"), "{second:?}");
+        let py = second
+            .units
+            .iter()
+            .find(|u| u.group.as_deref() == Some("py"))
+            .unwrap();
+        assert!(
+            py.not_inherited
+                .as_deref()
+                .unwrap()
+                .contains("did not finish"),
+            "{py:?}"
+        );
+        let outcome: Option<String> =
+            sqlx::query_scalar("SELECT probe_outcome FROM verify_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(outcome, None, "no proof ran for the second ticket");
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
     }
 
     #[tokio::test]

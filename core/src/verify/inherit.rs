@@ -857,6 +857,13 @@ async fn probe_step(
             short(head)
         )));
     }
+    // A proof of these groups on this very head did not finish a moment ago: a second one would
+    // stop the same way.
+    if let Some(head) = head
+        && probe::aborted_recently(&request.project_id, head, groups, Instant::now())
+    {
+        return Ok(ProbeStep::Task(probe::ABORTED_NOTE.to_owned()));
+    }
     let Some(executor) = executor else {
         return Ok(ProbeStep::Task(
             "no verify executor to prove it on master; treated as your failure".to_owned(),
@@ -881,6 +888,7 @@ async fn probe_step(
                     task_id: row.id,
                     ticket_id: request.id,
                     groups: groups.to_vec(),
+                    head: head.map(str::to_owned),
                 },
             );
             Ok(ProbeStep::Pending(row.id))

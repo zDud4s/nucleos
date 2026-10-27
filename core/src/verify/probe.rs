@@ -74,6 +74,11 @@ pub enum ProbeResult {
     Aborted,
 }
 
+/// What a unit is told when the proof on master did not finish (its own, or a recent one on the
+/// same head and groups).
+pub(super) const ABORTED_NOTE: &str =
+    "the proof on master did not finish; treated as your failure (a later verify tries again)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeOutcome {
     pub task_id: i64,
@@ -93,13 +98,13 @@ impl ProbeOutcome {
         match self.result {
             ProbeResult::Passed => format!(
                 "passes on master{}: the failure is yours",
-                head.map(|h| format!(" at {}", h.chars().take(10).collect::<String>())).unwrap_or_default()
+                head.map(|h| format!(" at {}", h.chars().take(10).collect::<String>()))
+                    .unwrap_or_default()
             ),
-            ProbeResult::Aborted => {
-                "the proof on master did not finish; treated as your failure (a later verify tries again)".to_owned()
-            }
+            ProbeResult::Aborted => ABORTED_NOTE.to_owned(),
             ProbeResult::Failed => {
-                "the master incident this proof opened has since closed; the failure is yours".to_owned()
+                "the master incident this proof opened has since closed; the failure is yours"
+                    .to_owned()
             }
         }
     }
@@ -107,7 +112,7 @@ impl ProbeOutcome {
 
 // ---- one proof per master sha ------------------------------------------------------------------
 
-/// A pass is remembered this long (the proof's own lease).
+/// A pass, or a proof that did not finish, is remembered this long (the proof's own lease).
 const PASS_TTL: Duration = Duration::from_secs(PROBE_LEASE_SECONDS as u64);
 
 /// "These groups passed on this master head": keyed by project and sha so the next ticket with the
@@ -118,15 +123,22 @@ struct ProbeMark {
     at: Instant,
 }
 
-static PASSES: LazyLock<Mutex<HashMap<(String, String), ProbeMark>>> =
-    LazyLock::new(Default::default);
+type Marks = LazyLock<Mutex<HashMap<(String, String), ProbeMark>>>;
 
-pub(super) fn remember_pass(project_id: &str, sha: &str, groups: &[String], at: Instant) {
-    let mut passes = PASSES
+static PASSES: Marks = LazyLock::new(Default::default);
+
+/// "A proof of these groups on this master head did not finish": kept like a pass, so a head whose
+/// proof cannot finish (a loaded machine, a tree that cannot be made) is not re-proved by every
+/// ticket that follows. Only passes and failures are otherwise remembered (the store keeps the
+/// `open` incident; a pass is `PASSES`). Expires with the lease, so a later verify tries again.
+static ABORTS: Marks = LazyLock::new(Default::default);
+
+fn remember(marks: &Marks, project_id: &str, sha: &str, groups: &[String], at: Instant) {
+    let mut marks = marks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    passes.retain(|_, mark| at.saturating_duration_since(mark.at) <= PASS_TTL);
-    let mark = passes
+    marks.retain(|_, mark| at.saturating_duration_since(mark.at) <= PASS_TTL);
+    let mark = marks
         .entry((project_id.to_owned(), sha.to_owned()))
         .or_insert_with(|| ProbeMark {
             groups: BTreeSet::new(),
@@ -136,16 +148,37 @@ pub(super) fn remember_pass(project_id: &str, sha: &str, groups: &[String], at: 
     mark.at = at;
 }
 
-pub(super) fn passed_recently(project_id: &str, sha: &str, groups: &[String], at: Instant) -> bool {
-    let passes = PASSES
+fn recent(marks: &Marks, project_id: &str, sha: &str, groups: &[String], at: Instant) -> bool {
+    let marks = marks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    passes
+    marks
         .get(&(project_id.to_owned(), sha.to_owned()))
         .is_some_and(|mark| {
             at.saturating_duration_since(mark.at) <= PASS_TTL
                 && groups.iter().all(|g| mark.groups.contains(g))
         })
+}
+
+pub(super) fn remember_pass(project_id: &str, sha: &str, groups: &[String], at: Instant) {
+    remember(&PASSES, project_id, sha, groups, at);
+}
+
+pub(super) fn passed_recently(project_id: &str, sha: &str, groups: &[String], at: Instant) -> bool {
+    recent(&PASSES, project_id, sha, groups, at)
+}
+
+pub(super) fn remember_abort(project_id: &str, sha: &str, groups: &[String], at: Instant) {
+    remember(&ABORTS, project_id, sha, groups, at);
+}
+
+pub(super) fn aborted_recently(
+    project_id: &str,
+    sha: &str,
+    groups: &[String],
+    at: Instant,
+) -> bool {
+    recent(&ABORTS, project_id, sha, groups, at)
 }
 
 // ---- single flight inside the process -------------------------------------------------------------
@@ -218,6 +251,8 @@ pub(super) enum ProofJob {
         task_id: i64,
         ticket_id: i64,
         groups: Vec<String>,
+        /// The master head the ticket was classified against: an aborted proof is kept under it.
+        head: Option<String>,
     },
     Reprobe {
         project_id: String,
@@ -249,6 +284,7 @@ pub(super) fn spawn_proof(executor: Arc<Executor>, job: ProofJob) -> bool {
                 task_id,
                 ticket_id,
                 groups,
+                head,
             } => {
                 run_probe(
                     &executor,
@@ -257,6 +293,7 @@ pub(super) fn spawn_proof(executor: Arc<Executor>, job: ProofJob) -> bool {
                     task_id,
                     ticket_id,
                     groups,
+                    head,
                 )
                 .await
             }
@@ -507,6 +544,7 @@ async fn run_probe(
     task_id: i64,
     ticket_id: i64,
     groups: Vec<String>,
+    head: Option<String>,
 ) {
     let proved = prove(
         executor,
@@ -562,6 +600,12 @@ async fn run_probe(
         Ok(_) => {
             if let Some(head) = passed_head {
                 remember_pass(project_id, &head, &groups, Instant::now());
+            }
+            // The next ticket on this head would start the same proof and stop the same way.
+            if result == ProbeResult::Aborted
+                && let Some(head) = &head
+            {
+                remember_abort(project_id, head, &groups, Instant::now());
             }
             let outcome = ProbeOutcome { task_id, result };
             if let Ok(json) = serde_json::to_string(&outcome)
@@ -653,6 +697,38 @@ mod tests {
             "proj-pass-test",
             "sha1",
             &groups(&["py"]),
+            t0 + PASS_TTL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn an_abort_is_remembered_apart_from_passes_until_it_expires() {
+        let t0 = Instant::now();
+        let groups = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        remember_abort("proj-abort-test", "sha1", &groups(&["core"]), t0);
+
+        assert!(aborted_recently(
+            "proj-abort-test",
+            "sha1",
+            &groups(&["core"]),
+            t0 + Duration::from_secs(5)
+        ));
+        assert!(
+            !passed_recently("proj-abort-test", "sha1", &groups(&["core"]), t0),
+            "an abort is not a pass"
+        );
+        assert!(
+            !aborted_recently("proj-abort-test", "sha1", &groups(&["core", "py"]), t0),
+            "a group the aborted proof did not cover"
+        );
+        assert!(
+            !aborted_recently("proj-abort-test", "sha2", &groups(&["core"]), t0),
+            "another master head"
+        );
+        assert!(!aborted_recently(
+            "proj-abort-test",
+            "sha1",
+            &groups(&["core"]),
             t0 + PASS_TTL + Duration::from_secs(1)
         ));
     }
