@@ -41,7 +41,7 @@ pub struct Dossier {
 }
 
 /// Keep the first `width` characters (char-safe).
-fn clip_head(s: &str, width: usize) -> String {
+pub(crate) fn clip_head(s: &str, width: usize) -> String {
     s.chars().take(width).collect()
 }
 

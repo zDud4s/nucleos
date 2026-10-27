@@ -189,6 +189,7 @@ pub async fn propose_in_with(
     .bind(provenance.evidence)
     .bind(provenance.points_at)
     .bind(provenance.distill_cause)
+    .bind(provenance.about)
     .execute(&mut **tx)
     .await?
     .last_insert_rowid();
