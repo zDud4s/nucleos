@@ -327,6 +327,11 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             {
                 tracing::warn!(run_id = id, %error, "could not cancel the run's queued vcs requests");
             }
+            // Task claims go back under the same condition, for the same reason: a pause resumes
+            // and keeps what it claimed.
+            if won && ends_the_run(status) {
+                release_claims_of_run(&state.pool, id).await;
+            }
             // Every terminator here stops the run before its `result`, the only line that carries a
             // cost, so every one of them leaves a run that spent money and reported none — the pause
             // included. It was left out once, on the belief that the resume "carries the real cost
@@ -341,6 +346,44 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             true
         }
         None => false,
+    }
+}
+
+/// Hands back the task claims a run held when it ends. Best effort, like `cancel_for_run`: the run
+/// IS over either way, and `task_claims::is_live` already counts a claim of an ended run as free —
+/// this only puts the row back to `open` and records `released`, so `task_list` and the hooks tell
+/// the truth. A crash that skips it is repaired by `reconcile_at_startup`.
+pub(crate) async fn release_claims_of_run(pool: &sqlx::SqlitePool, run_id: i64) {
+    if let Err(error) = crate::task_claims::store::release_for_owner(
+        pool,
+        crate::task_claims::HolderKind::Run,
+        &run_id.to_string(),
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        tracing::warn!(run_id, %error, "could not hand back the run's task claims");
+    }
+}
+
+/// The supervisor's call, once the run's body has returned or panicked: hands the claims back only
+/// if the row says the run is over. A run that paused itself (`awaiting_approval`) resumes, and
+/// keeps its claims; a body that returned without writing a terminal state keeps them too, because
+/// `is_live` already answers for it and the status write is someone else's business.
+pub(super) async fn release_claims_if_over(pool: &sqlx::SqlitePool, run_id: i64) {
+    let status = match sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::warn!(run_id, %error, "could not read the run's status to hand its task claims back");
+            return;
+        }
+    };
+    if status.is_some_and(|status| TERMINAL_RUN_STATUSES.contains(&status.as_str())) {
+        release_claims_of_run(pool, run_id).await;
     }
 }
 
