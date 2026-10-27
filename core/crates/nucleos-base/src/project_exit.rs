@@ -2199,6 +2199,31 @@ mod tests {
         )
     }
 
+    /// A note reference has no project, so it never makes a lesson's `knowledge` evidence mixed: the lesson
+    /// whose knowledge evidence is all alpha's goes with alpha even with a note beside it; its twin that also
+    /// rests on bravo stays.
+    #[tokio::test]
+    async fn forgetting_a_project_deletes_a_lesson_whose_knowledge_evidence_is_all_its_own_even_with_note_refs()
+     {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        let a = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let b = lesson_row(&pool, "project", Some("bravo"), "[]", None).await;
+        let with_note = lesson_row(
+            &pool,
+            "machine",
+            None,
+            &format!(r#"[{{"t":"knowledge","id":{a}}},{{"t":"note","id":3}}]"#),
+            Some("generalised"),
+        )
+        .await;
+        let mixed = lesson_row(&pool, "machine", None, &refs(&[a, b]), Some("generalised")).await;
+        remove(&pool, "alpha", true).await.unwrap();
+        assert!(!present(&pool, with_note).await);
+        assert!(present(&pool, mixed).await);
+        assert!(present(&pool, b).await);
+    }
+
     /// Derived (a), spec 9: a general lesson whose `knowledge` evidence is ALL the forgotten project's goes with it;
     /// one that also rests on another project stays (the owner approved its text). The lesson is selected BEFORE its
     /// evidence rows are deleted: afterwards every id would look foreign and the lesson would read as mixed.
