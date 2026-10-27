@@ -2469,4 +2469,99 @@ mod tests {
         let verdict = claim_gate::check(&pool, &landing, false, deadline(), chrono::Utc::now()).await;
         assert!(matches!(verdict, claim_gate::Verdict::Clear));
     }
+
+    #[tokio::test]
+    async fn a_claim_taken_after_admission_stops_the_merge_when_the_queue_runs_it() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-recheck-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let master_before = sha_of(&repo, "master");
+
+        let id = land_feat_x(&pool, &repo, Origin::Shell, false).await.expect("nothing is claimed yet");
+        claimed_task(&pool, &repo, "file:feature.txt", &["feature.txt"], &[], holder(HolderKind::Session, "s1", "C:/elsewhere")).await;
+
+        assert!(crate::execution::vcs::drain_once(&pool, "alpha", &crate::execution::git_exec::GitExecutor::default()).await);
+        let ticket = crate::execution::vcs::wait_for(&pool, id, std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(ticket.status, "failed");
+        assert!(ticket.failure_reason.as_deref().unwrap_or("").contains("task #"), "{:?}", ticket.failure_reason);
+        assert_eq!(sha_of(&repo, "master"), master_before, "nothing was published");
+    }
+
+    #[tokio::test]
+    async fn the_owners_override_is_recorded_once_and_holds_at_execution_time() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-override-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let task = claimed_task(&pool, &repo, "file:feature.txt", &["feature.txt"], &[], holder(HolderKind::Session, "s1", "C:/elsewhere")).await;
+
+        assert!(matches!(land_feat_x(&pool, &repo, Origin::Shell, false).await, Err(LandRefusal::Claimed(_))));
+        let id = land_feat_x(&pool, &repo, Origin::Shell, true).await.expect("the owner overrides");
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claim_events WHERE task_id = ? AND event = 'override_land'")
+            .bind(task.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(events, 1);
+
+        assert!(crate::execution::vcs::drain_once(&pool, "alpha", &crate::execution::git_exec::GitExecutor::default()).await);
+        let ticket = crate::execution::vcs::wait_for(&pool, id, std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(ticket.status, "succeeded", "the recorded override is honoured at execution time");
+    }
+
+    #[tokio::test]
+    async fn the_gates_own_revert_is_never_gated_even_when_its_incident_guards_the_files() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-revert-", "chore/other");
+        seed_project(&pool, "alpha", &repo, None).await;
+        let postgate = crate::verify::postgate::postgate_worktree(&repo).to_string_lossy().into_owned();
+        claimed_task(&pool, &repo, "file:feature.txt", &["feature.txt"], &[], holder(HolderKind::Postgate, "alpha", &postgate)).await;
+
+        let merge = Op::Merge { source: Branch::new("feat/x").unwrap(), target: Branch::new("master").unwrap() };
+        let revert = Op::Revert {
+            merge_sha: crate::execution::vcs::CommitSha::new(&sha_of(&repo, "feat/x")).unwrap(),
+            target: Branch::new("master").unwrap(),
+        };
+        let master = Branch::new("master").unwrap();
+        let gated = claim_gate::refusal_for_op(&pool, "alpha", &repo, &merge, false, None, Some(&master)).await;
+        assert!(gated.is_some(), "a merge touching the guarded file is held");
+        assert!(claim_gate::refusal_for_op(&pool, "alpha", &repo, &revert, false, None, Some(&master)).await.is_none());
+        assert!(claim_gate::refusal_for_op(&pool, "alpha", &repo, &merge, true, None, Some(&master)).await.is_none(), "resolver landings are exempt");
+    }
+
+    /// The queue-time gate only judges a landing: a merge INTO the integration branch. An agent
+    /// merging `master` into its own `feat/x` to catch up crosses a foreign guard path (master moved
+    /// it) and must pass; so must every merge when the integration branch is unknown.
+    #[tokio::test]
+    async fn a_merge_into_another_branch_than_the_integration_branch_is_not_a_landing() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-catchup-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        // master moves on after the fork and touches seed.txt; a foreign session guards that file.
+        assert!(git_in(&repo, &["checkout", "-q", "master"]));
+        std::fs::write(repo.join("seed.txt"), "master moved\n").unwrap();
+        assert!(git_in(&repo, &["commit", "-am", "master moves"]));
+        assert!(git_in(&repo, &["checkout", "-q", "chore/other"]));
+        claimed_task(&pool, &repo, "file:seed.txt", &["seed.txt"], &[], holder(HolderKind::Session, "s1", "C:/elsewhere")).await;
+
+        let master = Branch::new("master").unwrap();
+        let feature = Branch::new("feat/x").unwrap();
+        let catch_up = Op::Merge { source: master.clone(), target: feature.clone() };
+
+        // Control: were feat/x the integration branch, this very merge would be held. So the pass
+        // below is the target check at work, not an absence of anything to guard.
+        let held = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, None, Some(&feature)).await;
+        assert!(held.is_some(), "the guard bites when the target is the integration branch");
+
+        let into_feature = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, None, Some(&master)).await;
+        assert!(into_feature.is_none(), "master -> feat/x is not a landing: {into_feature:?}");
+        let unknown = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, None, None).await;
+        assert!(unknown.is_none(), "an unresolved integration branch means no queue-time gate");
+    }
 }
