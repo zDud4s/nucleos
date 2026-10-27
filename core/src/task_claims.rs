@@ -12,6 +12,8 @@
 use serde::Serialize;
 
 pub mod keys;
+pub mod sessions;
+pub mod store;
 
 pub use keys::{KeyError, TaskKey};
 
@@ -253,5 +255,68 @@ mod tests {
         let json = serde_json::to_value(row_with(None)).unwrap();
         assert_eq!(json["key"], "master-red");
         assert_eq!(json["status"], "open");
+    }
+}
+
+/// Fixtures for the tests of the HTTP, MCP and run-lifecycle layers.
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    /// An `open`, unheld `declared` task of project `alpha`. The key is taken as given (no
+    /// normalisation): tests name it the way `keys::normalize` would have.
+    pub fn row(key: &str, id: i64) -> TaskRow {
+        TaskRow {
+            id,
+            project_id: "alpha".to_owned(),
+            key: keys::TaskKey(key.to_owned()),
+            kind: TaskKind::Declared,
+            title: key.to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: Vec::new(),
+            hint_paths: Vec::new(),
+            status: Status::Open,
+            holder_kind: None,
+            holder_id: None,
+            holder_worktree: None,
+            lease_until: None,
+            checked_sha: None,
+            probe_lease_until: None,
+            created_at: "2026-10-22T00:00:00.000000Z".to_owned(),
+            claimed_at: None,
+            closed_at: None,
+            close_note: None,
+        }
+    }
+
+    pub fn new_task(key: &str, kind: TaskKind) -> NewTask {
+        NewTask {
+            key: keys::TaskKey(key.to_owned()),
+            kind,
+            title: key.to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: Vec::new(),
+            hint_paths: Vec::new(),
+        }
+    }
+
+    /// Claims `key` (a `declared` task of project `alpha`) for `holder` now; returns the task id.
+    pub async fn claimed_by(pool: &SqlitePool, holder: &Holder, key: &str) -> i64 {
+        let new = new_task(key, TaskKind::Declared);
+        match store::claim(pool, "alpha", new, holder, chrono::Utc::now()).await.unwrap() {
+            ClaimOutcome::Won { task, .. } => task.id,
+            ClaimOutcome::Lost { .. } => panic!("{key} was already held"),
+        }
+    }
+
+    /// `(status, holder_id)` as stored, read straight from the table: no `is_live`, no liveness
+    /// rules, so a test can tell "released" from "merely not live".
+    pub async fn state_of(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, holder_id FROM task_claims WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 }
