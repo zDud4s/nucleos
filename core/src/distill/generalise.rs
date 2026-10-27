@@ -1,8 +1,10 @@
 //! The daily generalisation pass: groups look-alike `source = 'distiller'` rows by embedding and asks the
 //! distiller's model for ONE general lesson per group that rests on three distinct subjects (spec 5).
 //!
-//! It reads no owner text (the notes seam, [`notes_near`], is Phase 6's) and writes only `proposed` rows: the
-//! owner approves a general lesson or it never reaches a prompt. State lives in `schema_meta` keys, no table.
+//! It reads owner text only as context for the model (the near notes, [`notes_near`] and [`note_texts`]: the
+//! two sanctioned reads of the notes module), never quoted and never stored, and writes only `proposed` rows:
+//! the owner approves a general lesson or it never reaches a prompt. State lives in `schema_meta` keys, no
+//! table.
 
 mod plan;
 #[cfg(test)]
@@ -117,23 +119,80 @@ pub(crate) async fn form_groups(
 }
 
 /// A note close to a group: only its id and cosine. The id is the distinct subject `note:<id>` (it counts for
-/// `MIN_SUBJECTS` and proves `about`, owner decision P5). Texts are NOT here: Phase 6 fetches them itself
-/// with `owner_notes::texts_for_ids` as CONTEXT for the model only, never quoted and never stored.
+/// `MIN_SUBJECTS` and proves `about`, owner decision P5). The texts are fetched apart, by [`note_texts`], as
+/// CONTEXT for the model only: never quoted and never stored.
 pub(crate) struct NearNote {
     pub id: i64,
-    #[allow(dead_code)] // Phase 6 reads it when it fills the seam.
+    #[allow(dead_code)] // the lookup orders by it; the pass itself only needs the id.
     pub cosine: f32,
 }
 
-/// Notes close to a group: Phase 6's seam. Phase 6 implements it on `owner_notes::nearest_to_vector`
-/// (`group.centroid`, `model`, `CLUSTER_THRESHOLD`, `MAX_NOTES_PER_GROUP`) and adds the sanctioned calls to the
-/// boundary sweep (spec section 10). Returns empty until then; this module names no owner-notes API.
-pub(crate) async fn notes_near(
-    _pool: &SqlitePool,
-    _group: &Group,
-    _model: &str,
-) -> Vec<NearNote> {
-    Vec::new()
+/// A note must be this close to a group's centroid to count: the grouping threshold (spec 5.2).
+pub(crate) const NOTE_FLOOR: f32 = CLUSTER_THRESHOLD;
+/// At most this many notes per group; a guess until there is data.
+pub(crate) const MAX_NOTES_PER_GROUP: usize = 5;
+
+/// Notes close to a group, best first: ids and cosines only, never text. Best-effort: a failed lookup is a
+/// group without notes. The sanctioned read of the notes module (spec 2026-10-22 section 10).
+pub(crate) async fn notes_near(pool: &SqlitePool, group: &Group, model: &str) -> Vec<NearNote> {
+    match crate::owner_notes::nearest_to_vector(
+        pool,
+        model,
+        &group.centroid,
+        NOTE_FLOOR,
+        MAX_NOTES_PER_GROUP,
+    )
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(id, cosine)| NearNote { id, cosine })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The text of the near notes, as owner context for the model. Best-effort, and the only other read of the
+/// notes module in this file; the texts never reach a log.
+async fn note_texts(pool: &SqlitePool, near: &[NearNote]) -> Vec<String> {
+    if near.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<i64> = near.iter().map(|n| n.id).collect();
+    match crate::owner_notes::texts_for_ids(pool, &ids).await {
+        Ok(rows) => rows.into_iter().map(|(_, text)| text).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A group's subjects plus one `note:<id>` subject per near note (built through [`Subject::Note`], never by
+/// formatting a key).
+fn subjects_with_notes(subjects: &BTreeSet<Subject>, near: &[NearNote]) -> BTreeSet<Subject> {
+    subjects
+        .iter()
+        .cloned()
+        .chain(near.iter().map(|n| Subject::Note(n.id)))
+        .collect()
+}
+
+/// The evidence of a general lesson: its `knowledge` rows, then the near notes by id (never their text), at
+/// most `MAX_EVIDENCE` entries in all. The `knowledge` rows are cut first so the notes fit.
+fn evidence_json(member_ids: &[i64], near: &[NearNote]) -> String {
+    let notes = near.len().min(MAX_EVIDENCE);
+    let knowledge = member_ids.len().min(MAX_EVIDENCE - notes);
+    serde_json::Value::Array(
+        member_ids
+            .iter()
+            .take(knowledge)
+            .map(|id| serde_json::json!({"t": "knowledge", "id": id}))
+            .chain(
+                near.iter()
+                    .take(notes)
+                    .map(|n| serde_json::json!({"t": "note", "id": n.id})),
+            )
+            .collect(),
+    )
+    .to_string()
 }
 
 const PASS_STANDING: &str = "You read several look-alike notes an assistant wrote down at different times, in \
@@ -252,6 +311,7 @@ pub(crate) async fn write_lesson(
     group: &Group,
     lesson: &Lesson,
     placement: &Placement,
+    near: &[NearNote],
     note_texts: &[String],
 ) -> sqlx::Result<Written> {
     if placement.reach == Reach::Nowhere {
@@ -269,14 +329,7 @@ pub(crate) async fn write_lesson(
         .filter_map(|m| m.project().map(str::to_owned))
         .collect();
     let fingerprint = crate::knowledge::title_fingerprint(&lesson.title);
-    let evidence = serde_json::Value::Array(
-        member_ids
-            .iter()
-            .take(MAX_EVIDENCE)
-            .map(|id| serde_json::json!({"t": "knowledge", "id": id}))
-            .collect(),
-    )
-    .to_string();
+    let evidence = evidence_json(&member_ids, near);
 
     let mut tx = pool.begin().await?;
     let mut best: Option<(i64, f32)> = None;
@@ -470,12 +523,12 @@ pub(crate) async fn pass(
     let groups = form_groups(pool, embedder.model(), now).await?;
     let mut prepared = Vec::new();
     for group in &groups {
-        // Phase 6's seam; empty today.
         let near = notes_near(pool, group, embedder.model()).await;
-        // Phase 6: owner_notes::texts_for_ids(near ids).
-        let note_texts: Vec<String> = Vec::new();
-        let mut subjects: BTreeSet<String> = group.subjects.iter().map(Subject::key).collect();
-        subjects.extend(near.iter().map(|n| Subject::Note(n.id).key()));
+        let note_texts = note_texts(pool, &near).await;
+        let subjects: BTreeSet<String> = subjects_with_notes(&group.subjects, &near)
+            .iter()
+            .map(Subject::key)
+            .collect();
         let ids: Vec<i64> = group.members.iter().map(|m| m.id).collect();
         let memory: Option<GroupMemory> = meta(pool, &memory_key(group.min_id))
             .await
@@ -518,17 +571,19 @@ pub(crate) async fn pass(
                 .iter()
                 .filter_map(|m| m.project().map(str::to_owned))
                 .collect();
-            let all: BTreeSet<Subject> = p
-                .group
-                .subjects
-                .iter()
-                .cloned()
-                .chain(p.near.iter().map(|n| Subject::Note(n.id)))
-                .collect();
+            let all = subjects_with_notes(&p.group.subjects, &p.near);
             let placement = scope_for(&projects, &all, lesson.owner);
-            if write_lesson(pool, embedder, p.group, lesson, &placement, &p.note_texts)
-                .await
-                .is_err()
+            if write_lesson(
+                pool,
+                embedder,
+                p.group,
+                lesson,
+                &placement,
+                &p.near,
+                &p.note_texts,
+            )
+            .await
+            .is_err()
             {
                 continue;
             }

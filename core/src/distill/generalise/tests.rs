@@ -441,13 +441,259 @@ async fn memory_of_a_group_that_no_longer_exists_is_pruned() {
     assert_eq!(left, 0);
 }
 
-#[tokio::test]
-async fn before_phase_six_no_notes_are_near_a_group() {
-    let group = Group {
+fn near(id: i64) -> NearNote {
+    NearNote { id, cosine: 0.9 }
+}
+
+/// An active note with a stored vector under `model`.
+async fn embedded_note(pool: &SqlitePool, text: &str, model: &str, v: [f32; 2]) -> i64 {
+    let id = crate::owner_notes::create(pool, text, "shell").await.unwrap();
+    sqlx::query(
+        "INSERT INTO owner_note_embeddings (note_id, model, dim, vector, text_hash, created_at)
+         VALUES (?, ?, 2, ?, 'h', 't')",
+    )
+    .bind(id)
+    .bind(model)
+    .bind(crate::embed::encode(&v))
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Three rows of ONE job in one project: a single subject, so only notes can make the group eligible.
+async fn one_job_trio(pool: &SqlitePool) {
+    for i in 0..3 {
+        seed(
+            pool,
+            ("project", Some("alpha")),
+            "proposed",
+            &format!("Same job {i}"),
+            &job(1),
+            &[1.0, 0.0],
+        )
+        .await;
+    }
+}
+
+fn group_of(subjects: &[Subject]) -> Group {
+    Group {
         members: Vec::new(),
-        subjects: BTreeSet::new(),
+        subjects: subjects.iter().cloned().collect(),
         centroid: vec![1.0, 0.0],
         min_id: 1,
-    };
-    assert!(notes_near(&pool().await, &group, "fake-model").await.is_empty());
+    }
+}
+
+#[test]
+fn a_nearby_note_counts_as_a_distinct_subject_named_note_id() {
+    let subjects =
+        subjects_with_notes(&group_of(&[Subject::Job(7)]).subjects, &[near(11), near(12)]);
+    let keys: BTreeSet<String> = subjects.iter().map(Subject::key).collect();
+    assert_eq!(
+        keys,
+        ["job:7", "note:11", "note:12"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert!(
+        subjects.len() >= plan::MIN_SUBJECTS,
+        "one row plus two notes reach MIN_SUBJECTS"
+    );
+}
+
+#[tokio::test]
+async fn notes_alone_do_not_form_a_group() {
+    let pool = pool().await;
+    for text in ["one", "two", "three"] {
+        embedded_note(&pool, text, MODEL, [1.0, 0.0]).await;
+    }
+    let groups = form_groups(&pool, MODEL, Utc::now()).await.unwrap();
+    assert!(groups.is_empty());
+    assert_eq!(
+        pass(&pool, Extractor::Cli(&down()), &embedder(), Utc::now())
+            .await
+            .unwrap(),
+        Outcome::Done,
+        "no group, so no model call"
+    );
+}
+
+#[tokio::test]
+async fn notes_near_applies_the_floor_the_cap_and_the_active_filter() {
+    let pool = pool().await;
+    let mut kept = Vec::new();
+    for i in 0..7 {
+        kept.push(
+            embedded_note(&pool, &format!("note {i}"), MODEL, [1.0, 0.01 * i as f32]).await,
+        );
+    }
+    let archived = embedded_note(&pool, "gone", MODEL, [1.0, 0.0]).await;
+    sqlx::query("UPDATE owner_notes SET state = 'archived' WHERE id = ?")
+        .bind(archived)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let below = embedded_note(&pool, "far", MODEL, [0.0, 1.0]).await;
+    let group = group_of(&[Subject::Job(1)]);
+    let got: Vec<i64> = notes_near(&pool, &group, MODEL)
+        .await
+        .into_iter()
+        .map(|n| n.id)
+        .collect();
+    assert_eq!(got.len(), MAX_NOTES_PER_GROUP);
+    assert!(!got.contains(&archived) && !got.contains(&below));
+}
+
+#[tokio::test]
+async fn near_notes_make_a_one_job_group_eligible_and_prove_about_owner() {
+    let pool = pool().await;
+    one_job_trio(&pool).await;
+    embedded_note(&pool, "I like short answers", MODEL, [1.0, 0.0]).await;
+    embedded_note(&pool, "keep replies brief", MODEL, [1.0, 0.0]).await;
+    let runner = answering(
+        r#"[{"layer":"semantic","title":"Prefers brief replies","body":"Keep answers short.","about":"owner"}]"#,
+    );
+    pass(&pool, Extractor::Cli(&runner), &embedder(), Utc::now())
+        .await
+        .unwrap();
+    let (kind, about, evidence): (String, Option<String>, String) = sqlx::query_as(
+        "SELECT scope_kind, about, evidence FROM knowledge WHERE distill_cause = 'generalised'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((kind.as_str(), about.as_deref()), ("machine", Some("owner")));
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&evidence).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e["t"] == "note")
+            .count(),
+        2
+    );
+    assert!(
+        !evidence.contains("short answers"),
+        "ids only, never the note text"
+    );
+}
+
+#[tokio::test]
+async fn notes_do_not_count_as_projects() {
+    let pool = pool().await;
+    one_job_trio(&pool).await;
+    embedded_note(&pool, "one", MODEL, [1.0, 0.0]).await;
+    embedded_note(&pool, "two", MODEL, [1.0, 0.0]).await;
+    let runner =
+        answering(r#"[{"layer":"semantic","title":"Same job lesson","body":"b","about":"work"}]"#);
+    pass(&pool, Extractor::Cli(&runner), &embedder(), Utc::now())
+        .await
+        .unwrap();
+    let (kind, scope, about): (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT scope_kind, scope_id, about FROM knowledge WHERE distill_cause = 'generalised'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (kind.as_str(), scope.as_deref(), about),
+        ("project", Some("alpha"), None)
+    );
+}
+
+#[test]
+fn evidence_carries_note_ids_without_text_and_stays_within_20_entries() {
+    let ids: Vec<i64> = (1..=18).collect();
+    let ev = evidence_json(&ids, &[near(11), near(12), near(13)]);
+    let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+    let entries = v.as_array().unwrap();
+    assert_eq!(entries.len(), 20);
+    assert!(
+        entries
+            .iter()
+            .any(|e| e == &serde_json::json!({"t": "note", "id": 11}))
+    );
+    assert!(!ev.contains("text"));
+    let none = evidence_json(&ids, &[]);
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&none)
+            .unwrap()
+            .len(),
+        18
+    );
+}
+
+#[test]
+fn the_note_text_is_scrubbed_and_sits_under_do_not_quote() {
+    let group = group_of(&[Subject::Job(1)]);
+    let with = dossier(&group, &["call me at sk-ABCDEF1234567890XYZ".to_owned()]);
+    assert!(with.contains("do not quote"));
+    assert!(!with.contains("sk-ABCDEF1234567890XYZ"));
+    assert!(!dossier(&group, &[]).contains("OWNER CONTEXT"));
+}
+
+#[tokio::test]
+async fn a_lesson_that_quotes_a_nearby_note_gets_the_quoted_owner_text_event() {
+    const NOTE: &str = "the staging database is restored from the friday backup every week";
+    for quotes in [true, false] {
+        let pool = pool().await;
+        one_job_trio(&pool).await;
+        embedded_note(&pool, NOTE, MODEL, [1.0, 0.0]).await;
+        embedded_note(&pool, "an unrelated second note", MODEL, [1.0, 0.0]).await;
+        let body = if quotes {
+            NOTE
+        } else {
+            "Restore staging regularly."
+        };
+        let runner = answering(&format!(
+            r#"[{{"layer":"semantic","title":"Staging restore","body":"{body}","about":"owner"}}]"#
+        ));
+        pass(&pool, Extractor::Cli(&runner), &embedder(), Utc::now())
+            .await
+            .unwrap();
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge_events e JOIN knowledge k ON k.id = e.knowledge_id
+              WHERE k.distill_cause = 'generalised' AND e.note = 'quoted_owner_text'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, i64::from(quotes));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM knowledge WHERE distill_cause = 'generalised'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "proposed");
+    }
+}
+
+#[tokio::test]
+async fn a_new_note_is_a_new_subject_for_the_group_memory() {
+    let pool = pool().await;
+    one_job_trio(&pool).await;
+    let now = Utc::now();
+    embedded_note(&pool, "one", MODEL, [1.0, 0.0]).await;
+    embedded_note(&pool, "two", MODEL, [1.0, 0.0]).await;
+    run_if_due(&pool, Extractor::Cli(&answering("[]")), Some(&embedder()), now).await;
+    // Same subjects a day later: not asked, so a down brain still succeeds.
+    run_if_due(
+        &pool,
+        Extractor::Cli(&down()),
+        Some(&embedder()),
+        now + Duration::hours(25),
+    )
+    .await;
+    assert_eq!(attempts(&pool).await.as_deref(), Some("0"));
+    // A third note is a new subject: asked again, and the brain was down.
+    embedded_note(&pool, "three", MODEL, [1.0, 0.0]).await;
+    run_if_due(
+        &pool,
+        Extractor::Cli(&down()),
+        Some(&embedder()),
+        now + Duration::hours(50),
+    )
+    .await;
+    assert_eq!(attempts(&pool).await.as_deref(), Some("1"));
 }
