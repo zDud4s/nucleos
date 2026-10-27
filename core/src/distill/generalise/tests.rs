@@ -697,3 +697,65 @@ async fn a_new_note_is_a_new_subject_for_the_group_memory() {
     .await;
     assert_eq!(attempts(&pool).await.as_deref(), Some("1"));
 }
+
+#[tokio::test]
+async fn three_weeks_with_the_same_rhythm_are_three_subjects_and_reach_the_pass() {
+    let pool = pool().await;
+    for week in ["2026-W41", "2026-W42", "2026-W43"] {
+        seed(
+            &pool,
+            ("observation", Some(&format!("week:{week}"))),
+            "observed",
+            &format!("Mon 07:00 gym {week}"),
+            "[]",
+            &[1.0, 0.0],
+        )
+        .await;
+    }
+    let groups = form_groups(&pool, MODEL, Utc::now()).await.unwrap();
+    assert_eq!(groups.len(), 1);
+    let keys: BTreeSet<String> = groups[0].subjects.iter().map(Subject::key).collect();
+    assert_eq!(
+        keys,
+        ["week:2026-W41", "week:2026-W42", "week:2026-W43"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    let runner = answering(
+        r#"[{"layer":"semantic","title":"Trains on Monday mornings","body":"b","about":"owner"}]"#,
+    );
+    pass(&pool, Extractor::Cli(&runner), &embedder(), Utc::now())
+        .await
+        .unwrap();
+    let (kind, about): (String, Option<String>) = sqlx::query_as(
+        "SELECT scope_kind, about FROM knowledge WHERE distill_cause = 'generalised'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((kind.as_str(), about.as_deref()), ("machine", Some("owner")));
+}
+
+#[tokio::test]
+async fn observations_of_one_week_are_one_subject_below_the_minimum() {
+    let pool = pool().await;
+    for i in 0..3 {
+        seed(
+            &pool,
+            ("observation", Some("week:2026-W41")),
+            "observed",
+            &format!("Mon 07:00 gym {i}"),
+            "[]",
+            &[1.0, 0.0],
+        )
+        .await;
+    }
+    // A model call would turn the pass into `Failed`.
+    assert_eq!(
+        pass(&pool, Extractor::Cli(&down()), &embedder(), Utc::now())
+            .await
+            .unwrap(),
+        Outcome::Done
+    );
+}
