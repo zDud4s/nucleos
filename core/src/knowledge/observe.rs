@@ -62,12 +62,16 @@ pub async fn sweep_observations(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::
         "knowledge_embed_failures",
         "knowledge_events",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE knowledge_id IN ({stale})"))
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE knowledge_id IN ({stale})"
+        )))
             .bind(&cutoff)
             .execute(&mut *tx)
             .await?;
     }
-    let removed = sqlx::query(&format!("DELETE FROM knowledge WHERE id IN ({stale})"))
+    let removed = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM knowledge WHERE id IN ({stale})"
+    )))
         .bind(&cutoff)
         .execute(&mut *tx)
         .await?
@@ -226,9 +230,9 @@ mod tests {
             "knowledge_embed_failures",
             "knowledge_events",
         ] {
-            let orphans: i64 = sqlx::query_scalar(&format!(
+            let orphans: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE knowledge_id IN ({old}, {archived})"
-            ))
+            )))
             .fetch_one(&pool)
             .await
             .unwrap();

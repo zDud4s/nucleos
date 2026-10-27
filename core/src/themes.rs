@@ -129,7 +129,7 @@ const ATTEMPTS_KEY: &str = "themes.clustered_attempts";
 pub fn pass_due(now: DateTime<Utc>, sealed: Option<DateTime<Utc>>, attempts: i64) -> bool {
     let Some(sealed) = sealed else { return true };
     if attempts > 0 && attempts < MAX_PASS_ATTEMPTS {
-        return crate::distill::extract::retry_at(attempts, sealed).is_some_and(|at| now >= at);
+        return crate::distill::retry_at(attempts, sealed).is_some_and(|at| now >= at);
     }
     now - sealed >= PERIOD
 }

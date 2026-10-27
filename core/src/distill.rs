@@ -2487,23 +2487,8 @@ mod tests {
     use super::{Dedup, SIM_NEAR, SIM_SAME, dedup_verdict, process_one_with, tick};
     use crate::embed::{Embedder, FakeEmbedder};
 
-    /// Claim the next due queue row and process it with `answer` as the brain's reply.
-    async fn distil(pool: &SqlitePool, answer: &str, embedder: Option<&dyn Embedder>) {
-        let runner = fake_answering(answer);
-        let row = claim_next(pool, noon()).await.unwrap().expect("a due row");
-        process_one_with(pool, Extractor::Cli(&runner), embedder, row, noon()).await;
-    }
-
     async fn embedding_count(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_embeddings")
-            .fetch_one(pool)
-            .await
-            .unwrap()
-    }
-
-    async fn events_noted(pool: &SqlitePool, note: &str) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE note = ?")
-            .bind(note)
             .fetch_one(pool)
             .await
             .unwrap()

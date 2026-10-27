@@ -580,6 +580,7 @@ mod tests {
             job_id: None,
             item_id: Some(202643),
             run_id: None,
+            chat_id: None,
             attempts: 0,
         }
     }
