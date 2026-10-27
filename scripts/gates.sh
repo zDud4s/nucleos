@@ -505,7 +505,8 @@ if [ "$target" = broker ]; then
     echo "python missing — the broker tests need it (scripts/doctor.sh reports this)" >&2
     failures="$failures  broker: python not installed"$'\n'
   else
-    run "broker: tests" . "$py" -m unittest discover -s scripts/heavy_tests -p 'test_heavy_*.py'
+    # NUCLEOS_HEAVY_LOCAL: the code under test is this checkout's broker, not master's staged one.
+    NUCLEOS_HEAVY_LOCAL=1 run "broker: tests" . "$py" -m unittest discover -s scripts/heavy_tests -p 'test_heavy_*.py'
   fi
 fi
 
