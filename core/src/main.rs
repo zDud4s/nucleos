@@ -986,10 +986,12 @@ async fn main() {
     // `run_events`, and eventually its line in the feed. Nothing removed any of those, so all three
     // grew for as long as the daemon was ever used — and a transcript is stored twice and indexed a
     // third time, so they grew at three times the obvious rate.
-    // The same loop takes the weekly database copy, on the primary instance only.
+    // The same loop takes the weekly database copy, on the primary instance only, and runs the
+    // consolidator, which lives in `nucleos-app` and so is handed in here.
     tokio::spawn(execution::runs::run_retention_loop(
         state.clone(),
         is_primary,
+        Some(std::sync::Arc::new(consolidate::Consolidator)),
     ));
     // Slot occupancy every minute, rolled into daily rows, for the analytics page's pressure
     // metric (spec analytics-pipeline §5.3). Its own loop: the retention loop is hourly and this

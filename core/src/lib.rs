@@ -35,7 +35,6 @@ pub mod chats;
 pub use nucleos_base::command_reader;
 pub use nucleos_base::commands;
 pub mod config;
-pub mod consolidate;
 pub mod context_refs;
 pub mod council;
 pub mod daemon_client;
