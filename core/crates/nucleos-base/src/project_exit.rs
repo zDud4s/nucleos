@@ -99,7 +99,7 @@ const PROJECT_SCOPED: &[&str] = &[
     // house's rows (`project_id` NULL raw, '' daily) never match a project id, so they stay.
     "slot_samples",
     "slot_samples_daily",
-    // The project's unresolved and past task claims (migration 0244) and the sessions registered for it:
+    // The project's unresolved and past task claims (migration 0246) and the sessions registered for it:
     // working history, so forgetting the project takes them. Their event log hangs off task_claims
     // (VIA_PARENT below).
     "task_claims",
@@ -153,7 +153,7 @@ const VIA_PARENT: &[(&str, &str, &str)] = &[
     // A run's frozen tool loadout (migration 0190). It belongs to the project through its run only,
     // exactly like `run_knowledge`; the CASCADE would take it anyway, listing it keeps the forget explicit.
     ("run_loadout", "run_id", "runs"),
-    // A task claim's event log (migration 0244): who held it, and when. It belongs to the project only
+    // A task claim's event log (migration 0246): who held it, and when. It belongs to the project only
     // through its task, like the two run tables above.
     ("task_claim_events", "task_id", "task_claims"),
 ];
