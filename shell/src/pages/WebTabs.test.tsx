@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { clearWebDraft } from "./Web";
+import { requestFocus, resetBrowserStore } from "../data/browser-store";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -13,6 +14,7 @@ vi.mock("../data/client", async (original) => ({
 
 beforeEach(() => {
   clearWebDraft();
+  resetBrowserStore();
   daemon.apiFetch.mockReset();
   daemon.apiText.mockReset();
   daemon.probeHealth.mockReset();
@@ -29,7 +31,13 @@ vi.mock("./BrowserPage", () => ({
   ),
 }));
 
+// The panel itself is tested in AgentPanel.test.tsx; here only where the page puts it.
+vi.mock("./AgentPanel", () => ({
+  AgentPanel: () => <div data-testid="agent-panel" />,
+}));
+
 const archiveToggle = () => screen.getByRole("button", { name: "Archive" });
+const agentToggle = () => screen.getByRole("button", { name: "Agent" });
 
 describe("the Web page split", () => {
   it("is the browser alone: a title for assistive technology, no header band, no panel", async () => {
@@ -99,5 +107,43 @@ describe("the Web page split", () => {
       expect(rail.getByRole("link", { name: "Web" }).getAttribute("aria-current")).toBe("page");
       unmount();
     }
+  });
+  it("the Agent button toggles the agent panel beside the browser", async () => {
+    const { router } = await renderApp({ initialPath: "/web" });
+    const browser = await screen.findByTestId("browser-page");
+    const toolbar = within(browser).getByRole("toolbar", { name: "Web panels" });
+    expect(within(toolbar).getByRole("button", { name: "Agent" })).toBe(agentToggle());
+    expect(agentToggle().getAttribute("aria-pressed")).toBe("false");
+
+    fireEvent.click(agentToggle());
+    await waitFor(() => expect(agentToggle().getAttribute("aria-pressed")).toBe("true"));
+    const side = screen.getByRole("complementary", { name: "Side panel" });
+    expect(within(side).getByTestId("agent-panel")).toBeDefined();
+    // Beside the browser, never over it: the browser is not inside the side panel.
+    expect(side.contains(screen.getByTestId("browser-page"))).toBe(false);
+    expect(screen.getByTestId("browser-page")).toBe(browser);
+
+    fireEvent.click(agentToggle());
+    await waitFor(() => expect(agentToggle().getAttribute("aria-pressed")).toBe("false"));
+    expect(screen.queryByRole("complementary", { name: "Side panel" })).toBeNull();
+
+    // Like Sessions, the Agent panel gives way to the Archive.
+    fireEvent.click(agentToggle());
+    await waitFor(() => expect(agentToggle().getAttribute("aria-pressed")).toBe("true"));
+    fireEvent.click(archiveToggle());
+    await waitFor(() => expect(router.state.location.pathname).toBe("/web/archive"));
+    expect(agentToggle().getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("a focus intent opens the agent panel", async () => {
+    await renderApp({ initialPath: "/web" });
+    await screen.findByTestId("browser-page");
+    expect(agentToggle().getAttribute("aria-pressed")).toBe("false");
+
+    act(() => requestFocus("p1", "s1"));
+
+    await waitFor(() => expect(agentToggle().getAttribute("aria-pressed")).toBe("true"));
+    const side = screen.getByRole("complementary", { name: "Side panel" });
+    expect(within(side).getByTestId("agent-panel")).toBeDefined();
   });
 });

@@ -43,12 +43,14 @@ export type BrowserSnapshot = {
   agentNotice: Record<string, string>;
   /** The WebView2 Runtime is not installed. */
   runtimeMissing: boolean;
+  /** The scope and tab in front, as BrowserPage publishes them; null before the page has mounted. */
+  activeTab: ActiveTab | null;
 };
 
 const FALLBACK_BOUNDS: Bounds = { x: 0, y: 0, width: 800, height: 600 };
 
 function initial(): BrowserSnapshot {
-  return { tabMap: {}, created: new Set(), focusIntent: null, agentNotice: {}, runtimeMissing: false };
+  return { tabMap: {}, created: new Set(), focusIntent: null, agentNotice: {}, runtimeMissing: false, activeTab: null };
 }
 
 let state: BrowserSnapshot = initial();
@@ -112,9 +114,31 @@ export function requestFocus(project: string, sessionId: string): void {
   set({ ...state, focusIntent: { project, sessionId, nonce: focusNonce } });
 }
 
+/** The nonce of the pending focus intent, or null; re-renders only when it changes. */
+export function useFocusNonce(): number | null {
+  const read = () => state.focusIntent?.nonce ?? null;
+  return useSyncExternalStore(subscribe, read, read);
+}
+
 export function consumeFocus(): void {
   if (state.focusIntent === null) return;
   set({ ...state, focusIntent: null });
+}
+
+/** The tab in front, as BrowserPage publishes it: its scope key and the active tab (null when none). */
+export type ActiveTab = { scope: string; tab: Tab | null };
+
+/** BrowserPage publishes the scope and tab in front; the agent panel reads it from the store. */
+export function setActiveTab(next: ActiveTab | null): void {
+  const prev = state.activeTab;
+  if (prev === next) return;
+  if (prev !== null && next !== null && prev.scope === next.scope && prev.tab === next.tab) return;
+  set({ ...state, activeTab: next });
+}
+
+/** The scope and tab in front (null before BrowserPage has published them). */
+export function useActiveTab(): ActiveTab | null {
+  return useSyncExternalStore(subscribe, () => state.activeTab, () => state.activeTab);
 }
 
 /** The page registers where the native webview goes; null when it unmounts. */

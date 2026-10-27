@@ -23,6 +23,7 @@ import {
   openOwnerTab,
   patchTab,
   ensureProjectAgent,
+  setActiveTab,
   setBoundsProvider,
   setTabMap,
   unmarkCreated,
@@ -150,6 +151,11 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
     },
     [],
   );
+
+  // Publish the scope and tab in front: the Agent panel reads them from the store, never from here.
+  useEffect(() => {
+    setActiveTab({ scope: project, tab: active });
+  }, [project, active]);
 
   // Show the address of the tab in front.
   useEffect(() => {
