@@ -222,7 +222,7 @@ pub(super) enum ProofJob {
     Reprobe {
         project_id: String,
         project_root: PathBuf,
-        task: TaskRow,
+        task: Box<TaskRow>,
     },
 }
 
@@ -264,7 +264,7 @@ pub(super) fn spawn_proof(executor: Arc<Executor>, job: ProofJob) -> bool {
                 project_id,
                 project_root,
                 task,
-            } => run_reprobe(&executor, &project_id, &project_root, task).await,
+            } => run_reprobe(&executor, &project_id, &project_root, *task).await,
         }
     });
     true

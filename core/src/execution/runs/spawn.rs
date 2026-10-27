@@ -1254,19 +1254,13 @@ mod wake_tests {
     }
 
     /// A body that writes `status` for its own run, as the real one does at its terminal writes.
-    fn body_ending_in(
-        pool: sqlx::SqlitePool,
-        id: i64,
-        status: &'static str,
-    ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        async move {
-            sqlx::query("UPDATE runs SET status = ? WHERE id = ?")
-                .bind(status)
-                .bind(id)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
+    async fn body_ending_in(pool: sqlx::SqlitePool, id: i64, status: &'static str) {
+        sqlx::query("UPDATE runs SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

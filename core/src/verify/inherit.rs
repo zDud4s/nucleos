@@ -471,7 +471,7 @@ async fn try_apply(
                     ticket,
                     &subset,
                     &suspects,
-                    Some(&row),
+                    Some(&*row),
                     proved_fresh,
                     worktree,
                     deadline,
@@ -688,7 +688,7 @@ pub(super) enum Freshness {
 enum ProbeStep {
     Task(String),
     Pending(i64),
-    Incident(TaskRow),
+    Incident(Box<TaskRow>),
 }
 
 /// `Fresh`: `checked_sha` is today's master `head`. Otherwise a re-proof is the single flight of
@@ -731,7 +731,7 @@ pub(super) async fn ensure_fresh(
         probe::ProofJob::Reprobe {
             project_id: project_id.to_owned(),
             project_root: project_root.to_path_buf(),
-            task: incident.clone(),
+            task: Box::new(incident.clone()),
         },
     );
     Ok(Freshness::InFlight { started })
@@ -886,7 +886,7 @@ async fn probe_step(
             Ok(ProbeStep::Pending(row.id))
         }
         ProbeStart::InFlight(row) => Ok(ProbeStep::Pending(row.id)),
-        ProbeStart::Exists(row) => Ok(ProbeStep::Incident(row)),
+        ProbeStart::Exists(row) => Ok(ProbeStep::Incident(Box::new(row))),
     }
 }
 

@@ -270,6 +270,8 @@ pub async fn check(
 /// feature branch to catch up) brings the guarded files to nobody's mainline and is left alone, and
 /// so is every merge when the integration branch could not be resolved (`None`: fail-open, as the
 /// admission gate is). The reason is `Some` when the merge must not run.
+// One call site (`drain_once`) passes these straight through; a struct for them would be churn.
+#[allow(clippy::too_many_arguments)]
 pub async fn refusal_for_op(
     pool: &sqlx::SqlitePool,
     project_id: &str,

@@ -3582,7 +3582,6 @@ tests:
                 red_groups: &["core"],
                 since: Some(&f.c1),
                 checked: Some(&f.c1), // old: master moved on to `head`
-                ..Default::default()
             },
         )
         .await;
@@ -3636,7 +3635,6 @@ tests:
                 red_groups: &["core"],
                 since: Some(&f.c1),
                 checked: Some(&f.c1),
-                ..Default::default()
             },
         )
         .await;

@@ -1632,7 +1632,6 @@ mod tests {
                 holder: Some(("session", "s1")),
                 lease: Some(t0() + secs(60)),
                 guard: &["core/src/a.rs", "core/tests"],
-                ..Seed::default()
             },
         )
         .await;
@@ -1644,7 +1643,6 @@ mod tests {
                 holder: Some(("session", "s2")),
                 lease: Some(t0() - secs(1)),
                 guard: &["core/src/a.rs"],
-                ..Seed::default()
             },
         )
         .await;
