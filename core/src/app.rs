@@ -22,6 +22,8 @@ pub mod consolidate;
 pub mod devtime;
 pub mod fleet;
 pub mod hooks;
+// Shadows the library's `map`, which holds only `intent`; `map.rs` re-exports that one.
+pub mod map;
 pub mod presets;
 pub mod price_refresh;
 pub mod verify_cli;

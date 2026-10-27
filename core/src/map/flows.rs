@@ -667,7 +667,9 @@ mod tests {
             running_in.display(),
         );
         running_in
-            .parent()
+            // The package, `core/crates/nucleos-app`, sits three levels below the root.
+            .ancestors()
+            .nth(3)
             .expect("the package sits inside the repository")
             .to_path_buf()
     }
