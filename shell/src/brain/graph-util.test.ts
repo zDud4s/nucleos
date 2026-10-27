@@ -44,10 +44,14 @@ describe("nodeRadius", () => {
 });
 
 describe("colorToken", () => {
-  it.each(["note", "knowledge", "project", "contact", "mail", "file"] as const)(
-    "gives a %s the one neutral node token",
+  it.each(["note", "knowledge", "project", "contact", "mail", "file", "job"] as const)(
+    "gives a %s its own kind token",
     (kind) => {
-      expect(colorToken(node("x", { kind }))).toBe("--brain-node");
+      expect(colorToken(node("x", { kind }))).toBe(`--brain-node-${kind}`);
     },
   );
+  it("gives every kind a different token", () => {
+    const kinds = ["note", "knowledge", "project", "contact", "mail", "file", "job"] as const;
+    expect(new Set(kinds.map((kind) => colorToken(node("x", { kind })))).size).toBe(kinds.length);
+  });
 });

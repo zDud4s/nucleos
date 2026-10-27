@@ -85,7 +85,7 @@ impl JobNodeMcp {
         let written = (|| -> std::io::Result<()> {
             let exe = std::env::current_exe()?;
             let config =
-                crate::assistant::build_job_node_mcp_config(&exe.to_string_lossy(), job_id);
+                crate::assistant_types::build_job_node_mcp_config(&exe.to_string_lossy(), job_id);
             let bytes = serde_json::to_vec(&config).map_err(std::io::Error::other)?;
             crate::storage::write_atomic(&path, &bytes)
         })();

@@ -137,7 +137,8 @@ fn test_only(files: &[(PathBuf, String)]) -> (HashSet<PathBuf>, Vec<PathBuf>) {
             .and_then(|stem| stem.to_str())
             .unwrap_or_default();
         let parent = path.parent().unwrap_or(Path::new(""));
-        let children = if matches!(stem, "mod" | "lib" | "main") {
+        // `app.rs` is a crate root too (`nucleos-app`), so its modules sit beside it.
+        let children = if matches!(stem, "mod" | "lib" | "main" | "app") {
             parent.to_path_buf()
         } else {
             parent.join(stem)
@@ -166,6 +167,19 @@ fn test_only(files: &[(PathBuf, String)]) -> (HashSet<PathBuf>, Vec<PathBuf>) {
                 continue;
             };
             let name = name.trim();
+            // Declared inside an inline `mod outer { ... }` (app.rs's `channels`): the file is
+            // under `outer/`. One level is all the tree has.
+            let indent = line.len() - line.trim_start().len();
+            let children = lines[..index]
+                .iter()
+                .rev()
+                .filter(|above| above.len() - above.trim_start().len() < indent)
+                .find_map(|above| {
+                    let above = above.trim();
+                    let above = above.strip_prefix("pub ").unwrap_or(above);
+                    above.strip_prefix("mod ")?.strip_suffix(" {")
+                })
+                .map_or_else(|| children.clone(), |outer| children.join(outer.trim()));
             test_files.insert(children.join(format!("{name}.rs")));
             test_files.insert(children.join(name).join("mod.rs"));
             test_dirs.push(children.join(name));
