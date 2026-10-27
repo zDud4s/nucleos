@@ -5,11 +5,15 @@ import { X } from "lucide-react";
 import { BrainPanel } from "../brain/BrainPanel";
 import { CapturePanel } from "../brain/CapturePanel";
 import { CapturesWaiting } from "../brain/CapturesWaiting";
+import { AboutYou } from "../brain/knowledge/AboutYou";
 import { KnowledgePanel } from "../brain/knowledge/KnowledgePanel";
 import { ToolRequests } from "../brain/knowledge/ToolRequests";
 import { WaitingPanel } from "../brain/knowledge/WaitingPanel";
 import { UnifiedList } from "../brain/UnifiedList";
 import { WeeklyReview } from "../brain/WeeklyReview";
+import { ThemesProposed } from "../brain/ThemesProposed";
+import { ThemesAccepted } from "../brain/ThemesAccepted";
+import { useGraphThemes } from "../data/themes";
 import { ForceGraph } from "../brain/ForceGraph";
 import { buildModel } from "../brain/graph-model";
 import type { GFilters } from "../brain/graph-types";
@@ -82,6 +86,8 @@ export function Brain() {
         <div className="brain-page">
           <Capture />
           <WeeklyReview onItem={showItem} />
+          <ThemesProposed />
+          <ThemesAccepted />
           <BrainListView item={item} onItem={showItem} onClose={closeItem} />
         </div>
       )}
@@ -307,13 +313,14 @@ export function BrainGraphView({
   const graph = useNotesGraph(filters.showArchived);
   const knowledge = useKnowledge();
   const projects = useProjects();
+  const themes = useGraphThemes();
   const knownRows = knowledge.data ?? EMPTY_KNOWLEDGE;
   const projectRows = projects.data;
   const canvasHeight = useElementHeight(stage);
 
   const model = useMemo(
-    () => (graph.data === undefined ? null : buildModel(graph.data, knownRows, projectRows, filters)),
-    [graph.data, knownRows, projectRows, filters],
+    () => (graph.data === undefined ? null : buildModel(graph.data, knownRows, projectRows, filters, themes)),
+    [graph.data, knownRows, projectRows, filters, themes],
   );
 
   const ref = parseItem(item);
@@ -365,6 +372,8 @@ export function BrainGraphView({
         {tool === "review" && (
           <div className="brain-pop">
             <WeeklyReview onItem={onItem} />
+            <ThemesProposed />
+            <ThemesAccepted />
           </div>
         )}
         {tool === "filters" && (
@@ -470,6 +479,7 @@ export function BrainListView({
             <CapturesWaiting onSelect={onItem} selected={selected} />
             <WaitingPanel rows={proposed} />
             <ToolRequests />
+            <AboutYou />
           </>
         ) : queueFailed ? (
           <ErrorNote
@@ -482,9 +492,12 @@ export function BrainListView({
             Part of what is asked of you could not be read, so an empty queue is not certain.
           </ErrorNote>
         ) : (
-          <Quiet compact says="Nothing open.">
-            Pick a row to read it whole, see what it links to, or teach it to the agent.
-          </Quiet>
+          <>
+            <Quiet compact says="Nothing open.">
+              Pick a row to read it whole, see what it links to, or teach it to the agent.
+            </Quiet>
+            <AboutYou />
+          </>
         )}
       </aside>
     </div>

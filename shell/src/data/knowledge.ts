@@ -55,7 +55,7 @@ export type KnownLayer = "semantic" | "episodic" | "procedural" | "working";
  * Whose it is. Two columns rather than one, because a `job` is not
  * a project and a single nullable `project_id` could not say so.
  */
-export type KnownScope = "machine" | "project" | "team" | "agent" | "job";
+export type KnownScope = "machine" | "project" | "team" | "agent" | "job" | "observation";
 
 /** The scope kinds a pending refinement can be approved into, with an id. */
 export const APPROVABLE_SCOPES = ["project", "team", "agent"] as const;
@@ -80,7 +80,8 @@ export type KnownStatus =
   | "archived"
   | "closed"
   | "expired"
-  | "live";
+  | "live"
+  | "observed";
 
 export const EVIDENCE_TAGS = [
   "run",
@@ -88,6 +89,8 @@ export const EVIDENCE_TAGS = [
   "job_item",
   "proposal",
   "knowledge",
+  "chat",
+  "note",
   "project",
   "command",
   "gate",
@@ -109,6 +112,11 @@ export interface Known {
   scope_id: string | null;
   /** Who knocked at the door — never read from the body. */
   source: "owner" | "run" | "consolidator" | "distiller";
+  /**
+   * Who the lesson is about: `owner` is the person, `null` the code, the work, the project.
+   * Optional: a daemon older than migration `0241` does not send it.
+   */
+  about?: "owner" | null;
   generator: string | null;
   kind: KnownKind;
   title: string;
@@ -166,6 +174,9 @@ export const DISTILL_CAUSE_LABELS: Record<string, string> = {
   gate_recovered: "a red gate recovered",
   review_blocking: "a review blocked it",
   run_exhausted: "a run ran out of attempts",
+  generalised: "seen across several places",
+  calendar_week: "a week of the calendar",
+  chat_exchanges: "a conversation",
   owner_answered: "you answered a question",
 };
 
@@ -173,6 +184,10 @@ export const DISTILL_CAUSE_LABELS: Record<string, string> = {
 export interface DistilledOrigin {
   job: number | string | null;
   runs: (number | string)[];
+  /** The conversation behind a chat lesson (first `chat` reference), `null` when none. */
+  chat: number | string | null;
+  /** How many `knowledge` rows a general lesson rests on. */
+  members: number;
   /** The raw cause as the daemon answered it, `null` when none is on record. */
   cause: string | null;
   /** The cause in words; the raw cause itself when this shell does not know it. */
@@ -197,9 +212,22 @@ export function distilledOrigin(
   return {
     job: refs.find((ref) => ref.t === "job")?.id ?? null,
     runs: refs.filter((ref) => ref.t === "run").map((ref) => ref.id),
+    chat: refs.find((ref) => ref.t === "chat")?.id ?? null,
+    members: refs.filter((ref) => ref.t === "knowledge").length,
     cause,
     causeLabel: cause === null ? null : (DISTILL_CAUSE_LABELS[cause] ?? cause),
   };
+}
+
+/** What the agent holds about the owner or the whole machine, in force: the "About you" section. */
+export function aboutYou(rows: Known[]): Known[] {
+  return rows
+    .filter(
+      (row) =>
+        row.status === "active" &&
+        (row.about === "owner" || (row.scope_kind === "machine" && row.source === "distiller")),
+    )
+    .sort((a, b) => a.id - b.id);
 }
 
 export interface MeasuredScope {
@@ -320,6 +348,59 @@ export function useScopedKnowledge(kind: "agent" | "team", id: string) {
         `/knowledge?${new URLSearchParams({ scope_kind: kind, scope_id: id }).toString()}`,
       ),
     refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * The conversation observations the distiller keeps for 60 days, newest first — `GET
+ * /knowledge?scope_kind=observation&limit=`. Raw material for the pass and the themes; no prompt
+ * ever reads them.
+ */
+export function useObservations() {
+  return useQuery({
+    queryKey: keys.knowledge.observations,
+    queryFn: () => apiFetch<Known[]>("/knowledge?scope_kind=observation&limit=100"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** Which sources the distiller reads — `GET`/`POST /config/distiller-sources`. */
+export interface DistillerSources {
+  chat: boolean;
+  calendar: boolean;
+}
+
+export function useDistillerSources() {
+  return useQuery({
+    queryKey: keys.system.distillerSources,
+    queryFn: () => apiFetch<DistillerSources>("/config/distiller-sources"),
+  });
+}
+
+/** Switches sources; only the fields present are written. The daemon's answer is the truth. */
+export function useSetDistillerSources() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Partial<DistillerSources>) =>
+      apiFetch<DistillerSources>("/config/distiller-sources", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.distillerSources });
+    },
+  });
+}
+
+/**
+ * Lets the distiller read past conversations, once, on the owner's word —
+ * `POST /distill/chats/ingest`. Nothing is asked of a model here: the chats are only marked.
+ */
+export function ingestChats(body: { chat_ids?: string[]; project?: string }) {
+  return apiFetch<{ seeded: number; skipped: number }>("/distill/chats/ingest", {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
 

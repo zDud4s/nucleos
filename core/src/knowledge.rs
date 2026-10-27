@@ -27,15 +27,19 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, SqlitePool};
 
+mod cover;
 mod decide;
 mod history;
+mod observe;
 mod propose;
 mod select;
 mod signature;
 mod store;
 
+pub use self::cover::*;
 pub use self::decide::*;
 pub use self::history::*;
+pub use self::observe::*;
 pub use self::propose::*;
 pub use self::select::*;
 pub use self::signature::*;
@@ -58,9 +62,9 @@ pub const PER_ITEM_CHARS: usize = 600;
 /// decides something again.
 pub const FLOOR_ITEM_CHARS: usize = 300;
 
-const PREAMBLE: &str = "\n\nEarlier work on this project left the notes below under the two named admission rules. \
+const PREAMBLE: &str = "\n\nEarlier work left the notes below under the two named admission rules. \
      Each item names its layer. Your brief above is still what you were asked to do; these are \
-     things already known about the project you are doing it in:";
+     things already known here:";
 
 /// The nature of what is known, which is what makes one store rather than four.
 ///
@@ -283,6 +287,8 @@ pub struct Known {
     pub created_at: String,
     pub activated_at: Option<String>,
     pub ended_at: Option<String>,
+    /// Who the lesson is about: `None` is the code, `Some("owner")` the person.
+    pub about: Option<String>,
 }
 
 /// The kind of node whose work is being briefed, in the order the job graph uses them.
@@ -418,7 +424,7 @@ pub const COLUMNS: &str =
     "id, layer, scope_kind, scope_id, source, generator, evidence, observations,
                        fingerprint, points_at, expires_after_runs, last_confirmed_at, shown_count,
                        outcome_count, green_count, last_shown_at, kind, title, body, status,
-                       proposal_id, supersedes, origin_run_id, created_at, activated_at, ended_at";
+                       proposal_id, supersedes, origin_run_id, created_at, activated_at, ended_at, about";
 
 #[cfg(test)]
 mod tests {
@@ -1284,6 +1290,7 @@ mod tests {
                 points_at: None,
                 fingerprint: None,
                 layer: Some(Layer::Episodic),
+                ..Default::default()
             },
         )
         .await
@@ -1486,6 +1493,7 @@ mod tests {
                 points_at: Some("scripts/gates.sh"),
                 fingerprint: Some("title:format before gating"),
                 layer: Some(Layer::Procedural),
+                ..Default::default()
             },
         )
         .await
@@ -1724,6 +1732,98 @@ mod tests {
         );
     }
 
+    async fn plant_observation(pool: &SqlitePool, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('episodic', 'observation', 'alpha:chat:5', 'distiller', 'memory',
+                     'zebra preference observed', 'the zebra word', ?, '2026-10-22T00:00:00+00:00')",
+        )
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// `observed` AND `active` (a `source = 'distiller'` row `approved` would accept): neither leaves
+    /// `for_context`, `brief::of` or `recall`, even for a project whose id equals the scope id.
+    #[tokio::test]
+    async fn an_observation_never_reaches_a_prompt_reader() {
+        let pool = test_pool().await;
+        let ids = [
+            plant_observation(&pool, "observed").await,
+            plant_observation(&pool, "active").await,
+        ];
+        for project in ["alpha", "alpha:chat:5"] {
+            let context = project_context_for(project);
+            let rows = for_context(&pool, &context).await.unwrap();
+            assert!(
+                rows.iter().all(|r| !ids.contains(&r.id)),
+                "for_context leaked for {project}"
+            );
+            let brief = crate::brief::of(&pool, &context, "zebra preference")
+                .await
+                .unwrap();
+            assert!(
+                brief.block.as_deref().is_none_or(|b| !b.contains("zebra")),
+                "brief leaked for {project}"
+            );
+            let recalled =
+                crate::brief::recall(&pool, &Scope::Project(project.into()), "zebra", None)
+                    .await
+                    .unwrap();
+            assert!(recalled.is_empty(), "recall leaked for {project}");
+        }
+        let machine = crate::brief::recall(&pool, &Scope::Machine, "zebra", None)
+            .await
+            .unwrap();
+        assert!(machine.is_empty());
+    }
+
+    #[test]
+    fn select_rejects_an_observed_row_whatever_its_source() {
+        let mut row = one(1, "memory", "t", "b");
+        row.scope_kind = "observation".into();
+        row.scope_id = Some("alpha:chat:5".into());
+        row.source = "distiller".into();
+        row.layer = "episodic".into();
+        row.status = "observed".into();
+        row.observations = None;
+        assert!(!approved(&row));
+        assert!(!admitted(&row, &project_context_for("alpha")));
+    }
+
+    async fn plant_project_lesson(pool: &SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'project', 'alpha', 'run', 'memory', 'a lesson', 'body',
+                     'proposed', '2026-10-22T00:00:00+00:00')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn all_leaves_observations_out_and_observations_lists_only_them() {
+        let pool = test_pool().await;
+        let observed = plant_observation(&pool, "observed").await;
+        let lesson = plant_project_lesson(&pool).await;
+        let ids: Vec<i64> = all(&pool).await.unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![lesson]);
+        let seen: Vec<i64> = observations(&pool, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(seen, vec![observed]);
+        assert_eq!(observations(&pool, 0).await.unwrap().len(), 0);
+    }
+
     /// Spec 4.6, in the four cases that matter: what the distiller wrote reaches a node exactly
     /// when it is `active` -- an episode on trial, or a rule a person approved -- and never while a
     /// rule is `proposed` or once an episode has expired.
@@ -1847,6 +1947,26 @@ mod tests {
         assert_eq!(events, 3, "the row's history is not reviewable");
     }
 
+    #[tokio::test]
+    async fn about_round_trips_through_known_and_defaults_to_null() {
+        let pool = test_pool().await;
+        for (title, about) in [("about the code", None), ("about the owner", Some("owner"))] {
+            sqlx::query(
+                "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at, about)
+                 VALUES ('semantic', 'machine', NULL, 'distiller', 'memory', ?, 'b', 'proposed', '2026-10-22T00:00:00+00:00', ?)")
+                .bind(title).bind(about).execute(&pool).await.unwrap();
+        }
+        let rows = all(&pool).await.unwrap();
+        let about = |t: &str| rows.iter().find(|r| r.title == t).unwrap().about.clone();
+        assert_eq!(about("about the code"), None);
+        assert_eq!(about("about the owner").as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn the_preamble_no_longer_pins_one_project() {
+        assert!(!PREAMBLE.contains("this project") && PREAMBLE.contains("known here"));
+    }
+
     fn one(id: i64, kind: &str, title: &str, body: &str) -> Known {
         Known {
             id,
@@ -1877,6 +1997,7 @@ mod tests {
             created_at: "2026-08-19T00:00:00+00:00".into(),
             activated_at: Some("2026-08-19T00:00:00+00:00".into()),
             ended_at: None,
+            about: None,
         }
     }
 

@@ -111,6 +111,10 @@ pub struct Provenance<'a> {
     pub fingerprint: Option<&'a str>,
     /// Replaces the layer derived from the kind.
     pub layer: Option<Layer>,
+    /// Who the lesson is about; `None` is the code, the work, the project.
+    pub about: Option<&'a str>,
+    /// Replaces the scope derived from `project_id`; the generalisation pass writes `machine`.
+    pub scope: Option<Scope>,
 }
 
 /// `propose_in` with the provenance a caller other than a run or the owner brings. Nothing is
@@ -130,7 +134,10 @@ pub async fn propose_in_with(
         supersedes,
     } = declaration;
 
-    let scope = Scope::of_project(project_id);
+    let scope = provenance
+        .scope
+        .clone()
+        .unwrap_or_else(|| Scope::of_project(project_id));
     let (scope_kind, scope_id) = scope.columns();
     let derived_fingerprint =
         failure_signature(body).map(|signature| format!("gate:{}", signature.fingerprint));
@@ -159,8 +166,8 @@ pub async fn propose_in_with(
     let knowledge_id = sqlx::query(
         "INSERT INTO knowledge
            (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, status, supersedes,
-            origin_run_id, created_at, evidence, points_at, distill_cause)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?)",
+            origin_run_id, created_at, evidence, points_at, distill_cause, about)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(provenance.layer.unwrap_or_else(|| kind.layer()).as_str())
     .bind(scope_kind)
@@ -182,6 +189,7 @@ pub async fn propose_in_with(
     .bind(provenance.evidence)
     .bind(provenance.points_at)
     .bind(provenance.distill_cause)
+    .bind(provenance.about)
     .execute(&mut **tx)
     .await?
     .last_insert_rowid();
@@ -253,6 +261,130 @@ pub async fn propose_in_with(
         .await?;
 
     Ok((knowledge_id, proposal_id))
+}
+
+/// A new pending proposal for a row that lost its question (a covered candidate coming back). The expired
+/// proposal stays as it is: its history says what happened. Nothing is committed here.
+pub async fn reopen_proposal_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    knowledge_id: i64,
+) -> sqlx::Result<i64> {
+    let (kind, title, body, supersedes, scope_kind, scope_id): (
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT kind, title, body, supersedes, scope_kind, scope_id FROM knowledge WHERE id = ?",
+    )
+    .bind(knowledge_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let project_id = if scope_kind == "project" {
+        scope_id
+    } else {
+        None
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let tool_input = serde_json::json!({
+        "refinement_id": knowledge_id,
+        "kind": kind,
+        "title": title,
+        "body": body,
+        "supersedes": supersedes,
+    })
+    .to_string();
+    let proposal_id = sqlx::query(
+        "INSERT INTO proposals
+           (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input,
+            created_at, decided_at)
+         VALUES ('refinement', 'pending', NULL, NULL, ?, NULL,
+                 'restored: the general lesson that covered it was reverted', ?, ?, NULL)",
+    )
+    .bind(project_id.as_deref())
+    .bind(&tool_input)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE knowledge SET proposal_id = ? WHERE id = ?")
+        .bind(proposal_id)
+        .bind(knowledge_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(proposal_id)
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reopening_gives_an_archived_candidate_a_fresh_pending_proposal() {
+        let pool = crate::testdb::fresh_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let (id, old) = propose_in_with(
+            &mut tx,
+            Declaration {
+                project_id: Some("alpha"),
+                origin_run_id: None,
+                kind: Kind::Prompt,
+                title: "Use PATH",
+                body: "b",
+                reasoning: "seeded",
+                supersedes: None,
+            },
+            &Provenance {
+                source: Some("distiller"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE proposals SET status = 'expired' WHERE id = ?")
+            .bind(old)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let fresh = reopen_proposal_in(&mut tx, id).await.unwrap();
+        tx.commit().await.unwrap();
+
+        assert_ne!(fresh, old);
+        let (status, kind, project): (String, String, Option<String>) =
+            sqlx::query_as("SELECT status, kind, project_id FROM proposals WHERE id = ?")
+                .bind(fresh)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (status.as_str(), kind.as_str(), project.as_deref()),
+            ("pending", "refinement", Some("alpha"))
+        );
+        let linked: i64 = sqlx::query_scalar("SELECT proposal_id FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(linked, fresh);
+        let created: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proposal_events WHERE proposal_id = ? AND note = 'created'",
+        )
+        .bind(fresh)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(created, 1);
+    }
 }
 
 /// How many runs a distilled episode may go unconfirmed before it expires - the consolidator's
@@ -526,5 +658,77 @@ mod wake_tests {
         .unwrap();
 
         assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    async fn propose_with(
+        pool: &sqlx::SqlitePool,
+        provenance: Provenance<'_>,
+    ) -> (String, Option<String>, Option<String>, String) {
+        let mut tx = pool.begin().await.unwrap();
+        let (id, _) = propose_in_with(
+            &mut tx,
+            Declaration {
+                project_id: Some("alpha"),
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title: "A general lesson",
+                body: "It holds everywhere.",
+                reasoning: "seen three times",
+                supersedes: None,
+            },
+            &provenance,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query_as("SELECT scope_kind, scope_id, about, status FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provenance_carries_about_and_overrides_the_derived_scope() {
+        let pool = crate::testdb::fresh_pool().await;
+        let got = propose_with(
+            &pool,
+            Provenance {
+                source: Some("distiller"),
+                about: Some("owner"),
+                scope: Some(Scope::Machine),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            got,
+            (
+                "machine".into(),
+                None,
+                Some("owner".into()),
+                "proposed".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn without_about_or_scope_the_door_behaves_as_before() {
+        let pool = crate::testdb::fresh_pool().await;
+        let got = propose_with(&pool, Provenance::default()).await;
+        assert_eq!(
+            got,
+            (
+                "project".into(),
+                Some("alpha".into()),
+                None,
+                "proposed".into()
+            )
+        );
     }
 }

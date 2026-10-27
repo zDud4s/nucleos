@@ -151,7 +151,8 @@ function OtherPanel({
         )}
       </section>
       {/* A note stub (gone or hidden) is a note, not a target something is written about. */}
-      {node.kind !== "note" && (
+      {/* A theme is a derived cluster, not a target a note can be written about. */}
+      {node.kind !== "note" && node.kind !== "theme" && (
         <NotesAbout
           kind={node.kind satisfies TargetKind}
           ref={node.ref}

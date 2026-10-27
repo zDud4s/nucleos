@@ -22,6 +22,7 @@
   --brain-node-mail: var(--tone-info-fg);
   --brain-node-file: var(--tone-pending-fg);
   --brain-node-job: color-mix(in srgb, var(--tone-danger-fg) 55%, var(--tone-shadow-fg));
+  --brain-node-theme: color-mix(in srgb, var(--tone-active-fg) 50%, var(--tone-pending-fg));
 }
 
 .brain-force {

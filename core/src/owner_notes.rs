@@ -676,6 +676,69 @@ pub async fn active_note_texts_for_project(
     .await
 }
 
+/// Vectors of the ACTIVE notes embedded by `model`, by id. Ids and vectors only: the theme clustering
+/// (spec 2026-10-22 section 6.2) needs no note text, so none is returned (section 10).
+pub async fn vectors_for_clustering(
+    pool: &SqlitePool,
+    model: &str,
+) -> sqlx::Result<Vec<(i64, Vec<f32>)>> {
+    let rows: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT e.note_id, e.dim, e.vector
+           FROM owner_note_embeddings e JOIN owner_notes n ON n.id = e.note_id
+          WHERE e.model = ? AND n.state = 'active' ORDER BY e.note_id",
+    )
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, dim, blob)| crate::embed::decode(&blob, dim).map(|v| (id, v)))
+        .collect())
+}
+
+/// Text of the ACTIVE notes among `ids`, by id. For the two sanctioned readers of spec 2026-10-22
+/// section 10 only: the theme synthesis (`themes.rs`) and the generalisation pass (`generalise.rs`),
+/// as owner context that is never quoted and never injected into an agent's prompt.
+pub async fn texts_for_ids(pool: &SqlitePool, ids: &[i64]) -> sqlx::Result<Vec<(i64, String)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marks = vec!["?"; ids.len()].join(", ");
+    // `AssertSqlSafe`, audited: only literal `?` placeholders are interpolated, as in
+    // `embed::vectors_for`.
+    let sql = sqlx::AssertSqlSafe(format!(
+        "SELECT id, note_text FROM owner_notes WHERE state = 'active' AND id IN ({marks}) ORDER BY id"
+    ));
+    let mut q = sqlx::query_as(sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool).await
+}
+
+/// Active notes with cosine >= `floor` to `vector` (same `model`), best first, ties on the lower id,
+/// at most `limit`. Ids and cosines only: a caller that needs the text asks `texts_for_ids`.
+pub async fn nearest_to_vector(
+    pool: &SqlitePool,
+    model: &str,
+    vector: &[f32],
+    floor: f32,
+    limit: usize,
+) -> sqlx::Result<Vec<(i64, f32)>> {
+    let mut scored: Vec<(i64, f32)> = vectors_for_clustering(pool, model)
+        .await?
+        .into_iter()
+        .filter_map(|(id, v)| {
+            crate::embed::cosine(vector, &v)
+                .filter(|c| *c >= floor)
+                .map(|c| (id, c))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
 /// Whether a target exists, for the kinds this module can answer from SQL. `None` for `project` and
 /// `file` (and anything unknown): the HTTP layer resolves those.
 pub async fn target_exists(
@@ -769,6 +832,7 @@ pub async fn resolve_sql_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source_scan::production_code;
 
     async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await
@@ -1242,37 +1306,194 @@ mod tests {
         one_call_is_sanctioned(source, &format!("{needle}s::create("))
     }
 
-    /// `source` up to its test module. Cut at the test module itself, not at any `#[cfg(test)]`:
-    /// a test-only helper above it would otherwise hide the production code that follows from
-    /// the sweep.
-    fn production_code(source: &str) -> String {
-        let lines: Vec<&str> = source.lines().collect();
-        let end = lines
-            .windows(2)
-            .position(|w| {
-                w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests")
-            })
-            .unwrap_or(lines.len());
-        lines[..end].join("\n")
+    /// `themes.rs` may name the notes module in exactly two places: the call that reads the vectors of
+    /// the active notes for the theme grouping, and the call that reads the text of the member notes
+    /// for the synthesis of an accepted theme. Both are owner-only readers (spec 2026-10-22
+    /// section 10): grouping needs vectors, never text; the synthesis text never leaves the Brain.
+    fn themes_mentions_are_sanctioned(source: &str) -> bool {
+        let needle = ["owner", "note"].join("_");
+        calls_are_sanctioned(
+            source,
+            &[
+                &format!("{needle}s::vectors_for_clustering"),
+                &format!("{needle}s::texts_for_ids"),
+            ],
+        )
     }
 
-    /// True when the production code of `source` names the notes module only inside `call`, and
-    /// exactly once.
-    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
+    /// `distill/generalise.rs` may name the notes module in exactly two places: the nearest-notes lookup
+    /// (ids and cosines) and the text of those notes as owner context (spec 2026-10-22 section 10).
+    fn generalise_mentions_are_sanctioned(source: &str) -> bool {
         let needle = ["owner", "note"].join("_");
-        let mut calls = 0;
-        let production = production_code(source);
-        for line in production.lines() {
+        calls_are_sanctioned(
+            source,
+            &[
+                &format!("{needle}s::nearest_to_vector"),
+                &format!("{needle}s::texts_for_ids"),
+            ],
+        )
+    }
+
+    /// True when the production code of `source` names the notes module only inside the listed
+    /// `calls`, and each of them exactly once.
+    fn calls_are_sanctioned(source: &str, calls: &[&str]) -> bool {
+        let needle = ["owner", "note"].join("_");
+        let mut seen = vec![0usize; calls.len()];
+        for line in production_code(source).lines() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            let here = line.matches(call).count();
+            let mut here = 0;
+            for (i, call) in calls.iter().enumerate() {
+                let n = line.matches(call).count();
+                seen[i] += n;
+                here += n;
+            }
             if line.matches(needle.as_str()).count() != here {
                 return false;
             }
-            calls += here;
         }
-        calls == 1
+        seen.iter().all(|n| *n == 1)
+    }
+
+    fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
+        calls_are_sanctioned(source, &[call])
+    }
+
+    #[tokio::test]
+    async fn texts_for_ids_returns_active_notes_only_in_id_order() {
+        let pool = test_pool().await;
+        let a = create(&pool, "alpha", "shell").await.unwrap();
+        let b = create(&pool, "beta", "shell").await.unwrap();
+        sqlx::query("UPDATE owner_notes SET state='archived' WHERE id = ?")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            texts_for_ids(&pool, &[b, a, 9999]).await.unwrap(),
+            vec![(a, "alpha".to_string())]
+        );
+        assert!(texts_for_ids(&pool, &[]).await.unwrap().is_empty());
+    }
+
+    async fn embedded_note(pool: &sqlx::SqlitePool, text: &str, model: &str, v: [f32; 2]) -> i64 {
+        let id = create(pool, text, "shell").await.unwrap();
+        sqlx::query(
+            "INSERT INTO owner_note_embeddings (note_id, model, dim, vector, text_hash, created_at)
+             VALUES (?, ?, 2, ?, 'h', 't')",
+        )
+        .bind(id)
+        .bind(model)
+        .bind(crate::embed::encode(&v))
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn nearest_to_vector_gives_ids_and_cosines_above_the_floor_capped_and_ordered() {
+        let pool = test_pool().await;
+        let near = embedded_note(&pool, "n", "m", [1.0, 0.1]).await;
+        let nearer = embedded_note(&pool, "n2", "m", [1.0, 0.0]).await;
+        let _far = embedded_note(&pool, "f", "m", [0.0, 1.0]).await;
+        let _other_model = embedded_note(&pool, "o", "x", [1.0, 0.0]).await;
+        let got = nearest_to_vector(&pool, "m", &[1.0, 0.0], 0.80, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![nearer, near]
+        );
+        assert!(got[0].1 > got[1].1);
+        assert_eq!(
+            nearest_to_vector(&pool, "m", &[1.0, 0.0], 0.80, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn clustering_vectors_are_the_active_notes_of_one_model_and_carry_no_text() {
+        let pool = test_pool().await;
+        let live = create(&pool, "live", "shell").await.unwrap();
+        let archived = create(&pool, "gone", "shell").await.unwrap();
+        let other = create(&pool, "other model", "shell").await.unwrap();
+        sqlx::query("UPDATE owner_notes SET state = 'archived' WHERE id = ?")
+            .bind(archived)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, model, v) in [
+            (live, "m1", [1.0_f32, 0.0]),
+            (archived, "m1", [0.0, 1.0]),
+            (other, "m2", [1.0, 1.0]),
+        ] {
+            sqlx::query(
+                "INSERT INTO owner_note_embeddings (note_id, model, dim, vector, text_hash, created_at)
+                 VALUES (?, ?, 2, ?, 'h', 't')",
+            )
+            .bind(id)
+            .bind(model)
+            .bind(crate::embed::encode(&v))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let got = vectors_for_clustering(&pool, "m1").await.unwrap();
+        assert_eq!(got, vec![(live, vec![1.0_f32, 0.0])]);
+    }
+
+    #[test]
+    fn calls_are_sanctioned_takes_a_list_and_counts_each_call_once() {
+        let needle = ["owner", "note"].join("_");
+        let a = format!("let v = {needle}s::vectors_for_clustering(&pool, m).await;");
+        let b = format!("let t = {needle}s::texts_for_ids(&pool, &ids).await;");
+        let calls = [
+            format!("{needle}s::vectors_for_clustering"),
+            format!("{needle}s::texts_for_ids"),
+        ];
+        let calls: Vec<&str> = calls.iter().map(String::as_str).collect();
+        assert!(calls_are_sanctioned(
+            &format!(
+                "{a}
+{b}"
+            ),
+            &calls
+        ));
+        assert!(
+            !calls_are_sanctioned(&a, &calls),
+            "every listed call must occur once"
+        );
+        assert!(!calls_are_sanctioned(
+            &format!(
+                "{a}
+{a}
+{b}"
+            ),
+            &calls
+        ));
+        assert!(!calls_are_sanctioned(
+            &format!(
+                "{a}
+{b}
+use crate::{needle}s;"
+            ),
+            &calls
+        ));
+        assert!(calls_are_sanctioned(
+            &format!(
+                "{a}
+{b}
+// mentions {needle}s"
+            ),
+            &calls
+        ));
+        // The one-call helper keeps its meaning.
+        assert!(one_call_is_sanctioned(&a, calls[0]));
     }
 
     #[test]
@@ -1294,6 +1515,71 @@ mod tests {
         // A test-only helper above production code does not end the sweep.
         assert!(!distill_mentions_are_sanctioned(&format!(
             "#[cfg(test)]\nfn helper() {{}}\n{call}\nuse crate::{needle}s;"
+        )));
+    }
+
+    #[test]
+    fn the_themes_rule_holds_its_two_calls_and_nothing_else() {
+        let n = ["owner", "note"].join("_");
+        let vecs = format!("let v = {n}s::vectors_for_clustering(&pool, m).await;");
+        let texts = format!("let t = {n}s::texts_for_ids(&pool, &ids).await?;");
+        assert!(themes_mentions_are_sanctioned(&format!("{vecs}\n{texts}")));
+        assert!(
+            !themes_mentions_are_sanctioned(&vecs),
+            "both calls must occur"
+        );
+        assert!(
+            !themes_mentions_are_sanctioned(&texts),
+            "both calls must occur"
+        );
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "{vecs}\n{texts}\n{texts}"
+        )));
+        assert!(!themes_mentions_are_sanctioned("fn nothing() {}"));
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "use crate::{n}s;\n{vecs}\n{texts}"
+        )));
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "{vecs}\n{texts}\nlet x = {n}s::list(&pool, f).await;"
+        )));
+        assert!(themes_mentions_are_sanctioned(&format!(
+            "{vecs}\n{texts}\n// mentions {n}s"
+        )));
+        assert!(themes_mentions_are_sanctioned(&format!(
+            "{vecs}\n{texts}\n#[cfg(test)]\nmod tests {{\n{n}s::create(&pool, \"x\", \"y\");\n}}"
+        )));
+        // A test-only helper above production code does not end the sweep.
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "#[cfg(test)]\nfn helper() {{}}\n{vecs}\n{texts}\nuse crate::{n}s;"
+        )));
+    }
+
+    #[test]
+    fn the_generalise_rule_holds_its_two_calls_and_nothing_else() {
+        let n = ["owner", "note"].join("_");
+        let near = format!("let ids = {n}s::nearest_to_vector(&pool, m, &c, 0.80, 5).await?;");
+        let texts = format!("let t = {n}s::texts_for_ids(&pool, &ids).await?;");
+        assert!(generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}"
+        )));
+        assert!(
+            !generalise_mentions_are_sanctioned(&near),
+            "both calls must occur"
+        );
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}\n{texts}"
+        )));
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "use crate::{n}s;\n{near}\n{texts}"
+        )));
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}\nlet x = {n}s::list(&pool, f).await;"
+        )));
+        assert!(generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}\n#[cfg(test)]\nmod tests {{\n{n}s::create(&pool, \"x\", \"y\");\n}}"
+        )));
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "#[cfg(test)]\nfn helper() {{}}\n{near}\n{texts}\nuse crate::{n}s;"
         )));
     }
 
@@ -1482,7 +1768,7 @@ mod tests {
     /// The guard below scans production code only: a test module may read the notes table to
     /// assert behaviour (D4 is about production reach, not about what a test inspects).
     #[test]
-    fn no_core_module_but_six_mentions_owner_notes() {
+    fn no_core_module_but_eight_mentions_owner_notes() {
         // Same guard as `redact.rs`: refuse to scan another checkout's sources.
         let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let running_in = std::env::current_dir().expect("the working directory must be readable");
@@ -1559,11 +1845,29 @@ mod tests {
                 );
                 continue;
             }
+            if crate::source_scan::is_top_level(&path) && name == "themes.rs" {
+                assert!(
+                    themes_mentions_are_sanctioned(&source),
+                    "themes.rs may name the notes only in its calls to vectors_for_clustering \
+                     and texts_for_ids (spec 2026-10-22 section 10: grouping needs vectors, \
+                     never text; the synthesis text never leaves the Brain)"
+                );
+                continue;
+            }
+            if crate::source_scan::module_path(&path) == "distill/generalise.rs" {
+                assert!(
+                    generalise_mentions_are_sanctioned(&source),
+                    "distill/generalise.rs may name the notes only in its calls to nearest_to_vector \
+                     and texts_for_ids (spec 2026-10-22 section 10: nearby notes are owner context, \
+                     never quoted)"
+                );
+                continue;
+            }
             assert!(
                 !production_code(&source).contains(&needle),
                 "{} mentions `{needle}` in production code (test modules are not scanned): the \
                  owner's notes are reachable from owner_notes.rs, \
-                 http.rs and main.rs (spec D4), from distill.rs through one read call, and from \
+                 http.rs and main.rs (spec D4), from distill.rs, themes.rs and distill/generalise.rs through their sanctioned read calls, and from \
                  capture.rs and channels/commands.rs through one write call each, only, so that \
                  nothing in the agent's memory can read them",
                 path.display()

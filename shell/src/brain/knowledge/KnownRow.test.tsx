@@ -154,6 +154,29 @@ describe("KnownRow", () => {
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/knowledge/2"));
   });
 
+  it("says where a general or chat lesson came from instead of 'a job'", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonWith(
+        [
+          known({
+            id: 5,
+            source: "distiller",
+            evidence: '[{"t":"knowledge","id":1},{"t":"knowledge","id":2},{"t":"knowledge","id":3}]',
+          }),
+          known({ id: 6, source: "distiller", evidence: '[{"t":"chat","id":7}]' }),
+        ],
+        undefined,
+        [
+          { id: 5, cause: "generalised" },
+          { id: 6, cause: "chat_exchanges" },
+        ],
+      ),
+    );
+    await renderRows();
+    expect(await screen.findByText(/distilled from 3 similar rows/)).toBeDefined();
+    expect(await screen.findByText(/distilled from a conversation/)).toBeDefined();
+  });
+
   it("a distilled row says which job it came from, why, and links its runs", async () => {
     daemon.apiFetch.mockImplementation(
       daemonWith(

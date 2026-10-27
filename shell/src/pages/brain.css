@@ -434,6 +434,7 @@
 .brain-legend-swatch[data-kind="mail"] { background: var(--brain-node-mail); }
 .brain-legend-swatch[data-kind="file"] { background: var(--brain-node-file); }
 .brain-legend-swatch[data-kind="job"] { background: var(--brain-node-job); }
+.brain-legend-swatch[data-kind="theme"] { background: var(--brain-node-theme); }
 
 @media (max-width: 40rem) {
   /* A narrow window: the drawer takes the lower half instead of the right edge. */

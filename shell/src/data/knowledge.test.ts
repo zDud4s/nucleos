@@ -12,6 +12,7 @@ vi.mock("./client", async (original) => ({
 import { createAppQueryClient } from "../app/queryClient";
 import { keys } from "./keys";
 import {
+  aboutYou,
   distilledOrigin,
   groupWaiting,
   measuredByGenerator,
@@ -74,6 +75,18 @@ describe("parseEvidence", () => {
     expect(parseEvidence(JSON.stringify([{ t: "mystery", id: 7 }]))).toEqual([]);
   });
 
+  it("parseEvidence keeps note refs and still drops unknown tags", () => {
+    const raw = JSON.stringify([
+      { t: "knowledge", id: 3 },
+      { t: "note", id: 11 },
+      { t: "nope", id: 1 },
+    ]);
+    expect(parseEvidence(raw)).toEqual([
+      { t: "knowledge", id: 3 },
+      { t: "note", id: 11 },
+    ]);
+  });
+
   it("parseEvidence keeps a job reference", () => {
     expect(parseEvidence('[{"t":"job","id":7},{"t":"run","id":3}]')).toEqual([
       { t: "job", id: 7 },
@@ -92,7 +105,9 @@ describe("distilledOrigin", () => {
 
     expect(distilledOrigin(row, new Map([[5, "job_failed"]]))).toEqual({
       job: 7,
+      chat: null,
       runs: [3, 4],
+      members: 0,
       cause: "job_failed",
       causeLabel: "the job failed",
     });
@@ -107,6 +122,52 @@ describe("distilledOrigin", () => {
       cause: null,
       causeLabel: null,
     });
+  });
+
+  it("labels the new causes and counts what a general lesson rests on", () => {
+    const causes = new Map([
+      [1, "generalised"],
+      [4, "chat_exchanges"],
+    ]);
+    const lesson = distilledOrigin(
+      known({
+        id: 1,
+        source: "distiller",
+        evidence: '[{"t":"knowledge","id":5},{"t":"knowledge","id":6},{"t":"knowledge","id":7}]',
+      }),
+      causes,
+    );
+    expect(lesson?.causeLabel).toBe("seen across several places");
+    expect(lesson?.members).toBe(3);
+    expect(
+      distilledOrigin(
+        known({ id: 4, source: "distiller", evidence: '[{"t":"chat","id":7},{"t":"run","id":9}]' }),
+        causes,
+      )?.chat,
+    ).toBe(7);
+  });
+
+  it("aboutYou keeps active rows about the owner and active distilled machine lessons", () => {
+    const m = { scope_kind: "machine" as const, scope_id: null, source: "distiller" as const };
+    const rows = [
+      known({ id: 1, about: "owner", ...m }),
+      known({ id: 2, about: null, ...m }),
+      known({ id: 3, about: null, ...m, source: "owner" }),
+      known({ id: 4, about: null, source: "distiller" }),
+      known({ id: 5, about: "owner", ...m, status: "proposed" }),
+      known({ id: 6, about: "owner", ...m, status: "reverted" }),
+    ];
+    expect(aboutYou(rows).map((r) => r.id)).toEqual([1, 2]);
+  });
+
+  it("reads a chat piece of evidence and labels the cause", () => {
+    expect(parseEvidence('[{"t":"chat","id":12},{"t":"run","id":3}]')).toEqual([
+      { t: "chat", id: 12 },
+      { t: "run", id: 3 },
+    ]);
+    const row = known({ source: "distiller", evidence: '[{"t":"chat","id":12},{"t":"run","id":3}]' });
+    const origin = distilledOrigin(row, new Map([[row.id, "chat_exchanges"]]));
+    expect(origin).toMatchObject({ job: null, chat: 12, causeLabel: "a conversation" });
   });
 
   it("distilledOrigin is null for a row the distiller did not write", () => {

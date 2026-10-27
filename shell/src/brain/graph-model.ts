@@ -1,6 +1,6 @@
 import type { Known } from "../data/knowledge";
 import type { NoteLink, NotesGraph } from "../data/owner-notes";
-import type { GEdge, GEdgeType, GFilters, GModel, GNode, GNodeKind } from "./graph-types";
+import type { GEdge, GEdgeType, GFilters, GModel, GNode, GNodeKind, GraphTheme } from "./graph-types";
 import { neighbours } from "./graph-util";
 import { knownBucket, noteBucket, passesState } from "./item-state";
 
@@ -30,18 +30,23 @@ export function buildModel(
   /** `undefined` while the roster is unknown (loading or failed): no project is called missing then. */
   projects: { project_id: string }[] | undefined,
   filters: GFilters,
+  /** Themes above the entities; a member that is not a node (filtered, gone) draws no edge. */
+  themes: GraphTheme[] = [],
 ): GModel {
+  // Observations are raw material for the pass and the themes, not entities: no node, edge or
+  // project stub is drawn for one.
+  const entities = knowledge.filter((row) => row.scope_kind !== "observation");
   const nodes = new Map<string, GNode>();
   const edges = new Map<string, GEdge>();
   const targetInfo = new Map(graph.targets.map((t) => [`${t.kind}:${t.ref}`, t]));
-  const knownIds = new Set(knowledge.map((row) => String(row.id)));
+  const knownIds = new Set(entities.map((row) => String(row.id)));
   const projectIds = projects === undefined ? null : new Set(projects.map((p) => p.project_id));
 
   const keepsKind = (kind: GNodeKind) => filters.nodeKinds.has(kind);
   /** Adds the node unless its kind or (for notes and knowledge) its Estado is filtered out. */
   const add = (node: Omit<GNode, "degree">): GNode | null => {
     if (!keepsKind(node.kind)) return null;
-    if ((node.kind === "note" || node.kind === "knowledge") && !passesState(node.bucket, filters.state, "graph")) {
+    if ((node.kind === "note" || node.kind === "knowledge" || node.kind === "theme") && !passesState(node.bucket, filters.state, "graph")) {
       return null;
     }
     const placed: GNode = { ...node, degree: 0 };
@@ -68,7 +73,7 @@ export function buildModel(
     });
   }
 
-  for (const row of knowledge) {
+  for (const row of entities) {
     add({
       id: `k:${row.id}`,
       kind: "knowledge",
@@ -123,7 +128,7 @@ export function buildModel(
     if (target) addEdge(link.link_type, source.id, target.id);
   }
 
-  for (const row of knowledge) {
+  for (const row of entities) {
     const self = nodes.get(`k:${row.id}`);
     if (!self) continue;
     if (row.supersedes != null) {
@@ -137,6 +142,22 @@ export function buildModel(
         add({ id, kind: "project", ref: row.scope_id, label: row.scope_id, bucket: "in_force", missing: projectIds !== null && !projectIds.has(row.scope_id) });
       }
       addEdge("scope", self.id, id);
+    }
+  }
+
+  for (const t of themes) {
+    const self = add({
+      id: `theme:${t.id}`,
+      kind: "theme",
+      ref: String(t.id),
+      label: t.name,
+      bucket: t.state === "accepted" ? "in_force" : "proposed",
+      missing: false,
+    });
+    if (!self) continue;
+    for (const m of t.members) {
+      const target = nodes.get(targetId(m.kind, String(m.id)));
+      if (target) addEdge("member", self.id, target.id);
     }
   }
 

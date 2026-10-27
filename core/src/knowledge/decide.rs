@@ -404,6 +404,11 @@ pub async fn revert(pool: &SqlitePool, knowledge_id: i64, note: &str) -> sqlx::R
     .bind(&now)
     .execute(&mut *tx)
     .await?;
+    // A general lesson gives back the undecided rows it covered (spec 5.5).
+    let reopened = super::cover::uncover_in(&mut tx, knowledge_id).await?;
     tx.commit().await?;
+    if reopened > 0 {
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
+    }
     Ok(true)
 }
