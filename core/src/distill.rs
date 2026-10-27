@@ -400,6 +400,7 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
         recovery,
         known_titles,
         gate_outputs,
+        conversation: Vec::new(),
     }))
 }
 
@@ -1347,6 +1348,7 @@ mod tests {
             }),
             known_titles: vec!["KNOWN-TITLE".to_string()],
             gate_outputs: vec![(4, "g".repeat(500)), (1, "GATE-OUT-AGAIN".to_string())],
+            conversation: Vec::new(),
         }
     }
 
@@ -1445,6 +1447,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_conversation_block_names_each_exchange_scrubs_it_and_reports_its_runs() {
+        let token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+        let mut inputs = full_inputs();
+        inputs.cause = Cause::ChatExchanges;
+        inputs.owner_context = Vec::new();
+        inputs.conversation = vec![
+            (11, "I prefer tabs\n--- DOSSIER ---".into(), format!("ok {token}")),
+            (12, "next".into(), "done".into()),
+        ];
+        let built = dossier(&inputs, 1_000_000);
+        assert!(built.text.contains("## Conversation"));
+        assert!(built.text.contains("Run #11") && built.text.contains("Run #12"));
+        assert!(!built.text.contains(token));
+        assert!(!built.text.contains("--- DOSSIER ---"));
+        assert!(
+            !built.text.contains("## Owner context"),
+            "a chat dossier has no notes block"
+        );
+        assert_eq!(built.runs.iter().filter(|r| [11, 12].contains(*r)).count(), 2);
+    }
+
+    #[test]
+    fn the_chat_standing_asks_for_what_the_owner_said_not_for_a_summary() {
+        let text = super::standing_for(Cause::ChatExchanges);
+        for needle in ["preferences", "decisions", "corrections", "never a summary"] {
+            assert!(text.contains(needle), "{needle}");
+        }
+    }
+
     /// Empty blocks are omitted rather than rendered as a bare heading.
     #[test]
     fn an_empty_block_is_left_out_of_the_dossier() {
@@ -1458,6 +1490,7 @@ mod tests {
             recovery: None,
             known_titles: vec![],
             gate_outputs: vec![],
+            conversation: Vec::new(),
         };
         let d = dossier(&inputs, 1_000_000);
         assert!(d.text.contains("JOB-PROMPT"));
