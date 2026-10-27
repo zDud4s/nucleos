@@ -7,6 +7,8 @@ use nucleos_core::*;
 // Both crates have a `channels`; the app's is the lib's plus ingest, media and commands, so name it
 // explicitly or the two globs collide (this import also makes `crate::channels` in `http` resolve).
 use nucleos_app::channels;
+// The same for `map`: the library's holds only `intent`, the app's is the whole map.
+use nucleos_app::map;
 
 use auth::Token;
 use state::AppState;
