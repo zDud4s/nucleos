@@ -266,7 +266,39 @@ pub(super) async fn ensure_incident(
     }
     let widened = guards.len() != row.guard_paths.len();
     store_detail(pool, &mut row, &patch, widened.then_some(guards), None).await;
+    if let Some(red_sha) = state.red_sha.as_deref() {
+        store_checked_sha(pool, &mut row, red_sha).await;
+    }
     Ok(row)
+}
+
+/// The postgate proved `red_groups` failing at `red_sha`, so that is the incident's `checked_sha`
+/// (spec: "último sha do master em que os `red_tests` foram provados a falhar"). Without it every
+/// verify reads the incident as stale and re-proves, under the probe lease, the very red the
+/// postgate is bisecting. Written through `finish_reprobe` (still red), which also clears
+/// `probe_lease_until`: so it is skipped while a verify's re-proof is in flight -- that re-proof
+/// moves `checked_sha` itself -- and when the row already says `red_sha`.
+async fn store_checked_sha(pool: &sqlx::SqlitePool, row: &mut TaskRow, red_sha: &str) {
+    if row.checked_sha.as_deref() == Some(red_sha) {
+        return;
+    }
+    let now = Utc::now();
+    let flying = row
+        .probe_lease_until
+        .as_deref()
+        .is_some_and(|until| until > crate::execution::wave::stamp(now).as_str());
+    if flying {
+        return;
+    }
+    match task_claims::store::finish_reprobe(pool, row.id, red_sha, true, now).await {
+        Ok(()) => {
+            row.checked_sha = Some(red_sha.to_owned());
+            row.probe_lease_until = None;
+        }
+        Err(error) => {
+            tracing::warn!(incident = row.id, %error, "postgate: cannot record the checked sha")
+        }
+    }
 }
 
 /// Writes the bisection's verdict into the incident: the culprit (and so `hint_paths`, the files

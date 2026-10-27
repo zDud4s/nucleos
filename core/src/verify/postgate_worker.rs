@@ -1985,6 +1985,13 @@ mod tests {
             row.detail["red_since_sha"],
             serde_json::json!(state.red_since_sha)
         );
+        // Proved failing at the red sha, so a verify finds the incident fresh there and does not
+        // re-prove what the postgate is bisecting.
+        assert!(state.red_sha.is_some());
+        assert_eq!(
+            row.checked_sha, state.red_sha,
+            "the confirmed red sha is the incident's checked_sha"
+        );
         assert_eq!(
             row.detail["red_groups"],
             serde_json::json!(["gate_command"])
@@ -2036,6 +2043,13 @@ mod tests {
             serde_json::json!(["core::a::boom"])
         );
         assert_eq!(row.guard_paths, vec!["core/src/a.rs".to_owned()]);
+        assert!(state.red_sha.is_some());
+        assert_eq!(row.checked_sha, state.red_sha, "returned with the red sha");
+        assert_eq!(
+            incident(&f).await.unwrap().checked_sha,
+            state.red_sha,
+            "and persisted"
+        );
 
         // A later pass that has no ids (the bisection's) keeps what the ticket named.
         let again = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, None)
