@@ -29,6 +29,7 @@ use sqlx::{FromRow, SqlitePool};
 
 mod decide;
 mod history;
+mod observe;
 mod propose;
 mod select;
 mod signature;
@@ -36,6 +37,7 @@ mod store;
 
 pub use self::decide::*;
 pub use self::history::*;
+pub use self::observe::*;
 pub use self::propose::*;
 pub use self::select::*;
 pub use self::signature::*;
