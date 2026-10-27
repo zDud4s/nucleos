@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::task_claims::{
-    self, Holder, HolderKind, MASTER_RED_KEY, NewTask, TaskKind, TaskRow, keys,
+    self, ClaimOutcome, Closer, Holder, HolderKind, MASTER_RED_KEY, NewTask, TaskKind, TaskRow, keys,
 };
 
 /// The postgate as a claimant: its id is the project, its worktree the one the gate checks out.
@@ -269,6 +269,116 @@ pub(super) async fn record_verdict(
     };
     store_detail(pool, &mut row, &patch, None, hints).await;
     row
+}
+
+/// The answer to "may the daemon revert now?".
+pub(super) enum RevertRight {
+    /// The incident is the gate's (just claimed, or already its own).
+    Mine,
+    /// Another live holder has it; nothing is reverted while that holds.
+    HeldBy { incident: i64, who: String },
+    /// The claims store failed (or the row could not be had even after one retry). **The only path
+    /// on which the daemon reverts without holding the incident**, on purpose: claims are fail-open
+    /// (spec §3), a database glitch must not stop the revert the owner switched on. The land gate
+    /// then sees an unclaimed incident, so the gate's own revert still passes (it is an `Op::Revert`,
+    /// never gated), and a later pass reclaims.
+    Unknown,
+}
+
+/// One claim attempt, with the store's error kept so the caller can tell a vanished row apart.
+async fn try_claim(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    project_root: &Path,
+    row: &TaskRow,
+) -> sqlx::Result<RevertRight> {
+    let me = gate_holder(project_id, project_root);
+    Ok(match task_claims::store::claim_by_id(pool, row.id, &me, Utc::now()).await? {
+        ClaimOutcome::Won { .. } => RevertRight::Mine,
+        ClaimOutcome::Lost { holder, .. } => RevertRight::HeldBy {
+            incident: row.id,
+            who: describe(&holder),
+        },
+    })
+}
+
+/// Claims `row` for the gate. `claim_by_id` is idempotent for the same holder, so repeating this
+/// (a crash after the claim, a second pass) renews the claim and never loses to itself. If the row
+/// vanished between `ensure_incident` and here (`RowNotFound`), the incident is opened again ONCE
+/// and that fresh row claimed; any other failure, or a second one, is `Unknown`.
+pub(super) async fn claim_for_revert(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    project_root: &Path,
+    state: &State,
+    row: &TaskRow,
+) -> RevertRight {
+    match try_claim(pool, project_id, project_root, row).await {
+        Ok(right) => right,
+        Err(sqlx::Error::RowNotFound) => {
+            let fresh = match ensure_incident(pool, project_id, project_root, state, None).await {
+                Ok(fresh) => fresh,
+                Err(reason) => {
+                    tracing::warn!(project = project_id, %reason, "postgate: cannot reopen the incident");
+                    return RevertRight::Unknown;
+                }
+            };
+            match try_claim(pool, project_id, project_root, &fresh).await {
+                Ok(right) => right,
+                Err(error) => {
+                    tracing::warn!(project = project_id, incident = fresh.id, %error, "postgate: cannot claim the reopened incident");
+                    RevertRight::Unknown
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(project = project_id, incident = row.id, %error, "postgate: cannot claim the incident");
+            RevertRight::Unknown
+        }
+    }
+}
+
+/// Closes the live `master-red` incident when the gate is green on a descendant of the sha the red
+/// began at (spec §3 Postgate, "Fecho"). It reads the gate's colour, not the event that turned it:
+/// a gate pass, a covered tip and a flake clear all end here, and so does a restart in between.
+/// `Closer::Green` records the previous holder, which is how a session owner is told (`Notice`).
+pub(super) async fn close_if_green(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    project_root: &Path,
+    state: &State,
+) {
+    if !state.red_groups.is_empty() {
+        return;
+    }
+    let Some(green) = state.last_green_sha.as_deref() else {
+        return;
+    };
+    let Some(row) = live_master_red(pool, project_id).await else {
+        return;
+    };
+    let red_since = row
+        .detail
+        .get("red_since_sha")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| row.checked_sha.clone());
+    if let Some(red_since) = red_since {
+        let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
+        match git_exec::is_ancestor(project_root, &red_since, green, deadline).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(reason) => {
+                tracing::warn!(project = project_id, %reason, "postgate: cannot tell if the green follows the red");
+                return;
+            }
+        }
+    }
+    let note = format!("green at {}", short(green));
+    match task_claims::store::done(pool, row.id, Closer::Green { sha: green.to_owned() }, &note, Utc::now()).await {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(incident = row.id, %error, "postgate: cannot close the incident"),
+    }
 }
 
 #[cfg(test)]
