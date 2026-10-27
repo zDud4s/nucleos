@@ -457,6 +457,7 @@ the contract, not a snapshot.
 | `distill/generalise/plan.rs` | **Pure.** Subjects (job/chat/week/note), `scope_for` (reach and `about` in code), group memory and novelty order, the seal and its backoff. |
 | `distill/generalise/tests.rs` | Shared fixtures and the pass's tests. |
 | `distill/extract.rs` | **Pure.** The extraction steps: the dossier, the extraction prompt and its schema, strict parsing of the answer (`parse_items`), the layer-to-door mapping and the retry backoff. |
+| `distill/week.rs` | The `calendar_week` cause: one queue row per ISO week (`enqueue_week_if_due`, called at the start of `tick`), the owner's `human` calendar events of a `-28 d .. +14 d` window turned into day/hour/duration/recurrence lines, a contact mark (a correspondent the owner both wrote to and named in an event title; name only), and the model's episodic items written as week-scoped `observed` rows. Reads the calendar and the contact roster only: no notes, no themes (a test pins it). |
 | `embed.rs` | Local (Ollama) embeddings of knowledge rows: the client behind a trait, f32 blobs and cosine, the backfill and the nearest-row query. Never logs a text or a vector. |
 | `embed/cluster.rs` | **Pure.** The one deterministic vector grouping (seed-anchored, inclusive cosine threshold, no chaining) shared by the generalisation pass and the themes. |
 | `embed/model.rs` | Which Ollama model embeds knowledge rows: the owner's choice persisted in `schema_meta` over the yaml default, `/config/embedding`, and the reinstall plus nudge that swaps it without a restart. |

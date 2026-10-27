@@ -171,6 +171,7 @@ export const DISTILL_CAUSE_LABELS: Record<string, string> = {
   review_blocking: "a review blocked it",
   run_exhausted: "a run ran out of attempts",
   generalised: "seen across several places",
+  calendar_week: "a week of the calendar",
 };
 
 /** Where a distilled row came from: its job, the runs behind it, and why it was written. */
