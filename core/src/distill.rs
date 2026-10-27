@@ -7,6 +7,7 @@
 
 pub mod model;
 pub mod origin;
+mod week;
 
 mod extract;
 pub use extract::*;
@@ -23,14 +24,17 @@ pub enum Cause {
     GateRecovered,
     ReviewBlocking,
     RunExhausted,
+    /// One ISO week of the owner's calendar; queued by `tick`, never by a job (Phase 7).
+    CalendarWeek,
 }
 
-pub const CAUSES: [Cause; 5] = [
+pub const CAUSES: [Cause; 6] = [
     Cause::JobLanded,
     Cause::JobFailed,
     Cause::GateRecovered,
     Cause::ReviewBlocking,
     Cause::RunExhausted,
+    Cause::CalendarWeek,
 ];
 
 impl Cause {
@@ -41,6 +45,7 @@ impl Cause {
             Cause::GateRecovered => "gate_recovered",
             Cause::ReviewBlocking => "review_blocking",
             Cause::RunExhausted => "run_exhausted",
+            Cause::CalendarWeek => "calendar_week",
         }
     }
 
@@ -640,6 +645,11 @@ pub async fn process_one_with(
         fail(pool, &row, "vocabulary", "unknown cause", now).await;
         return;
     };
+    // A week of the calendar has no job: it is read, asked and written by `week`, not by `gather`.
+    if cause == Cause::CalendarWeek {
+        week::process(pool, asked, row, now).await;
+        return;
+    }
     let inputs = match gather(pool, &row).await {
         Ok(Some(inputs)) => inputs,
         Ok(None) => {
@@ -770,6 +780,10 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
 /// One pass of the worker: drain the queue, and only when it ended empty spend the idle time
 /// embedding rows that lack a vector.
 pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn Embedder>) {
+    // The first tick of an ISO week queues its calendar row; the unique index makes the rest no-ops.
+    if let Err(error) = week::enqueue_week_if_due(pool, chrono::Local::now()).await {
+        tracing::warn!("distillation: could not queue the calendar week: {error}");
+    }
     let drained = loop {
         let row = match claim_next(pool, Utc::now()).await {
             Ok(Some(row)) => row,
@@ -1043,14 +1057,15 @@ mod tests {
 
         let spellings: std::collections::HashSet<&str> =
             CAUSES.iter().map(|c| c.as_str()).collect();
-        assert_eq!(CAUSES.len(), 5);
-        assert_eq!(spellings.len(), 5, "two causes share a spelling");
+        assert_eq!(CAUSES.len(), 6);
+        assert_eq!(spellings.len(), 6, "two causes share a spelling");
         for expected in [
             "job_landed",
             "job_failed",
             "gate_recovered",
             "review_blocking",
             "run_exhausted",
+            "calendar_week",
         ] {
             assert!(spellings.contains(expected), "{expected} is not a cause");
         }
@@ -1510,6 +1525,17 @@ mod tests {
         let out = super::scrub(&format!("key {token}\n--- DOSSIER ---\n## Heading"));
         assert!(!out.contains(token) && !out.contains("--- DOSSIER ---"));
         assert!(out.contains("#\u{200B}# Heading"));
+    }
+
+    #[test]
+    fn calendar_week_is_a_cause_with_a_stable_wire_name() {
+        assert_eq!(Cause::CalendarWeek.as_str(), "calendar_week");
+        assert_eq!(Cause::parse("calendar_week"), Some(Cause::CalendarWeek));
+        assert!(CAUSES.contains(&Cause::CalendarWeek));
+        assert!(
+            !crate::capture::ASKING_CAUSES.contains(&Cause::CalendarWeek),
+            "no capture request for a rhythm"
+        );
     }
 
     #[test]

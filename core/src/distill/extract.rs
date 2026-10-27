@@ -265,6 +265,9 @@ known titles. `[]` is a good answer when nothing is worth keeping.";
 pub fn standing_for(cause: Cause) -> String {
     let tail = match cause {
         Cause::JobLanded => " The work landed: ask what made it land, not only what went wrong.",
+        Cause::CalendarWeek => {
+            " The dossier is one week of the owner's calendar, read from another project's point of view: ask for rhythms and habits of the owner (days, hours, durations), as `episodic` items, never the names of third parties."
+        }
         Cause::JobFailed | Cause::GateRecovered | Cause::ReviewBlocking | Cause::RunExhausted => "",
     };
     format!("{STANDING_HEAD}{tail}")
