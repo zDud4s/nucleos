@@ -10,6 +10,7 @@ mod chat_key;
 pub mod rotation;
 pub mod slash;
 
+mod linked;
 mod live;
 mod send;
 mod serve;

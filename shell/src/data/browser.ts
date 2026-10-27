@@ -58,6 +58,11 @@ export interface BrowserSession {
   visible: boolean;
   /** The conversation the session answers to when no run opened it ("Open with agent"). */
   owner_chat_id: string | null;
+  /**
+   * The browser conversation that drives this session's agent tab. Optional: absent (an older
+   * daemon) reads as `null`, no conversation.
+   */
+  chat_id?: string | null;
   refusal: string | null;
   /** The proposal that asked for the wheel, once one exists. Null means nothing to decide yet. */
   proposal_id: number | null;
