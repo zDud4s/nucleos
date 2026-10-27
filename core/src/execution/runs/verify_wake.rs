@@ -175,7 +175,12 @@ async fn retry_for_slot(state: AppState, run_id: i64, ticket_id: i64, value: ser
         tokio::time::sleep(SLOT_RETRY).await;
         match super::resume_for_verify(&state, run_id, ticket_id, &value).await {
             Ok(child) => {
-                tracing::info!(run_id, ticket_id, child, "run resumed with its verification verdict");
+                tracing::info!(
+                    run_id,
+                    ticket_id,
+                    child,
+                    "run resumed with its verification verdict"
+                );
                 return;
             }
             Err(super::WakeRefusal::AlreadyHandled) => return,
@@ -622,8 +627,10 @@ mod tests {
 {"type":"result","subtype":"success"}
 "#;
         assert!(ended_listening(turn));
-        assert!(!ended_listening(r#"{"type":"result"}
-{"type":"assistant"}"#));
+        assert!(!ended_listening(
+            r#"{"type":"result"}
+{"type":"assistant"}"#
+        ));
         assert!(!ended_listening(""));
         assert!(!ended_listening("not json"));
     }
