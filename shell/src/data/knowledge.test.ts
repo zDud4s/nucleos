@@ -12,6 +12,7 @@ vi.mock("./client", async (original) => ({
 import { createAppQueryClient } from "../app/queryClient";
 import { keys } from "./keys";
 import {
+  aboutYou,
   distilledOrigin,
   groupWaiting,
   measuredByGenerator,
@@ -93,6 +94,8 @@ describe("distilledOrigin", () => {
     expect(distilledOrigin(row, new Map([[5, "job_failed"]]))).toEqual({
       job: 7,
       runs: [3, 4],
+      chat: null,
+      members: 0,
       cause: "job_failed",
       causeLabel: "the job failed",
     });
@@ -107,6 +110,42 @@ describe("distilledOrigin", () => {
       cause: null,
       causeLabel: null,
     });
+  });
+
+  it("labels the new causes and counts what a general lesson rests on", () => {
+    const causes = new Map([
+      [1, "generalised"],
+      [4, "chat_exchanges"],
+    ]);
+    const lesson = distilledOrigin(
+      known({
+        id: 1,
+        source: "distiller",
+        evidence: '[{"t":"knowledge","id":5},{"t":"knowledge","id":6},{"t":"knowledge","id":7}]',
+      }),
+      causes,
+    );
+    expect(lesson?.causeLabel).toBe("seen across several places");
+    expect(lesson?.members).toBe(3);
+    expect(
+      distilledOrigin(
+        known({ id: 4, source: "distiller", evidence: '[{"t":"chat","id":7},{"t":"run","id":9}]' }),
+        causes,
+      )?.chat,
+    ).toBe(7);
+  });
+
+  it("aboutYou keeps active rows about the owner and active distilled machine lessons", () => {
+    const m = { scope_kind: "machine" as const, scope_id: null, source: "distiller" as const };
+    const rows = [
+      known({ id: 1, about: "owner", ...m }),
+      known({ id: 2, about: null, ...m }),
+      known({ id: 3, about: null, ...m, source: "owner" }),
+      known({ id: 4, about: null, source: "distiller" }),
+      known({ id: 5, about: "owner", ...m, status: "proposed" }),
+      known({ id: 6, about: "owner", ...m, status: "reverted" }),
+    ];
+    expect(aboutYou(rows).map((r) => r.id)).toEqual([1, 2]);
   });
 
   it("distilledOrigin is null for a row the distiller did not write", () => {
