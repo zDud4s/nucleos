@@ -9,7 +9,8 @@ use super::store::{green_sha, row_by_id};
 use super::{HolderKind, Notice, Status, SESSION_LEASE_SECONDS};
 use crate::execution::wave::stamp;
 use chrono::{DateTime, Duration, Utc};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
+use std::path::Path;
 
 /// Registers (or refreshes) a session and renews every claim it holds that has not already lapsed.
 ///
@@ -71,8 +72,8 @@ pub async fn session_seen_in(pool: &SqlitePool, session_id: &str, worktree: &str
 /// - `IncidentClosed`: a `done` event closed by green (`green <sha>` note) names this session as the
 ///   owner. The session's own `task_done` has no such note and says nothing.
 ///
-/// The "an incident I inherited in a verify ticket was closed" notice depends on verify tickets and is
-/// added by the verify phase; this function covers what the event log alone can say.
+/// - `InheritedClosed`: a `done` event for an incident that this session's worktree inherited in a
+///   verify ticket (`verify_requests.inherited_task_ids`); see `inherited_notices`.
 pub async fn take_notices(
     pool: &SqlitePool,
     session_id: &str,
@@ -145,8 +146,98 @@ pub async fn take_notices(
             notices.push(Notice::ClaimLost { task, new_holder });
         }
     }
+    // Inside the same transaction: the cursor has advanced, so an error here rolls the advance back and
+    // the notice is not lost.
+    inherited_notices(&mut tx, session_id, cursor, newest, &mut notices).await?;
     tx.commit().await?;
     Ok(notices)
+}
+
+/// The comparison key of a worktree path. `canonicalize` adds the `\\?\` verbatim prefix on Windows,
+/// git prints forward slashes, a hook may send a trailing one, and Windows paths ignore case: none of
+/// these make two paths different.
+pub(super) fn worktree_key(canonical: &str) -> String {
+    let path = match canonical.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!("//{rest}"),
+        None => canonical.strip_prefix(r"\\?\").unwrap_or(canonical).to_owned(),
+    };
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    if cfg!(windows) { path.to_lowercase() } else { path.to_owned() }
+}
+
+/// `None` when the path cannot be canonicalised (a deleted worktree): the caller skips it.
+async fn worktree_key_of(path: &str) -> Option<String> {
+    match crate::execution::git_exec::canonical(Path::new(path)).await {
+        Ok(canonical) => Some(worktree_key(&canonical)),
+        Err(reason) => {
+            tracing::debug!(%reason, path, "task claims: skipping a worktree that cannot be canonicalised");
+            None
+        }
+    }
+}
+
+/// The sessions whose verify ticket inherited an incident that just closed are owed "#N resolved at
+/// <sha>, rebase and re-verify" (spec section 3, "Aviso de fecho"). A `done` event is read for ANY
+/// holder; the session that held the incident gets `IncidentClosed` instead and is skipped here.
+/// The `verify_requests.worktree` is git's toplevel and `task_sessions.worktree` is what the hook sent:
+/// both are canonicalised and compared by `worktree_key`; a ticket whose worktree is gone is skipped.
+async fn inherited_notices(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+    cursor: i64,
+    newest: i64,
+    notices: &mut Vec<Notice>,
+) -> sqlx::Result<()> {
+    let closed: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT task_id, holder_kind, holder_id FROM task_claim_events
+         WHERE id > ? AND id <= ? AND event = 'done' ORDER BY id",
+    )
+    .bind(cursor)
+    .bind(newest)
+    .fetch_all(&mut *conn)
+    .await?;
+    if closed.is_empty() {
+        return Ok(());
+    }
+    let session: Option<(String, String)> =
+        sqlx::query_as("SELECT worktree, project_id FROM task_sessions WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((worktree, project_id)) = session else { return Ok(()) };
+    let Some(mine) = worktree_key_of(&worktree).await else { return Ok(()) };
+    for (task_id, holder_kind, holder_id) in closed {
+        let held_it = holder_kind.as_deref() == Some("session") && holder_id.as_deref() == Some(session_id);
+        if held_it {
+            continue;
+        }
+        let Some(task) = row_by_id(&mut *conn, task_id).await? else { continue };
+        if task.project_id != project_id {
+            continue;
+        }
+        let worktrees: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT v.worktree
+               FROM verify_requests v, json_each(v.inherited_task_ids) j
+              WHERE v.inherited_task_ids != '[]' AND v.project_id = ? AND j.value = ?",
+        )
+        .bind(&project_id)
+        .bind(task_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut waited = false;
+        for candidate in worktrees {
+            if worktree_key_of(&candidate).await.is_some_and(|key| key == mine) {
+                waited = true;
+                break;
+            }
+        }
+        if waited {
+            let sha = task.close_note.as_deref().and_then(green_sha);
+            notices.push(Notice::InheritedClosed { task, sha });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -306,5 +397,111 @@ mod tests {
         assert!(take_notices(&pool, "s1", t0()).await.unwrap().is_empty());
         assert!(take_notices(&pool, "never-seen", t0()).await.unwrap().is_empty());
         let _ = TaskKey::master_red(); // keeps the import honest if the fixtures above change
+    }
+
+    use crate::verify::store::{insert_request, set_classification, NewRequest};
+
+    /// A verify ticket of project `p` over `worktree`, classified as having inherited `incidents`.
+    async fn ticket_at(pool: &SqlitePool, worktree: &str, incidents: &[i64]) -> i64 {
+        let id = insert_request(
+            pool,
+            &NewRequest {
+                project_id: "p", worktree, kind: "test", scope: "scope", base: None,
+                priority: 0, caller: "owner", note: None, unclaimed: &[],
+            },
+        )
+        .await
+        .unwrap();
+        set_classification(pool, id, "{}", incidents).await.unwrap();
+        id
+    }
+
+    fn native(dir: &tempfile::TempDir) -> String {
+        dir.path().to_string_lossy().into_owned()
+    }
+
+    /// How git prints a toplevel: forward slashes, whatever the platform.
+    fn git_form(dir: &tempfile::TempDir) -> String {
+        native(dir).replace('\', "/")
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_ticket_inherited_the_incident_is_told_when_it_closes() {
+        let pool = pool().await;
+        let (a, b, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for (session, dir) in [("s1", &a), ("s2", &b), ("s3", &c)] {
+            touch_session(&pool, session, &native(dir), "p", t0()).await.unwrap();
+        }
+        let red = claimed(&pool, "master-red", &holder("owner"), t0()).await;
+        let unrelated = claimed(&pool, "file:x.rs", &holder("owner"), t0()).await;
+        ticket_at(&pool, &git_form(&a), &[red]).await; // s1's worktree, twice: one notice, not two
+        ticket_at(&pool, &git_form(&a), &[red]).await;
+        ticket_at(&pool, &git_form(&b), &[red]).await; // s2's
+        ticket_at(&pool, &git_form(&c), &[unrelated]).await; // s3 inherited something else
+
+        done(&pool, red, Closer::Green { sha: "abc123".into() }, "revert", t0() + secs(5)).await.unwrap();
+
+        let s1 = take_notices(&pool, "s1", t0() + secs(6)).await.unwrap();
+        let [Notice::InheritedClosed { task, sha }] = s1.as_slice() else { panic!("expected one InheritedClosed, got {s1:?}") };
+        assert_eq!((task.id, sha.as_deref()), (red, Some("abc123")));
+        assert!(take_notices(&pool, "s1", t0() + secs(7)).await.unwrap().is_empty(), "the cursor advanced");
+        let s2 = take_notices(&pool, "s2", t0() + secs(6)).await.unwrap();
+        assert!(matches!(s2.as_slice(), [Notice::InheritedClosed { .. }]), "{s2:?}");
+        assert!(take_notices(&pool, "s3", t0() + secs(6)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_holder_keeps_its_own_notice_and_does_not_get_the_inherited_one_twice() {
+        let pool = pool().await;
+        let a = tempfile::tempdir().unwrap();
+        touch_session(&pool, "s1", &native(&a), "p", t0()).await.unwrap();
+        let red = claimed(&pool, "master-red", &holder("s1"), t0()).await;
+        ticket_at(&pool, &git_form(&a), &[red]).await;
+
+        done(&pool, red, Closer::Green { sha: "abc123".into() }, "revert", t0() + secs(5)).await.unwrap();
+
+        let notices = take_notices(&pool, "s1", t0() + secs(6)).await.unwrap();
+        assert!(matches!(notices.as_slice(), [Notice::IncidentClosed { .. }]), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_over_a_deleted_worktree_is_skipped_and_so_is_a_session_in_one() {
+        let pool = pool().await;
+        let (live, gone) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let gone_path = git_form(&gone);
+        drop(gone); // the worktree was removed: `canonicalize` fails for it
+        touch_session(&pool, "s-live", &native(&live), "p", t0()).await.unwrap();
+        touch_session(&pool, "s-gone", &gone_path.replace('/', std::path::MAIN_SEPARATOR_STR), "p", t0()).await.unwrap();
+        let red = claimed(&pool, "master-red", &holder("owner"), t0()).await;
+        ticket_at(&pool, &gone_path, &[red]).await; // skipped: cannot be canonicalised
+        ticket_at(&pool, &git_form(&live), &[red]).await;
+
+        done(&pool, red, Closer::Green { sha: "abc123".into() }, "revert", t0() + secs(5)).await.unwrap();
+
+        let live_notices = take_notices(&pool, "s-live", t0() + secs(6)).await.unwrap();
+        assert!(matches!(live_notices.as_slice(), [Notice::InheritedClosed { .. }]), "{live_notices:?}");
+        assert!(
+            take_notices(&pool, "s-gone", t0() + secs(6)).await.unwrap().is_empty(),
+            "a session whose own worktree is gone hears nothing, and nothing panics"
+        );
+    }
+
+    #[test]
+    fn worktree_keys_ignore_the_verbatim_prefix_the_slash_direction_and_a_trailing_slash() {
+        assert_eq!(worktree_key(r"\?\C:\Repo\wt"), worktree_key("C:/Repo/wt/"));
+        assert_eq!(worktree_key(r"\?\UNC\srv\share\wt"), worktree_key("//srv/share/wt"));
+        assert_ne!(worktree_key("/r/wt-a"), worktree_key("/r/wt-b"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn on_windows_worktree_keys_ignore_case() {
+        assert_eq!(worktree_key(r"\?\C:\Repo\WT"), worktree_key("c:/repo/wt"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn elsewhere_worktree_keys_keep_case() {
+        assert_ne!(worktree_key("/r/WT"), worktree_key("/r/wt"));
     }
 }
