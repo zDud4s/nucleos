@@ -9,8 +9,12 @@ scheme and appends one telemetry line per run.
     heavy.py warm [--cwd PATH] [-- argv...]
 
 Admission is a machine token queue: every request has a weight (heavy_classify) and a
-priority; the head of the queue (priority, then arrival) runs once the held weights plus
-its own fit the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4). Underneath it sits the
+priority; the head of the queue (priority, then arrival) is admitted by the admission mode
+(`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than capacity() jobs are held and
+the live probe shows room (free RAM, idle cores, a settle window since the last admission),
+or nothing is held; an unreadable probe falls back to `static`, the held weights plus its own
+fitting the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4; setting it forces `static`);
+`shadow` decides as static and only logs the cost model's opinion. Underneath it sits the
 runtime: process liveness (pid + creation time), the directory mutex, running the child
 inside a Windows Job object (so a hard-killed broker takes its child with it),
 `NUCLEOS_HEAVY=0`, and fail-open. A bug in the broker must run the command, never block it;
@@ -549,6 +553,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     itself. When it returns True the request is admitted WITHOUT a held/<pid> record: the
     caller's callable has registered the light run and tells the caller by its own side effect."""
     queue_dir, held_dir = directory / "queue", directory / "held"
+    # A re-queue (pool slot handed back) must not carry the previous admission's record.
+    rec.pop("adm", None)
     me = os.getpid()
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
     t0 = time.time()
@@ -556,12 +562,16 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     queued = False
     last_report = t0
     shadow = None
+    dyn = False
+    hc = None
     try:
         hc = _cost_mod()
         if hc is not None and hc.admission_mode() == "shadow":
             shadow = hc.Shadow(rec, directory)
+        dyn = hc is not None and hc.admission_mode() == "dynamic"
     except Exception:
         shadow = None
+        dyn = False
     admitted = False
     light_retry = _env_float("NUCLEOS_HEAVY_LIGHT_RETRY_S", 2.0)
     last_light = None
@@ -572,13 +582,20 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             _sweep_held_tmp(directory)
             qfile.write_text(json.dumps(rec), encoding="utf-8")
             queued = True
+        last_pos = 1
         while True:
             position = 0
             if shadow is not None:
                 shadow.tick()
+            # Dynamic admission reads the live machine state OUTSIDE the Mutex (the probe may
+            # sleep to prime its CPU sample), and only from a waiter that was at the head on the
+            # previous poll: the others cannot be admitted, so they would only add probe load.
+            probed = dyn and last_pos <= 1
+            pr = hc.dynamic_probe() if probed else None
             with Mutex(directory):
                 order = _queue_order(_entries(queue_dir), directory)
-                held_recs = [r for _, r in _entries(held_dir)]
+                held_ents = _entries(held_dir)
+                held_recs = [r for _, r in held_ents]
                 held = sum(int(r.get("weight") or 1) for r in held_recs)
                 names = [f.name for f, _ in order]
                 position = names.index(qfile.name) + 1 if qfile.name in names else 0
@@ -591,12 +608,30 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     static_fit = held + rec["weight"] <= capacity()
                     if shadow is not None:
                         shadow.observe(held_recs, static_fit)
-                    if static_fit:
+                    fit = static_fit
+                    if dyn and not probed:
+                        # Just reached the head: no fresh probe yet, decide on the next poll.
+                        fit = False
+                    elif dyn:
+                        adm = None
+                        try:
+                            try:
+                                since = time.time() - max(f.stat().st_mtime for f, _ in held_ents)
+                            except (OSError, ValueError):
+                                since = float("inf")
+                            fit, adm = hc.dynamic_fit(len(held_recs), pr, since, capacity(),
+                                                      static_fit)
+                        except Exception:
+                            fit, adm = static_fit, None
+                        if fit and adm:
+                            rec["adm"] = adm
+                    if fit:
                         (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
                         qfile.unlink()
                         queued = False
                         admitted = True
                         return True, time.time() - t0
+            last_pos = position
             if light is not None and (last_light is None
                                       or time.monotonic() - last_light >= light_retry):
                 last_light = time.monotonic()
@@ -2558,6 +2593,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             "wait_lock_s": round(wait_lock, 3), "wait_token_s": round(wait_token, 3),
             "token": bool(holding), "nested": nested, "in_held": in_held,
         }
+        if rec.get("adm"):
+            row["adm"] = rec["adm"]
         if warm:
             row["warm"] = True
         if light:

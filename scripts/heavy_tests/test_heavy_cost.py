@@ -198,12 +198,18 @@ class Mode(unittest.TestCase):
         self.addCleanup(patcher.stop)
         pop_keys()
 
-    def test_admission_mode_defaults_to_shadow_and_capacity_forces_static(self):
+    def test_admission_mode_defaults_to_dynamic_and_capacity_forces_static(self):
         c = load_cost()
-        self.assertEqual(c.admission_mode(), "shadow")
+        self.assertEqual(c.admission_mode(), "dynamic")
         with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_ADMISSION": "dynamic"}):
+            self.assertEqual(c.admission_mode(), "dynamic")
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_ADMISSION": "shadow"}):
             self.assertEqual(c.admission_mode(), "shadow")
         with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_ADMISSION": "static"}):
+            self.assertEqual(c.admission_mode(), "static")
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_ADMISSION": "banana"}):
+            self.assertEqual(c.admission_mode(), "dynamic")
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_CAPACITY": "4", "NUCLEOS_HEAVY_ADMISSION": "dynamic"}):
             self.assertEqual(c.admission_mode(), "static")
         with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_CAPACITY": "4"}):
             self.assertEqual(c.admission_mode(), "static")
