@@ -163,8 +163,10 @@ class Shadow(Base):
                            "busy_cores": busy})
 
     def env(self, busy: float = 9, **extra: str) -> dict:
+        # Shadow is opt-in now that `dynamic` is the default; a caller's `extra` may override.
         return clean_env(str(self.state), NUCLEOS_HEAVY_POLL_S="0.1",
-                         NUCLEOS_HEAVY_FAKE_PROBE=self.probe(busy), **extra)
+                         NUCLEOS_HEAVY_FAKE_PROBE=self.probe(busy),
+                         **{"NUCLEOS_HEAVY_ADMISSION": "shadow", **extra})
 
     def test_disagreement_is_logged_and_static_still_admits(self) -> None:
         self.hold(3, 9, 1000)
@@ -203,6 +205,7 @@ class Shadow(Base):
 
     def test_broken_probe_is_fail_open(self) -> None:
         env = clean_env(str(self.state), NUCLEOS_HEAVY_POLL_S="0.1",
+                        NUCLEOS_HEAVY_ADMISSION="shadow",
                         NUCLEOS_HEAVY_FAKE_PROBE="not json{")
         cp = run_broker(["--", sys.executable, "-c", "pass"], env)
         self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
