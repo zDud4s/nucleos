@@ -238,6 +238,9 @@ if ($NoStart) { exit 0 }
 
 # --- 5. start (foreground, like `cargo run`) ---------------------------------------------------
 Remove-Item Env:NUCLEOS_SIDECAR_DIR -ErrorAction SilentlyContinue
+# Started from a Claude Code session, the daemon would inherit its id and hand it to every gate it
+# runs, and heavy.py would file the daemon's gates under that session.
+Remove-Item Env:CLAUDE_CODE_SESSION_ID -ErrorAction SilentlyContinue
 Push-Location $RepoRoot
 & (Join-Path $RunDir 'nucleos-core.exe') @DaemonArgs
 $code = $LASTEXITCODE
