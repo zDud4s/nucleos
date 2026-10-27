@@ -231,22 +231,44 @@ pub async fn drain_once(
         }
     }
     let id = claimed.id;
-    let outcome = match CatchUnwind(executor.execute(&claimed)).await {
-        Ok(outcome) => outcome,
-        // A panic in the executor must not leave the row `running`: the partial unique index would
-        // hold the repository's only slot until a restart reconciled it. It becomes an ordinary
-        // failure, written by the same `finish` below.
-        Err(panic) => {
-            let detail = panic
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_owned());
-            tracing::error!(vcs_request_id = id, %detail, "vcs: the executor panicked");
-            Outcome::Failed {
-                reason: format!("the executor panicked: {detail}"),
-                exit_code: None,
-                output_tail: String::new(),
+    // Spec 2026-10-22 task-claims §3 Land: the claim may have changed between admission and now, so
+    // the merge is judged again. Refused before the executor is entered, so nothing is published.
+    // Only a merge into the integration branch (`claimed.integration_branch`, resolved just above)
+    // is a landing; with none resolved the gate stands aside, as at admission.
+    let held = crate::execution::land::claim_gate::refusal_for_op(
+        pool,
+        &claimed.project_id,
+        std::path::Path::new(&claimed.project_root),
+        &claimed.op,
+        claimed.from_resolution,
+        claimed.run_id,
+        claimed.integration_branch.as_ref(),
+    )
+    .await;
+    let outcome = if let Some(reason) = held {
+        Outcome::Failed {
+            reason,
+            exit_code: None,
+            output_tail: String::new(),
+        }
+    } else {
+        match CatchUnwind(executor.execute(&claimed)).await {
+            Ok(outcome) => outcome,
+            // A panic in the executor must not leave the row `running`: the partial unique index
+            // would hold the repository's only slot until a restart reconciled it. It becomes an
+            // ordinary failure, written by the same `finish` below.
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                tracing::error!(vcs_request_id = id, %detail, "vcs: the executor panicked");
+                Outcome::Failed {
+                    reason: format!("the executor panicked: {detail}"),
+                    exit_code: None,
+                    output_tail: String::new(),
+                }
             }
         }
     };
