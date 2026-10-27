@@ -3,7 +3,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import { AgentPanel } from "./AgentPanel";
 import { resetBrowserStore, setActiveTab } from "../data/browser-store";
 import { NO_PROJECT, newTab } from "../data/browser-tabs";
-import { daemonFetch, daemonState, renderWithRouter } from "../test/harness";
+import { daemonFetch, daemonState, project, renderWithRouter } from "../test/harness";
 import type { Turn } from "../lib/turns";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -241,13 +241,68 @@ describe("the Agent panel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     await waitFor(() => expect(agentChat.createBrowserTask).toHaveBeenCalledTimes(1));
-    expect(agentChat.createBrowserTask).toHaveBeenCalledWith("Book a table for two");
+    // No project scope: no directory for the new chat.
+    expect(agentChat.createBrowserTask).toHaveBeenCalledWith("Book a table for two", null);
     // "New task" never links to a mother: the panel neither relinks nor sends through a chat.
     expect(agentChat.relinkBrowserChat).not.toHaveBeenCalled();
     expect(sendSpy).not.toHaveBeenCalled();
     // The new conversation is the one the panel then shows.
     expect(await screen.findByText("Looking at the booking page now.")).toBeDefined();
     expect(chats.useChatTranscript).toHaveBeenCalledWith("new-1");
+  });
+
+  it("New task in a project scope places the chat in that project's folder", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(daemonState({ projects: [project({ project_id: "p1", project_root: "C:/work/p1" })] })),
+    );
+    agentChat.createBrowserTask.mockResolvedValue({ chat_id: "new-1", turn_id: 3 });
+    act(() => setActiveTab({ scope: "p1", tab: null }));
+    await renderPanel();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New task" }));
+    const box = await screen.findByPlaceholderText("Message the agent…");
+    fireEvent.change(box, { target: { value: "Book a table for two" } });
+    // The roster arrives through a query: a send before it lands is refused as "still loading",
+    // so retry until the panel knows the folder.
+    await waitFor(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      expect(agentChat.createBrowserTask).toHaveBeenCalledTimes(1);
+    });
+    expect(agentChat.createBrowserTask).toHaveBeenCalledWith("Book a table for two", "C:/work/p1");
+  });
+
+  it("a project scope with no folder refuses New task and keeps the draft", async () => {
+    daemon.apiFetch.mockImplementation(
+      daemonFetch(daemonState({ projects: [project({ project_id: "p1", project_root: null })] })),
+    );
+    act(() => setActiveTab({ scope: "p1", tab: null }));
+    await renderPanel();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New task" }));
+    const box = await screen.findByPlaceholderText("Message the agent…");
+    fireEvent.change(box, { target: { value: "Book a table for two" } });
+    await waitFor(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      expect(screen.getByText("This project has no folder on disk, so a task cannot be started in it.")).toBeDefined();
+    });
+    expect(agentChat.createBrowserTask).not.toHaveBeenCalled();
+    expect((box as HTMLTextAreaElement).value).toBe("Book a table for two");
+  });
+
+  it("a failed New task shows the error and keeps the draft", async () => {
+    agentChat.createBrowserTask.mockRejectedValue(new Error("409 busy"));
+    act(() => setActiveTab({ scope: NO_PROJECT, tab: null }));
+    await renderPanel();
+
+    fireEvent.click(await screen.findByRole("button", { name: "New task" }));
+    const box = await screen.findByPlaceholderText("Message the agent…");
+    fireEvent.change(box, { target: { value: "Book a table for two" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("409 busy")).toBeDefined();
+    expect((screen.getByPlaceholderText("Message the agent…") as HTMLTextAreaElement).value).toBe(
+      "Book a table for two",
+    );
   });
 
   it("the header names the parent and offers relink and unlink", async () => {

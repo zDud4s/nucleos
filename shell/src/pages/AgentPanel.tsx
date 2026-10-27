@@ -12,9 +12,10 @@ import {
   useLastBrowserChat,
 } from "../data/browser-agent-chat";
 import { useActiveTab } from "../data/browser-store";
-import { NO_PROJECT } from "../data/browser-tabs";
+import { NO_PROJECT, scopeProject } from "../data/browser-tabs";
 import { useChats, useChatTranscript, useSendMessage } from "../data/chats";
 import { keys } from "../data/keys";
+import { useProjects } from "../data/system";
 import { ComposerBox } from "../chats/ComposerBox";
 import { MessageList, type ListedMessage } from "../chats/MessageList";
 import type { Turn } from "../lib/turns";
@@ -63,6 +64,14 @@ export function AgentPanel() {
   }));
   const last = useLastBrowserChat(scope).data ?? null;
   const chats = useChats().data;
+  // A "New task" chat is placed in the scope's project through its directory: the daemon files
+  // each turn under the project its chat's directory belongs to.
+  const projects = useProjects().data;
+  const scopeProjectId = scopeProject(scope);
+  const scopeRoot =
+    scopeProjectId === null
+      ? null
+      : (projects?.find((row) => row.project_id === scopeProjectId)?.project_root ?? null);
 
   // The conversation a "New task" started, kept only while the same tab stays in front.
   const [created, setCreated] = useState<{ key: string; chatId: string } | null>(null);
@@ -163,10 +172,20 @@ export function AgentPanel() {
     setError(null);
     if (chatId === null) {
       // "New task": a conversation with no mother, its first message carried by the creation.
+      // A project scope whose folder is not known would start a task filed under no project,
+      // where this scope never lists it: refused here, the draft kept.
+      if (scopeProjectId !== null && scopeRoot === null) {
+        setError(
+          projects === undefined
+            ? "The project list is still loading; try again in a moment."
+            : "This project has no folder on disk, so a task cannot be started in it.",
+        );
+        return;
+      }
       setBusy(true);
       const key = tabKey;
       const view = viewKey;
-      createBrowserTask(words)
+      createBrowserTask(words, scopeRoot)
         .then((started) => {
           // The scope's newest conversation and the chat list both changed: without this a
           // return to the tab would show the empty state again and invite a duplicate task.

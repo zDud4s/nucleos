@@ -119,8 +119,9 @@ describe("createBrowserTask", () => {
       return Promise.reject(new Error(`unexpected ${path}`));
     });
 
-    const started = await createBrowserTask("Find the cheapest flight to Porto");
+    const started = await createBrowserTask("Find the cheapest flight to Porto", null);
 
+    // No project: no directory to set, so no PATCH between the creation and the link.
     expect(daemon.apiFetch).toHaveBeenCalledTimes(3);
     expect(call(0)).toEqual({ path: "/assistant/chats", method: "POST", body: {} });
     expect(call(1)).toEqual({
@@ -135,6 +136,69 @@ describe("createBrowserTask", () => {
     });
     expect(started.chat_id).toBe("child-1");
     expect(started.turn_id).toBe(42);
+  });
+
+  it("createBrowserTask places the new chat in the scope's project directory before linking it", async () => {
+    daemon.apiFetch.mockImplementation((path: string) => {
+      if (path === "/assistant/chats") return Promise.resolve({ chat_id: "child-1" });
+      if (path === "/assistant/chats/child-1") return Promise.resolve(undefined);
+      if (path === "/assistant/chats/child-1/link") return Promise.resolve({ link: link("child-1", null) });
+      if (path === "/assistant/message") return Promise.resolve({ queued: true });
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
+
+    const started = await createBrowserTask("Compare three laptops", "C:/work/p1");
+
+    expect(daemon.apiFetch).toHaveBeenCalledTimes(4);
+    expect(call(0)).toEqual({ path: "/assistant/chats", method: "POST", body: {} });
+    // The daemon stamps each turn's project from the chat's directory.
+    expect(call(1)).toEqual({ path: "/assistant/chats/child-1", method: "PATCH", body: { cwd: "C:/work/p1" } });
+    expect(call(2).path).toBe("/assistant/chats/child-1/link");
+    expect(call(3).path).toBe("/assistant/message");
+    expect(started.queued).toBe(true);
+  });
+
+  it("createBrowserTask archives the new chat and rethrows when the first message fails", async () => {
+    const refused = new Error("409 busy");
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats") return Promise.resolve({ chat_id: "child-1" });
+      if (path === "/assistant/chats/child-1" && init?.method === "PATCH") return Promise.resolve(undefined);
+      if (path === "/assistant/chats/child-1/link") return Promise.resolve({ link: link("child-1", null) });
+      if (path === "/assistant/message") return Promise.reject(refused);
+      if (path === "/assistant/chats/child-1" && init?.method === "DELETE") return Promise.resolve(undefined);
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
+
+    await expect(createBrowserTask("Book a table for two", "C:/work/p1")).rejects.toBe(refused);
+
+    expect(daemon.apiFetch).toHaveBeenCalledTimes(5);
+    expect(call(4)).toEqual({ path: "/assistant/chats/child-1", method: "DELETE", body: undefined });
+  });
+
+  it("createBrowserTask rethrows the step's error even when the cleanup fails too", async () => {
+    const refused = new Error("link refused");
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats" && init?.method === "POST") return Promise.resolve({ chat_id: "child-1" });
+      if (path === "/assistant/chats/child-1/link") return Promise.reject(refused);
+      if (path === "/assistant/chats/child-1" && init?.method === "DELETE") {
+        return Promise.reject(new Error("archive failed"));
+      }
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
+
+    await expect(createBrowserTask("Book a table for two", null)).rejects.toBe(refused);
+
+    // No message was sent after the failed link; the cleanup was attempted.
+    expect(daemon.apiFetch).toHaveBeenCalledTimes(3);
+    expect(call(2)).toEqual({ path: "/assistant/chats/child-1", method: "DELETE", body: undefined });
+  });
+
+  it("createBrowserTask cleans up nothing when the creation itself fails", async () => {
+    const down = new Error("daemon unreachable");
+    daemon.apiFetch.mockRejectedValue(down);
+
+    await expect(createBrowserTask("Book a table for two", null)).rejects.toBe(down);
+    expect(daemon.apiFetch).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -90,20 +90,42 @@ async function postLink(childChatId: string, parentChatId: string | null): Promi
   return answer.link;
 }
 
-/** "New task": a new chat, linked to the panel only (null parent), then the task sent as its first message. */
-export async function createBrowserTask(text: string): Promise<BrowserTaskStarted> {
+/**
+ * "New task": a new chat, placed in the scope's project, linked to the panel only (null parent),
+ * then the task sent as its first message.
+ *
+ * `cwd` is the project root of the panel's scope, or `null` for no project. `POST /assistant/chats`
+ * takes no directory, so it is set with the same PATCH `useSetChatProject` sends; the daemon stamps
+ * each turn's project from the chat's directory, which is what files the task under its scope.
+ *
+ * Four requests and no transaction: when any step after the creation fails, the new chat is
+ * archived (best effort; archiving also closes its link) so it does not linger as the scope's newest
+ * browser conversation, and the original error is rethrown for the caller to show.
+ */
+export async function createBrowserTask(text: string, cwd: string | null): Promise<BrowserTaskStarted> {
   const opened = await apiFetch<{ chat_id: string }>("/assistant/chats", {
     method: "POST",
     body: JSON.stringify({}),
   });
-  // Linked before the first message, so the run the message starts already knows it reports to
-  // the panel rather than to nobody.
-  await postLink(opened.chat_id, null);
-  const sent = await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
-    method: "POST",
-    body: JSON.stringify({ chat_id: opened.chat_id, text, images: [], wait_if_busy: true }),
-  });
-  return { chat_id: opened.chat_id, turn_id: sent?.turn_id, queued: sent?.queued };
+  const chatPath = `/assistant/chats/${encodeURIComponent(opened.chat_id)}`;
+  try {
+    if (cwd !== null) {
+      await apiFetch<void>(chatPath, { method: "PATCH", body: JSON.stringify({ cwd }) });
+    }
+    // Linked before the first message, so the run the message starts already knows it reports to
+    // the panel rather than to nobody.
+    await postLink(opened.chat_id, null);
+    const sent = await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
+      method: "POST",
+      body: JSON.stringify({ chat_id: opened.chat_id, text, images: [], wait_if_busy: true }),
+    });
+    return { chat_id: opened.chat_id, turn_id: sent?.turn_id, queued: sent?.queued };
+  } catch (error) {
+    // The same DELETE `useArchiveChat` sends. A failed cleanup must not hide the failure that
+    // caused it, so its own error is dropped.
+    await apiFetch<void>(chatPath, { method: "DELETE" }).catch(() => undefined);
+    throw error;
+  }
 }
 
 /** Link a browser conversation (the child) to a new mother conversation. */
@@ -159,7 +181,7 @@ export function useBrowserAgentActions() {
     void queryClient.invalidateQueries({ queryKey: browserAgentKeys.all });
   };
   const createTask = useMutation({
-    mutationFn: (text: string) => createBrowserTask(text),
+    mutationFn: ({ text, cwd }: { text: string; cwd: string | null }) => createBrowserTask(text, cwd),
     retry: false,
     onSettled: refresh,
   });
