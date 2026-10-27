@@ -235,12 +235,23 @@ pub async fn drain_once(
     // the merge is judged again. Refused before the executor is entered, so nothing is published.
     // Only a merge into the integration branch (`claimed.integration_branch`, resolved just above)
     // is a landing; with none resolved the gate stands aside, as at admission.
+    // Who queued it decides the exemption, as at admission: the daemon's own landings pass. The
+    // claim does not carry the origin, so it is read back; a read error leaves it a non-daemon
+    // request, the safe side.
+    let from_daemon = sqlx::query_scalar::<_, String>("SELECT origin FROM vcs_requests WHERE id = ?")
+        .bind(claimed.id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|origin| origin == Origin::Daemon.as_str());
     let held = crate::execution::land::claim_gate::refusal_for_op(
         pool,
         &claimed.project_id,
         std::path::Path::new(&claimed.project_root),
         &claimed.op,
         claimed.from_resolution,
+        if from_daemon { Origin::Daemon } else { Origin::Shell },
         claimed.run_id,
         claimed.integration_branch.as_ref(),
     )

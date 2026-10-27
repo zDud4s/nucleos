@@ -11,7 +11,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 
 use crate::execution::git_exec;
-use crate::execution::vcs::{Branch, Op};
+use crate::execution::vcs::{Branch, Op, Origin};
 use crate::task_claims::{self, Holder, HolderKind, TaskRow};
 
 /// Who is landing what, as far as the gate cares.
@@ -87,6 +87,20 @@ fn same_path(a: &str, b: &str) -> bool {
     !a.is_empty() && fold(a) == fold(b)
 }
 
+/// True when `child` is `root` or lies beneath it (same folding as [`same_path`]).
+fn path_within(child: &str, root: &str) -> bool {
+    let fold = |p: &str| {
+        let p = p.replace('\\', "/");
+        let p = p.trim_end_matches('/').to_owned();
+        if cfg!(windows) { p.to_lowercase() } else { p }
+    };
+    if child.is_empty() || root.is_empty() {
+        return false;
+    }
+    let (child, root) = (fold(child), fold(root));
+    child == root || child.strip_prefix(&root).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// The guards `landing` is not entitled to cross: the owner (the worktree that holds the branch is
 /// the task's `holder_worktree`, or the run that owns it is the one asking) passes.
 pub fn blocking<'a>(
@@ -97,7 +111,9 @@ pub fn blocking<'a>(
     guards
         .iter()
         .filter(|guard| {
-            let by_worktree = owner_worktree.is_some_and(|w| same_path(w, &guard.holder_worktree));
+            let by_worktree = owner_worktree.is_some_and(|w| {
+                same_path(w, &guard.holder_worktree) || path_within(&guard.holder_worktree, w)
+            });
             let by_run = matches!(guard.holder_kind, Some(HolderKind::Run))
                 && run_id.is_some_and(|id| guard.holder_id == id.to_string());
             !(by_worktree || by_run)
@@ -199,8 +215,9 @@ pub async fn check(
     for guard in blocking(&guards, owner.as_deref(), landing.run_id) {
         // An override recorded when this branch was admitted holds for the claim in force
         // (`override_recorded` is true only for an `override_land` event after the current
-        // `claimed_at`, so a new owner's claim is not covered by an old override).
-        if task_claims::store::override_recorded(pool, guard.id, &note).await {
+        // `claimed_at`, so a new owner's claim is not covered by an old override). A read error
+        // means "not recorded": the landing is refused, the safe side.
+        if task_claims::store::override_recorded(pool, guard.id, &note).await.unwrap_or(false) {
             continue;
         }
         still.push(guard);
@@ -247,6 +264,7 @@ pub async fn refusal_for_op(
     project_root: &Path,
     op: &Op,
     from_resolution: bool,
+    origin: Origin,
     run_id: Option<i64>,
     integration: Option<&Branch>,
 ) -> Option<String> {
@@ -256,7 +274,7 @@ pub async fn refusal_for_op(
     if integration.is_none_or(|branch| branch.as_str() != target.as_str()) {
         return None;
     }
-    let landing = Landing { project_id, project_root, source, target, exempt: from_resolution, run_id };
+    let landing = Landing { project_id, project_root, source, target, exempt: from_resolution || matches!(origin, Origin::Daemon), run_id };
     let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
     match check(pool, &landing, false, deadline, Utc::now()).await {
         Verdict::Refused(message) => Some(format!("refused when the queue came to run it: {message}")),
@@ -294,6 +312,18 @@ mod pure_tests {
         assert!(blocking(&guards, Some("c:\\work\\repo-wt\\"), None).is_empty());
         #[cfg(not(windows))]
         assert_eq!(blocking(&guards, Some("c:/work/repo-wt"), None).len(), 1);
+    }
+
+    #[test]
+    fn a_holder_worktree_beneath_the_branchs_worktree_is_the_owner_too() {
+        let guards = [guard(1, HolderKind::Session, "s1", "C:/Work/Repo-wt/sub/dir")];
+        assert!(blocking(&guards, Some("C:\\Work\\Repo-wt\\"), None).is_empty());
+        // A sibling that merely shares the prefix is a stranger.
+        let sibling = [guard(2, HolderKind::Session, "s1", "C:/Work/Repo-wt2")];
+        assert_eq!(blocking(&sibling, Some("C:/Work/Repo-wt"), None).len(), 1);
+        // The reverse (the claim holds a parent of the branch's worktree) is not ownership.
+        let parent = [guard(3, HolderKind::Session, "s1", "C:/Work")];
+        assert_eq!(blocking(&parent, Some("C:/Work/Repo-wt"), None).len(), 1);
     }
 
     #[test]

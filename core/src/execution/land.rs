@@ -401,12 +401,7 @@ async fn resolve_target(
 }
 
 /// Admits a landing for a caller with no claims override. See [`submit_with`].
-///
-/// `owner_override` is the project owner's override of the task-claims gate
-/// (`NUCLEOS_ALLOW_CLAIMED_LAND`, carried by `POST /vcs/land`): the landing is admitted and the
-/// override is recorded against each task it crossed.
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_with(
+pub async fn submit(
     pool: &sqlx::SqlitePool,
     repo: &ResolvedRepo,
     project_root: &Path,
@@ -414,7 +409,6 @@ pub async fn submit_with(
     requested_target: Option<&str>,
     deadline: Instant,
     origin: Origin,
-    owner_override: bool,
 ) -> Result<i64, LandRefusal> {
     submit_with(pool, repo, project_root, source, requested_target, deadline, origin, false).await
 }
@@ -440,7 +434,13 @@ pub async fn submit_with(
 /// resolver handing over a resolution it finished on its own (`resolver::land_finished`). Both
 /// carry their own approval, so the row starts `queued` either way; the column is what lets
 /// metric 2 tell a conflict the daemon closed alone from one a person landed.
-pub async fn submit(
+///
+/// `owner_override` is the project owner's override of the task-claims gate
+/// (`NUCLEOS_ALLOW_CLAIMED_LAND`): the landing is admitted and the override is recorded against
+/// each task it crossed. The route wiring that carries it from `POST /vcs/land` comes in chunk 3
+/// Task 10; until then only direct callers can set it.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_with(
     pool: &sqlx::SqlitePool,
     repo: &ResolvedRepo,
     project_root: &Path,
@@ -448,6 +448,7 @@ pub async fn submit(
     requested_target: Option<&str>,
     deadline: Instant,
     origin: Origin,
+    owner_override: bool,
 ) -> Result<i64, LandRefusal> {
     let source = Branch::new(source).map_err(LandRefusal::Refused)?;
     let from_resolution =
@@ -2490,6 +2491,25 @@ mod tests {
         assert_eq!(sha_of(&repo, "master"), master_before, "nothing was published");
     }
 
+    /// A daemon-origin landing is exempt at admission, so it must be exempt when the queue runs it
+    /// too: a claim taken in between does not stop the daemon's own merge.
+    #[tokio::test]
+    async fn a_daemon_landing_admitted_exempt_is_still_exempt_when_the_queue_runs_it() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-daemon-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+
+        let id = land_feat_x(&pool, &repo, Origin::Daemon, false).await.expect("nothing is claimed yet");
+        claimed_task(&pool, &repo, "file:feature.txt", &["feature.txt"], &[], holder(HolderKind::Session, "s1", "C:/elsewhere")).await;
+
+        assert!(crate::execution::vcs::drain_once(&pool, "alpha", &crate::execution::git_exec::GitExecutor::default()).await);
+        let ticket = crate::execution::vcs::wait_for(&pool, id, std::time::Duration::ZERO).await.unwrap();
+        assert_eq!(ticket.status, "succeeded", "{:?}", ticket.failure_reason);
+    }
+
     #[tokio::test]
     async fn the_owners_override_is_recorded_once_and_holds_at_execution_time() {
         let _lock = crate::execution::worktree::test_env_lock();
@@ -2526,10 +2546,10 @@ mod tests {
             target: Branch::new("master").unwrap(),
         };
         let master = Branch::new("master").unwrap();
-        let gated = claim_gate::refusal_for_op(&pool, "alpha", &repo, &merge, false, None, Some(&master)).await;
+        let gated = claim_gate::refusal_for_op(&pool, "alpha", &repo, &merge, false, Origin::Shell, None, Some(&master)).await;
         assert!(gated.is_some(), "a merge touching the guarded file is held");
-        assert!(claim_gate::refusal_for_op(&pool, "alpha", &repo, &revert, false, None, Some(&master)).await.is_none());
-        assert!(claim_gate::refusal_for_op(&pool, "alpha", &repo, &merge, true, None, Some(&master)).await.is_none(), "resolver landings are exempt");
+        assert!(claim_gate::refusal_for_op(&pool, "alpha", &repo, &revert, false, Origin::Shell, None, Some(&master)).await.is_none());
+        assert!(claim_gate::refusal_for_op(&pool, "alpha", &repo, &merge, true, Origin::Shell, None, Some(&master)).await.is_none(), "resolver landings are exempt");
     }
 
     /// The queue-time gate only judges a landing: a merge INTO the integration branch. An agent
@@ -2556,12 +2576,12 @@ mod tests {
 
         // Control: were feat/x the integration branch, this very merge would be held. So the pass
         // below is the target check at work, not an absence of anything to guard.
-        let held = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, None, Some(&feature)).await;
+        let held = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, Origin::Shell, None, Some(&feature)).await;
         assert!(held.is_some(), "the guard bites when the target is the integration branch");
 
-        let into_feature = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, None, Some(&master)).await;
+        let into_feature = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, Origin::Shell, None, Some(&master)).await;
         assert!(into_feature.is_none(), "master -> feat/x is not a landing: {into_feature:?}");
-        let unknown = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, None, None).await;
+        let unknown = claim_gate::refusal_for_op(&pool, "alpha", &repo, &catch_up, false, Origin::Shell, None, None).await;
         assert!(unknown.is_none(), "an unresolved integration branch means no queue-time gate");
     }
 }
