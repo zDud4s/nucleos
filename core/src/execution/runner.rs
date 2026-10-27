@@ -3423,7 +3423,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_node_request_allows_exactly_the_finding_and_verify_tools() {
+    fn a_job_node_request_allows_exactly_the_finding_verify_and_task_tools() {
         let mut request = baseline_run_request();
         request.mcp_config = Some(PathBuf::from("C:/tmp/job-node.json"));
         request.allowed_mcp_tools = Some(
@@ -3442,7 +3442,8 @@ mod tests {
         assert_eq!(
             allowed,
             "mcp__nucleos__note_finding,mcp__nucleos__record,mcp__nucleos__verify,\
-             mcp__nucleos__verify_status"
+             mcp__nucleos__verify_status,mcp__nucleos__task_list,mcp__nucleos__task_claim,\
+             mcp__nucleos__task_release,mcp__nucleos__task_done"
         );
         assert_ne!(allowed, "mcp__nucleos__*");
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));

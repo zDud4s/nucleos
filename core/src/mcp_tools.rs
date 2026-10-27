@@ -1087,6 +1087,10 @@ mod tests {
                 "shadow_queue",
                 "shadow_scoreboard",
                 "suggest_model",
+                "task_claim",
+                "task_done",
+                "task_list",
+                "task_release",
                 "triage_email",
                 "vcs_request",
                 "vcs_ticket",
@@ -2702,14 +2706,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worktree_box_server_announces_only_verify_verify_status_and_record() {
+    async fn a_worktree_box_server_announces_only_verify_record_and_task_tools() {
         let (_running, context) = served_request_context().await;
 
         let listed = worktree_server("/work/a")
             .list_tools(None, context)
             .await
             .unwrap();
-        assert_eq!(advertised(&listed), ["record", "verify", "verify_status"]);
+        assert_eq!(
+            advertised(&listed),
+            [
+                "record",
+                "task_claim",
+                "task_done",
+                "task_list",
+                "task_release",
+                "verify",
+                "verify_status"
+            ]
+        );
         assert!(!served_in_box(
             &McpBox::Worktree("/work/a".to_owned()),
             "note_finding"
