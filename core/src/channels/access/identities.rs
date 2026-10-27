@@ -345,11 +345,38 @@ pub async fn set_home(
     .execute(&mut *tx)
     .await
     .map_err(SetHomeError::Db)?;
+    // Only a channel gaining its first home adopts the primary: moving an existing home leaves a
+    // primary the user cleared by hand cleared.
+    if previous.is_none() {
+        adopt_primary_if_unset(&mut tx, channel)
+            .await
+            .map_err(SetHomeError::Db)?;
+    }
     tx.commit().await.map_err(SetHomeError::Db)?;
     Ok(HomeSet {
         home: conversation_ref.to_string(),
         previous,
     })
+}
+
+/// A channel that just gained a home becomes primary when nothing is primary yet, in the caller's
+/// transaction, with its cursors reset exactly as `set_primary` does (E.3). An existing primary is
+/// never replaced. Returns whether it adopted. `channel` must be a compiled manifest id.
+pub(super) async fn adopt_primary_if_unset(
+    conn: &mut sqlx::SqliteConnection,
+    channel: &str,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE channels_global SET primary_channel = ? WHERE id = 1 AND primary_channel IS NULL",
+    )
+    .bind(channel)
+    .execute(&mut *conn)
+    .await?;
+    let adopted = done.rows_affected() == 1;
+    if adopted {
+        routing::reseed(conn, channel).await?;
+    }
+    Ok(adopted)
 }
 
 /// `PUT /channels/primary {channel}` (E.3). `None` clears it. Asking for the current primary is a
@@ -885,6 +912,96 @@ mod tests {
                 .conversation_ref,
             "c1"
         );
+    }
+
+    async fn feed_cursor(pool: &SqlitePool, channel: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT feed_cursor FROM channel_routing_state WHERE channel = ?")
+            .bind(channel)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_first_home_with_no_primary_makes_the_channel_primary_and_reseeds() {
+        let st = state().await;
+        let pool = &st.pool;
+        seed(
+            pool,
+            "1",
+            None,
+            "c1",
+            "private",
+            None,
+            false,
+            "2026-10-12T09:00:00Z",
+        )
+        .await;
+        let old = nucleos_base::feed::append(pool, None, "summary", "old news", None, None)
+            .await
+            .unwrap();
+
+        let set = set_home(pool, "telegram", "1", "c1").await.unwrap();
+        assert_eq!(set.previous, None);
+        assert_eq!(stored_primary(pool).await.as_deref(), Some("telegram"));
+        assert_eq!(feed_cursor(pool, "telegram").await, Some(old));
+    }
+
+    #[tokio::test]
+    async fn a_first_home_keeps_an_existing_primary() {
+        let st = state().await;
+        let pool = &st.pool;
+        sqlx::query("UPDATE channels_global SET primary_channel = 'fake' WHERE id = 1")
+            .execute(pool)
+            .await
+            .unwrap();
+        seed(
+            pool,
+            "1",
+            None,
+            "c1",
+            "private",
+            None,
+            false,
+            "2026-10-12T09:00:00Z",
+        )
+        .await;
+
+        set_home(pool, "telegram", "1", "c1").await.unwrap();
+        assert_eq!(stored_primary(pool).await.as_deref(), Some("fake"));
+        assert_eq!(feed_cursor(pool, "telegram").await, None);
+    }
+
+    #[tokio::test]
+    async fn moving_a_home_does_not_adopt_a_cleared_primary() {
+        let st = state().await;
+        let pool = &st.pool;
+        seed(
+            pool,
+            "1",
+            None,
+            "c1",
+            "private",
+            None,
+            true,
+            "2026-10-12T09:00:00Z",
+        )
+        .await;
+        seed(
+            pool,
+            "1",
+            None,
+            "g1",
+            "group",
+            None,
+            false,
+            "2026-10-12T09:01:00Z",
+        )
+        .await;
+
+        set_home(pool, "telegram", "1", "g1").await.unwrap();
+        assert_eq!(stored_primary(pool).await, None);
+        assert_eq!(feed_cursor(pool, "telegram").await, None);
     }
 
     #[tokio::test]

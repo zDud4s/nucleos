@@ -282,7 +282,7 @@ pub async fn admit(
     from_chat_id: &str,
     to_chat_id: &str,
     sending_run_id: i64,
-    origin: crate::assistant::Origin,
+    origin: crate::assistant_types::Origin,
     body: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<i64, Refusal> {
@@ -556,7 +556,7 @@ pub async fn sender_read_untrusted(pool: &sqlx::SqlitePool, relay_id: i64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assistant::Origin;
+    use crate::assistant_types::Origin;
 
     async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await

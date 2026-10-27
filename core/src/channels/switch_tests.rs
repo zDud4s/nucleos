@@ -613,7 +613,7 @@ async fn migration_0235_is_idempotent() {
 
 #[tokio::test]
 async fn a_queued_message_with_the_migrated_origin_replays_as_a_channel_turn() {
-    use crate::assistant::Origin;
+    use crate::assistant_types::Origin;
 
     let pool = pre_switch_pool_with_origins().await;
     apply_migrations_after(&pool, BEFORE_SWITCH).await;
@@ -642,7 +642,7 @@ async fn a_queued_message_with_the_migrated_origin_replays_as_a_channel_turn() {
 
 #[tokio::test]
 async fn chat_said_now_origin_telegram_is_read_as_before() {
-    use crate::assistant::Origin;
+    use crate::assistant_types::Origin;
 
     let pool = pre_switch_pool_with_origins().await;
     apply_migrations_after(&pool, BEFORE_SWITCH).await;

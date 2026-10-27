@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::RngExt;
 use sqlx::SqlitePool;
 
-use super::ingest::own_channel;
+use super::own_channel;
 use crate::auth::Scope;
 use crate::channels::contract::{ErrorResponse, InPart, MediaCreated};
 use crate::channels::registry;
@@ -297,19 +297,8 @@ pub async fn open(
     })
 }
 
-/// For `outbox` degradation: the stored name, or the mime when the row has none. Generic over the
-/// executor so it runs on a pool or on a connection inside a transaction.
-pub async fn display_name<'e, E>(executor: E, media_id: &str) -> sqlx::Result<Option<String>>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    let row: Option<(Option<String>, String)> =
-        sqlx::query_as("SELECT name, mime FROM channel_media WHERE id = ?")
-            .bind(media_id)
-            .fetch_optional(executor)
-            .await?;
-    Ok(row.map(|(name, mime)| name.filter(|n| !n.is_empty()).unwrap_or(mime)))
-}
+// For `outbox` degradation; it moved down into `nucleos-core` with it, and stays nameable here.
+pub use super::display_name;
 
 /// Housekeeping hook called hourly by `run_housekeeping`. TTL of `channel_media` is 7 days; the
 /// row goes first, then its file under `files_root`. A file already gone is fine and any other

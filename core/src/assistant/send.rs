@@ -2,69 +2,6 @@
 
 use super::*;
 
-/// Which client sent a chat message, as the client states it.
-///
-/// Stated rather than inferred, and that is why this type exists at all. A Telegram group id is
-/// negative, so the origin is guessable from the shape of `chat_id` — and guessing would make a
-/// routing decision depend on a numbering scheme Telegram owns and can change without telling
-/// anybody. A client that says nothing is `Shell`, which keeps every existing caller where it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    Shell,
-    /// Spoken into the microphone of the machine this daemon runs on.
-    ///
-    /// A variant and not a flag on `Shell`, because the two differ in what happens to the ANSWER:
-    /// a shell turn is read, a voice turn is spoken. Recorded on the row for the same reason the
-    /// other two are — a queued message must be sent as the thing it was.
-    Voice,
-    /// Typed in the panel of a NucleOS browser window on this machine; answered like `Shell`.
-    BrowserPanel,
-    /// A message that arrived through a channel sidecar, named by its registry id.
-    ///
-    /// The id is the manifest's `&'static str`, so the type stays `Copy`; an id that is not in the
-    /// registry cannot be built from the wire (see `from_wire`).
-    Channel(&'static str),
-}
-
-impl Origin {
-    /// An unknown spelling resolves to `Shell` for the same reason absence does: this is a
-    /// ship-dark feature, so anything not explicitly asking for the new path gets the old one.
-    pub fn from_wire(value: Option<&str>) -> Self {
-        match value {
-            // Legacy spelling of the Telegram origin, kept so a message queued before the
-            // channel registry still resolves; never built from any other bare wire string.
-            Some("telegram") => Self::Channel(crate::channels::registry::TELEGRAM.id),
-            Some("voice") => Self::Voice,
-            Some("browser-panel") => Self::BrowserPanel,
-            Some(wire) => wire
-                .strip_prefix("channel:")
-                .and_then(crate::channels::registry::by_id)
-                .map_or(Self::Shell, |manifest| Self::Channel(manifest.id)),
-            None => Self::Shell,
-        }
-    }
-
-    /// Whether the sender is somebody on the far side of a network rather than at this machine.
-    pub fn is_remote(self) -> bool {
-        matches!(self, Self::Channel(_))
-    }
-
-    /// How this origin is written down, so a message that waits is sent as the thing it was.
-    ///
-    /// The inverse of `from_wire` and asserted against it: a queued message carries its origin
-    /// through the database, and an origin that did not survive the round trip would route a
-    /// Telegram turn back into the shell.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            Self::Voice => "voice",
-            Self::BrowserPanel => "browser-panel",
-            Self::Shell => "shell",
-            Self::Channel(id) => crate::channels::registry::by_id(id)
-                .map_or("shell", |manifest| manifest.origin_wire),
-        }
-    }
-}
-
 /// The channel-wide doctrine pushed onto a turn, by the door the message came in by.
 ///
 /// Written out per origin rather than swept up by a wildcard, so that the next origin — which will
@@ -82,45 +19,6 @@ fn doctrine_for(state: &crate::state::AppState, origin: Origin) -> Option<String
 /// default of a remote origin, which has always been answered locally when it can be.
 fn undeclared_brain_wants_local(origin: Origin) -> bool {
     origin.is_remote()
-}
-
-/// Why a turn was refused before it cost anything: the chat says `local` and this machine has none.
-///
-/// A named constant rather than a sentence written twice, because `http.rs` turns it into the one
-/// status code that tells this apart from a daemon that broke. Matched exactly there — a refusal
-/// recognised by a substring is a refusal that stops being recognised when someone edits the words.
-pub const NO_LOCAL_MODEL: &str = "this chat is set to the local model and none is configured";
-
-/// Why a turn was refused before it cost anything: the chat says `openrouter` and this daemon has
-/// no hosted model wired up to answer it.
-///
-/// `NO_LOCAL_MODEL`'s sibling and not its synonym, and the two have to stay apart because the
-/// failure they each guard is aimed at a different wallet. A chat that says `local` and finds no
-/// local model falls back to the CLI today when the choice was only inferred (`origin ==
-/// Origin::Channel(_)`) and refuses only when a person SAID `local` outright — because
-/// the CLI has always answered an unmarked Telegram message, so refusing there would take the bot
-/// off the air to enforce a promise nobody made. `openrouter` has no such history: nothing before
-/// this brain existed could ever have chosen it, so there is no old behaviour to preserve and no
-/// argument for falling through at all. Every turn that reaches this brain is refused, full stop,
-/// until the hosted route is actually wired — the placeholder this constant replaces the silence
-/// of (`(None, Some(crate::chats::Brain::OpenRouter)) => false` in `send_message_with`) is exactly
-/// what let that turn go to the cloud CLI instead: silently, and on the bill.
-///
-/// A named constant for the same reason `NO_LOCAL_MODEL` is one: `http.rs` will need to turn this
-/// into a status code a client can act on, and a refusal recognised by a fragment of its wording
-/// stops being recognised the day somebody improves the sentence.
-///
-pub const NO_HOSTED_MODEL: &str = "this chat is set to the hosted model and none is configured";
-
-/// What became of a message somebody sent: a turn, or a place in the queue.
-///
-/// Two outcomes rather than an `Option<i64>`, because the caller has something different to say
-/// about each and a null id says neither. A turn is answered by watching it; a queued message is
-/// answered by showing it waiting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sent {
-    Turn(i64),
-    Queued,
 }
 
 /// Sends a message, or keeps it until the conversation has a turn free.
@@ -552,17 +450,6 @@ pub async fn drain_waiting_queues(state: crate::state::AppState) {
         drain_queued(&state, &chat).await;
     }
 }
-
-/// Why a turn was refused before it cost anything: this conversation is already answering one.
-///
-/// A constant because two callers now have to recognise it and act differently on it. `http.rs`
-/// turns it into the one status a client can retry on, and `scheduler.rs` reads it as "nothing was
-/// started" and hands the window back so the rule tries again on the next tick.
-///
-/// Matched by value at both, never by substring. A refusal recognised by a fragment of its wording
-/// stops being recognised the moment somebody improves the sentence, and the two behaviours that
-/// depend on it would fail apart and silently.
-pub const TURN_IN_PROGRESS: &str = "a turn is already in progress for this chat";
 
 /// How many pictures one turn may carry.
 ///
@@ -1619,6 +1506,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,

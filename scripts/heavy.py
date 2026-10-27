@@ -13,7 +13,8 @@ priority; the head of the queue (priority, then arrival) runs once the held weig
 its own fit the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4). Underneath it sits the
 runtime: process liveness (pid + creation time), the directory mutex, running the child
 inside a Windows Job object (so a hard-killed broker takes its child with it),
-`NUCLEOS_HEAVY=0`, and fail-open. A bug in the broker must run the command, never block it.
+`NUCLEOS_HEAVY=0`, and fail-open. A bug in the broker must run the command, never block it;
+a busy mutex is contention, not a bug, and is answered with exit 75.
 
 Standard library only. Never `os.kill(pid, 0)` on Windows: CPython maps it to
 TerminateProcess.
@@ -41,14 +42,23 @@ LOG_ARGV_WORDS = 40
 LOG_ARGV_CHARS = 300
 MUTEX_STALE_S = 60.0
 MUTEX_WAIT_S = 30.0
+MUTEX_POLL_S = 0.05
+# Measurement (2026-10-22, mutex.jsonl): four calls timed out together with n_exists=1 and
+# owner_held_s 0.1 -- the machine froze ~37 s inside one poll. A deadline alone cannot tell a
+# stall from contention, so a timeout also needs this many failed attempts (half the nominal
+# polls), and MUTEX_WAIT_CAP_X times the timeout is the wall-clock cap that raises regardless.
+MUTEX_MIN_ATTEMPTS_FRAC = 0.5
+MUTEX_WAIT_CAP_X = 4.0
 # Measurement (2026-10-07, "broker mutex busy" fail-opens): an acquisition that waits or
 # holds longer than this, and every timeout, gets a row in `mutex.jsonl`.
 MUTEX_TRACE_S = 1.0
 STILL_ACTIVE = 259
 DEFAULT_CAPACITY = 4
 # Predicted peak memory (p90 of the class, costs.json) from which a request weighs
-# capacity - 1. Between node's 4.7 GB and core clippy's 6.2 GB (costs.json, 2026-10-21).
-BIG_MEM_MB = 5120.0
+# capacity - 1. Off unless NUCLEOS_HEAVY_BIG_MEM_MB sets it. Measured 2026-10-27 (log.jsonl): with
+# it on at 5120, every nucleos-core run weighed 3 and ran alone, yet ran no faster (run p50
+# 415 s vs 230-490 s two-to-four abreast on 10-15..10-20) while its wait p50 went 0 s -> 1865 s.
+BIG_MEM_MB = float("inf")
 AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
@@ -147,6 +157,10 @@ def is_alive(pid, ctime=None) -> bool:
 _MUTEX_HELD: set[str] = set()
 
 
+class MutexBusy(TimeoutError):
+    """The mutex stayed held by a live owner: contention, not a broker bug."""
+
+
 class Mutex:
     """`mkdir $DIR/.mutex` plus an `owner` file. Stale when older than 60 s, when the owner
     is dead, or when the owner is this very process and it does not hold it; a stale one is
@@ -241,6 +255,8 @@ class Mutex:
     def acquire(self) -> None:
         t0 = time.time()
         deadline = t0 + self.timeout
+        hard_cap = t0 + self.timeout * MUTEX_WAIT_CAP_X
+        min_attempts = max(1, int(self.timeout / MUTEX_POLL_S * MUTEX_MIN_ATTEMPTS_FRAC))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             try:
@@ -255,11 +271,15 @@ class Mutex:
                     self.n_exists += 1
                 if self._stale() and self._break_stale():
                     continue
-                if time.time() > deadline:
-                    self.waited = time.time() - t0
+                now = time.time()
+                # A stalled machine can pass the deadline inside one iteration (2026-10-22:
+                # n_exists=1, owner_held_s 0.1); require the minimum attempts unless capped.
+                attempts = self.n_exists + self.n_perm
+                if (now > deadline and attempts >= min_attempts) or now > hard_cap:
+                    self.waited = now - t0
                     self._trace_timeout()
-                    raise TimeoutError("broker mutex busy")
-                time.sleep(0.05)
+                    raise MutexBusy("broker mutex busy")
+                time.sleep(MUTEX_POLL_S)
         self.held = True
         _MUTEX_HELD.add(str(self.path))
         self.t_held = time.time()
@@ -2283,10 +2303,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             costs = hc.load_costs(directory)
             rec["cls"] = hc.class_key(argv, filtered, True)
             rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(costs, rec["cls"], weight)
-            # Measured 2026-10-21: a nucleos-core compile peaks at 6-9 GB on a 16 GB machine,
-            # and two at once (static weight 2 + 2) swapped (one ran 2557 s at 0.47 cores). A
-            # class past the threshold takes capacity - 1, so it never overlaps another one
-            # but a go/npm/tsc still fits beside it.
+            # Opt-in (BIG_MEM_MB): a class past the threshold takes capacity - 1, so it never
+            # overlaps another one but a go/npm/tsc still fits beside it.
             if rec["pred_mem_mb"] >= _env_float("NUCLEOS_HEAVY_BIG_MEM_MB", BIG_MEM_MB):
                 weight = max(weight, capacity() - 1)
                 rec["weight"] = weight
@@ -2548,6 +2566,22 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             row["session"] = session
         if eff_td:
             row["target_dir"] = _norm_td(eff_td)
+    except MutexBusy as exc:
+        # Contention on the broker's own mutex is not a broker bug: running the command here
+        # would put it outside the budget exactly when the machine is loaded (2026-10-22).
+        if lease is not None and env is not None:
+            env.pop("CARGO_TARGET_DIR", None)
+        _release_all(directory, lock_hash, holding, lease)
+        waited = time.time() - t_start
+        sys.stderr.write(
+            f"heavy: broker mutex busy for {int(waited)}s ({exc}); nothing was compiled - "
+            "try again, re-run with the Bash tool timeout set to 600000\n")
+        try:
+            _log_timeout(directory or _safe_state_dir(), opts["agent"], None, opts["kind"],
+                         None, waited, argv, waited_on="mutex")
+        except Exception:
+            pass
+        return EXIT_QUEUE_TIMEOUT
     except Exception as exc:
         if lease is not None and env is not None:
             env.pop("CARGO_TARGET_DIR", None)  # the lease goes now: build without it
@@ -2652,7 +2686,7 @@ def _log_timeout(directory, agent, prio, kind, weight, waited, argv, *,
     """A run that gave up waiting still leaves a row, so `report` counts the exit 75.
 
     `waited` is the lock wait (`wait_lock_s`); `wait_token` is the token/slot wait
-    (`wait_token_s`). `waited_on` names the refusal: lock | gate | estimate | token | slot."""
+    (`wait_token_s`). `waited_on` names the refusal: lock | gate | estimate | token | slot | mutex."""
     append_log({
         "v": LOG_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "worktree": os.getcwd(), "agent": agent, "prio": prio, "eff_prio": prio,

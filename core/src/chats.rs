@@ -1976,14 +1976,24 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::assistant::upsert_session(&pool, &id, "aaaa-1111", "2026-08-11T10:00:00+00:00")
-            .await
-            .unwrap();
+        crate::assistant_types::upsert_session(
+            &pool,
+            &id,
+            "aaaa-1111",
+            "2026-08-11T10:00:00+00:00",
+        )
+        .await
+        .unwrap();
 
         // The conversation is let go of, and the next turn runs in a session the daemon minted here.
-        crate::assistant::upsert_session(&pool, &id, "minted-here", "2026-08-11T11:00:00+00:00")
-            .await
-            .unwrap();
+        crate::assistant_types::upsert_session(
+            &pool,
+            &id,
+            "minted-here",
+            "2026-08-11T11:00:00+00:00",
+        )
+        .await
+        .unwrap();
 
         let taken = picked_up(&pool).await.unwrap();
         assert!(taken.contains(&"aaaa-1111".to_string()), "{taken:?}");
