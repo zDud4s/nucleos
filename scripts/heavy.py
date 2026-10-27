@@ -2431,7 +2431,12 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             env.pop("NUCLEOS_HEAVY_TOKEN", None)
         elif held:
             env = dict(os.environ)
-            env.pop("NUCLEOS_HEAVY_TOKEN", None)
+            # A hold-worktree started under a token holder (`heavy.py -- bash gates.sh x`, where
+            # gates.sh opens its own session) keeps the marker: its steps are the holder's work,
+            # and queueing them for a token the holder already owns would wait on itself (seen
+            # 2026-10-22: outer weight 3 + inner clippy 3 > capacity 4, never admitted).
+            if not nested:
+                env.pop("NUCLEOS_HEAVY_TOKEN", None)
             env["NUCLEOS_HEAVY_HELD"] = str(os.getpid())
             env["NUCLEOS_HEAVY_PRIO"] = str(prio)
         elif nested:
