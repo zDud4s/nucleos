@@ -110,14 +110,12 @@ export interface Known {
   scope_kind: KnownScope;
   /** `null` only for `machine`: a lesson about the house rather than about a repo. */
   scope_id: string | null;
-  /**
-   * Whose preference it is, once a pass proved it. Optional: a daemon older than migration
-   * `0241` does not send it.
-   */
-  about?: "owner" | null;
   /** Who knocked at the door — never read from the body. */
   source: "owner" | "run" | "consolidator" | "distiller";
-  /** Who the lesson is about: `owner` is the person, `null` the code, the work, the project. */
+  /**
+   * Who the lesson is about: `owner` is the person, `null` the code, the work, the project.
+   * Optional: a daemon older than migration `0241` does not send it.
+   */
   about?: "owner" | null;
   generator: string | null;
   kind: KnownKind;

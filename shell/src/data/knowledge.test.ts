@@ -107,7 +107,6 @@ describe("distilledOrigin", () => {
       job: 7,
       chat: null,
       runs: [3, 4],
-      chat: null,
       members: 0,
       cause: "job_failed",
       causeLabel: "the job failed",
