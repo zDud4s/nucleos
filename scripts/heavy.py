@@ -3125,5 +3125,108 @@ def main(argv: list[str]) -> int:
         return 130
 
 
+# Staged versions older than this, other than the current one, are pruned.
+STAGED_KEEP_S = 86400.0
+
+
+def _staged_broker() -> Path | None:
+    """The master version of the broker, staged under `<dev home>/run/broker/<stamp>/`, or None to
+    run this file as it is.
+
+    Owner decision, 2026-10-27: one broker per machine, not one per worktree. Every worktree used
+    to run its own `scripts/heavy.py`, so a broker fix reached a session only once its branch
+    merged master, and sessions on different versions shared one queue. Now every copy forwards
+    to master's, staged from the git objects (never a checkout), so it is refreshed by the first
+    run after a land and needs no daemon. The staged files are master's `scripts/heavy*.py`, read
+    from master itself, so a module master adds later is staged too. A version is a directory
+    written once and renamed into place, so a refresh never touches a version already in use.
+
+    None (run locally) when NUCLEOS_HEAVY_LOCAL is set (the broker's tests, or trying a broker
+    change), when NUCLEOS_HEAVY_DIR is set (an isolated broker is the code under test), when this
+    file is already a staged copy, or when git cannot say what master holds."""
+    if os.environ.get("NUCLEOS_HEAVY_LOCAL") or os.environ.get("NUCLEOS_HEAVY_DIR"):
+        return None
+    try:
+        here = Path(__file__).resolve().parent
+        root = _dev_home() / "run" / "broker"
+        if here.parent == root.resolve():
+            return None
+        ref = os.environ.get("NUCLEOS_HEAVY_MASTER_REF") or "master"
+        out = subprocess.run(
+            ["git", "-C", str(here), "ls-tree", "--full-tree", ref, "--", "scripts/"],
+            capture_output=True, text=True, timeout=20)
+        if out.returncode != 0:
+            return None
+        blobs: dict[str, str] = {}
+        for line in out.stdout.splitlines():
+            meta, _, name = line.partition("	")
+            parts = meta.split()
+            base = name.rsplit("/", 1)[-1]
+            if (len(parts) == 3 and parts[1] == "blob" and base.startswith("heavy")
+                    and base.endswith(".py")):
+                blobs[base] = parts[2]
+        if "heavy.py" not in blobs:
+            return None
+        stamp = hashlib.sha256(
+            "".join(f"{n}={blobs[n]};" for n in sorted(blobs)).encode()).hexdigest()[:16]
+        target = root / stamp
+        if (target / "heavy.py").is_file():
+            os.utime(target)  # in use: keep it out of the prune
+        else:
+            tmp = root / f".tmp-{stamp}-{os.getpid()}"
+            tmp.mkdir(parents=True, exist_ok=True)
+            for name, sha in blobs.items():
+                blob = subprocess.run(
+                    ["git", "-C", str(here), "cat-file", "blob", sha],
+                    capture_output=True, timeout=20, check=True).stdout
+                (tmp / name).write_bytes(blob)
+            try:
+                tmp.rename(target)
+            except OSError:
+                # Another run staged the same version first.
+                shutil.rmtree(tmp, ignore_errors=True)
+            _prune_staged(root, stamp)
+        return target / "heavy.py" if (target / "heavy.py").is_file() else None
+    except Exception:
+        return None
+
+
+def _prune_staged(root: Path, keep: str) -> None:
+    """Remove staged versions other than `keep` that no run has used for STAGED_KEEP_S (every
+    forwarded run touches its version), and leftover temp dirs of the same age."""
+    try:
+        now = time.time()
+        for d in root.iterdir():
+            if d.name != keep and d.is_dir() and now - d.stat().st_mtime > STAGED_KEEP_S:
+                shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _load_staged(path: Path):
+    """The staged broker's `main`, or None when it cannot even load: a broken land must fall back
+    to this copy, never stop the command (fail-open). It runs in this process, so the caller's
+    pid, console and job object are the broker's, exactly as when it is run directly. This
+    checkout's `scripts/` leaves sys.path, so the staged code imports only staged siblings."""
+    import runpy
+
+    here = str(Path(__file__).resolve().parent)
+    saved = list(sys.path)
+    sys.path[:] = [str(path.parent)] + [p for p in sys.path
+                                        if p and Path(p).resolve() != Path(here)]
+    try:
+        entry = runpy.run_path(str(path), run_name="heavy_staged").get("main")
+        if callable(entry):
+            sys.argv[0] = str(path)
+            return entry
+    except Exception as exc:
+        print(f"heavy: staged broker {path.parent.name} failed to load ({exc!r}); "
+              "running this checkout's copy", file=sys.stderr)
+    sys.path[:] = saved
+    return None
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    _staged = _staged_broker()
+    _main = (_load_staged(_staged) if _staged else None) or main
+    sys.exit(_main(sys.argv[1:]))
