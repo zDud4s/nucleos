@@ -2,29 +2,6 @@
 
 use super::*;
 
-/// Every `runs.answered_by` wire word `spawn_local_turn` below ever writes.
-///
-/// One array, read by `answered_by_a_local_agent_loop` below and by nothing else — the single place
-/// that has to grow the day a third `LocalChat` joins `runner::OllamaChat` and `openai_compatible::OpenAiCompatibleChat`,
-/// because `spawn_local_turn`'s own `answered_by` parameter is generalised to accept whatever wire
-/// word a caller passes it, and this is the one spot that says which words those calls actually use.
-pub(super) const LOCAL_AGENT_ANSWERED_BY: &[&str] = &["local", "openrouter"];
-
-/// Whether `answered_by` names a turn `spawn_local_turn` drove, as opposed to the CLI path.
-///
-/// Exists so a reader OUTSIDE this module — `voice.rs`'s `answer_so_far` is the one today — never
-/// has to spell `"local"` or `"openrouter"` out for itself to answer a question that is really about
-/// `spawn_local_turn`'s own behaviour: every turn it drives writes `stdout` as the plain finished
-/// answer and streams nothing while running, where a CLI turn streams JSONL into both. A caller that
-/// compared `answered_by` against `"local"` alone — literally the bug this replaces — quietly mis-
-/// classified every hosted turn as a CLI one instead, which is exactly the failure a third route
-/// added here without a matching edit at every call site would repeat. Checking against
-/// `LOCAL_AGENT_ANSWERED_BY` instead of the two literals directly means a future third entry needs
-/// only ONE new line, not a search for every place someone once wrote `"local"`.
-pub fn answered_by_a_local_agent_loop(answered_by: &str) -> bool {
-    LOCAL_AGENT_ANSWERED_BY.contains(&answered_by)
-}
-
 /// Records and drives a turn answered by a `local_agent::LocalAssistant` tool-calling loop rather
 /// than the agent CLI — the local model on this machine (`answered_by == "local"`) or the hosted
 /// one reached over OpenRouter (`answered_by == "openrouter"`). One body for both: the two differ
@@ -1491,6 +1468,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,

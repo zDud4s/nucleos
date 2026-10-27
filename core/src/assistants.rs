@@ -79,8 +79,8 @@ impl Refusal {
     pub fn message(&self, brain: crate::chats::Brain) -> String {
         match self {
             Refusal::RouteNotConfigured => match brain {
-                crate::chats::Brain::Local => crate::assistant::NO_LOCAL_MODEL,
-                crate::chats::Brain::OpenRouter => crate::assistant::NO_HOSTED_MODEL,
+                crate::chats::Brain::Local => crate::assistant_types::NO_LOCAL_MODEL,
+                crate::chats::Brain::OpenRouter => crate::assistant_types::NO_HOSTED_MODEL,
                 // `message` is `pub` on a `pub` enum, so `RouteNotConfigured.message(Brain::Cloud)`
                 // is a call anybody can write even though `assistant_for` never reaches here for
                 // `Brain::Cloud` (it refuses with `NotServedByThisFactory` first). Returning
@@ -1006,7 +1006,7 @@ mod tests {
     fn a_rota_local_desligada_recusa_com_a_frase_que_o_http_ja_compara() {
         assert_eq!(
             Refusal::RouteNotConfigured.message(Brain::Local),
-            crate::assistant::NO_LOCAL_MODEL
+            crate::assistant_types::NO_LOCAL_MODEL
         );
     }
 
@@ -1014,7 +1014,7 @@ mod tests {
     fn a_rota_alojada_desligada_recusa_com_a_frase_que_o_http_ja_compara() {
         assert_eq!(
             Refusal::RouteNotConfigured.message(Brain::OpenRouter),
-            crate::assistant::NO_HOSTED_MODEL
+            crate::assistant_types::NO_HOSTED_MODEL
         );
     }
 

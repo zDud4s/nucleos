@@ -23,6 +23,16 @@ impl LateSlot {
             .expect("a LateSlot holds a single type")
     }
 
+    /// The value, or `None` while nothing has been put in the slot. Never builds one.
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        self.0.get().map(|value| {
+            value
+                .clone()
+                .downcast::<T>()
+                .expect("a LateSlot holds a single type")
+        })
+    }
+
     /// Puts `value` in an empty slot; a slot already filled keeps what it has.
     pub fn set<T: Send + Sync + 'static>(&self, value: Arc<T>) {
         let _ = self.0.set(value);
@@ -490,6 +500,10 @@ pub struct AppState {
     /// The live fleet tree's hub (spec 2026-10-20): built on first use, stopped when the last
     /// client leaves. `Default` is inert, which is what every test that ignores it gets.
     pub fleet: Arc<LateSlot>,
+    /// How the lib starts an assistant turn (voice, the browser panel): the assistant lives in
+    /// `nucleos-app`, so the daemon puts its [`crate::assistant_types::Turns`] here at startup.
+    /// `Default` is empty, and a caller that finds it so reports the turn as not wired.
+    pub turns: Arc<LateSlot>,
     /// Maximum silence between streamed events; independent of the total wall-clock run timeout.
     pub progress_timeout: Duration,
     pub run_timeout: Duration,

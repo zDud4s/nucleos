@@ -187,6 +187,41 @@ describe("Brain", () => {
     expect(await screen.findByRole("list", { name: "Local graph nodes" })).toBeTruthy();
   });
 
+  it("the graph view is full-bleed: no composer in the page flow, tools and legend over the canvas", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith());
+    const { container } = await renderWithRouter(<Brain />, { initialPath: "/brain?view=graph" });
+    await screen.findByRole("list", { name: "Graph nodes" });
+
+    const page = container.querySelector(".brain-page");
+    expect(page?.classList.contains("brain-page-graph")).toBe(true);
+    // Capture lives inside the canvas stage (hidden until its tool is opened), not above it.
+    expect(page?.querySelector(":scope > .brain-compose")).toBeNull();
+    const stage = container.querySelector(".brain-stage");
+    expect(stage?.querySelector(".brain-compose")).not.toBeNull();
+    expect(screen.getByRole("list", { name: "Node colours" })).toBeTruthy();
+
+    const capture = screen.getByRole("button", { name: "Capture" });
+    expect(capture.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(capture);
+    expect(capture.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("textbox", { name: "Capture a note" })).toBeTruthy();
+  });
+
+  it("the selected node is a closable drawer over the canvas", async () => {
+    daemon.apiFetch.mockImplementation(daemonWith());
+    const { router, container } = await renderWithRouter(<Brain />, { initialPath: "/brain?view=graph" });
+    await screen.findByRole("list", { name: "Graph nodes" });
+    expect(screen.queryByRole("complementary", { name: "Selected" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "n:1" }));
+    const drawer = await screen.findByRole("complementary", { name: "Selected" });
+    expect(container.querySelector(".brain-stage")?.contains(drawer)).toBe(true);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(router.state.location.search).toEqual({ view: "graph" }));
+    expect(screen.queryByRole("complementary", { name: "Selected" })).toBeNull();
+  });
+
   it("an entity node opens its panel without touching the address", async () => {
     daemon.apiFetch.mockImplementation(daemonWith());
     const { router } = await renderWithRouter(<Brain />, { initialPath: "/brain?view=graph" });

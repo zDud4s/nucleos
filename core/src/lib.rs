@@ -18,7 +18,7 @@
 
 pub use nucleos_base::agent;
 pub mod agents;
-pub mod assistant;
+pub mod assistant_types;
 pub mod assistants;
 pub mod attention;
 pub mod auth;
