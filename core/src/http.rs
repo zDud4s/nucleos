@@ -54,6 +54,7 @@ mod nodes;
 mod projects;
 mod proposals;
 mod relay;
+mod remote;
 mod repo;
 mod run_queue;
 mod team;
@@ -141,6 +142,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(projects::routes())
         .merge(proposals::routes())
         .merge(relay::routes())
+        .merge(remote::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
         .merge(team::routes())

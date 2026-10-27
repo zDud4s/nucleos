@@ -20,6 +20,7 @@ pub const EMAIL: &str = "email";
 pub const WEB: &str = "web";
 pub const BROWSER: &str = "browser";
 pub const QUOTA: &str = "quota";
+pub const REMOTE: &str = "remote";
 
 /// The two values [`SidecarState::state`] takes, written once because it is serialized to the shell.
 const RUNNING: &str = "running";
@@ -476,6 +477,39 @@ pub const BROWSER_ADDR: &str = "127.0.0.1:8795";
 /// business, and it reaches the vendor holding the owner's own token (design D2).
 pub const QUOTA_ADDR: &str = "127.0.0.1:8796";
 
+/// Where the remote gateway answers; `tailscale serve` forwards to it. 8797 follows the quota
+/// sidecar (8796). The Go side refuses to bind anything that is not loopback: the only way in from
+/// off-machine is the tunnel, never a listener of its own.
+pub const REMOTE_ADDR: &str = "127.0.0.1:8797";
+
+/// The remote gateway's environment.
+///
+/// `remote_key` is the minted `Service::Remote` key and NOTHING ELSE: the control token is never a
+/// parameter here, so it cannot reach a process that faces the network. `dist_dir` is resolved by
+/// the caller (config value or `<dir of daemon exe>/dist-remote`). `REMOTE_COOKIE_MAX_AGE_SECONDS`
+/// and `REMOTE_MAX_BODY_BYTES` are left to the gateway's defaults (30 d, 64 MiB).
+pub fn remote_env(
+    daemon_url: &str,
+    remote_key: &str,
+    config: &crate::remote::RemoteConfig,
+    dist_dir: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), remote_key.to_string()),
+        ("REMOTE_ADDR".to_string(), REMOTE_ADDR.to_string()),
+        (
+            "REMOTE_PUBLIC_ORIGIN".to_string(),
+            config.public_origin.clone(),
+        ),
+        ("REMOTE_DIST_DIR".to_string(), dist_dir.to_string()),
+        (
+            "REMOTE_STREAM_MAX_SECONDS".to_string(),
+            config.stream_max_seconds.to_string(),
+        ),
+    ]
+}
+
 /// The quota sidecar's environment (spec §1.4, design D2).
 ///
 /// Deliberately SHORT, and the absences are the design. No credential is passed: the sidecar reads
@@ -726,6 +760,64 @@ async fn wait_out(name: &str, delay: Duration) -> Duration {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn remote_config() -> crate::remote::RemoteConfig {
+        crate::remote::RemoteConfig {
+            enabled: true,
+            public_origin: "https://box.tail1234.ts.net".to_string(),
+            dist_dir: None,
+            stream_max_seconds: 120,
+        }
+    }
+
+    fn env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn remote_env_names_the_contract_and_binds_loopback() {
+        let env = remote_env(
+            "http://127.0.0.1:8791",
+            "remote.key",
+            &remote_config(),
+            "C:/app/dist-remote",
+        );
+        let mut names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "NUCLEOS_DAEMON_TOKEN",
+                "NUCLEOS_DAEMON_URL",
+                "REMOTE_ADDR",
+                "REMOTE_DIST_DIR",
+                "REMOTE_PUBLIC_ORIGIN",
+                "REMOTE_STREAM_MAX_SECONDS",
+            ]
+        );
+        assert_eq!(env_value(&env, "REMOTE_ADDR"), Some("127.0.0.1:8797"));
+        assert!(REMOTE_ADDR.starts_with("127.0.0.1:"));
+        assert_eq!(
+            env_value(&env, "REMOTE_PUBLIC_ORIGIN"),
+            Some("https://box.tail1234.ts.net")
+        );
+        assert_eq!(
+            env_value(&env, "REMOTE_DIST_DIR"),
+            Some("C:/app/dist-remote")
+        );
+        assert_eq!(env_value(&env, "REMOTE_STREAM_MAX_SECONDS"), Some("120"));
+        assert_eq!(env_value(&env, "NUCLEOS_DAEMON_URL"), Some("http://127.0.0.1:8791"));
+    }
+
+    #[test]
+    fn remote_env_never_carries_the_control_token() {
+        let control = "nos_control_SECRET";
+        let env = remote_env("http://127.0.0.1:8791", "remote.key", &remote_config(), "d");
+        assert_eq!(env_value(&env, "NUCLEOS_DAEMON_TOKEN"), Some("remote.key"));
+        assert!(env.iter().all(|(_, value)| !value.contains(control)));
+    }
 
     /// A sidecar that starts and dies immediately, over and over, must cost less each time.
     ///

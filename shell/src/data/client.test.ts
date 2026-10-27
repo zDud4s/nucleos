@@ -246,6 +246,27 @@ describe("a rotated token", () => {
   });
 });
 
+describe("desktop transport", () => {
+  it("desktop transport keeps the daemon URL, the bearer and the 401 re-read-and-retry", async () => {
+    const { apiFetch, DAEMON_URL } = await freshClient();
+    invoke.mockResolvedValueOnce("old").mockResolvedValueOnce("new");
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(401, { refusal: "unauthorized" }))
+      .mockResolvedValueOnce(jsonResponse(200, ["ok"]));
+
+    await expect(apiFetch("/projects")).resolves.toEqual(["ok"]);
+
+    expect(DAEMON_URL).toBe("http://127.0.0.1:8791");
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
+      "http://127.0.0.1:8791/projects",
+      "http://127.0.0.1:8791/projects",
+    ]);
+    const sent = fetchMock.mock.calls.map((c) => new Headers((c[1] as RequestInit).headers).get("Authorization"));
+    expect(sent).toEqual(["Bearer old", "Bearer new"]);
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("probeHealth", () => {
   it("answers false instead of throwing when the daemon is not there", async () => {
     const { probeHealth } = await freshClient();

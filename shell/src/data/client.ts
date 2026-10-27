@@ -1,12 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
+import { DAEMON_URL, TokenReadError, getTransport } from "./transport";
 
 /**
- * The núcleo, on loopback. There is no remote daemon and no second base URL:
- * the shell and the core are the same install, talking over 127.0.0.1 because
- * a socket is easier to get right than shared memory — not because either one
- * could be somewhere else.
+ * The núcleo, on loopback (defined with the desktop transport). The desktop
+ * shell has no second base URL; the remote shell goes through the transport
+ * seam instead of this constant.
  */
-export const DAEMON_URL = "http://127.0.0.1:8791";
+export { DAEMON_URL };
 
 /**
  * The daemon answered, and the answer was no.
@@ -85,32 +84,8 @@ export function isApiUnavailable(error: unknown): error is ApiUnavailable {
   return error instanceof ApiUnavailable;
 }
 
-/**
- * The credential, fetched once for the life of the window.
- *
- * The token lives in the OS Credential Manager and the daemon rotates it on
- * restart, not per request — so re-reading it on every call is a keychain hit
- * per poll tick for a value that does not change. The promise is memoised
- * rather than the string, so a burst of calls at startup shares one read
- * instead of racing several.
- *
- * A *rejection* is not memoised. A keychain can be momentarily locked, and a
- * cached rejection would turn a lock that lasts one second into a session that
- * can never authenticate — every subsequent tick re-throwing the same stale
- * failure forever.
- */
-let tokenRequest: Promise<string> | null = null;
-
-function daemonToken(): Promise<string> {
-  if (tokenRequest === null) {
-    const attempt = invoke<string>("get_daemon_token");
-    attempt.catch(() => {
-      if (tokenRequest === attempt) tokenRequest = null;
-    });
-    tokenRequest = attempt;
-  }
-  return tokenRequest;
-}
+// The credential memo (one read per window, rejections never memoised) lives
+// in the desktop transport, see ./transport.ts.
 
 /**
  * Names for the statuses the núcleo refuses with, for routes that refuse
@@ -197,31 +172,43 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
 }
 
 /**
- * A 401 most likely means the daemon restarted and rotated its token, so the
- * memoised one is stale: drop it, read the credential again and retry once.
- * Safe for mutations too — a 401 means the request was never acted on. A second
- * 401 is a real refusal.
+ * A 401 under the desktop transport most likely means the daemon restarted and
+ * rotated its token, so the transport drops the memoised one and asks for one
+ * retry. Safe for mutations too — a 401 means the request was never acted on. A
+ * second 401, or a transport that answers "fail" (the remote session is gone),
+ * is a real refusal.
  */
 async function request(path: string, init: RequestInit | undefined): Promise<Response> {
+  const transport = getTransport();
   try {
-    return await requestOnce(path, init);
+    return await requestOnce(transport, path, init);
   } catch (error) {
     if (!(error instanceof ApiRefusal) || error.status !== 401) throw error;
-    tokenRequest = null;
-    return await requestOnce(path, init);
+    const decision = await transport.onUnauthorized();
+    if (decision === "retry") return await requestOnce(transport, path, init);
+    if (transport.unauthorizedCode !== undefined && error.code !== transport.unauthorizedCode) {
+      throw new ApiRefusal(401, transport.unauthorizedCode, error.detail, error.body);
+    }
+    throw error;
   }
 }
 
-async function requestOnce(path: string, init: RequestInit | undefined): Promise<Response> {
-  let token: string;
+async function requestOnce(
+  transport: ReturnType<typeof getTransport>,
+  path: string,
+  init: RequestInit | undefined,
+): Promise<Response> {
+  let authHeaders: Record<string, string>;
   try {
-    token = await daemonToken();
+    authHeaders = await transport.headers();
   } catch (cause) {
-    throw new ApiUnavailable("token", "the daemon token could not be read", cause);
+    if (cause instanceof ApiUnavailable) throw cause;
+    const reason = cause instanceof TokenReadError ? cause.reason : cause;
+    throw new ApiUnavailable("token", "the daemon token could not be read", reason);
   }
 
   const headers = new Headers(init?.headers);
-  headers.set("Authorization", `Bearer ${token}`);
+  for (const [name, value] of Object.entries(authHeaders)) headers.set(name, value);
   // Set only when we are actually sending something, and never over a caller
   // that chose its own type — a multipart upload picks its own boundary and
   // must not be told it is JSON.
@@ -231,7 +218,7 @@ async function requestOnce(path: string, init: RequestInit | undefined): Promise
 
   let res: Response;
   try {
-    res = await fetch(`${DAEMON_URL}${path}`, { ...init, headers });
+    res = await fetch(`${transport.baseUrl}${path}`, { credentials: transport.credentials, ...init, headers });
   } catch (cause) {
     throw new ApiUnavailable("transport", "the daemon did not answer", cause);
   }
@@ -315,6 +302,17 @@ export async function apiStream(path: string, init?: RequestInit): Promise<Respo
 }
 
 /**
+ * `GET <base>/health` through the active transport, without any credential.
+ * Under the desktop transport this is the bare `fetch(url)` it always was.
+ */
+function probeFetch(): Promise<Response> {
+  const transport = getTransport();
+  const url = `${transport.baseUrl}/health`;
+  if (transport.probeHeaders === undefined) return fetch(url);
+  return fetch(url, { credentials: transport.credentials, headers: transport.probeHeaders });
+}
+
+/**
  * Is the daemon there?
  *
  * The one call that carries no token — it is what the shell asks *before* it
@@ -324,7 +322,7 @@ export async function apiStream(path: string, init?: RequestInit): Promise<Respo
  */
 export async function probeHealth(): Promise<boolean> {
   try {
-    const res = await fetch(`${DAEMON_URL}/health`);
+    const res = await probeFetch();
     return res.ok;
   } catch {
     return false;
@@ -353,7 +351,7 @@ export interface UpdateReadiness {
  */
 export async function probeDaemonVersion(): Promise<string | null> {
   try {
-    const res = await fetch(`${DAEMON_URL}/health`);
+    const res = await probeFetch();
     if (!res.ok) return null;
     return res.headers.get("x-nucleos-version");
   } catch {

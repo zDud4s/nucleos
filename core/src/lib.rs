@@ -75,6 +75,7 @@ pub mod proposals;
 pub mod quota;
 pub use nucleos_base::recurrence;
 pub mod relay;
+pub mod remote;
 pub mod repo_trigger;
 pub mod resolver;
 pub use nucleos_base::router_client;
