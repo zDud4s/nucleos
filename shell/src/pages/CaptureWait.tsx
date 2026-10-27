@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useCaptureWait, useSetCaptureWait } from "../data/capture-wait";
-import { ErrorNote, Field, RefusalNote } from "../ui";
+import { ingestChats, useDistillerSources, useSetDistillerSources } from "../data/knowledge";
+import { useProjects } from "../data/system";
+import { Button, ErrorNote, Field, RefusalNote, Select, Switch } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -28,6 +30,7 @@ export function CaptureWait() {
   }
 
   return (
+    <>
     <div className="sy-pref">
       <Field label="Capture wait (minutes)" helper="0 turns capture requests off; at most a week (10080).">
         <input
@@ -50,6 +53,76 @@ export function CaptureWait() {
       ) : set.error ? (
         <ErrorNote>the {DAEMON_NAME} is not responding: the capture wait was not changed</ErrorNote>
       ) : null}
+    </div>
+    <DistillerSources />
+    </>
+  );
+}
+
+/**
+ * Which sources the distiller reads (conversations and calendar, both on by default), and the
+ * owner's one-time request to let it read the conversations from before it was switched on. Each
+ * switch sends only the field that changed; the ingest button only marks chats, it asks no model.
+ */
+function DistillerSources() {
+  const sources = useDistillerSources();
+  const set = useSetDistillerSources();
+  const projects = useProjects();
+  const [project, setProject] = useState("");
+  const [result, setResult] = useState<{ seeded: number; skipped: number } | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  // An absent answer reads as on, like the daemon: only a stored off turns a source off.
+  const chatOn = sources.data?.chat !== false;
+  const calendarOn = sources.data?.calendar !== false;
+  const refusal = [set.error, sources.error].find(isApiRefusal);
+
+  async function ingest() {
+    setBusy(true);
+    setFailed(false);
+    try {
+      setResult(await ingestChats(project === "" ? {} : { project }));
+    } catch {
+      setResult(null);
+      setFailed(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="sy-pref">
+      <Switch label="Conversations" checked={chatOn} disabled={set.isPending} onChange={(on) => set.mutate({ chat: on })} />
+      <Switch label="Calendar" checked={calendarOn} disabled={set.isPending} onChange={(on) => set.mutate({ calendar: on })} />
+      {refusal ? <RefusalNote refusal={refusal} /> : null}
+      <Field
+        label="Project to ingest"
+        helper="Sends up to 40 exchanges per chat to the distiller model, a few chats a day."
+      >
+        <Select
+          value={project}
+          disabled={busy}
+          onChange={(event) => setProject(event.target.value)}
+        >
+          <option value="">All projects</option>
+          {(Array.isArray(projects.data) ? projects.data : []).map((p) => (
+            <option key={p.project_id} value={p.project_id}>
+              {p.project_id}
+            </option>
+          ))}
+        </Select>
+      </Field>
+      <Button disabled={!chatOn || busy} onClick={() => void ingest()}>
+        Ingest past conversations
+      </Button>
+      {!chatOn ? <p>Turn conversations on to ingest them</p> : null}
+      {result ? (
+        <p role="status">
+          {result.seeded} conversations queued, {result.skipped} already ingested
+        </p>
+      ) : null}
+      {failed ? <ErrorNote>the daemon is not responding: nothing was ingested</ErrorNote> : null}
     </div>
   );
 }
