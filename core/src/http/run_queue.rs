@@ -448,7 +448,8 @@ pub(super) async fn land_worktree(
     .map_err(|refusal| {
         let code = match &refusal {
             crate::execution::land::LandRefusal::AlreadyOnTarget(_)
-            | crate::execution::land::LandRefusal::NothingToLand(_) => StatusCode::CONFLICT,
+            | crate::execution::land::LandRefusal::NothingToLand(_)
+            | crate::execution::land::LandRefusal::Claimed(_) => StatusCode::CONFLICT,
             crate::execution::land::LandRefusal::Refused(_) => StatusCode::UNPROCESSABLE_ENTITY,
             crate::execution::land::LandRefusal::NotAdmitted(error) => {
                 tracing::warn!(%error, "land: admitting the request failed");
