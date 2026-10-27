@@ -18,8 +18,10 @@ export type MarkKey =
   | "contact"
   | "mail"
   | "file"
-  | "job";
+  | "job"
+  | "theme";
 
+// An octagon: the one shape with eight sides, apart from the hexagon of a project.
 export const MARK_PATHS: Record<MarkKey, string> = {
   note: "M0 -0.9A0.9 0.9 0 1 1 0 0.9A0.9 0.9 0 1 1 0 -0.9Z",
   "k-semantic": "M-0.8 -0.8H0.8V0.8H-0.8Z",
@@ -32,6 +34,7 @@ export const MARK_PATHS: Record<MarkKey, string> = {
   file: "M-0.7 -1H0.3L0.8 -0.5V1H-0.7Z",
   // A pentagon, point up: the one regular shape no other kind takes.
   job: "M0 -1L0.95 -0.31L0.59 0.81H-0.59L-0.95 -0.31Z",
+  theme: "M-0.38 -0.92H0.38L0.92 -0.38V0.38L0.38 0.92H-0.38L-0.92 0.38V-0.38Z",
 };
 
 /** The mark a graph node takes: a knowledge row by its layer, anything else by its kind. */

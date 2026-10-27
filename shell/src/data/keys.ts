@@ -394,6 +394,13 @@ export const keys = {
       ["loadout-tools", status, ownerKind, ownerId] as const,
   },
 
+  /** Themes above the entities — `GET /themes`; one root, so accept/refuse/synthesise refetch list and detail. */
+  themes: {
+    all: ["themes"] as const,
+    list: (state: string) => ["themes", "list", state] as const,
+    detail: (id: number) => ["themes", "detail", id] as const,
+  },
+
   /**
    * The owner's own notes — `GET /owner-notes` and its graph. One root, so a
    * write to a note or a link refetches the list, the open note and the graph

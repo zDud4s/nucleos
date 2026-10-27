@@ -6,8 +6,8 @@ import type { GEdgeType, GFilters, GNodeKind } from "./graph-types";
 import { neighbours } from "./graph-util";
 import { backlinks, buildModel, localModel } from "./graph-model";
 
-const ALL_KINDS: GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file", "job"];
-const ALL_EDGES: GEdgeType[] = ["relates", "supports", "contradicts", "details", "supersedes", "supersedes_k", "scope"];
+const ALL_KINDS: GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file", "job", "theme"];
+const ALL_EDGES: GEdgeType[] = ["relates", "supports", "contradicts", "details", "supersedes", "supersedes_k", "scope", "member"];
 
 function filters(over: Partial<GFilters> = {}): GFilters {
   return {
@@ -282,5 +282,37 @@ describe("backlinks", () => {
   });
   it("lists links to a knowledge row, matching the ref exactly", () => {
     expect(backlinks(g, "knowledge", "5").map((l) => l.note_id)).toEqual([3]);
+  });
+});
+
+describe("buildModel themes", () => {
+  const theme = (id: number, state: "proposed" | "accepted", members: { kind: "note" | "knowledge"; id: number }[]) =>
+    ({ id, name: `theme ${id}`, state, members });
+
+  it("makes theme:<id> nodes and member edges to n:<id> and k:<id>", () => {
+    const m = buildModel(graph([note(1)]), [known(7)], [], filters(), [
+      theme(3, "accepted", [{ kind: "note", id: 1 }, { kind: "knowledge", id: 7 }]),
+    ]);
+    expect(ids(m)).toContain("theme:3");
+    expect(m.edges.filter((e) => e.type === "member").map((e) => e.target).sort()).toEqual(["k:7", "n:1"]);
+    expect(m.nodes.find((n) => n.id === "theme:3")?.bucket).toBe("in_force");
+  });
+
+  it("puts proposed themes in the hollow proposed bucket, kept by in_force", () => {
+    const m = buildModel(graph([note(1)]), [], [], filters({ state: "in_force" }), [
+      theme(4, "proposed", [{ kind: "note", id: 1 }]),
+    ]);
+    expect(m.nodes.find((n) => n.id === "theme:4")?.bucket).toBe("proposed");
+  });
+
+  it("draws no edge to a member that is not a node and never invents one", () => {
+    const m = buildModel(graph([]), [], [], filters(), [theme(5, "accepted", [{ kind: "note", id: 99 }])]);
+    expect(m.edges).toEqual([]);
+  });
+
+  it("is unchanged without themes", () => {
+    expect(buildModel(graph([note(1)]), [], [], filters())).toEqual(
+      buildModel(graph([note(1)]), [], [], filters(), []),
+    );
   });
 });

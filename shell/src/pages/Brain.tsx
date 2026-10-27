@@ -11,6 +11,9 @@ import { ToolRequests } from "../brain/knowledge/ToolRequests";
 import { WaitingPanel } from "../brain/knowledge/WaitingPanel";
 import { UnifiedList } from "../brain/UnifiedList";
 import { WeeklyReview } from "../brain/WeeklyReview";
+import { ThemesProposed } from "../brain/ThemesProposed";
+import { ThemesAccepted } from "../brain/ThemesAccepted";
+import { useGraphThemes } from "../data/themes";
 import { ForceGraph } from "../brain/ForceGraph";
 import { buildModel } from "../brain/graph-model";
 import type { GFilters } from "../brain/graph-types";
@@ -83,6 +86,8 @@ export function Brain() {
         <div className="brain-page">
           <Capture />
           <WeeklyReview onItem={showItem} />
+          <ThemesProposed />
+          <ThemesAccepted />
           <BrainListView item={item} onItem={showItem} onClose={closeItem} />
         </div>
       )}
@@ -308,13 +313,14 @@ export function BrainGraphView({
   const graph = useNotesGraph(filters.showArchived);
   const knowledge = useKnowledge();
   const projects = useProjects();
+  const themes = useGraphThemes();
   const knownRows = knowledge.data ?? EMPTY_KNOWLEDGE;
   const projectRows = projects.data;
   const canvasHeight = useElementHeight(stage);
 
   const model = useMemo(
-    () => (graph.data === undefined ? null : buildModel(graph.data, knownRows, projectRows, filters)),
-    [graph.data, knownRows, projectRows, filters],
+    () => (graph.data === undefined ? null : buildModel(graph.data, knownRows, projectRows, filters, themes)),
+    [graph.data, knownRows, projectRows, filters, themes],
   );
 
   const ref = parseItem(item);
@@ -366,6 +372,8 @@ export function BrainGraphView({
         {tool === "review" && (
           <div className="brain-pop">
             <WeeklyReview onItem={onItem} />
+            <ThemesProposed />
+            <ThemesAccepted />
           </div>
         )}
         {tool === "filters" && (
