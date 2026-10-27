@@ -1792,6 +1792,36 @@ mod tests {
         assert!(!admitted(&row, &project_context_for("alpha")));
     }
 
+    async fn plant_project_lesson(pool: &SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('semantic', 'project', 'alpha', 'run', 'memory', 'a lesson', 'body',
+                     'proposed', '2026-10-22T00:00:00+00:00')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn all_leaves_observations_out_and_observations_lists_only_them() {
+        let pool = test_pool().await;
+        let observed = plant_observation(&pool, "observed").await;
+        let lesson = plant_project_lesson(&pool).await;
+        let ids: Vec<i64> = all(&pool).await.unwrap().iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![lesson]);
+        let seen: Vec<i64> = observations(&pool, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(seen, vec![observed]);
+        assert_eq!(observations(&pool, 0).await.unwrap().len(), 0);
+    }
+
     /// Spec 4.6, in the four cases that matter: what the distiller wrote reaches a node exactly
     /// when it is `active` -- an episode on trial, or a rule a person approved -- and never while a
     /// rule is `proposed` or once an episode has expired.

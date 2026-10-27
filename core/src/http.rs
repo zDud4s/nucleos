@@ -25146,7 +25146,55 @@ mod tests {
         assert_eq!(crate::distill::sources::chat_floor(&pool).await, newer);
     }
 
+    #[tokio::test]
+    async fn knowledge_lists_observations_only_when_asked_for_them() {
+        let state = test_state().await;
+        for (scope_kind, scope_id, status) in [
+            ("observation", "alpha:chat:5", "observed"),
+            ("project", "alpha", "proposed"),
+        ] {
+            sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('episodic', ?, ?, 'distiller', 'memory', 't', 'b', ?,
+                         '2026-10-22T00:00:00+00:00')",
+            )
+            .bind(scope_kind)
+            .bind(scope_id)
+            .bind(status)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let (_, plain) = call(state.clone(), "GET", "/knowledge", None).await;
+        assert!(
+            plain
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["scope_kind"] != "observation")
+        );
+        let (status, seen) = call(
+            state.clone(),
+            "GET",
+            "/knowledge?scope_kind=observation&limit=1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.as_array().unwrap().len(), 1);
+        assert_eq!(seen[0]["scope_kind"], "observation");
+        let (status, _) = call(
+            state,
+            "GET",
+            "/knowledge?scope_kind=observation&scope_id=x",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
 
+    async fn loadout_seed_agent_and_team(pool: &sqlx::SqlitePool) {
         sqlx::query(
             "INSERT OR IGNORE INTO agents
                  (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
