@@ -293,6 +293,8 @@ pub(super) struct LeaveNoteResponse {
 pub(super) struct KnowledgeNarrow {
     pub(super) scope_kind: Option<String>,
     pub(super) scope_id: Option<String>,
+    /// Only read with `scope_kind=observation`.
+    pub(super) limit: Option<i64>,
 }
 
 /// Everything the layer holds, in every status.
@@ -301,11 +303,22 @@ pub(super) struct KnowledgeNarrow {
 /// showed only what is in force could not answer "what did it try to learn that I said no to".
 ///
 /// `?scope_kind=&scope_id=` narrows it to one project, team or agent: both or neither, or 422.
+/// The one exception is `?scope_kind=observation[&limit=]`, which lists the conversation
+/// observations and nothing else; the plain list never carries them.
 pub(super) async fn list_knowledge(
     State(state): State<AppState>,
     Query(narrow): Query<KnowledgeNarrow>,
 ) -> Result<Json<Vec<crate::knowledge::Known>>, StatusCode> {
     let scope = match (narrow.scope_kind, narrow.scope_id) {
+        (Some(kind), None) if kind == "observation" => {
+            return crate::knowledge::observations(&state.pool, narrow.limit.unwrap_or(100).clamp(1, 500))
+                .await
+                .map(Json)
+                .map_err(|error| {
+                    tracing::warn!(%error, "listing observations failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                });
+        }
         (None, None) => None,
         (Some(kind), Some(id)) => Some(
             refinement_target(&format!("{kind}:{id}")).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?,

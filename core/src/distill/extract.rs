@@ -32,6 +32,8 @@ pub struct DossierInputs {
     pub recovery: Option<Recovery>,
     pub known_titles: Vec<String>,
     pub gate_outputs: Vec<(i64, String)>,
+    /// Chat exchanges: run id, what the owner wrote, the answer.
+    pub conversation: Vec<(i64, String, String)>,
 }
 
 /// The text handed to the model and the runs whose text survived the cut.
@@ -105,6 +107,11 @@ fn scrubbed(inputs: &DossierInputs) -> DossierInputs {
             .iter()
             .map(|(id, t)| (*id, scrub(t)))
             .collect(),
+        conversation: inputs
+            .conversation
+            .iter()
+            .map(|(id, asked, answered)| (*id, scrub(asked), scrub(answered)))
+            .collect(),
     }
 }
 
@@ -142,6 +149,25 @@ fn blocks(inputs: &DossierInputs) -> Vec<(String, Vec<i64>)> {
         out.push((
             format!("## Review output\n{}", body.join("\n\n")),
             reviews.iter().map(|(id, _)| *id).collect(),
+        ));
+    }
+
+    // 2b. A conversation: the exchanges of one chat, each named by its run.
+    let exchanges: Vec<&(i64, String, String)> = inputs
+        .conversation
+        .iter()
+        .filter(|(_, asked, answered)| present(asked) || present(answered))
+        .collect();
+    if !exchanges.is_empty() {
+        let body: Vec<String> = exchanges
+            .iter()
+            .map(|(id, asked, answered)| {
+                format!("Run #{id}:\nOwner: {asked}\nAssistant: {answered}")
+            })
+            .collect();
+        out.push((
+            format!("## Conversation\n{}", body.join("\n\n")),
+            exchanges.iter().map(|(id, _, _)| *id).collect(),
         ));
     }
 
@@ -267,6 +293,9 @@ pub fn standing_for(cause: Cause) -> String {
         Cause::JobLanded => " The work landed: ask what made it land, not only what went wrong.",
         Cause::CalendarWeek => {
             " The dossier is one week of the owner's calendar, read from another project's point of view: ask for rhythms and habits of the owner (days, hours, durations), as `episodic` items, never the names of third parties."
+        }
+        Cause::ChatExchanges => {
+            " This dossier is a conversation between the owner and an assistant. Write down the preferences, decisions and corrections the owner stated that would still matter in a later session, never a summary of the conversation."
         }
         Cause::JobFailed | Cause::GateRecovered | Cause::ReviewBlocking | Cause::RunExhausted => "",
     };

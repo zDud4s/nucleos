@@ -21,6 +21,16 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 
+/// The observations of one project's chats, by the exact shape `<project>:chat:<digits>`. Never
+/// `LIKE`: a project id may hold `_`, `%` or `:` (ids are not validated on creation).
+/// `a:chat:5:chat:9` belongs to the project `a:chat:5`, not to `a`: its tail `5:chat:9` is not
+/// digits. `-:chat:N` (no project) and `week:...` have no project and fall to the 60-day sweep.
+const CHAT_OBSERVATIONS: &str = "SELECT id FROM knowledge
+     WHERE scope_kind = 'observation'
+       AND substr(scope_id, 1, length(?1) + 6) = ?1 || ':chat:'
+       AND length(scope_id) > length(?1) + 6
+       AND substr(scope_id, length(?1) + 7) NOT GLOB '*[^0-9]*'";
+
 /// Every table in this database that carries a `project_id`, minus `autopilot_state` itself.
 ///
 /// **Written out, and held honest by a test rather than by a loop.** Deriving this from
@@ -490,6 +500,31 @@ pub async fn remove(
                  OR (scope_kind = 'job'
                      AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))",
         )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // The project's chat observations, children first and the rows last, like the statements
+        // above (and before the `PROJECT_SCOPED` loop for the same reason).
+        for table in [
+            "knowledge_embeddings",
+            "knowledge_embed_failures",
+            "knowledge_events",
+        ] {
+            // SAFETY: interpolates a literal table name and the `CHAT_OBSERVATIONS` const only; the
+            // project id is bound.
+            forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE knowledge_id IN ({CHAT_OBSERVATIONS})"
+            )))
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM knowledge WHERE id IN ({CHAT_OBSERVATIONS})"
+        )))
         .bind(project_id)
         .execute(&mut *tx)
         .await?
@@ -1421,6 +1456,126 @@ mod tests {
             left,
             vec![ids[1]],
             "the vector of a forgotten project's job knowledge outlived it, or bravo's job's went with it"
+        );
+    }
+
+    /// An observation with a vector, a failure mark and an event, like the ones the distiller writes.
+    async fn put_observation(pool: &SqlitePool, scope_id: &str) -> i64 {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('episodic', 'observation', ?, 'distiller', 'memory', 't', 'b', 'observed',
+                     '2026-10-22T00:00:00+00:00') RETURNING id",
+        )
+        .bind(scope_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        store_vector(pool, id).await;
+        sqlx::query(
+            "INSERT INTO knowledge_embed_failures (knowledge_id, model, failed_at) VALUES (?, 'test-model', 't')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+             VALUES (?, NULL, 'observed', 'created', 't')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn observation_scopes(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT scope_id FROM knowledge WHERE scope_kind = 'observation' ORDER BY scope_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Exact shape `<project>:chat:<digits>`, compared with `=`/`substr`/`GLOB`, never `LIKE`: ids with
+    /// `_`, `%` and `:` must not reach a neighbour, and neither must a nested `:chat:`.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_exactly_its_chat_observations() {
+        let pool = pool().await;
+        for p in ["a", "a_b", "axb", "a%b", "a:chat:5"] {
+            register(&pool, p).await;
+        }
+        for s in [
+            "a:chat:5",
+            "a:chat:5:chat:9",
+            "axb:chat:7",
+            "a_b:chat:2",
+            "a%b:chat:3",
+            "week:2026-W43",
+            "-:chat:4",
+            "a:chat:",
+        ] {
+            put_observation(&pool, s).await;
+        }
+        let ours = put_observation(&pool, "a:chat:6").await;
+
+        remove(&pool, "a", true).await.unwrap();
+        let left = observation_scopes(&pool).await;
+        assert!(!left.contains(&"a:chat:5".into()) && !left.contains(&"a:chat:6".into()));
+        for kept in [
+            "a:chat:5:chat:9",
+            "axb:chat:7",
+            "a_b:chat:2",
+            "a%b:chat:3",
+            "week:2026-W43",
+            "-:chat:4",
+            "a:chat:",
+        ] {
+            assert!(left.contains(&kept.to_string()), "{kept} was taken by forgetting `a`");
+        }
+        for table in [
+            "knowledge_embeddings",
+            "knowledge_embed_failures",
+            "knowledge_events",
+        ] {
+            let orphans: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE knowledge_id = {ours}"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(orphans, 0, "{table} outlived the observation");
+        }
+        remove(&pool, "a_b", true).await.unwrap();
+        remove(&pool, "a%b", true).await.unwrap();
+        let left = observation_scopes(&pool).await;
+        assert!(!left.contains(&"a_b:chat:2".into()) && !left.contains(&"a%b:chat:3".into()));
+        assert!(left.contains(&"axb:chat:7".to_string()), "`_` or `%` matched the `x`");
+        remove(&pool, "a:chat:5", true).await.unwrap();
+        assert!(!observation_scopes(&pool).await.contains(&"a:chat:5:chat:9".into()));
+    }
+
+    /// A chat's candidates are plain `project` rows: the existing statements already take them.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_chat_candidates_too() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        sqlx::query(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at, distill_cause)
+             VALUES ('semantic','project','alpha','distiller','memory','c','b','proposed','t','chat_exchanges')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        remove(&pool, "alpha", true).await.unwrap();
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM knowledge WHERE distill_cause = 'chat_exchanges'"
+            )
+            .await,
+            0
         );
     }
 

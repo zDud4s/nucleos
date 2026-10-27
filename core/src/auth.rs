@@ -3249,6 +3249,9 @@ mod tests {
             (Method::POST, "/themes/7/merge"),
             (Method::POST, "/themes/7/members"),
             (Method::DELETE, "/themes/7/members/note/3"),
+            (Method::GET, "/config/distiller-sources"),
+            (Method::POST, "/config/distiller-sources"),
+            (Method::POST, "/distill/chats/ingest"),
         ];
         let refused = [
             Scope::Run(1),

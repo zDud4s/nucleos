@@ -1028,6 +1028,39 @@ mod tests {
         assert_eq!(filled, 0);
     }
 
+    /// Migration `0243` cuts the automatic chat history at the newest run (P8).
+    #[tokio::test]
+    async fn migration_0242_seeds_the_history_cut_at_the_newest_run() {
+        let pool = crate::testdb::pool_migrated_through(242).await;
+        for _ in 0..3 {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, created_at) \
+                 VALUES ('p', 'completed', 'assistant', '2026-10-01T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        crate::testdb::apply_migrations_after(&pool, 242).await;
+        let cut: String = sqlx::query_scalar(
+            "SELECT value FROM schema_meta WHERE key = 'distiller.chat_floor_run_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cut, "3");
+
+        let empty = crate::testdb::pool_migrated_through(242).await;
+        crate::testdb::apply_migrations_after(&empty, 242).await;
+        let cut: String = sqlx::query_scalar(
+            "SELECT value FROM schema_meta WHERE key = 'distiller.chat_floor_run_id'",
+        )
+        .fetch_one(&empty)
+        .await
+        .unwrap();
+        assert_eq!(cut, "0");
+    }
+
     /// Migrations `0198` and `0202` index the `runs` lookups that were full scans of a 229 MB table.
     #[tokio::test]
     async fn the_runs_lookups_by_job_status_and_project_use_an_index() {

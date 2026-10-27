@@ -376,6 +376,8 @@ export const keys = {
     /** `GET /distill/duplicates` — each row flagged a near-duplicate, and of which. */
     nearDuplicates: ["knowledge", "near-duplicates"] as const,
     detail: (id: number) => ["knowledge", "detail", id] as const,
+    /** `GET /knowledge?scope_kind=observation` — the conversation observations. */
+    observations: ["knowledge", "observations"] as const,
     /** `GET /knowledge?scope_kind=&scope_id=` — one agent's or team's rows, every status. */
     scope: (kind: string, id: string) => ["knowledge", "scope", kind, id] as const,
   },
@@ -695,6 +697,8 @@ export const keys = {
     machine: ["system", "machine"] as const,
     /** `GET /config/distiller` — which brain the distiller asks. */
     distiller: ["system", "distiller"] as const,
+    /** `GET /config/distiller-sources` — the chat and calendar switches. */
+    distillerSources: ["system", "distillerSources"] as const,
     /** `GET /config/capture-wait` — how long a capture request waits for the owner, in minutes. */
     captureWait: ["system", "captureWait"] as const,
     /** `GET /config/embedding` — which Ollama model embeds knowledge rows. */

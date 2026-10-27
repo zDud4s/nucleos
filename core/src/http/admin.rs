@@ -21,6 +21,12 @@ pub(super) fn routes() -> Router<AppState> {
             get(crate::distill::model::get_distiller_config)
                 .post(crate::distill::model::post_distiller_config),
         )
+        // In no `auth.rs` table on purpose, like `/config/distiller`.
+        .route(
+            "/config/distiller-sources",
+            get(crate::distill::sources::get_sources).post(crate::distill::sources::post_sources),
+        )
+        .route("/distill/chats/ingest", post(post_ingest_chats))
         .route(
             "/config/capture-wait",
             get(get_capture_wait).post(post_capture_wait),
@@ -787,6 +793,35 @@ pub(super) async fn post_capture_wait(
         )),
         Err(WaitError::Db(error)) => {
             tracing::warn!(%error, "setting the capture wait failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub(super) struct IngestChatsRequest {
+    chat_ids: Option<Vec<String>>,
+    project: Option<String>,
+}
+
+/// `POST /distill/chats/ingest`: the owner's explicit request to let the distiller read past chats
+/// (P8). Seeds, never asks a model; answers `{seeded, skipped}`. `chat_ids` and `project` together
+/// are ambiguous: 400.
+pub(super) async fn post_ingest_chats(
+    State(state): State<AppState>,
+    Json(body): Json<IngestChatsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::distill::chats::{Selection, ingest};
+    let selection = match (body.chat_ids, body.project) {
+        (Some(_), Some(_)) => return Err(refusal(StatusCode::BAD_REQUEST, "chat_ids_or_project")),
+        (Some(ids), None) => Selection::Chats(ids),
+        (None, Some(project)) => Selection::Project(project),
+        (None, None) => Selection::All,
+    };
+    match ingest(&state.pool, selection).await {
+        Ok((seeded, skipped)) => Ok(Json(serde_json::json!({ "seeded": seeded, "skipped": skipped }))),
+        Err(error) => {
+            tracing::warn!(%error, "ingesting past chats failed");
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }

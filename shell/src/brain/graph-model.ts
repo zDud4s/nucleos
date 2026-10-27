@@ -31,10 +31,13 @@ export function buildModel(
   projects: { project_id: string }[] | undefined,
   filters: GFilters,
 ): GModel {
+  // Observations are raw material for the pass and the themes, not entities: no node, edge or
+  // project stub is drawn for one.
+  const entities = knowledge.filter((row) => row.scope_kind !== "observation");
   const nodes = new Map<string, GNode>();
   const edges = new Map<string, GEdge>();
   const targetInfo = new Map(graph.targets.map((t) => [`${t.kind}:${t.ref}`, t]));
-  const knownIds = new Set(knowledge.map((row) => String(row.id)));
+  const knownIds = new Set(entities.map((row) => String(row.id)));
   const projectIds = projects === undefined ? null : new Set(projects.map((p) => p.project_id));
 
   const keepsKind = (kind: GNodeKind) => filters.nodeKinds.has(kind);
@@ -68,7 +71,7 @@ export function buildModel(
     });
   }
 
-  for (const row of knowledge) {
+  for (const row of entities) {
     add({
       id: `k:${row.id}`,
       kind: "knowledge",
@@ -123,7 +126,7 @@ export function buildModel(
     if (target) addEdge(link.link_type, source.id, target.id);
   }
 
-  for (const row of knowledge) {
+  for (const row of entities) {
     const self = nodes.get(`k:${row.id}`);
     if (!self) continue;
     if (row.supersedes != null) {

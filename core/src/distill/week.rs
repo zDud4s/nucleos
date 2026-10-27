@@ -21,27 +21,6 @@ const WINDOW_FORWARD_DAYS: i64 = 14;
 /// The most observations one row may write.
 const MAX_OBS_PER_ROW: usize = 8;
 
-/// The `schema_meta` key that turns the calendar source off.
-// seam: Phase 3 owns `crate::distill::sources::{enabled, CALENDAR_KEY}`; at the merge this constant
-// and `calendar_source_on` below are replaced by that module (same policy, see the body).
-const CALENDAR_KEY: &str = "distiller.calendar_sources";
-
-/// Whether the calendar source is on: an absent key is on, a stored `0` is off, and an unreadable
-/// key is off.
-// seam: Phase 3. At the merge the body becomes
-// `crate::distill::sources::enabled(pool, crate::distill::sources::CALENDAR_KEY).await`.
-async fn calendar_source_on(pool: &SqlitePool) -> bool {
-    match sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = ?")
-        .bind(CALENDAR_KEY)
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(None) => true,
-        Ok(Some(value)) => value.trim() != "0",
-        Err(_) => false,
-    }
-}
-
 /// One line per `human` occurrence: `Mon 07:00, 60 min, weekly: Gym`. The day and hour come from
 /// the local time the event is lived in, never from the UTC instant. `freq` maps an event id to its
 /// recurrence word.
@@ -175,7 +154,7 @@ pub(super) async fn enqueue_week_if_due(
     pool: &SqlitePool,
     now: DateTime<Local>,
 ) -> sqlx::Result<bool> {
-    if !calendar_source_on(pool).await {
+    if !crate::distill::sources::enabled(pool, crate::distill::sources::CALENDAR_KEY).await {
         return Ok(false);
     }
     let queued = sqlx::query(
@@ -210,48 +189,6 @@ async fn close(pool: &SqlitePool, row: &QueueRow, error: Option<&str>, now: Date
             row.id
         );
     }
-}
-
-/// Where a week's observation is stored. The Phase 3 helper takes the same arguments.
-// seam: Phase 3 `knowledge::record_observation_in(tx, scope_id, kind, title, body, provenance)`
-// replaces this function at the merge (same signature); delete this one then.
-async fn record_observation_in(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    scope_id: &str,
-    kind: crate::knowledge::Kind,
-    title: &str,
-    body: &str,
-    provenance: &crate::knowledge::Provenance<'_>,
-) -> sqlx::Result<i64> {
-    let now = Utc::now().to_rfc3339();
-    let id = sqlx::query(
-        "INSERT INTO knowledge
-           (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, evidence,
-            distill_cause, about, status, created_at)
-         VALUES (?, 'observation', ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, 'observed', ?)",
-    )
-    .bind(provenance.layer.unwrap_or_else(|| kind.layer()).as_str())
-    .bind(scope_id)
-    .bind(kind.as_str())
-    .bind(title)
-    .bind(body)
-    .bind(provenance.fingerprint)
-    .bind(provenance.evidence)
-    .bind(provenance.distill_cause)
-    .bind(provenance.about)
-    .bind(&now)
-    .execute(&mut **tx)
-    .await?
-    .last_insert_rowid();
-    sqlx::query(
-        "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
-         VALUES (?, NULL, 'observed', 'created', ?)",
-    )
-    .bind(id)
-    .bind(&now)
-    .execute(&mut **tx)
-    .await?;
-    Ok(id)
 }
 
 /// Write the episodic items as `observed` rows of the week and close the queue row, in one
@@ -306,7 +243,7 @@ async fn write_observations(
             about: None,
             ..Default::default()
         };
-        let id = record_observation_in(
+        let id = crate::knowledge::record_observation_in(
             &mut tx,
             scope_id,
             crate::knowledge::Kind::Memory,
@@ -345,7 +282,7 @@ pub(super) async fn process(
     row: QueueRow,
     now: DateTime<Utc>,
 ) {
-    if !calendar_source_on(pool).await {
+    if !crate::distill::sources::enabled(pool, crate::distill::sources::CALENDAR_KEY).await {
         close(pool, &row, Some("disabled"), now).await;
         return;
     }
@@ -568,19 +505,12 @@ mod tests {
     #[tokio::test]
     async fn the_calendar_source_is_on_when_the_key_is_absent_and_off_only_for_a_stored_zero() {
         let pool = crate::testdb::fresh_pool().await;
-        assert!(calendar_source_on(&pool).await);
-        sqlx::query(
-            "INSERT INTO schema_meta (key, value) VALUES ('distiller.calendar_sources', '0')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert!(!calendar_source_on(&pool).await);
-        sqlx::query("UPDATE schema_meta SET value = '1' WHERE key = 'distiller.calendar_sources'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(calendar_source_on(&pool).await);
+        use crate::distill::sources::{CALENDAR_KEY, enabled, set};
+        assert!(enabled(&pool, CALENDAR_KEY).await);
+        set(&pool, CALENDAR_KEY, false).await.unwrap();
+        assert!(!enabled(&pool, CALENDAR_KEY).await);
+        set(&pool, CALENDAR_KEY, true).await.unwrap();
+        assert!(enabled(&pool, CALENDAR_KEY).await);
     }
 
     async fn queue_rows(pool: &SqlitePool) -> Vec<(String, i64, String)> {

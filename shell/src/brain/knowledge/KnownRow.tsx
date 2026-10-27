@@ -70,7 +70,7 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
               {origin.job === null ? "a job" : <Link to="/fleet">job #{origin.job}</Link>}
             </>
           )}
-          {origin.causeLabel !== null && <> · {origin.causeLabel}</>}
+          {origin.chat === null && origin.causeLabel !== null && <> · {origin.causeLabel}</>}
         </p>
       )}
       {duplicateOf !== null && (

@@ -55,7 +55,7 @@ export type KnownLayer = "semantic" | "episodic" | "procedural" | "working";
  * Whose it is. Two columns rather than one, because a `job` is not
  * a project and a single nullable `project_id` could not say so.
  */
-export type KnownScope = "machine" | "project" | "team" | "agent" | "job";
+export type KnownScope = "machine" | "project" | "team" | "agent" | "job" | "observation";
 
 /** The scope kinds a pending refinement can be approved into, with an id. */
 export const APPROVABLE_SCOPES = ["project", "team", "agent"] as const;
@@ -80,7 +80,8 @@ export type KnownStatus =
   | "archived"
   | "closed"
   | "expired"
-  | "live";
+  | "live"
+  | "observed";
 
 export const EVIDENCE_TAGS = [
   "run",
@@ -109,6 +110,11 @@ export interface Known {
   scope_kind: KnownScope;
   /** `null` only for `machine`: a lesson about the house rather than about a repo. */
   scope_id: string | null;
+  /**
+   * Whose preference it is, once a pass proved it. Optional: a daemon older than migration
+   * `0241` does not send it.
+   */
+  about?: "owner" | null;
   /** Who knocked at the door — never read from the body. */
   source: "owner" | "run" | "consolidator" | "distiller";
   /** Who the lesson is about: `owner` is the person, `null` the code, the work, the project. */
@@ -172,6 +178,7 @@ export const DISTILL_CAUSE_LABELS: Record<string, string> = {
   run_exhausted: "a run ran out of attempts",
   generalised: "seen across several places",
   calendar_week: "a week of the calendar",
+  chat_exchanges: "a conversation",
 };
 
 /** Where a distilled row came from: its job, the runs behind it, and why it was written. */
@@ -342,6 +349,59 @@ export function useScopedKnowledge(kind: "agent" | "team", id: string) {
         `/knowledge?${new URLSearchParams({ scope_kind: kind, scope_id: id }).toString()}`,
       ),
     refetchInterval: POLL.queue,
+  });
+}
+
+/**
+ * The conversation observations the distiller keeps for 60 days, newest first — `GET
+ * /knowledge?scope_kind=observation&limit=`. Raw material for the pass and the themes; no prompt
+ * ever reads them.
+ */
+export function useObservations() {
+  return useQuery({
+    queryKey: keys.knowledge.observations,
+    queryFn: () => apiFetch<Known[]>("/knowledge?scope_kind=observation&limit=100"),
+    refetchInterval: POLL.queue,
+  });
+}
+
+/** Which sources the distiller reads — `GET`/`POST /config/distiller-sources`. */
+export interface DistillerSources {
+  chat: boolean;
+  calendar: boolean;
+}
+
+export function useDistillerSources() {
+  return useQuery({
+    queryKey: keys.system.distillerSources,
+    queryFn: () => apiFetch<DistillerSources>("/config/distiller-sources"),
+  });
+}
+
+/** Switches sources; only the fields present are written. The daemon's answer is the truth. */
+export function useSetDistillerSources() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Partial<DistillerSources>) =>
+      apiFetch<DistillerSources>("/config/distiller-sources", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: keys.system.distillerSources });
+    },
+  });
+}
+
+/**
+ * Lets the distiller read past conversations, once, on the owner's word —
+ * `POST /distill/chats/ingest`. Nothing is asked of a model here: the chats are only marked.
+ */
+export function ingestChats(body: { chat_ids?: string[]; project?: string }) {
+  return apiFetch<{ seeded: number; skipped: number }>("/distill/chats/ingest", {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
 
