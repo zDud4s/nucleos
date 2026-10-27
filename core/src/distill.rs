@@ -1107,7 +1107,6 @@ mod tests {
     #[tokio::test]
     async fn a_chat_row_is_claimed_with_its_chat_id_and_is_queued_once_per_last_run() {
         let pool = test_pool().await;
-        no_capture_wait(&pool).await;
         for _ in 0..2 {
             sqlx::query(
                 "INSERT OR IGNORE INTO distill_queue (cause, project_id, run_id, chat_id, status, attempts, created_at)
@@ -2977,7 +2976,6 @@ mod tests {
 
     /// A pending `chat_exchanges` row for `chat`, watermarked at `last_run`.
     async fn chat_row(pool: &SqlitePool, project: &str, chat: &str, last_run: i64) -> i64 {
-        no_capture_wait(pool).await;
         sqlx::query(
             "INSERT INTO distill_queue (cause, project_id, run_id, chat_id, status, attempts, created_at)
              VALUES ('chat_exchanges', ?, ?, ?, 'pending', 0, '2026-10-05T00:00:00Z')",
@@ -3249,7 +3247,6 @@ mod tests {
     #[tokio::test]
     async fn a_tick_queues_idle_chats_serves_them_and_sweeps_old_observations() {
         let pool = test_pool().await;
-        no_capture_wait(&pool).await;
         let chat = fixtures::chat_with(&pool).await;
         four_turns(&pool, &chat, None).await;
         let stale = fixtures::stale_observation(&pool, 61).await;
