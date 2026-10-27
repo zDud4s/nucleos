@@ -95,7 +95,7 @@ pub async fn mark_removed(pool: &SqlitePool, owner: Owner) -> sqlx::Result<()> {
     // The verification state kept for this tree is dead weight now. Detached and best-effort: the
     // executor's periodic sweep removes anything this misses.
     #[cfg(not(any(test, feature = "testkit")))]
-    if let Some(root) = crate::machine_config::root() {
+    if let Some(root) = crate::machine_config::root().map(|root| crate::warm::home(&root)) {
         for (project_id, path) in removed {
             let Some(project_id) = project_id else {
                 continue;

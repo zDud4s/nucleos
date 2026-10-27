@@ -2,10 +2,11 @@
 //!
 //! Layout: `<root>/warm/<project>/<wt-id>/<dir>` per worktree and
 //! `<root>/warm/<project>/shared/<dir>` for state a project shares. Every function takes `root`
-//! (the resolved `~/.nucleos`) so tests can point it at a temp dir. Nothing here ever touches a
-//! path outside `<root>/warm/`.
+//! ([`home`]: the resolved `~/.nucleos`, unless `NUCLEOS_WARM_HOME` moves it) so tests can point it
+//! at a temp dir. Nothing here ever touches a path outside `<root>/warm/`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +19,26 @@ pub const MARKER_WORKTREE: &str = ".worktree";
 pub const MARKER_USED: &str = ".last_used";
 const SHARED: &str = "shared";
 const SHARED_PREFIX: &str = "shared:";
+
+/// Moves warm state out of the machine root: `warm/` is created under this directory instead of
+/// `~/.nucleos`. Warm dirs hold build output (`CARGO_TARGET_DIR`), and a profile path with a space
+/// in it (`C:\Users\PC Multimedia`) breaks the `windows-gnu` linker, which splits its arguments on
+/// the space: measured 2026-10-27, every `core: clippy` unit failed with `rust-lld: could not open
+/// 'C:\Users\PC\'`. `scripts/run-daemon.ps1` sets it to the dev home.
+pub const HOME_ENV: &str = "NUCLEOS_WARM_HOME";
+
+/// The directory warm state lives under: [`HOME_ENV`] when it names an absolute path, the
+/// machine root otherwise.
+pub fn home(machine_root: &Path) -> PathBuf {
+    home_from(machine_root, std::env::var_os(HOME_ENV))
+}
+
+fn home_from(machine_root: &Path, value: Option<OsString>) -> PathBuf {
+    value
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| machine_root.to_path_buf())
+}
 
 /// A worktree path in lexical form: no `\\?\` prefix, '/'-separated, no trailing '/'.
 /// No filesystem access, so it is the same before and after the tree is deleted.
@@ -321,6 +342,19 @@ pub fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_is_the_machine_root_unless_an_absolute_override_names_another() {
+        let machine = std::env::temp_dir().join("machine");
+        let other = std::env::temp_dir().join("warm-home");
+        assert_eq!(home_from(&machine, None), machine);
+        assert_eq!(home_from(&machine, Some(OsString::new())), machine);
+        assert_eq!(home_from(&machine, Some("relative/dir".into())), machine);
+        assert_eq!(
+            home_from(&machine, Some(other.clone().into_os_string())),
+            other
+        );
+    }
 
     fn warm(dir: &str) -> Warm {
         Warm {
