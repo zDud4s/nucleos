@@ -3,13 +3,27 @@
 //! The pure half (`decide`) is below; the half that reads git and the claims store (`apply`,
 //! `ensure_fresh`, `refresh_master_red`) follows it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlx::SqlitePool;
 
-use crate::task_claims::{Status, TaskRow};
+use crate::task_claims::{Status, TaskKey, TaskRow, store};
+use crate::test_select;
+use crate::tests_map::{self, MapState};
+use crate::verify::exec::Executor;
 use crate::verify::failures::Failures;
+use crate::verify::plan::{Ticket, UnitReport};
+use crate::verify::postgate_worker::GATE_UNIT;
+use crate::verify::runs as verify_runs;
+use crate::verify::store as verify_store;
+use crate::verify::store::RequestRow;
+use crate::verify::{probe, resolve};
 
 /// The live `master-red` row, as the decision needs it.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +147,390 @@ pub fn decide(facts: &Facts<'_>, incident: Option<&Incident>, branch_has_red_sin
 /// A done ticket whose failed units are all inherited has the verdict `inherited`.
 pub fn only_inherited(classes: &[Class]) -> bool {
     !classes.is_empty() && classes.iter().all(|class| matches!(class, Class::Inherited { .. }))
+}
+
+// ---- the half that reads git and the claims store ------------------------------------------------
+
+/// Every git read of one classification (master head, diff, ancestry) shares this budget.
+const GIT_BUDGET: Duration = Duration::from_secs(20);
+
+/// One failed unit and what it was decided to be.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitClass {
+    /// Index in `ticket.units`.
+    pub index: usize,
+    pub class: Class,
+}
+
+/// Stored in `verify_requests.classification`. A draft (`done == false`) caches what git said so a
+/// poll never reruns it; a final one (`done == true`) is read back as stored.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Classification {
+    pub done: bool,
+    /// Failed unit index -> its group is suspect. `None` until the diff was read.
+    pub suspects: Option<BTreeMap<usize, bool>>,
+    /// `red_since_sha` -> the verified worktree's HEAD contains it.
+    pub contains: BTreeMap<String, bool>,
+    /// Re-proofs this ticket started. It starts at most one: after a lapsed flight it gives up and
+    /// reads the incident as it stands (`Freshness::GaveUp`).
+    pub reprobes: u8,
+    /// Final per-unit classes (empty until `done`; the draft carries the pending ones too).
+    pub classes: Vec<UnitClass>,
+}
+
+impl Classification {
+    /// Writes what was decided onto the ticket the reader is about to return.
+    fn apply_to(&self, ticket: &mut Ticket) {
+        let mut inherited = BTreeSet::new();
+        let mut waiting: Vec<String> = Vec::new();
+        for entry in &self.classes {
+            let Some(unit) = ticket.units.get_mut(entry.index) else { continue };
+            match &entry.class {
+                Class::Inherited { task_id, note } => {
+                    unit.inherited = Some(note.clone());
+                    inherited.insert(*task_id);
+                }
+                Class::Pending { task_id, reprobe } => {
+                    let what = if *reprobe { "reprobe" } else { "probe" };
+                    unit.pending = Some(format!("{what} #{task_id}"));
+                    waiting.push(format!("{what} #{task_id}"));
+                }
+                Class::Task { note } => unit.not_inherited = note.clone(),
+                Class::NeedsProbe => {}
+            }
+        }
+        ticket.inherited_task_ids = inherited.iter().copied().collect();
+        let note = |ticket: &mut Ticket, text: String| {
+            ticket.note = Some(match ticket.note.take() {
+                Some(old) if !old.is_empty() => format!("{old}; {text}"),
+                _ => text,
+            });
+        };
+        if !waiting.is_empty() {
+            // Not finished: `wait_ticket` keeps waiting and the asker keeps polling.
+            ticket.done = false;
+            ticket.verdict = None;
+            waiting.dedup();
+            note(ticket, format!("waiting for {}", waiting.join(", ")));
+            return;
+        }
+        let classes: Vec<Class> = self.classes.iter().map(|entry| entry.class.clone()).collect();
+        let clean = ticket.units.iter().all(|unit| !matches!(unit.status.as_str(), "errored" | "unknown"));
+        if clean && only_inherited(&classes) {
+            ticket.verdict = Some("inherited".to_owned());
+            let ids: Vec<String> = inherited.iter().map(|id| format!("#{id}")).collect();
+            note(
+                ticket,
+                format!(
+                    "every failed unit is inherited from the master incident {}: do not fix it, keep \
+                     working on your task, and re-verify when it closes",
+                    ids.join(", ")
+                ),
+            );
+        }
+    }
+}
+
+/// Only tickets a person or an autonomous run is waiting on are classified.
+fn classified(caller: &str) -> bool {
+    caller == "owner" || caller.starts_with("run:")
+}
+
+/// Case 1, and the entry to cases 2 and 3. **Fail-open in everything**: any error logs a warning and
+/// leaves the ticket exactly as `assemble` made it.
+pub async fn apply(
+    pool: &SqlitePool,
+    executor: Option<&Arc<Executor>>,
+    request: &RequestRow,
+    ticket: &mut Ticket,
+    now: DateTime<Utc>,
+) {
+    if let Err(error) = try_apply(pool, executor, request, ticket, now).await {
+        tracing::warn!(%error, ticket = ticket.ticket, "verify: cannot classify the red units; they stay failed");
+    }
+}
+
+async fn try_apply(
+    pool: &SqlitePool,
+    executor: Option<&Arc<Executor>>,
+    request: &RequestRow,
+    ticket: &mut Ticket,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    if !ticket.done || ticket.verdict.as_deref() != Some("failed") || !classified(&request.caller) {
+        return Ok(());
+    }
+    let mut stored: Classification = request
+        .classification
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    if stored.done {
+        stored.apply_to(ticket);
+        return Ok(());
+    }
+
+    let failed: Vec<usize> = ticket
+        .units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.status == verify_runs::STATUS_FAILED)
+        .map(|(index, _)| index)
+        .collect();
+    let project_id = request.project_id.as_str();
+    let project_root = crate::inspect::project_root(pool, project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("project {project_id} has no root recorded"))?;
+    let worktree = Path::new(&request.worktree);
+    let deadline = Instant::now() + GIT_BUDGET;
+
+    let head = probe::master_head(pool, project_id, &project_root, deadline).await.ok();
+    let incident = store::live_by_key(pool, project_id, &TaskKey::master_red(), now)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    // Case 3 first: an incident not re-checked at today's master head is re-proved before anything
+    // is decided against it, and the units wait while that runs.
+    let mut freshness = Freshness::Fresh;
+    if let Some(row) = incident.as_ref().filter(|row| matches!(row.status, Status::Open | Status::Claimed)) {
+        freshness = match head.as_deref() {
+            Some(head) => {
+                ensure_fresh(pool, executor, project_id, &project_root, row, head, stored.reprobes > 0, now).await?
+            }
+            None => Freshness::GaveUp,
+        };
+    }
+    if let (Some(row), Freshness::InFlight { started }) = (incident.as_ref(), freshness) {
+        if started {
+            stored.reprobes += 1;
+        }
+        let class = Class::Pending { task_id: row.id, reprobe: true };
+        stored.classes = failed.iter().map(|&index| UnitClass { index, class: class.clone() }).collect();
+        persist(pool, request.id, &stored).await;
+        stored.apply_to(ticket);
+        return Ok(());
+    }
+    let fresh = freshness == Freshness::Fresh;
+
+    let suspects = match stored.suspects.clone() {
+        Some(known) => known,
+        None => {
+            let found = suspects_of(pool, request, &project_root, ticket, &failed, deadline).await;
+            stored.suspects = Some(found.clone());
+            found
+        }
+    };
+
+    let mut classes =
+        decide_units(&mut stored, ticket, &failed, &suspects, incident.as_ref(), fresh, worktree, deadline).await;
+
+    // Units that need a master proof share ONE proof of all their groups.
+    let needing: Vec<usize> = (0..classes.len()).filter(|&i| classes[i] == Class::NeedsProbe).collect();
+    if !needing.is_empty() {
+        let mut groups: Vec<String> = Vec::new();
+        for &i in &needing {
+            if let Some(group) = ticket.units[failed[i]].group.clone()
+                && !groups.contains(&group)
+            {
+                groups.push(group);
+            }
+        }
+        match probe_step(pool, executor, request, &project_root, &groups, head.as_deref(), now).await? {
+            ProbeStep::Task(note) => {
+                for &i in &needing {
+                    classes[i] = Class::Task { note: Some(note.clone()) };
+                }
+            }
+            ProbeStep::Pending(task_id) => {
+                for &i in &needing {
+                    classes[i] = Class::Pending { task_id, reprobe: false };
+                }
+            }
+            ProbeStep::Incident(row) => {
+                // A proof (ours or someone's) opened the incident meanwhile: decide against it. It was
+                // proved at the master head by definition, so it is fresh when `checked_sha` says so.
+                let proved_fresh = head.as_deref().is_some_and(|h| row.checked_sha.as_deref() == Some(h));
+                let subset: Vec<usize> = needing.iter().map(|&i| failed[i]).collect();
+                let redone =
+                    decide_units(&mut stored, ticket, &subset, &suspects, Some(&row), proved_fresh, worktree, deadline)
+                        .await;
+                for (&i, class) in needing.iter().zip(redone) {
+                    classes[i] = class;
+                }
+            }
+        }
+    }
+
+    stored.done = !classes.iter().any(|class| matches!(class, Class::Pending { .. }));
+    stored.classes = failed.iter().copied().zip(classes).map(|(index, class)| UnitClass { index, class }).collect();
+    persist(pool, request.id, &stored).await;
+    stored.apply_to(ticket);
+    Ok(())
+}
+
+/// Final classifications also store the incident ids the close notice joins on.
+async fn persist(pool: &SqlitePool, id: i64, stored: &Classification) {
+    let Ok(json) = serde_json::to_string(stored) else { return };
+    let written = if stored.done {
+        let ids: BTreeSet<i64> = stored
+            .classes
+            .iter()
+            .filter_map(|entry| match entry.class {
+                Class::Inherited { task_id, .. } => Some(task_id),
+                _ => None,
+            })
+            .collect();
+        let ids: Vec<i64> = ids.into_iter().collect();
+        verify_store::set_classification(pool, id, &json, &ids).await
+    } else {
+        verify_store::set_classification_draft(pool, id, &json).await
+    };
+    if let Err(error) = written {
+        tracing::warn!(%error, ticket = id, "verify: cannot store the classification");
+    }
+}
+
+/// `decide` for each unit in `indexes` (indexes into `ticket.units`) against one incident. The
+/// ancestry test is made once per `red_since_sha` and remembered in `stored.contains`.
+#[allow(clippy::too_many_arguments)]
+async fn decide_units(
+    stored: &mut Classification,
+    ticket: &Ticket,
+    indexes: &[usize],
+    suspects: &BTreeMap<usize, bool>,
+    row: Option<&TaskRow>,
+    fresh: bool,
+    worktree: &Path,
+    deadline: Instant,
+) -> Vec<Class> {
+    let incident = row.map(|row| Incident::from_row(row, fresh));
+    let branch_has = match incident.as_ref().and_then(|inc| inc.red_since_sha.as_deref()) {
+        Some(since) if incident.as_ref().is_some_and(|inc| inc.status != Status::Probing) => {
+            Some(contains(stored, worktree, since, deadline).await)
+        }
+        _ => None,
+    };
+    indexes
+        .iter()
+        .map(|&index| {
+            let unit: &UnitReport = &ticket.units[index];
+            // The runner's ids live on the unit, not in `Failures`: rebuild them for `decide`.
+            let failures = unit
+                .failed_tests
+                .as_ref()
+                .map(|ids| Failures { tests: ids.iter().cloned().collect(), files: BTreeSet::new() });
+            let facts = Facts {
+                group: unit.group.as_deref().unwrap_or(GATE_UNIT),
+                failed: failures.as_ref(),
+                suspect: suspects.get(&index).copied().unwrap_or(false),
+            };
+            decide(&facts, incident.as_ref(), branch_has)
+        })
+        .collect()
+}
+
+/// Does the verified worktree's HEAD contain `sha`? Memoised; any doubt (a sha that is not hex, a
+/// git error) is "no", which is the side that never masks a failure.
+async fn contains(stored: &mut Classification, worktree: &Path, sha: &str, deadline: Instant) -> bool {
+    if let Some(known) = stored.contains.get(sha) {
+        return *known;
+    }
+    let hex = (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit());
+    let found = hex && resolve::is_ancestor(worktree, sha, "HEAD", deadline).await.unwrap_or(false);
+    stored.contains.insert(sha.to_owned(), found);
+    found
+}
+
+/// Which failed units are in a group the session's diff did not select (case 2's "suspect").
+/// Anything that cannot be read -- no map, no base, a git error -- makes nobody suspect.
+async fn suspects_of(
+    pool: &SqlitePool,
+    request: &RequestRow,
+    project_root: &Path,
+    ticket: &Ticket,
+    failed: &[usize],
+    deadline: Instant,
+) -> BTreeMap<usize, bool> {
+    let none = || failed.iter().map(|&index| (index, false)).collect::<BTreeMap<_, _>>();
+    let worktree = PathBuf::from(&request.worktree);
+    let map = {
+        let worktree = worktree.clone();
+        match tokio::task::spawn_blocking(move || tests_map::load(&worktree)).await {
+            Ok(MapState::Valid(map)) => map,
+            _ => return none(),
+        }
+    };
+    let base = match ticket.base.clone() {
+        Some(base) => base,
+        None => match resolve::resolve_base(pool, &request.project_id, project_root, &worktree, None, deadline).await {
+            Ok(base) => base,
+            Err(_) => return none(),
+        },
+    };
+    let Ok(changed) = resolve::changed_paths(&worktree, &base, deadline).await else { return none() };
+    let fillable = {
+        let (worktree, changed) = (worktree.clone(), changed.clone());
+        tokio::task::spawn_blocking(move || test_select::vet(&worktree, &changed)).await.unwrap_or_default()
+    };
+    // An empty diff selects nothing, so every group is "untouched by the session": suspect.
+    let picked: BTreeSet<String> =
+        test_select::select(&map, &changed, &fillable, false).units.into_iter().map(|unit| unit.group).collect();
+    failed
+        .iter()
+        .map(|&index| {
+            let suspect = ticket.units[index].group.as_deref().is_some_and(|group| !picked.contains(group));
+            (index, suspect)
+        })
+        .collect()
+}
+
+/// Whether an open/claimed incident was checked against today's master head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Freshness {
+    Fresh,
+    /// A re-proof is running (`started`: this call launched it).
+    InFlight { started: bool },
+    /// It is stale, no flight is running, and this ticket already tried once (or nobody can run
+    /// one): read the incident as it stands.
+    GaveUp,
+}
+
+enum ProbeStep {
+    Task(String),
+    #[allow(dead_code)]
+    Pending(i64),
+    #[allow(dead_code)]
+    Incident(TaskRow),
+}
+
+/// Task 4 body; Task 6 replaces it with the real re-proof.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn ensure_fresh(
+    _pool: &SqlitePool,
+    _executor: Option<&Arc<Executor>>,
+    _project_id: &str,
+    _project_root: &Path,
+    _incident: &TaskRow,
+    _head: &str,
+    _already_tried: bool,
+    _now: DateTime<Utc>,
+) -> Result<Freshness, String> {
+    Ok(Freshness::Fresh)
+}
+
+/// Task 4 body; Task 5 replaces it with the real probe.
+async fn probe_step(
+    _pool: &SqlitePool,
+    _executor: Option<&Arc<Executor>>,
+    _request: &RequestRow,
+    _project_root: &Path,
+    _groups: &[String],
+    _head: Option<&str>,
+    _now: DateTime<Utc>,
+) -> Result<ProbeStep, String> {
+    Ok(ProbeStep::Task("not proved on master (no probe yet)".to_owned()))
 }
 
 #[cfg(test)]
