@@ -507,107 +507,29 @@ async fn write_items(
     let evidence = serde_json::Value::Array(evidence_list).to_string();
     let reasoning = format!("distilled from job #{job_id} ({})", cause.as_str());
 
+    let subject = Subject {
+        cause,
+        project_id: &row.project_id,
+        evidence: &evidence,
+        reasoning: &reasoning,
+        sources: &sources,
+        model,
+    };
     let mut tx = pool.begin().await?;
     let mut proposed_any = false;
     let mut kept = 0usize;
     for (index, item) in items.iter().enumerate() {
-        let Some(fingerprint) = crate::knowledge::title_fingerprint(&item.title) else {
-            continue;
-        };
-        if crate::knowledge::reconfirm_in(&mut tx, &row.project_id, &fingerprint, &evidence)
-            .await?
-            .is_some()
-        {
-            continue;
-        }
-        let embedded = match (vectors.get(index), model) {
-            (Some(Some(vector)), Some(model)) => Some((vector.as_slice(), model)),
-            _ => None,
-        };
-        let mut near: Option<i64> = None;
-        if let Some((vector, model)) = embedded {
-            let best = crate::embed::nearest_in(&mut tx, &row.project_id, model, vector).await?;
-            match dedup_verdict(best) {
-                Dedup::Same(id) => {
-                    if crate::knowledge::reconfirm_id_in(&mut tx, id, &evidence).await? {
-                        continue;
-                    }
-                }
-                Dedup::Near(id) => near = Some(id),
-                Dedup::New => {}
-            }
-        }
-        let points_at = if item.files.is_empty() {
-            None
-        } else {
-            Some(serde_json::json!(item.files).to_string())
-        };
-        // A learning that quotes the owner's text reaches no prompt without the owner's yes
-        // (spec `2026-10-07-fronteira-prompts-design.md` §4): an episode is proposed, not recorded.
-        let (kind, by_layer) = door(item.layer);
-        let quoted = crate::governance::quote_guard::quotes(
-            &format!("{}\n{}", item.title, item.body),
-            &sources,
-        );
-        let demoted = quoted && by_layer == Door::Record;
-        let how = if quoted { Door::Propose } else { by_layer };
-        let declaration = crate::knowledge::Declaration {
-            project_id: Some(&row.project_id),
-            origin_run_id: None,
-            kind,
-            title: &item.title,
-            body: &item.body,
-            reasoning: &reasoning,
-            supersedes: None,
-        };
-        let provenance = crate::knowledge::Provenance {
-            source: Some("distiller"),
-            distill_cause: Some(cause.as_str()),
-            evidence: Some(&evidence),
-            points_at: points_at.as_deref(),
-            fingerprint: Some(&fingerprint),
-            layer: Some(item.layer),
-            ..Default::default()
-        };
-        let new_id = match how {
-            Door::Record => {
-                crate::knowledge::record_distilled(&mut tx, &declaration, &provenance).await?
-            }
-            Door::Propose => {
+        let vector = vectors.get(index).and_then(|v| v.as_deref());
+        match write_one_item(&mut tx, &subject, item, vector).await? {
+            Written::Skipped => {}
+            Written::Recorded => kept += 1,
+            Written::Proposed => {
                 proposed_any = true;
-                crate::knowledge::propose_in_with(&mut tx, declaration, &provenance)
-                    .await
-                    .map_err(|e| match e {
-                        crate::knowledge::ProposeError::Db(db) => db,
-                        _ => sqlx::Error::Protocol("a distilled learning was refused".into()),
-                    })?
-                    .0
-            }
-        };
-        kept += 1;
-        if demoted {
-            crate::knowledge::arm_trial_in(&mut tx, new_id).await?;
-        }
-        if quoted {
-            crate::knowledge::note_quoted_owner_text_in(&mut tx, new_id).await?;
-        }
-        if let Some((vector, model)) = embedded {
-            crate::embed::store_in(&mut tx, new_id, model, vector).await?;
-            if let Some(of_id) = near {
-                crate::knowledge::note_near_duplicate_in(&mut tx, new_id, of_id).await?;
+                kept += 1;
             }
         }
     }
-    sqlx::query(
-        "UPDATE distill_queue SET status = ?, finished_at = ?, error = NULL
-          WHERE id = ? AND status = ?",
-    )
-    .bind(STATUS_DONE)
-    .bind(now.to_rfc3339())
-    .bind(row.id)
-    .bind(STATUS_RUNNING)
-    .execute(&mut *tx)
-    .await?;
+    close_row(&mut tx, row.id, now, None).await?;
     tx.commit().await?;
     // Only after the commit: a waker must never see a proposal the database does not hold yet.
     if proposed_any {
@@ -615,6 +537,146 @@ async fn write_items(
     }
     Ok(kept)
 }
+
+/// What every item of one queue row shares.
+struct Subject<'a> {
+    cause: Cause,
+    project_id: &'a str,
+    evidence: &'a str,
+    reasoning: &'a str,
+    sources: &'a [&'a str],
+    model: Option<&'a str>,
+}
+
+/// What [`write_one_item`] did with one item.
+enum Written {
+    /// No fingerprint, or a reconfirmation of a learning already held.
+    Skipped,
+    Recorded,
+    Proposed,
+}
+
+/// Write one extracted item inside the caller's transaction: dedup against what is held, pick the
+/// door, store the vector. `vector` is the item's own embedding, `None` takes the fingerprint path
+/// alone.
+async fn write_one_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    subject: &Subject<'_>,
+    item: &Item,
+    vector: Option<&[f32]>,
+) -> sqlx::Result<Written> {
+    let Some(fingerprint) = crate::knowledge::title_fingerprint(&item.title) else {
+        return Ok(Written::Skipped);
+    };
+    if crate::knowledge::reconfirm_in(tx, subject.project_id, &fingerprint, subject.evidence)
+        .await?
+        .is_some()
+    {
+        return Ok(Written::Skipped);
+    }
+    let embedded = match (vector, subject.model) {
+        (Some(vector), Some(model)) => Some((vector, model)),
+        _ => None,
+    };
+    let mut near: Option<i64> = None;
+    if let Some((vector, model)) = embedded {
+        let best = crate::embed::nearest_in(tx, subject.project_id, model, vector).await?;
+        match dedup_verdict(best) {
+            Dedup::Same(id) => {
+                if crate::knowledge::reconfirm_id_in(tx, id, subject.evidence).await? {
+                    return Ok(Written::Skipped);
+                }
+            }
+            Dedup::Near(id) => near = Some(id),
+            Dedup::New => {}
+        }
+    }
+    let points_at = if item.files.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!(item.files).to_string())
+    };
+    // A learning that quotes the owner's text reaches no prompt without the owner's yes
+    // (spec `2026-10-07-fronteira-prompts-design.md` §4): an episode is proposed, not recorded.
+    let (kind, by_layer) = door(item.layer);
+    let quoted = crate::governance::quote_guard::quotes(
+        &format!("{}\n{}", item.title, item.body),
+        subject.sources,
+    );
+    let demoted = quoted && by_layer == Door::Record;
+    let how = if quoted { Door::Propose } else { by_layer };
+    let declaration = crate::knowledge::Declaration {
+        project_id: Some(subject.project_id),
+        origin_run_id: None,
+        kind,
+        title: &item.title,
+        body: &item.body,
+        reasoning: subject.reasoning,
+        supersedes: None,
+    };
+    let provenance = crate::knowledge::Provenance {
+        source: Some("distiller"),
+        distill_cause: Some(subject.cause.as_str()),
+        evidence: Some(subject.evidence),
+        points_at: points_at.as_deref(),
+        fingerprint: Some(&fingerprint),
+        layer: Some(item.layer),
+        ..Default::default()
+    };
+    let new_id = match how {
+        Door::Record => {
+            crate::knowledge::record_distilled(tx, &declaration, &provenance).await?
+        }
+        Door::Propose => {
+            crate::knowledge::propose_in_with(tx, declaration, &provenance)
+                .await
+                .map_err(|e| match e {
+                    crate::knowledge::ProposeError::Db(db) => db,
+                    _ => sqlx::Error::Protocol("a distilled learning was refused".into()),
+                })?
+                .0
+        }
+    };
+    if demoted {
+        crate::knowledge::arm_trial_in(tx, new_id).await?;
+    }
+    if quoted {
+        crate::knowledge::note_quoted_owner_text_in(tx, new_id).await?;
+    }
+    if let Some((vector, model)) = embedded {
+        crate::embed::store_in(tx, new_id, model, vector).await?;
+        if let Some(of_id) = near {
+            crate::knowledge::note_near_duplicate_in(tx, new_id, of_id).await?;
+        }
+    }
+    Ok(if matches!(how, Door::Propose) {
+        Written::Proposed
+    } else {
+        Written::Recorded
+    })
+}
+
+/// Close a queue row: `done`, with `error` as the note it keeps (`None` clears it).
+async fn close_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    row_id: i64,
+    now: DateTime<Utc>,
+    error: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE distill_queue SET status = ?, finished_at = ?, error = ?
+          WHERE id = ? AND status = ?",
+    )
+    .bind(STATUS_DONE)
+    .bind(now.to_rfc3339())
+    .bind(error)
+    .bind(row_id)
+    .bind(STATUS_RUNNING)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 
 /// How many elements the model's answer holds as a JSON array, before `parse_items` drops the bad
 /// ones and caps the rest; 0 when the answer is not an array. It unwraps a code fence with the
