@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0244_creates_the_theme_tables_without_foreign_keys() {
+    async fn migration_0248_creates_the_theme_tables_without_foreign_keys() {
         let pool = crate::testdb::fresh_pool().await;
         let theme_cols: Vec<String> =
             sqlx::query_scalar("SELECT name FROM pragma_table_info('themes') ORDER BY cid")
