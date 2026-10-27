@@ -139,6 +139,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(map_flows::routes())
         .merge(map_states::routes())
         .merge(nodes::routes())
+        .merge(tasks::routes())
         .merge(projects::routes())
         .merge(proposals::routes())
         .merge(relay::routes())
