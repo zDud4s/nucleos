@@ -9,6 +9,7 @@ pub mod model;
 pub mod origin;
 
 mod extract;
+mod generalise;
 pub use extract::*;
 
 use sqlx::SqliteConnection;
