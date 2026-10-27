@@ -3240,6 +3240,14 @@ mod tests {
             (Method::POST, "/capture-requests/7/answer"),
             (Method::GET, "/config/capture-wait"),
             (Method::POST, "/config/capture-wait"),
+            (Method::GET, "/themes"),
+            (Method::GET, "/themes/7"),
+            (Method::POST, "/themes/7/accept"),
+            (Method::POST, "/themes/7/refuse"),
+            (Method::POST, "/themes/7/rename"),
+            (Method::POST, "/themes/7/merge"),
+            (Method::POST, "/themes/7/members"),
+            (Method::DELETE, "/themes/7/members/note/3"),
         ];
         let refused = [
             Scope::Run(1),
@@ -3281,6 +3289,14 @@ mod tests {
             (Method::POST, "/owner-notes/{id}/links"),
             (Method::DELETE, "/owner-notes/links/{link_id}"),
             (Method::POST, "/owner-notes/{id}/teach"),
+            (Method::GET, "/themes"),
+            (Method::GET, "/themes/{id}"),
+            (Method::POST, "/themes/{id}/accept"),
+            (Method::POST, "/themes/{id}/refuse"),
+            (Method::POST, "/themes/{id}/rename"),
+            (Method::POST, "/themes/{id}/merge"),
+            (Method::POST, "/themes/{id}/members"),
+            (Method::DELETE, "/themes/{id}/members/{kind}/{member_id}"),
         ];
         for (method, pattern) in TEMPLATES {
             assert!(
