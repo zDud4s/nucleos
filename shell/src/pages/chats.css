@@ -3357,6 +3357,87 @@
   background: none;
 }
 
+/* Where a command came from: a tag, not part of the sentence, so a muted pill set apart from the
+ * description and never squeezed by it. */
+.chats-mention-source,
+.chats-slash-source {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+/* What a slash command answered with: the same quiet panel as the list it was chosen from, above
+ * the box, and gone when dismissed. */
+.chats-slash-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 18rem;
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2);
+  overflow-y: auto;
+  overscroll-behavior: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.chats-slash-card ul {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chats-slash-group {
+  margin: 0 0 var(--space-1);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.chats-slash-entry {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+}
+
+.chats-slash-dismiss,
+.chats-slash-suggestion {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.chats-slash-dismiss {
+  align-self: flex-end;
+}
+
+.chats-slash-suggestion {
+  margin-left: var(--space-1);
+  font-family: var(--font-mono);
+}
+
+.chats-slash-dismiss:hover,
+.chats-slash-suggestion:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
 /* What was said while it was busy and has not been sent yet.
  *
  * Deliberately unlike a turn: no ground of its own, dashed down the side, and quieter than either

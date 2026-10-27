@@ -136,6 +136,7 @@ the contract, not a snapshot.
 | `http/chat_edit.rs` | Creating and editing a conversation and its groups (`POST /assistant/chats`, `PATCH /assistant/chats/{chat_id}`, `/assistant/chat-groups*`). |
 | `http/chat_turns.rs` | Sending a message and following its turn (`/assistant/message`, `/assistant/turns/*`, `/assistant/{turn_id}/live*`, relay and forward). |
 | `http/chats.rs` | Reading a conversation and the state around it (`/assistant/chats*`). |
+| `http/chats/command.rs` | `POST /assistant/chats/{chat_id}/command`: runs a typed slash command, answering a card, a control to open, or a prompt sent through `send_expanded_or_queue`. |
 | `http/commands.rs` | A project's commands, rules and limits (`/projects/{id}/commands*`, `/rules`, `/shell-rules`, `/wip-limit`). |
 | `http/common.rs` | Query shapes, resolvers and refusals shared by more than one route family. |
 | `http/email.rs` | Mail, contacts and calendar (`/email/*`, `/contacts/*`, `/calendar/*`). |
@@ -292,6 +293,11 @@ the contract, not a snapshot.
 | `assistant/rotation.rs` | Root-chat rotation: past a soft context threshold, a shell chat whose root node has no waiting child is let go of and its next turn starts from a stored, redacted rehydration prefix (`root_rotations`, migration 0217); `DaemonRootNodes` reads the tree from `work_nodes`. |
 | `assistant/send.rs` | Message origins, sending, queued delivery, images, and history handover. |
 | `assistant/serve.rs` | Serving turns and tracking background task output. |
+| `assistant/slash.rs` | Parent of `assistant/slash/`. Slash commands typed in a chat, run by the daemon so every engine sees the same thing (only the Claude CLI expands a slash itself). Owns the vocabulary: `Outcome` (a card that stays in the chat, a prompt for the model with the typed text kept apart, or a shell control to open), `CardKind`, `Control` and `SlashError`, one variant per HTTP refusal. Knows nothing about chats or models. |
+| `assistant/slash/parse.rs` | `/name arguments` taken apart: `[A-Za-z0-9][A-Za-z0-9_.:-]*` names, `rest` raw and `argv` split with quotes and a backslash before a quote. Pure, and decides by shape alone: `//text` and `/etc/hosts` are not commands, an unclosed quote is `InvalidArgument`. |
+| `assistant/slash/expand.rs` | A command or skill file turned into the prompt every engine receives: front matter stripped, `$ARGUMENTS` and `$1..$9` replaced in one pass, `ARGUMENTS:` appended when the body names no placeholder, the base-directory header for a skill. Also reports `partial` reasons (`allowed-tools`, `model`, `bang`, `at-file`) -- things the file asked the CLI to do that reach the model as literal text. Pure: the caller reads the file. |
+| `assistant/slash/registry.rs` | The built-ins (`BUILTINS`, only `/help` with alias `/commands` so far) joined with `commands::available` in the order built-in, project, personal, plugin. A name taken by an earlier entry is shadowed: kept in `entries` for `/help`, never returned by `resolve` or `listing`. Names compare without case and aliases are not entries of their own. `BUNDLE_SKILLS` names the workflow skills the daemon materializes. |
+| `assistant/slash/help.rs` | The `/help` and `/commands` cards: every command grouped by source with shadowed ones marked, or one entry in full for `/help name`. An unknown name is `SlashError::Unknown` with suggestions. |
 | `assistant/slots.rs` | Per-chat turn slots, steering, stopping, and immediate answers. |
 | `assistant/spontaneous.rs` | Between-turn watching and spontaneous assistant turns. |
 | `assistant/turn.rs` | Local turns, runner selection, deadlines, and assistant turn launching. |
