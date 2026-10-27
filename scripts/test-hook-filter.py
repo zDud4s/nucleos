@@ -39,7 +39,11 @@ import tempfile
 import urllib.error
 from unittest import mock
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# Claims are off for every test but the claims ones (which set it empty): a registration request
+# would otherwise consume one of the replies the helpers below feed to `urlopen`.
+os.environ["NUCLEOS_CLAIMS_OFF"] = "1"
+
+ROOT =os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HOOK = os.path.join(ROOT, "core", "hooks", "ask_daemon.py")
 
 spec = importlib.util.spec_from_file_location("ask_daemon", HOOK)
@@ -1281,6 +1285,213 @@ def session_start_cases():
     return cases
 
 
+def _claims_env(tmp, **extra):
+    env = {"NUCLEOS_CLAIMS_OFF": "", "NUCLEOS_CLAIMS_DIR": tmp, "NUCLEOS_DAEMON_URL": "http://127.0.0.1:1"}
+    env.update(extra)
+    return env
+
+
+def _exchange(tmp, payload, replies, now=1000.0, **kwargs):
+    """Runs `claims_exchange`; returns `(answer, requests)` where requests are `(url, body, timeout)`."""
+    seen = []
+    queue = list(replies)
+
+    def urlopen(request, timeout=None):
+        seen.append((request.full_url, json.loads(request.data), timeout))
+        reply = queue.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return _Reply(reply)
+
+    with mock.patch.dict(os.environ, _claims_env(tmp)):
+        os.environ.pop("NUCLEOS_RUN_ID", None)
+        with mock.patch.object(hook, "read_control_token", return_value=("tok", None)):
+            with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                answer = hook.claims_exchange(payload, now=now, **kwargs)
+    return answer, seen
+
+
+def claims_exchange_cases():
+    cases = []
+    payload = {"session_id": "s1", "cwd": "/work/repo", "tool_name": "Read", "tool_input": {}}
+    ok = {"registered": True, "project_id": "alpha", "notices": [], "incidents": []}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        answer, seen = _exchange(tmp, payload, [ok])  # now=1000: next = 1020
+        good = answer == ok and len(seen) == 1 and seen[0][0].endswith("/tasks/session")
+        good = good and seen[0][1] == {"session_id": "s1", "cwd": "/work/repo", "want_incidents": False}
+        cases.append(("a tool call registers the session with (session_id, cwd)", "" if good else f"{answer!r} {seen!r}"))
+        cases.append(("the registration waits 2 seconds at most", "" if seen and seen[0][2] == 2 else f"timeout {seen[0][2]!r}"))
+
+        answer, seen = _exchange(tmp, payload, [ok], now=1005.0)
+        cases.append(("a second call within 20 s sends nothing", "" if answer is None and not seen else f"{seen!r}"))
+        answer, seen = _exchange(tmp, payload, [ok], now=1005.0, force=True)  # next = 1025
+        cases.append(("force skips the rate limit (task tools, prompts)", "" if answer == ok and len(seen) == 1 else f"{seen!r}"))
+        answer, seen = _exchange(tmp, payload, [ok], now=1021.0)
+        cases.append(("a forced call restarts the 20 s window", "" if answer is None and not seen else f"{seen!r}"))
+        answer, seen = _exchange(tmp, payload, [ok], now=1026.0)
+        cases.append(("after 20 s the next call registers again (a long tool call is covered by its PostToolUse)", "" if len(seen) == 1 else f"{seen!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        answer, seen = _exchange(tmp, payload, [urllib.error.URLError("down")])
+        cases.append(("a dead daemon is silent", "" if answer is None else f"{answer!r}"))
+        answer, seen = _exchange(tmp, payload, [ok], now=1030.0)
+        cases.append(("and is not retried for a minute", "" if answer is None and not seen else f"{seen!r}"))
+        answer, seen = _exchange(tmp, payload, [ok], now=1061.0)
+        cases.append(("then it is tried again", "" if answer == ok else f"{answer!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        away = {"registered": False}
+        _exchange(tmp, payload, [away])
+        answer, seen = _exchange(tmp, payload, [ok], now=1200.0)
+        cases.append(("an unregistered project is not asked again for 5 minutes", "" if answer is None and not seen else f"{seen!r}"))
+        answer, seen = _exchange(tmp, payload, [ok], now=1301.0)
+        cases.append(("and is asked again after", "" if answer == ok else f"{answer!r} {seen!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        nested = os.path.join(tmp, "not", "there", "yet")
+        answer, seen = _exchange(nested, payload, [ok])
+        written = os.path.join(nested, "s1.json")
+        cases.append(("the state directory is created when it does not exist (like the pending one)", "" if os.path.isfile(written) else f"no {written}"))
+        again, seen = _exchange(nested, payload, [ok], now=1005.0)
+        cases.append(("and the state it wrote is what rate-limits the next call", "" if again is None and not seen else f"{seen!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, bad in (("no session id", {"cwd": "/w"}), ("an unsafe session id", {"session_id": "../x", "cwd": "/w"}), ("no cwd", {"session_id": "s1"})):
+            answer, seen = _exchange(tmp, bad, [ok])
+            cases.append((f"{label}: nothing is sent", "" if answer is None and not seen else f"{seen!r}"))
+        with mock.patch.dict(os.environ, _claims_env(tmp, NUCLEOS_RUN_ID="7")):
+            with mock.patch.object(hook.urllib.request, "urlopen", side_effect=AssertionError("a run is not a session")):
+                got = hook.claims_exchange(payload, now=1000.0)
+        cases.append(("a governed run never registers as a session", "" if got is None else f"{got!r}"))
+
+    # The switch is "on" for any NON-EMPTY value, "0" included; only empty (what every test here
+    # sets) leaves claims running.
+    for value in ("1", "0", "off"):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, _claims_env(tmp, NUCLEOS_CLAIMS_OFF=value)):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=AssertionError("switched off")):
+                    got = hook.claims_exchange(payload, now=1000.0)
+            cases.append((f"NUCLEOS_CLAIMS_OFF={value!r} switches claims off", "" if got is None else f"{got!r}"))
+    with tempfile.TemporaryDirectory() as tmp:
+        answer, seen = _exchange(tmp, payload, [ok])
+        cases.append(("NUCLEOS_CLAIMS_OFF empty leaves claims on", "" if answer == ok else f"{answer!r}"))
+    return cases
+
+
+def _run_claims_main(tmp, payload, replies):
+    """`main()` as an interactive session with claims on; returns `(exit_code, printed, requests)`."""
+    seen, queue, captured, code = [], list(replies), io.StringIO(), "no exit"
+
+    def urlopen(request, timeout=None):
+        seen.append(request.full_url)
+        reply = queue.pop(0) if queue else {"registered": False}
+        if isinstance(reply, Exception):
+            raise reply
+        return _Reply(reply)
+
+    with mock.patch.dict(os.environ, _claims_env(tmp)):
+        os.environ.pop("NUCLEOS_RUN_ID", None)
+        with mock.patch.object(hook, "read_control_token", return_value=("tok", None)):
+            with mock.patch.object(hook, "control_token", return_value="tok"):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                    with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                        with mock.patch("sys.stdout", captured):
+                            try:
+                                hook.main()
+                            except SystemExit as exit_:
+                                code = exit_.code
+    return code, captured.getvalue(), seen
+
+
+def claims_tool_call_cases():
+    cases = []
+    ok = {"registered": True, "project_id": "alpha", "notices": [], "incidents": []}
+    base = {"hook_event_name": "PreToolUse", "session_id": "s1", "cwd": "/work/repo"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = dict(base, tool_name="mcp__nucleos__task_claim", tool_input={"key": "master-red", "session_id": "forged"})
+        code, printed, seen = _run_claims_main(tmp, payload, [ok])
+        try:
+            special = json.loads(printed)["hookSpecificOutput"]
+            good = (
+                code in (0, None)
+                and special["permissionDecision"] == "allow"
+                and special["updatedInput"] == {"key": "master-red", "session_id": "s1"}
+                and seen[0].endswith("/tasks/session")
+            )
+            failure = "" if good else f"{code!r} {printed!r} {seen!r}"
+        except Exception as exc:  # noqa: BLE001
+            failure = f"unparseable {printed!r}: {exc!r}"
+        cases.append(("a task tool is allowed with the session id stamped over whatever the model sent, after the session is registered", failure))
+
+    # A fresh state directory per tool: a shared one would rate-limit every call after the first,
+    # and the loop would prove nothing about the later names. `exercised` checks the call really
+    # reached the claims step (the notice came through), so a silent pass cannot hide a skipped case.
+    for tool in ("mcp__nucleos__task_claimx", "mcp__other__task_claim", "mcp__nucleos__verify", "task_claim", "Bash"):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = dict(base, tool_name=tool, tool_input={"command": "ls"} if tool == "Bash" else {})
+            code, printed, seen = _run_claims_main(tmp, payload, [dict(ok, notices=["hello"])])
+            special = json.loads(printed)["hookSpecificOutput"] if printed.strip() else {}
+            bad = "permissionDecision" in special or "updatedInput" in special
+            exercised = bool(seen) and "hello" in special.get("additionalContext", "")
+            if bad:
+                failure = f"approved: {printed!r}"
+            elif not exercised:
+                failure = f"the case did not reach the claims step: {printed!r} {seen!r}"
+            else:
+                failure = ""
+            cases.append((f"{tool} is never approved or rewritten: only the four exact task tools are", failure))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = dict(base, tool_name="mcp__nucleos__task_list", tool_input={})
+        code, printed, _ = _run_claims_main(tmp, payload, [dict(ok, notices=["Your claim on #3 is gone"])])
+        special = json.loads(printed)["hookSpecificOutput"]
+        good = special["permissionDecision"] == "allow" and "#3" in special.get("additionalContext", "")
+        cases.append(("a notice rides on the same answer as the stamp", "" if good else f"{printed!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = dict(base, tool_name="mcp__nucleos__task_claim", tool_input={"key": "master-red"})
+        code, printed, _ = _run_claims_main(tmp, payload, [urllib.error.URLError("down")])
+        special = json.loads(printed)["hookSpecificOutput"]
+        good = special["updatedInput"]["session_id"] == "s1"
+        cases.append(("with the daemon down the stamp still goes: the tool call fails on its own, the hook never blocks", "" if good else f"{printed!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = dict(base, tool_name="mcp__nucleos__task_claim", tool_input={}, session_id="../x")
+        code, printed, _ = _run_claims_main(tmp, payload, [ok])
+        cases.append(("an unsafe session id is not stamped", "" if not printed.strip() else f"{printed!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = dict(base, tool_name="Read", tool_input={"file_path": "a"})
+        code, printed, _ = _run_claims_main(tmp, payload, [dict(ok, notices=["Incident #4 `master-red` was closed"])])
+        special = json.loads(printed)["hookSpecificOutput"]
+        good = "#4" in special["additionalContext"] and special["hookEventName"] == "PreToolUse" and "permissionDecision" not in special
+        cases.append(("an ordinary tool call only gets context", "" if good else f"{printed!r}"))
+
+        post = dict(base, hook_event_name="PostToolUse", tool_name="Read", tool_input={}, tool_response={})
+        code, printed, seen = _run_claims_main(tmp, post, [dict(ok, notices=["Your claim on #3 is gone"])])
+        # (state dir shared with the previous call: this one is within 20 s of it)
+        cases.append(("a PostToolUse inside the rate limit stays silent", "" if not printed.strip() and not seen else f"{printed!r} {seen!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        post = dict(base, hook_event_name="PostToolUse", tool_name="Read", tool_input={}, tool_response={})
+        code, printed, seen = _run_claims_main(tmp, post, [dict(ok, notices=["Your claim on #3 is gone"])])
+        special = json.loads(printed)["hookSpecificOutput"]
+        good = special["hookEventName"] == "PostToolUse" and "#3" in special["additionalContext"] and seen == ["http://127.0.0.1:1/tasks/session"]
+        cases.append(("a PostToolUse registers the session and injects the notice, without a decision", "" if good and "permissionDecision" not in special else f"{printed!r} {seen!r}"))
+
+    rust = os.path.join(ROOT, "core", "src", "mcp_tools", "boxes.rs")
+    try:
+        with open(rust, encoding="utf-8") as handle:
+            listed = re.search(r"TASK_TOOL_NAMES: \[&str; 4\] = \[([^\]]*)\]", handle.read())
+    except OSError:
+        listed = None
+    want = sorted(f"mcp__nucleos__{n}" for n in re.findall(r'"(task_[a-z]+)"', listed.group(1))) if listed else []
+    cases.append(("TASK_TOOLS equals mcp_tools::TASK_TOOL_NAMES", "" if sorted(hook.TASK_TOOLS) == want else f"{sorted(hook.TASK_TOOLS)!r} vs {want!r}"))
+    return cases
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -1320,6 +1531,8 @@ def main() -> int:
         + admit_cases()
         + one_source_cases()
         + session_start_cases()
+        + claims_exchange_cases()
+        + claims_tool_call_cases()
     ):
         total += 1
         if failure:

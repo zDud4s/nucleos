@@ -4,8 +4,9 @@
 Registered under seven events (`autopilot.rs`'s `wire_classifier_hook`), told apart by the
 payload's own `hook_event_name` rather than by anything the invocation says, because the same
 command is wired to all seven. `Stop`, `SubagentStop`, `UserPromptSubmit` and `SessionStart` (stdout JSON such as
-`hookSpecificOutput.additionalContext` is printed verbatim) only forward to the
-hooks a pinned workflow bundle declares (`bundle_hooks`), and fail open; the three tool events
+`hookSpecificOutput.additionalContext` is printed verbatim) forward to the
+hooks a pinned workflow bundle declares (`bundle_hooks`), and fail open; the last two also
+carry the claims context of the session (`claims_context`); the three tool events
 are what follows:
 
 A run (NUCLEOS_RUN_ID present) gets the full safety gate on `PreToolUse`: allows emit the
@@ -15,11 +16,16 @@ for the daemon's admission to run (`admit_heavy`), the one leg here that fails o
 
 An interactive session gets one narrow question instead: is this a git operation the
 VCS queue performs? If so it is queued and this call is refused; otherwise this hook
-says nothing at all. **It can refuse but it can never approve** — that asymmetry is what
+says nothing at all. **It can refuse but it can never approve, with one exception**:
+a call to one of the four `mcp__nucleos__task_*` tools is allowed, only to stamp the session id
+into its input (see `interactive_session`); every other tool, MCP server or near-miss name gets
+no decision at all. That asymmetry is what
 makes it safe to speak here, where the old version had to stay silent. Registered
 repo-wide, an allow would auto-approve a person's own tools; a refusal grants nothing.
 This branch may also add context (`additionalContext`) telling the agent that a vcs request
-it was refused for has settled, once per request; that carries no permission decision either,
+it was refused for has settled, once per request; so does the claims context (`claims_exchange`:
+a 2 s, rate-limited, fail-open registration of the session with the daemon, and the notices it
+answers); that carries no permission decision either,
 and it is silent on every error.
 
 That silence was a real hole rather than a conservative default. The queue exists to
@@ -31,7 +37,8 @@ merged, with no hook, no proposal and no row.
 never block anything: by the time either fires the tool has already run (or already failed), so
 a refusal here would be a barrier with nothing left to stop — an expensive warning, not a
 protection. `report_outcome` is therefore silent on every failure of its own: an unreachable
-daemon, a missing token, a payload it cannot use. Never `deny()`, never `approve()`.
+daemon, a missing token, a payload it cannot use. Never `deny()`, never `approve()`. They also
+carry the claims notices, as context only.
 
 All malformed-input, configuration, and daemon errors still fail closed ON THE PreToolUse PATH —
 the one path where failing open would matter.
@@ -59,6 +66,22 @@ PENDING_DIR_ENV = "NUCLEOS_VCS_PENDING_DIR"
 PENDING_TTL_SECONDS = 30 * 60
 PENDING_RECHECK_SECONDS = 15
 SESSION_ID_SHAPE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+# Task claims (spec 2026-10-22). An interactive session tells the daemon it is alive so that the
+# claims it holds stay alive, and hears back what happened to them. A run never does this: it is a
+# holder by its own id, which the daemon reads off its key.
+CLAIMS_DIR_ENV = "NUCLEOS_CLAIMS_DIR"
+# Switched off by ANY non-empty value ("1", "0" and "off" alike); only unset or empty leaves it on.
+CLAIMS_OFF_ENV = "NUCLEOS_CLAIMS_OFF"
+# Never more than this: the registration is its OWN request, apart from the git path (30 s, fails
+# closed). A claim must never be able to slow a tool call or stop one.
+CLAIMS_TIMEOUT_SECONDS = 2
+# The token costs a git call and a process spawn when it is not in the environment, and this hook
+# runs before and after every tool call. The lease is 30 minutes, so one registration every 20
+# seconds keeps it far from lapsing and a tool call longer than that is caught by its PostToolUse.
+CLAIMS_INTERVAL_SECONDS = 20
+CLAIMS_ERROR_BACKOFF_SECONDS = 60
+CLAIMS_UNREGISTERED_BACKOFF_SECONDS = 300
 
 # A deliberately over-broad local filter, and it must never be the authority. Its only job is
 # to keep the fast path free: this hook runs in front of every tool call in every editor
@@ -169,7 +192,7 @@ def _verb_in(tokens) -> str:
     return ""
 
 
-def approve(reason: str = "autopilot: allowed", updated_input=None) -> None:
+def approve(reason: str = "autopilot: allowed", updated_input=None, context=None) -> None:
     """Allows the tool call, optionally rewriting its input.
 
     A rewrite (`updatedInput`) rides only on an allow, and a malformed one (anything but
@@ -182,6 +205,8 @@ def approve(reason: str = "autopilot: allowed", updated_input=None) -> None:
     }
     if isinstance(updated_input, dict):
         output["updatedInput"] = updated_input
+    if isinstance(context, str) and context:
+        output["additionalContext"] = context
     print(json.dumps({"hookSpecificOutput": output}))
     sys.exit(0)
 
@@ -536,11 +561,153 @@ def settled_notice(payload, token=None):
         return ""
 
 
-def tell(text: str) -> None:
+def claims_off():
+    return bool(os.environ.get(CLAIMS_OFF_ENV))
+
+
+def claims_state_path(session_id):
+    """Where this session's claims state is kept, or None for an unsafe id."""
+    try:
+        if not isinstance(session_id, str) or not SESSION_ID_SHAPE.fullmatch(session_id):
+            return None
+        base = os.environ.get(CLAIMS_DIR_ENV) or os.path.join(
+            tempfile.gettempdir(), "nucleos-claims"
+        )
+        return os.path.join(base, f"{session_id}.json")
+    except Exception:
+        return None
+
+
+def _claims_state(path):
+    """The state file as a dict; `{}` when it is missing or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_claims_state(path, state):
+    """Writes the state through a temp file; silent on every error. Never holds the token."""
+    try:
+        # Like `_store_pending`: the directory does not exist the first time.
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _number(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return 0
+
+
+def claims_exchange(payload, want_incidents=False, force=False, now=None):
+    """Registers this session with the daemon; returns the daemon's answer or None. Silent on every error.
+
+    None means "nothing to say": switched off, a governed run, an id or cwd it cannot use, the rate
+    limit, a daemon that is down (retried after a minute), or a project that is not registered
+    (answered, but asked again only after five). Nothing here can raise, deny or approve.
+    """
+    try:
+        if claims_off() or os.environ.get("NUCLEOS_RUN_ID") is not None:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        session_id = payload.get("session_id")
+        cwd = payload.get("cwd")
+        path = claims_state_path(session_id)
+        if path is None or not isinstance(cwd, str) or not cwd.strip():
+            return None
+        now = time.time() if now is None else now
+        state = _claims_state(path)
+        if not force and now < _number(state.get("next")):
+            return None
+
+        token, _why = read_control_token(cwd, 2, 3)
+        if not token:
+            state["next"] = now + CLAIMS_ERROR_BACKOFF_SECONDS
+            _save_claims_state(path, state)
+            return None
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        request = urllib.request.Request(
+            f"{daemon_url}/tasks/session",
+            data=json.dumps(
+                {"session_id": session_id, "cwd": cwd, "want_incidents": bool(want_incidents)}
+            ).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=CLAIMS_TIMEOUT_SECONDS) as response:
+                answer = json.loads(response.read())
+        except Exception:
+            answer = None
+        if not isinstance(answer, dict):
+            state["next"] = now + CLAIMS_ERROR_BACKOFF_SECONDS
+            _save_claims_state(path, state)
+            return None
+        if answer.get("registered") is not True:
+            state["next"] = now + CLAIMS_UNREGISTERED_BACKOFF_SECONDS
+        else:
+            state["next"] = now + CLAIMS_INTERVAL_SECONDS
+        _save_claims_state(path, state)
+        return answer
+    except Exception:
+        return None
+
+
+# Equals mcp_tools::TASK_TOOL_NAMES behind the server prefix; a test compares the two.
+TASK_TOOLS = tuple(f"mcp__nucleos__task_{name}" for name in ("list", "claim", "release", "done"))
+INCIDENTS_HEADER = (
+    "Live incidents in this project. Before fixing anything outside your own task, claim it with "
+    "mcp__nucleos__task_claim, and if you do not win, leave it:\n"
+)
+
+
+def claims_context(payload, want_incidents=False, force=False, always_list=False):
+    """The text this session should read before its next step, or "". Silent on every error.
+
+    Notices (a claim lost, an incident closed) come from the daemon already worded. Incidents are
+    listed only when asked, and only when the list changed since this session last saw it (or
+    `always_list`, after a compaction dropped it from the context).
+    """
+    try:
+        answer = claims_exchange(payload, want_incidents=want_incidents, force=force)
+        if not isinstance(answer, dict) or answer.get("registered") is not True:
+            return ""
+        notices = answer.get("notices")
+        parts = [n for n in (notices if isinstance(notices, list) else []) if isinstance(n, str) and n.strip()]
+        if want_incidents:
+            raw = answer.get("incidents")
+            incidents = [i for i in (raw if isinstance(raw, list) else []) if isinstance(i, str) and i.strip()]
+            digest = "\n".join(incidents)
+            path = claims_state_path(payload.get("session_id"))
+            state = _claims_state(path) if path else {}
+            if incidents and (always_list or digest != state.get("incidents")):
+                parts.append(INCIDENTS_HEADER + "\n".join(f"- {line}" for line in incidents))
+            if path and state.get("incidents") != digest:
+                # Also stored when the list went empty, so that the same list coming back is news.
+                state["incidents"] = digest
+                _save_claims_state(path, state)
+        return "\n\n".join(parts)
+    except Exception:
+        return ""
+
+
+def tell(text: str, event: str = "PreToolUse") -> None:
     """Adds context to the next turn. Carries no permission decision, so it grants nothing."""
     print(
         json.dumps(
-            {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+            {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
         )
     )
     sys.exit(0)
@@ -732,10 +899,34 @@ def verify_hint(payload: dict, now=None) -> str:
 
 
 def interactive_session(payload: dict) -> None:
-    """A session a person opened. Refuses queue operations; may add context, never approves.
+    """A session a person opened. Refuses queue operations; may add context. The one thing it ever
+    approves is a call to one of the four `mcp__nucleos__task_*` tools, to stamp the session id.
 
     The non-git branch may also add the verify hint (context only, never a decision).
     """
+    tool = payload.get("tool_name")
+    session_id = payload.get("session_id")
+    tool_input = payload.get("tool_input")
+    stamping = (
+        tool in TASK_TOOLS
+        and isinstance(session_id, str)
+        and SESSION_ID_SHAPE.fullmatch(session_id) is not None
+        and isinstance(tool_input, dict)
+    )
+    # A task tool forces the registration: the daemon only believes a session id it has seen.
+    claims = claims_context(payload, force=stamping)
+    if stamping:
+        # The ONE approval this hook ever gives, and the reason it is safe to give: the four task
+        # tools only write claim rows in the daemon's own table (idempotent, no effect outside it).
+        # The owner accepted this on 2026-10-22. The stamp overwrites whatever the model put in
+        # `session_id`, so a session cannot speak for another. The residual trust is the server
+        # NAME: `mcp__nucleos__` is whatever this session registered as `nucleos`, the same trust
+        # `is_job_node_tool` places in it on the daemon side.
+        approve(
+            "claims: task tools only write claim rows",
+            {**tool_input, "session_id": session_id},
+            claims or None,
+        )
     command = (payload.get("tool_input") or {}).get("command")
     if (
         payload.get("tool_name") not in ("Bash", "PowerShell")
@@ -744,7 +935,7 @@ def interactive_session(payload: dict) -> None:
     ):
         notice = settled_notice(payload)
         hint = verify_hint(payload)
-        text = "\n\n".join(t for t in (notice, hint) if t)
+        text = "\n\n".join(t for t in (claims, notice, hint) if t)
         if text:
             tell(text)
         no_opinion()
@@ -786,7 +977,7 @@ def interactive_session(payload: dict) -> None:
         and not isinstance(request_id, bool)
     ):
         remember_pending(payload.get("session_id"), request_id)
-    notice = settled_notice(payload, token)
+    notice = "\n\n".join(t for t in (claims, settled_notice(payload, token)) if t)
     if decision.get("decision") == "allow":
         # Never re-emitted as an approval. The daemon means "not mine to govern", and the
         # session's ordinary permissions decide from here.
@@ -894,6 +1085,10 @@ def main() -> None:
     event = payload.get("hook_event_name") if payload is not None else None
     if event in ("PostToolUse", "PostToolUseFailure"):
         report_outcome(payload)
+        if os.environ.get("NUCLEOS_RUN_ID") is None:
+            text = claims_context(payload)
+            if text:
+                tell(text, event)
         return
 
     # Before the run branch, which would otherwise send a `Stop` to the tool gate: these events
