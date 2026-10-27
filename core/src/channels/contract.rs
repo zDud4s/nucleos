@@ -16,7 +16,7 @@ pub use decode::*;
 mod conformance;
 
 /// Where the shared fixtures live, relative to the `nucleos-core` package root.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 pub const FIXTURES_REL: &str = "../sidecars/lib/channelkit/contract/fixtures";
 
 /// The fixture directory of the checkout this test binary was compiled in.

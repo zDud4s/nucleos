@@ -15,6 +15,7 @@ import { select } from "d3-selection";
 import type { GEdgeType, GModel, GNode } from "./graph-types";
 import { colorToken, neighbours, nodeRadius } from "./graph-util";
 import { MARK_PATHS, markKey } from "./marks";
+import { fitTransform } from "./fit";
 import { hitTest, labelVisible, type Placed } from "./hit-test";
 import "./force-graph.css";
 
@@ -41,6 +42,8 @@ export interface ForceGraphProps {
   compact?: boolean;
   /** CSS pixels. Default 560, or 220 when compact. */
   height?: number;
+  /** CSS pixels at the canvas's right edge that an overlay (the drawer) covers; the fit avoids them. */
+  fitRight?: number;
   /**
    * Called after every frame with each node as DRAWN — screen position in CSS pixels relative to
    * the canvas, and on-screen radius. A test hook (and the CSP surface's): it is how a caller
@@ -57,6 +60,7 @@ interface Engine {
   redraw(): void;
   resize(): void;
   fit(): void;
+  refit(): void;
   zoomBy(factor: number): void;
 }
 
@@ -104,6 +108,8 @@ const FALLBACK_WIDTH = 600;
 /** Fit the view once the layout has had this many ticks to settle. */
 const FIT_AFTER_TICKS = 120;
 const LABEL_MAX = 40;
+/** A label is drawn to the right of its node and is not in the bounds; the fit leaves room for it. */
+const LABEL_ROOM = 120;
 /** The local graph sits in a 23rem panel: a 40-character label ran off its edge. */
 const LOCAL_LABEL_MAX = 22;
 
@@ -115,16 +121,16 @@ function prefersReducedMotion(): boolean {
   return typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
-export function ForceGraph({ model, selected, onSelect, compact = false, height, onLayout }: ForceGraphProps) {
+export function ForceGraph({ model, selected, onSelect, compact = false, height, fitRight = 0, onLayout }: ForceGraphProps) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<Engine | null>(null);
 
   // The engine lives outside React's render cycle; it reads the latest props through these.
   const resolvedHeight = height ?? (compact ? 220 : 560);
-  const live = useRef({ model, selected, onSelect, compact, height: resolvedHeight, onLayout });
+  const live = useRef({ model, selected, onSelect, compact, height: resolvedHeight, fitRight, onLayout });
   useLayoutEffect(() => {
-    live.current = { model, selected, onSelect, compact, height: resolvedHeight, onLayout };
+    live.current = { model, selected, onSelect, compact, height: resolvedHeight, fitRight, onLayout };
   });
 
   useEffect(() => {
@@ -138,7 +144,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
     let height = 0;
     let dpr = 1;
     let transform: ZoomTransform = zoomIdentity;
-    let centred = false;
+    let userMoved = false;
     let nodes: SimNode[] = [];
     let links: SimLink[] = [];
     let byId = new Map<string, SimNode>();
@@ -248,7 +254,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         const r = nodeRadius(n.degree);
         const fill = colour(colorToken(n));
         c.globalAlpha = lit && !lit.has(n.id) ? 0.15 : 1;
-        // The node's silhouette is its identity (`marks.tsx`); one neutral fill serves them all.
+        // The silhouette (`marks.tsx`) and the kind's hue (`colorToken`, cached per frame) together.
         const shape = markPath(n);
         if (n.missing) {
           c.setLineDash([3 / k, 2 / k]);
@@ -314,33 +320,38 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         maxX = Math.max(maxX, (n.x ?? 0) + r);
         maxY = Math.max(maxY, (n.y ?? 0) + r);
       }
-      const pad = live.current.compact ? 12 : 32;
-      const fitK = Math.min(
-        (width - 2 * pad) / Math.max(maxX - minX, 1),
-        (height - 2 * pad) / Math.max(maxY - minY, 1),
-      );
-      const k = Math.max(0.2, Math.min(live.current.compact ? 2 : 1.6, fitK));
-      const cx = (minX + maxX) / 2;
-      const cy = (minY + maxY) / 2;
+      // The overlay toolbar (top-left) and legend (bottom-left) sit inside the generous full-bleed
+      // padding; an open drawer takes its width off the right.
+      const pad = live.current.compact ? 12 : 56;
+      const insets = { top: 0, bottom: 0, left: 0, right: live.current.compact ? 0 : live.current.fitRight + LABEL_ROOM };
       canvasSel.call(
         zoomBehaviour.transform,
-        zoomIdentity.translate(width / 2, height / 2).scale(k).translate(-cx, -cy),
+        fitTransform({ minX, minY, maxX, maxY }, width, height, insets, pad, 0.2, 2),
       );
+    };
+
+    /** The Fit button and the settle fit: back to automatic, so a resize keeps the graph fitted. */
+    const autoFit = () => {
+      userMoved = false;
+      fit();
+    };
+    const markSettled = () => {
+      wrap.dataset.settled = "true";
     };
 
     sim.on("tick", () => {
       ticks += 1;
       if (!fitted && ticks >= FIT_AFTER_TICKS) {
         fitted = true;
-        fit();
+        if (!userMoved) fit();
       }
       requestDraw();
     });
     sim.on("end", () => {
-      if (!fitted) {
-        fitted = true;
-        fit();
-      }
+      if (!fitted) fitted = true;
+      // The layout is at rest: fit once more on the final positions.
+      if (!userMoved) fit();
+      markSettled();
       requestDraw();
     });
 
@@ -379,6 +390,8 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
       })
       .on("zoom", (event: { transform: ZoomTransform }) => {
         transform = event.transform;
+        // A pointer gesture has a source event; our own programmatic fits do not.
+        if ((event as { sourceEvent?: unknown }).sourceEvent) userMoved = true;
         requestDraw();
       });
 
@@ -413,9 +426,11 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
         [0, 0],
         [w, h],
       ]);
-      if (!centred) {
-        centred = true;
-        canvasSel.call(zoomBehaviour.transform, zoomIdentity.translate(w / 2, h / 2));
+      // Keep the view centred on the new size; once the layout has been fitted, refit to it
+      // unless the user has panned or zoomed by hand.
+      if (!userMoved) {
+        if (fitted) fit();
+        else canvasSel.call(zoomBehaviour.transform, zoomIdentity.translate(w / 2, h / 2));
       }
       requestDraw();
     };
@@ -441,6 +456,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
           nodeKey = key;
           ticks = 0;
           fitted = false;
+          delete wrap.dataset.settled;
         }
         if (hovered && !byId.has(hovered)) hovered = null;
         lit = hovered ? neighbours(next, hovered, 1) : null;
@@ -456,6 +472,7 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
           sim.tick(Math.ceil(Math.log(sim.alphaMin() / 0.5) / Math.log(1 - sim.alphaDecay())));
           fitted = true;
           fit();
+          markSettled();
         } else {
           sim.alpha(0.5).restart();
         }
@@ -463,8 +480,12 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
       },
       redraw: requestDraw,
       resize,
-      fit,
+      fit: autoFit,
+      refit() {
+        if (fitted && !userMoved) fit();
+      },
       zoomBy(factor) {
+        userMoved = true;
         canvasSel.call(zoomBehaviour.scaleBy, factor, [width / 2, height / 2]);
       },
     };
@@ -495,6 +516,10 @@ export function ForceGraph({ model, selected, onSelect, compact = false, height,
   useEffect(() => {
     engineRef.current?.resize();
   }, [resolvedHeight]);
+
+  useEffect(() => {
+    engineRef.current?.refit();
+  }, [fitRight]);
 
   const hintId = useId();
   return (

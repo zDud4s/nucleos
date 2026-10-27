@@ -1114,7 +1114,7 @@ const PROJECT_KNOWLEDGE: Known[] = [
 ];
 
 export const OPEN_CAPTURES: CaptureRequest[] = [
-  { job_id: 7, project_id: "alpha", causes: ["gate"], prompt_text: "Why did the release gate fail twice on Friday? Anything you know that the logs do not say.", state: "open", deadline: ago(-6 * HOUR), seconds_left: 6 * 3600, note_id: null, created_at: ago(40 * MINUTE), closed_at: null },
+  { job_id: 7, project_id: "alpha", causes: ["gate"], prompt_text: "Why did the release gate fail twice on Friday? Anything you know that the logs do not say.", state: "open", deadline: ago(-6 * HOUR), seconds_left: 6 * 3600, note_id: null, created_at: ago(40 * MINUTE), closed_at: null, digest_id: 1 },
 ];
 
 /*
@@ -3750,7 +3750,8 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;
   if (path === "/config/distiller" && init?.method === undefined) return { model: "cloud" };
-  if (path === "/config/capture-wait" && init?.method === undefined) return { minutes: 120 };
+  if (path === "/config/capture" && init?.method === undefined) return { answer_days: 5, digest_hour: 18 };
+  if (path === "/capture-digests") return [];
   if (path === "/config/embedding" && init?.method === undefined) return { model: "nomic-embed-text" };
   if (path === "/config/secrets" && init?.method === undefined) return { secrets: MACHINE_SECRETS };
   if (route === "/notifications/policy") {

@@ -209,6 +209,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // Awaiting-You Amber: unlike a parked job, this line IS a question put to the reader — the
     // distiller holds the job until the owner answers, dismisses or the wait runs out.
     capture_requested: { tone: "pending", label: "asked of you" },
+    capture_digest: { tone: "pending", label: "questions for you" },
     job_finished: { tone: "info", label: "job finished" },
     job_failed: { tone: "danger", label: "job failed" },
     job_stopped: { tone: "off", label: "job stopped" },
