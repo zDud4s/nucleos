@@ -70,7 +70,7 @@ the contract, not a snapshot.
 | `execution/runs/api.rs` | The `/runs` request and response shapes, search, and the create/get/tail handlers. |
 | `execution/runs/create.rs` | Creating a run row: the entry points for each kind of run, provisioning, and `create_run_with`. |
 | `execution/runs/handoff.rs` | Handing a run over to a successor when its context fills: the handoff prompt, the successor row and the gate before it. |
-| `execution/runs/lifecycle.rs` | The end of a run: stop decisions, termination, cancel, orphan reconciliation at startup and transcript retention. |
+| `execution/runs/lifecycle.rs` | The end of a run: stop decisions, termination, cancel, orphan reconciliation at startup and transcript retention (whose consolidation sweep is the `Consolidation` hook the daemon passes in). |
 | `execution/runs/policy.rs` | What a run is allowed: its environment, job-node MCP token, untrusted-context marks, tool policy and timeouts. |
 | `execution/runs/resume.rs` | Resuming a run: an approved resume, a correction, and continuing a paused run. |
 | `execution/runs/spawn.rs` | Spawning a run's process: registration, the event stream, the context-fill mirror, and `spawn_run`. |
@@ -136,6 +136,7 @@ the contract, not a snapshot.
 | `http/chat_edit.rs` | Creating and editing a conversation and its groups (`POST /assistant/chats`, `PATCH /assistant/chats/{chat_id}`, `/assistant/chat-groups*`). |
 | `http/chat_turns.rs` | Sending a message and following its turn (`/assistant/message`, `/assistant/turns/*`, `/assistant/{turn_id}/live*`, relay and forward). |
 | `http/chats.rs` | Reading a conversation and the state around it (`/assistant/chats*`). |
+| `http/chats/command.rs` | `POST /assistant/chats/{chat_id}/command`: runs a typed slash command, answering a card, a control to open, or a prompt sent through `send_expanded_or_queue`. |
 | `http/commands.rs` | A project's commands, rules and limits (`/projects/{id}/commands*`, `/rules`, `/shell-rules`, `/wip-limit`). |
 | `http/common.rs` | Query shapes, resolvers and refusals shared by more than one route family. |
 | `http/email.rs` | Mail, contacts and calendar (`/email/*`, `/contacts/*`, `/calendar/*`). |
@@ -159,7 +160,7 @@ the contract, not a snapshot.
 | `http/team.rs` | Council and teams (`/council/*`, `/teams/*`, `/team-*`). |
 | `http/themes.rs` | Themes (`/themes/*`, owner-only, spec `2026-10-22-segundo-cerebro-abstrato` section 6): list, detail with the members resolved, accept, refuse, rename, merge, add and exclude a member. One of the three files allowed to name the theme tables. |
 | `http/workflows.rs` | Workflows (`/workflows/*`, `/projects/{id}/workflows/*`). |
-| `app.rs` | Root of `nucleos-app` (`crates/nucleos-app`, sources stay in `core/src`): the top modules nothing in `nucleos-core` reads — `hooks`, `fleet`, `devtime`, `analytics`, `analytics_pipeline`, `price_refresh`, `verify_cli`, `presets` (split out 2026-10-22); `assistant` and `channels::{commands, ingest, media}` (2026-10-22, phase 3b; `app.rs`'s `channels` re-exports the library's and adds those three). Depends on `nucleos-core`; the daemon binary depends on both. |
+| `app.rs` | Root of `nucleos-app` (`crates/nucleos-app`, sources stay in `core/src`): the top modules nothing in `nucleos-core` reads — `hooks`, `fleet`, `devtime`, `analytics`, `analytics_pipeline`, `price_refresh`, `verify_cli`, `presets` (split out 2026-10-22); `assistant` and `channels::{commands, ingest, media}` (2026-10-22, phase 3b; `app.rs`'s `channels` re-exports the library's and adds those three); `consolidate` (phase 3c; the retention loop reaches it through `execution::runs::Consolidation`, which `main.rs` hands in). Depends on `nucleos-core`; the daemon binary depends on both. |
 | `lib.rs` | The library crate root: declares every module except the binary's own (`main`, `http`, `cli`, `startup`) and the ones in `nucleos-app` (the bottom ones are re-exported from `nucleos-base`), all `pub`, so the binary (`main.rs` + `http.rs`, `cli.rs`, `startup.rs`) compiles separately and an edit to `http.rs` recompiles only the binary. The `testkit` feature exposes test fixtures to the binary's tests; Cargo turns it on for test builds through the self dev-dependency in `Cargo.toml`. |
 | `crates/nucleos-base/src/lib.rs` | Root of `nucleos-base`, the bottom crate: storage (with `MIGRATOR`, which embeds `core/migrations`), the test database, process/gate plumbing and the other modules that name nothing above them. `nucleos-core`'s `lib.rs` re-exports each one (`pub use nucleos_base::storage;`), so `crate::storage::...` is unchanged there. Its `testkit` feature exposes fixtures to the crates above and is enabled by theirs. |
 | `door.rs` | The few pieces of the HTTP door the library itself calls or tests against, moved out of `http.rs` by the lib/bin split: `uncancellable`, `files_root`, `refusal`, `sending_run_id_of`, and the knowledge door (`post_knowledge`, `recall_knowledge`, `post_finding`) that `mcp_tools`' and `assistant`'s tests drive end to end. `http.rs` routes to them; nothing here is new. |
@@ -294,6 +295,11 @@ the contract, not a snapshot.
 | `assistant/rotation.rs` | Root-chat rotation: past a soft context threshold, a shell chat whose root node has no waiting child is let go of and its next turn starts from a stored, redacted rehydration prefix (`root_rotations`, migration 0217); `DaemonRootNodes` reads the tree from `work_nodes`. |
 | `assistant/send.rs` | Message origins, sending, queued delivery, images, and history handover. |
 | `assistant/serve.rs` | Serving turns and tracking background task output. |
+| `assistant/slash.rs` | Parent of `assistant/slash/`. Slash commands typed in a chat, run by the daemon so every engine sees the same thing (only the Claude CLI expands a slash itself). Owns the vocabulary: `Outcome` (a card that stays in the chat, a prompt for the model with the typed text kept apart, or a shell control to open), `CardKind`, `Control` and `SlashError`, one variant per HTTP refusal. Knows nothing about chats or models. |
+| `assistant/slash/parse.rs` | `/name arguments` taken apart: `[A-Za-z0-9][A-Za-z0-9_.:-]*` names, `rest` raw and `argv` split with quotes and a backslash before a quote. Pure, and decides by shape alone: `//text` and `/etc/hosts` are not commands, an unclosed quote is `InvalidArgument`. |
+| `assistant/slash/expand.rs` | A command or skill file turned into the prompt every engine receives: front matter stripped, `$ARGUMENTS` and `$1..$9` replaced in one pass, `ARGUMENTS:` appended when the body names no placeholder, the base-directory header for a skill. Also reports `partial` reasons (`allowed-tools`, `model`, `bang`, `at-file`) -- things the file asked the CLI to do that reach the model as literal text. Pure: the caller reads the file. |
+| `assistant/slash/registry.rs` | The built-ins (`BUILTINS`, only `/help` with alias `/commands` so far) joined with `commands::available` in the order built-in, project, personal, plugin. A name taken by an earlier entry is shadowed: kept in `entries` for `/help`, never returned by `resolve` or `listing`. Names compare without case and aliases are not entries of their own. `BUNDLE_SKILLS` names the workflow skills the daemon materializes. |
+| `assistant/slash/help.rs` | The `/help` and `/commands` cards: every command grouped by source with shadowed ones marked, or one entry in full for `/help name`. An unknown name is `SlashError::Unknown` with suggestions. |
 | `assistant/slots.rs` | Per-chat turn slots, steering, stopping, and immediate answers. |
 | `assistant/spontaneous.rs` | Between-turn watching and spontaneous assistant turns. |
 | `assistant/turn.rs` | Local turns, runner selection, deadlines, and assistant turn launching. |
@@ -449,7 +455,7 @@ the contract, not a snapshot.
 | `devtime/precision.rs` | Per-rule precision from feedback marks, phase-2 eligibility, base rates, and the mark API (endpoint in SP4). |
 | `devtime/unexplained.rs` | PURE per-turn active/explained time and the listing of slow turns no rule explains. |
 | `devtime/rules/fixture.rs` | Tests only: compact session-script DSL that builds devtime rows, spans and rule facts. |
-| `consolidate.rs` | The periodic consolidation pass measures each project's gate history and refused-action history, then writes only episodic measurements from its two fixed-template generators. It skips any project with a live job or running run. Detection stays in SQL and the body is a template; no model interprets the histories. |
+| `consolidate.rs` | In `nucleos-app`. The periodic consolidation pass measures each project's gate history and refused-action history, then writes only episodic measurements from its two fixed-template generators. It skips any project with a live job or running run. Detection stays in SQL and the body is a template; no model interprets the histories. |
 | `distill.rs` | Parent of `distill/`. A durable queue of closed jobs and runs, and the worker that reads one's text, asks the configured brain once, and writes project-scoped learnings through `knowledge`'s doors. Never writes `observations` or `generator`; never logs a dossier or an answer. |
 | `governance/quote_guard.rs` | PURE: `quotes(text, sources)` — whether `text` repeats `QUOTE_WORDS` (8) consecutive normalised words of a source, or the whole of a source of 4..8 words (`.ai/specs/2026-10-07-fronteira-prompts-design.md` §3). The distiller asks it about each new learning against the owner's text in its dossier; it catches quotation, never paraphrase. Knows no notes, no store, no SQL. |
 | `distill/model.rs` | The distiller's brain: which model the worker asks (cloud, local or openrouter), persisted, and the choosing logic `distill::run_distill_loop` reads every tick. |
@@ -624,7 +630,7 @@ breaks the GNU linker, so point `RUSTUP_HOME` and `CARGO_HOME` at a space-free d
   `-p nucleos-base <name>` for a module under `crates/nucleos-base/src`, `--lib <name>` for one in the
   core library (every other module but those below), `-p nucleos-app <name>` for one of the moved modules (`hooks`,
   `fleet`, `devtime`, `analytics`, `analytics_pipeline`, `price_refresh`, `verify_cli`, `presets`,
-  `assistant`, `channels::{commands, ingest, media}`),
+  `assistant`, `channels::{commands, ingest, media}`, `consolidate`),
   `-p nucleos-daemon <name>` for one in `http.rs`, `main.rs`, `cli.rs` or `startup.rs` — each builds only that test binary.
 - `cargo build` · `cargo fmt --all` (check: `cargo fmt --all -- --check`) · `cargo clippy --all-targets`
 - After a `claude update`: run `node scripts/tool-surface.mjs`. It measures the CLI's own advertised

@@ -736,7 +736,7 @@ pub mod tests {
         .unwrap()
         .last_insert_rowid();
 
-        let loop_task = tokio::spawn(run_retention_loop(state.clone(), false));
+        let loop_task = tokio::spawn(run_retention_loop(state.clone(), false, None));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")
