@@ -14,7 +14,10 @@ use super::*;
 
 #[derive(Debug, Deserialize)]
 pub struct OpenBody {
-    pub project_id: String,
+    /// Absent or null: the calling turn's stamped project, else no project ([`resolve_scope`]).
+    /// An explicit `""` or [`NO_PROJECT_KEY`] is refused ([`explicit_project`]).
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub url: String,
     /// Still deserialised so an older caller does not fail, but IGNORED: the owning run comes from
     /// the daemon-set header only (spec §4.0).
@@ -61,6 +64,55 @@ pub struct ActBody {
     pub filename: String,
 }
 
+/// The project a `POST /browser/open` body names, checked before it is resolved.
+///
+/// Absent or `null` passes through as `None` (resolved from the calling run by [`resolve_scope`]).
+/// An explicit `""` or [`NO_PROJECT_KEY`] is a 400: the no-project scope is reached only by
+/// omitting the field, never by spelling one of its internal names.
+#[allow(clippy::result_large_err)] // the error is the ready-made axum response, as in access::resolve_channel
+pub(crate) fn explicit_project(
+    requested: Option<&str>,
+) -> Result<Option<&str>, axum::response::Response> {
+    match requested {
+        Some("") => Err(super::embedded::bad_request("project_id is empty")),
+        Some(NO_PROJECT_KEY) => Err(super::embedded::bad_request(
+            "project_id is the reserved no-project key",
+        )),
+        other => Ok(other),
+    }
+}
+
+/// The scope a browser open runs under.
+///
+/// An explicit id is kept as given (and validated downstream exactly as before). An absent one
+/// resolves to the calling run's stamped `runs.project_id`; a run with no project, no run at all,
+/// or a lookup that fails is [`NO_PROJECT`].
+pub(crate) async fn resolve_scope(
+    pool: &sqlx::SqlitePool,
+    run_id: Option<i64>,
+    requested: Option<&str>,
+) -> String {
+    if let Some(requested) = requested {
+        return requested.to_owned();
+    }
+    let Some(run_id) = run_id else {
+        return NO_PROJECT.to_owned();
+    };
+    let stamped: Result<Option<Option<String>>, sqlx::Error> =
+        sqlx::query_scalar("SELECT project_id FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await;
+    match stamped {
+        Ok(Some(Some(project))) if !project.is_empty() => project,
+        Ok(_) => NO_PROJECT.to_owned(),
+        Err(error) => {
+            tracing::warn!(%error, run = run_id, "could not read the calling run's project; browsing in no project");
+            NO_PROJECT.to_owned()
+        }
+    }
+}
+
 /// `POST /browser/open`.
 pub async fn post_open(
     State(state): State<AppState>,
@@ -69,15 +121,22 @@ pub async fn post_open(
     axum::Json(body): axum::Json<OpenBody>,
 ) -> axum::response::Response {
     let now = chrono::Utc::now();
+    // The chat turn the auth door admitted, else the header only (spec §4.0): a `run_id` in the
+    // body is a permission the caller would grant itself, so the body field is deserialised for
+    // compatibility and never read.
+    let run_id = chat
+        .as_ref()
+        .map(|chat| chat.run_id)
+        .or_else(|| crate::door::sending_run_id_of(&headers));
+    let requested = match explicit_project(body.project_id.as_deref()) {
+        Ok(requested) => requested,
+        Err(refused) => return refused,
+    };
+    // No project named: the calling turn's own project, or no project at all.
+    let project_id = resolve_scope(&state.pool, run_id, requested).await;
     let ask = Ask {
-        project_id: &body.project_id,
-        // The chat turn the auth door admitted, else the header only (spec §4.0): a `run_id` in the
-        // body is a permission the caller would grant itself, so the body field is deserialised for
-        // compatibility and never read.
-        run_id: chat
-            .as_ref()
-            .map(|chat| chat.run_id)
-            .or_else(|| crate::door::sending_run_id_of(&headers)),
+        project_id: &project_id,
+        run_id,
         url: &body.url,
         // The assistant, always, in this version. Spec §6.0b: the autonomous path is a seam and not
         // a road, and the seam is `browser_policy`'s refusal rather than a branch here. When a
@@ -405,9 +464,9 @@ pub async fn post_close(
     }
 }
 
-/// `GET /browser/sessions` — what is open right now.
+/// `GET /browser/sessions` — what is open right now, each with the chat it answers to.
 pub async fn list_open_sessions(State(state): State<AppState>) -> axum::response::Response {
-    match open_sessions(&state.pool).await {
+    match open_session_views(&state.pool).await {
         Ok(sessions) => axum::Json(sessions).into_response(),
         Err(error) => db_error(error),
     }
@@ -559,4 +618,60 @@ pub fn browser_error(error: BrowserError) -> axum::response::Response {
         BrowserError::Failed(_) => StatusCode::BAD_GATEWAY,
     };
     (status, error.to_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn run_stamped(pool: &sqlx::SqlitePool, project: Option<&str>) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, project_id, created_at)
+             VALUES ('p', 'running', 'worktree', ?, '2026-10-22T10:00:00Z') RETURNING id",
+        )
+        .bind(project)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_absent_project_id_resolves_to_the_calling_turns_stamped_project() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = run_stamped(&pool, Some("acme")).await;
+        assert_eq!(resolve_scope(&pool, Some(run), None).await, "acme");
+    }
+
+    #[tokio::test]
+    async fn an_absent_project_id_with_no_stamped_project_is_the_no_project_scope() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = run_stamped(&pool, None).await;
+        assert_eq!(resolve_scope(&pool, Some(run), None).await, NO_PROJECT);
+        assert_eq!(resolve_scope(&pool, None, None).await, NO_PROJECT);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_project_id_is_kept_as_before() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = run_stamped(&pool, Some("acme")).await;
+        assert_eq!(
+            resolve_scope(&pool, Some(run), Some("other")).await,
+            "other"
+        );
+    }
+
+    /// An explicit `""` or the internal no-project key is a 400; absent still resolves from the run.
+    #[test]
+    fn an_explicit_empty_or_no_project_key_project_id_is_refused() {
+        assert_eq!(
+            explicit_project(Some("")).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            explicit_project(Some(NO_PROJECT_KEY)).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(explicit_project(None).ok(), Some(None));
+        assert_eq!(explicit_project(Some("acme")).ok(), Some(Some("acme")));
+    }
 }

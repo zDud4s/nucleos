@@ -10,12 +10,14 @@
  *    code "http_410" (see {@link isRequestGone}).
  */
 import { apiFetch, isApiRefusal } from "./client";
+import { scopeProject } from "./browser-tabs";
 
 export type EmbeddedRequest = {
   request_id: string;
   /** "open" (url), "close" (session_id) or "focus" (session_id: bring that tab to the front). */
   kind: "open" | "close" | "focus" | string;
-  project: string;
+  /** The project id, or `null` for the no-project scope (map it with `scopeKey`). */
+  project: string | null;
   url?: string;
   session_id?: string;
 };
@@ -24,12 +26,20 @@ function post(body: unknown): RequestInit {
   return { method: "POST", body: JSON.stringify(body) };
 }
 
-export function embeddedPrepare(project: string): Promise<{ proxy_addr: string }> {
-  return apiFetch<{ proxy_addr: string }>("/browser/embedded/prepare", post({ project }));
+/** `key` is a scope key (`scopeKey`); the body carries `project: null` for no project. */
+export function embeddedPrepare(key: string): Promise<{ proxy_addr: string }> {
+  return apiFetch<{ proxy_addr: string }>(
+    "/browser/embedded/prepare",
+    post({ project: scopeProject(key) }),
+  );
 }
 
-export function embeddedRegister(project: string, cdpHttp: string): Promise<void> {
-  return apiFetch<void>("/browser/embedded/register", post({ project, cdp_http: cdpHttp }));
+/** `key` is a scope key (`scopeKey`); the body carries `project: null` for no project. */
+export function embeddedRegister(key: string, cdpHttp: string): Promise<void> {
+  return apiFetch<void>(
+    "/browser/embedded/register",
+    post({ project: scopeProject(key), cdp_http: cdpHttp }),
+  );
 }
 
 export function embeddedRequests(): Promise<EmbeddedRequest[]> {

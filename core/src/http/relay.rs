@@ -438,6 +438,158 @@ mod tests {
         (status, json)
     }
 
+    /// The embedded routes take a missing or `null` project as the no-project scope; an explicit
+    /// empty string stays a client error.
+    #[tokio::test]
+    async fn embedded_prepare_and_register_accept_a_missing_project() {
+        use axum::extract::Path;
+        use axum::response::IntoResponse as _;
+        use axum::routing::post;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorder = seen.clone();
+        let app = axum::Router::new()
+            .route(
+                "/{verb}",
+                post(|| async { StatusCode::NO_CONTENT.into_response() }),
+            )
+            .route(
+                "/embedded/{verb}",
+                post(
+                    move |Path(verb): Path<String>,
+                          axum::Json(body): axum::Json<serde_json::Value>| {
+                        let recorder = recorder.clone();
+                        async move {
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::json!({"verb": verb, "body": body}));
+                            if verb == "attach" {
+                                return axum::Json(serde_json::json!({
+                                    "id": "e1",
+                                    "mode": "agent",
+                                    "requested_url": body["url"],
+                                    "final_url": "https://news.example.net/",
+                                    "title": "Landed",
+                                }))
+                                .into_response();
+                            }
+                            axum::Json(serde_json::json!({ "proxy_addr": "127.0.0.1:9911" }))
+                                .into_response()
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut state = state().await;
+        state.browser = std::sync::Arc::new(crate::browser::BrowserRuntime {
+            enabled: true,
+            client: crate::browser_client::BrowserClient::new(&address.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
+        });
+        state
+            .browser
+            .embedded_forced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "project": null }),
+        ] {
+            let (status, answer) = call(
+                &state,
+                "POST",
+                "/browser/embedded/prepare",
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "prepare {body}");
+            assert_eq!(answer["proxy_addr"], "127.0.0.1:9911");
+        }
+        {
+            let recorded = seen.lock().unwrap();
+            assert_eq!(recorded.len(), 2, "{recorded:?}");
+            for call in recorded.iter() {
+                assert_eq!(call["verb"], "prepare");
+                assert_eq!(call["body"]["project"], "(no project)", "{call}");
+            }
+        }
+
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/browser/embedded/register",
+            Some(serde_json::json!({ "cdp_http": "http://127.0.0.1:9333" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // A no-project open is listed to the shell with a null project.
+        let url = "https://news.example.net/";
+        let ask = crate::browser::Ask {
+            project_id: crate::browser::NO_PROJECT,
+            run_id: None,
+            url,
+            surface: crate::browser_policy::Surface::Assistant,
+            requester: crate::browser_policy::Requester::Owner,
+            now: "2026-08-16T10:00:00Z",
+        };
+        let shell = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let (status, listed) =
+                    call(&state, "GET", "/browser/embedded/requests", None).await;
+                assert_eq!(status, StatusCode::OK);
+                if let Some(request) = listed.as_array().and_then(|list| list.first()) {
+                    let request_id = request["request_id"].as_str().unwrap().to_string();
+                    state.browser.embedded.ack(&request_id, "n0nce").await;
+                    return Some(request.clone());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let (_opened, listed) = tokio::join!(
+            crate::browser::open(&state.pool, &state.browser, ask),
+            shell
+        );
+        let listed = listed.expect("the no-project open was listed for the shell");
+        assert_eq!(listed["kind"], "open");
+        assert!(
+            listed
+                .get("project")
+                .is_some_and(serde_json::Value::is_null),
+            "project is an explicit null on the wire: {listed}"
+        );
+
+        // An explicit empty string is not the no-project scope.
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/browser/embedded/prepare",
+            Some(serde_json::json!({ "project": "" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/browser/embedded/register",
+            Some(serde_json::json!({ "project": "", "cdp_http": "http://127.0.0.1:9333" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     fn empty_policy() -> serde_json::Value {
         serde_json::json!({"families": [], "kinds": []})
     }
