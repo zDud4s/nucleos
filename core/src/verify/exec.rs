@@ -433,6 +433,16 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     .await;
     let (status, exit_code) = status_of(&outcome);
     let tail = tail_of(&outcome);
+    // The full output is still in `outcome.tail` here; `finish` keeps only 4000 characters of it. The
+    // ids are written BEFORE `finish` makes the row terminal: a reader that sees `failed` must already
+    // find them, or it would classify the unit as "no ids".
+    if status == verify_runs::STATUS_FAILED
+        && let Some(failures) = crate::verify::failures::extract(&outcome.tail)
+        && let Err(error) =
+            verify_runs::set_failed_tests(&executor.pool, claimed.id, &failures).await
+    {
+        tracing::warn!(%error, id = claimed.id, "verify executor: cannot record the failed test ids");
+    }
     let duration_ms = i64::try_from(outcome.duration.as_millis()).unwrap_or(i64::MAX);
     if let Err(error) = verify_runs::finish(
         &executor.pool,
@@ -657,6 +667,37 @@ mod tests {
         let state = wait_terminal(&ex, submitted.id).await;
         assert_eq!(state.status, verify_runs::STATUS_FAILED);
         assert!(matches!(state.exit_code, Some(code) if code != 0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_unit_stores_the_test_ids_the_runner_printed() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        // `sh` is the portable shell the neighbouring tests of this module (runs.rs) use.
+        let script = "printf 'test a::boom ... FAILED\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\\n'; exit 1";
+        let argv = ["sh", "-c", script];
+        let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+
+        let state = wait_terminal(&ex, submitted.id).await;
+
+        assert_eq!(state.status, verify_runs::STATUS_FAILED);
+        let failures = state.failed_tests.expect("ids stored");
+        assert!(failures.tests.contains("a::boom"), "{failures:?}");
+    }
+
+    #[tokio::test]
+    async fn a_passed_unit_and_a_failed_one_without_ids_store_none() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        for argv in [["git", "--version"], ["git", "definitely-not-a-git-subcommand"]] {
+            let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+            assert_eq!(ex.start_ready().await, 1);
+            let state = wait_terminal(&ex, submitted.id).await;
+            assert_eq!(state.failed_tests, None, "{argv:?}");
+        }
     }
 
     #[test]

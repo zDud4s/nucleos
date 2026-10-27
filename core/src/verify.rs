@@ -10,6 +10,7 @@
 pub mod batch;
 pub mod bisect;
 pub mod exec;
+pub mod failures;
 pub mod fingerprint;
 pub mod flaky;
 pub mod guard;
@@ -1443,6 +1444,11 @@ tests:
             run_id: None,
             cached_from: None,
             already_failing: None,
+            failed_tests: None,
+            failed_files: Vec::new(),
+            inherited: None,
+            pending: None,
+            not_inherited: None,
         }
     }
 
@@ -1465,6 +1471,7 @@ tests:
                 running: Vec::new(),
             },
             units,
+            inherited_task_ids: Vec::new(),
         }
     }
 
