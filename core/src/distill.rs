@@ -784,11 +784,12 @@ pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn
         process_one_with(pool, asked, embedder, row, Utc::now()).await;
         tracing::info!("distillation: queue row {id} ({cause}) processed");
     };
-    if drained
-        && let Some(embedder) = embedder
-        && let Err(error) = crate::embed::backfill(pool, embedder, BACKFILL_PER_TICK).await
-    {
-        tracing::warn!("distillation: embedding backfill failed: {error}");
+    if drained && let Some(embedder) = embedder {
+        if let Err(error) = crate::embed::backfill(pool, embedder, BACKFILL_PER_TICK).await {
+            tracing::warn!("distillation: embedding backfill failed: {error}");
+        }
+        // Weekly and sealed at its own start, so most ticks return at once.
+        crate::themes::run_weekly(pool, embedder.model(), Utc::now()).await;
     }
     if drained {
         generalise::run_if_due(pool, asked, embedder, Utc::now()).await;
@@ -2628,5 +2629,64 @@ mod tests {
             .position(|c| c == &crate::embed::text_of("Old rule", "Never embedded."))
             .expect("the old row was embedded");
         assert!(item < backfilled, "queue first, backfill after: {calls:?}");
+    }
+
+    #[tokio::test]
+    async fn tick_runs_the_weekly_theme_pass_after_draining_when_an_embedder_is_installed() {
+        let pool = test_pool().await;
+        for i in 0..3 {
+            crate::themes::tests_support::knowledge_row(
+                &pool,
+                "x",
+                "distiller",
+                "active",
+                [1.0, 0.01 * i as f32, 0.0],
+            )
+            .await;
+        }
+        let embedder = FakeEmbedder::new("m", Vec::new(), Some(vec![1.0, 0.0, 0.0]));
+        let runner = fake_answering("[]");
+
+        tick(
+            &pool,
+            Extractor::Cli(&runner),
+            Some(&embedder as &dyn Embedder),
+        )
+        .await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM themes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let sealed: Option<String> =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'themes.clustered_at'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(sealed.is_some());
+        tick(
+            &pool,
+            Extractor::Cli(&runner),
+            Some(&embedder as &dyn Embedder),
+        )
+        .await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM themes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "sealed for the week");
+    }
+
+    #[tokio::test]
+    async fn tick_without_an_embedder_runs_no_theme_pass() {
+        let pool = test_pool().await;
+        let runner = fake_answering("[]");
+        tick(&pool, Extractor::Cli(&runner), None).await;
+        let sealed: Option<String> =
+            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'themes.clustered_at'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(sealed.is_none());
     }
 }
