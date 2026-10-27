@@ -1730,6 +1730,68 @@ mod tests {
         );
     }
 
+    async fn plant_observation(pool: &SqlitePool, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge
+               (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('episodic', 'observation', 'alpha:chat:5', 'distiller', 'memory',
+                     'zebra preference observed', 'the zebra word', ?, '2026-10-22T00:00:00+00:00')",
+        )
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// `observed` AND `active` (a `source = 'distiller'` row `approved` would accept): neither leaves
+    /// `for_context`, `brief::of` or `recall`, even for a project whose id equals the scope id.
+    #[tokio::test]
+    async fn an_observation_never_reaches_a_prompt_reader() {
+        let pool = test_pool().await;
+        let ids = [
+            plant_observation(&pool, "observed").await,
+            plant_observation(&pool, "active").await,
+        ];
+        for project in ["alpha", "alpha:chat:5"] {
+            let context = project_context_for(project);
+            let rows = for_context(&pool, &context).await.unwrap();
+            assert!(
+                rows.iter().all(|r| !ids.contains(&r.id)),
+                "for_context leaked for {project}"
+            );
+            let brief = crate::brief::of(&pool, &context, "zebra preference")
+                .await
+                .unwrap();
+            assert!(
+                brief.block.as_deref().is_none_or(|b| !b.contains("zebra")),
+                "brief leaked for {project}"
+            );
+            let recalled =
+                crate::brief::recall(&pool, &Scope::Project(project.into()), "zebra", None)
+                    .await
+                    .unwrap();
+            assert!(recalled.is_empty(), "recall leaked for {project}");
+        }
+        let machine = crate::brief::recall(&pool, &Scope::Machine, "zebra", None)
+            .await
+            .unwrap();
+        assert!(machine.is_empty());
+    }
+
+    #[test]
+    fn select_rejects_an_observed_row_whatever_its_source() {
+        let mut row = one(1, "memory", "t", "b");
+        row.scope_kind = "observation".into();
+        row.scope_id = Some("alpha:chat:5".into());
+        row.source = "distiller".into();
+        row.layer = "episodic".into();
+        row.status = "observed".into();
+        row.observations = None;
+        assert!(!approved(&row));
+        assert!(!admitted(&row, &project_context_for("alpha")));
+    }
+
     /// Spec 4.6, in the four cases that matter: what the distiller wrote reaches a node exactly
     /// when it is `active` -- an episode on trial, or a rule a person approved -- and never while a
     /// rule is `proposed` or once an episode has expired.
