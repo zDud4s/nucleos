@@ -8,8 +8,6 @@
 //! consumer (the claim, `task_list`, the verify, the land gate, the postgate, the hooks) asks, so an
 //! expired claim counts as free everywhere.
 
-#![allow(unused_imports)] // until the write functions of Tasks 5-9 use them; removed in Task 9
-
 use super::{
     ClaimOutcome, Closer, FailedProbe, Holder, HolderKind, NewTask, ProbeStart, Status, TaskKey, TaskKind,
     TaskRow, PROBE_LEASE_SECONDS, SESSION_LEASE_SECONDS,
@@ -928,6 +926,43 @@ pub async fn finish_reprobe(
     Ok(())
 }
 
+// ---- startup ----------------------------------------------------------------------------------------
+
+/// The daemon restarted. Must run AFTER the run and job reconciliations: a claim held by a run or job
+/// is judged by whether that run or job is live, and before them every dead one still reads live.
+///
+/// - `probing` rows are deleted: the proof died with the daemon.
+/// - `claimed` by a dead run or job: back to `open` (event `released`).
+/// - `claimed` by the postgate while the project is no longer red: closed `done`.
+/// - Session leases are not touched: they lapse lazily, like everywhere else.
+pub async fn reconcile_at_startup(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<()> {
+    let mut tx = begin(pool).await?;
+    let probes: Vec<i64> = sqlx::query_scalar("SELECT id FROM task_claims WHERE status = 'probing'")
+        .fetch_all(&mut *tx)
+        .await?;
+    for id in probes {
+        delete_task(&mut tx, id).await?;
+    }
+    let raws = sqlx::query_as::<_, RawRow>(
+        "SELECT * FROM task_claims WHERE status = 'claimed' AND holder_kind IN ('run', 'job', 'postgate') ORDER BY id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for raw in raws {
+        let row = decode(raw)?;
+        if is_live_on(&mut tx, &row, now).await? {
+            continue;
+        }
+        if row.holder_kind == Some(HolderKind::Postgate) {
+            close_in_tx(&mut tx, row.id, &Closer::Reconcile, "the master is no longer red", now).await?;
+        } else {
+            reopen(&mut tx, &row, "released", "owner finished before the daemon restarted", now).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +1037,38 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn startup_frees_dead_runs_closes_stale_postgate_claims_and_drops_probes() {
+        let pool = test_pool().await;
+        let dead_run = sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'interrupted', 't')")
+            .execute(&pool).await.unwrap().last_insert_rowid();
+        let live_run = sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', 't')")
+            .execute(&pool).await.unwrap().last_insert_rowid();
+        sqlx::query("INSERT INTO postgate_state (project_id, target, red_groups) VALUES ('p', 'main', '[]')")
+            .execute(&pool).await.unwrap();
+
+        let probe = seed(&pool, Seed { key: "master-red", status: "probing", holder: Some(("verify", "t")), ..Seed::default() }).await;
+        let dead = seed(&pool, Seed { key: "file:dead.rs", status: "claimed", holder: Some(("run", &dead_run.to_string())), ..Seed::default() }).await;
+        let alive = seed(&pool, Seed { key: "file:alive.rs", status: "claimed", holder: Some(("run", &live_run.to_string())), ..Seed::default() }).await;
+        let stale_postgate = seed(&pool, Seed { key: "file:pg.rs", status: "claimed", holder: Some(("postgate", "p")), ..Seed::default() }).await;
+        let session_claim = seed(&pool, Seed {
+            key: "file:s.rs", status: "claimed", holder: Some(("session", "s1")), lease: Some(t0() - secs(10_000)), ..Seed::default()
+        }).await;
+
+        reconcile_at_startup(&pool, t0()).await.unwrap();
+
+        let gone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims WHERE id = ?")
+            .bind(probe).fetch_one(&pool).await.unwrap();
+        assert_eq!(gone, 0, "the proof died with the daemon");
+        assert_eq!(row(&pool, dead).await.status, Status::Open);
+        assert_eq!(events(&pool, dead).await.last().unwrap().0, "released");
+        assert_eq!(row(&pool, alive).await.status, Status::Claimed);
+        let closed = row(&pool, stale_postgate).await;
+        assert_eq!(closed.status, Status::Done, "the master is green again");
+        assert_eq!(events(&pool, stale_postgate).await.last().unwrap().1.as_deref(), Some("p"));
+        assert_eq!(row(&pool, session_claim).await.status, Status::Claimed, "leases lapse lazily; the sweep does not touch them");
     }
 
     #[test]

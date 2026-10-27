@@ -114,6 +114,15 @@ pub(super) async fn reconcile_after_restart(pool: &sqlx::SqlitePool) {
         Err(error) => tracing::warn!(%error, "orphaned concurrency slot sweep failed"),
     }
 
+    // After the run and job reconciliations above: a task claim held by a run or job is judged by asking
+    // whether that run or job is still live, and before those two every dead one still reads live.
+    // Best effort, like the slot sweep: a claim left stale is a task shown as taken, not a daemon that
+    // must not start (and a lapsed one counts as free everywhere through `is_live` anyway).
+    match task_claims::store::reconcile_at_startup(pool, chrono::Utc::now()).await {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(%error, "task claim reconciliation failed"),
+    }
+
     // Neither fatal like the run reconciliations above nor mere hygiene like the worktree sweep
     // below: louder than the sweep, quieter than the panics.
     //
