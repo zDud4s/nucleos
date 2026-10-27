@@ -503,8 +503,10 @@ pub async fn finish_red(
              running_sha = NULL, running_request_id = NULL, running_started_at = NULL, \
              red_groups = ?, \
              red_since_sha = COALESCE(red_since_sha, ?), \
-             red_phase = 'flake_check', red_sha = ?, red_base_sha = last_green_sha, \
-             probe_sha = NULL, probe_request_id = NULL, probes = '[]', \
+             red_phase = CASE WHEN red_groups <> '[]' AND red_base_sha IS last_green_sha THEN 'bisect' ELSE 'flake_check' END, \
+             red_sha = ?, red_base_sha = last_green_sha, \
+             probe_sha = NULL, probe_request_id = NULL, \
+             probes = CASE WHEN red_groups <> '[]' AND red_base_sha IS last_green_sha THEN probes ELSE '[]' END, \
              covered_sha = NULL, \
              updated_at = CURRENT_TIMESTAMP \
          WHERE project_id = ? AND running_sha = ?",
@@ -1264,6 +1266,39 @@ mod tests {
         let s = load(&pool, "p").await.unwrap().unwrap();
         assert_eq!(s.red_groups, later);
         assert_eq!(s.red_since_sha.as_deref(), Some("a1"));
+    }
+
+    #[tokio::test]
+    async fn a_red_on_a_target_already_red_keeps_the_probes_and_skips_the_recheck() {
+        let pool = crate::testdb::fresh_pool().await;
+        start(&pool, "p", "master", "a1", None).await.unwrap();
+        assert!(finish_green(&pool, "p", "a1").await.unwrap());
+        start(&pool, "p", "master", "b2", None).await.unwrap();
+        let groups = vec!["gate_command".to_owned()];
+        assert!(finish_red(&pool, "p", "b2", &groups).await.unwrap());
+        assert_eq!(
+            load(&pool, "p").await.unwrap().unwrap().red_phase,
+            Some(RedPhase::FlakeCheck)
+        );
+        // The first red's handling bisects, stores a probe and reports.
+        sqlx::query(
+            "UPDATE postgate_state SET red_phase = 'bisect', \
+             probes = '[[\"b1\",\"red\"]]' WHERE project_id = 'p'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        end_red(&pool, "b2").await;
+
+        // A later tip, still red over the same last green: the probes of the range already
+        // measured stay, and no recheck of a red that is already established is queued.
+        start(&pool, "p", "master", "c3", None).await.unwrap();
+        assert!(finish_red(&pool, "p", "c3", &groups).await.unwrap());
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.red_phase, Some(RedPhase::Bisect));
+        assert_eq!(s.red_sha.as_deref(), Some("c3"));
+        assert_eq!(s.red_base_sha.as_deref(), Some("a1"));
+        assert_eq!(s.probes, vec![("b1".to_owned(), Probe::Red)]);
     }
 
     #[tokio::test]
