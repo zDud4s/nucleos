@@ -165,14 +165,35 @@ pub const TEAM_TOOLS: &[&str] = &[
 /// in `--allowedTools` through this list) — but, unlike `note_finding`, they are also offered to
 /// every other box: see `EVERY_BOX_TOOLS`. `record` rides with them: a job node files its workflow
 /// ledger records against the same worktree it verifies.
-pub const JOB_NODE_TOOLS: &[&str] = &["note_finding", "record", "verify", "verify_status"];
+pub const JOB_NODE_TOOLS: &[&str] = &[
+    "note_finding",
+    "record",
+    "verify",
+    "verify_status",
+    "task_list",
+    "task_claim",
+    "task_release",
+    "task_done",
+];
 
 /// The members of `JOB_NODE_TOOLS` that `McpBox::All` serves as well. A chat or a plain run has a
 /// worktree of its own to verify and the daemon is the only thing that may run verification, so
 /// these are not a job node's privilege the way a finding is. `record` is served wherever `verify`
 /// is, because the workflow that verifies is the one that keeps the ledger, in whichever box it
 /// runs.
-pub const EVERY_BOX_TOOLS: &[&str] = &["record", "verify", "verify_status"];
+pub const EVERY_BOX_TOOLS: &[&str] = &[
+    "record",
+    "verify",
+    "verify_status",
+    "task_list",
+    "task_claim",
+    "task_release",
+    "task_done",
+];
+
+/// The task-claim tools (spec 2026-10-22, section 4). A claim is a row in the daemon's own table,
+/// so they ride with `verify` into every box that has a worktree or a run behind it.
+pub const TASK_TOOL_NAMES: [&str; 4] = ["task_list", "task_claim", "task_release", "task_done"];
 
 /// What a team agent's box serves by default: today's `TEAM_TOOLS` plus the door that asks for more
 /// and `read_context`, the door onto the context files the agent was given.
@@ -211,6 +232,10 @@ pub const JOB_NODE_BASE: &[&str] = &[
     "read_context",
     "record",
     "request_tool",
+    "task_claim",
+    "task_done",
+    "task_list",
+    "task_release",
     "verify",
     "verify_status",
 ];

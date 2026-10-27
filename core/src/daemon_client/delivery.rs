@@ -142,6 +142,13 @@ impl DaemonClient {
         self.verify_request("/workflow/records", body).await
     }
 
+    /// `POST /tasks/{op}`: the body is the tool's arguments as the box resolved them (the worktree,
+    /// the hook-stamped session id). The daemon picks the project and the holder.
+    pub async fn task_call(&self, op: &str, body: &Value) -> Result<Value, String> {
+        let path = task_path(op).ok_or_else(|| format!("{op} is not a task operation"))?;
+        self.verify_request(&path, body).await
+    }
+
     /// Ask the daemon for a covered verification of a worktree (F3-13): `cover` makes the daemon
     /// pick the base, so the request carries neither `files` nor `base`. The answer is a ticket, as
     /// with `verify`.
@@ -203,6 +210,31 @@ impl DaemonClient {
             });
         }
         serde_json::from_str(&text).map_err(|error| error.to_string())
+    }
+}
+
+/// The route of one task operation, or `None` for a name that is not one. Every path is literal so
+/// that `auth::TASK_ROUTES` can list them.
+fn task_path(op: &str) -> Option<String> {
+    ["list", "claim", "release", "done"]
+        .contains(&op)
+        .then(|| format!("/tasks/{op}"))
+}
+
+#[cfg(test)]
+mod task_path_tests {
+    use super::task_path;
+
+    #[test]
+    fn the_task_paths_are_the_four_literal_routes_a_run_key_reaches() {
+        for op in ["list", "claim", "release", "done"] {
+            assert_eq!(
+                task_path(op).as_deref(),
+                Some(format!("/tasks/{op}").as_str())
+            );
+        }
+        assert_eq!(task_path("session"), None, "the registry is the hook's, not a tool's");
+        assert_eq!(task_path("../verify"), None);
     }
 }
 

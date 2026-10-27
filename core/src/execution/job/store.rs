@@ -334,6 +334,19 @@ pub async fn retire(pool: &SqlitePool, job_id: i64, status: &str) -> sqlx::Resul
         // finding the hourly retention net will close later. Retirement therefore continues.
         tracing::warn!(job_id, %error, "job: failed to close working findings");
     }
+    // Handed back whichever way the write went, like the findings above. Best effort: `is_live`
+    // already counts a retired job's claim as free, and a row that does not go back to `open` must
+    // never stop the retirement (a job left live holds the project's exclusivity slot forever).
+    if let Err(error) = crate::task_claims::store::release_for_owner(
+        pool,
+        crate::task_claims::HolderKind::Job,
+        &job_id.to_string(),
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        tracing::warn!(job_id, %error, "job: failed to hand back the task claims");
+    }
     crate::execution::concurrency::release(pool, crate::execution::worktree::Owner::Job(job_id))
         .await?;
     Ok(retired.rows_affected() > 0)
@@ -1501,6 +1514,25 @@ mod tests {
                 ordinal: Some(0),
                 of: Some(2)
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_a_job_hands_its_claims_back() {
+        let pool = pool().await;
+        let job = job_with(&pool, None).await;
+        let holder = crate::task_claims::Holder {
+            kind: crate::task_claims::HolderKind::Job,
+            id: job.to_string(),
+            worktree: "/w".into(),
+        };
+        let task = crate::task_claims::testing::claimed_by(&pool, &holder, "file:core/a.rs").await;
+
+        retire(&pool, job, STATUS_CANCELLED).await.unwrap();
+
+        assert_eq!(
+            crate::task_claims::testing::state_of(&pool, task).await,
+            ("open".to_owned(), None)
         );
     }
 

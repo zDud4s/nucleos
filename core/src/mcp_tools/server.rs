@@ -71,7 +71,7 @@ impl NucleosTools {
     /// together. Split in two only to keep each file under the size ceiling; every caller asks
     /// for this one.
     pub(super) fn tool_router() -> ToolRouter<Self> {
-        Self::work_tools() + Self::ops_tools()
+        Self::work_tools() + Self::ops_tools() + Self::task_tools()
     }
 
     /// Whether this instance will announce and dispatch one name.

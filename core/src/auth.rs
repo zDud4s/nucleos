@@ -198,6 +198,17 @@ const VERIFY_STATUS_ROUTE: &str = "/verify/status";
 /// fences exactly as it does for verification — this table only lets the request in.
 const WORKFLOW_RECORD_ROUTE: &str = "/workflow/records";
 
+/// The task-claim routes (`task_list`, `task_claim`, `task_release`, `task_done`). A run reaches
+/// them for the reason it reaches `/verify`: the holder is the run itself, taken from this key's
+/// scope by the handler, never from the body; this table only lets the request in. All POST, so
+/// the literal-path rule of `Scope::Run` covers them.
+const TASK_ROUTES: [&str; 4] = [
+    "/tasks/list",
+    "/tasks/claim",
+    "/tasks/release",
+    "/tasks/done",
+];
+
 /// The email sidecar's whole daemon surface: report what it fetched, and ask where it got to.
 ///
 /// Two routes, and that is not a simplification — `daemon/client.go` builds a URL in exactly two
@@ -576,7 +587,8 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
                     || path == FINDING_ROUTE
                     || path == VERIFY_ROUTE
                     || path == VERIFY_STATUS_ROUTE
-                    || path == WORKFLOW_RECORD_ROUTE)
+                    || path == WORKFLOW_RECORD_ROUTE
+                    || TASK_ROUTES.contains(&path))
         }
         Scope::Service(Service::Email) => listed(EMAIL_ROUTES),
         Scope::Service(Service::Council) => listed(COUNCIL_ROUTES),
@@ -3170,6 +3182,35 @@ mod tests {
             assert!(!permits(&run, &method, ADMIT_ROUTE), "{method}");
         }
         assert!(!permits(&run, &Method::POST, "/hooks/admit/other"));
+    }
+
+    /// The claim routes a run's key reaches: by POST and by literal path only, like `/verify`.
+    /// `/tasks/session` is deliberately not one of them: only a person's session registers itself,
+    /// a run is a holder by its own id.
+    #[test]
+    fn a_run_key_reaches_the_task_routes_and_not_the_session_registry() {
+        let run = Scope::Run(1);
+        for route in TASK_ROUTES {
+            assert!(permits(&run, &Method::POST, route), "POST {route}");
+            for method in [Method::GET, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(!permits(&run, &method, route), "{method} {route}");
+            }
+        }
+        assert!(!permits(&run, &Method::POST, "/tasks/session"));
+        assert!(!permits(&run, &Method::POST, "/tasks/claim/1"));
+        assert!(!permits(&run, &Method::GET, "/projects/alpha/tasks"));
+        assert!(!permits(&run, &Method::POST, "/projects/alpha/tasks/claim"));
+        for scope in [
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::ApiToken(ApiTokenLevel::RunCreating),
+            Scope::TeamRun("t".to_owned()),
+            Scope::Service(Service::Email),
+            Scope::Service(Service::Council),
+        ] {
+            for route in TASK_ROUTES {
+                assert!(!permits(&scope, &Method::POST, route), "{scope:?} reached {route}");
+            }
+        }
     }
 
     /// A job node verifies its own worktree through the daemon, so the run key reaches the two
