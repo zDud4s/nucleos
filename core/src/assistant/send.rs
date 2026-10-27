@@ -40,6 +40,29 @@ pub async fn send_or_queue(
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<Sent, String> {
+    send_or_queue_inner(state, chat_id, text, None, images, origin).await
+}
+
+/// [`send_or_queue`] for a slash command that expanded: `typed` is what the person wrote (the
+/// transcript and the queue keep it), `model_text` is what the model reads. Never carries pictures.
+pub async fn send_expanded_or_queue(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    typed: &str,
+    model_text: &str,
+    origin: Origin,
+) -> Result<Sent, String> {
+    send_or_queue_inner(state, chat_id, typed, Some(model_text), &[], origin).await
+}
+
+async fn send_or_queue_inner(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    model_text: Option<&str>,
+    images: &[crate::execution::runner::Attachment],
+    origin: Origin,
+) -> Result<Sent, String> {
     // Refused before anything waits: a picture that cannot be sent now cannot be sent from the
     // queue either, and finding that out at the drain is finding it out after the person left.
     check_images(images)?;
@@ -69,19 +92,35 @@ pub async fn send_or_queue(
     let waiting = crate::chats::queued(&state.pool, chat_id)
         .await
         .map_err(|error| error.to_string())?;
+    let enqueue = || async {
+        let written = match model_text {
+            Some(model_text) => {
+                crate::chats::enqueue_expanded(
+                    &state.pool,
+                    chat_id,
+                    text,
+                    model_text,
+                    origin.as_wire(),
+                    &carried(),
+                )
+                .await
+            }
+            None => {
+                crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
+                    .await
+            }
+        };
+        written.map_err(|error| error.to_string())
+    };
     if !waiting.is_empty() {
-        crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
-            .await
-            .map_err(|error| error.to_string())?;
+        enqueue().await?;
         spawn_drain_if_free(state, chat_id);
         return Ok(Sent::Queued);
     }
-    match send_message_with(state, chat_id, text, images, origin).await {
+    match send_message_inner(state, chat_id, text, model_text, images, origin, None).await {
         Ok(id) => Ok(Sent::Turn(id)),
         Err(refusal) if refusal == TURN_IN_PROGRESS => {
-            crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
-                .await
-                .map_err(|error| error.to_string())?;
+            enqueue().await?;
             // The turn may have ended between the refusal and the write; then nobody would drain it.
             spawn_drain_if_free(state, chat_id);
             Ok(Sent::Queued)
@@ -259,6 +298,7 @@ async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold
     // `take_queued`'s own doc. It decides which of the two doors below the resend goes back
     // through, so a message that waited still produces a run recording where it came from.
     let text = taken.text.clone();
+    let model_text = taken.model_text.clone();
     let origin = Origin::from_wire(taken.origin.as_deref());
     let carried = taken.images.clone();
     let relay_id = taken.relay_id;
@@ -376,7 +416,16 @@ async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold
                     })
                 })
                 .collect();
-            Box::pin(send_message_with(state, chat_id, &text, &images, origin)).await
+            Box::pin(send_message_inner(
+                state,
+                chat_id,
+                &text,
+                model_text.as_deref(),
+                &images,
+                origin,
+                None,
+            ))
+            .await
         }
     };
     let Err(refusal) = sent else {
@@ -561,7 +610,7 @@ pub async fn send_message_with(
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<i64, String> {
-    send_message_inner(state, chat_id, text, images, origin, None).await
+    send_message_inner(state, chat_id, text, None, images, origin, None).await
 }
 
 /// Sends a message that arrived by relay from another conversation, recording which relay bore it.
@@ -578,7 +627,7 @@ pub async fn send_relayed_message(
     origin: Origin,
     relay_id: i64,
 ) -> Result<i64, String> {
-    send_message_inner(state, chat_id, text, &[], origin, Some(relay_id)).await
+    send_message_inner(state, chat_id, text, None, &[], origin, Some(relay_id)).await
 }
 
 /// Sends a relayed message, or keeps it until the destination has a turn free.
@@ -639,10 +688,13 @@ pub(super) async fn send_message_inner(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
+    model_text: Option<&str>,
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
     relay_id: Option<i64>,
 ) -> Result<i64, String> {
+    // What the model reads. `runs.prompt` keeps `text`, the words that were typed (spec D1).
+    let model_text = model_text.unwrap_or(text);
     // Refused before the slot is taken, so a turn nobody can send costs nothing and leaves the
     // conversation answerable.
     check_images(images)?;
@@ -692,6 +744,7 @@ pub(super) async fn send_message_inner(
                     state,
                     slot,
                     text.to_string(),
+                    model_text.to_string(),
                     assistant,
                     relay_id,
                     origin,
@@ -731,6 +784,7 @@ pub(super) async fn send_message_inner(
                     state,
                     slot,
                     text.to_string(),
+                    model_text.to_string(),
                     assistant,
                     relay_id,
                     origin,
@@ -929,7 +983,7 @@ pub(super) async fn send_message_inner(
         tracing::warn!(%error, id, "the turn was sent but its pictures were not recorded");
     }
 
-    let prompt = text.to_string();
+    let prompt = model_text.to_string();
     // The conversation so far, for a turn that has no session to hold it.
     //
     // `resume` is `None` on a first turn — where there is nothing to replay and this adds nothing —
@@ -1922,6 +1976,7 @@ mod tests {
                 origin: Some("shell".to_string()),
                 images: Some("[]".to_string()),
                 relay_id: None,
+                model_text: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
             },
             TURN_IN_PROGRESS,
@@ -2123,6 +2178,7 @@ mod tests {
             origin: Some("shell".to_string()),
             images: Some("[]".to_string()),
             relay_id: None,
+            model_text: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
@@ -2297,6 +2353,7 @@ mod tests {
             origin: Some("telegram".to_string()),
             images: Some("[]".to_string()),
             relay_id: None,
+            model_text: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
@@ -2527,6 +2584,161 @@ mod tests {
         let leaked = path.exists();
         let _ = std::fs::remove_file(&path);
         assert!(!leaked, "the MCP config outlived a turn that never started");
+    }
+
+    // --- Expanded slash commands: the model reads `model_text`, the transcript keeps `typed` ---
+
+    /// A local chat client that remembers every message list it was asked with.
+    struct RecordingLocal(Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>);
+
+    #[async_trait::async_trait]
+    impl crate::models::local_agent::LocalChat for RecordingLocal {
+        async fn exchange(
+            &self,
+            messages: Vec<serde_json::Value>,
+            _tools: Option<Vec<serde_json::Value>>,
+        ) -> std::io::Result<serde_json::Value> {
+            self.0.lock().unwrap().push(messages);
+            Ok(serde_json::json!({"role": "assistant", "content": "done"}))
+        }
+    }
+
+    struct NoLocalTools;
+
+    #[async_trait::async_trait]
+    impl crate::models::local_agent::ToolBox for NoLocalTools {
+        fn schemas(&self) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        async fn call(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+        ) -> crate::models::local_agent::ToolAnswer {
+            unreachable!("this assistant answers without calling tools")
+        }
+    }
+
+    /// The text of the last `user` message of the first exchange a recording client saw, polled.
+    async fn last_user_message_seen(
+        seen: &Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>,
+    ) -> Option<String> {
+        for _ in 0..200 {
+            if let Some(first) = seen.lock().unwrap().first() {
+                return first
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "user")
+                    .and_then(|message| message["content"].as_str())
+                    .map(str::to_string);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    /// The CLI path: the runner is handed the expansion, while the run row keeps what was typed.
+    #[tokio::test]
+    async fn slash_model_text_reaches_cli_runner_runs_prompt_stays_typed() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("slash-cli");
+        let typed = "/expand-me 7";
+        let model_text = "EXPANDED BODY for seven";
+
+        let sent = send_expanded_or_queue(&state, &chat, typed, model_text, Origin::Shell).await;
+
+        let Ok(Sent::Turn(id)) = sent else {
+            panic!("a free chat starts a turn: {sent:?}");
+        };
+        settled(&state.pool, id).await;
+        assert_eq!(prompts_of(&state.pool, &chat, 1).await, vec![typed]);
+        let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            handed.contains(model_text),
+            "the CLI must receive the expansion: {handed:?}"
+        );
+        assert!(
+            !handed.contains(typed),
+            "the typed words are for the transcript, not for the model: {handed:?}"
+        );
+    }
+
+    /// The local path: the model's last user message is the expansion, the run row the typed text.
+    #[tokio::test]
+    async fn slash_model_text_reaches_local_turn_runs_prompt_stays_typed() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = test_state().await;
+        state.assistants = Arc::new(crate::assistants::FixedAssistants(Arc::new(
+            crate::models::local_agent::LocalAssistant::new(
+                Box::new(RecordingLocal(seen.clone())),
+                Box::new(NoLocalTools),
+            ),
+        )));
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+        let typed = "/expand-me 7";
+        let model_text = "EXPANDED BODY for seven";
+
+        let sent = send_expanded_or_queue(&state, &chat, typed, model_text, Origin::Shell).await;
+
+        let Ok(Sent::Turn(id)) = sent else {
+            panic!("a free chat starts a turn: {sent:?}");
+        };
+        assert_eq!(
+            last_user_message_seen(&seen).await.as_deref(),
+            Some(model_text)
+        );
+        settled(&state.pool, id).await;
+        assert_eq!(prompts_of(&state.pool, &chat, 1).await, vec![typed]);
+    }
+
+    /// A busy chat keeps both halves: the queue shows what was typed, and the drain sends the
+    /// expansion that was stored beside it.
+    #[tokio::test]
+    async fn slash_model_text_survives_queue_and_drain() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("slash-queue");
+        *fake.delay.lock().unwrap() = Some(Duration::from_millis(400));
+        let first = send_message(&state, &chat, "first words", Origin::Shell)
+            .await
+            .unwrap();
+        let typed = "/expand-me 7";
+        let model_text = "EXPANDED BODY for seven";
+
+        let outcome = send_expanded_or_queue(&state, &chat, typed, model_text, Origin::Shell).await;
+
+        assert_eq!(outcome, Ok(Sent::Queued));
+        let waiting = crate::chats::queued(&state.pool, &chat).await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].text, typed, "the queue shows what was typed");
+        assert_eq!(waiting[0].model_text.as_deref(), Some(model_text));
+
+        settled(&state.pool, first).await;
+        let asked = prompts_of(&state.pool, &chat, 2).await;
+        assert_eq!(
+            asked.len(),
+            2,
+            "the drain starts the queued turn: {asked:?}"
+        );
+        assert_eq!(asked[1], typed, "runs.prompt stays typed after a drain");
+        let mut handed = String::new();
+        for _ in 0..200 {
+            handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+            if handed.contains(model_text) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            handed.contains(model_text),
+            "the drain must send the stored expansion: {handed:?}"
+        );
+        assert!(!handed.contains(typed), "{handed:?}");
     }
 
     // --- Rotation summary (chats-dev-env spec P6 (ii)) ---

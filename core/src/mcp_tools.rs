@@ -2757,14 +2757,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worktree_box_server_announces_only_verify_verify_status_and_record() {
+    async fn a_worktree_box_server_announces_the_verify_record_and_node_tools() {
         let (_running, context) = served_request_context().await;
 
         let listed = worktree_server("/work/a")
             .list_tools(None, context)
             .await
             .unwrap();
-        assert_eq!(advertised(&listed), ["record", "verify", "verify_status"]);
+        assert_eq!(
+            advertised(&listed),
+            [
+                "node_active",
+                "node_close",
+                "node_open",
+                "node_tree",
+                "node_update",
+                "record",
+                "verify",
+                "verify_status"
+            ]
+        );
         assert!(!served_in_box(
             &McpBox::Worktree("/work/a".to_owned()),
             "note_finding"
@@ -2773,6 +2785,172 @@ mod tests {
             &McpBox::Worktree("/work/a".to_owned()),
             "create_run"
         ));
+    }
+
+    fn node_open_request() -> rmcp::model::CallToolRequestParams {
+        rmcp::model::CallToolRequestParams::new("node_open").with_arguments(
+            serde_json::json!({"kind": "root", "title": "t", "goal": "g"})
+                .as_object()
+                .expect("the fixture is an object")
+                .clone(),
+        )
+    }
+
+    fn reached_the_daemon(answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> bool {
+        answer.as_ref().is_ok_and(|result| {
+            result.content.iter().any(|block| {
+                matches!(block, rmcp::model::ContentBlock::Text(text)
+                    if text.text.contains("error sending request"))
+            })
+        })
+    }
+
+    fn refusal_names(
+        answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+        name: &str,
+    ) -> bool {
+        match answer {
+            Err(error) => error.message.contains(name),
+            Ok(result) => {
+                result.is_error == Some(true)
+                    && result.content.iter().any(|block| {
+                        matches!(block, rmcp::model::ContentBlock::Text(text)
+                            if text.text.contains(name))
+                    })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worktree_box_dispatches_node_open_instead_of_refusing_it() {
+        let (_running, context) = served_request_context().await;
+
+        let answer = worktree_server("/work/a")
+            .call_tool(node_open_request(), context)
+            .await;
+        assert!(
+            reached_the_daemon(&answer),
+            "the worktree box refused node_open before it reached the daemon: {answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_node_box_neither_announces_nor_dispatches_node_open() {
+        let (_running, context) = served_request_context().await;
+
+        let listed = job_node_server(9)
+            .list_tools(None, context.clone())
+            .await
+            .unwrap();
+        assert!(
+            !advertised(&listed).iter().any(|name| name == "node_open"),
+            "a job node was offered node_open"
+        );
+
+        let answer = job_node_server(9)
+            .call_tool(node_open_request(), context.clone())
+            .await;
+        assert!(
+            !reached_the_daemon(&answer),
+            "the job-node box dispatched node_open and only the dead port stopped it: {answer:?}"
+        );
+        assert!(
+            refusal_names(&answer, "node_open"),
+            "the job-node box refused the call without naming node_open: {answer:?}"
+        );
+
+        let control = worktree_server("/work/a")
+            .call_tool(node_open_request(), context)
+            .await;
+        assert!(
+            reached_the_daemon(&control),
+            "the worktree control never dispatched, so the refusal above proves nothing: \
+             {control:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_worktree_box_of_the_three_serves_any_node_tool() {
+        let node_tools = [
+            "node_active",
+            "node_close",
+            "node_open",
+            "node_tree",
+            "node_update",
+        ];
+        for name in node_tools {
+            assert!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box does not serve {name}"
+            );
+            assert!(
+                !served_in_box(&McpBox::JobNode(9), name),
+                "a job node box serves {name}"
+            );
+            assert!(
+                !served_in_box(&McpBox::Team(1), name),
+                "a team box serves {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_box_tools_hold_every_box_tools_and_grant_nothing_that_acts_or_reads_untrusted() {
+        let worktree: Vec<&str> = WORKTREE_BOX_TOOLS.to_vec();
+        let registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        for name in EVERY_BOX_TOOLS {
+            assert!(
+                worktree.contains(name),
+                "{name} is served everywhere but missing from the worktree list"
+            );
+        }
+        for &name in &worktree {
+            assert!(
+                registered.iter().any(|r| r == name),
+                "{name} is not a registered tool"
+            );
+            assert!(
+                TOOL_EFFECTS.iter().any(|(n, _)| *n == name),
+                "{name} is missing from TOOL_EFFECTS"
+            );
+            let effect = tool_effect(name);
+            assert!(
+                effect != ToolEffect::Acts && effect != ToolEffect::ReadsUntrusted,
+                "{name} is graded {effect:?} and must not be served in a worktree box"
+            );
+        }
+
+        let mut sorted = worktree.clone();
+        sorted.sort_unstable();
+        assert_eq!(worktree, sorted, "WORKTREE_BOX_TOOLS is not sorted");
+        assert_eq!(
+            worktree,
+            [
+                "node_active",
+                "node_close",
+                "node_open",
+                "node_tree",
+                "node_update",
+                "record",
+                "verify",
+                "verify_status"
+            ]
+        );
+
+        assert!(!EVERY_BOX_TOOLS.contains(&"node_open"));
+        assert!(!served_in_box(&McpBox::JobNode(1), "node_open"));
+        for (name, _) in TOOL_EFFECTS {
+            assert_eq!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                worktree.contains(name),
+                "{name}: the worktree box disagrees with WORKTREE_BOX_TOOLS"
+            );
+        }
     }
 
     #[tokio::test]

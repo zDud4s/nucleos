@@ -36,6 +36,9 @@ pub(super) async fn spawn_local_turn(
     state: &crate::state::AppState,
     slot: ChatSlot,
     text: String,
+    // What the model reads: `text` for an ordinary message, the expansion for a slash command.
+    // `runs.prompt` keeps `text`, the words that were typed.
+    model_text: String,
     assistant: std::sync::Arc<crate::models::local_agent::LocalAssistant>,
     relay_id: Option<i64>,
     origin: Origin,
@@ -100,7 +103,7 @@ pub(super) async fn spawn_local_turn(
         tracing::warn!(%error, id, relay_id, "the relayed turn started but was not stamped onto its relay");
     }
 
-    let prompt = text;
+    let prompt = model_text;
 
     let pool = state.pool.clone();
     let run_timeout = state.run_timeout;

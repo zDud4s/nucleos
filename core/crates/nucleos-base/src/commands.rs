@@ -18,6 +18,17 @@ pub enum Source {
     Personal,
     /// Shipped by an installed plugin, and named `plugin:command`.
     Plugin,
+    /// Implemented by the daemon itself, with no file behind it. Listed before every other source,
+    /// which is also the order they win a shared name in.
+    Builtin,
+}
+
+/// Whether a command is a `commands/` file or a skill folder, which expand differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Command,
+    Skill,
 }
 
 /// One command a conversation could be about to run.
@@ -30,6 +41,29 @@ pub struct Command {
     /// The `argument-hint` from the front matter — what this command expects after its name.
     pub hint: Option<String>,
     pub source: Source,
+    pub kind: Kind,
+    /// The file this was read from, which the expansion reads again so a body is never cached.
+    /// Empty for a built-in. Never serialized: it is a path on this machine, and the shell has no
+    /// use for it.
+    #[serde(skip)]
+    pub path: PathBuf,
+    /// Why running this on every engine is only partly faithful to the CLI: `allowed-tools` and
+    /// `model` in the front matter, in that order. The body-derived reasons are added at expansion.
+    pub partial: Vec<String>,
+    /// Other names this answers to. Empty for everything but a few built-ins.
+    pub aliases: Vec<String>,
+}
+
+/// The reasons a front matter alone makes a command partial, in their fixed order.
+fn partial_of(front: &FrontMatter) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if front.allowed_tools.is_some() {
+        reasons.push("allowed-tools".to_string());
+    }
+    if front.model.is_some() {
+        reasons.push("model".to_string());
+    }
+    reasons
 }
 
 /// How deep a `commands/` folder is walked. Namespaces are one level in the CLI, and a walk with
@@ -198,11 +232,16 @@ fn collect_skills(root: &Path, prefix: &str, source: Source, found: &mut Vec<Com
         if !front.user_invocable {
             continue;
         }
+        let partial = partial_of(&front);
         found.push(Command {
             name: format!("{prefix}{name}"),
             description: front.description,
             hint: front.hint,
             source,
+            kind: Kind::Skill,
+            path: item.path().join("SKILL.md"),
+            partial,
+            aliases: Vec::new(),
         });
     }
 }
@@ -238,12 +277,17 @@ fn collect(root: &Path, prefix: &str, source: Source, found: &mut Vec<Command>) 
             };
             let body = std::fs::read_to_string(item.path()).unwrap_or_default();
             let front = described(&body);
+            let partial = partial_of(&front);
             let (description, hint) = (front.description, front.hint);
             found.push(Command {
                 name: format!("{prefix}{namespace}{stem}"),
                 description,
                 hint,
                 source,
+                kind: Kind::Command,
+                path: item.path(),
+                partial,
+                aliases: Vec::new(),
             });
         }
     }
@@ -295,6 +339,11 @@ pub struct FrontMatter {
     /// would put doors in the picker that do not open, which is the failure `available` already
     /// refuses for uninstalled plugins.
     pub user_invocable: bool,
+    /// The `allowed-tools` key. Read only so the command can be marked partial: no engine here
+    /// enforces it.
+    pub allowed_tools: Option<String>,
+    /// The `model` key, read for the same reason.
+    pub model: Option<String>,
 }
 
 pub fn described(body: &str) -> FrontMatter {
@@ -305,12 +354,16 @@ pub fn described(body: &str) -> FrontMatter {
     let mut description = None;
     let mut hint = None;
     let mut user_invocable = false;
+    let mut allowed_tools = None;
+    let mut model = None;
     for line in lines.take(FRONT_MATTER_LINES) {
         if line.trim() == "---" {
             return FrontMatter {
                 description,
                 hint,
                 user_invocable,
+                allowed_tools,
+                model,
             };
         }
         let Some((key, value)) = line.split_once(':') else {
@@ -327,6 +380,8 @@ pub fn described(body: &str) -> FrontMatter {
         match key.trim() {
             "description" => description = Some(value),
             "argument-hint" => hint = Some(value),
+            "allowed-tools" => allowed_tools = Some(value),
+            "model" => model = Some(value),
             // Skills declare this; commands have no such key and never set it. Only `true` counts,
             // so a value nobody can parse leaves a skill out of the picker rather than in it.
             "user-invocable" => user_invocable = value.eq_ignore_ascii_case("true"),
@@ -531,18 +586,30 @@ mod tests {
                 description: None,
                 hint: None,
                 source: Source::Project,
+                kind: Kind::Command,
+                path: PathBuf::new(),
+                partial: Vec::new(),
+                aliases: Vec::new(),
             },
             Command {
                 name: "ops:deploy".into(),
                 description: None,
                 hint: None,
                 source: Source::Project,
+                kind: Kind::Command,
+                path: PathBuf::new(),
+                partial: Vec::new(),
+                aliases: Vec::new(),
             },
             Command {
                 name: "notes".into(),
                 description: None,
                 hint: None,
                 source: Source::Personal,
+                kind: Kind::Command,
+                path: PathBuf::new(),
+                partial: Vec::new(),
+                aliases: Vec::new(),
             },
         ];
 
@@ -664,6 +731,7 @@ mod tests {
                 // A command file has no such key, and absence must read as "not invocable by
                 // name" rather than as a default that would put every command in twice.
                 user_invocable: false,
+                ..Default::default()
             }
         );
         assert_eq!(described("Just a body.\n"), FrontMatter::default());
@@ -679,5 +747,75 @@ mod tests {
         assert!(described("---\nname: a\nuser-invocable: TRUE\n---\n").user_invocable);
         assert!(!described("---\nname: a\nuser-invocable: yes\n---\n").user_invocable);
         assert!(!described("---\nname: a\n---\n").user_invocable);
+    }
+
+    /// `allowed-tools` and `model` are read only so a command that sets them can be marked partial:
+    /// the expansion runs on every engine and ignores both, so the picker must say so.
+    #[test]
+    fn described_reads_allowed_tools_and_model() {
+        let front = described(
+            "---\ndescription: Ship it\nallowed-tools: Bash(git:*)\nmodel: opus\n---\n\nGo.\n",
+        );
+        assert_eq!(front.allowed_tools.as_deref(), Some("Bash(git:*)"));
+        assert_eq!(front.model.as_deref(), Some("opus"));
+        // Neither key present: both read as absent.
+        let plain = described("---\ndescription: Ship it\n---\n\nGo.\n");
+        assert_eq!(plain.allowed_tools, None);
+        assert_eq!(plain.model, None);
+
+        // `available` carries the reasons on the command, in this fixed order.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".claude/commands/risky.md",
+            "---\nallowed-tools: Bash\nmodel: opus\n---\n\nGo.\n",
+        );
+        write(dir.path(), ".claude/commands/calm.md", "Just go.\n");
+        let found = available(Some(dir.path()), None);
+        let risky = found.iter().find(|c| c.name == "risky").unwrap();
+        assert_eq!(
+            risky.partial,
+            vec!["allowed-tools".to_string(), "model".to_string()]
+        );
+        let calm = found.iter().find(|c| c.name == "calm").unwrap();
+        assert!(calm.partial.is_empty());
+        assert!(calm.aliases.is_empty());
+    }
+
+    #[test]
+    fn described_reads_kind_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".claude/commands/ship.md", PROBE);
+        write(
+            dir.path(),
+            ".claude/skills/review/SKILL.md",
+            "---\ndescription: Review\nuser-invocable: true\n---\n\nLook.\n",
+        );
+        let found = available(Some(dir.path()), None);
+
+        let ship = found.iter().find(|c| c.name == "ship").unwrap();
+        assert_eq!(ship.kind, Kind::Command);
+        assert_eq!(ship.path, dir.path().join(".claude/commands/ship.md"));
+
+        let review = found.iter().find(|c| c.name == "review").unwrap();
+        assert_eq!(review.kind, Kind::Skill);
+        assert_eq!(
+            review.path,
+            dir.path().join(".claude/skills/review/SKILL.md")
+        );
+
+        // `path` stays on the server: it is never serialized.
+        let json = serde_json::to_value(ship).unwrap();
+        assert!(json.get("path").is_none());
+        assert_eq!(json["kind"], "command");
+        assert_eq!(serde_json::to_value(review).unwrap()["kind"], "skill");
+    }
+
+    #[test]
+    fn described_reads_builtin_source_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&Source::Builtin).unwrap(),
+            "\"builtin\""
+        );
     }
 }

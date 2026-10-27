@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod command;
+
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/assistant/chats", get(list_chats).post(create_chat))
@@ -19,6 +21,11 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/assistant/chats/{chat_id}/commands",
             get(get_chat_commands),
+        )
+        // Running one: expanded here, so every engine receives the same prompt.
+        .route(
+            "/assistant/chats/{chat_id}/command",
+            post(command::post_chat_command),
         )
         // What is different in this conversation's project. On demand and never polled, for the
         // reason the projects' own inspect readers give: re-asking it on a timer would walk
@@ -332,11 +339,17 @@ pub(super) async fn get_chat_commands(
     // Off the async runtime, as the file walk is: this reads several directories and every command
     // file's front matter, which is short but is still disk on a request thread.
     let commands = tokio::task::spawn_blocking(move || {
-        let available = crate::commands::available(
+        // The registry's listing and not `available`: it adds the built-ins and drops the
+        // entries a higher-precedence name shadows, so the picker offers only what would run.
+        let listed = crate::assistant::slash::registry::listing(
             cwd.as_deref().map(std::path::Path::new),
             crate::commands::home().as_deref(),
         );
-        crate::commands::matching(&available, &typed)
+        let mut found = crate::commands::matching(&listed, &typed);
+        // Built-ins lead whatever was typed; the sort is stable, so the match order holds inside
+        // each group.
+        found.sort_by_key(|command| command.source != crate::commands::Source::Builtin);
+        found
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

@@ -450,7 +450,7 @@ export interface Attachment {
 }
 
 /** Where a command came from, which is the only thing explaining two of the same name. */
-export type CommandSource = "project" | "personal" | "plugin";
+export type CommandSource = "builtin" | "project" | "personal" | "plugin";
 
 /** One slash command a conversation can run. */
 export interface Command {
@@ -460,6 +460,30 @@ export interface Command {
   /** What the command expects after its name, when its file says. */
   hint: string | null;
   source: CommandSource;
+  /** A command file or a skill; older daemons omit it, which reads as a command. */
+  kind?: "command" | "skill";
+  /** Other names that run the same thing. */
+  aliases?: string[];
+}
+
+/** A card the daemon answers a slash command with. */
+export interface CommandCard {
+  kind: "help" | "help_entry" | (string & {});
+  data: unknown;
+}
+
+/** What `POST /assistant/chats/{id}/command` answers with on a 200. */
+export type CommandResult =
+  | { kind: "card"; card: CommandCard }
+  | { kind: "prompt"; turn_id?: number; queued?: boolean }
+  | { kind: "open"; control: string };
+
+/** The body of a refused slash command (`ApiRefusal.body`). */
+export interface CommandRefusal {
+  error?: string;
+  detail?: string;
+  suggestions?: string[];
+  usage?: string;
 }
 
 /** Whether a cached list item is a conversation row (the `chats` keys hold many shapes). */
@@ -1347,6 +1371,38 @@ export function useSendMessage(chatId: string) {
           [real],
         ),
       );
+      refreshTail(queryClient, chatId);
+    },
+  });
+}
+
+/** Run a slash command in a conversation: the daemon parses `text` and answers with a card, a prompt or a control. */
+export function postChatCommand(chatId: string, text: string): Promise<CommandResult> {
+  return apiFetch<CommandResult>(`/assistant/chats/${encodeURIComponent(chatId)}/command`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
+}
+
+/**
+ * `postChatCommand` as a mutation. A prompt result is a turn started (or queued), so it refreshes
+ * the transcript the way a sent message does; a card or a control touches nothing cached.
+ */
+export function useChatCommand(chatId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (text: string) => postChatCommand(chatId, text),
+    retry: false,
+    onSuccess: (result, text) => {
+      if (result.kind !== "prompt") return;
+      // A turn started: drawn at once under its real id, as `useSendMessage` swaps its placeholder
+      // in, with the line as typed for `asked`. Not before the answer, because only the daemon
+      // knows whether a line is a turn at all (a card or a control draws none). The daemon's own
+      // row, once read, wins on the shared id. Queued (no id): the transcript read carries it.
+      if (result.turn_id !== undefined) {
+        const turn = optimisticTurn(result.turn_id, text);
+        writeTurns(queryClient, chatId, (turns) => merge(turns, [turn]));
+      }
       refreshTail(queryClient, chatId);
     },
   });
