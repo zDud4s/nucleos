@@ -24,8 +24,8 @@ makes it safe to speak here, where the old version had to stay silent. Registere
 repo-wide, an allow would auto-approve a person's own tools; a refusal grants nothing.
 This branch may also add context (`additionalContext`) telling the agent that a vcs request
 it was refused for has settled, once per request; so does the claims context (`claims_exchange`:
-a 2 s, rate-limited, fail-open registration of the session with the daemon, and the notices it
-answers); that carries no permission decision either,
+a rate-limited, fail-open registration of the session with the daemon, 2 s in total with token
+discovery included, and the notices it answers); that carries no permission decision either,
 and it is silent on every error.
 
 That silence was a real hole rather than a conservative default. The queue exists to
@@ -73,8 +73,9 @@ SESSION_ID_SHAPE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 CLAIMS_DIR_ENV = "NUCLEOS_CLAIMS_DIR"
 # Switched off by ANY non-empty value ("1", "0" and "off" alike); only unset or empty leaves it on.
 CLAIMS_OFF_ENV = "NUCLEOS_CLAIMS_OFF"
-# Never more than this: the registration is its OWN request, apart from the git path (30 s, fails
-# closed). A claim must never be able to slow a tool call or stop one.
+# Never more than this IN TOTAL: token discovery (at most 1 s) and the HTTP call share it. The
+# registration is its OWN request, apart from the git path (30 s, fails closed). A claim must never
+# be able to slow a tool call or stop one.
 CLAIMS_TIMEOUT_SECONDS = 2
 # The token costs a git call and a process spawn when it is not in the environment, and this hook
 # runs before and after every tool call. The lease is 30 minutes, so one registration every 20
@@ -148,19 +149,34 @@ def governed_git_verb(command: str) -> str:
 CLAIMED_LAND_OVERRIDE = "nucleos_allow_claimed_land"
 
 
-def claimed_land_override(payload: dict) -> bool:
-    """Whether this tool call mentions the owner's land override, however it is spelled.
+# The forms that SET a variable, on text already stripped and lower-cased: `NAME=`, `NAME =`,
+# `env:NAME` (also `$env:NAME` and `Set-Item env:NAME`), `export NAME`, `env NAME`, `set NAME`,
+# `-e NAME`. A bare mention (`rg NAME`, `git commit -m "... NAME ..."`, a doc) is not one.
+_CLAIMED_LAND_SETTING = re.compile(
+    r"(?<![a-z0-9_])(?:(?:env:|export\s+|env\s+|set\s+|-e\s+)" + CLAIMED_LAND_OVERRIDE
+    + r"|" + CLAIMED_LAND_OVERRIDE + r"\s*=)"
+)
 
-    Deliberately over-broad, like `governed_git_verb`: quotes, backslashes and backticks are
-    dropped before looking and the match ignores case, so `NUCLEOS_ALLOW_"CLAIMED_LAND"=1` and
-    `$env:nucleos_allow_claimed_land` are both caught. A mention in an `echo` is refused too.
+
+def claimed_land_override(payload: dict) -> bool:
+    """Whether this tool call SETS the owner's land override, however it is spelled.
+
+    A speed bump, not the guard: a shell has endless ways to build a name (`n=NUCLEOS_ALLOW_CLAIMED;
+    export ${n}_LAND=1`) that no text filter catches. The real refusal lives in `nucleos-core
+    --land`, which is what honours or ignores the variable. This only stops the plain attempts.
+
+    Over-broad like `governed_git_verb` on spelling: quotes, backslashes, backticks and `+ $ { }`
+    are dropped before looking and the match ignores case, so `NUCLEOS_ALLOW_"CLAIMED_LAND"=1` and
+    `$env:nucleos_allow_claimed_land` are both caught. Narrow on form: only a setting is refused
+    (see `_CLAIMED_LAND_SETTING`), so searching for the name or writing it in a message is not.
     """
     if payload.get("tool_name") not in ("Bash", "PowerShell"):
         return False
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return False
-    return CLAIMED_LAND_OVERRIDE in re.sub(r"[\\`'\"]", "", command).lower()
+    stripped = re.sub(r"[\\`'\"+${}]", "", command).lower()
+    return _CLAIMED_LAND_SETTING.search(stripped) is not None
 
 
 def _verb_in_command(command: str) -> str:
@@ -376,20 +392,32 @@ def control_token(cwd: str) -> str:
     )
 
 
-def read_control_token(cwd: str, git_timeout=10, print_timeout=20):
+def read_control_token(cwd: str, git_timeout=10, print_timeout=20, total_timeout=None):
     """`(token, why)`: the token or None, and why none (`"repo"` or `"token"`).
 
     Raises nothing and never denies, so a caller that must stay silent (the follow-up that
     reports a settled request) can use it; `control_token` turns the failure into its denials.
+    `total_timeout`, when given, is one budget for git and every `--print-token` together; each
+    call gets the smaller of its own timeout and what is left of it.
     """
     from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
     if from_env:
         return from_env, None
 
+    deadline = None if total_timeout is None else time.monotonic() + total_timeout
+
+    def left(own):
+        if deadline is None:
+            return own
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("token discovery", total_timeout)
+        return min(own, remaining)
+
     try:
         common = subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            capture_output=True, text=True, timeout=git_timeout,
+            capture_output=True, text=True, timeout=left(git_timeout),
         )
         if common.returncode != 0:
             return None, "repo"
@@ -399,7 +427,7 @@ def read_control_token(cwd: str, git_timeout=10, print_timeout=20):
             if os.path.exists(binary):
                 printed = subprocess.run(
                     [binary, "--print-token"], capture_output=True, text=True,
-                    timeout=print_timeout,
+                    timeout=left(print_timeout),
                 )
                 if printed.returncode == 0 and printed.stdout.strip():
                     return printed.stdout.strip(), None
@@ -634,6 +662,10 @@ def claims_exchange(payload, want_incidents=False, force=False, now=None):
     None means "nothing to say": switched off, a governed run, an id or cwd it cannot use, the rate
     limit, a daemon that is down (retried after a minute), or a project that is not registered
     (answered, but asked again only after five). Nothing here can raise, deny or approve.
+
+    One total budget of CLAIMS_TIMEOUT_SECONDS covers token discovery (at most 1 s of it) and the
+    HTTP call. `force` skips the rate limit, but not the error backoff: only a previous exchange
+    that succeeded lets it through, so a dead daemon is not retried on every forced call.
     """
     try:
         if claims_off() or os.environ.get("NUCLEOS_RUN_ID") is not None:
@@ -647,12 +679,14 @@ def claims_exchange(payload, want_incidents=False, force=False, now=None):
             return None
         now = time.time() if now is None else now
         state = _claims_state(path)
-        if not force and now < _number(state.get("next")):
+        if now < _number(state.get("next")) and not (force and state.get("ok") is True):
             return None
 
-        token, _why = read_control_token(cwd, 2, 3)
+        started = time.monotonic()
+        token, _why = read_control_token(cwd, 1, 1, total_timeout=1)
         if not token:
             state["next"] = now + CLAIMS_ERROR_BACKOFF_SECONDS
+            state["ok"] = False
             _save_claims_state(path, state)
             return None
         daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
@@ -668,14 +702,17 @@ def claims_exchange(payload, want_incidents=False, force=False, now=None):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=CLAIMS_TIMEOUT_SECONDS) as response:
+            remaining = max(0.2, CLAIMS_TIMEOUT_SECONDS - (time.monotonic() - started))
+            with urllib.request.urlopen(request, timeout=remaining) as response:
                 answer = json.loads(response.read())
         except Exception:
             answer = None
         if not isinstance(answer, dict):
             state["next"] = now + CLAIMS_ERROR_BACKOFF_SECONDS
+            state["ok"] = False
             _save_claims_state(path, state)
             return None
+        state["ok"] = True
         if answer.get("registered") is not True:
             state["next"] = now + CLAIMS_UNREGISTERED_BACKOFF_SECONDS
         else:

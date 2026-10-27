@@ -43,7 +43,7 @@ from unittest import mock
 # would otherwise consume one of the replies the helpers below feed to `urlopen`.
 os.environ["NUCLEOS_CLAIMS_OFF"] = "1"
 
-ROOT =os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HOOK = os.path.join(ROOT, "core", "hooks", "ask_daemon.py")
 
 spec = importlib.util.spec_from_file_location("ask_daemon", HOOK)
@@ -1564,16 +1564,34 @@ def claimed_land_override_cases():
         ("env", payload("Bash", f"env {CLAIMED_LAND}=1 nucleos-core --land")),
         ("powershell", payload("PowerShell", f"$env:{CLAIMED_LAND}='1'; nucleos-core --land")),
         ("quoted and escaped", payload("Bash", f"\"{CLAIMED_LAND[:10]}\"{CLAIMED_LAND[10:]}=1 nucleos-core --land")),
+        ("backslash", payload("Bash", f"{CLAIMED_LAND[:10]}\\{CLAIMED_LAND[10:]}=1 nucleos-core --land")),
+        ("backtick", payload("PowerShell", f"$env:{CLAIMED_LAND[:10]}`{CLAIMED_LAND[10:]}='1'")),
+        ("plus", payload("PowerShell", f"$env:{CLAIMED_LAND[:10]}'+'{CLAIMED_LAND[10:]}='1'")),
+        ("dollar", payload("Bash", f"{CLAIMED_LAND[:10]}$'{CLAIMED_LAND[10:]}'=1 nucleos-core --land")),
+        ("braces", payload("Bash", f"{CLAIMED_LAND[:10]}{{{CLAIMED_LAND[10:]}}}=1 nucleos-core --land")),
+        ("spaced equals", payload("Bash", f"{CLAIMED_LAND} = 1")),
+        ("set", payload("Bash", f"set {CLAIMED_LAND}=1")),
+        ("Set-Item", payload("PowerShell", f"Set-Item env:{CLAIMED_LAND} 1")),
+        ("docker -e", payload("Bash", f"docker run -e {CLAIMED_LAND} img")),
         ("lower case", payload("Bash", f"{CLAIMED_LAND.lower()}=1 nucleos-core --land")),
     ]
     for label, p in refused:
         results.append((f"claimed land override, {label}", None if hook.claimed_land_override(p) else "was not recognised"))
     allowed = [
         ("plain land", payload("Bash", "nucleos-core --land")),
+        ("rg mention", payload("Bash", f"rg {CLAIMED_LAND} core/src")),
+        ("grep mention", payload("Bash", f"grep -rn {CLAIMED_LAND.lower()} docs")),
+        ("git commit mention", payload("Bash", f"{G} commit -m 'document {CLAIMED_LAND}'")),
+        ("echo mention", payload("Bash", f"echo the {CLAIMED_LAND} variable")),
         ("another tool", {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": CLAIMED_LAND}}),
     ]
     for label, p in allowed:
         results.append((f"claimed land override, {label}", "was refused" if hook.claimed_land_override(p) else None))
+    # Known limit, documented rather than fixed: the filter is a speed bump, and a name assembled
+    # at run time is not caught here. `nucleos-core --land` is the real refusal.
+    built = payload("Bash", f"n={CLAIMED_LAND[:-5]}; export ${{n}}_LAND=1")
+    results.append(("claimed land override, known limit: a name built at run time is not caught",
+                    "now caught; update the docstring" if hook.claimed_land_override(built) else None))
 
     # Through main(): an interactive session and a governed run are both refused before the daemon
     # is asked anything.
