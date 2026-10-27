@@ -129,8 +129,8 @@ pub fn decide(facts: &Facts<'_>, incident: Option<&Incident>, branch_has_red_sin
     if branch_has_red_since == Some(false) {
         let since = incident.red_since_sha.as_deref().map(short).unwrap_or_default();
         return own(Some(format!(
-            "your branch predates the break (it does not contain {since}); rebase to check whether this \
-             red is yours"
+            "your branch predates the break: it branched before the red was proven at {since}, so it \
+             does not contain that commit; rebase to check whether this red is yours"
         )));
     }
     let id = incident.task_id;
@@ -314,17 +314,37 @@ async fn try_apply(
     }
     let fresh = freshness == Freshness::Fresh;
 
+    let mut suspects_read = true;
     let suspects = match stored.suspects.clone() {
         Some(known) => known,
-        None => {
-            let found = suspects_of(pool, request, &project_root, ticket, &failed, deadline).await;
-            stored.suspects = Some(found.clone());
-            found
-        }
+        None => match suspects_of(pool, request, &project_root, ticket, &failed, deadline).await {
+            Some(found) => {
+                stored.suspects = Some(found.clone());
+                found
+            }
+            // Could not read: nobody is suspect for this call, and nothing is cached.
+            None => {
+                suspects_read = false;
+                failed.iter().map(|&index| (index, false)).collect()
+            }
+        },
     };
 
-    let mut classes =
-        decide_units(&mut stored, ticket, &failed, &suspects, incident.as_ref(), fresh, worktree, deadline).await;
+    // A git read that failed (as opposed to one that found nothing) must not be remembered nor
+    // finalised: the draft stays open so a later read retries it.
+    let mut unread = !suspects_read;
+    let mut classes = decide_units(
+        &mut stored,
+        ticket,
+        &failed,
+        &suspects,
+        incident.as_ref(),
+        fresh,
+        worktree,
+        deadline,
+        &mut unread,
+    )
+    .await;
 
     // Units that need a master proof share ONE proof of all their groups.
     let needing: Vec<usize> = (0..classes.len()).filter(|&i| classes[i] == Class::NeedsProbe).collect();
@@ -353,9 +373,18 @@ async fn try_apply(
                 // proved at the master head by definition, so it is fresh when `checked_sha` says so.
                 let proved_fresh = head.as_deref().is_some_and(|h| row.checked_sha.as_deref() == Some(h));
                 let subset: Vec<usize> = needing.iter().map(|&i| failed[i]).collect();
-                let redone =
-                    decide_units(&mut stored, ticket, &subset, &suspects, Some(&row), proved_fresh, worktree, deadline)
-                        .await;
+                let redone = decide_units(
+                    &mut stored,
+                    ticket,
+                    &subset,
+                    &suspects,
+                    Some(&row),
+                    proved_fresh,
+                    worktree,
+                    deadline,
+                    &mut unread,
+                )
+                .await;
                 for (&i, class) in needing.iter().zip(redone) {
                     classes[i] = class;
                 }
@@ -363,7 +392,7 @@ async fn try_apply(
         }
     }
 
-    stored.done = !classes.iter().any(|class| matches!(class, Class::Pending { .. }));
+    stored.done = !unread && !classes.iter().any(|class| matches!(class, Class::Pending { .. }));
     stored.classes = failed.iter().copied().zip(classes).map(|(index, class)| UnitClass { index, class }).collect();
     persist(pool, request.id, &stored).await;
     stored.apply_to(ticket);
@@ -404,11 +433,19 @@ async fn decide_units(
     fresh: bool,
     worktree: &Path,
     deadline: Instant,
+    unread: &mut bool,
 ) -> Vec<Class> {
     let incident = row.map(|row| Incident::from_row(row, fresh));
     let branch_has = match incident.as_ref().and_then(|inc| inc.red_since_sha.as_deref()) {
         Some(since) if incident.as_ref().is_some_and(|inc| inc.status != Status::Probing) => {
-            Some(contains(stored, worktree, since, deadline).await)
+            match contains(stored, worktree, since, deadline).await {
+                Some(found) => Some(found),
+                // Unreadable: the side that never masks a failure, but not remembered.
+                None => {
+                    *unread = true;
+                    Some(false)
+                }
+            }
         }
         _ => None,
     };
@@ -431,20 +468,21 @@ async fn decide_units(
         .collect()
 }
 
-/// Does the verified worktree's HEAD contain `sha`? Memoised; any doubt (a sha that is not hex, a
-/// git error) is "no", which is the side that never masks a failure.
-async fn contains(stored: &mut Classification, worktree: &Path, sha: &str, deadline: Instant) -> bool {
+/// Does the verified worktree's HEAD contain `sha`? Memoised. A sha that is not hex is a settled
+/// "no"; a git error is `None` (could not read) and is neither remembered nor taken as an answer.
+async fn contains(stored: &mut Classification, worktree: &Path, sha: &str, deadline: Instant) -> Option<bool> {
     if let Some(known) = stored.contains.get(sha) {
-        return *known;
+        return Some(*known);
     }
     let hex = (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit());
-    let found = hex && resolve::is_ancestor(worktree, sha, "HEAD", deadline).await.unwrap_or(false);
+    let found = if hex { resolve::is_ancestor(worktree, sha, "HEAD", deadline).await.ok()? } else { false };
     stored.contains.insert(sha.to_owned(), found);
-    found
+    Some(found)
 }
 
 /// Which failed units are in a group the session's diff did not select (case 2's "suspect").
-/// Anything that cannot be read -- no map, no base, a git error -- makes nobody suspect.
+/// No usable map makes nobody suspect (a settled answer). `None` means a read failed (budget,
+/// missing worktree, base or diff error): the caller must neither cache nor finalise on it.
 async fn suspects_of(
     pool: &SqlitePool,
     request: &RequestRow,
@@ -452,24 +490,25 @@ async fn suspects_of(
     ticket: &Ticket,
     failed: &[usize],
     deadline: Instant,
-) -> BTreeMap<usize, bool> {
+) -> Option<BTreeMap<usize, bool>> {
     let none = || failed.iter().map(|&index| (index, false)).collect::<BTreeMap<_, _>>();
     let worktree = PathBuf::from(&request.worktree);
     let map = {
         let worktree = worktree.clone();
         match tokio::task::spawn_blocking(move || tests_map::load(&worktree)).await {
             Ok(MapState::Valid(map)) => map,
-            _ => return none(),
+            Ok(_) => return Some(none()),
+            Err(_) => return None,
         }
     };
     let base = match ticket.base.clone() {
         Some(base) => base,
         None => match resolve::resolve_base(pool, &request.project_id, project_root, &worktree, None, deadline).await {
             Ok(base) => base,
-            Err(_) => return none(),
+            Err(_) => return None,
         },
     };
-    let Ok(changed) = resolve::changed_paths(&worktree, &base, deadline).await else { return none() };
+    let Ok(changed) = resolve::changed_paths(&worktree, &base, deadline).await else { return None };
     let fillable = {
         let (worktree, changed) = (worktree.clone(), changed.clone());
         tokio::task::spawn_blocking(move || test_select::vet(&worktree, &changed)).await.unwrap_or_default()
@@ -477,13 +516,15 @@ async fn suspects_of(
     // An empty diff selects nothing, so every group is "untouched by the session": suspect.
     let picked: BTreeSet<String> =
         test_select::select(&map, &changed, &fillable, false).units.into_iter().map(|unit| unit.group).collect();
-    failed
-        .iter()
-        .map(|&index| {
-            let suspect = ticket.units[index].group.as_deref().is_some_and(|group| !picked.contains(group));
-            (index, suspect)
-        })
-        .collect()
+    Some(
+        failed
+            .iter()
+            .map(|&index| {
+                let suspect = ticket.units[index].group.as_deref().is_some_and(|group| !picked.contains(group));
+                (index, suspect)
+            })
+            .collect(),
+    )
 }
 
 /// Whether an open/claimed incident was checked against today's master head.
@@ -728,6 +769,17 @@ mod pure_tests {
         let inc = incident(Status::Open, &["a::boom"], &["core"], Some("s0"));
         let note = task_note(decide(&facts("core", &ids, true), Some(&inc), Some(false)));
         assert!(note.contains("rebase") && note.contains("s0"), "{note}");
+    }
+
+    #[test]
+    fn a_branch_from_before_the_red_was_proven_is_not_inherited_and_says_so() {
+        // `red_since_sha` is the head the red was first proven at: a session branched earlier does
+        // not contain it. Spec section 3 Verify: its failure, with a rebase note.
+        let ids = failed(&["a::boom"]);
+        let inc = incident(Status::Claimed, &["a::boom"], &["core"], Some("abcdef0123456789"));
+        let note = task_note(decide(&facts("core", &ids, false), Some(&inc), Some(false)));
+        assert!(note.contains("before the red was proven") && note.contains("abcdef0123"), "{note}");
+        assert!(note.contains("rebase"), "{note}");
     }
 
     #[test]

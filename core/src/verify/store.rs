@@ -179,10 +179,19 @@ pub async fn set_classification(
     Ok(())
 }
 
-/// Stores a draft classification; it never claims an incident.
+/// Stores a draft classification; it never claims an incident. Writers race (a poll and a reader),
+/// so `reprobes` is merged with max inside the one UPDATE: a stale writer cannot reset it.
 pub async fn set_classification_draft(pool: &SqlitePool, id: i64, json: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE verify_requests SET classification = ? WHERE id = ?")
-        .bind(json)
+    sqlx::query(
+        "UPDATE verify_requests SET classification = CASE \
+           WHEN json_valid(?1) AND json_valid(classification) \
+             AND json_type(classification, '$.reprobes') = 'integer' \
+             AND json_extract(classification, '$.reprobes') > COALESCE(json_extract(?1, '$.reprobes'), 0) \
+           THEN json_set(?1, '$.reprobes', json_extract(classification, '$.reprobes')) \
+           ELSE ?1 END \
+         WHERE id = ?2",
+    )
+    .bind(json)
         .bind(id)
         .execute(pool)
         .await?;
@@ -420,6 +429,43 @@ mod tests {
         let done = get_request(&pool, id).await.unwrap().unwrap();
         assert_eq!(done.inherited_task_ids, [3, 5]);
         assert_eq!(done.probe_outcome.as_deref(), Some(r#"{"task_id":4,"result":"passed"}"#));
+    }
+
+    #[tokio::test]
+    async fn two_draft_writers_never_lower_reprobes() {
+        let pool = test_pool().await;
+        let id = insert_request(
+            &pool,
+            &NewRequest {
+                project_id: "alpha",
+                worktree: "/wt",
+                kind: "test",
+                scope: "own",
+                base: None,
+                priority: 0,
+                caller: "owner",
+                note: None,
+                unclaimed: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let reprobes = |row: Option<String>| -> i64 {
+            let value: serde_json::Value = serde_json::from_str(&row.unwrap()).unwrap();
+            value["reprobes"].as_i64().unwrap()
+        };
+        // Writer A started the re-proof; writer B read before that and writes a stale draft.
+        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":1}"#).await.unwrap();
+        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":0,"contains":{"abc":true}}"#)
+            .await
+            .unwrap();
+        let row = get_request(&pool, id).await.unwrap().unwrap();
+        assert_eq!(reprobes(row.classification.clone()), 1, "the stale writer must not reset reprobes");
+        assert!(row.classification.unwrap().contains("\"abc\""), "the rest of the draft is last-writer");
+        // A higher count still goes through.
+        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":2}"#).await.unwrap();
+        let row = get_request(&pool, id).await.unwrap().unwrap();
+        assert_eq!(reprobes(row.classification), 2);
     }
 
     #[tokio::test]
