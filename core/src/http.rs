@@ -56,6 +56,7 @@ mod proposals;
 mod relay;
 mod repo;
 mod run_queue;
+mod tasks;
 mod team;
 mod workflows;
 
