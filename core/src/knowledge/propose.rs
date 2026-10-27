@@ -262,6 +262,130 @@ pub async fn propose_in_with(
     Ok((knowledge_id, proposal_id))
 }
 
+/// A new pending proposal for a row that lost its question (a covered candidate coming back). The expired
+/// proposal stays as it is: its history says what happened. Nothing is committed here.
+pub async fn reopen_proposal_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    knowledge_id: i64,
+) -> sqlx::Result<i64> {
+    let (kind, title, body, supersedes, scope_kind, scope_id): (
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT kind, title, body, supersedes, scope_kind, scope_id FROM knowledge WHERE id = ?",
+    )
+    .bind(knowledge_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let project_id = if scope_kind == "project" {
+        scope_id
+    } else {
+        None
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let tool_input = serde_json::json!({
+        "refinement_id": knowledge_id,
+        "kind": kind,
+        "title": title,
+        "body": body,
+        "supersedes": supersedes,
+    })
+    .to_string();
+    let proposal_id = sqlx::query(
+        "INSERT INTO proposals
+           (kind, status, run_id, session_id, project_id, tool_name, reasoning, tool_input,
+            created_at, decided_at)
+         VALUES ('refinement', 'pending', NULL, NULL, ?, NULL,
+                 'restored: the general lesson that covered it was reverted', ?, ?, NULL)",
+    )
+    .bind(project_id.as_deref())
+    .bind(&tool_input)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, NULL, 'pending', 'created', ?)",
+    )
+    .bind(proposal_id)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE knowledge SET proposal_id = ? WHERE id = ?")
+        .bind(proposal_id)
+        .bind(knowledge_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(proposal_id)
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reopening_gives_an_archived_candidate_a_fresh_pending_proposal() {
+        let pool = crate::testdb::fresh_pool().await;
+        let mut tx = pool.begin().await.unwrap();
+        let (id, old) = propose_in_with(
+            &mut tx,
+            Declaration {
+                project_id: Some("alpha"),
+                origin_run_id: None,
+                kind: Kind::Prompt,
+                title: "Use PATH",
+                body: "b",
+                reasoning: "seeded",
+                supersedes: None,
+            },
+            &Provenance {
+                source: Some("distiller"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE proposals SET status = 'expired' WHERE id = ?")
+            .bind(old)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let fresh = reopen_proposal_in(&mut tx, id).await.unwrap();
+        tx.commit().await.unwrap();
+
+        assert_ne!(fresh, old);
+        let (status, kind, project): (String, String, Option<String>) =
+            sqlx::query_as("SELECT status, kind, project_id FROM proposals WHERE id = ?")
+                .bind(fresh)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (status.as_str(), kind.as_str(), project.as_deref()),
+            ("pending", "refinement", Some("alpha"))
+        );
+        let linked: i64 = sqlx::query_scalar("SELECT proposal_id FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(linked, fresh);
+        let created: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proposal_events WHERE proposal_id = ? AND note = 'created'",
+        )
+        .bind(fresh)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(created, 1);
+    }
+}
+
 /// How many runs a distilled episode may go unconfirmed before it expires - the consolidator's
 /// trial, spec `destilador` section 3.
 pub const DISTILLED_TRIAL_RUNS: i64 = 50;
