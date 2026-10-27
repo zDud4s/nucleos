@@ -4025,7 +4025,14 @@ mod tests {
             "the proof worktree must never be swept"
         );
         assert_eq!(owner_from_dir_name("postgate-repo"), None);
-        assert_eq!(owner_from_dir_name("postgate-probe-repo"), None);
+        assert_eq!(owner_from_dir_name("probe-repo"), None);
+        // A project named `probe-repo` has the postgate tree `postgate-probe-repo`; the proof tree
+        // of the project `repo` must not be that directory.
+        let lookalike = container.path().join("probe-repo");
+        assert_ne!(
+            crate::verify::probe::probe_worktree(&project_root),
+            crate::verify::postgate::postgate_worktree(&lookalike)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
