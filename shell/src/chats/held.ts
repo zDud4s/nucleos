@@ -20,6 +20,12 @@ import type { Attachment } from "../data/chats";
 export interface HeldMessage {
   text: string;
   images: Attachment[];
+  /**
+   * The text is a slash command line, to go out on the command route rather than as a message.
+   * Absent means a plain message. When more is appended to something held, the first part decides:
+   * the text still starts with whatever was held first.
+   */
+  command?: boolean;
 }
 
 const held = new Map<string, HeldMessage>();
@@ -39,6 +45,8 @@ export function holdMessage(chatId: string, message: HeldMessage, maxImages = In
           text: [was.text, message.text].filter((part) => part !== "").join("\n\n"),
           images: [...was.images, ...message.images].slice(0, maxImages),
         };
+  const command = was === undefined ? message.command : was.command;
+  if (command === true) next.command = true;
   held.set(chatId, next);
   changed();
 }

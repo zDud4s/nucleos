@@ -33,6 +33,16 @@ describe("held messages", () => {
     expect(heldMessage("c-1")?.text).toBe("look");
   });
 
+  it("held marks a slash command line, and the first thing held decides what the whole is", () => {
+    holdMessage("c-1", { text: "/frob it", images: [], command: true });
+    holdMessage("c-1", { text: "and more", images: [] });
+    holdMessage("c-2", { text: "plain first", images: [] });
+    holdMessage("c-2", { text: "/frob", images: [], command: true });
+
+    expect(heldMessage("c-1")).toEqual({ text: "/frob it\n\nand more", images: [], command: true });
+    expect(heldMessage("c-2")?.command).toBeUndefined();
+  });
+
   it("hands the words out exactly once", () => {
     holdMessage("c-1", { text: "once", images: [] });
 

@@ -12,8 +12,10 @@ import {
   type RefObject,
   type SetStateAction,
 } from "react";
-import { createPortal } from "react-dom";
+import { createPortal, flushSync } from "react-dom";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { keys } from "../data/keys";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -50,8 +52,12 @@ import {
   X,
 } from "lucide-react";
 import { isApiRefusal } from "../data/client";
+import { SlashCard, sourceLabel } from "../chats/SlashCard";
 import {
   useArchiveChat,
+  useChatCommand,
+  type CommandCard,
+  type CommandRefusal,
   useAssistantModels,
   useModelGroups,
   useChatTranscript,
@@ -122,8 +128,7 @@ import { ComposerBox } from "../chats/ComposerBox";
 import {
   commandAt,
   mentionAt,
-  orchestratePrompt,
-  orchestrateTask,
+  slashEscape,
   withCommand,
   withMention,
 } from "../lib/mention";
@@ -990,9 +995,19 @@ function ChatDetail({
    * stands in for a missing project, and the composer when somebody speaks before choosing one.
    */
   const [picking, setPicking] = useState(false);
+  const projectRead = useChatProject(chatId).data;
+  /**
+   * Set when the daemon answered a slash command with `needs_project` while the last project read
+   * still named a directory. The daemon is the authority, so the conversation is treated as unrooted
+   * (the composer holds, `Project` offers the picker) without writing a guess into the cache; the
+   * read is invalidated instead. Any later, different read of the project, or a project chosen in
+   * the picker, supersedes it.
+   */
+  const [refusedRoot, setRefusedRoot] = useState(false);
+  useEffect(() => setRefusedRoot(false), [projectRead]);
   // No project yet: the middle of the window is the question of where it runs (`NoProject`), and
   // "nothing has been said yet" under it would be a second, lesser sentence about the same void.
-  const unrooted = useChatProject(chatId).data?.cwd === null;
+  const unrooted = projectRead?.cwd === null || refusedRoot;
 
   // Once per chat opened, after the transcript has loaded — not on every poll
   // tick that follows. `markedSeen` is fresh per mount, and `ChatDetail` is
@@ -1048,7 +1063,13 @@ function ChatDetail({
           saveScroll(chatId, follows.current ? 0 : (box.current?.scrollTop ?? 0));
         }}
       >
-        <Project chatId={chatId} picking={picking} onPicking={setPicking} />
+        <Project
+          chatId={chatId}
+          picking={picking}
+          onPicking={setPicking}
+          refused={refusedRoot}
+          onRooted={() => setRefusedRoot(false)}
+        />
 
         {stale && <StaleNote dataUpdatedAt={transcript.dataUpdatedAt} />}
 
@@ -1094,6 +1115,8 @@ function ChatDetail({
         chat={summary}
         reuse={reuse}
         onNeedsProject={() => setPicking(true)}
+        refusedRoot={refusedRoot}
+        onRefusedRoot={() => setRefusedRoot(true)}
         runningTurn={
           (transcript.data?.turns ?? []).find((t) => turnIsLive(t.status))?.id ?? null
         }
@@ -1710,17 +1733,24 @@ function Project({
   chatId,
   picking,
   onPicking,
+  refused = false,
+  onRooted,
 }: {
   chatId: string;
   picking: boolean;
   onPicking: (open: boolean) => void;
+  /** The daemon refused a command for want of a directory: offer the picker whatever was read. */
+  refused?: boolean;
+  /** A project was chosen in the picker. */
+  onRooted?: () => void;
 }) {
   const project = useChatProject(chatId);
 
   // Nothing at all until it is known. A conversation is not "without a project" because the answer
   // has not arrived yet, and a note that appears and then retracts itself is worse than a late one.
   if (project.data === undefined) return null;
-  const { cwd, tools, workflow_missing } = project.data;
+  const { tools, workflow_missing } = project.data;
+  const cwd = refused ? null : project.data.cwd;
 
   return (
     <>
@@ -1729,7 +1759,7 @@ function Project({
           own, because "exceptions dominate, the normal disappears" and a conversation
           that is set up correctly is the normal case. */}
       {cwd === null && (
-        <NoProject chatId={chatId} picking={picking} onPicking={onPicking} />
+        <NoProject chatId={chatId} picking={picking} onPicking={onPicking} onRooted={onRooted} />
       )}
       {cwd !== null && workflow_missing === true && (
         <WorkflowMissing chatId={chatId} cwd={cwd} tools={tools} />
@@ -1974,10 +2004,12 @@ function NoProject({
   chatId,
   picking,
   onPicking,
+  onRooted,
 }: {
   chatId: string;
   picking: boolean;
   onPicking: (open: boolean) => void;
+  onRooted?: () => void;
 }) {
   const point = useSetChatProject(chatId);
   const held = useHeldMessage(chatId);
@@ -2012,7 +2044,12 @@ function NoProject({
         holding={held !== null}
         onChoose={(cwd) => {
           if (point.isPending) return;
-          point.mutate(cwd, { onSuccess: () => onPicking(false) });
+          point.mutate(cwd, {
+            onSuccess: () => {
+              onPicking(false);
+              onRooted?.();
+            },
+          });
         }}
         refusal={point.isError ? <ProjectRefusal error={point.error} /> : undefined}
       />
@@ -5465,6 +5502,8 @@ interface Choice {
   key: string;
   primary: string;
   secondary: string;
+  /** Where the choice came from, drawn as its own tag (commands only). */
+  badge?: string;
   chosen: () => void;
 }
 
@@ -5507,6 +5546,8 @@ function Composer({
   chat,
   reuse,
   onNeedsProject,
+  refusedRoot = false,
+  onRefusedRoot,
   runningTurn,
   chips,
 }: {
@@ -5517,6 +5558,10 @@ function Composer({
   reuse?: { text: string; at: number } | null;
   /** Open the project picker: something was said to a conversation that has nowhere to run. */
   onNeedsProject?: () => void;
+  /** The daemon said `needs_project` for this conversation; see `refusedRoot` in `ChatDetail`. */
+  refusedRoot?: boolean;
+  /** Report a `needs_project` answer, so the conversation is treated as unrooted from it on. */
+  onRefusedRoot?: () => void;
   /**
    * The turn of this conversation running now, or null. The box then offers "Send now", and turns
    * its send button into Stop while it is empty.
@@ -5545,16 +5590,30 @@ function Composer({
   }, [chatId, text, attached]);
   // A picture that could not be read: said beside the box, and the page left standing.
   const [attachError, setAttachError] = useState<string | null>(null);
-  // `/orchestrate` was typed where the workflow or the tools are missing: not sent, and said why.
-  const [orchestrateBlocked, setOrchestrateBlocked] = useState(false);
-  useEffect(() => setOrchestrateBlocked(false), [text]);
+  // What slash commands answered with, newest last. In memory only: never persisted, never replayed.
+  const [cards, setCards] = useState<{ id: number; card: CommandCard }[]>([]);
+  // A command the daemon refused: its sentence and the names it suggests. Cleared by the next edit.
+  const [slashError, setSlashError] = useState<CommandRefusal | null>(null);
+  // Set when a refused held command is put back in the box together with its refusal: that one
+  // change of the text is the window's, not an edit, and must not clear what it is shown with.
+  const keepSlashError = useRef(false);
+  useEffect(() => {
+    if (keepSlashError.current) {
+      keepSlashError.current = false;
+      return;
+    }
+    setSlashError(null);
+  }, [text]);
   const box = useRef<HTMLTextAreaElement | null>(null);
   const send = useSendMessage(chatId);
+  const slash = useChatCommand(chatId);
   const sayNow = useSayNow(chatId);
   const project = useChatProject(chatId);
+  const queryClient = useQueryClient();
   // Sendable only once the conversation is KNOWN to have a directory. Unknown is not "none", but
-  // it is not "some" either, and what is said while it is being read waits the half-second.
-  const rooted = project.data !== undefined && project.data.cwd !== null;
+  // it is not "some" either, and what is said while it is being read waits the half-second. A
+  // `needs_project` answer (`refusedRoot`) outranks a read that still names a directory.
+  const rooted = project.data !== undefined && project.data.cwd !== null && !refusedRoot;
   // Send now steers a running turn of a rooted conversation, and carries text only.
   const steerable = turnRunning && rooted && attached.length === 0;
   const held = useHeldMessage(chatId);
@@ -5617,6 +5676,19 @@ function Composer({
 
   const files = useChatFiles(chatId, command === null ? live(mention) : null);
   const commands = useChatCommands(chatId, live(command));
+  // The whole list, asked for as soon as the box starts with a slash (spec §4.6), so a line pasted
+  // or restored in one piece is recognised without the picker ever having been open. `/word` goes
+  // to the command route only when `word` is a name or alias in it, so a path or a slash in prose
+  // stays plain text. Keyed lower-case: the daemon matches names case-insensitively.
+  const everyCommand = useChatCommands(chatId, text.trimStart().startsWith("/") ? "" : null);
+  const knownCommands = useMemo(() => {
+    const known = new Map<string, Command>();
+    for (const entry of everyCommand.data?.commands ?? []) {
+      known.set(entry.name.toLowerCase(), entry);
+      for (const alias of entry.aliases ?? []) known.set(alias.toLowerCase(), entry);
+    }
+    return known;
+  }, [everyCommand.data]);
 
   // Writing the choice back means moving the caret, and only the element knows how. Set on the next
   // frame because React has not re-rendered the new value yet at the moment this is called.
@@ -5648,8 +5720,9 @@ function Composer({
           key: hit.name,
           primary: `/${hit.name}${hit.hint === null ? "" : ` ${hit.hint}`}`,
           // The source is worth saying: two commands can share a name, and which one runs depends
-          // on where it came from. Falls back to it when a command's file gives no description.
-          secondary: hit.description ?? hit.source,
+          // on where it came from, so it is its own tag beside the description.
+          secondary: hit.description ?? "",
+          badge: sourceLabel(hit.source, hit.kind),
           chosen: () => write(withCommand(text, command, hit.name)),
         }))
       : mention !== null && live(mention) !== null
@@ -5677,26 +5750,83 @@ function Composer({
   // A picture on its own is a message: "what is this?" is a reasonable thing to send with nothing
   // typed, and refusing it because the box is empty would be the window deciding what counts.
   const sayable =
-    (text.trim() !== "" || attached.length > 0) && !send.isPending;
+    (text.trim() !== "" || attached.length > 0) && !send.isPending && !slash.isPending;
   const sayItNow = () => {
     const outgoing = text.trim();
     if (outgoing === "" || sayNow.isPending) return;
     sayNow.mutate(outgoing, { onSuccess: () => setText("") });
   };
+  /**
+   * Run a command line on the command route. `typed` is a line from the box, which is left alone
+   * until the daemon has answered (a refusal keeps the words as typed); otherwise it is a held line
+   * going out by itself, and a refusal puts it back in the box beside whatever is there now.
+   */
+  const runCommand = (line: string, typed: boolean) => {
+    setSlashError(null);
+    slash.mutate(line, {
+      onSuccess: (result) => {
+        if (result.kind === "card") {
+          const card = result.card;
+          setCards((was) => [...was, { id: (was[was.length - 1]?.id ?? 0) + 1, card }]);
+        }
+        if (typed) {
+          setText("");
+          clearDraft(chatId);
+        }
+      },
+      onError: (error) => {
+        if (isApiRefusal(error) && error.status === 409 && error.code === "needs_project") {
+          // Held like a plain message that has no project; see `held.ts`. The daemon has just said
+          // this conversation has no directory, whatever this window last read. The read is asked
+          // again rather than overwritten with a guess, and the refusal is committed BEFORE the
+          // hold lands: the hold re-renders this box at once, and the effect below would otherwise
+          // send the line straight back out while the box still believed in a directory.
+          flushSync(() => onRefusedRoot?.());
+          void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+          holdMessage(chatId, { text: line, images: [], command: true }, MAX_PICTURES);
+          if (typed) {
+            setText("");
+            clearDraft(chatId);
+          }
+          onNeedsProject?.();
+          return;
+        }
+        if (!typed) {
+          keepSlashError.current = true;
+          setText((was) => (was === "" ? line : `${line}\n\n${was}`));
+        }
+        if (!isApiRefusal(error)) {
+          setSlashError({ detail: `The ${DAEMON_NAME} is not responding. Nothing was sent` });
+          return;
+        }
+        const body = (error.body ?? {}) as CommandRefusal;
+        setSlashError({ ...body, detail: body.detail ?? error.detail });
+      },
+    });
+  };
   const say = () => {
     if (!sayable) return;
-    // `/orchestrate <task>` goes out as a request to run the skill, not as raw text: the CLI's own
-    // slash expansion was only measured for `claude -p`.
-    const task = orchestrateTask(text);
-    const outgoing = task === null ? text.trim() : orchestratePrompt(task);
-    if (
-      task !== null &&
-      rooted &&
-      (project.data?.tools !== true || project.data?.workflow_missing === true)
-    ) {
-      setOrchestrateBlocked(true);
+    const trimmed = text.trim();
+    // `/name ...` with a name the daemon listed runs on the command route. `//x` is a literal `/x`
+    // and anything else starting with a slash (a path, a slash in prose) is plain text.
+    const typedName = /^\/([^\s/]\S*)/.exec(trimmed)?.[1];
+    const known =
+      typedName === undefined ? undefined : knownCommands.get(typedName.toLowerCase());
+    if (known !== undefined && attached.length === 0) {
+      // A built-in runs anywhere. Anything else may expand into a turn, and a conversation does
+      // not start before it knows where it runs: held, marked as a command, exactly as a message.
+      if (known.source !== "builtin" && !rooted) {
+        setSlashError(null);
+        holdMessage(chatId, { text: trimmed, images: [], command: true }, MAX_PICTURES);
+        setText("");
+        clearDraft(chatId);
+        if (project.data !== undefined) onNeedsProject?.();
+        return;
+      }
+      runCommand(trimmed, true);
       return;
     }
+    const outgoing = slashEscape(trimmed);
     if (!rooted) {
       // Not sent: a conversation does not start before it knows where it runs. See `held.ts`.
       holdMessage(chatId, { text: outgoing, images: attached }, MAX_PICTURES);
@@ -5722,13 +5852,38 @@ function Composer({
     );
   };
 
+  // A suggested name replaces the one that was typed, and the caret lands just after it. After
+  // `/help <name>` (or `/commands <name>`) the name that was not found is the argument, so the
+  // suggestion replaces that and the command asked with stays.
+  const suggest = (name: string) => {
+    const asked = /^(\s*\/(\S+)\s+)(\S+)/.exec(text);
+    if (asked !== null && ["help", "commands"].includes(asked[2].toLowerCase())) {
+      const head = asked[1];
+      write({
+        text: `${head}${name}${text.slice(asked[0].length)}`,
+        caret: head.length + name.length,
+      });
+      return;
+    }
+    const lead = /^\s*/.exec(text)?.[0].length ?? 0;
+    write({
+      text: text.replace(/^(\s*)\/\S+/, `$1/${name}`),
+      caret: lead + 1 + name.length,
+    });
+  };
+
   // The held message goes out the moment there is somewhere for it to run. Taken out of the store
   // BEFORE the send, so a re-render mid-flight cannot send it twice; a send that fails puts the
   // words back in the box rather than losing them.
+  // A held command line goes back to the command route it was meant for, never out as plain text.
   useEffect(() => {
     if (!rooted || held === null) return;
     const message = takeHeld(chatId);
     if (message === null) return;
+    if (message.command === true) {
+      runCommand(message.text, false);
+      return;
+    }
     send.mutate(message, {
       onError: () => {
         setText((was) => (was === "" ? message.text : `${message.text}
@@ -5782,11 +5937,34 @@ ${was}`));
       {nowhere && (
         <Quiet compact says="this conversation has no directory, so there are no files to name here" />
       )}
-      {orchestrateBlocked && (
+      {cards.map(({ id, card }) => (
+        <SlashCard
+          key={id}
+          card={card}
+          onDismiss={() => setCards((was) => was.filter((entry) => entry.id !== id))}
+        />
+      ))}
+      {slashError !== null && (
         <Quiet
           compact
           announce
-          says="/orchestrate needs this conversation's project to have the workflow and its tools: set them up above, then send again"
+          says={slashError.detail ?? "That command was refused"}
+          action={
+            slashError.suggestions === undefined || slashError.suggestions.length === 0 ? undefined : (
+              <>
+                {slashError.suggestions.map((name) => (
+                  <button
+                    key={name}
+                    type="button"
+                    className="chats-slash-suggestion"
+                    onClick={() => suggest(name)}
+                  >
+                    /{name}
+                  </button>
+                ))}
+              </>
+            )
+          }
         />
       )}
       {choices.length > 0 && (
@@ -5965,6 +6143,9 @@ function Choices({
           >
             <span className="chats-mention-name">{choice.primary}</span>
             <span className="chats-mention-path">{choice.secondary}</span>
+            {choice.badge !== undefined && (
+              <span className="chats-mention-source">{choice.badge}</span>
+            )}
           </button>
         </li>
       ))}
