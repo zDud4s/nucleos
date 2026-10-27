@@ -109,6 +109,10 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
                 >
                   knowledge {ref.id}
                 </Button>
+              ) : ref.t === "note" ? (
+                <Link to="/brain" search={{ item: `note:${String(ref.id)}` }}>
+                  note #{ref.id}
+                </Link>
               ) : (
                 <span>
                   {ref.t} {ref.id}

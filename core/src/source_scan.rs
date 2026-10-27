@@ -112,6 +112,19 @@ fn declares_test_only_mod(source: &str, stem: &str) -> bool {
     })
 }
 
+/// `source` up to its test module. Cut at the test module itself, not at any `#[cfg(test)]`:
+/// a test-only helper above it would otherwise hide the production code that follows from
+/// the sweep.
+pub fn production_code(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let end = lines
+        .windows(2)
+        .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests"))
+        .unwrap_or(lines.len());
+    lines[..end].join("
+")
+}
+
 fn is_rust(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("rs")
 }

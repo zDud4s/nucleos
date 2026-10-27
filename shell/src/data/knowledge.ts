@@ -89,6 +89,7 @@ export const EVIDENCE_TAGS = [
   "proposal",
   "knowledge",
   "chat",
+  "note",
   "project",
   "command",
   "gate",

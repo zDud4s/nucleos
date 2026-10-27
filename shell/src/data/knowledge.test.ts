@@ -75,6 +75,18 @@ describe("parseEvidence", () => {
     expect(parseEvidence(JSON.stringify([{ t: "mystery", id: 7 }]))).toEqual([]);
   });
 
+  it("parseEvidence keeps note refs and still drops unknown tags", () => {
+    const raw = JSON.stringify([
+      { t: "knowledge", id: 3 },
+      { t: "note", id: 11 },
+      { t: "nope", id: 1 },
+    ]);
+    expect(parseEvidence(raw)).toEqual([
+      { t: "knowledge", id: 3 },
+      { t: "note", id: 11 },
+    ]);
+  });
+
   it("parseEvidence keeps a job reference", () => {
     expect(parseEvidence('[{"t":"job","id":7},{"t":"run","id":3}]')).toEqual([
       { t: "job", id: 7 },
