@@ -112,8 +112,9 @@ class Measured(Base):
         self.assertEqual((rows[0]["pred_cores"], rows[0]["pred_mem_mb"]), (1, 300))
 
 class BigWeight(Base):
-    """A class whose measured peak memory is past NUCLEOS_HEAVY_BIG_MEM_MB takes capacity - 1
-    weights: two of them never overlap, a small command still fits beside one."""
+    """With NUCLEOS_HEAVY_BIG_MEM_MB set, a class whose measured peak memory is past it takes
+    capacity - 1 weights: two of them never overlap, a small command still fits beside one.
+    Unset, no class is bumped."""
 
     def run_python(self, mem_mb: float, **extra: str) -> dict:
         (self.state / "costs.json").write_text(json.dumps({"v": 1, "classes": {
@@ -125,17 +126,21 @@ class BigWeight(Base):
         self.assertEqual(len(rows), 1, rows)
         return rows[0]
 
+    def test_off_by_default(self) -> None:
+        self.assertEqual(self.run_python(90000)["weight"], 1)
+
     def test_a_big_class_takes_capacity_minus_one(self) -> None:
-        self.assertEqual(self.run_python(9000)["weight"], 3)
+        self.assertEqual(self.run_python(9000, NUCLEOS_HEAVY_BIG_MEM_MB="5120")["weight"], 3)
 
     def test_a_small_class_keeps_its_weight(self) -> None:
-        self.assertEqual(self.run_python(1000)["weight"], 1)
+        self.assertEqual(self.run_python(1000, NUCLEOS_HEAVY_BIG_MEM_MB="5120")["weight"], 1)
 
     def test_threshold_is_configurable(self) -> None:
         self.assertEqual(self.run_python(3000, NUCLEOS_HEAVY_BIG_MEM_MB="2000")["weight"], 3)
 
     def test_never_lowers_a_weight_under_a_small_capacity(self) -> None:
-        self.assertEqual(self.run_python(9000, NUCLEOS_HEAVY_CAPACITY="1")["weight"], 1)
+        self.assertEqual(self.run_python(9000, NUCLEOS_HEAVY_CAPACITY="1",
+                                        NUCLEOS_HEAVY_BIG_MEM_MB="5120")["weight"], 1)
 
 
 class Shadow(Base):
