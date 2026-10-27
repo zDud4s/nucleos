@@ -676,6 +676,26 @@ pub async fn active_note_texts_for_project(
     .await
 }
 
+/// Vectors of the ACTIVE notes embedded by `model`, by id. Ids and vectors only: the theme clustering
+/// (spec 2026-10-22 section 6.2) needs no note text, so none is returned (section 10).
+pub async fn vectors_for_clustering(
+    pool: &SqlitePool,
+    model: &str,
+) -> sqlx::Result<Vec<(i64, Vec<f32>)>> {
+    let rows: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT e.note_id, e.dim, e.vector
+           FROM owner_note_embeddings e JOIN owner_notes n ON n.id = e.note_id
+          WHERE e.model = ? AND n.state = 'active' ORDER BY e.note_id",
+    )
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, dim, blob)| crate::embed::decode(&blob, dim).map(|v| (id, v)))
+        .collect())
+}
+
 /// Whether a target exists, for the kinds this module can answer from SQL. `None` for `project` and
 /// `file` (and anything unknown): the HTTP layer resolves those.
 pub async fn target_exists(
@@ -1267,6 +1287,37 @@ mod tests {
 
     fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
         calls_are_sanctioned(source, &[call])
+    }
+
+    #[tokio::test]
+    async fn clustering_vectors_are_the_active_notes_of_one_model_and_carry_no_text() {
+        let pool = test_pool().await;
+        let live = create(&pool, "live", "shell").await.unwrap();
+        let archived = create(&pool, "gone", "shell").await.unwrap();
+        let other = create(&pool, "other model", "shell").await.unwrap();
+        sqlx::query("UPDATE owner_notes SET state = 'archived' WHERE id = ?")
+            .bind(archived)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, model, v) in [
+            (live, "m1", [1.0_f32, 0.0]),
+            (archived, "m1", [0.0, 1.0]),
+            (other, "m2", [1.0, 1.0]),
+        ] {
+            sqlx::query(
+                "INSERT INTO owner_note_embeddings (note_id, model, dim, vector, text_hash, created_at)
+                 VALUES (?, ?, 2, ?, 'h', 't')",
+            )
+            .bind(id)
+            .bind(model)
+            .bind(crate::embed::encode(&v))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let got = vectors_for_clustering(&pool, "m1").await.unwrap();
+        assert_eq!(got, vec![(live, vec![1.0_f32, 0.0])]);
     }
 
     #[test]
