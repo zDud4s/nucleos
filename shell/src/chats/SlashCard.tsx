@@ -6,9 +6,9 @@ export function sourceLabel(source: CommandSource, kind?: Command["kind"]): stri
     source === "builtin"
       ? "built-in"
       : source === "project"
-        ? "projeto"
+        ? "project"
         : source === "personal"
-          ? "pessoal"
+          ? "personal"
           : "plugin";
   return kind === "skill" ? `skill · ${where}` : where;
 }
@@ -47,6 +47,122 @@ function EntryLine({ entry, source }: { entry: HelpEntry; source: CommandSource 
   );
 }
 
+/** Money as the cards write it: dollars and cents. */
+function usd(value: number): string {
+  return `$${value.toFixed(2)}`;
+}
+
+/** A token count with thousands separators, or nothing when the engine did not measure it. */
+function tokens(value: number | null | undefined): string | null {
+  return typeof value === "number" ? value.toLocaleString("en-US") : null;
+}
+
+const NO_MEASURE = "No measure on this engine";
+
+interface StateData {
+  text?: string;
+  stopped?: "interrupted" | "killed";
+  // context
+  engine?: string;
+  model?: string | null;
+  window_tokens?: number | null;
+  used_tokens?: number | null;
+  peak_tokens?: number | null;
+  percent?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  cache_creation_tokens?: number | null;
+  live_session?: boolean;
+  compacted?: boolean;
+  turns?: number;
+  note?: string | null;
+  // cost
+  total_usd?: number;
+  unmeasured_turns?: number;
+  since_clear_usd?: number;
+  last_turn_usd?: number | null;
+  turn_budget_usd?: number | null;
+  // effort
+  current?: string | null;
+  efforts?: string[];
+  // dirs
+  cwd?: string | null;
+  extra_dirs?: string[];
+  // budget
+  warning?: string | null;
+  global?: BudgetSnapshot | null;
+}
+
+/** The house budget as the core's `BudgetSnapshot` serializes it (snake_case, no renames). */
+interface BudgetSnapshot {
+  limit_usd: number | null;
+  period: string;
+  hourly_limit_usd?: number | null;
+  window_spend_usd: number;
+  hourly_spend_usd?: number;
+  paused: boolean;
+  reason?: string | null;
+}
+
+function ContextBody({ data }: { data: StateData }) {
+  const used = tokens(data.used_tokens);
+  const window = tokens(data.window_tokens);
+  const detail: string[] = [];
+  const peak = tokens(data.peak_tokens);
+  if (peak !== null) detail.push(`peak ${peak}`);
+  const input = tokens(data.input_tokens);
+  if (input !== null) detail.push(`${input} in`);
+  const output = tokens(data.output_tokens);
+  if (output !== null) detail.push(`${output} out`);
+  const cacheRead = tokens(data.cache_read_tokens);
+  if (cacheRead !== null) detail.push(`${cacheRead} cache read`);
+  const cacheWrite = tokens(data.cache_creation_tokens);
+  if (cacheWrite !== null) detail.push(`${cacheWrite} cache written`);
+  return (
+    <>
+      <p>
+        {[data.engine, data.model].filter((part) => part != null && part !== "").join(" · ")}
+      </p>
+      {used === null ? (
+        <p>{data.note ?? NO_MEASURE}</p>
+      ) : (
+        <p>
+          {used}
+          {window !== null ? ` of ${window}` : ""} tokens
+          {typeof data.percent === "number" ? ` (${Math.round(data.percent)}%)` : ""}
+        </p>
+      )}
+      {used !== null && data.note != null && <p>{data.note}</p>}
+      {used !== null && detail.length > 0 && <p>{detail.join(" · ")}</p>}
+      {typeof data.turns === "number" && <p>{data.turns === 1 ? "1 turn" : `${data.turns} turns`}</p>}
+      {data.compacted === true && <p>Compacted</p>}
+    </>
+  );
+}
+
+function CostBody({ data }: { data: StateData }) {
+  const total = data.total_usd ?? 0;
+  const turns = data.turns ?? 0;
+  const unmeasured = data.unmeasured_turns ?? 0;
+  const since = data.since_clear_usd;
+  return (
+    <>
+      <p>
+        Total {usd(total)} over {turns === 1 ? "1 turn" : `${turns} turns`}
+      </p>
+      {unmeasured > 0 && (
+        <p>{unmeasured === 1 ? "1 turn with no cost" : `${unmeasured} turns with no cost`}</p>
+      )}
+      {typeof since === "number" && since !== total && <p>Since clear {usd(since)}</p>}
+      {typeof data.last_turn_usd === "number" && <p>Last turn {usd(data.last_turn_usd)}</p>}
+      {typeof data.turn_budget_usd === "number" && (
+        <p>Per-turn budget {usd(data.turn_budget_usd)}</p>
+      )}
+    </>
+  );
+}
+
 /**
  * What a slash command answered with, drawn beside the transcript. Held in memory only: a card is
  * an answer to the person at the keyboard, not part of the conversation, so it is never replayed.
@@ -56,7 +172,7 @@ export function SlashCard({ card, onDismiss }: { card: CommandCard; onDismiss: (
     groups?: HelpGroup[];
     entry?: HelpEntry;
     source?: CommandSource;
-  };
+  } & StateData;
   return (
     <section className="chats-slash-card" aria-label={card.kind === "help" ? "Commands" : "Command"}>
       {card.kind === "help" &&
@@ -74,6 +190,53 @@ export function SlashCard({ card, onDismiss }: { card: CommandCard; onDismiss: (
         <ul>
           <EntryLine entry={data.entry} source={data.source ?? "builtin"} />
         </ul>
+      )}
+      {card.kind === "notice" && <p>{data.text ?? ""}</p>}
+      {card.kind === "context" && <ContextBody data={data} />}
+      {card.kind === "cost" && <CostBody data={data} />}
+      {card.kind === "effort" && (
+        <>
+          <p>Effort is {data.current ?? "not set"}</p>
+          {(data.efforts ?? []).length > 0 && <p>Levels: {(data.efforts ?? []).join(", ")}</p>}
+        </>
+      )}
+      {card.kind === "dirs" && (
+        <>
+          <p>Working directory: {data.cwd ?? "none"}</p>
+          {(data.extra_dirs ?? []).length > 0 ? (
+            <ul>
+              {(data.extra_dirs ?? []).map((dir) => (
+                <li key={dir}>{dir}</li>
+              ))}
+            </ul>
+          ) : (
+            <p>No extra directories</p>
+          )}
+        </>
+      )}
+      {card.kind === "budget" && (
+        <>
+          <p>
+            {typeof data.turn_budget_usd === "number"
+              ? `Per-turn budget ${usd(data.turn_budget_usd)}`
+              : "No per-turn budget"}
+          </p>
+          {data.global != null && typeof data.global.limit_usd === "number" && (
+            <p>
+              Global budget {usd(data.global.limit_usd)} per {data.global.period},{" "}
+              {usd(data.global.window_spend_usd)} spent
+            </p>
+          )}
+          {data.global != null && data.global.paused && (
+            <p>
+              Paused
+              {data.global.reason != null && data.global.reason !== ""
+                ? `: ${data.global.reason}`
+                : ""}
+            </p>
+          )}
+          {data.warning != null && data.warning !== "" && <p>{data.warning}</p>}
+        </>
       )}
       <button type="button" className="chats-slash-dismiss" onClick={onDismiss}>
         Dismiss

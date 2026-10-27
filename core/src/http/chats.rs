@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod builtins;
+mod builtins_config;
 mod command;
 
 pub(super) fn routes() -> Router<AppState> {
