@@ -696,6 +696,49 @@ pub async fn vectors_for_clustering(
         .collect())
 }
 
+/// Text of the ACTIVE notes among `ids`, by id. For the two sanctioned readers of spec 2026-10-22
+/// section 10 only: the theme synthesis (`themes.rs`) and the generalisation pass (`generalise.rs`),
+/// as owner context that is never quoted and never injected into an agent's prompt.
+pub async fn texts_for_ids(pool: &SqlitePool, ids: &[i64]) -> sqlx::Result<Vec<(i64, String)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let marks = vec!["?"; ids.len()].join(", ");
+    // `AssertSqlSafe`, audited: only literal `?` placeholders are interpolated, as in
+    // `embed::vectors_for`.
+    let sql = sqlx::AssertSqlSafe(format!(
+        "SELECT id, note_text FROM owner_notes WHERE state = 'active' AND id IN ({marks}) ORDER BY id"
+    ));
+    let mut q = sqlx::query_as(sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    q.fetch_all(pool).await
+}
+
+/// Active notes with cosine >= `floor` to `vector` (same `model`), best first, ties on the lower id,
+/// at most `limit`. Ids and cosines only: a caller that needs the text asks `texts_for_ids`.
+pub async fn nearest_to_vector(
+    pool: &SqlitePool,
+    model: &str,
+    vector: &[f32],
+    floor: f32,
+    limit: usize,
+) -> sqlx::Result<Vec<(i64, f32)>> {
+    let mut scored: Vec<(i64, f32)> = vectors_for_clustering(pool, model)
+        .await?
+        .into_iter()
+        .filter_map(|(id, v)| {
+            crate::embed::cosine(vector, &v)
+                .filter(|c| *c >= floor)
+                .map(|c| (id, c))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
 /// Whether a target exists, for the kinds this module can answer from SQL. `None` for `project` and
 /// `file` (and anything unknown): the HTTP layer resolves those.
 pub async fn target_exists(
@@ -1295,6 +1338,62 @@ mod tests {
 
     fn one_call_is_sanctioned(source: &str, call: &str) -> bool {
         calls_are_sanctioned(source, &[call])
+    }
+
+    #[tokio::test]
+    async fn texts_for_ids_returns_active_notes_only_in_id_order() {
+        let pool = test_pool().await;
+        let a = create(&pool, "alpha", "shell").await.unwrap();
+        let b = create(&pool, "beta", "shell").await.unwrap();
+        sqlx::query("UPDATE owner_notes SET state='archived' WHERE id = ?")
+            .bind(b)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            texts_for_ids(&pool, &[b, a, 9999]).await.unwrap(),
+            vec![(a, "alpha".to_string())]
+        );
+        assert!(texts_for_ids(&pool, &[]).await.unwrap().is_empty());
+    }
+
+    async fn embedded_note(pool: &sqlx::SqlitePool, text: &str, model: &str, v: [f32; 2]) -> i64 {
+        let id = create(pool, text, "shell").await.unwrap();
+        sqlx::query(
+            "INSERT INTO owner_note_embeddings (note_id, model, dim, vector, text_hash, created_at)
+             VALUES (?, ?, 2, ?, 'h', 't')",
+        )
+        .bind(id)
+        .bind(model)
+        .bind(crate::embed::encode(&v))
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn nearest_to_vector_gives_ids_and_cosines_above_the_floor_capped_and_ordered() {
+        let pool = test_pool().await;
+        let near = embedded_note(&pool, "n", "m", [1.0, 0.1]).await;
+        let nearer = embedded_note(&pool, "n2", "m", [1.0, 0.0]).await;
+        let _far = embedded_note(&pool, "f", "m", [0.0, 1.0]).await;
+        let _other_model = embedded_note(&pool, "o", "x", [1.0, 0.0]).await;
+        let got = nearest_to_vector(&pool, "m", &[1.0, 0.0], 0.80, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![nearer, near]
+        );
+        assert!(got[0].1 > got[1].1);
+        assert_eq!(
+            nearest_to_vector(&pool, "m", &[1.0, 0.0], 0.80, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
