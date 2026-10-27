@@ -4,7 +4,7 @@
 //! therefore runs [`extract`] on the full output (up to 1 MiB, `gate::GATE_OUTPUT_CAP`) before that
 //! tail is cut, and stores the result in `verify_runs.failed_tests`.
 //!
-//! Covered: libtest (pretty format), pytest, vitest, `go test`. Anything else, and any output whose
+//! Covered: libtest (pretty format), cargo-nextest, pytest, vitest, `go test`. Anything else, and any output whose
 //! own failure count disagrees with the lines seen or that was truncated, yields `None`: the caller
 //! then treats the unit as "no ids" and it falls to the group-level rules.
 
@@ -61,7 +61,7 @@ pub fn extract(output: &str) -> Option<Failures> {
         return None;
     }
     let mut found = Failures::default();
-    for reader in [libtest as Reader, pytest, vitest, go] {
+    for reader in [libtest as Reader, nextest, pytest, vitest, go] {
         match reader(output) {
             Reading::Absent => {}
             Reading::Incomplete => return None,
@@ -119,6 +119,70 @@ fn panic_file(location: &str) -> Option<&str> {
     let (column, line, file) = (parts.next()?, parts.next()?, parts.next()?);
     let numeric = |field: &str| !field.is_empty() && field.chars().all(|c| c.is_ascii_digit());
     (numeric(column) && numeric(line)).then_some(file)
+}
+
+/// cargo-nextest (what the core gate runs when it is installed): final-status lines
+/// `FAIL [ 0.010s] <binary-id> <test::path>`, also `LEAK-FAIL`, `EXEC-FAIL`, `TIMEOUT`, `SIGSEGV`,
+/// `SIGABRT`, `ABORT`. They print once when the test ends and again in the closing recap, so pairs
+/// of (binary, test) are deduped. `TRY n …` lines are attempts, not outcomes (a test that passes on
+/// a retry prints `TRY 1 FAIL` and no final failure), and are skipped. Confirmed by
+/// `Summary [ 1.2s] N tests run: X passed, Y failed[, Z timed out], …`: the lines seen must equal
+/// `failed` (timeouts are counted either inside it or beside it, depending on the version).
+/// The id is the test path alone; files come from `panicked at <file>:<line>:<col>`.
+fn nextest(output: &str) -> Reading {
+    const STATUSES: [&str; 7] = ["FAIL", "LEAK-FAIL", "EXEC-FAIL", "TIMEOUT", "SIGSEGV", "SIGABRT", "ABORT"];
+    let mut found = Failures::default();
+    let mut outcomes: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut timeouts: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut failed = 0usize;
+    let mut timed_out = 0usize;
+    let mut summarized = false;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Summary [")
+            && let Some((_, counts)) = rest.split_once(" run:")
+        {
+            summarized = true;
+            for part in counts.split(',') {
+                let mut words = part.split_whitespace();
+                let count = words.next().and_then(|word| word.parse::<usize>().ok()).unwrap_or(0);
+                match (words.next(), words.next()) {
+                    (Some("failed"), _) => failed += count,
+                    (Some("timed"), Some("out")) => timed_out += count,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if let Some((_, location)) = line.split_once(" panicked at ")
+            && let Some(file) = panic_file(location)
+        {
+            found.add_file(file);
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let Some(status) = words.next().filter(|word| STATUSES.contains(word)) else { continue };
+        // `[`, the duration and `]` (nextest pads the duration inside the brackets).
+        let Some((_, after)) = line.split_once(']') else { continue };
+        if !line[status.len()..].trim_start().starts_with('[') {
+            continue;
+        }
+        let mut ids = after.split_whitespace();
+        if let (Some(binary), Some(test)) = (ids.next(), ids.next()) {
+            let key = (binary.to_owned(), test.to_owned());
+            if status == "TIMEOUT" {
+                timeouts.insert(key.clone());
+            }
+            found.tests.insert(test.to_owned());
+            outcomes.insert(key);
+        }
+    }
+    if outcomes.is_empty() && !summarized {
+        return Reading::Absent;
+    }
+    let seen = outcomes.len();
+    let complete = summarized && (seen == failed || (!timeouts.is_empty() && seen == failed + timed_out));
+    if complete { Reading::Ids(found) } else if seen == 0 && failed == 0 && timed_out == 0 { Reading::Absent } else { Reading::Incomplete }
 }
 
 /// pytest: `FAILED <nodeid>[ - msg]` / `ERROR <nodeid>[ - msg]` summary lines (a node id names a
@@ -344,5 +408,49 @@ mod tests {
     fn an_application_log_line_starting_with_error_is_not_a_pytest_failure() {
         let out = "ERROR something happened\ntest a ... FAILED\ntest result: FAILED. 0 passed; 1 failed;\n";
         assert_eq!(ids(&extract(out).expect("libtest only")), ["a"]);
+    }
+
+    #[test]
+    fn nextest_failures_are_read_and_checked_against_the_summary() {
+        let out = "    Starting 4 tests across 2 binaries\n\
+                   \x20       PASS [   0.004s] nucleos-core verify::tests::ok\n\
+                   \x20       FAIL [   0.010s] nucleos-core verify::tests::boom\n\
+                   \n--- STDERR:              nucleos-core verify::tests::boom ---\n\
+                   thread 'verify::tests::boom' panicked at core/src/verify.rs:10:5:\n\
+                   assertion failed\n\
+                   \x20       FAIL [   0.011s] nucleos-app::bin/app run::tests::bang\n\
+                   ------------\n\
+                   \x20    Summary [   0.050s] 4 tests run: 2 passed, 2 failed, 0 skipped\n\
+                   \x20       FAIL [   0.010s] nucleos-core verify::tests::boom\n\
+                   \x20       FAIL [   0.011s] nucleos-app::bin/app run::tests::bang\n\
+                   error: test run failed\n";
+        let failures = extract(out).expect("ids");
+        assert_eq!(ids(&failures), ["run::tests::bang", "verify::tests::boom"]);
+        assert!(failures.files.contains("core/src/verify.rs"), "{:?}", failures.files);
+
+        // The summary says 3 failed but only 2 were seen.
+        assert_eq!(extract(&out.replace("2 failed", "3 failed")), None);
+        // No summary at all (killed run): not trusted.
+        assert_eq!(extract(&out.replace("Summary", "Other")), None);
+    }
+
+    #[test]
+    fn nextest_retries_signals_and_timeouts() {
+        let out = "\x20       TRY 1 FAIL [   0.010s] c flaky::passes_later\n\
+                   \x20       TRY 2 PASS [   0.010s] c flaky::passes_later\n\
+                   \x20       TRY 1 FAIL [   0.010s] c real::fails\n\
+                   \x20       TRY 2 FAIL [   0.010s] c real::fails\n\
+                   \x20       FAIL [   0.020s] c real::fails\n\
+                   \x20    SIGSEGV [   0.030s] c crash::segv\n\
+                   \x20    TIMEOUT [   2.000s] c slow::hangs\n\
+                   \x20     FLAKY 2/2 [   0.020s] c flaky::passes_later\n\
+                   \x20    Summary [   3.000s] 5 tests run: 1 passed, 3 failed, 0 skipped\n";
+        let failures = extract(out).expect("ids");
+        assert_eq!(ids(&failures), ["crash::segv", "real::fails", "slow::hangs"]);
+        // The same run where this version counts the timeout beside `failed`.
+        let beside = out.replace("3 failed, 0 skipped", "2 failed, 1 timed out, 0 skipped");
+        assert_eq!(ids(&extract(&beside).expect("ids")), ["crash::segv", "real::fails", "slow::hangs"]);
+        // A fully passing run reports nothing.
+        assert_eq!(extract("        PASS [ 0.1s] c a\n     Summary [ 0.1s] 1 test run: 1 passed, 0 skipped\n"), None);
     }
 }
