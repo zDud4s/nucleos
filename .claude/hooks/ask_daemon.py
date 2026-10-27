@@ -142,6 +142,27 @@ def governed_git_verb(command: str) -> str:
     return ""
 
 
+# The project owner's override of the task-claims land gate (`nucleos-core --land` reads it). It is
+# for a person at their own terminal, like NUCLEOS_ALLOW_DIRECT_GIT, but unlike that one an agent
+# must not reach it at all: a claimed task is only closed by its owner or by green.
+CLAIMED_LAND_OVERRIDE = "nucleos_allow_claimed_land"
+
+
+def claimed_land_override(payload: dict) -> bool:
+    """Whether this tool call mentions the owner's land override, however it is spelled.
+
+    Deliberately over-broad, like `governed_git_verb`: quotes, backslashes and backticks are
+    dropped before looking and the match ignores case, so `NUCLEOS_ALLOW_"CLAIMED_LAND"=1` and
+    `$env:nucleos_allow_claimed_land` are both caught. A mention in an `echo` is refused too.
+    """
+    if payload.get("tool_name") not in ("Bash", "PowerShell"):
+        return False
+    command = (payload.get("tool_input") or {}).get("command")
+    if not isinstance(command, str):
+        return False
+    return CLAIMED_LAND_OVERRIDE in re.sub(r"[\\`'\"]", "", command).lower()
+
+
 def _verb_in_command(command: str) -> str:
     """One reading of `governed_git_verb`: separators, then quote-aware and plain tokens."""
     normalized = command
@@ -1015,41 +1036,67 @@ def merged_stdout(outputs):
     return "\n\n".join(out.strip() for out in outputs)
 
 
-def bundle_hooks(payload: dict) -> None:
+def with_context(outputs, event, extra):
+    """`outputs` (bundle hook stdout) with `extra` added as context, still ONE document.
+
+    A bundle that printed a JSON object keeps it, and `extra` goes into its
+    `hookSpecificOutput.additionalContext` (Claude Code reads stdout as one document, so a second
+    object beside it would parse as neither). Otherwise `extra` is one more plain-text paragraph.
+    """
+    if not extra:
+        return outputs
+    for index, out in enumerate(outputs):
+        try:
+            parsed = json.loads(out)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            special = parsed.get("hookSpecificOutput")
+            if not isinstance(special, dict):
+                special = parsed["hookSpecificOutput"] = {}
+            special.setdefault("hookEventName", event)
+            current = special.get("additionalContext")
+            special["additionalContext"] = f"{current}\n\n{extra}" if current else extra
+            return outputs[:index] + [json.dumps(parsed)] + outputs[index + 1:]
+    return outputs + [extra]
+
+
+def bundle_hooks(payload: dict, extra: str = "") -> None:
     """Runs the hooks the project's pinned workflow bundles declare for this session event.
 
     The daemon runs them, from its library, and hands back what each did; this reproduces Claude
     Code's own reading of a hook. The first one that exited 2 blocks: its stderr is printed and
     this exits 2. Otherwise the stdout of those that printed something is printed (`merged_stdout`)
-    and this exits 0.
+    and this exits 0. `extra` (the claims text of `main`) rides in that same document, and is
+    printed even when there is no bundle, token or daemon behind the call.
 
     **Fails open, every way.** No token, no daemon, an error, an answer it cannot read, no project,
-    no pins: exit 0 with nothing printed. These events are not a tool call this daemon governs;
-    they are a workflow's own guards, and a guard that cannot be reached must not leave a session
-    that can never stop, or a prompt that can never be sent.
+    no pins: exit 0 with nothing printed (but `extra`). These events are not a tool call this
+    daemon governs; they are a workflow's own guards, and a guard that cannot be reached must not
+    leave a session that can never stop, or a prompt that can never be sent.
     """
+    results = []
     try:
         cwd = payload.get("cwd") or os.getcwd()
         token, _why = read_control_token(cwd, 2, 3)
-        if not token:
-            no_opinion()
-        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
-        request = urllib.request.Request(
-            f"{daemon_url}/hooks/bundle",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=BUNDLE_HOOKS_TIMEOUT) as response:
-            answer = json.loads(response.read())
-        results = answer.get("results") if isinstance(answer, dict) else None
-        if not isinstance(results, list):
-            no_opinion()
+        if token:
+            daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+            request = urllib.request.Request(
+                f"{daemon_url}/hooks/bundle",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=BUNDLE_HOOKS_TIMEOUT) as response:
+                answer = json.loads(response.read())
+            found = answer.get("results") if isinstance(answer, dict) else None
+            if isinstance(found, list):
+                results = found
     except Exception:
-        no_opinion()
+        results = []
 
     outputs = []
     for result in results:
@@ -1061,6 +1108,7 @@ def bundle_hooks(payload: dict) -> None:
         out = result.get("stdout")
         if isinstance(out, str) and out.strip():
             outputs.append(out)
+    outputs = with_context(outputs, payload.get("hook_event_name"), extra)
     if outputs:
         print(merged_stdout(outputs))
     sys.exit(0)
@@ -1094,7 +1142,23 @@ def main() -> None:
     # Before the run branch, which would otherwise send a `Stop` to the tool gate: these events
     # carry no tool call, and they fail open whoever's session fired them.
     if event in SESSION_EVENTS:
-        bundle_hooks(payload)
+        extra = ""
+        if event in ("UserPromptSubmit", "SessionStart") and os.environ.get("NUCLEOS_RUN_ID") is None:
+            # Forced: a prompt is rare next to tool calls, and a list that is a minute stale is not
+            # worth the rate limit. `always_list` after a compaction, which drops the context.
+            extra = claims_context(
+                payload, want_incidents=True, force=True, always_list=(event == "SessionStart"),
+            )
+        bundle_hooks(payload, extra)
+
+    # Refused for a person's session and for a governed run alike, before either is asked
+    # anything: the override belongs to the project's owner, not to an agent.
+    if payload is not None and claimed_land_override(payload):
+        deny(
+            "this variable is for the project's owner at their own terminal, not for an agent. "
+            "A branch that touches a claimed task waits for the task to close; task_list shows "
+            "who holds it."
+        )
 
     run_id_raw = os.environ.get("NUCLEOS_RUN_ID")
     if run_id_raw is None:

@@ -1492,6 +1492,112 @@ def claims_tool_call_cases():
     return cases
 
 
+def claims_prompt_cases():
+    cases = []
+    incident = "#4 master-red since 1234567: unclaimed"
+    answer = {"registered": True, "project_id": "alpha", "notices": [], "incidents": [incident]}
+    prompt = {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": "/work/repo"}
+    bundle_none = {"results": []}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, printed, _ = _run_claims_main(tmp, prompt, [answer, bundle_none])
+        good = code == 0 and incident in printed and "task_claim" in printed
+        cases.append(("a prompt lists the live incidents even when no workflow bundle has a hook", "" if good else f"{code!r} {printed!r}"))
+
+        code, printed, _ = _run_claims_main(tmp, prompt, [answer, bundle_none])
+        cases.append(("the same list is not repeated on the next prompt", "" if incident not in printed else f"{printed!r}"))
+
+        changed = dict(answer, incidents=[incident, "#5 test:a::b since 7654321: being fixed by run #9"])
+        code, printed, _ = _run_claims_main(tmp, prompt, [changed, bundle_none])
+        cases.append(("a changed list is shown again", "" if "#5" in printed else f"{printed!r}"))
+
+        start = dict(prompt, hook_event_name="SessionStart", source="compact")
+        code, printed, _ = _run_claims_main(tmp, start, [changed, bundle_none])
+        cases.append(("after a compaction the list comes back even if unchanged", "" if "#5" in printed else f"{printed!r}"))
+
+        code, printed, _ = _run_claims_main(tmp, prompt, [dict(answer, incidents=[]), bundle_none])
+        code, printed, _ = _run_claims_main(tmp, prompt, [changed, bundle_none])
+        cases.append(("a list that went empty and came back is shown again", "" if "#5" in printed else f"{printed!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bundle = {"results": [{"exit_code": 0, "stdout": "tree", "stderr": ""}]}
+        code, printed, _ = _run_claims_main(tmp, prompt, [answer, bundle])
+        cases.append(("claim context and a bundle's plain text share one document", "" if "tree" in printed and incident in printed else f"{printed!r}"))
+
+        as_json = json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "tree"}})
+        bundle = {"results": [{"exit_code": 0, "stdout": as_json, "stderr": ""}]}
+        code, printed, _ = _run_claims_main(tmp, prompt, [dict(answer, incidents=[incident + " v2"]), bundle])
+        try:
+            context = json.loads(printed)["hookSpecificOutput"]["additionalContext"]
+            failure = "" if "tree" in context and "v2" in context else f"{context!r}"
+        except Exception as exc:  # noqa: BLE001
+            failure = f"not one JSON document: {printed!r} ({exc!r})"
+        cases.append(("with a bundle that prints JSON the claim text goes inside its additionalContext", failure))
+
+        block = {"results": [{"exit_code": 2, "stdout": "", "stderr": "stop"}]}
+        with mock.patch("sys.stderr", io.StringIO()):
+            code, printed, _ = _run_claims_main(tmp, prompt, [dict(answer, incidents=[incident + " v3"]), block])
+        cases.append(("a bundle's exit 2 still blocks, and the claim text does not hide it", "" if code == 2 else f"{code!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, printed, _ = _run_claims_main(tmp, prompt, [urllib.error.URLError("down"), urllib.error.URLError("down")])
+        cases.append(("with the daemon down a prompt still goes through, silently", "" if code == 0 and printed == "" else f"{code!r} {printed!r}"))
+        stop = {"hook_event_name": "Stop", "session_id": "s1", "cwd": "/work/repo"}
+        code, printed, seen = _run_claims_main(tmp, stop, [bundle_none])
+        cases.append(("a Stop never asks about claims", "" if seen and all("/tasks/session" not in url for url in seen) else f"{seen!r}"))
+    return cases
+
+
+CLAIMED_LAND = "NUCLEOS_ALLOW_" + "CLAIMED_LAND"  # kept out of the text so this session's own hook ignores it
+
+
+def claimed_land_override_cases():
+    """The owner's land override is refused to every agent, spelled however it is spelled."""
+    results = []
+
+    def payload(tool, command, event="PreToolUse"):
+        return {"hook_event_name": event, "tool_name": tool, "tool_input": {"command": command}, "cwd": "/work/repo"}
+
+    refused = [
+        ("bash prefix", payload("Bash", f"{CLAIMED_LAND}=1 nucleos-core --land")),
+        ("export", payload("Bash", f"export {CLAIMED_LAND}=1; nucleos-core --land")),
+        ("env", payload("Bash", f"env {CLAIMED_LAND}=1 nucleos-core --land")),
+        ("powershell", payload("PowerShell", f"$env:{CLAIMED_LAND}='1'; nucleos-core --land")),
+        ("quoted and escaped", payload("Bash", f"\"{CLAIMED_LAND[:10]}\"{CLAIMED_LAND[10:]}=1 nucleos-core --land")),
+        ("lower case", payload("Bash", f"{CLAIMED_LAND.lower()}=1 nucleos-core --land")),
+    ]
+    for label, p in refused:
+        results.append((f"claimed land override, {label}", None if hook.claimed_land_override(p) else "was not recognised"))
+    allowed = [
+        ("plain land", payload("Bash", "nucleos-core --land")),
+        ("another tool", {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": CLAIMED_LAND}}),
+    ]
+    for label, p in allowed:
+        results.append((f"claimed land override, {label}", "was refused" if hook.claimed_land_override(p) else None))
+
+    # Through main(): an interactive session and a governed run are both refused before the daemon
+    # is asked anything.
+    for run_id in (None, "7"):
+        captured = io.StringIO()
+        env = {"NUCLEOS_DAEMON_URL": "http://127.0.0.1:1", "NUCLEOS_DAEMON_TOKEN": "tok"}
+        if run_id:
+            env["NUCLEOS_RUN_ID"] = run_id
+        code = "no exit"
+        with mock.patch.dict(os.environ, env):
+            if not run_id:
+                os.environ.pop("NUCLEOS_RUN_ID", None)
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(payload("Bash", f"{CLAIMED_LAND}=1 nucleos-core --land")))):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=AssertionError("asked the daemon")):
+                    with mock.patch("sys.stdout", captured):
+                        try:
+                            hook.main()
+                        except SystemExit as exit_:
+                            code = exit_.code
+        blocked = '"block"' in captured.getvalue() and code == 0
+        results.append((f"claimed land override through main, run={run_id}", None if blocked else f"printed {captured.getvalue()!r}, exit {code}"))
+    return results
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -1533,6 +1639,8 @@ def main() -> int:
         + session_start_cases()
         + claims_exchange_cases()
         + claims_tool_call_cases()
+        + claims_prompt_cases()
+        + claimed_land_override_cases()
     ):
         total += 1
         if failure:
