@@ -480,9 +480,10 @@ def _env_pos(name: str, default: float) -> float:
 def admission_mode() -> str:
     if os.environ.get("NUCLEOS_HEAVY_CAPACITY", "").strip():
         return "static"
-    if os.environ.get("NUCLEOS_HEAVY_ADMISSION", "").strip().lower() == "static":
-        return "static"
-    return "shadow"
+    mode = os.environ.get("NUCLEOS_HEAVY_ADMISSION", "").strip().lower()
+    if mode in ("static", "shadow", "dynamic"):
+        return mode
+    return "dynamic"
 
 
 _K32 = None
@@ -582,6 +583,63 @@ def probe() -> dict:
     if os.name == "nt":
         return _win_probe(logical)
     return _posix_probe(logical)
+
+
+def dynamic_probe() -> dict | None:
+    """The live probe for dynamic admission, primed once when busy_cores is not yet known (the
+    Windows probe needs two samples). None on any failure: the caller falls back to the static
+    weight sum. Call it OUTSIDE the broker Mutex, since the priming sleeps."""
+    try:
+        p = probe()
+        if isinstance(p, dict) and p.get("busy_cores") is None:
+            time.sleep(PRIME_S)
+            p = probe()
+        return p if isinstance(p, dict) else None
+    except Exception:
+        return None
+
+
+def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
+                static_fit: bool) -> tuple[bool, dict]:
+    """Dynamic admission decision for the head of the queue. Returns (ok, adm); `adm` is the
+    record kept with the admission (it is meaningful on a denial too, the caller ignores it).
+
+    Nothing held: admitted ("alone"). Unreadable probe: the static weight-sum decision stands
+    ("static_fallback"). Otherwise held COUNT must be under `ceiling` and the probe must show
+    room: free RAM, idle cores (skipped when busy_cores is unknown) and a settle window since
+    the last admission."""
+    avail = None
+    idle = None
+    usable = isinstance(p, dict)
+    if usable:
+        a = p.get("avail_mb")
+        if _num(a):
+            avail = float(a)
+        else:
+            usable = False
+        b = p.get("busy_cores")
+        lg = p.get("logical")
+        if usable and _num(b) and _num(lg):
+            idle = float(lg) - float(b)
+
+    def adm(rule: str) -> dict:
+        return {
+            "mode": "dynamic", "rule": rule,
+            "avail_mb": round(avail) if avail is not None else None,
+            "idle_cores": round(idle, 1) if idle is not None else None,
+            "held_n": n_held,
+        }
+
+    if n_held <= 0:
+        return True, adm("alone")
+    if not usable:
+        return bool(static_fit), adm("static_fallback")
+    if n_held >= ceiling:
+        return False, adm("room")
+    ok = (avail >= _env_pos("NUCLEOS_HEAVY_MIN_AVAIL_MB", 1536.0)
+          and (idle is None or idle >= _env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0))
+          and since_admit_s >= _env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0))
+    return ok, adm("room")
 
 
 def budget(p: dict) -> tuple[float, float, float]:

@@ -241,15 +241,37 @@ async fn is_tracked(worktree: &Path, rel: &str) -> Result<bool, String> {
     Ok(!out.stdout.trim().is_empty())
 }
 
+/// The worktree's private git directory, refused unless git resolves `worktree` as a checkout of its
+/// own. A registered worktree whose `.git` file is gone resolves to whatever repository encloses its
+/// directory; under `.claude/worktrees/` that is the main checkout, whose provenance it would
+/// otherwise overwrite.
 async fn git_dir(worktree: &Path) -> Result<PathBuf, String> {
-    let out = git(worktree, &["rev-parse", "--absolute-git-dir"]).await?;
-    if !out.succeeded() || out.stdout.trim().is_empty() {
+    let out = git(
+        worktree,
+        &["rev-parse", "--absolute-git-dir", "--show-toplevel"],
+    )
+    .await?;
+    let mut lines = out.stdout.lines().map(str::trim);
+    let (Some(dir), Some(top)) = (lines.next(), lines.next()) else {
+        return Err(format!(
+            "could not resolve the git directory: {}",
+            out.output_tail
+        ));
+    };
+    if !out.succeeded() || dir.is_empty() || top.is_empty() {
         return Err(format!(
             "could not resolve the git directory: {}",
             out.output_tail
         ));
     }
-    Ok(PathBuf::from(out.stdout.trim()))
+    let own = git_exec::canonical(worktree).await;
+    if own.is_err() || own != git_exec::canonical(Path::new(top)).await {
+        return Err(format!(
+            "{} is not a checkout of its own: git resolves it to {top}",
+            worktree.display()
+        ));
+    }
+    Ok(PathBuf::from(dir))
 }
 
 /// The directory `info/exclude` lives in: shared by every worktree of the repository.
@@ -889,6 +911,58 @@ mod tests {
         assert!(!repo.path().join(MCP).exists());
         assert!(!wt.join(MCP).exists());
         assert!(!switch_is(&pool).await);
+    }
+
+    /// A worktree still registered but whose `.git` file is gone (a removal that stopped halfway)
+    /// and whose directory sits inside the main checkout, as `.claude/worktrees/<name>` does: git
+    /// walks up from it to the main repository. Provisioning it must neither write its config nor
+    /// overwrite the main checkout's provenance with the orphan's bytes.
+    #[tokio::test]
+    async fn an_orphaned_worktree_inside_the_main_checkout_is_not_provisioned_as_the_main_one() {
+        let repo = repo();
+        let orphan = repo.path().join(".claude").join("worktrees").join("orphan");
+        std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+        git_in(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &orphan.to_string_lossy(),
+                "-b",
+                "orphan",
+            ],
+        );
+        std::fs::remove_file(orphan.join(".git")).unwrap();
+        let pool = pool_with(repo.path(), true).await;
+
+        let reports = reconcile(&pool, "alpha", EXE).await.unwrap();
+
+        let main = report_for(&reports, repo.path()).await;
+        assert!(
+            matches!(main.state, ProvisionState::Provisioned),
+            "the main checkout: {main:?}"
+        );
+        let lost = report_for(&reports, &orphan).await;
+        assert!(
+            matches!(lost.state, ProvisionState::NotProvisioned),
+            "the orphan: {lost:?}"
+        );
+        assert!(!orphan.join(MCP).exists(), "the orphan got a config");
+        let args = json_of(&repo.path().join(MCP))["mcpServers"]["nucleos"]["args"].clone();
+        assert!(
+            same_dir(args[4].as_str().unwrap(), repo.path()).await,
+            "the main checkout's config names another worktree: {args}"
+        );
+        let provenance: Provenance = serde_json::from_slice(
+            &std::fs::read(repo.path().join(".git").join(PROVENANCE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            provenance.mcp_bytes,
+            std::fs::read_to_string(repo.path().join(MCP)).unwrap(),
+            "the main checkout's provenance was overwritten by the orphan's"
+        );
     }
 
     /// Plan 2026-10-17 F1: a project rostered with nothing said about the switch is on, so the

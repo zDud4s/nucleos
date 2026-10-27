@@ -20,6 +20,7 @@ pub struct ClaudeCliRunner {
 /// that quiet is work in progress, not a stalled run — the same exemption `LiveChat::gather` makes
 /// for a kept process. The run's wall clock still bounds the wait. `Err` carries the deadline that
 /// expired.
+#[cfg(test)]
 pub(super) async fn next_line_unless_silent<R>(
     lines: &mut tokio::io::Lines<R>,
     silence: Option<Duration>,
@@ -32,7 +33,7 @@ where
 }
 
 /// `read`, given up after `silence` unless a tool call is open — the rule of
-/// [`next_line_unless_silent`], for any read of the next line.
+/// `next_line_unless_silent`, for any read of the next line.
 async fn unless_silent<F, T>(
     read: F,
     silence: Option<Duration>,

@@ -31,6 +31,8 @@ pub enum Subject {
     Council(String),
     TeamRun(String),
     Vcs(i64),
+    /// A daily digest of capture questions (`capture_digests.id`).
+    CaptureDigest(i64),
 }
 
 impl Subject {
@@ -42,6 +44,7 @@ impl Subject {
             Subject::Council(id) => format!("council:{id}"),
             Subject::TeamRun(id) => format!("team_run:{id}"),
             Subject::Vcs(id) => format!("vcs:{id}"),
+            Subject::CaptureDigest(id) => format!("capture_digest:{id}"),
         }
     }
 }
@@ -713,6 +716,7 @@ mod tests {
             Subject::Council("c-1".into()),
             Subject::TeamRun("t-1".into()),
             Subject::Vcs(21),
+            Subject::CaptureDigest(12),
         ]
         .iter()
         .map(Subject::key)
@@ -724,7 +728,8 @@ mod tests {
                 "run:900598",
                 "council:c-1",
                 "team_run:t-1",
-                "vcs:21"
+                "vcs:21",
+                "capture_digest:12"
             ]
         );
     }

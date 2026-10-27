@@ -21,7 +21,7 @@ type FeedRow = (i64, Option<String>, String, String, Option<String>);
 /// The text of a feed line. The capture request is a question: the raw kind prefix would only
 /// stand in front of it, so it goes out as its summary alone.
 fn feed_text(kind: &str, summary: &str) -> String {
-    if kind == crate::capture::FEED_KIND {
+    if kind == crate::capture::FEED_KIND || kind == crate::capture::digest::FEED_KIND {
         summary.to_owned()
     } else {
         strings::render(&Text::Feed {
@@ -33,6 +33,11 @@ fn feed_text(kind: &str, summary: &str) -> String {
 
 /// `job:7` on a capture request names the job whose answer the owner is being asked for.
 fn capture_subject(kind: &str, subject: Option<&str>) -> Option<Subject> {
+    if kind == crate::capture::digest::FEED_KIND {
+        return Some(Subject::CaptureDigest(
+            subject?.strip_prefix("capture_digest:")?.parse().ok()?,
+        ));
+    }
     if kind != crate::capture::FEED_KIND {
         return None;
     }
@@ -646,6 +651,26 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1, "Job 7 failed. What now?");
         assert_eq!(rows[0].3.as_deref(), Some("capture:7"));
+    }
+
+    #[tokio::test]
+    async fn route_capture_digest_has_digest_subject_and_no_type_prefix() {
+        let state = ready(false, &[], true).await;
+        line(
+            &state,
+            None,
+            crate::capture::digest::FEED_KIND,
+            "2 questions today.",
+            Some(&nucleos_base::feed::Subject::CaptureDigest(3)),
+        )
+        .await;
+        routing::route_once(&state, now(), feed_only())
+            .await
+            .unwrap();
+        let rows = sent(&state).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "2 questions today.");
+        assert_eq!(rows[0].3.as_deref(), Some("capture_digest:3"));
     }
 
     #[tokio::test]

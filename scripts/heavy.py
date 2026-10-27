@@ -9,8 +9,12 @@ scheme and appends one telemetry line per run.
     heavy.py warm [--cwd PATH] [-- argv...]
 
 Admission is a machine token queue: every request has a weight (heavy_classify) and a
-priority; the head of the queue (priority, then arrival) runs once the held weights plus
-its own fit the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4). Underneath it sits the
+priority; the head of the queue (priority, then arrival) is admitted by the admission mode
+(`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than capacity() jobs are held and
+the live probe shows room (free RAM, idle cores, a settle window since the last admission),
+or nothing is held; an unreadable probe falls back to `static`, the held weights plus its own
+fitting the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4; setting it forces `static`);
+`shadow` decides as static and only logs the cost model's opinion. Underneath it sits the
 runtime: process liveness (pid + creation time), the directory mutex, running the child
 inside a Windows Job object (so a hard-killed broker takes its child with it),
 `NUCLEOS_HEAVY=0`, and fail-open. A bug in the broker must run the command, never block it;
@@ -55,8 +59,10 @@ MUTEX_TRACE_S = 1.0
 STILL_ACTIVE = 259
 DEFAULT_CAPACITY = 4
 # Predicted peak memory (p90 of the class, costs.json) from which a request weighs
-# capacity - 1. Between node's 4.7 GB and core clippy's 6.2 GB (costs.json, 2026-10-21).
-BIG_MEM_MB = 5120.0
+# capacity - 1. Off unless NUCLEOS_HEAVY_BIG_MEM_MB sets it. Measured 2026-10-27 (log.jsonl): with
+# it on at 5120, every nucleos-core run weighed 3 and ran alone, yet ran no faster (run p50
+# 415 s vs 230-490 s two-to-four abreast on 10-15..10-20) while its wait p50 went 0 s -> 1865 s.
+BIG_MEM_MB = float("inf")
 AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
@@ -547,6 +553,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     itself. When it returns True the request is admitted WITHOUT a held/<pid> record: the
     caller's callable has registered the light run and tells the caller by its own side effect."""
     queue_dir, held_dir = directory / "queue", directory / "held"
+    # A re-queue (pool slot handed back) must not carry the previous admission's record.
+    rec.pop("adm", None)
     me = os.getpid()
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
     t0 = time.time()
@@ -554,12 +562,16 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     queued = False
     last_report = t0
     shadow = None
+    dyn = False
+    hc = None
     try:
         hc = _cost_mod()
         if hc is not None and hc.admission_mode() == "shadow":
             shadow = hc.Shadow(rec, directory)
+        dyn = hc is not None and hc.admission_mode() == "dynamic"
     except Exception:
         shadow = None
+        dyn = False
     admitted = False
     light_retry = _env_float("NUCLEOS_HEAVY_LIGHT_RETRY_S", 2.0)
     last_light = None
@@ -570,13 +582,20 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             _sweep_held_tmp(directory)
             qfile.write_text(json.dumps(rec), encoding="utf-8")
             queued = True
+        last_pos = 1
         while True:
             position = 0
             if shadow is not None:
                 shadow.tick()
+            # Dynamic admission reads the live machine state OUTSIDE the Mutex (the probe may
+            # sleep to prime its CPU sample), and only from a waiter that was at the head on the
+            # previous poll: the others cannot be admitted, so they would only add probe load.
+            probed = dyn and last_pos <= 1
+            pr = hc.dynamic_probe() if probed else None
             with Mutex(directory):
                 order = _queue_order(_entries(queue_dir), directory)
-                held_recs = [r for _, r in _entries(held_dir)]
+                held_ents = _entries(held_dir)
+                held_recs = [r for _, r in held_ents]
                 held = sum(int(r.get("weight") or 1) for r in held_recs)
                 names = [f.name for f, _ in order]
                 position = names.index(qfile.name) + 1 if qfile.name in names else 0
@@ -589,12 +608,30 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     static_fit = held + rec["weight"] <= capacity()
                     if shadow is not None:
                         shadow.observe(held_recs, static_fit)
-                    if static_fit:
+                    fit = static_fit
+                    if dyn and not probed:
+                        # Just reached the head: no fresh probe yet, decide on the next poll.
+                        fit = False
+                    elif dyn:
+                        adm = None
+                        try:
+                            try:
+                                since = time.time() - max(f.stat().st_mtime for f, _ in held_ents)
+                            except (OSError, ValueError):
+                                since = float("inf")
+                            fit, adm = hc.dynamic_fit(len(held_recs), pr, since, capacity(),
+                                                      static_fit)
+                        except Exception:
+                            fit, adm = static_fit, None
+                        if fit and adm:
+                            rec["adm"] = adm
+                    if fit:
                         (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
                         qfile.unlink()
                         queued = False
                         admitted = True
                         return True, time.time() - t0
+            last_pos = position
             if light is not None and (last_light is None
                                       or time.monotonic() - last_light >= light_retry):
                 last_light = time.monotonic()
@@ -2301,10 +2338,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             costs = hc.load_costs(directory)
             rec["cls"] = hc.class_key(argv, filtered, True)
             rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(costs, rec["cls"], weight)
-            # Measured 2026-10-21: a nucleos-core compile peaks at 6-9 GB on a 16 GB machine,
-            # and two at once (static weight 2 + 2) swapped (one ran 2557 s at 0.47 cores). A
-            # class past the threshold takes capacity - 1, so it never overlaps another one
-            # but a go/npm/tsc still fits beside it.
+            # Opt-in (BIG_MEM_MB): a class past the threshold takes capacity - 1, so it never
+            # overlaps another one but a go/npm/tsc still fits beside it.
             if rec["pred_mem_mb"] >= _env_float("NUCLEOS_HEAVY_BIG_MEM_MB", BIG_MEM_MB):
                 weight = max(weight, capacity() - 1)
                 rec["weight"] = weight
@@ -2431,7 +2466,12 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             env.pop("NUCLEOS_HEAVY_TOKEN", None)
         elif held:
             env = dict(os.environ)
-            env.pop("NUCLEOS_HEAVY_TOKEN", None)
+            # A hold-worktree started under a token holder (`heavy.py -- bash gates.sh x`, where
+            # gates.sh opens its own session) keeps the marker: its steps are the holder's work,
+            # and queueing them for a token the holder already owns would wait on itself (seen
+            # 2026-10-22: outer weight 3 + inner clippy 3 > capacity 4, never admitted).
+            if not nested:
+                env.pop("NUCLEOS_HEAVY_TOKEN", None)
             env["NUCLEOS_HEAVY_HELD"] = str(os.getpid())
             env["NUCLEOS_HEAVY_PRIO"] = str(prio)
         elif nested:
@@ -2558,6 +2598,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             "wait_lock_s": round(wait_lock, 3), "wait_token_s": round(wait_token, 3),
             "token": bool(holding), "nested": nested, "in_held": in_held,
         }
+        if rec.get("adm"):
+            row["adm"] = rec["adm"]
         if warm:
             row["warm"] = True
         if light:
