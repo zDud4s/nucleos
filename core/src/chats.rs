@@ -1,4 +1,5 @@
 pub mod groups;
+pub mod links;
 pub mod notices;
 pub mod seed;
 pub mod tasks;
@@ -952,6 +953,10 @@ pub async fn stamp_project(pool: &SqlitePool, run_id: i64, chat_id: &str) {
 pub struct Waiting {
     pub id: i64,
     pub text: String,
+    /// What the model reads when it differs from `text` (an expanded slash command). Never sent to
+    /// the window: the queue shows what was typed.
+    #[serde(skip)]
+    pub model_text: Option<String>,
 }
 
 /// What is waiting to be said to this conversation, oldest first.
@@ -959,7 +964,7 @@ pub struct Waiting {
 /// Ordered by `id` and never by `created_at`: two messages typed in the same second must not swap
 /// places, and a queue that reorders itself is one nobody can predict.
 pub async fn queued(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Vec<Waiting>> {
-    sqlx::query_as("SELECT id, text FROM chat_queue WHERE chat_id = ? ORDER BY id")
+    sqlx::query_as("SELECT id, text, model_text FROM chat_queue WHERE chat_id = ? ORDER BY id")
         .bind(chat_id)
         .fetch_all(pool)
         .await
@@ -1000,7 +1005,20 @@ pub async fn enqueue(
     origin: &str,
     images: &str,
 ) -> sqlx::Result<()> {
-    enqueue_inner(pool, chat_id, text, origin, images, None).await
+    enqueue_inner(pool, chat_id, text, origin, images, None, None).await
+}
+
+/// [`enqueue`] for a slash command that expanded: `text` is what was typed (the queue shows it),
+/// `model_text` is what the model will read once the drain sends it.
+pub async fn enqueue_expanded(
+    pool: &SqlitePool,
+    chat_id: &str,
+    text: &str,
+    model_text: &str,
+    origin: &str,
+    images: &str,
+) -> sqlx::Result<()> {
+    enqueue_inner(pool, chat_id, text, origin, images, None, Some(model_text)).await
 }
 
 /// Keeps a relayed message until its destination conversation has a turn free, naming the relay it
@@ -1017,7 +1035,7 @@ pub async fn enqueue_relayed(
     images: &str,
     relay_id: i64,
 ) -> sqlx::Result<()> {
-    enqueue_inner(pool, chat_id, text, origin, images, Some(relay_id)).await
+    enqueue_inner(pool, chat_id, text, origin, images, Some(relay_id), None).await
 }
 
 /// The shared write behind `enqueue` and `enqueue_relayed`.
@@ -1033,16 +1051,18 @@ async fn enqueue_inner(
     origin: &str,
     images: &str,
     relay_id: Option<i64>,
+    model_text: Option<&str>,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO chat_queue (chat_id, text, origin, images, relay_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chat_queue (chat_id, text, origin, images, relay_id, model_text, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(chat_id)
     .bind(text)
     .bind(origin)
     .bind(images)
     .bind(relay_id)
+    .bind(model_text)
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await
@@ -1065,7 +1085,7 @@ pub async fn take_queued(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Optio
     sqlx::query_as(
         "DELETE FROM chat_queue
           WHERE id = (SELECT id FROM chat_queue WHERE chat_id = ? ORDER BY id LIMIT 1)
-      RETURNING id, text, origin, images, relay_id, created_at",
+      RETURNING id, text, origin, images, relay_id, model_text, created_at",
     )
     .bind(chat_id)
     .fetch_optional(pool)
@@ -1080,6 +1100,8 @@ pub struct Queued {
     pub origin: Option<String>,
     pub images: Option<String>,
     pub relay_id: Option<i64>,
+    /// The expansion of a slash command, when `text` is only what was typed.
+    pub model_text: Option<String>,
     pub created_at: String,
 }
 
@@ -1090,8 +1112,8 @@ pub struct Queued {
 /// the end would be sent after the ones typed after it.
 pub async fn requeue(pool: &SqlitePool, chat_id: &str, taken: &Queued) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO chat_queue (id, chat_id, text, origin, images, relay_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO chat_queue (id, chat_id, text, origin, images, relay_id, model_text, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(taken.id)
     .bind(chat_id)
@@ -1099,6 +1121,7 @@ pub async fn requeue(pool: &SqlitePool, chat_id: &str, taken: &Queued) -> sqlx::
     .bind(&taken.origin)
     .bind(&taken.images)
     .bind(taken.relay_id)
+    .bind(&taken.model_text)
     .bind(&taken.created_at)
     .execute(pool)
     .await
@@ -1351,8 +1374,9 @@ pub async fn archive(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(chat_id)
         .execute(pool)
-        .await
-        .map(|_| ())
+        .await?;
+    // An archived conversation answers to nobody and nobody answers to it.
+    links::close_all_for(pool, chat_id).await
 }
 
 #[cfg(test)]

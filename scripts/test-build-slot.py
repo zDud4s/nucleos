@@ -365,6 +365,38 @@ def test_gates_delegates_to_broker_when_present() -> None:
         assert record.read_text().split(NL) == ["--", "cargo", "build"], record.read_text()
 
 
+def test_an_old_main_broker_gives_way_to_the_forwarding_one() -> None:
+    # The main checkout can sit on a branch from before the single broker; the gate then runs this
+    # checkout's heavy.py, which forwards to master's staged copy. Not when the main one forwards
+    # too, and never against an explicit NUCLEOS_HEAVY_MAIN.
+    own = (GATES.parent / "heavy.py").resolve()
+    with tempfile.TemporaryDirectory() as tmp:
+        main = Path(tmp)
+        (main / "scripts").mkdir()
+        old = main / "scripts" / "heavy.py"
+
+        def entry(**extra: str) -> Path:
+            env = {k: v for k, v in os.environ.items() if k != "NUCLEOS_HEAVY_MAIN"}
+            env.update(extra)
+            script = f'source "{GATES.as_posix()}" || exit 2; heavy_entry "{main.as_posix()}"'
+            out = subprocess.run([BASH, "-c", script], env=env, capture_output=True, text=True,
+                                 timeout=60)
+            assert out.returncode == 0, out.stderr
+            return Path(out.stdout.strip()).resolve()
+
+        old.write_text("# a broker from before the forwarder\n")
+        assert entry() == own
+        # Sourced by a relative path, then called from a subdirectory, as `run` does for a step.
+        env = {k: v for k, v in os.environ.items() if k != "NUCLEOS_HEAVY_MAIN"}
+        script = f'source scripts/gates.sh || exit 2; cd shell && heavy_entry "{main.as_posix()}"'
+        out = subprocess.run([BASH, "-c", script], cwd=GATES.parent.parent, env=env,
+                             capture_output=True, text=True, timeout=60)
+        assert Path(out.stdout.strip()).resolve() == own, (out.stdout, out.stderr)
+        assert entry(NUCLEOS_HEAVY_MAIN=main.as_posix()) == old.resolve()
+        old.write_text("def _staged_broker(): ...\n")
+        assert entry() == old.resolve()
+
+
 def test_gates_falls_back_when_broker_absent() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -417,5 +449,6 @@ test_bypass_and_a_relative_dir()
 test_check_and_clippy_skip_the_slot_but_test_still_waits()
 test_gates_wraps_only_the_building_steps()
 test_gates_delegates_to_broker_when_present()
+test_an_old_main_broker_gives_way_to_the_forwarding_one()
 test_gates_falls_back_when_broker_absent()
 print("build slot: ok")

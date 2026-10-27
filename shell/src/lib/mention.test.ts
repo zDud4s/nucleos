@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { commandAt, mentionAt, orchestrateTask, withCommand, withMention } from "./mention";
+import { commandAt, mentionAt, slashEscape, withCommand, withMention } from "./mention";
 
 /* ------------------------------------------------------------- mentionAt -- */
 
@@ -135,17 +135,19 @@ describe("withCommand", () => {
   });
 });
 
-/* ------------------------------------------------------- orchestrateTask -- */
+/* ------------------------------------------------------------ slashEscape -- */
 
-describe("orchestrateTask", () => {
-  it("reads the task out of /orchestrate <task> and nothing else", () => {
-    expect(orchestrateTask("/orchestrate fix the login")).toBe("fix the login");
-    expect(orchestrateTask("  /orchestrate   fix it\nand the logout  ")).toBe("fix it\nand the logout");
-    // No task is not a request, and a longer command name is another command.
-    expect(orchestrateTask("/orchestrate")).toBeNull();
-    expect(orchestrateTask("/orchestrate   ")).toBeNull();
-    expect(orchestrateTask("/orchestrated fix")).toBeNull();
-    expect(orchestrateTask("please /orchestrate fix")).toBeNull();
-    expect(orchestrateTask("fix the login")).toBeNull();
+describe("slashEscape", () => {
+  // A leading `//` is how a person says "this starts with a slash but is not a command".
+  it("escape turns //text into /text", () => {
+    expect(slashEscape("//text")).toBe("/text");
+    expect(slashEscape("//etc/hosts is the file")).toBe("/etc/hosts is the file");
+  });
+
+  it("escape leaves other text", () => {
+    expect(slashEscape("/help")).toBe("/help");
+    expect(slashEscape("plain text")).toBe("plain text");
+    expect(slashEscape("see //not-leading")).toBe("see //not-leading");
+    expect(slashEscape("")).toBe("");
   });
 });

@@ -176,10 +176,72 @@ def ts_epoch(ts) -> float | None:
         return None
 
 
-def queue_reason(pos: int, rec: dict, used: int, cap: int) -> str:
+def dynamic_state(held: list, cap: int) -> dict | None:
+    """What dynamic admission sees right now, or None when the broker decides by weight
+    (`static`/`shadow`) or the probe is unreadable (it then falls back to weight too).
+
+    `short` lists the conditions that hold the head back, each with its threshold, so the view
+    says why nothing starts ("idle 0.6 < 1.0 cores") instead of a weight sum the broker ignores."""
+    hc = heavy._cost_mod()
+    if hc is None or hc.admission_mode() != "dynamic":
+        return None
+    p = hc.dynamic_probe()
+    if not isinstance(p, dict) or not isinstance(p.get("avail_mb"), (int, float)):
+        return None
+    avail = float(p["avail_mb"])
+    busy, logical = p.get("busy_cores"), p.get("logical")
+    idle = (float(logical) - float(busy)
+            if isinstance(busy, (int, float)) and isinstance(logical, (int, float)) else None)
+    try:
+        since = time.time() - max(f.stat().st_mtime for f, _ in held)
+    except (OSError, ValueError):
+        since = float("inf")
+    min_avail = hc._env_pos("NUCLEOS_HEAVY_MIN_AVAIL_MB", 1536.0)
+    min_idle = hc._env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0)
+    settle = hc._env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0)
+    short = []
+    if held:
+        if len(held) >= cap:
+            short.append(f"jobs {len(held)}/{cap}")
+        if avail < min_avail:
+            short.append(f"RAM {avail / 1024:.1f} < {min_avail / 1024:.1f} GB")
+        if idle is not None and idle < min_idle:
+            short.append(f"idle {idle:.1f} < {min_idle:.1f} cores")
+        if since < settle:
+            short.append(f"settle {since:.0f}s < {settle:.0f}s")
+    return {"avail_mb": avail, "idle": idle, "since": since, "min_avail_mb": min_avail,
+            "min_idle": min_idle, "settle": settle, "short": short}
+
+
+def dynamic_line(dyn: dict) -> str:
+    def part(text: str, ok: bool) -> str:
+        return (GREEN if ok else RED) + text + RESET
+    idle = dyn["idle"]
+    since = dyn["since"]
+    return (f"{DIM}admission dynamic:{RESET} "
+            + part(f"RAM {dyn['avail_mb'] / 1024:.1f}/{dyn['min_avail_mb'] / 1024:.1f} GB",
+                   dyn["avail_mb"] >= dyn["min_avail_mb"])
+            + "  " + (part(f"idle {idle:.1f}/{dyn['min_idle']:.1f} cores", idle >= dyn["min_idle"])
+                      if idle is not None else f"{DIM}idle ?{RESET}")
+            + "  " + part("settle " + ("-" if since == float("inf") else f"{since:.0f}s")
+                          + f"/{dyn['settle']:.0f}s", since >= dyn["settle"]))
+
+
+def queue_reason(pos: int, rec: dict, used: int, cap: int, dyn: dict | None = None) -> str:
     need = int(rec.get("weight") or 1)
     free = max(0, cap - used)
     head = f"token (free {free}/{cap}, needs {need}"
+    if dyn is not None:
+        if pos > 1:
+            return f"its turn ({pos - 1} ahead)"
+        if dyn["short"]:
+            reason = "room: " + ", ".join(dyn["short"])
+        else:
+            reason = "room: admitting"
+        if used + need > cap:
+            # A waiter still on a broker from before dynamic admission decides by weight.
+            reason += f" {DIM}(a weight-based broker: free {free}/{cap}, needs {need}){RESET}"
+        return reason
     if pos == 1 and used + need > cap:
         return f"{head}): {used + need - cap} weight must be freed"
     if pos == 1:
@@ -620,8 +682,10 @@ def frame(primed: dict) -> str:
     locks = worktree_locks(d)
     lock_ages = {l["rec"].get("pid"): l["age"] for l in locks if l["alive"]}
     alerts: list[str] = []
+    dyn = dynamic_state(held, cap)
+    # Dynamic admission counts jobs, not weight: show what it counts.
     head = (f"{BOLD}heavy broker{RESET}  {time.strftime('%H:%M:%S')}   "
-            f"capacity {bar(used, cap)}")
+            + (f"jobs {bar(len(held), cap)}" if dyn is not None else f"capacity {bar(used, cap)}"))
     if psutil is not None:
         vm, sw = psutil.virtual_memory(), psutil.swap_memory()
         colour = RED if vm.available < 2 * 2**30 else (YELLOW if vm.available < 4 * 2**30 else GREEN)
@@ -630,7 +694,7 @@ def frame(primed: dict) -> str:
         if vm.available < 2 * 2**30:
             alerts.append(f"{RED}RAM {vm.available / 2**30:.1f} GB free: builds swap, "
                           f"cpu/wall drops{RESET}")
-    lines = [head, f"{DIM}{d}{RESET}", ""]
+    lines = [head] + ([dynamic_line(dyn)] if dyn is not None else []) + [f"{DIM}{d}{RESET}", ""]
 
     slots: dict[int, dict] = {}
     try:
@@ -724,7 +788,7 @@ def frame(primed: dict) -> str:
     # the alerts, the slots or the health line.
     lines.append(f"{BOLD}QUEUED ({len(queue)}){RESET}")
     for i, (f, r) in enumerate(queue, 1):
-        reason = queue_reason(i, r, used, cap)
+        reason = queue_reason(i, r, used, cap, dyn)
         n_retry = retries(r, rows, now)
         prio = heavy._int_prio(r.get("prio"))
         if len(queue) > 3:

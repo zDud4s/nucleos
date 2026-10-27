@@ -174,6 +174,32 @@ pub const JOB_NODE_TOOLS: &[&str] = &["note_finding", "record", "verify", "verif
 /// runs.
 pub const EVERY_BOX_TOOLS: &[&str] = &["record", "verify", "verify_status"];
 
+/// What an interactive (IDE/terminal) session's worktree box serves: `EVERY_BOX_TOOLS` plus the five
+/// work-node tools, so the `orchestrate` skill can run a node tree there. Sorted.
+///
+/// Not `EVERY_BOX_TOOLS`: that list is also served by `McpBox::All` and `McpBox::JobNode`, and a job
+/// node holds a `Scope::Run` token the `/nodes` routes refuse, so offering it `node_*` would be a
+/// rain of 403s (the failure `TEAM_TOOLS` names). `McpBox::All` already serves them.
+///
+/// No new authority: this box's client already holds the owner's control token (the stored-token
+/// fallback of `client_for_box`), `/nodes` admits exactly that token and an Admin key, and the same
+/// session's SessionStart hook forwarder calls them already. The box only decides what the MODEL is
+/// offered. The effects stay low: `node_open/update/close` are `WritesOwn`, `node_tree/active` are
+/// `ReadsOwn`; none `Acts`, none `ReadsUntrusted`, and this box serves no untrusted read, so the taint
+/// rule has nothing to guard. The daemon enforces depth, sibling and `owned_paths` limits itself.
+/// Accepted residual: node ids are not fenced to the worktree; they are the owner's own bookkeeping
+/// rows and run nothing.
+pub const WORKTREE_BOX_TOOLS: &[&str] = &[
+    "node_active",
+    "node_close",
+    "node_open",
+    "node_tree",
+    "node_update",
+    "record",
+    "verify",
+    "verify_status",
+];
+
 /// What a team agent's box serves by default: today's `TEAM_TOOLS` plus the door that asks for more
 /// and `read_context`, the door onto the context files the agent was given.
 pub const TEAM_BASE: &[&str] = &[
@@ -273,7 +299,7 @@ pub(super) fn served_in_box(served: &McpBox, tool: &str) -> bool {
         // extras from that row, so the box announces the base and the extras alike.
         McpBox::JobNode(_) => JOB_NODE_BASE.contains(&tool) || JOB_NODE_EXTRAS.contains(&tool),
         McpBox::Team(_) => TEAM_BASE.contains(&tool) || TEAM_EXTRAS.contains(&tool),
-        McpBox::Worktree(_) => EVERY_BOX_TOOLS.contains(&tool),
+        McpBox::Worktree(_) => WORKTREE_BOX_TOOLS.contains(&tool),
     }
 }
 

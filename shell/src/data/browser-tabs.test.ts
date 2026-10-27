@@ -55,6 +55,30 @@ describe("browser tab commands", () => {
   });
 });
 
+describe("no-project scope", () => {
+  it("no project is a reserved key that round-trips to null", () => {
+    expect(tabs.NO_PROJECT).toBe("@none");
+    expect(tabs.scopeKey(null)).toBe(tabs.NO_PROJECT);
+    expect(tabs.scopeProject(tabs.NO_PROJECT)).toBeNull();
+    expect(tabs.scopeProject("alpha")).toBe("alpha");
+    expect(tabs.scopeKey("alpha")).toBe("alpha");
+  });
+
+  it("tabCreate and envEnsure send a null project for the no-project key", async () => {
+    invoke.mockResolvedValue({ cdp_http: null });
+    await tabs.envEnsure(tabs.NO_PROJECT, "agent");
+    expect(invoke).toHaveBeenCalledWith("browser_env_ensure", { project: null, role: "agent" });
+    await tabs.tabCreate(tabs.NO_PROJECT, "owner", "t1", "about:blank", bounds);
+    expect(invoke).toHaveBeenCalledWith("browser_tab_create", {
+      project: null,
+      role: "owner",
+      tabId: "t1",
+      url: "about:blank",
+      bounds,
+    });
+  });
+});
+
 describe("listenBrowserEvents", () => {
   it("routes payloads and unlistens all", async () => {
     const cbs: Record<string, (e: { payload: unknown }) => void> = {};

@@ -32,10 +32,14 @@ use super::*;
 /// not route on it, having already been chosen by the time this is called — which is exactly what
 /// makes forgetting it easy and invisible until `relay::admit` refuses a relay it should have
 /// admitted.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_local_turn(
     state: &crate::state::AppState,
     slot: ChatSlot,
     text: String,
+    // What the model reads: `text` for an ordinary message, the expansion for a slash command.
+    // `runs.prompt` keeps `text`, the words that were typed.
+    model_text: String,
     assistant: std::sync::Arc<crate::models::local_agent::LocalAssistant>,
     relay_id: Option<i64>,
     origin: Origin,
@@ -76,6 +80,9 @@ pub(super) async fn spawn_local_turn(
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+    // A relay from a tainted sender marks this run before anything else learns it exists; a mark
+    // that fails ends it here, unstarted. The CLI path makes the same call at the same point.
+    inherit_relay_taint(&state.pool, id, relay_id).await?;
     crate::chats::stamp_project(&state.pool, id, &slot.chat_id).await;
     // A channel conversation sees "working" as soon as its turn exists. A no-op for any other chat.
     crate::channels::replies::turn_started(state, id, &slot.chat_id).await;
@@ -97,7 +104,7 @@ pub(super) async fn spawn_local_turn(
         tracing::warn!(%error, id, relay_id, "the relayed turn started but was not stamped onto its relay");
     }
 
-    let prompt = text;
+    let prompt = model_text;
 
     let pool = state.pool.clone();
     let run_timeout = state.run_timeout;
@@ -213,6 +220,47 @@ pub(super) async fn spawn_local_turn(
     });
 
     Ok(id)
+}
+
+/// Marks the just-inserted run `id` `read_untrusted` when the relay that bore it was sent by a
+/// conversation with third-party text behind it (`relay::sender_read_untrusted`). A no-op for a
+/// typed turn and for a relay from a clean sender.
+///
+/// Called by both turn launchers between their INSERT and their spawn, so the hooks see the mark
+/// from the first tool call and `turn.rs` never leaves a resumable session behind a prompt made of a
+/// stranger's words. `handover_of` already keeps such a turn `McpOnly`; that limits THIS turn, and
+/// only the mark limits what comes after it.
+///
+/// Fails closed: a mark that cannot be written ends the run as `failed` before it starts and returns
+/// the refusal, so the caller spawns nothing — a turn holding tainted words on a row that reads clean
+/// is the one state every barrier downstream assumes does not exist.
+pub(super) async fn inherit_relay_taint(
+    pool: &SqlitePool,
+    id: i64,
+    relay_id: Option<i64>,
+) -> Result<(), String> {
+    let Some(relay_id) = relay_id else {
+        return Ok(());
+    };
+    if !crate::relay::sender_read_untrusted(pool, relay_id).await {
+        return Ok(());
+    }
+    let Err(error) = crate::execution::runs::mark_untrusted_context(pool, id).await else {
+        return Ok(());
+    };
+    tracing::error!(run_id = id, relay_id, %error, "could not mark a turn relayed from a tainted sender; not starting it");
+    let written = sqlx::query(
+        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind("this turn was relayed from a conversation that read third-party text and the daemon could not record that; it was not started")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await;
+    crate::execution::runs::warn_on_terminal_write_err(&written, id, "failed");
+    Err(format!(
+        "could not record that the relayed turn carries untrusted text: {error}"
+    ))
 }
 
 /// What tools a conversation's turn may reach.
@@ -1198,6 +1246,10 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // already wrote its status can still be followed by one last wake-up here, and an unguarded
         // write would report a completed turn for a CLI that was killed. First writer wins; no rows
         // means the turn was finalised elsewhere, which is an outcome, not an error.
+        //
+        // What a linked browser agent's completed turn answered, handed to its parent once the slot
+        // below is free. Failed, cancelled and timed-out turns leave it `None`: they deliver nothing.
+        let mut linked_reply: Option<String> = None;
         match result {
             // A turn's product is the `result` event, and a CLI that exited without one answered
             // nothing. That is a failed turn, not a completed one — and emphatically not a turn
@@ -1287,6 +1339,13 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     .execute(&pool)
                     .await;
                     crate::execution::runs::warn_on_terminal_write_err(&completed, id, status);
+                    if status == "completed"
+                        && completed
+                            .as_ref()
+                            .is_ok_and(|written| written.rows_affected() > 0)
+                    {
+                        linked_reply = reply.clone();
+                    }
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
                         // runs that produced it. Dropping the row here as well closes the one case that
@@ -1420,6 +1479,11 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // cannot set another aside before this one is written.
         record_set_aside(&after, &drained_chat).await;
         drop(turn);
+        // A linked child's answer travels to its parent now that this chat's slot is free. An
+        // unlinked chat costs one read inside `deliver_reply`.
+        if let Some(reply) = linked_reply {
+            super::linked::deliver_reply(&after, &drained_chat, id, &reply).await;
+        }
         // The process this turn kept is read from here on, so a background task's own answer is not
         // left waiting for the next person's turn.
         watch_between_turns(&after, &drained_chat);
@@ -1486,6 +1550,101 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    /// A linked browser agent's turn that completes hands its answer to its mother, as a relay the
+    /// child's turn sent, once the child's slot is free: no caller has to fetch it.
+    #[tokio::test]
+    async fn finishing_a_linked_childs_turn_delivers_its_reply() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let mother = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let child = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::rename(&state.pool, &child, Some("Flights"))
+            .await
+            .unwrap();
+        crate::chats::links::open(&state.pool, &child, Some(&mother), "browser", None)
+            .await
+            .expect("link the child to its mother");
+        let mother_turn: i64 = sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at)
+             VALUES ('find flights', 'completed', 'assistant', ?, 'shell', ?) RETURNING id",
+        )
+        .bind(&mother)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let task_relay: i64 = sqlx::query_scalar(
+            "INSERT INTO chat_relays (from_chat_id, to_chat_id, sending_run_id, body, depth, created_at)
+             VALUES (?, ?, ?, 'find flights', 1, ?) RETURNING id",
+        )
+        .bind(&mother)
+        .bind(&child)
+        .bind(mother_turn)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let child_turn = crate::assistant::send_relayed_message(
+            &state,
+            &child,
+            "find flights",
+            crate::assistant::Origin::Shell,
+            task_relay,
+        )
+        .await
+        .unwrap();
+
+        let mut delivered: Option<(i64, String, i64)> = None;
+        for _ in 0..500 {
+            delivered = sqlx::query_as(
+                "SELECT r.id, r.prompt, c.sending_run_id
+                   FROM runs r JOIN chat_relays c ON c.id = r.from_relay_id
+                  WHERE r.chat_id = ? AND c.from_chat_id = ?",
+            )
+            .bind(&mother)
+            .bind(&child)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+            if delivered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&child);
+        let (parent_turn, prompt, sending_run_id) =
+            delivered.expect("the child's finished turn was never delivered to its mother");
+        assert_eq!(
+            sending_run_id, child_turn,
+            "the relay is sent by the child's turn"
+        );
+        assert_eq!(prompt, "[browser agent · Flights] fake output");
+        for _ in 0..500 {
+            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(parent_turn)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&mother);
     }
 
     /// A declined chat is not re-evaluated on every poll: it is left alone for the TTL, and only it.
