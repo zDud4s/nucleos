@@ -422,8 +422,22 @@ pub async fn claim(
     holder: &Holder,
     now: DateTime<Utc>,
 ) -> sqlx::Result<ClaimOutcome> {
-    refuse_declared_master_red(new.kind, &new.key)?;
     let mut tx = begin(pool).await?;
+    if is_declared_master_red(new.kind, &new.key) {
+        // A session may not CREATE `master-red`, but it may claim the incident the daemon
+        // already opened ("claim it with task_claim"): first claim wins, through the same CAS.
+        // The incident's detail and paths are the daemon's, so nothing of `new` is merged.
+        let incident = unresolved_by_key(&mut tx, project_id, &new.key)
+            .await?
+            .filter(|row| matches!(row.status, Status::Open | Status::Claimed));
+        let Some(incident) = incident else {
+            // No incident (or only a proof in flight): the refusal; the dropped `tx` rolls back.
+            return Err(master_red_refusal());
+        };
+        let outcome = cas(&mut tx, incident.id, holder, now).await?;
+        tx.commit().await?;
+        return Ok(outcome);
+    }
     let task_id = match unresolved_by_key(&mut tx, project_id, &new.key).await? {
         None => insert_open(&mut tx, project_id, &new, now).await?,
         Some(row) => {
@@ -471,15 +485,24 @@ pub async fn claim_by_id(
     Ok(outcome)
 }
 
+fn is_declared_master_red(kind: TaskKind, key: &TaskKey) -> bool {
+    kind == TaskKind::Declared && key.as_str() == super::MASTER_RED_KEY
+}
+
 /// Only the daemon creates `master-red` (through `create_or_adopt_open` / `begin_probe`); an agent's
-/// `declared` claim on it is refused. The store has no refusal shape, so this is a `Protocol` error.
+/// `declared` claim that would create one is refused (`claim` lets it take an existing incident).
+/// The store has no refusal shape, so this is a `Protocol` error.
 fn refuse_declared_master_red(kind: TaskKind, key: &TaskKey) -> sqlx::Result<()> {
-    if kind == TaskKind::Declared && key.as_str() == super::MASTER_RED_KEY {
-        return Err(sqlx::Error::Protocol(
-            "the master-red task is created by the daemon only; it cannot be declared".to_owned(),
-        ));
+    if is_declared_master_red(kind, key) {
+        return Err(master_red_refusal());
     }
     Ok(())
+}
+
+fn master_red_refusal() -> sqlx::Error {
+    sqlx::Error::Protocol(
+        "the master-red task is created by the daemon only; it cannot be declared".to_owned(),
+    )
 }
 
 async fn cas(
@@ -1035,7 +1058,10 @@ pub async fn begin_reprobe(
 
 /// The re-proof ran the `red_tests` on `master_sha`. Still failing: `checked_sha` moves to it and the
 /// flight is released. Passing: the incident closes by green at that sha (previous owner kept in the
-/// event, exactly as the postgate's green does).
+/// event, exactly as the postgate's green does) -- unless the project's `postgate_state` is still
+/// red: the postgate is still on this red (bisecting, reverting), and closing under it would make
+/// its next `ensure_incident` open a second `master-red`. Then only the flight is released, and the
+/// incident waits for the postgate's own green close (`incident::close_if_green`).
 pub async fn finish_reprobe(
     pool: &SqlitePool,
     task_id: i64,
@@ -1044,7 +1070,17 @@ pub async fn finish_reprobe(
     now: DateTime<Utc>,
 ) -> sqlx::Result<()> {
     let mut tx = begin(pool).await?;
-    if still_red {
+    let postgate_red = match row_by_id(&mut tx, task_id).await? {
+        Some(row) => project_is_red(&mut tx, &row.project_id).await?,
+        None => false,
+    };
+    if !still_red && postgate_red {
+        // `checked_sha` stays: the red tests were NOT proved failing at `master_sha`.
+        sqlx::query("UPDATE task_claims SET probe_lease_until = NULL WHERE id = ?")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+    } else if still_red {
         sqlx::query(
             "UPDATE task_claims SET checked_sha = ?, probe_lease_until = NULL WHERE id = ?",
         )
@@ -2934,5 +2970,40 @@ mod tests {
         let last = events(&pool, id).await.pop().unwrap();
         assert_eq!((last.0.as_str(), last.1.as_deref()), ("done", Some("s1")));
         assert_eq!(green_sha(&last.2), Some("m3".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn a_passing_reprobe_leaves_the_incident_to_a_postgate_still_on_the_red() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, red_groups)
+             VALUES ('p', 'main', '[\"core\"]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let owner = session("s1");
+        let id = claimed_by(&pool, "master-red", &owner).await;
+        begin_reprobe(&pool, id, t0()).await.unwrap();
+        finish_reprobe(&pool, id, "m3", false, t0() + secs(30))
+            .await
+            .unwrap();
+        let after = row(&pool, id).await;
+        assert_eq!(
+            (
+                after.status,
+                after.checked_sha.as_deref(),
+                after.probe_lease_until
+            ),
+            (Status::Claimed, None, None),
+            "not closed, not marked proved at m3, and the flight is free"
+        );
+        let again = create_or_adopt_open(&pool, "p", task("master-red"), t0() + secs(31))
+            .await
+            .unwrap();
+        assert_eq!(
+            again.id, id,
+            "the postgate's next report adopts the same incident"
+        );
     }
 }

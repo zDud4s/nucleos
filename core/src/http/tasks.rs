@@ -209,8 +209,10 @@ fn claim_error(error: sqlx::Error) -> Fail {
 }
 
 /// How long `SessionStart` waits for the re-proof of a stale `master-red` before listing the
-/// incident as it stands (spec §3 Verify, "Também no SessionStart").
-const SESSION_REFRESH_WAIT: Duration = Duration::from_secs(2);
+/// incident as it stands (spec §3 Verify, "Também no SessionStart"). The whole refresh (git
+/// included) runs detached and this bounds the wait for it: the hook's own budget,
+/// `CLAIMS_TIMEOUT_SECONDS` = 2 s in `ask_daemon.py`, also covers up to 1 s of token discovery.
+const SESSION_REFRESH_WAIT: Duration = Duration::from_millis(500);
 
 /// The shape the hook also checks (`SESSION_ID_SHAPE` in `ask_daemon.py`).
 fn valid_session_id(id: &str) -> bool {
@@ -474,7 +476,8 @@ pub(super) async fn done_task(
 /// claim it holds), then hand over what happened to its claims since the last call. Notices are
 /// delivered once: `take_notices` advances the session's cursor, so a hook reply that is lost in
 /// transit loses its notices — the price of never repeating them, accepted because every notice
-/// is also visible to `task_list`.
+/// is also visible to `task_list`. So they are taken last, after the (bounded) `master-red`
+/// refresh: a reply that runs out of the hook's time there has not consumed any.
 pub(super) async fn session_step(
     pool: &sqlx::SqlitePool,
     session_id: &str,
@@ -485,26 +488,37 @@ pub(super) async fn session_step(
     now: Now,
 ) -> sqlx::Result<Value> {
     sessions::touch_session(pool, session_id, root, project_id, now).await?;
-    let notices: Vec<String> = sessions::take_notices(pool, session_id, now)
-        .await?
-        .iter()
-        .map(render_notice)
-        .collect();
     let incidents: Vec<String> = if want_incidents {
         // Re-prove a stale `master-red` before the list, so only what is still live is told.
         // The executor is a process global (`verify::installed`); without one (early startup,
-        // tests) the list goes out as it stands.
+        // tests) the list goes out as it stands. The refresh runs as its own task so that a
+        // wait that runs out leaves it to finish (and settle the re-proof flight) in the
+        // background, instead of dropping it halfway.
         if let Some(executor) = executor {
-            let refresh = crate::verify::inherit::refresh_master_red(
-                pool,
-                executor,
-                project_id,
-                SESSION_REFRESH_WAIT,
-                chrono::Utc::now(),
-            )
-            .await;
-            if let crate::verify::inherit::Refresh::Unavailable(why) = refresh {
-                tracing::warn!(%why, project_id, "could not refresh master-red at SessionStart");
+            let (pool, executor, project) = (pool.clone(), executor.clone(), project_id.to_owned());
+            let refresh = tokio::spawn(async move {
+                crate::verify::inherit::refresh_master_red(
+                    &pool,
+                    &executor,
+                    &project,
+                    SESSION_REFRESH_WAIT,
+                    chrono::Utc::now(),
+                )
+                .await
+            });
+            match tokio::time::timeout(SESSION_REFRESH_WAIT, refresh).await {
+                Ok(Ok(crate::verify::inherit::Refresh::Unavailable(why))) => {
+                    tracing::warn!(
+                        %why,
+                        project_id,
+                        "could not refresh master-red at SessionStart"
+                    );
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, project_id, "the master-red refresh task failed");
+                }
+                // Done, or still running past the wait: list the incident as it stands.
+                Ok(Ok(_)) | Err(_) => {}
             }
         }
         store::list_live(pool, project_id, now)
@@ -519,6 +533,11 @@ pub(super) async fn session_step(
     } else {
         Vec::new()
     };
+    let notices: Vec<String> = sessions::take_notices(pool, session_id, now)
+        .await?
+        .iter()
+        .map(render_notice)
+        .collect();
     Ok(
         json!({ "registered": true, "project_id": project_id, "notices": notices, "incidents": incidents }),
     )
@@ -1153,6 +1172,47 @@ mod tests {
             "{}",
             refused.1
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_wins_the_open_master_red_incident_through_task_claim() {
+        let pool = crate::testdb::fresh_pool().await;
+        let t0 = chrono::Utc::now();
+        // The postgate's way in (`ensure_incident`): an open incident nobody holds.
+        let new = crate::task_claims::testing::new_task(
+            "master-red",
+            crate::task_claims::TaskKind::Incident,
+        );
+        let incident = store::create_or_adopt_open(&pool, "alpha", new, t0)
+            .await
+            .unwrap();
+        let body = ClaimBody {
+            key: Some("master-red".into()),
+            ..Default::default()
+        };
+        let at = located("alpha", "/w");
+        let (s1, s2) = (
+            holder(HolderKind::Session, "s1", "/w"),
+            holder(HolderKind::Session, "s2", "/w2"),
+        );
+
+        let won = claim_task(&pool, &at, &s1, &body, t0)
+            .await
+            .expect("claiming the daemon's incident is not a refusal");
+        assert_eq!(won["won"], true, "{won}");
+        assert_eq!(won["task"]["id"], incident.id);
+        assert_eq!(
+            won["task"]["kind"], "incident",
+            "the incident stays the daemon's kind"
+        );
+        let lost = claim_task(&pool, &at, &s2, &body, t0).await.unwrap();
+        assert_eq!(lost["won"], false, "first claim wins: {lost}");
+        assert_eq!(lost["holder"]["id"], "s1");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "no second master-red");
     }
 
     fn located_in(worktree: &str, project_root: &str) -> Located {
