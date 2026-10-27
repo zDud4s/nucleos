@@ -124,6 +124,7 @@ pub(super) async fn rule_session(
 }
 
 /// [`run_rules_pass`] with the families injected, so a test can run the pass over its own.
+#[cfg(test)]
 pub(super) async fn run_rules_pass_with(
     pool: &SqlitePool,
     cfg: &DevtimeRulesConfig,

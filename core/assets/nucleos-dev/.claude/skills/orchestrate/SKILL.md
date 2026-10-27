@@ -120,6 +120,8 @@ When Size is `large`, or the plan would not fit one controller within `nodes.orc
 
 **Who does what.** Only you run cargo, gates, commits and merges, and only you write the contract. Every other node edits (a leaf, inside its own files) or splits (an orchestrator, without editing). The engine is `python <bundle_dir>/scripts/tree.py <verb>`: `init`, `branch add|bind|drop`, `budget`, `open`, `prompt`, `record`, `gate`, `review`, `merge`, `close`, `park`, `status`, `finish`. Each verb has `--help`. `--tree <id>` or the env var `NUCLEOS_TREE_ID` selects the tree for every verb except `init`. It prints JSON; exit 2 is a refusal, so read its `error` and fix the input instead of retrying. It never calls MCP: when a verb returns `{"mcp": [...]}`, make those calls in that order. The tree's state is `tree.json` and `node_tree`, never your context. Node-side rules live in `orchestrate-node`; the decomposition rules are in workflow.md ("Decomposition (node trees)").
 
+**Precondition.** Before step 1, check that the `mcp__nucleos__node_open`, `node_update`, `node_close`, `node_tree` and `node_active` tools are in this session. If any is absent (the nucleos MCP is not connected, or the daemon predates the fix that gave the worktree box the `node_*` tools), open nothing and do not improvise a tree: tell the user why, and ask whether to run the task undecomposed as a medium flow.
+
 **The cycle**
 
 1. **Open.** `node_open` the root (no `parent_id`), then `tree.py init <root_id> --feature-branch <b> --goal <g>`. Its `dirty_owner_files` lists the owner's uncommitted files in the main checkout: tell the user now that a feature touching them will be Blocked at the land. Never stash them.

@@ -706,8 +706,8 @@ export const keys = {
     distiller: ["system", "distiller"] as const,
     /** `GET /config/distiller-sources` — the chat and calendar switches. */
     distillerSources: ["system", "distillerSources"] as const,
-    /** `GET /config/capture-wait` — how long a capture request waits for the owner, in minutes. */
-    captureWait: ["system", "captureWait"] as const,
+    /** `GET /config/capture` — the capture answer window in days and the daily digest hour. */
+    captureConfig: ["system", "captureConfig"] as const,
     /** `GET /config/embedding` — which Ollama model embeds knowledge rows. */
     embedding: ["system", "embedding"] as const,
     /** The credentials this machine holds, by presence only -- `GET /config/secrets`. */

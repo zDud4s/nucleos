@@ -62,6 +62,10 @@ pub enum Text {
         jobs: Vec<i64>,
         reply_to: bool,
     },
+    /// A reply to a digest with several questions open: which ones, answer nothing.
+    CaptureDigestHint {
+        jobs: Vec<i64>,
+    },
     CaptureNeedsText,
     CaptureAnswered {
         job: i64,
@@ -201,13 +205,23 @@ pub fn render(text: &Text) -> String {
                 format!("Capture requests waiting: {list}. Answer with /cap <N> <text>.")
             }
         }
+        Text::CaptureDigestHint { jobs } => {
+            let list = jobs
+                .iter()
+                .map(|j| format!("#{j}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Several questions are open: {list}. Answer one with /cap <N> <text>.")
+        }
         Text::CaptureNeedsText => {
             "Capture requests take a typed reply - type your answer instead.".to_string()
         }
-        Text::CaptureAnswered { job } => format!("Answered capture request #{job}."),
+        Text::CaptureAnswered { job } => {
+            format!("Noted for capture request #{job}; the next distillation will read it.")
+        }
         Text::CaptureLate { note } => {
             format!(
-                "Noted (#{note}), but that question has moved on - the answer was kept as a plain note."
+                "Noted (#{note}), but no new reading was scheduled for it (limit reached or the job is gone)."
             )
         }
         Text::AlreadyHandled => "That one was already handled.".to_string(),
@@ -439,6 +453,7 @@ mod tests {
                 jobs: vec![1, 2],
                 reply_to: false,
             },
+            Text::CaptureDigestHint { jobs: vec![1, 2] },
             Text::CaptureNeedsText,
             Text::CaptureAnswered { job: 1 },
             Text::AlreadyHandled,
@@ -473,6 +488,12 @@ mod tests {
                 assert!(!s.contains(pt), "{t:?} is not English: {s}");
             }
         }
+    }
+
+    #[test]
+    fn a_late_capture_answer_says_no_new_reading_was_scheduled() {
+        let s = render(&Text::CaptureLate { note: 5 });
+        assert!(s.contains("no new reading was scheduled"), "{s}");
     }
 
     #[test]

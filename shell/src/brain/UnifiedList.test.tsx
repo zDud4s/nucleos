@@ -44,6 +44,7 @@ function capture(over: Partial<CaptureRequest> = {}): CaptureRequest {
     note_id: null,
     created_at: "2026-09-01T10:00:00+00:00",
     closed_at: "2026-09-01T11:00:00+00:00",
+    digest_id: null,
     ...over,
   };
 }

@@ -179,6 +179,7 @@ export const DISTILL_CAUSE_LABELS: Record<string, string> = {
   generalised: "seen across several places",
   calendar_week: "a week of the calendar",
   chat_exchanges: "a conversation",
+  owner_answered: "you answered a question",
 };
 
 /** Where a distilled row came from: its job, the runs behind it, and why it was written. */

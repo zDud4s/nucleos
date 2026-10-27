@@ -51,6 +51,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "browser_writes",
     // A forgotten project's open questions must hold nothing, nor be answered later.
     "capture_requests",
+    // `capture_digests` has no `project_id`: it is not here on purpose; `remove` deletes it
+    // through `json_each(job_ids)`.
     // Dev time is project history, and it goes with the project. Its file offsets in
     // `devtime_files` are deliberately KEPT (owner's decision, 2026-10-05): re-adding the folder
     // then counts time from that moment on, instead of resurrecting the old time from transcripts
@@ -568,6 +570,27 @@ pub async fn remove(
               WHERE session_id IN (SELECT session_id FROM devtime_sessions WHERE project_id = ?1)
                  OR finding_key IN (SELECT finding_key FROM devtime_findings WHERE project_id = ?1)",
         )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // A digest names jobs of several projects (`job_ids` JSON) and has no `project_id`, so no
+        // loop reaches it. BEFORE the `PROJECT_SCOPED` loop, which deletes `jobs`: this reads
+        // them. The feed line goes first, because it is found through the digest row.
+        let cited = "EXISTS (SELECT 1 FROM json_each(d.job_ids) je
+                              JOIN jobs j ON j.id = je.value WHERE j.project_id = ?1)";
+        forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM feed WHERE subject IN
+                 (SELECT 'capture_digest:' || d.id FROM capture_digests d WHERE {cited})"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM capture_digests WHERE id IN (SELECT d.id FROM capture_digests d WHERE {cited})"
+        )))
         .bind(project_id)
         .execute(&mut *tx)
         .await?
@@ -1892,6 +1915,77 @@ mod tests {
         assert_eq!(
             left, 0,
             "a forgotten project's capture requests outlived it"
+        );
+    }
+
+    /// A digest names jobs of several projects and its feed line quotes their headers, so it goes
+    /// with any one of them; the other project's questions stay answerable.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_the_digests_that_cite_its_jobs_and_their_feed_lines() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        register(&pool, "bravo").await;
+        for (id, project) in [(7, "alpha"), (8, "bravo")] {
+            sqlx::query(
+                "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+                 VALUES (?, ?, '/tmp', 'failed', 3, 't')",
+            )
+            .bind(id)
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at, digest_id)
+                 VALUES (?, ?, '[]', 'q', 'open', '2999-01-01T00:00:00+00:00', 't', 1)",
+            )
+            .bind(id)
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // A digest of bravo alone must survive alpha's forget.
+        sqlx::query("INSERT INTO capture_digests (id, day, job_ids, created_at) VALUES (1, '2026-10-07', '[7,8]', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO capture_digests (id, day, job_ids, created_at) VALUES (2, '2026-10-08', '[8]', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in [1, 2] {
+            sqlx::query("INSERT INTO feed (project_id, kind, summary, subject, created_at) VALUES (NULL, 'capture_digest', 's', ?, 't')")
+                .bind(format!("capture_digest:{id}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM capture_digests").await,
+            1
+        );
+        let kept: String =
+            sqlx::query_scalar("SELECT subject FROM feed WHERE kind = 'capture_digest'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept, "capture_digest:2",
+            "the digest and its feed line go together, only the cited ones"
+        );
+        let requests: Vec<i64> =
+            sqlx::query_scalar("SELECT job_id FROM capture_requests ORDER BY job_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            requests,
+            vec![8],
+            "bravo's question stays answerable; alpha's went with its project"
         );
     }
 

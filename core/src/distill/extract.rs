@@ -297,7 +297,11 @@ pub fn standing_for(cause: Cause) -> String {
         Cause::ChatExchanges => {
             " This dossier is a conversation between the owner and an assistant. Write down the preferences, decisions and corrections the owner stated that would still matter in a later session, never a summary of the conversation."
         }
-        Cause::JobFailed | Cause::GateRecovered | Cause::ReviewBlocking | Cause::RunExhausted => "",
+        Cause::JobFailed
+        | Cause::GateRecovered
+        | Cause::ReviewBlocking
+        | Cause::RunExhausted
+        | Cause::OwnerAnswered => "",
     };
     format!("{STANDING_HEAD}{tail}")
 }
