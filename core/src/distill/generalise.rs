@@ -224,6 +224,7 @@ fn dossier(group: &Group, note_texts: &[String]) -> String {
 /// What the write did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Written {
+    #[allow(dead_code)] // the new row's id: the pass only needs to know it was written.
     Proposed(i64),
     Reconfirmed,
     /// The owner already refused it, or it has nowhere to live: nothing was written.
