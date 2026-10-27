@@ -32,6 +32,7 @@ use super::*;
 /// not route on it, having already been chosen by the time this is called — which is exactly what
 /// makes forgetting it easy and invisible until `relay::admit` refuses a relay it should have
 /// admitted.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_local_turn(
     state: &crate::state::AppState,
     slot: ChatSlot,
