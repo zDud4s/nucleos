@@ -203,26 +203,9 @@ pub(super) async fn ensure_incident(
     let key = keys::normalize(MASTER_RED_KEY, project_root).map_err(|error| format!("{error:?}"))?;
     let none = RedFailures::default();
     let failures = failures.unwrap_or(&none);
-    let new = NewTask {
-        key,
-        kind: TaskKind::Incident,
-        title: format!("{} is red: {}", state.target, state.red_groups.join(", ")),
-        detail: new_incident_detail(
-            &state.target,
-            state.red_since_sha.as_deref(),
-            state.red_sha.as_deref(),
-            state.red_base_sha.as_deref(),
-            &state.red_groups,
-            failures,
-        ),
-        guard_paths: failures.files.clone(),
-        hint_paths: Vec::new(),
-    };
-    let mut row = task_claims::store::create_or_adopt_open(pool, project_id, new, Utc::now())
-        .await
-        .map_err(|error| error.to_string())?;
-    // Adoption keeps what the row already knew; the postgate's word wins on the shas, groups and
-    // (when the runner named any) the tests.
+    // The patch, not `new_incident_detail`: `create_or_adopt_open` merges `detail` over an adopted
+    // row with the new keys winning, so an empty `red_tests` here would wipe the tests an earlier
+    // pass (or a verify probe) named. The empty list a fresh row needs is added below instead.
     let patch = red_patch(
         &state.target,
         state.red_since_sha.as_deref(),
@@ -231,6 +214,32 @@ pub(super) async fn ensure_incident(
         &state.red_groups,
         failures,
     );
+    let new = NewTask {
+        key,
+        kind: TaskKind::Incident,
+        title: format!("{} is red: {}", state.target, state.red_groups.join(", ")),
+        detail: patch.clone(),
+        guard_paths: failures.files.clone(),
+        hint_paths: Vec::new(),
+    };
+    let mut row = task_claims::store::create_or_adopt_open(pool, project_id, new, Utc::now())
+        .await
+        .map_err(|error| error.to_string())?;
+    // Adoption keeps what the row already knew; the postgate's word wins on the shas, groups and
+    // (when the runner named any) the tests. A row that has no `red_tests` at all (just created, or
+    // adopted from a writer that set none) gets the empty list `new_incident_detail` gives.
+    let patch = if row.detail.get("red_tests").is_none() {
+        new_incident_detail(
+            &state.target,
+            state.red_since_sha.as_deref(),
+            state.red_sha.as_deref(),
+            state.red_base_sha.as_deref(),
+            &state.red_groups,
+            failures,
+        )
+    } else {
+        patch
+    };
     // `create_or_adopt_open` unions the paths of an open row; a claimed one may not, so the union is
     // made here and written when it adds anything (`update_detail` replaces, so the whole list).
     let mut guards = row.guard_paths.clone();
