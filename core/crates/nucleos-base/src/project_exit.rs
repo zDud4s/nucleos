@@ -1568,7 +1568,10 @@ mod tests {
             "-:chat:4",
             "a:chat:",
         ] {
-            assert!(left.contains(&kept.to_string()), "{kept} was taken by forgetting `a`");
+            assert!(
+                left.contains(&kept.to_string()),
+                "{kept} was taken by forgetting `a`"
+            );
         }
         for table in [
             "knowledge_embeddings",
@@ -1587,9 +1590,16 @@ mod tests {
         remove(&pool, "a%b", true).await.unwrap();
         let left = observation_scopes(&pool).await;
         assert!(!left.contains(&"a_b:chat:2".into()) && !left.contains(&"a%b:chat:3".into()));
-        assert!(left.contains(&"axb:chat:7".to_string()), "`_` or `%` matched the `x`");
+        assert!(
+            left.contains(&"axb:chat:7".to_string()),
+            "`_` or `%` matched the `x`"
+        );
         remove(&pool, "a:chat:5", true).await.unwrap();
-        assert!(!observation_scopes(&pool).await.contains(&"a:chat:5:chat:9".into()));
+        assert!(
+            !observation_scopes(&pool)
+                .await
+                .contains(&"a:chat:5:chat:9".into())
+        );
     }
 
     /// A chat's candidates are plain `project` rows: the existing statements already take them.
