@@ -346,6 +346,44 @@ pub async fn remove(
         // cannot outlive it, and it reads `knowledge` to find its rows, so it goes before that
         // table does.
         //
+        // Derived (a), spec 9: the general lessons whose `knowledge` evidence is ALL this project's rows.
+        // Chosen into a temp table BEFORE the statements below, which delete the very rows this one reads;
+        // `note` references have no project and do not make the evidence mixed. Ids compare by equality, never
+        // LIKE. The observation arm is `<project>:chat:<n>` by `substr`, since a project id may hold a LIKE wildcard.
+        sqlx::query("CREATE TEMP TABLE forgotten_lessons (id INTEGER PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO forgotten_lessons (id)
+             SELECT g.id FROM knowledge g
+              WHERE g.distill_cause = 'generalised' AND json_valid(g.evidence)
+                AND EXISTS (SELECT 1 FROM json_each(g.evidence) e
+                             WHERE json_extract(e.value, '$.t') = 'knowledge')
+                AND NOT EXISTS (SELECT 1 FROM json_each(g.evidence) e
+                     WHERE json_extract(e.value, '$.t') = 'knowledge'
+                       AND COALESCE(json_extract(e.value, '$.id'), -1) NOT IN (
+                           SELECT id FROM knowledge
+                            WHERE (scope_kind = 'project' AND scope_id = ?1)
+                               OR (scope_kind = 'job'
+                                   AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))
+                               OR (scope_kind = 'observation'
+                                   AND substr(scope_id, 1, length(?1) + 6) = ?1 || ':chat:')))",
+        )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        for sql in [
+            "DELETE FROM knowledge_embeddings WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
+            "DELETE FROM knowledge_embed_failures WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
+            "DELETE FROM knowledge_events WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
+            "DELETE FROM knowledge WHERE id IN (SELECT id FROM forgotten_lessons)",
+        ] {
+            forgotten += sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
+        }
+        sqlx::query("DROP TABLE forgotten_lessons")
+            .execute(&mut *tx)
+            .await?;
+
         // `machine` appears in none of the statements, and that is correct: machine rows are not a
         // project's.
         forgotten += sqlx::query(
@@ -1914,5 +1952,95 @@ mod tests {
 
         remove_tree(&d).unwrap();
         assert!(!d.exists(), "the locked tree is still there");
+    }
+
+    async fn lesson_row(
+        pool: &SqlitePool,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        evidence: &str,
+        cause: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, evidence, distill_cause, status, created_at)
+             VALUES ('semantic', ?, ?, 'distiller', 'memory', 't', 'b', ?, ?, 'active', '2026-10-20T00:00:00Z')",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(evidence)
+        .bind(cause)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+    async fn present(pool: &SqlitePool, id: i64) -> bool {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            > 0
+    }
+    fn refs(ids: &[i64]) -> String {
+        format!(
+            "[{}]",
+            ids.iter()
+                .map(|i| format!(r#"{{"t":"knowledge","id":{i}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    /// Derived (a), spec 9: a general lesson whose `knowledge` evidence is ALL the forgotten project's goes with it;
+    /// one that also rests on another project stays (the owner approved its text). The lesson is selected BEFORE its
+    /// evidence rows are deleted: afterwards every id would look foreign and the lesson would read as mixed.
+    #[tokio::test]
+    async fn forgetting_a_project_selects_its_general_lessons_before_deleting_their_evidence() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        let a1 = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let a2 = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let a3 = lesson_row(&pool, "observation", Some("alpha:chat:4"), "[]", None).await;
+        let b1 = lesson_row(&pool, "project", Some("bravo"), "[]", None).await;
+        let only_alpha = lesson_row(
+            &pool,
+            "machine",
+            None,
+            &refs(&[a1, a2, a3]).replace(']', r#",{"t":"note","id":9}]"#),
+            Some("generalised"),
+        )
+        .await;
+        let mixed = lesson_row(&pool, "machine", None, &refs(&[a1, b1]), Some("generalised")).await;
+        let not_general = lesson_row(&pool, "machine", None, &refs(&[a1]), Some("job_failed")).await;
+        let no_evidence = lesson_row(&pool, "machine", None, "[]", Some("generalised")).await;
+        store_vector(&pool, only_alpha).await;
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        assert!(
+            !present(&pool, only_alpha).await,
+            "a lesson resting only on alpha's rows outlived them"
+        );
+        let vectors: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_embeddings WHERE knowledge_id = ?")
+                .bind(only_alpha)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(vectors, 0);
+        for kept in [mixed, not_general, no_evidence, b1] {
+            assert!(present(&pool, kept).await, "{kept} should stay");
+        }
+    }
+
+    #[tokio::test]
+    async fn keeping_the_history_keeps_every_general_lesson() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        let a1 = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let g = lesson_row(&pool, "machine", None, &refs(&[a1]), Some("generalised")).await;
+        remove(&pool, "alpha", false).await.unwrap();
+        assert!(present(&pool, g).await);
     }
 }
