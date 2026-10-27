@@ -1164,8 +1164,7 @@ mod tests {
             chrono::Utc::now(),
         )
         .await
-        .err()
-        .expect("the store refuses a declared master-red");
+        .expect_err("the store refuses a declared master-red");
         assert_eq!(refused.0, StatusCode::CONFLICT);
         assert!(
             refused.1.contains("created by the daemon only"),
