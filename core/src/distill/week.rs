@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday};
 use sqlx::SqlitePool;
 
 use super::{Cause, QueueRow, STATUS_DONE, STATUS_RUNNING, ask, fail};
@@ -62,6 +62,27 @@ pub(super) fn week_scope_id(day: NaiveDate) -> String {
 /// week it was queued for).
 fn week_scope_of_item(item_id: i64) -> String {
     format!("week:{}-W{:02}", item_id / 100, item_id % 100)
+}
+
+/// The instant the window of a queued week is read around: the middle of that week (Thursday 00:00
+/// local), from the row's `item_id`, so a retry in a later week reads the week it was queued for.
+/// Without an `item_id`, or for one that names no week, `now`.
+fn week_anchor(item_id: Option<i64>, now: DateTime<Utc>) -> DateTime<Utc> {
+    let Some(item_id) = item_id else { return now };
+    let Ok(year) = i32::try_from(item_id / 100) else {
+        return now;
+    };
+    let Some(thursday) = u32::try_from(item_id % 100)
+        .ok()
+        .and_then(|week| NaiveDate::from_isoywd_opt(year, week, Weekday::Thu))
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+    else {
+        return now;
+    };
+    Local
+        .from_local_datetime(&thursday)
+        .earliest()
+        .map_or(now, |t| t.with_timezone(&Utc))
 }
 
 /// `true` when `name` occurs in `title` as a whole word, ignoring case. Word characters are
@@ -286,7 +307,7 @@ pub(super) async fn process(
         close(pool, &row, Some("disabled"), now).await;
         return;
     }
-    let inputs = match gather_week(pool, now).await {
+    let inputs = match gather_week(pool, week_anchor(row.item_id, now)).await {
         Ok(Some(inputs)) => inputs,
         Ok(None) => {
             close(pool, &row, None, now).await;
@@ -694,6 +715,18 @@ mod tests {
             );
             assert_eq!((about, cause.as_deref()), (None, Some("calendar_week")));
         }
+    }
+
+    #[test]
+    fn a_retried_row_reads_the_window_of_its_own_week_not_of_now() {
+        let anchor = week_anchor(Some(202643), Utc.with_ymd_and_hms(2026, 12, 1, 12, 0, 0).unwrap());
+        assert_eq!(
+            anchor.with_timezone(&Local).date_naive(),
+            NaiveDate::from_ymd_opt(2026, 10, 22).unwrap()
+        );
+        let now = noon();
+        assert_eq!(week_anchor(None, now), now);
+        assert_eq!(week_anchor(Some(202699), now), now);
     }
 
     #[test]

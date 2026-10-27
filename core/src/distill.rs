@@ -898,9 +898,10 @@ pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn
         }
         // Weekly and sealed at its own start, so most ticks return at once.
         crate::themes::run_weekly(pool, embedder.model(), Utc::now()).await;
-        crate::themes::refresh_syntheses(pool, asked, Utc::now()).await;
     }
     if drained {
+        // A synthesis needs only the model, not an embedder.
+        crate::themes::refresh_syntheses(pool, asked, Utc::now()).await;
         generalise::run_if_due(pool, asked, embedder, Utc::now()).await;
     }
 }

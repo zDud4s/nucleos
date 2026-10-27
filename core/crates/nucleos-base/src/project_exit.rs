@@ -356,29 +356,61 @@ pub async fn remove(
         // cannot outlive it, and it reads `knowledge` to find its rows, so it goes before that
         // table does.
         //
+        //
+        // Derived (a), spec 9: the general lessons whose `knowledge` evidence is ALL this project's rows.
+        // Chosen into a temp table BEFORE the statements below, which delete the very rows this one reads;
+        // `note` references have no project and do not make the evidence mixed. Ids compare by equality, never
+        // LIKE. The observation arm is `<project>:chat:<n>` by `substr`, since a project id may hold a LIKE wildcard.
+        sqlx::query("CREATE TEMP TABLE forgotten_lessons (id INTEGER PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO forgotten_lessons (id)
+             SELECT g.id FROM knowledge g
+              WHERE g.distill_cause = 'generalised' AND json_valid(g.evidence)
+                AND EXISTS (SELECT 1 FROM json_each(g.evidence) e
+                             WHERE json_extract(e.value, '$.t') = 'knowledge')
+                AND NOT EXISTS (SELECT 1 FROM json_each(g.evidence) e
+                     WHERE json_extract(e.value, '$.t') = 'knowledge'
+                       AND COALESCE(json_extract(e.value, '$.id'), -1) NOT IN (
+                           SELECT id FROM knowledge
+                            WHERE (scope_kind = 'project' AND scope_id = ?1)
+                               OR (scope_kind = 'job'
+                                   AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))
+                               OR id IN ({CHAT_OBSERVATIONS})))"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
         // Derived (b) + (d), spec 2026-10-22 section 9: the themes. They read the knowledge rows the
         // statements below delete, so they run first, for the reason given above. A theme that loses a
         // knowledge member keeps living with a NULL centroid (recomputed next run) and without the
         // synthesis built on that member; a `proposed` theme left with fewer than 3 members is deleted
         // with them. Notes have no project and keep counting as live members.
-        const GONE: &str = "SELECT id FROM knowledge
-             WHERE (scope_kind = 'project' AND scope_id = ?1)
-                OR (scope_kind = 'job'
-                    AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))";
+        // Also the project's chat observations and the general lessons about to go (`forgotten_lessons`,
+        // chosen above): `themes::candidates` takes `observed` and `distiller` rows as members too.
+        let gone = format!(
+            "SELECT id FROM knowledge
+              WHERE (scope_kind = 'project' AND scope_id = ?1)
+                 OR (scope_kind = 'job'
+                     AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))
+                 OR id IN ({CHAT_OBSERVATIONS})
+                 OR id IN (SELECT id FROM forgotten_lessons)"
+        );
         sqlx::query("CREATE TEMP TABLE _theme_affected (id INTEGER PRIMARY KEY)")
             .execute(&mut *tx)
             .await?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO _theme_affected (id)
              SELECT DISTINCT theme_id FROM theme_members
-              WHERE member_kind = 'knowledge' AND member_id IN ({GONE})"
+              WHERE member_kind = 'knowledge' AND member_id IN ({gone})"
         )))
         .bind(project_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM theme_members
-              WHERE member_kind = 'knowledge' AND member_id IN ({GONE})"
+              WHERE member_kind = 'knowledge' AND member_id IN ({gone})"
         )))
         .bind(project_id)
         .execute(&mut *tx)
@@ -412,33 +444,6 @@ pub async fn remove(
         sqlx::query("DROP TABLE _theme_affected")
             .execute(&mut *tx)
             .await?;
-        //
-        // Derived (a), spec 9: the general lessons whose `knowledge` evidence is ALL this project's rows.
-        // Chosen into a temp table BEFORE the statements below, which delete the very rows this one reads;
-        // `note` references have no project and do not make the evidence mixed. Ids compare by equality, never
-        // LIKE. The observation arm is `<project>:chat:<n>` by `substr`, since a project id may hold a LIKE wildcard.
-        sqlx::query("CREATE TEMP TABLE forgotten_lessons (id INTEGER PRIMARY KEY)")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "INSERT INTO forgotten_lessons (id)
-             SELECT g.id FROM knowledge g
-              WHERE g.distill_cause = 'generalised' AND json_valid(g.evidence)
-                AND EXISTS (SELECT 1 FROM json_each(g.evidence) e
-                             WHERE json_extract(e.value, '$.t') = 'knowledge')
-                AND NOT EXISTS (SELECT 1 FROM json_each(g.evidence) e
-                     WHERE json_extract(e.value, '$.t') = 'knowledge'
-                       AND COALESCE(json_extract(e.value, '$.id'), -1) NOT IN (
-                           SELECT id FROM knowledge
-                            WHERE (scope_kind = 'project' AND scope_id = ?1)
-                               OR (scope_kind = 'job'
-                                   AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))
-                               OR (scope_kind = 'observation'
-                                   AND substr(scope_id, 1, length(?1) + 6) = ?1 || ':chat:')))",
-        )
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await?;
         for sql in [
             "DELETE FROM knowledge_embeddings WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
             "DELETE FROM knowledge_embed_failures WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
@@ -2377,6 +2382,53 @@ mod tests {
         assert!(!present(&pool, with_note).await);
         assert!(present(&pool, mixed).await);
         assert!(present(&pool, b).await);
+    }
+
+    /// The observation arm uses the exact chat shape: a lesson resting only on `a:chat:5`'s (another
+    /// project's) or a malformed scope's observations is not `a`'s to forget.
+    #[tokio::test]
+    async fn forgetting_a_project_keeps_a_lesson_resting_on_a_look_alike_observation_scope() {
+        let pool = pool().await;
+        register(&pool, "a").await;
+        let other = put_observation(&pool, "a:chat:5:chat:9").await;
+        let bad = put_observation(&pool, "a:chat:").await;
+        let l1 = lesson_row(&pool, "machine", None, &refs(&[other]), Some("generalised")).await;
+        let l2 = lesson_row(&pool, "machine", None, &refs(&[bad]), Some("generalised")).await;
+        let own = put_observation(&pool, "a:chat:6").await;
+        let l3 = lesson_row(&pool, "machine", None, &refs(&[own]), Some("generalised")).await;
+        remove(&pool, "a", true).await.unwrap();
+        assert!(present(&pool, l1).await && present(&pool, l2).await);
+        assert!(!present(&pool, l3).await);
+    }
+
+    /// A chat observation and a general lesson are theme members too: forgetting their project takes
+    /// them out of the theme and clears its synthesis.
+    #[tokio::test]
+    async fn forgetting_a_project_removes_its_observations_and_lessons_from_themes() {
+        let pool = pool().await;
+        register(&pool, "a").await;
+        let obs = put_observation(&pool, "a:chat:6").await;
+        let other = put_observation(&pool, "b:chat:1").await;
+        let lesson = lesson_row(&pool, "machine", None, &refs(&[obs]), Some("generalised")).await;
+        let theme = theme_row(&pool, "accepted").await;
+        theme_member(&pool, theme, "knowledge", obs).await;
+        theme_member(&pool, theme, "knowledge", lesson).await;
+        theme_member(&pool, theme, "knowledge", other).await;
+        remove(&pool, "a", true).await.unwrap();
+        let members: Vec<i64> =
+            sqlx::query_scalar("SELECT member_id FROM theme_members WHERE theme_id = ?")
+                .bind(theme)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(members, vec![other]);
+        let synthesis: Option<String> =
+            sqlx::query_scalar("SELECT synthesis FROM themes WHERE id = ?")
+                .bind(theme)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(synthesis.is_none());
     }
 
     /// Derived (a), spec 9: a general lesson whose `knowledge` evidence is ALL the forgotten project's goes with it;
