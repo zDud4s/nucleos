@@ -94,7 +94,9 @@ pub fn plan_new_themes(
             .collect();
         let set: HashSet<MemberKey> = keys.iter().copied().collect();
         if keys.len() < MIN_MEMBERS
-            || blocking.iter().any(|b| jaccard(&set, b) >= BLOCKING_OVERLAP)
+            || blocking
+                .iter()
+                .any(|b| jaccard(&set, b) >= BLOCKING_OVERLAP)
         {
             continue;
         }
@@ -413,9 +415,15 @@ pub async fn run_weekly(pool: &SqlitePool, model: &str, now: DateTime<Utc>) {
         return;
     }
     // A pass that starts after the attempts were spent begins a fresh round.
-    let next = if attempts >= MAX_PASS_ATTEMPTS { 1 } else { attempts + 1 };
+    let next = if attempts >= MAX_PASS_ATTEMPTS {
+        1
+    } else {
+        attempts + 1
+    };
     if set_meta(pool, SEAL_KEY, &now.to_rfc3339()).await.is_err()
-        || set_meta(pool, ATTEMPTS_KEY, &next.to_string()).await.is_err()
+        || set_meta(pool, ATTEMPTS_KEY, &next.to_string())
+            .await
+            .is_err()
     {
         tracing::warn!("themes: could not seal the pass");
         return;
@@ -496,9 +504,7 @@ pub fn refresh_due(
     let before: HashSet<&String> = basis.iter().collect();
     let after: HashSet<&String> = current.iter().collect();
     let changes = before.symmetric_difference(&after).count() / 2;
-    changes > 0
-        && (changes >= 3 || changes * 5 >= basis.len().max(1))
-        && now - at >= REFRESH_AFTER
+    changes > 0 && (changes >= 3 || changes * 5 >= basis.len().max(1)) && now - at >= REFRESH_AFTER
 }
 
 /// The owner's "force" route is limited to one synthesis an hour.
@@ -1030,13 +1036,15 @@ mod tests {
                 "decided_at"
             ]
         );
-        let fks: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pragma_foreign_key_list('theme_members')",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(fks, 0, "a member that vanished must read `missing`, not block a delete");
+        let fks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('theme_members')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            fks, 0,
+            "a member that vanished must read `missing`, not block a delete"
+        );
         // The primary key is (theme_id, member_kind, member_id): the same member twice is refused.
         let insert = "INSERT INTO theme_members (theme_id, member_kind, member_id, added_at) \
                       VALUES (1, 'note', 7, 't')";
@@ -1067,7 +1075,12 @@ mod tests {
             }
             let source = std::fs::read_to_string(&path).unwrap();
             let production = crate::source_scan::production_code(&source);
-            for table in ["theme_members", "FROM themes", "INTO themes", "UPDATE themes"] {
+            for table in [
+                "theme_members",
+                "FROM themes",
+                "INTO themes",
+                "UPDATE themes",
+            ] {
                 assert!(!production.contains(table), "{module} names `{table}`");
             }
         }
@@ -1095,7 +1108,11 @@ mod tests {
             !pass_due(now, Some(now - chrono::Duration::days(3)), 0),
             "sealed for the week"
         );
-        assert!(pass_due(now, Some(now - wk - chrono::Duration::minutes(1)), 0));
+        assert!(pass_due(
+            now,
+            Some(now - wk - chrono::Duration::minutes(1)),
+            0
+        ));
         // One failed attempt just now: not yet; after the backoff: yes.
         assert!(!pass_due(now, Some(now), 1));
         assert!(pass_due(now, Some(now - chrono::Duration::hours(24)), 1));
@@ -1129,7 +1146,14 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            knowledge_row(&pool, &format!("t{i}"), src, st, [1.0, 0.01 * i as f32, 0.0]).await;
+            knowledge_row(
+                &pool,
+                &format!("t{i}"),
+                src,
+                st,
+                [1.0, 0.01 * i as f32, 0.0],
+            )
+            .await;
         }
         knowledge_row(&pool, "counter", "consolidator", "active", [1.0, 0.0, 0.0]).await;
         knowledge_row(&pool, "old", "distiller", "archived", [1.0, 0.0, 0.0]).await;
@@ -1143,7 +1167,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((state.as_str(), members), ("proposed", 3));
-        assert!(name.starts_with('t'), "named after a member title, got {name}");
+        assert!(
+            name.starts_with('t'),
+            "named after a member title, got {name}"
+        );
         // A second run on the same data proposes nothing (the blocking sets cover the group).
         assert_eq!(
             cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap(),
@@ -1155,7 +1182,14 @@ mod tests {
     async fn a_refused_theme_does_not_come_back() {
         let pool = crate::testdb::fresh_pool().await;
         for i in 0..3 {
-            knowledge_row(&pool, "x", "distiller", "active", [1.0, 0.01 * i as f32, 0.0]).await;
+            knowledge_row(
+                &pool,
+                "x",
+                "distiller",
+                "active",
+                [1.0, 0.01 * i as f32, 0.0],
+            )
+            .await;
         }
         cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
         sqlx::query("UPDATE themes SET state = 'refused'")
@@ -1172,7 +1206,14 @@ mod tests {
     async fn an_accepted_theme_absorbs_a_new_close_member_and_recomputes_its_centroid() {
         let pool = crate::testdb::fresh_pool().await;
         for i in 0..3 {
-            knowledge_row(&pool, "x", "distiller", "active", [1.0, 0.01 * i as f32, 0.0]).await;
+            knowledge_row(
+                &pool,
+                "x",
+                "distiller",
+                "active",
+                [1.0, 0.01 * i as f32, 0.0],
+            )
+            .await;
         }
         cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
         sqlx::query("UPDATE themes SET state = 'accepted'")
@@ -1326,7 +1367,11 @@ mod tests {
         add_member(&pool, t, MemberKind::Note, 5).await.unwrap();
         exclude_member(&pool, t, MemberKind::Note, 5).await.unwrap();
         let merged = theme(&pool, "merged").await;
-        assert!(add_member(&pool, merged, MemberKind::Note, 5).await.is_err());
+        assert!(
+            add_member(&pool, merged, MemberKind::Note, 5)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1507,15 +1552,24 @@ mod tests {
         let mut changed = small.clone();
         changed[0] = "note:50".into();
         assert!(refresh_due(&small, &changed, old, now));
-        assert!(!refresh_due(&small, &small, old, now), "no change, no refresh");
+        assert!(
+            !refresh_due(&small, &small, old, now),
+            "no change, no refresh"
+        );
         assert!(refresh_due(&[], &small, None, now));
     }
 
     #[test]
     fn the_force_route_is_limited_to_one_synthesis_per_hour() {
         let now = chrono::Utc::now();
-        assert!(!force_allowed(Some(now - chrono::Duration::minutes(10)), now));
-        assert!(force_allowed(Some(now - chrono::Duration::minutes(61)), now));
+        assert!(!force_allowed(
+            Some(now - chrono::Duration::minutes(10)),
+            now
+        ));
+        assert!(force_allowed(
+            Some(now - chrono::Duration::minutes(61)),
+            now
+        ));
         assert!(force_allowed(None, now));
     }
 }
@@ -1541,7 +1595,9 @@ pub(crate) mod tests_support {
         .await
         .unwrap();
         let mut conn = pool.acquire().await.unwrap();
-        crate::embed::store_in(&mut conn, id, "m", &v).await.unwrap();
+        crate::embed::store_in(&mut conn, id, "m", &v)
+            .await
+            .unwrap();
         id
     }
 }

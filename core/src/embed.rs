@@ -261,7 +261,9 @@ pub async fn nearest_in_scope(
             AND e.model = ?
           ORDER BY e.knowledge_id"
     );
-    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(scope_kind).bind(scope_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(scope_kind)
+        .bind(scope_id);
     for status in statuses {
         query = query.bind(*status);
     }
@@ -562,7 +564,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(next.0, other, "the group's own member is evidence, not a duplicate");
+        assert_eq!(
+            next.0, other,
+            "the group's own member is evidence, not a duplicate"
+        );
         let dead = nearest_in_scope(&mut conn, "machine", None, &["rejected"], "m", &query, &[])
             .await
             .unwrap()
@@ -575,9 +580,17 @@ mod tests {
             None
         );
         assert_eq!(
-            nearest_in_scope(&mut conn, "project", Some("alpha"), &live, "m", &query, &[elsewhere])
-                .await
-                .unwrap(),
+            nearest_in_scope(
+                &mut conn,
+                "project",
+                Some("alpha"),
+                &live,
+                "m",
+                &query,
+                &[elsewhere]
+            )
+            .await
+            .unwrap(),
             None
         );
     }

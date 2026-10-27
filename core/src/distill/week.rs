@@ -230,12 +230,7 @@ async fn record_observation_in(
             distill_cause, about, status, created_at)
          VALUES (?, 'observation', ?, 'distiller', ?, ?, ?, ?, ?, ?, ?, 'observed', ?)",
     )
-    .bind(
-        provenance
-            .layer
-            .unwrap_or_else(|| kind.layer())
-            .as_str(),
-    )
+    .bind(provenance.layer.unwrap_or_else(|| kind.layer()).as_str())
     .bind(scope_id)
     .bind(kind.as_str())
     .bind(title)
@@ -426,8 +421,22 @@ mod tests {
     fn human_events_count_and_agent_proposals_do_not() {
         let rows = week_lines(
             &[
-                occ("Gym", "human", "2026-10-20T07:00:00", "2026-10-20T06:00:00Z", 60, 1),
-                occ("Agent slot", "proposal", "2026-10-20T10:00:00", "2026-10-20T09:00:00Z", 30, 2),
+                occ(
+                    "Gym",
+                    "human",
+                    "2026-10-20T07:00:00",
+                    "2026-10-20T06:00:00Z",
+                    60,
+                    1,
+                ),
+                occ(
+                    "Agent slot",
+                    "proposal",
+                    "2026-10-20T10:00:00",
+                    "2026-10-20T09:00:00Z",
+                    30,
+                    2,
+                ),
             ],
             &HashMap::new(),
         );
@@ -440,7 +449,14 @@ mod tests {
     fn day_and_hour_come_from_the_local_time_not_from_utc() {
         // 00:30 local on Monday 2026-10-26 is 23:30Z on Sunday 2026-10-25 (UTC+1).
         let rows = week_lines(
-            &[occ("Night shift", "human", "2026-10-26T00:30:00", "2026-10-25T23:30:00Z", 90, 1)],
+            &[occ(
+                "Night shift",
+                "human",
+                "2026-10-26T00:30:00",
+                "2026-10-25T23:30:00Z",
+                90,
+                1,
+            )],
             &HashMap::new(),
         );
         assert!(rows[0].starts_with("Mon 00:30"), "got {:?}", rows[0]);
@@ -452,7 +468,14 @@ mod tests {
         let mut freq = HashMap::new();
         freq.insert(1_i64, "weekly".to_owned());
         let rows = week_lines(
-            &[occ("Gym", "human", "2026-10-20T07:00:00", "2026-10-20T06:00:00Z", 60, 1)],
+            &[occ(
+                "Gym",
+                "human",
+                "2026-10-20T07:00:00",
+                "2026-10-20T06:00:00Z",
+                60,
+                1,
+            )],
             &freq,
         );
         assert!(rows[0].contains("weekly"));
@@ -460,13 +483,19 @@ mod tests {
 
     #[test]
     fn the_week_key_packs_the_iso_year_and_week() {
-        assert_eq!(week_item_id(NaiveDate::from_ymd_opt(2026, 10, 21).unwrap()), 202643);
+        assert_eq!(
+            week_item_id(NaiveDate::from_ymd_opt(2026, 10, 21).unwrap()),
+            202643
+        );
         assert_eq!(
             week_scope_id(NaiveDate::from_ymd_opt(2026, 10, 21).unwrap()),
             "week:2026-W43"
         );
         // 2027-01-01 belongs to ISO week 53 of 2026.
-        assert_eq!(week_item_id(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()), 202653);
+        assert_eq!(
+            week_item_id(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()),
+            202653
+        );
         assert_eq!(week_scope_of_item(202643), "week:2026-W43");
     }
 
@@ -484,7 +513,10 @@ mod tests {
                  (address, contact_id, first_seen, last_seen, outbound_ever, display_name)
              VALUES (?, ?, '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', ?, ?)",
         )
-        .bind(format!("{}@example.test", name.to_lowercase().replace(' ', ".")))
+        .bind(format!(
+            "{}@example.test",
+            name.to_lowercase().replace(' ', ".")
+        ))
         .bind(contact_id)
         .bind(i64::from(outbound))
         .bind(name)
@@ -524,7 +556,9 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            contact_marks(&pool, &["ana's birthday".to_owned()]).await.unwrap(),
+            contact_marks(&pool, &["ana's birthday".to_owned()])
+                .await
+                .unwrap(),
             vec!["Ana".to_owned()]
         );
         // The dossier line has the name and the fixed phrase only: no address, count or mail text.
@@ -535,10 +569,12 @@ mod tests {
     async fn the_calendar_source_is_on_when_the_key_is_absent_and_off_only_for_a_stored_zero() {
         let pool = crate::testdb::fresh_pool().await;
         assert!(calendar_source_on(&pool).await);
-        sqlx::query("INSERT INTO schema_meta (key, value) VALUES ('distiller.calendar_sources', '0')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES ('distiller.calendar_sources', '0')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert!(!calendar_source_on(&pool).await);
         sqlx::query("UPDATE schema_meta SET value = '1' WHERE key = 'distiller.calendar_sources'")
             .execute(&pool)
@@ -651,7 +687,10 @@ mod tests {
         event(&pool, "Soon", "human", noon() + day(10)).await;
         event(&pool, "Too far", "human", noon() + day(20)).await;
         event(&pool, "Agent slot", "proposal", noon() - day(5)).await;
-        let inputs = gather_week(&pool, noon()).await.unwrap().expect("two events");
+        let inputs = gather_week(&pool, noon())
+            .await
+            .unwrap()
+            .expect("two events");
         assert_eq!(inputs.titles, vec!["Past".to_owned(), "Soon".to_owned()]);
 
         // A fresh database has no human event: done, empty error, the model never asked.
@@ -661,16 +700,21 @@ mod tests {
         let runner = fake_answering("[]");
         super::super::process_one_with(&empty, Extractor::Cli(&runner), None, row, noon()).await;
         assert_eq!(queue_state(&empty, id).await, ("done".to_owned(), None));
-        assert!(runner.last_prompt.lock().unwrap().is_none(), "the model was asked");
+        assert!(
+            runner.last_prompt.lock().unwrap().is_none(),
+            "the model was asked"
+        );
     }
 
     #[tokio::test]
     async fn a_disabled_source_queues_nothing_and_a_queued_row_closes_done_disabled() {
         let pool = crate::testdb::fresh_pool().await;
-        sqlx::query("INSERT INTO schema_meta (key, value) VALUES ('distiller.calendar_sources', '0')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES ('distiller.calendar_sources', '0')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let wed = Local.with_ymd_and_hms(2026, 10, 21, 9, 0, 0).unwrap();
         assert!(!enqueue_week_if_due(&pool, wed).await.unwrap());
         assert!(queue_rows(&pool).await.is_empty());
@@ -684,7 +728,10 @@ mod tests {
             queue_state(&pool, id).await,
             ("done".to_owned(), Some("disabled".to_owned()))
         );
-        assert!(runner.last_prompt.lock().unwrap().is_none(), "the model was asked");
+        assert!(
+            runner.last_prompt.lock().unwrap().is_none(),
+            "the model was asked"
+        );
     }
 
     #[tokio::test]
@@ -720,7 +767,10 @@ mod tests {
 
     #[test]
     fn the_dossier_has_titles_and_the_contact_mark_but_no_notes_block() {
-        let d = week_dossier(&["Mon 07:00, 60 min, weekly: Gym".to_owned()], &["Ana".to_owned()]);
+        let d = week_dossier(
+            &["Mon 07:00, 60 min, weekly: Gym".to_owned()],
+            &["Ana".to_owned()],
+        );
         assert!(d.contains("Gym") && d.contains("You write to: Ana"));
         assert!(!d.contains("owner context"));
     }

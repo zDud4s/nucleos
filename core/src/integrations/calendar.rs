@@ -380,7 +380,10 @@ pub async fn recurrence_of(
         sqlx::query_as("SELECT id, freq FROM calendar_events WHERE freq IS NOT NULL")
             .fetch_all(pool)
             .await?;
-    Ok(rows.into_iter().filter(|(id, _)| ids.contains(id)).collect())
+    Ok(rows
+        .into_iter()
+        .filter(|(id, _)| ids.contains(id))
+        .collect())
 }
 
 /// Whether an event is running at `at`.
@@ -1091,7 +1094,9 @@ mod tests {
         )
         .await
         .expect("the event to insert");
-        let found = recurrence_of(&pool, &[once, weekly]).await.expect("the read");
+        let found = recurrence_of(&pool, &[once, weekly])
+            .await
+            .expect("the read");
         assert_eq!(found.len(), 1);
         assert_eq!(found.get(&weekly).map(String::as_str), Some("weekly"));
     }

@@ -240,14 +240,21 @@ pub(crate) fn parse_lessons(answer: &str) -> Result<Vec<Lesson>, extract::ParseE
             let o = v.as_object()?;
             let layer = Layer::parse(o.get("layer")?.as_str()?)
                 .filter(|l| matches!(l, Layer::Semantic | Layer::Procedural))?;
-            let (title, body) = (o.get("title")?.as_str()?.trim(), o.get("body")?.as_str()?.trim());
+            let (title, body) = (
+                o.get("title")?.as_str()?.trim(),
+                o.get("body")?.as_str()?.trim(),
+            );
             if title.is_empty() || body.is_empty() {
                 return None;
             }
             let files = o
                 .get("files")
                 .and_then(|f| f.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_owned))
+                        .collect()
+                })
                 .unwrap_or_default();
             Some(Lesson {
                 layer,
@@ -363,8 +370,7 @@ pub(crate) async fn write_lesson(
         {
             if similarity >= super::SIM_SAME {
                 hit = Some(id);
-            } else if similarity >= super::SIM_NEAR
-                && best.is_none_or(|(_, top)| similarity > top)
+            } else if similarity >= super::SIM_NEAR && best.is_none_or(|(_, top)| similarity > top)
             {
                 best = Some((id, similarity));
             }

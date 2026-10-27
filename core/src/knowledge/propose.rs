@@ -708,7 +708,12 @@ mod provenance_tests {
         .await;
         assert_eq!(
             got,
-            ("machine".into(), None, Some("owner".into()), "proposed".into())
+            (
+                "machine".into(),
+                None,
+                Some("owner".into()),
+                "proposed".into()
+            )
         );
     }
 
@@ -718,7 +723,12 @@ mod provenance_tests {
         let got = propose_with(&pool, Provenance::default()).await;
         assert_eq!(
             got,
-            ("project".into(), Some("alpha".into()), None, "proposed".into())
+            (
+                "project".into(),
+                Some("alpha".into()),
+                None,
+                "proposed".into()
+            )
         );
     }
 }

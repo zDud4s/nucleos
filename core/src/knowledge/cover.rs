@@ -143,7 +143,9 @@ pub async fn uncover_in(tx: &mut Transaction<'_, Sqlite>, lesson_id: i64) -> sql
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge::{Declaration, Kind, Layer, Provenance, approve, propose_in_with, revert};
+    use crate::knowledge::{
+        Declaration, Kind, Layer, Provenance, approve, propose_in_with, revert,
+    };
 
     async fn propose(
         pool: &SqlitePool,
@@ -234,7 +236,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(covers, 1);
-        assert_eq!(tidy_covered(&pool).await.unwrap(), 0, "nothing left to cover");
+        assert_eq!(
+            tidy_covered(&pool).await.unwrap(),
+            0,
+            "nothing left to cover"
+        );
     }
 
     #[tokio::test]

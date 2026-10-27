@@ -1548,7 +1548,10 @@ mod tests {
     fn standing_is_general_for_every_cause_and_asks_why_it_landed_only_for_a_landing() {
         for cause in super::CAUSES {
             let text = super::standing_for(cause);
-            assert!(!text.contains("THIS project"), "{cause:?} still pins one project");
+            assert!(
+                !text.contains("THIS project"),
+                "{cause:?} still pins one project"
+            );
             assert!(text.contains("another project"), "{cause:?}");
             assert!(text.contains("Never quote the owner context"), "{cause:?}");
             assert_eq!(

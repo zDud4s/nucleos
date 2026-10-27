@@ -1457,25 +1457,39 @@ mod tests {
             format!("{needle}s::texts_for_ids"),
         ];
         let calls: Vec<&str> = calls.iter().map(String::as_str).collect();
-        assert!(calls_are_sanctioned(&format!("{a}
-{b}"), &calls));
+        assert!(calls_are_sanctioned(
+            &format!(
+                "{a}
+{b}"
+            ),
+            &calls
+        ));
         assert!(
             !calls_are_sanctioned(&a, &calls),
             "every listed call must occur once"
         );
-        assert!(!calls_are_sanctioned(&format!("{a}
-{a}
-{b}"), &calls));
         assert!(!calls_are_sanctioned(
-            &format!("{a}
+            &format!(
+                "{a}
+{a}
+{b}"
+            ),
+            &calls
+        ));
+        assert!(!calls_are_sanctioned(
+            &format!(
+                "{a}
 {b}
-use crate::{needle}s;"),
+use crate::{needle}s;"
+            ),
             &calls
         ));
         assert!(calls_are_sanctioned(
-            &format!("{a}
+            &format!(
+                "{a}
 {b}
-// mentions {needle}s"),
+// mentions {needle}s"
+            ),
             &calls
         ));
         // The one-call helper keeps its meaning.
@@ -1510,9 +1524,17 @@ use crate::{needle}s;"),
         let vecs = format!("let v = {n}s::vectors_for_clustering(&pool, m).await;");
         let texts = format!("let t = {n}s::texts_for_ids(&pool, &ids).await?;");
         assert!(themes_mentions_are_sanctioned(&format!("{vecs}\n{texts}")));
-        assert!(!themes_mentions_are_sanctioned(&vecs), "both calls must occur");
-        assert!(!themes_mentions_are_sanctioned(&texts), "both calls must occur");
-        assert!(!themes_mentions_are_sanctioned(&format!("{vecs}\n{texts}\n{texts}")));
+        assert!(
+            !themes_mentions_are_sanctioned(&vecs),
+            "both calls must occur"
+        );
+        assert!(
+            !themes_mentions_are_sanctioned(&texts),
+            "both calls must occur"
+        );
+        assert!(!themes_mentions_are_sanctioned(&format!(
+            "{vecs}\n{texts}\n{texts}"
+        )));
         assert!(!themes_mentions_are_sanctioned("fn nothing() {}"));
         assert!(!themes_mentions_are_sanctioned(&format!(
             "use crate::{n}s;\n{vecs}\n{texts}"
@@ -1537,9 +1559,16 @@ use crate::{needle}s;"),
         let n = ["owner", "note"].join("_");
         let near = format!("let ids = {n}s::nearest_to_vector(&pool, m, &c, 0.80, 5).await?;");
         let texts = format!("let t = {n}s::texts_for_ids(&pool, &ids).await?;");
-        assert!(generalise_mentions_are_sanctioned(&format!("{near}\n{texts}")));
-        assert!(!generalise_mentions_are_sanctioned(&near), "both calls must occur");
-        assert!(!generalise_mentions_are_sanctioned(&format!("{near}\n{texts}\n{texts}")));
+        assert!(generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}"
+        )));
+        assert!(
+            !generalise_mentions_are_sanctioned(&near),
+            "both calls must occur"
+        );
+        assert!(!generalise_mentions_are_sanctioned(&format!(
+            "{near}\n{texts}\n{texts}"
+        )));
         assert!(!generalise_mentions_are_sanctioned(&format!(
             "use crate::{n}s;\n{near}\n{texts}"
         )));

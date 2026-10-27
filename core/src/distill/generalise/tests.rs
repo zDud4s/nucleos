@@ -90,15 +90,47 @@ pub(super) fn down() -> crate::execution::runner::FakeCommandRunner {
 async fn groups_hold_only_live_distiller_rows_that_do_not_quote_the_owner() {
     let pool = pool().await;
     let [a, b, c] = trio(&pool).await;
-    let quoting = seed(&pool, ("project", Some("alpha")), "proposed", "Quoted", &job(9), &[1.0, 0.0]).await;
+    let quoting = seed(
+        &pool,
+        ("project", Some("alpha")),
+        "proposed",
+        "Quoted",
+        &job(9),
+        &[1.0, 0.0],
+    )
+    .await;
     sqlx::query("INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at) VALUES (?, 'proposed', 'proposed', 'quoted_owner_text', 'x')")
         .bind(quoting)
         .execute(&pool)
         .await
         .unwrap();
-    let refused = seed(&pool, ("project", Some("alpha")), "rejected", "No", &job(8), &[1.0, 0.0]).await;
-    let machine = seed(&pool, ("machine", None), "active", "Already general", &job(7), &[1.0, 0.0]).await;
-    let gate = seed(&pool, ("project", Some("alpha")), "active", "Counter", &job(6), &[1.0, 0.0]).await;
+    let refused = seed(
+        &pool,
+        ("project", Some("alpha")),
+        "rejected",
+        "No",
+        &job(8),
+        &[1.0, 0.0],
+    )
+    .await;
+    let machine = seed(
+        &pool,
+        ("machine", None),
+        "active",
+        "Already general",
+        &job(7),
+        &[1.0, 0.0],
+    )
+    .await;
+    let gate = seed(
+        &pool,
+        ("project", Some("alpha")),
+        "active",
+        "Counter",
+        &job(6),
+        &[1.0, 0.0],
+    )
+    .await;
     sqlx::query("UPDATE knowledge SET source = 'gate' WHERE id = ?")
         .bind(gate)
         .execute(&pool)
@@ -111,7 +143,11 @@ async fn groups_hold_only_live_distiller_rows_that_do_not_quote_the_owner() {
         .flat_map(|g| g.members.iter().map(|m| m.id))
         .collect();
     assert_eq!(ids, vec![a, b, c]);
-    assert!(![quoting, refused, machine, gate].iter().any(|x| ids.contains(x)));
+    assert!(
+        ![quoting, refused, machine, gate]
+            .iter()
+            .any(|x| ids.contains(x))
+    );
 }
 
 #[tokio::test]
@@ -174,9 +210,14 @@ async fn three_near_identical_candidates_in_three_projects_make_one_machine_prop
     // The fake embeds the lesson at [1,0] too: cosine 1.0 against every member. Only excluding the group's own
     // members from the fence lets the lesson be written.
     assert_eq!(
-        pass(&pool, Extractor::Cli(&answering(LESSON)), &embedder(), Utc::now())
-            .await
-            .unwrap(),
+        pass(
+            &pool,
+            Extractor::Cli(&answering(LESSON)),
+            &embedder(),
+            Utc::now()
+        )
+        .await
+        .unwrap(),
         Outcome::Done
     );
 
@@ -193,7 +234,12 @@ async fn three_near_identical_candidates_in_three_projects_make_one_machine_prop
         ("machine", None, "proposed", None)
     );
     for id in [a, b, c] {
-        assert!(evidence.as_deref().unwrap().contains(&format!(r#""id":{id}"#)));
+        assert!(
+            evidence
+                .as_deref()
+                .unwrap()
+                .contains(&format!(r#""id":{id}"#))
+        );
     }
     let (pending, vectors): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM proposals p JOIN knowledge k ON k.proposal_id = p.id WHERE k.distill_cause = 'generalised' AND p.status = 'pending'),
@@ -254,7 +300,10 @@ async fn owner_proof_needs_two_conversation_subjects() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!((kind.as_str(), about.as_deref()), ("machine", Some("owner")));
+    assert_eq!(
+        (kind.as_str(), about.as_deref()),
+        ("machine", Some("owner"))
+    );
 }
 
 #[tokio::test]
@@ -292,9 +341,14 @@ async fn a_lesson_the_owner_refused_or_reverted_does_not_come_back_and_a_live_on
                 .await
                 .unwrap();
         }
-        let out = pass(&pool, Extractor::Cli(&answering(LESSON)), &embedder(), Utc::now())
-            .await
-            .unwrap();
+        let out = pass(
+            &pool,
+            Extractor::Cli(&answering(LESSON)),
+            &embedder(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (out, generalised(&pool).await),
             (Outcome::Done, 0),
@@ -365,10 +419,21 @@ async fn a_brain_that_is_down_or_answers_garbage_fails_until_the_third_attempt_t
         let pool = pool().await;
         trio(&pool).await;
         let now = Utc::now();
-        for (minutes, expected) in [(0, "1"), (5, "1" /* not due yet */), (11, "2"), (40, "0" /* spent: the day */)] {
+        for (minutes, expected) in [
+            (0, "1"),
+            (5, "1" /* not due yet */),
+            (11, "2"),
+            (40, "0" /* spent: the day */),
+        ] {
             let at = now + Duration::minutes(minutes);
             if garbage {
-                run_if_due(&pool, Extractor::Cli(&answering("not json")), Some(&embedder()), at).await
+                run_if_due(
+                    &pool,
+                    Extractor::Cli(&answering("not json")),
+                    Some(&embedder()),
+                    at,
+                )
+                .await
             } else {
                 run_if_due(&pool, Extractor::Cli(&down()), Some(&embedder()), at).await
             }
@@ -388,7 +453,13 @@ async fn the_same_group_is_not_asked_on_day_two_and_a_new_subject_asks_again() {
     trio(&pool).await;
     let now = Utc::now();
     // Success with nothing to write.
-    run_if_due(&pool, Extractor::Cli(&answering("[]")), Some(&embedder()), now).await;
+    run_if_due(
+        &pool,
+        Extractor::Cli(&answering("[]")),
+        Some(&embedder()),
+        now,
+    )
+    .await;
     let keys: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM schema_meta WHERE key LIKE 'generalise.group.%'")
             .fetch_one(&pool)
@@ -404,7 +475,15 @@ async fn the_same_group_is_not_asked_on_day_two_and_a_new_subject_asks_again() {
         now + Duration::hours(25),
     )
     .await;
-    seed(&pool, ("project", Some("alpha")), "proposed", "Same job again", &job(1), &[1.0, 0.0]).await;
+    seed(
+        &pool,
+        ("project", Some("alpha")),
+        "proposed",
+        "Same job again",
+        &job(1),
+        &[1.0, 0.0],
+    )
+    .await;
     run_if_due(
         &pool,
         Extractor::Cli(&down()),
@@ -414,7 +493,15 @@ async fn the_same_group_is_not_asked_on_day_two_and_a_new_subject_asks_again() {
     .await;
     assert_eq!(attempts(&pool).await.as_deref(), Some("0"));
     // A new job is: asked again, and the brain was down.
-    seed(&pool, ("project", Some("alpha")), "proposed", "New job", &job(4), &[1.0, 0.0]).await;
+    seed(
+        &pool,
+        ("project", Some("alpha")),
+        "proposed",
+        "New job",
+        &job(4),
+        &[1.0, 0.0],
+    )
+    .await;
     run_if_due(
         &pool,
         Extractor::Cli(&down()),
@@ -432,7 +519,13 @@ async fn memory_of_a_group_that_no_longer_exists_is_pruned() {
         .execute(&pool)
         .await
         .unwrap();
-    run_if_due(&pool, Extractor::Cli(&down()), Some(&embedder()), Utc::now()).await;
+    run_if_due(
+        &pool,
+        Extractor::Cli(&down()),
+        Some(&embedder()),
+        Utc::now(),
+    )
+    .await;
     let left: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM schema_meta WHERE key = 'generalise.group.999'")
             .fetch_one(&pool)
@@ -447,7 +540,9 @@ fn near(id: i64) -> NearNote {
 
 /// An active note with a stored vector under `model`.
 async fn embedded_note(pool: &SqlitePool, text: &str, model: &str, v: [f32; 2]) -> i64 {
-    let id = crate::owner_notes::create(pool, text, "shell").await.unwrap();
+    let id = crate::owner_notes::create(pool, text, "shell")
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO owner_note_embeddings (note_id, model, dim, vector, text_hash, created_at)
          VALUES (?, ?, 2, ?, 'h', 't')",
@@ -487,8 +582,10 @@ fn group_of(subjects: &[Subject]) -> Group {
 
 #[test]
 fn a_nearby_note_counts_as_a_distinct_subject_named_note_id() {
-    let subjects =
-        subjects_with_notes(&group_of(&[Subject::Job(7)]).subjects, &[near(11), near(12)]);
+    let subjects = subjects_with_notes(
+        &group_of(&[Subject::Job(7)]).subjects,
+        &[near(11), near(12)],
+    );
     let keys: BTreeSet<String> = subjects.iter().map(Subject::key).collect();
     assert_eq!(
         keys,
@@ -525,9 +622,7 @@ async fn notes_near_applies_the_floor_the_cap_and_the_active_filter() {
     let pool = pool().await;
     let mut kept = Vec::new();
     for i in 0..7 {
-        kept.push(
-            embedded_note(&pool, &format!("note {i}"), MODEL, [1.0, 0.01 * i as f32]).await,
-        );
+        kept.push(embedded_note(&pool, &format!("note {i}"), MODEL, [1.0, 0.01 * i as f32]).await);
     }
     let archived = embedded_note(&pool, "gone", MODEL, [1.0, 0.0]).await;
     sqlx::query("UPDATE owner_notes SET state = 'archived' WHERE id = ?")
@@ -564,15 +659,12 @@ async fn near_notes_make_a_one_job_group_eligible_and_prove_about_owner() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!((kind.as_str(), about.as_deref()), ("machine", Some("owner")));
-    let entries: Vec<serde_json::Value> = serde_json::from_str(&evidence).unwrap();
     assert_eq!(
-        entries
-            .iter()
-            .filter(|e| e["t"] == "note")
-            .count(),
-        2
+        (kind.as_str(), about.as_deref()),
+        ("machine", Some("owner"))
     );
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&evidence).unwrap();
+    assert_eq!(entries.iter().filter(|e| e["t"] == "note").count(), 2);
     assert!(
         !evidence.contains("short answers"),
         "ids only, never the note text"
@@ -676,7 +768,13 @@ async fn a_new_note_is_a_new_subject_for_the_group_memory() {
     let now = Utc::now();
     embedded_note(&pool, "one", MODEL, [1.0, 0.0]).await;
     embedded_note(&pool, "two", MODEL, [1.0, 0.0]).await;
-    run_if_due(&pool, Extractor::Cli(&answering("[]")), Some(&embedder()), now).await;
+    run_if_due(
+        &pool,
+        Extractor::Cli(&answering("[]")),
+        Some(&embedder()),
+        now,
+    )
+    .await;
     // Same subjects a day later: not asked, so a down brain still succeeds.
     run_if_due(
         &pool,
@@ -734,7 +832,10 @@ async fn three_weeks_with_the_same_rhythm_are_three_subjects_and_reach_the_pass(
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!((kind.as_str(), about.as_deref()), ("machine", Some("owner")));
+    assert_eq!(
+        (kind.as_str(), about.as_deref()),
+        ("machine", Some("owner"))
+    );
 }
 
 #[tokio::test]

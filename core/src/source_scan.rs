@@ -121,8 +121,10 @@ pub fn production_code(source: &str) -> String {
         .windows(2)
         .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests"))
         .unwrap_or(lines.len());
-    lines[..end].join("
-")
+    lines[..end].join(
+        "
+",
+    )
 }
 
 fn is_rust(path: &Path) -> bool {

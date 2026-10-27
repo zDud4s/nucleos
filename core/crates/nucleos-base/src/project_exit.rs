@@ -2243,8 +2243,16 @@ mod tests {
             Some("generalised"),
         )
         .await;
-        let mixed = lesson_row(&pool, "machine", None, &refs(&[a1, b1]), Some("generalised")).await;
-        let not_general = lesson_row(&pool, "machine", None, &refs(&[a1]), Some("job_failed")).await;
+        let mixed = lesson_row(
+            &pool,
+            "machine",
+            None,
+            &refs(&[a1, b1]),
+            Some("generalised"),
+        )
+        .await;
+        let not_general =
+            lesson_row(&pool, "machine", None, &refs(&[a1]), Some("job_failed")).await;
         let no_evidence = lesson_row(&pool, "machine", None, "[]", Some("generalised")).await;
         store_vector(&pool, only_alpha).await;
 

@@ -92,8 +92,8 @@ pub mod state;
 pub use nucleos_base::storage;
 pub mod team;
 pub use nucleos_base::team_notes;
-pub mod themes;
 pub mod test_select;
+pub mod themes;
 #[cfg(any(test, feature = "testkit"))]
 pub use nucleos_base::testdb;
 pub use nucleos_base::tests_map;
