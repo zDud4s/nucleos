@@ -260,7 +260,7 @@ pub async fn nearest_in_scope(
             AND e.model = ?
           ORDER BY e.knowledge_id"
     );
-    let mut query = sqlx::query(&sql).bind(scope_kind).bind(scope_id);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(scope_kind).bind(scope_id);
     for status in statuses {
         query = query.bind(*status);
     }
