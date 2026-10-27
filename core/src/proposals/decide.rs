@@ -897,6 +897,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,

@@ -90,8 +90,11 @@ impl TeamNodeMcp {
         ));
         let exe = std::env::current_exe()?.to_string_lossy().into_owned();
         // What narrows a department's surface is `--allowedTools`, taken from the node's loadout.
-        let body = serde_json::to_vec(&crate::assistant::build_team_mcp_config(&exe, node_run_id))
-            .map_err(std::io::Error::other)?;
+        let body = serde_json::to_vec(&crate::assistant_types::build_team_mcp_config(
+            &exe,
+            node_run_id,
+        ))
+        .map_err(std::io::Error::other)?;
         crate::storage::write_atomic(&path, &body)?;
         Ok(Self { path })
     }

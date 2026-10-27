@@ -126,7 +126,7 @@ export function toastsFor(inputs: NotifyInputs): { toasts: Toast[]; seen: Notify
           key: `feed:${row.id}`,
           title: readFeedKind(row.kind)?.label ?? row.kind,
           body: brief(row.summary),
-          to: row.run_id === null ? "/feed" : `/runs/${row.run_id}`,
+          to: row.kind === "capture_digest" ? "/brain" : row.run_id === null ? "/feed" : `/runs/${row.run_id}`,
         });
       }
     }

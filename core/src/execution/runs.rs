@@ -147,6 +147,7 @@ pub mod testkit {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -735,7 +736,7 @@ pub mod tests {
         .unwrap()
         .last_insert_rowid();
 
-        let loop_task = tokio::spawn(run_retention_loop(state.clone(), false));
+        let loop_task = tokio::spawn(run_retention_loop(state.clone(), false, None));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let status: String = sqlx::query_scalar("SELECT status FROM knowledge WHERE id = ?")

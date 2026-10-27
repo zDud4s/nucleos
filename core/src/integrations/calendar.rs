@@ -1406,6 +1406,7 @@ mod tests {
             )),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }

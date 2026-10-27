@@ -18,7 +18,7 @@
 
 pub use nucleos_base::agent;
 pub mod agents;
-pub mod assistant;
+pub mod assistant_types;
 pub mod assistants;
 pub mod attention;
 pub mod auth;
@@ -35,7 +35,6 @@ pub mod chats;
 pub use nucleos_base::command_reader;
 pub use nucleos_base::commands;
 pub mod config;
-pub mod consolidate;
 pub mod context_refs;
 pub mod council;
 pub mod daemon_client;

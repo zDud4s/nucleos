@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { pluralWord } from "../lib/plural";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { X } from "lucide-react";
@@ -14,6 +14,7 @@ import { ForceGraph } from "../brain/ForceGraph";
 import { buildModel } from "../brain/graph-model";
 import type { GFilters } from "../brain/graph-types";
 import { GraphFilters, defaultGraphFilters } from "../brain/GraphFilters";
+import { GraphLegend } from "../brain/GraphLegend";
 import { formatItem, itemOfNode, nodeIdOf, parseItem, type BrainView, type ItemRef } from "../brain/item-ref";
 import { validateBrainSearch, type BrainSearch } from "../brain/search";
 
@@ -71,15 +72,19 @@ export function Brain() {
         }
       />
 
-      <div className="brain-page">
-        <Capture />
-        <WeeklyReview onItem={showItem} />
-        {view === "graph" ? (
-          <BrainGraphView item={item} onItem={showItem} />
-        ) : (
+      {view === "graph" ? (
+        // The map takes the whole page under the header: the capture box and the weekly review
+        // move into the canvas's own tool overlay instead of pushing it down.
+        <div className="brain-page brain-page-graph">
+          <BrainGraphView item={item} onItem={showItem} onClose={closeItem} />
+        </div>
+      ) : (
+        <div className="brain-page">
+          <Capture />
+          <WeeklyReview onItem={showItem} />
           <BrainListView item={item} onItem={showItem} onClose={closeItem} />
-        )}
-      </div>
+        </div>
+      )}
     </>
   );
 }
@@ -162,7 +167,7 @@ function useBrainSearch(): BrainSearch {
  * The capture box. Ctrl/Cmd+Enter saves; the box clears only once the daemon has answered, so a
  * refused note is still there to be sent again.
  */
-function Capture() {
+function Capture({ hidden = false, onStamp }: { hidden?: boolean; onStamp?: () => void } = {}) {
   const create = useCreateNote();
   const [text, setText] = useState("");
   const [saved, setSaved] = useState(false);
@@ -183,8 +188,9 @@ function Capture() {
         brainSearch({ ...validateBrainSearch(prev), capture: undefined }),
       replace: true,
     });
+    onStamp?.();
     areaRef.current?.focus();
-  }, [capture, navigate]);
+  }, [capture, navigate, onStamp]);
 
   const blank = text.trim() === "";
   const save = () => {
@@ -204,6 +210,7 @@ function Capture() {
   return (
     <form
       className="brain-compose"
+      hidden={hidden}
       aria-label="Capture"
       onSubmit={(event) => {
         event.preventDefault();
@@ -279,15 +286,30 @@ function missingSentence(
  * state until the knowledge panel exists; that selection belongs to the item it was made under, so
  * "back" to another item drops it.
  */
-export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item: string) => void }) {
+export function BrainGraphView({
+  item,
+  onItem,
+  onClose,
+}: {
+  item?: string;
+  onItem: (item: string) => void;
+  onClose?: () => void;
+}) {
   const [filters, setFilters] = useState<GFilters>(defaultGraphFilters);
   const [entity, setEntity] = useState<{ id: string; under: string | undefined } | null>(null);
+  const [tool, setTool] = useState<GraphTool | null>(null);
+  const { capture } = useBrainSearch();
+  // A capture stamp (the global shortcut) opens the box at once; `onStamp` keeps it open after the
+  // address has been cleaned.
+  const captureOpen = tool === "capture" || capture !== undefined;
+  const openCapture = useCallback(() => setTool("capture"), []);
+  const [stage, setStage] = useState<HTMLDivElement | null>(null);
   const graph = useNotesGraph(filters.showArchived);
   const knowledge = useKnowledge();
   const projects = useProjects();
   const knownRows = knowledge.data ?? EMPTY_KNOWLEDGE;
   const projectRows = projects.data;
-  const canvasHeight = useCanvasHeight();
+  const canvasHeight = useElementHeight(stage);
 
   const model = useMemo(
     () => (graph.data === undefined ? null : buildModel(graph.data, knownRows, projectRows, filters)),
@@ -312,15 +334,55 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
     return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding: the graph is not known</ErrorNote>;
   if (graph.data === undefined || model === null) return <Skeleton label="Loading the graph" variant="cards" count={4} />;
   const missing = missingSentence(knowledge, projects);
+  const drawerOpen = selected !== null || ref !== null;
+  const close = () => {
+    setEntity(null);
+    onClose?.();
+  };
+  const toggle = (next: GraphTool) => setTool(tool === next ? null : next);
 
   return (
-    <div className="brain-desk">
-      <div className="brain-desk-main">
-        <GraphFilters filters={filters} onFilters={setFilters} />
-        {missing !== null && <Quiet says={missing} />}
-        <ForceGraph model={model} selected={selected} onSelect={select} height={canvasHeight} />
+    <div ref={setStage} className={drawerOpen ? "brain-stage has-drawer" : "brain-stage"}>
+      <ForceGraph model={model} selected={selected} onSelect={select} height={canvasHeight} fitRight={drawerOpen ? DRAWER_WIDTH_PX : 0} />
+
+      <div className="brain-tools">
+        <div className="brain-tools-bar" role="toolbar" aria-label="Graph tools">
+          <ToolButton active={captureOpen} onClick={() => toggle("capture")}>
+            Capture
+          </ToolButton>
+          <ToolButton active={tool === "review"} onClick={() => toggle("review")}>
+            This week
+          </ToolButton>
+          <ToolButton active={tool === "filters"} onClick={() => toggle("filters")}>
+            Filters
+          </ToolButton>
+        </div>
+        {missing !== null && <Quiet compact says={missing} />}
+        {/* Capture stays mounted while closed, so a half-written note survives closing the popover. */}
+        <div className="brain-pop" hidden={!captureOpen}>
+          <Capture hidden={!captureOpen} onStamp={openCapture} />
+        </div>
+        {tool === "review" && (
+          <div className="brain-pop">
+            <WeeklyReview onItem={onItem} />
+          </div>
+        )}
+        {tool === "filters" && (
+          <div className="brain-pop">
+            <GraphFilters filters={filters} onFilters={setFilters} />
+          </div>
+        )}
       </div>
-      <aside className="brain-aside" aria-label="Selected">
+
+      <GraphLegend model={model} />
+
+      <aside className="brain-drawer" aria-label="Selected" hidden={!drawerOpen}>
+        <div className="brain-aside-bar">
+          <button type="button" className="brain-aside-close" onClick={close}>
+            <X aria-hidden="true" size={14} strokeWidth={2} />
+            Close
+          </button>
+        </div>
         {ref?.kind === "knowledge" && entity?.under !== item ? (
           <KnowledgePanel key={ref.id} id={ref.id} onSelect={select} />
         ) : (
@@ -328,6 +390,16 @@ export function BrainGraphView({ item, onItem }: { item?: string; onItem: (item:
         )}
       </aside>
     </div>
+  );
+}
+
+type GraphTool = "capture" | "review" | "filters";
+
+function ToolButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: string }) {
+  return (
+    <button type="button" className="brain-tool" aria-pressed={active} onClick={onClick}>
+      {children}
+    </button>
   );
 }
 
@@ -419,19 +491,26 @@ export function BrainListView({
   );
 }
 
+/** Never smaller than this, whatever the stage measures (jsdom and a not-yet-laid-out box measure 0). */
+const MIN_CANVAS_HEIGHT = 320;
+/** The drawer is 23rem wide (brain.css); the graph fit keeps clear of it. */
+const DRAWER_WIDTH_PX = 368;
+
 /**
- * The graph takes the window's height rather than a fixed 560px: on a tall window a fixed
- * canvas leaves a band of nothing under the map, and on 800x600 it pushes the panel off screen.
- * Read on resize; the canvas sets its own size through the CSSOM (`ForceGraph`).
+ * The canvas takes the height of the box the page gives it (everything under the header), so it
+ * follows the window and the layout rather than a number of pixels. The canvas sets its own size
+ * through the CSSOM (`ForceGraph`).
  */
-function useCanvasHeight(): number {
-  const measure = () => Math.round(Math.min(900, Math.max(420, window.innerHeight - 320)));
-  const [height, setHeight] = useState(measure);
+function useElementHeight(element: HTMLElement | null): number {
+  const [height, setHeight] = useState(MIN_CANVAS_HEIGHT);
   useEffect(() => {
-    const onResize = () => setHeight(measure());
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
+    if (element === null) return;
+    const measure = () => setHeight(Math.max(MIN_CANVAS_HEIGHT, Math.round(element.clientHeight)));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [element]);
   return height;
 }
 

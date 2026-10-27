@@ -19,6 +19,7 @@ import {
   reportAgentTabClosed,
   startAgentPoller,
 } from "./browser-agent";
+import { NO_PROJECT } from "./browser-tabs";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -229,6 +230,22 @@ describe("ensureAgentEnv", () => {
     invoke.mockResolvedValue({ cdp_http: "c" });
     emb.embeddedRegister.mockRejectedValueOnce(new Error("e3"));
     expect(await ensureAgentEnv("p3")).toEqual({ ok: false, reason: "e3" });
+  });
+
+  it("ensureAgentEnv prepares, ensures and registers the no-project scope with null", async () => {
+    emb.embeddedPrepare.mockResolvedValue({ proxy_addr: "127.0.0.1:1" });
+    invoke.mockResolvedValue({ cdp_http: "http://127.0.0.1:9" });
+    emb.embeddedRegister.mockResolvedValue(undefined);
+    const r = await ensureAgentEnv(NO_PROJECT);
+    expect(r).toEqual({ ok: true, cdpHttp: "http://127.0.0.1:9" });
+    expect(invoke).toHaveBeenCalledWith("browser_env_ensure", {
+      project: null,
+      role: "agent",
+      proxyAddr: "127.0.0.1:1",
+    });
+    // The embedded client takes the scope key and posts null on the wire itself.
+    expect(emb.embeddedPrepare).toHaveBeenCalledWith(NO_PROJECT);
+    expect(emb.embeddedRegister).toHaveBeenCalledWith(NO_PROJECT, "http://127.0.0.1:9");
   });
 
   it("dedupes in-flight calls per project", async () => {

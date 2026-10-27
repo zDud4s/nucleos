@@ -14,9 +14,25 @@ mod tests {
     use tokio::time::Instant;
 
     use crate::channels::ChannelsRuntime;
-    use crate::channels::contract::{
-        ConversationKey, EventShape, HelloShape, OutPart, decode, fixtures_dir,
-    };
+    use crate::channels::contract::{ConversationKey, EventShape, HelloShape, OutPart, decode};
+
+    /// `contract::fixtures_dir`, from this crate's package root: that one is test-only in the
+    /// library and anchored to the library's own `CARGO_MANIFEST_DIR`. The same guard against a
+    /// binary compiled in another worktree.
+    fn fixtures_dir() -> std::path::PathBuf {
+        let built_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let running_in = std::env::current_dir().expect("the working directory must be readable");
+        assert_eq!(
+            built_in,
+            running_in.as_path(),
+            "compiled in {} but running in {}; touch this file to force a rebuild",
+            built_in.display(),
+            running_in.display(),
+        );
+        built_in
+            .join("../..")
+            .join(crate::channels::contract::FIXTURES_REL)
+    }
     use crate::channels::fake::{FakeAdapter, Reply, register_media, request, stimulate};
     use crate::channels::outbox::{self, Class, NewAction};
     use crate::channels::registry::ChannelConfig;

@@ -40,6 +40,7 @@ pub use plan::*;
 pub use recruit::*;
 pub use rounds::*;
 
+#[cfg(test)]
 use actions::validate_payload;
 #[cfg(test)]
 use axum::Json;
@@ -51,7 +52,9 @@ use config::slug;
 use ingest::*;
 use launch::*;
 use prompts::*;
-use rounds::{round_width, run_capacity};
+#[cfg(test)]
+use rounds::round_width;
+use rounds::run_capacity;
 
 use crate::state::AppState;
 
@@ -852,6 +855,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: Some(root),
             files_trash: None,
             workflow_library: None,

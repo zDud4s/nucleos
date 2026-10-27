@@ -1,14 +1,17 @@
 //! Capture requests: when a job went wrong, the distiller asks the owner, once, what only they
-//! know about it, and holds that job's queue rows until the answer, a dismissal or the deadline.
+//! know about it. The questions go out in a daily digest (`digest`) and stay answerable for a few
+//! days; they never hold the distiller's queue.
 //! Design: .ai/specs/2026-10-07-pedidos-captura-design.md.
 //!
 //! The question is a fixed template (no model, spec P5) and is redacted before it is written. An
 //! answer is known here only as a note id: composing the note is http.rs's job (spec 5.3).
 
 use crate::distill::Cause;
-use chrono::{DateTime, Duration, Local, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{SqliteConnection, SqlitePool};
+
+pub mod digest;
 
 pub const STATE_OPEN: &str = "open";
 pub const STATE_ANSWERED: &str = "answered";
@@ -30,121 +33,112 @@ pub struct Fact {
     pub fact: String,
 }
 
-/// What the first and the last line of the question say.
-pub struct Header<'a> {
-    pub project: &'a str,
-    pub job_id: i64,
-    /// The deadline as the owner reads it, local `HH:MM`.
-    pub until: &'a str,
-}
-
 /// The one timestamp format of this table: fixed width, so `deadline > now` as text is time order.
 pub fn stamp(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
-fn cause_label(cause: &str) -> &'static str {
-    match cause {
-        "job_failed" => "o job falhou",
-        "run_exhausted" => "o gate esgotou as tentativas",
-        "review_blocking" => "a review bloqueou",
-        _ => "algo correu mal",
-    }
-}
+/// The retired wait setting (minutes). Only read as a fallback by [`answer_days`]: a stored `0`
+/// keeps requests off.
+const OLD_WAIT_KEY: &str = "distiller.capture_wait_minutes";
 
-/// The question, from its header and its facts, in the order the facts arrived.
-pub fn render(header: &Header, facts: &[Fact]) -> String {
-    let mut labels: Vec<&str> = Vec::new();
-    for f in facts {
-        let label = cause_label(&f.cause);
-        if !labels.contains(&label) {
-            labels.push(label);
-        }
-    }
-    let mut out = format!(
-        "🧠 {} · job #{} · {}\n",
-        header.project,
-        header.job_id,
-        labels.join(", ")
-    );
-    for f in facts {
-        out.push_str(&f.fact);
-        out.push('\n');
-    }
-    out.push_str("Há alguma coisa que só tu saibas sobre isto?\n");
-    out.push_str(&format!(
-        "(até às {}; depois o destilador avança) #cap{}",
-        header.until, header.job_id
-    ));
-    out
-}
+pub const ANSWER_DAYS_KEY: &str = "capture.answer_days";
+pub const DIGEST_HOUR_KEY: &str = "capture.digest_hour";
+pub const DEFAULT_ANSWER_DAYS: i64 = 5;
+pub const MAX_ANSWER_DAYS: i64 = 30;
+pub const DEFAULT_DIGEST_HOUR: i64 = 18;
 
-/// Where the wait lives: a row of `schema_meta`, like `distiller.model`, read every tick.
-pub const WAIT_SETTING_KEY: &str = "distiller.capture_wait_minutes";
-pub const DEFAULT_WAIT_MINUTES: i64 = 120;
-/// A week. Beyond it the deadline arithmetic could overflow and panic on every tick, inside the
-/// worker's claiming transaction; no owner means to hold a job longer than that.
-pub const MAX_WAIT_MINUTES: i64 = 7 * 24 * 60;
-
-/// Minutes a request holds its job. `0` turns requests off; anything unreadable or out of range is
-/// the default.
-pub async fn wait_minutes(pool: &SqlitePool) -> i64 {
+async fn meta(pool: &SqlitePool, key: &str) -> Option<String> {
     sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = ?")
-        .bind(WAIT_SETTING_KEY)
+        .bind(key)
         .fetch_optional(pool)
         .await
         .ok()
         .flatten()
-        .and_then(|stored| stored.trim().parse::<i64>().ok())
-        .filter(|minutes| (0..=MAX_WAIT_MINUTES).contains(minutes))
-        .unwrap_or(DEFAULT_WAIT_MINUTES)
 }
 
-/// Queue rows created before this UTC second never ask; see migration 0173. Absent: all may ask.
-pub const FROM_KEY: &str = "distiller.capture_from";
+/// Days a request stays answerable. `0` turns requests off. Without the new key the old
+/// `distiller.capture_wait_minutes` is read as a fallback: `0` stays off, any other value is the default.
+pub async fn answer_days(pool: &SqlitePool) -> i64 {
+    if let Some(days) = meta(pool, ANSWER_DAYS_KEY)
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        return if (0..=MAX_ANSWER_DAYS).contains(&days) {
+            days
+        } else {
+            DEFAULT_ANSWER_DAYS
+        };
+    }
+    match meta(pool, OLD_WAIT_KEY)
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        Some(0) => 0,
+        _ => DEFAULT_ANSWER_DAYS,
+    }
+}
+
+pub async fn digest_hour(pool: &SqlitePool) -> u32 {
+    meta(pool, DIGEST_HOUR_KEY)
+        .await
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|h| (0..=23).contains(h))
+        .unwrap_or(DEFAULT_DIGEST_HOUR) as u32
+}
 
 #[derive(Debug)]
-pub enum WaitError {
+pub enum ConfigError {
     OutOfRange,
     Db(sqlx::Error),
 }
 
-impl std::fmt::Display for WaitError {
+impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WaitError::OutOfRange => write!(f, "the wait is 0 to {MAX_WAIT_MINUTES} minutes"),
-            WaitError::Db(error) => write!(f, "{error}"),
+            ConfigError::OutOfRange => write!(f, "answer_days is 0 to 30 and digest_hour 0 to 23"),
+            ConfigError::Db(error) => write!(f, "{error}"),
         }
     }
 }
 
-impl From<sqlx::Error> for WaitError {
+impl From<sqlx::Error> for ConfigError {
     fn from(error: sqlx::Error) -> Self {
-        WaitError::Db(error)
+        ConfigError::Db(error)
     }
 }
 
-/// Store the wait, refusing anything `wait_minutes` would not read back.
-pub async fn set_wait_minutes(
+/// Store the answer window and/or the digest hour; both are validated before either is written.
+pub async fn set_config(
     pool: &SqlitePool,
-    minutes: i64,
+    answer_days: Option<i64>,
+    digest_hour: Option<i64>,
     now: DateTime<Utc>,
-) -> Result<(), WaitError> {
-    if !(0..=MAX_WAIT_MINUTES).contains(&minutes) {
-        return Err(WaitError::OutOfRange);
+) -> Result<(), ConfigError> {
+    if answer_days.is_some_and(|d| !(0..=MAX_ANSWER_DAYS).contains(&d))
+        || digest_hour.is_some_and(|h| !(0..=23).contains(&h))
+    {
+        return Err(ConfigError::OutOfRange);
     }
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO schema_meta (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(WAIT_SETTING_KEY)
-    .bind(minutes.to_string())
-    .execute(&mut *tx)
-    .await?;
-    // A zero wait holds nothing, so a request still open would ask a question nobody waits on:
+    for (key, value) in [
+        (ANSWER_DAYS_KEY, answer_days),
+        (DIGEST_HOUR_KEY, digest_hour),
+    ] {
+        if let Some(value) = value {
+            sqlx::query(
+                "INSERT INTO schema_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(key)
+            .bind(value.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    // Zero days holds nothing, so a request still open would ask a question nobody waits on:
     // close them as dismissed, the way the owner would have.
-    if minutes == 0 {
+    if answer_days == Some(0) {
         sqlx::query("UPDATE capture_requests SET state = ?, closed_at = ? WHERE state = ?")
             .bind(STATE_DISMISSED)
             .bind(stamp(now))
@@ -155,6 +149,27 @@ pub async fn set_wait_minutes(
     tx.commit().await?;
     Ok(())
 }
+
+pub fn question_for(cause: &str) -> &'static str {
+    match cause {
+        "run_exhausted" => "Is there something about this item or the gate that only you know?",
+        "review_blocking" => "Was the review right, or is there a rule of yours behind it?",
+        _ => "What went wrong that the logs would not show?",
+    }
+}
+
+/// One job's line in the digest: ids, project, its facts in arrival order, then the first cause's question.
+pub fn question_line(project: &str, job_id: i64, facts: &[Fact]) -> String {
+    let said: Vec<&str> = facts.iter().map(|f| f.fact.as_str()).collect();
+    let ask = question_for(facts.first().map_or("", |f| f.cause.as_str()));
+    format!(
+        "#{job_id} · {project} · job #{job_id} — {}. {ask}",
+        said.join("; ")
+    )
+}
+
+/// Queue rows created before this UTC second never ask; see migration 0173. Absent: all may ask.
+pub const FROM_KEY: &str = "distiller.capture_from";
 
 #[derive(sqlx::FromRow)]
 struct AskingRow {
@@ -194,16 +209,14 @@ async fn fact_for(conn: &mut SqliteConnection, row: &AskingRow) -> sqlx::Result<
                         .and_then(crate::knowledge::failure_signature)
                         .map(|s| format!(": `{}`", s.headline))
                         .unwrap_or_default();
-                    format!(
-                        "o item {ordinal} «{short}» esgotou {attempts} tentativas no gate{signature}"
-                    )
+                    format!("item {ordinal} «{short}» used up {attempts} gate attempts{signature}")
                 }
-                None => "um item esgotou as tentativas no gate".to_owned(),
+                None => "an item used up its gate attempts".to_owned(),
             })
         }
         "review_blocking" => Ok(match row.run_id {
-            Some(run) => format!("a review bloqueou o job (run #{run})"),
-            None => "a review bloqueou o job".to_owned(),
+            Some(run) => format!("the review blocked the job (run #{run})"),
+            None => "the review blocked the job".to_owned(),
         }),
         _ => {
             // Not wait_reason: it is only meaningful while a job waits, and would mislead here.
@@ -212,137 +225,15 @@ async fn fact_for(conn: &mut SqliteConnection, row: &AskingRow) -> sqlx::Result<
                 .fetch_optional(&mut *conn)
                 .await?;
             Ok(match status {
-                Some(status) => format!("o job terminou em `{status}`"),
-                None => "o job falhou".to_owned(),
+                Some(status) => format!("the job ended in `{status}`"),
+                None => "the job failed".to_owned(),
             })
         }
     }
 }
 
-fn until_local(deadline: &str) -> String {
-    DateTime::parse_from_rfc3339(deadline)
-        .map(|d| d.with_timezone(&Local).format("%H:%M").to_string())
-        .unwrap_or_else(|_| "?".to_owned())
-}
-
-/// The question exactly as it is stored: rendered, then redacted.
-fn written(project: &str, job_id: i64, deadline: &str, facts: &[Fact]) -> String {
-    let until = until_local(deadline);
-    let header = Header {
-        project,
-        job_id,
-        until: &until,
-    };
-    crate::governance::redact::redact_secrets(&render(&header, facts))
-}
-
 fn facts_json(facts: &[Fact]) -> String {
     serde_json::to_string(facts).unwrap_or_else(|_| "[]".to_owned())
-}
-
-/// Open a request for every job with a pending failure row and no request yet, or add a new row's
-/// fact to its open request. A closed request is never reopened (spec 3.1). Returns how many
-/// requests it opened. Runs inside the worker's claiming transaction.
-pub async fn open_due(
-    conn: &mut SqliteConnection,
-    now: DateTime<Utc>,
-    wait_minutes: i64,
-) -> sqlx::Result<u32> {
-    if wait_minutes <= 0 {
-        return Ok(0);
-    }
-    let from: Option<String> = sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
-        .bind(FROM_KEY)
-        .fetch_optional(&mut *conn)
-        .await?;
-    let rows: Vec<AskingRow> = sqlx::query_as(
-        "SELECT id, cause, project_id, job_id, item_id, run_id FROM distill_queue
-          WHERE status = ? AND job_id IS NOT NULL AND cause IN (?, ?, ?)
-            AND (?5 IS NULL OR substr(created_at, 1, 19) > ?5)
-          ORDER BY id",
-    )
-    .bind(crate::distill::STATUS_PENDING)
-    .bind(ASKING_CAUSES[0].as_str())
-    .bind(ASKING_CAUSES[1].as_str())
-    .bind(ASKING_CAUSES[2].as_str())
-    .bind(from)
-    .fetch_all(&mut *conn)
-    .await?;
-
-    let mut opened = 0;
-    for row in rows {
-        let existing: Option<(String, String, String)> =
-            sqlx::query_as("SELECT state, causes, deadline FROM capture_requests WHERE job_id = ?")
-                .bind(row.job_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-        match existing {
-            None => {
-                let deadline = stamp(now + Duration::minutes(wait_minutes));
-                // Redacted at the source: the fact is stored in `causes` too, not only in the question.
-                let fact =
-                    crate::governance::redact::redact_secrets(&fact_for(&mut *conn, &row).await?);
-                let facts = vec![Fact {
-                    row: row.id,
-                    cause: row.cause.clone(),
-                    fact,
-                }];
-                let text = written(&row.project_id, row.job_id, &deadline, &facts);
-                sqlx::query(
-                    "INSERT INTO capture_requests
-                         (job_id, project_id, causes, prompt_text, state, deadline, created_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(row.job_id)
-                .bind(&row.project_id)
-                .bind(facts_json(&facts))
-                .bind(&text)
-                .bind(STATE_OPEN)
-                .bind(&deadline)
-                .bind(stamp(now))
-                .execute(&mut *conn)
-                .await?;
-                crate::feed::append_on(
-                    &mut *conn,
-                    Some(&row.project_id),
-                    FEED_KIND,
-                    &text,
-                    None,
-                    Some(&crate::feed::Subject::Job(row.job_id)),
-                )
-                .await?;
-                opened += 1;
-            }
-            Some((state, causes, deadline)) if state == STATE_OPEN => {
-                // Unreadable facts are left as they are: rewriting them from an empty list would
-                // drop every earlier fact without a trace.
-                let Ok(mut facts) = serde_json::from_str::<Vec<Fact>>(&causes) else {
-                    continue;
-                };
-                if facts.iter().any(|f| f.row == row.id) {
-                    continue;
-                }
-                // Redacted at the source: the fact is stored in `causes` too, not only in the question.
-                let fact =
-                    crate::governance::redact::redact_secrets(&fact_for(&mut *conn, &row).await?);
-                facts.push(Fact {
-                    row: row.id,
-                    cause: row.cause.clone(),
-                    fact,
-                });
-                let text = written(&row.project_id, row.job_id, &deadline, &facts);
-                sqlx::query("UPDATE capture_requests SET causes = ?, prompt_text = ? WHERE job_id = ? AND state = ?")
-                    .bind(facts_json(&facts))
-                    .bind(&text)
-                    .bind(row.job_id)
-                    .bind(STATE_OPEN)
-                    .execute(&mut *conn)
-                    .await?;
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(opened)
 }
 
 /// Close every open request whose deadline has come. `<= now` here is the exact complement of the
@@ -476,9 +367,9 @@ impl std::fmt::Display for AnswerError {
     }
 }
 
-/// The owner's answer becomes a note linked to the job; it also closes the request and releases the
-/// job when the request is still open. A late answer keeps its note and releases nothing. Returns
-/// the note's id and whether the request was released.
+/// The owner's answer becomes a note linked to the job; it also closes the request when it is
+/// still open and schedules a new reading of the job. A late answer keeps its note too. Returns the
+/// note's id and whether the owner's reading was scheduled.
 pub async fn answer(
     pool: &SqlitePool,
     job_id: i64,
@@ -507,7 +398,7 @@ pub async fn answer(
 
 /// One attempt at an owner's answer: the note, its link and the request's close commit together or
 /// not at all, so a retry after a busy database never finds half of the previous try. Returns the
-/// note's id and whether the request was released.
+/// note's id and whether the owner's reading was scheduled.
 async fn answer_step(
     pool: &SqlitePool,
     job_id: i64,
@@ -519,11 +410,14 @@ async fn answer_step(
     // `owner_notes.rs`); its error converts through the `From` impl that lives beside `NoteError`.
     let note_id =
         crate::owner_notes::create_linked_to_job_in(&mut tx, text, origin, job_id).await?;
-    let released = close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now())
+    close_answered_in(&mut tx, job_id, note_id, chrono::Utc::now())
+        .await
+        .map_err(AnswerError::Db)?;
+    let requeued = crate::distill::enqueue_answered_in(&mut tx, job_id, note_id)
         .await
         .map_err(AnswerError::Db)?;
     tx.commit().await.map_err(AnswerError::Db)?;
-    Ok((note_id, released))
+    Ok((note_id, requeued))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,6 +448,7 @@ pub struct CaptureRequest {
     pub note_id: Option<i64>,
     pub created_at: String,
     pub closed_at: Option<String>,
+    pub digest_id: Option<i64>,
 }
 
 type ListRow = (
@@ -566,6 +461,7 @@ type ListRow = (
     Option<i64>,
     String,
     Option<String>,
+    Option<i64>,
 );
 
 /// Requests for the shell, nearest deadline first; `seconds_left` is 0 for a closed or due one.
@@ -575,7 +471,8 @@ pub async fn list(
     now: DateTime<Utc>,
 ) -> sqlx::Result<Vec<CaptureRequest>> {
     let rows: Vec<ListRow> = sqlx::query_as(
-        "SELECT job_id, project_id, causes, prompt_text, state, deadline, note_id, created_at, closed_at
+        "SELECT job_id, project_id, causes, prompt_text, state, deadline, note_id, created_at, closed_at,
+                digest_id
            FROM capture_requests WHERE (? OR state = ?) ORDER BY deadline, job_id",
     )
     .bind(listing == Listing::All)
@@ -595,6 +492,7 @@ pub async fn list(
                 note_id,
                 created_at,
                 closed_at,
+                digest_id,
             )| {
                 let seconds_left = if state == STATE_OPEN {
                     DateTime::parse_from_rfc3339(&deadline)
@@ -619,6 +517,7 @@ pub async fn list(
                     note_id,
                     created_at,
                     closed_at,
+                    digest_id,
                 }
             },
         )
@@ -634,48 +533,6 @@ mod tests {
             row,
             cause: cause.to_owned(),
             fact: line.to_owned(),
-        }
-    }
-
-    #[test]
-    fn the_question_is_one_fixed_template() {
-        let header = Header {
-            project: "web",
-            job_id: 7,
-            until: "14:30",
-        };
-        let cases = [
-            (
-                vec![fact(1, "job_failed", "o job terminou em `failed`")],
-                "🧠 web · job #7 · o job falhou\n\
-                 o job terminou em `failed`\n\
-                 Há alguma coisa que só tu saibas sobre isto?\n\
-                 (até às 14:30; depois o destilador avança) #cap7",
-            ),
-            (
-                vec![
-                    fact(
-                        1,
-                        "run_exhausted",
-                        "o item 2 «build» esgotou 3 tentativas no gate: `E0425`",
-                    ),
-                    fact(4, "review_blocking", "a review bloqueou o job (run #9)"),
-                ],
-                "🧠 web · job #7 · o gate esgotou as tentativas, a review bloqueou\n\
-                 o item 2 «build» esgotou 3 tentativas no gate: `E0425`\n\
-                 a review bloqueou o job (run #9)\n\
-                 Há alguma coisa que só tu saibas sobre isto?\n\
-                 (até às 14:30; depois o destilador avança) #cap7",
-            ),
-            (
-                vec![fact(1, "run_exhausted", "a"), fact(2, "run_exhausted", "b")],
-                "🧠 web · job #7 · o gate esgotou as tentativas\na\nb\n\
-                 Há alguma coisa que só tu saibas sobre isto?\n\
-                 (até às 14:30; depois o destilador avança) #cap7",
-            ),
-        ];
-        for (facts, want) in cases {
-            assert_eq!(render(&header, &facts), want);
         }
     }
 
@@ -713,33 +570,6 @@ mod tests {
         .unwrap();
     }
 
-    async fn queued(
-        pool: &SqlitePool,
-        cause: &str,
-        job_id: i64,
-        item_id: Option<i64>,
-        run_id: Option<i64>,
-    ) -> i64 {
-        sqlx::query_scalar(
-            "INSERT INTO distill_queue (cause, project_id, job_id, item_id, run_id, status, attempts, created_at)
-             VALUES (?, 'web', ?, ?, ?, 'pending', 0, '2026-10-07T09:00:00+00:00') RETURNING id",
-        )
-        .bind(cause)
-        .bind(job_id)
-        .bind(item_id)
-        .bind(run_id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
-    }
-
-    async fn tick(pool: &SqlitePool, now: DateTime<Utc>, wait: i64) {
-        let mut tx = pool.begin().await.unwrap();
-        open_due(&mut tx, now, wait).await.unwrap();
-        expire_due(&mut tx, now).await.unwrap();
-        tx.commit().await.unwrap();
-    }
-
     async fn request(pool: &SqlitePool, job_id: i64) -> Option<(String, String, String, String)> {
         sqlx::query_as(
             "SELECT state, causes, prompt_text, deadline FROM capture_requests WHERE job_id = ?",
@@ -755,187 +585,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_job_opens_one_request_and_one_feed_line() {
+    async fn the_answer_window_and_hour_default_to_5_days_and_18() {
         let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        queued(&pool, "job_failed", 7, None, None).await;
-
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
-
-        let (state, causes, text, deadline) = request(&pool, 7).await.expect("a request");
-        assert_eq!(state, STATE_OPEN);
-        assert_eq!(deadline, "2026-10-07T12:00:00+00:00");
-        assert!(
-            text.contains("o job terminou em `failed`") && text.ends_with("#cap7"),
-            "{text}"
+        assert_eq!(
+            (answer_days(&pool).await, digest_hour(&pool).await),
+            (5, 18)
         );
-        assert_eq!(serde_json::from_str::<Vec<Fact>>(&causes).unwrap().len(), 1);
-        let feed: Vec<(String, String)> =
-            sqlx::query_as("SELECT kind, summary FROM feed WHERE subject = 'job:7'")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(feed, vec![(FEED_KIND.to_owned(), text)]);
     }
 
     #[tokio::test]
-    async fn a_success_cause_or_a_zero_wait_opens_nothing() {
+    async fn a_legacy_zero_wait_keeps_requests_off_and_any_other_value_gives_the_default() {
         let pool = pool().await;
-        job(&pool, 7, "done").await;
-        queued(&pool, "job_landed", 7, None, None).await;
-        queued(&pool, "gate_recovered", 7, None, None).await;
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
-        assert!(request(&pool, 7).await.is_none());
-
-        job(&pool, 8, "failed").await;
-        queued(&pool, "job_failed", 8, None, None).await;
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 0).await;
-        assert!(request(&pool, 8).await.is_none());
+        set_meta(&pool, OLD_WAIT_KEY, "0").await;
+        assert_eq!(
+            answer_days(&pool).await,
+            0,
+            "an owner who turned requests off keeps them off"
+        );
+        set_meta(&pool, OLD_WAIT_KEY, "30").await;
+        assert_eq!(
+            answer_days(&pool).await,
+            5,
+            "minutes are not converted into days"
+        );
+        set_meta(&pool, ANSWER_DAYS_KEY, "9").await;
+        assert_eq!(
+            answer_days(&pool).await,
+            9,
+            "the new key wins over the old one"
+        );
+        set_meta(&pool, ANSWER_DAYS_KEY, "31").await;
+        assert_eq!(
+            answer_days(&pool).await,
+            5,
+            "out of range reads as the default"
+        );
     }
 
     #[tokio::test]
-    async fn a_second_cause_joins_once_however_many_ticks_run() {
+    async fn the_config_is_set_within_bounds_and_zero_days_dismisses_the_open_requests() {
         let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        queued(&pool, "job_failed", 7, None, None).await;
         let now = at("2026-10-07T10:00:00+00:00");
-        tick(&pool, now, 120).await;
-        // The review fact reads only the queue row's run_id, so no run row is needed.
-        queued(&pool, "review_blocking", 7, None, Some(9)).await;
-        for _ in 0..3 {
-            tick(&pool, now + chrono::Duration::minutes(1), 120).await;
-        }
-        let (_, causes, text, deadline) = request(&pool, 7).await.unwrap();
-        let facts: Vec<Fact> = serde_json::from_str(&causes).unwrap();
-        assert_eq!(
-            facts.iter().map(|f| f.cause.as_str()).collect::<Vec<_>>(),
-            ["job_failed", "review_blocking"]
-        );
-        assert!(text.contains("a review bloqueou o job (run #9)"), "{text}");
-        assert_eq!(
-            deadline, "2026-10-07T12:00:00+00:00",
-            "joining never moves the deadline"
-        );
-        let feed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE subject = 'job:7'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(feed, 1, "only the opening is announced");
-    }
+        assert!(matches!(
+            set_config(&pool, Some(31), None, now).await,
+            Err(ConfigError::OutOfRange)
+        ));
+        assert!(matches!(
+            set_config(&pool, None, Some(24), now).await,
+            Err(ConfigError::OutOfRange)
+        ));
+        set_config(&pool, Some(7), Some(9), now).await.unwrap();
+        assert_eq!((answer_days(&pool).await, digest_hour(&pool).await), (7, 9));
 
-    #[tokio::test]
-    async fn an_exhausted_item_names_its_signature_never_the_raw_output() {
-        let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        let item: i64 = sqlx::query_scalar(
-            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, gate_attempts, gate_output)
-             VALUES (7, 'implement', 2, 'build the thing', 'gate_failed', 3, ?) RETURNING id",
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (7, 'p', '[]', 'q', 'open', '2999-01-01T00:00:00+00:00', 't')",
         )
-        .bind("error[E0425]: cannot find value `x` in this scope\n --> src/a.rs:1:1\nlots of raw lines")
-        .fetch_one(&pool)
+        .execute(&pool)
         .await
         .unwrap();
-        queued(&pool, "run_exhausted", 7, Some(item), None).await;
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
-        let (_, _, text, _) = request(&pool, 7).await.unwrap();
-        assert!(
-            text.contains("o item 2 «build the thing» esgotou 3 tentativas no gate"),
-            "{text}"
+        set_config(&pool, Some(0), None, now).await.unwrap();
+        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_DISMISSED);
+    }
+
+    #[test]
+    fn the_question_is_fixed_per_cause_and_the_line_is_one_line() {
+        let line = question_line(
+            "api",
+            9,
+            &[fact(
+                1,
+                "run_exhausted",
+                "item 2 «add retries» used up 3 gate attempts: `error[E0382]`",
+            )],
         );
-        assert!(!text.contains("lots of raw lines"), "{text}");
+        assert_eq!(
+            line,
+            "#9 · api · job #9 — item 2 «add retries» used up 3 gate attempts: `error[E0382]`. Is there something about this item or the gate that only you know?"
+        );
+        assert_eq!(
+            question_line(
+                "api",
+                7,
+                &[fact(1, "job_failed", "the job ended in `failed`")]
+            ),
+            "#7 · api · job #7 — the job ended in `failed`. What went wrong that the logs would not show?"
+        );
+        assert!(
+            question_for("review_blocking")
+                .contains("Was the review right, or is there a rule of yours behind it?")
+        );
+        assert!(!line.contains('\n'));
     }
 
     #[tokio::test]
-    async fn a_closed_request_is_never_reopened() {
+    async fn expire_due_closes_requests_without_any_digest_running() {
         let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        queued(&pool, "job_failed", 7, None, None).await;
-        let now = at("2026-10-07T10:00:00+00:00");
-        tick(&pool, now, 120).await;
-        sqlx::query("UPDATE capture_requests SET state = 'dismissed' WHERE job_id = 7")
-            .execute(&pool)
-            .await
-            .unwrap();
-        queued(&pool, "run_exhausted", 7, None, None).await;
-        tick(&pool, now, 120).await;
-        let (state, causes, _, _) = request(&pool, 7).await.unwrap();
-        assert_eq!(state, STATE_DISMISSED);
-        assert_eq!(serde_json::from_str::<Vec<Fact>>(&causes).unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn unreadable_facts_are_never_rewritten_from_nothing() {
-        let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        queued(&pool, "job_failed", 7, None, None).await;
-        let now = at("2026-10-07T10:00:00+00:00");
-        tick(&pool, now, 120).await;
-        sqlx::query("UPDATE capture_requests SET causes = 'not json' WHERE job_id = 7")
-            .execute(&pool)
-            .await
-            .unwrap();
-        queued(&pool, "run_exhausted", 7, None, None).await;
-        tick(&pool, now, 120).await;
-        let (state, causes, _, _) = request(&pool, 7).await.unwrap();
-        assert_eq!((state.as_str(), causes.as_str()), (STATE_OPEN, "not json"));
-    }
-
-    #[tokio::test]
-    async fn the_deadline_expires_a_request_exactly_at_its_instant() {
-        let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        queued(&pool, "job_failed", 7, None, None).await;
-        let opened = at("2026-10-07T10:00:00+00:00");
-        tick(&pool, opened, 120).await;
-        tick(&pool, opened + chrono::Duration::minutes(119), 120).await;
-        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_OPEN);
-        tick(&pool, opened + chrono::Duration::minutes(120), 120).await;
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (7, 'web', '[]', 'q', 'open', '2026-10-07T12:00:00+00:00', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            expire_due(&mut conn, at("2026-10-07T11:59:59+00:00"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            expire_due(&mut conn, at("2026-10-07T12:00:00+00:00"))
+                .await
+                .unwrap(),
+            1
+        );
+        drop(conn);
         assert_eq!(request(&pool, 7).await.unwrap().0, STATE_EXPIRED);
-    }
-
-    #[tokio::test]
-    async fn a_secret_in_a_fact_never_reaches_the_question() {
-        const SECRET: &str = "rk_live_51H8abcdefghijklmnop";
-        let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        let item: i64 = sqlx::query_scalar(
-            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, gate_attempts)
-             VALUES (7, 'implement', 1, ?, 'gate_failed', 2) RETURNING id",
-        )
-        .bind(format!("use {SECRET}"))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        queued(&pool, "run_exhausted", 7, Some(item), None).await;
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
-        let (_, causes, text, _) = request(&pool, 7).await.unwrap();
-        assert!(!text.contains(SECRET), "{text}");
-        assert!(
-            !causes.contains(SECRET),
-            "the stored facts are redacted too: {causes}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_wait_is_read_from_schema_meta_with_a_default() {
-        let pool = pool().await;
-        assert_eq!(wait_minutes(&pool).await, DEFAULT_WAIT_MINUTES);
-        for (stored, want) in [
-            ("0", 0),
-            ("45", 45),
-            ("-3", DEFAULT_WAIT_MINUTES),
-            ("soon", DEFAULT_WAIT_MINUTES),
-            ("10080", MAX_WAIT_MINUTES),
-            ("999999999999", DEFAULT_WAIT_MINUTES),
-        ] {
-            sqlx::query("INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)")
-                .bind(WAIT_SETTING_KEY)
-                .bind(stored)
-                .execute(&pool)
-                .await
-                .unwrap();
-            assert_eq!(wait_minutes(&pool).await, want, "stored {stored}");
-        }
     }
 
     async fn set_meta(pool: &SqlitePool, key: &str, value: &str) {
@@ -947,72 +714,22 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn rows_queued_before_the_marker_never_ask() {
-        let pool = pool().await;
-        job(&pool, 7, "failed").await;
-        queued(&pool, "job_failed", 7, None, None).await;
-        // The helper queues at 09:00:00; a marker at that second or later excludes it.
-        set_meta(&pool, FROM_KEY, "2026-10-07T09:00:00").await;
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
-        assert!(request(&pool, 7).await.is_none());
-
-        set_meta(&pool, FROM_KEY, "2026-10-07T08:59:59").await;
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
-        assert!(request(&pool, 7).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn without_a_marker_every_row_asks() {
-        let pool = pool().await;
-        sqlx::query("DELETE FROM schema_meta WHERE key = ?")
-            .bind(FROM_KEY)
-            .execute(&pool)
-            .await
-            .unwrap();
-        job(&pool, 7, "failed").await;
-        queued(&pool, "job_failed", 7, None, None).await;
-        tick(&pool, at("2026-10-07T10:00:00+00:00"), 120).await;
-        assert!(request(&pool, 7).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn the_wait_is_set_within_bounds_and_refused_outside() {
-        let pool = pool().await;
-        for bad in [-1, MAX_WAIT_MINUTES + 1] {
-            assert!(matches!(
-                set_wait_minutes(&pool, bad, Utc::now()).await,
-                Err(WaitError::OutOfRange)
-            ));
-        }
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = ?")
-                .bind(WAIT_SETTING_KEY)
-                .fetch_optional(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stored, None, "a refused value writes nothing");
-        for good in [0, 45, MAX_WAIT_MINUTES] {
-            set_wait_minutes(&pool, good, Utc::now()).await.unwrap();
-            assert_eq!(wait_minutes(&pool).await, good);
-        }
-    }
-
-    #[tokio::test]
-    async fn a_zero_wait_dismisses_the_open_requests() {
-        let pool = pool().await;
-        let now = opened(&pool, 7).await;
-        set_wait_minutes(&pool, 30, now).await.unwrap();
-        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_OPEN);
-        set_wait_minutes(&pool, 0, now).await.unwrap();
-        assert_eq!(request(&pool, 7).await.unwrap().0, STATE_DISMISSED);
-    }
-
+    /// An open request for `job_id`, as a digest would have left it, answerable for two hours.
     async fn opened(pool: &SqlitePool, job_id: i64) -> DateTime<Utc> {
         job(pool, job_id, "failed").await;
-        queued(pool, "job_failed", job_id, None, None).await;
         let now = at("2026-10-07T10:00:00+00:00");
-        tick(pool, now, 120).await;
+        sqlx::query(
+            "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
+             VALUES (?, 'web', ?, 'q', ?, ?, ?)",
+        )
+        .bind(job_id)
+        .bind(facts_json(&[fact(1, "job_failed", "the job ended in `failed`")]))
+        .bind(STATE_OPEN)
+        .bind(stamp(now + chrono::Duration::minutes(120)))
+        .bind(stamp(now))
+        .execute(pool)
+        .await
+        .unwrap();
         now
     }
 
@@ -1040,8 +757,8 @@ mod tests {
     async fn capture_answer_creates_a_linked_note_and_closes_the_request() {
         let pool = pool().await;
         opened(&pool, 7).await;
-        let (note_id, released) = answer(&pool, 7, "only I knew this", "shell").await.unwrap();
-        assert!(released);
+        let (note_id, requeued) = answer(&pool, 7, "only I knew this", "shell").await.unwrap();
+        assert!(requeued);
         let (state, note): (String, Option<i64>) =
             sqlx::query_as("SELECT state, note_id FROM capture_requests WHERE job_id = 7")
                 .fetch_one(&pool)
@@ -1049,7 +766,10 @@ mod tests {
                 .unwrap();
         assert_eq!((state.as_str(), note), (STATE_ANSWERED, Some(note_id)));
         let (_, late) = answer(&pool, 7, "a second thought", "shell").await.unwrap();
-        assert!(!late, "a late answer keeps its note and releases nothing");
+        assert!(
+            late,
+            "a late answer keeps its note and rides the row already pending"
+        );
     }
 
     #[tokio::test]

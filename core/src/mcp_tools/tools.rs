@@ -680,4 +680,20 @@ impl NucleosTools {
     ) -> String {
         json_result(self.client.send_to_chat(&chat_id, &text).await)
     }
+
+    #[tool(
+        description = "Create a NEW browser agent conversation and give it a task to do on the \
+                       web. Returns immediately with the new conversation's chat_id; the agent's \
+                       final answer arrives later as a message in THIS conversation, so carry on \
+                       without waiting for it. Write the task so it can be done without asking \
+                       you anything, and pass url to say which page to start on. Refused if \
+                       nobody is at the machine right now to see it, or if this conversation \
+                       came in from a remote channel."
+    )]
+    pub(super) async fn browser_agent(
+        &self,
+        Parameters(BrowserAgentParams { task, url }): Parameters<BrowserAgentParams>,
+    ) -> String {
+        json_result(self.client.browser_agent(&task, url.as_deref()).await)
+    }
 }

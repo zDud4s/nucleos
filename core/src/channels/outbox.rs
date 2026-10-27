@@ -21,8 +21,8 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
 use tokio::sync::Notify;
 
-use super::ingest::{contract_error, own_channel};
 use super::{contract, registry};
+use super::{contract_error, own_channel};
 use crate::auth::Scope;
 use crate::state::AppState;
 
@@ -125,6 +125,8 @@ impl Class {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject {
     Capture(i64),
+    /// A daily digest of capture requests: `capture_digest:<id>`.
+    CaptureDigest(i64),
     Proposal(i64),
     Run(i64),
 }
@@ -133,6 +135,7 @@ impl Subject {
     pub fn to_text(&self) -> String {
         match self {
             Self::Capture(id) => format!("capture:{id}"),
+            Self::CaptureDigest(id) => format!("capture_digest:{id}"),
             Self::Proposal(id) => format!("proposal:{id}"),
             Self::Run(id) => format!("run:{id}"),
         }
@@ -143,6 +146,7 @@ impl Subject {
         let id: i64 = id.parse().ok()?;
         match kind {
             "capture" => Some(Self::Capture(id)),
+            "capture_digest" => Some(Self::CaptureDigest(id)),
             "proposal" => Some(Self::Proposal(id)),
             "run" => Some(Self::Run(id)),
             _ => None,
@@ -602,6 +606,15 @@ pub async fn prune(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_digest_subject_round_trips_through_its_text() {
+        assert_eq!(
+            Subject::from_text("capture_digest:3"),
+            Some(Subject::CaptureDigest(3))
+        );
+        assert_eq!(Subject::CaptureDigest(3).to_text(), "capture_digest:3");
+    }
 
     async fn insert(pool: &SqlitePool, channel: &str, state: &str, attempts: i64) -> i64 {
         sqlx::query_scalar(

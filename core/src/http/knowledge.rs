@@ -61,6 +61,7 @@ pub(super) fn routes() -> Router<AppState> {
         // Capture requests (spec 2026-10-07-pedidos-captura). In no `auth.rs` table on purpose:
         // Control and Admin only, like the notes an answer becomes.
         .route("/capture-requests", get(get_capture_requests))
+        .route("/capture-digests", get(get_capture_digests))
         .route(
             "/capture-requests/{job_id}/dismiss",
             post(post_capture_dismiss),
@@ -722,6 +723,22 @@ pub(super) async fn get_capture_requests(
         })
 }
 
+/// The digests of the last 14 local days (today included), newest first.
+pub(super) async fn get_capture_digests(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::capture::digest::DigestRow>>, (StatusCode, Json<serde_json::Value>)> {
+    let since = (chrono::Local::now() - chrono::Duration::days(13))
+        .format("%Y-%m-%d")
+        .to_string();
+    crate::capture::digest::list(&state.pool, &since)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing capture digests failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })
+}
+
 pub(super) async fn post_capture_dismiss(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
@@ -752,8 +769,9 @@ pub(super) struct CaptureAnswerRequest {
     pub(super) origin: Option<String>,
 }
 
-/// The owner's answer becomes a note linked to the job; it also closes the request and releases the
-/// job when the request is still open. A late answer keeps its note and releases nothing.
+/// The owner's answer becomes a note linked to the job; it also closes the request when it is
+/// still open and re-enqueues the job for a new reading (`requeued`). A late answer keeps its note
+/// and is re-enqueued too, up to the per-job ceiling.
 pub(super) async fn post_capture_answer(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
@@ -761,7 +779,7 @@ pub(super) async fn post_capture_answer(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     use crate::capture::AnswerError;
     let origin = body.origin.as_deref().unwrap_or("shell");
-    let (note_id, released) =
+    let (note_id, requeued) =
         match crate::capture::answer(&state.pool, job_id, &body.note_text, origin).await {
             Ok(done) => done,
             Err(AnswerError::NotFound) => return Err(refusal(StatusCode::NOT_FOUND, "not_found")),
@@ -776,7 +794,7 @@ pub(super) async fn post_capture_answer(
         };
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({ "note_id": note_id, "released": released })),
+        Json(serde_json::json!({ "note_id": note_id, "requeued": requeued })),
     ))
 }
 

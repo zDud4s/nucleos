@@ -1027,6 +1027,9 @@ mod tests {
                 "approve_proposal",
                 "ask_council",
                 "browser_act",
+                // Not a browser verb: it opens a conversation, not a page. See
+                // `the_browser_verbs_stay_exactly_six_plus_browser_agent`.
+                "browser_agent",
                 "browser_close",
                 "browser_handoff",
                 "browser_look",
@@ -1155,15 +1158,38 @@ mod tests {
             );
         }
 
-        // And the browser set is exactly six, pinned by name. A forbidden-list alone cannot catch
-        // the tool nobody thought to forbid, and this is the surface where one more verb is the
-        // difference between "the agent looked" and "the agent did something on your account".
+        // The pinned set of browser names lives in
+        // `the_browser_verbs_stay_exactly_six_plus_browser_agent` below.
         //
-        // It was five until `browser_look` was added, and the sixth is worth its own sentence
-        // because it is the one that does NOT fit the shape of the other five: it returns pixels,
-        // and pixels are the one carrier `filter_outgoing` cannot inspect. It earns its place by
-        // reading and nothing else — it has no argument but the session, it cannot be aimed at a
-        // coordinate, and the numbers it draws are refs a snapshot already handed out.
+        // `browser_screenshot` is a ROUTE and not a tool, and its absence stays deliberate even
+        // now that a tool DOES return an image. The two are not the same picture: a screenshot is
+        // the whole document, unlabelled, taken of any session including one a person has the wheel
+        // of — which is a login screen. A look is the viewport, labelled with refs, and refused
+        // outright the moment the wheel is asked for.
+        assert!(!names.iter().any(|name| name == "browser_screenshot"));
+    }
+
+    /// The browser set is exactly six verbs plus `browser_agent`, pinned by name. A forbidden-list
+    /// alone (`no_web_tool_can_write_anywhere`, which every name here also passes) cannot catch
+    /// the tool nobody thought to forbid, and this is the surface where one more verb is the
+    /// difference between "the agent looked" and "the agent did something on your account".
+    ///
+    /// It was five until `browser_look` was added, and the sixth is worth its own sentence
+    /// because it is the one that does NOT fit the shape of the other five: it returns pixels,
+    /// and pixels are the one carrier `filter_outgoing` cannot inspect. It earns its place by
+    /// reading and nothing else — it has no argument but the session, it cannot be aimed at a
+    /// coordinate, and the numbers it draws are refs a snapshot already handed out.
+    ///
+    /// `browser_agent` is the seventh name and not a seventh verb: it touches no page. It opens a
+    /// new conversation and hands it a task through `relay::admit`, graded `Acts` like
+    /// `send_to_chat` (`browser_agent_is_a_registered_acts_tool_outside_every_narrowed_box`).
+    #[test]
+    fn the_browser_verbs_stay_exactly_six_plus_browser_agent() {
+        let names: Vec<_> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
         let mut browsing: Vec<&str> = names
             .iter()
             .map(String::as_str)
@@ -1174,20 +1200,16 @@ mod tests {
             browsing,
             [
                 "browser_act",
+                "browser_agent",
                 "browser_close",
                 "browser_handoff",
                 "browser_look",
                 "browser_open",
                 "browser_snapshot",
             ],
-            "the browser surface changed; spec §6.1a classifies exactly these"
+            "the browser surface changed; spec §6.1a classifies exactly these six verbs, and \
+             browser_agent opens a conversation, not a page"
         );
-        // `browser_screenshot` is a ROUTE and not a tool, and its absence stays deliberate even
-        // now that a tool DOES return an image. The two are not the same picture: a screenshot is
-        // the whole document, unlabelled, taken of any session including one a person has the wheel
-        // of — which is a login screen. A look is the viewport, labelled with refs, and refused
-        // outright the moment the wheel is asked for.
-        assert!(!names.iter().any(|name| name == "browser_screenshot"));
     }
 
     /// Spec §6.1a's third price, which nothing else would catch.
@@ -1506,6 +1528,7 @@ mod tests {
             )),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -2430,6 +2453,39 @@ mod tests {
         }
     }
 
+    /// `browser_agent` opens a NEW conversation and hands it a task through the relay gate, so it
+    /// is graded beside `send_to_chat`: `Acts`, which is what shuts it once a turn has read a
+    /// stranger's page — a web text that could aim a fresh browser agent is the case this exists
+    /// to refuse. Registered, because `tool_effect` answers `Acts` for a name it does not know and
+    /// that default alone would make the grading assertion pass for a tool that does not exist.
+    ///
+    /// Off every narrowed box for `send_to_chat`'s reasons: none of them can name the conversation
+    /// it speaks FOR, and the mother of a browser agent is exactly that conversation.
+    #[test]
+    fn browser_agent_is_a_registered_acts_tool_outside_every_narrowed_box() {
+        let names: Vec<_> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "browser_agent"),
+            "browser_agent must be a registered tool"
+        );
+        assert_eq!(tool_effect("browser_agent"), ToolEffect::Acts);
+        for (list, name) in [
+            (LOCAL_TOOLS, "LOCAL_TOOLS"),
+            (COUNCIL_TOOLS, "COUNCIL_TOOLS"),
+            (TEAM_TOOLS, "TEAM_TOOLS"),
+            (JOB_NODE_TOOLS, "JOB_NODE_TOOLS"),
+        ] {
+            assert!(
+                !list.contains(&"browser_agent"),
+                "browser_agent must stay off {name}"
+            );
+        }
+    }
+
     /// Convening is an act and reading the result is not, and the pair is graded apart on purpose.
     ///
     /// `permitted_after_untrusted` reads `TOOL_EFFECTS` BY NAME, so one tool doing both would have
@@ -2701,14 +2757,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worktree_box_server_announces_only_verify_verify_status_and_record() {
+    async fn a_worktree_box_server_announces_the_verify_record_and_node_tools() {
         let (_running, context) = served_request_context().await;
 
         let listed = worktree_server("/work/a")
             .list_tools(None, context)
             .await
             .unwrap();
-        assert_eq!(advertised(&listed), ["record", "verify", "verify_status"]);
+        assert_eq!(
+            advertised(&listed),
+            [
+                "node_active",
+                "node_close",
+                "node_open",
+                "node_tree",
+                "node_update",
+                "record",
+                "verify",
+                "verify_status"
+            ]
+        );
         assert!(!served_in_box(
             &McpBox::Worktree("/work/a".to_owned()),
             "note_finding"
@@ -2717,6 +2785,172 @@ mod tests {
             &McpBox::Worktree("/work/a".to_owned()),
             "create_run"
         ));
+    }
+
+    fn node_open_request() -> rmcp::model::CallToolRequestParams {
+        rmcp::model::CallToolRequestParams::new("node_open").with_arguments(
+            serde_json::json!({"kind": "root", "title": "t", "goal": "g"})
+                .as_object()
+                .expect("the fixture is an object")
+                .clone(),
+        )
+    }
+
+    fn reached_the_daemon(answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> bool {
+        answer.as_ref().is_ok_and(|result| {
+            result.content.iter().any(|block| {
+                matches!(block, rmcp::model::ContentBlock::Text(text)
+                    if text.text.contains("error sending request"))
+            })
+        })
+    }
+
+    fn refusal_names(
+        answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+        name: &str,
+    ) -> bool {
+        match answer {
+            Err(error) => error.message.contains(name),
+            Ok(result) => {
+                result.is_error == Some(true)
+                    && result.content.iter().any(|block| {
+                        matches!(block, rmcp::model::ContentBlock::Text(text)
+                            if text.text.contains(name))
+                    })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worktree_box_dispatches_node_open_instead_of_refusing_it() {
+        let (_running, context) = served_request_context().await;
+
+        let answer = worktree_server("/work/a")
+            .call_tool(node_open_request(), context)
+            .await;
+        assert!(
+            reached_the_daemon(&answer),
+            "the worktree box refused node_open before it reached the daemon: {answer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_node_box_neither_announces_nor_dispatches_node_open() {
+        let (_running, context) = served_request_context().await;
+
+        let listed = job_node_server(9)
+            .list_tools(None, context.clone())
+            .await
+            .unwrap();
+        assert!(
+            !advertised(&listed).iter().any(|name| name == "node_open"),
+            "a job node was offered node_open"
+        );
+
+        let answer = job_node_server(9)
+            .call_tool(node_open_request(), context.clone())
+            .await;
+        assert!(
+            !reached_the_daemon(&answer),
+            "the job-node box dispatched node_open and only the dead port stopped it: {answer:?}"
+        );
+        assert!(
+            refusal_names(&answer, "node_open"),
+            "the job-node box refused the call without naming node_open: {answer:?}"
+        );
+
+        let control = worktree_server("/work/a")
+            .call_tool(node_open_request(), context)
+            .await;
+        assert!(
+            reached_the_daemon(&control),
+            "the worktree control never dispatched, so the refusal above proves nothing: \
+             {control:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_worktree_box_of_the_three_serves_any_node_tool() {
+        let node_tools = [
+            "node_active",
+            "node_close",
+            "node_open",
+            "node_tree",
+            "node_update",
+        ];
+        for name in node_tools {
+            assert!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box does not serve {name}"
+            );
+            assert!(
+                !served_in_box(&McpBox::JobNode(9), name),
+                "a job node box serves {name}"
+            );
+            assert!(
+                !served_in_box(&McpBox::Team(1), name),
+                "a team box serves {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_box_tools_hold_every_box_tools_and_grant_nothing_that_acts_or_reads_untrusted() {
+        let worktree: Vec<&str> = WORKTREE_BOX_TOOLS.to_vec();
+        let registered: Vec<String> = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+
+        for name in EVERY_BOX_TOOLS {
+            assert!(
+                worktree.contains(name),
+                "{name} is served everywhere but missing from the worktree list"
+            );
+        }
+        for &name in &worktree {
+            assert!(
+                registered.iter().any(|r| r == name),
+                "{name} is not a registered tool"
+            );
+            assert!(
+                TOOL_EFFECTS.iter().any(|(n, _)| *n == name),
+                "{name} is missing from TOOL_EFFECTS"
+            );
+            let effect = tool_effect(name);
+            assert!(
+                effect != ToolEffect::Acts && effect != ToolEffect::ReadsUntrusted,
+                "{name} is graded {effect:?} and must not be served in a worktree box"
+            );
+        }
+
+        let mut sorted = worktree.clone();
+        sorted.sort_unstable();
+        assert_eq!(worktree, sorted, "WORKTREE_BOX_TOOLS is not sorted");
+        assert_eq!(
+            worktree,
+            [
+                "node_active",
+                "node_close",
+                "node_open",
+                "node_tree",
+                "node_update",
+                "record",
+                "verify",
+                "verify_status"
+            ]
+        );
+
+        assert!(!EVERY_BOX_TOOLS.contains(&"node_open"));
+        assert!(!served_in_box(&McpBox::JobNode(1), "node_open"));
+        for (name, _) in TOOL_EFFECTS {
+            assert_eq!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                worktree.contains(name),
+                "{name}: the worktree box disagrees with WORKTREE_BOX_TOOLS"
+            );
+        }
     }
 
     #[tokio::test]

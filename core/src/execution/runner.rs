@@ -4164,7 +4164,7 @@ mod tests {
 
     #[test]
     fn a_codex_job_node_carries_the_box_in_its_server_args() {
-        let config = crate::assistant::build_job_node_mcp_config("C:/x/n.exe", 7);
+        let config = crate::assistant_types::build_job_node_mcp_config("C:/x/n.exe", 7);
         let overrides = codex_mcp_overrides(&config, &[]).unwrap();
 
         assert!(overrides.iter().any(|value| {

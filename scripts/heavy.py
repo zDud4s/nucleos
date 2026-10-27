@@ -9,11 +9,16 @@ scheme and appends one telemetry line per run.
     heavy.py warm [--cwd PATH] [-- argv...]
 
 Admission is a machine token queue: every request has a weight (heavy_classify) and a
-priority; the head of the queue (priority, then arrival) runs once the held weights plus
-its own fit the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4). Underneath it sits the
+priority; the head of the queue (priority, then arrival) is admitted by the admission mode
+(`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than capacity() jobs are held and
+the live probe shows room (free RAM, idle cores, a settle window since the last admission),
+or nothing is held; an unreadable probe falls back to `static`, the held weights plus its own
+fitting the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4; setting it forces `static`);
+`shadow` decides as static and only logs the cost model's opinion. Underneath it sits the
 runtime: process liveness (pid + creation time), the directory mutex, running the child
 inside a Windows Job object (so a hard-killed broker takes its child with it),
-`NUCLEOS_HEAVY=0`, and fail-open. A bug in the broker must run the command, never block it.
+`NUCLEOS_HEAVY=0`, and fail-open. A bug in the broker must run the command, never block it;
+a busy mutex is contention, not a bug, and is answered with exit 75.
 
 Standard library only. Never `os.kill(pid, 0)` on Windows: CPython maps it to
 TerminateProcess.
@@ -41,14 +46,23 @@ LOG_ARGV_WORDS = 40
 LOG_ARGV_CHARS = 300
 MUTEX_STALE_S = 60.0
 MUTEX_WAIT_S = 30.0
+MUTEX_POLL_S = 0.05
+# Measurement (2026-10-22, mutex.jsonl): four calls timed out together with n_exists=1 and
+# owner_held_s 0.1 -- the machine froze ~37 s inside one poll. A deadline alone cannot tell a
+# stall from contention, so a timeout also needs this many failed attempts (half the nominal
+# polls), and MUTEX_WAIT_CAP_X times the timeout is the wall-clock cap that raises regardless.
+MUTEX_MIN_ATTEMPTS_FRAC = 0.5
+MUTEX_WAIT_CAP_X = 4.0
 # Measurement (2026-10-07, "broker mutex busy" fail-opens): an acquisition that waits or
 # holds longer than this, and every timeout, gets a row in `mutex.jsonl`.
 MUTEX_TRACE_S = 1.0
 STILL_ACTIVE = 259
 DEFAULT_CAPACITY = 4
 # Predicted peak memory (p90 of the class, costs.json) from which a request weighs
-# capacity - 1. Between node's 4.7 GB and core clippy's 6.2 GB (costs.json, 2026-10-21).
-BIG_MEM_MB = 5120.0
+# capacity - 1. Off unless NUCLEOS_HEAVY_BIG_MEM_MB sets it. Measured 2026-10-27 (log.jsonl): with
+# it on at 5120, every nucleos-core run weighed 3 and ran alone, yet ran no faster (run p50
+# 415 s vs 230-490 s two-to-four abreast on 10-15..10-20) while its wait p50 went 0 s -> 1865 s.
+BIG_MEM_MB = float("inf")
 AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
@@ -147,6 +161,10 @@ def is_alive(pid, ctime=None) -> bool:
 _MUTEX_HELD: set[str] = set()
 
 
+class MutexBusy(TimeoutError):
+    """The mutex stayed held by a live owner: contention, not a broker bug."""
+
+
 class Mutex:
     """`mkdir $DIR/.mutex` plus an `owner` file. Stale when older than 60 s, when the owner
     is dead, or when the owner is this very process and it does not hold it; a stale one is
@@ -241,6 +259,8 @@ class Mutex:
     def acquire(self) -> None:
         t0 = time.time()
         deadline = t0 + self.timeout
+        hard_cap = t0 + self.timeout * MUTEX_WAIT_CAP_X
+        min_attempts = max(1, int(self.timeout / MUTEX_POLL_S * MUTEX_MIN_ATTEMPTS_FRAC))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             try:
@@ -255,11 +275,15 @@ class Mutex:
                     self.n_exists += 1
                 if self._stale() and self._break_stale():
                     continue
-                if time.time() > deadline:
-                    self.waited = time.time() - t0
+                now = time.time()
+                # A stalled machine can pass the deadline inside one iteration (2026-10-22:
+                # n_exists=1, owner_held_s 0.1); require the minimum attempts unless capped.
+                attempts = self.n_exists + self.n_perm
+                if (now > deadline and attempts >= min_attempts) or now > hard_cap:
+                    self.waited = now - t0
                     self._trace_timeout()
-                    raise TimeoutError("broker mutex busy")
-                time.sleep(0.05)
+                    raise MutexBusy("broker mutex busy")
+                time.sleep(MUTEX_POLL_S)
         self.held = True
         _MUTEX_HELD.add(str(self.path))
         self.t_held = time.time()
@@ -529,6 +553,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     itself. When it returns True the request is admitted WITHOUT a held/<pid> record: the
     caller's callable has registered the light run and tells the caller by its own side effect."""
     queue_dir, held_dir = directory / "queue", directory / "held"
+    # A re-queue (pool slot handed back) must not carry the previous admission's record.
+    rec.pop("adm", None)
     me = os.getpid()
     poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
     t0 = time.time()
@@ -536,12 +562,16 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     queued = False
     last_report = t0
     shadow = None
+    dyn = False
+    hc = None
     try:
         hc = _cost_mod()
         if hc is not None and hc.admission_mode() == "shadow":
             shadow = hc.Shadow(rec, directory)
+        dyn = hc is not None and hc.admission_mode() == "dynamic"
     except Exception:
         shadow = None
+        dyn = False
     admitted = False
     light_retry = _env_float("NUCLEOS_HEAVY_LIGHT_RETRY_S", 2.0)
     last_light = None
@@ -552,13 +582,20 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             _sweep_held_tmp(directory)
             qfile.write_text(json.dumps(rec), encoding="utf-8")
             queued = True
+        last_pos = 1
         while True:
             position = 0
             if shadow is not None:
                 shadow.tick()
+            # Dynamic admission reads the live machine state OUTSIDE the Mutex (the probe may
+            # sleep to prime its CPU sample), and only from a waiter that was at the head on the
+            # previous poll: the others cannot be admitted, so they would only add probe load.
+            probed = dyn and last_pos <= 1
+            pr = hc.dynamic_probe() if probed else None
             with Mutex(directory):
                 order = _queue_order(_entries(queue_dir), directory)
-                held_recs = [r for _, r in _entries(held_dir)]
+                held_ents = _entries(held_dir)
+                held_recs = [r for _, r in held_ents]
                 held = sum(int(r.get("weight") or 1) for r in held_recs)
                 names = [f.name for f, _ in order]
                 position = names.index(qfile.name) + 1 if qfile.name in names else 0
@@ -571,12 +608,30 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     static_fit = held + rec["weight"] <= capacity()
                     if shadow is not None:
                         shadow.observe(held_recs, static_fit)
-                    if static_fit:
+                    fit = static_fit
+                    if dyn and not probed:
+                        # Just reached the head: no fresh probe yet, decide on the next poll.
+                        fit = False
+                    elif dyn:
+                        adm = None
+                        try:
+                            try:
+                                since = time.time() - max(f.stat().st_mtime for f, _ in held_ents)
+                            except (OSError, ValueError):
+                                since = float("inf")
+                            fit, adm = hc.dynamic_fit(len(held_recs), pr, since, capacity(),
+                                                      static_fit)
+                        except Exception:
+                            fit, adm = static_fit, None
+                        if fit and adm:
+                            rec["adm"] = adm
+                    if fit:
                         (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
                         qfile.unlink()
                         queued = False
                         admitted = True
                         return True, time.time() - t0
+            last_pos = position
             if light is not None and (last_light is None
                                       or time.monotonic() - last_light >= light_retry):
                 last_light = time.monotonic()
@@ -2283,10 +2338,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             costs = hc.load_costs(directory)
             rec["cls"] = hc.class_key(argv, filtered, True)
             rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(costs, rec["cls"], weight)
-            # Measured 2026-10-21: a nucleos-core compile peaks at 6-9 GB on a 16 GB machine,
-            # and two at once (static weight 2 + 2) swapped (one ran 2557 s at 0.47 cores). A
-            # class past the threshold takes capacity - 1, so it never overlaps another one
-            # but a go/npm/tsc still fits beside it.
+            # Opt-in (BIG_MEM_MB): a class past the threshold takes capacity - 1, so it never
+            # overlaps another one but a go/npm/tsc still fits beside it.
             if rec["pred_mem_mb"] >= _env_float("NUCLEOS_HEAVY_BIG_MEM_MB", BIG_MEM_MB):
                 weight = max(weight, capacity() - 1)
                 rec["weight"] = weight
@@ -2413,7 +2466,12 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             env.pop("NUCLEOS_HEAVY_TOKEN", None)
         elif held:
             env = dict(os.environ)
-            env.pop("NUCLEOS_HEAVY_TOKEN", None)
+            # A hold-worktree started under a token holder (`heavy.py -- bash gates.sh x`, where
+            # gates.sh opens its own session) keeps the marker: its steps are the holder's work,
+            # and queueing them for a token the holder already owns would wait on itself (seen
+            # 2026-10-22: outer weight 3 + inner clippy 3 > capacity 4, never admitted).
+            if not nested:
+                env.pop("NUCLEOS_HEAVY_TOKEN", None)
             env["NUCLEOS_HEAVY_HELD"] = str(os.getpid())
             env["NUCLEOS_HEAVY_PRIO"] = str(prio)
         elif nested:
@@ -2540,6 +2598,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             "wait_lock_s": round(wait_lock, 3), "wait_token_s": round(wait_token, 3),
             "token": bool(holding), "nested": nested, "in_held": in_held,
         }
+        if rec.get("adm"):
+            row["adm"] = rec["adm"]
         if warm:
             row["warm"] = True
         if light:
@@ -2548,6 +2608,22 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             row["session"] = session
         if eff_td:
             row["target_dir"] = _norm_td(eff_td)
+    except MutexBusy as exc:
+        # Contention on the broker's own mutex is not a broker bug: running the command here
+        # would put it outside the budget exactly when the machine is loaded (2026-10-22).
+        if lease is not None and env is not None:
+            env.pop("CARGO_TARGET_DIR", None)
+        _release_all(directory, lock_hash, holding, lease)
+        waited = time.time() - t_start
+        sys.stderr.write(
+            f"heavy: broker mutex busy for {int(waited)}s ({exc}); nothing was compiled - "
+            "try again, re-run with the Bash tool timeout set to 600000\n")
+        try:
+            _log_timeout(directory or _safe_state_dir(), opts["agent"], None, opts["kind"],
+                         None, waited, argv, waited_on="mutex")
+        except Exception:
+            pass
+        return EXIT_QUEUE_TIMEOUT
     except Exception as exc:
         if lease is not None and env is not None:
             env.pop("CARGO_TARGET_DIR", None)  # the lease goes now: build without it
@@ -2652,7 +2728,7 @@ def _log_timeout(directory, agent, prio, kind, weight, waited, argv, *,
     """A run that gave up waiting still leaves a row, so `report` counts the exit 75.
 
     `waited` is the lock wait (`wait_lock_s`); `wait_token` is the token/slot wait
-    (`wait_token_s`). `waited_on` names the refusal: lock | gate | estimate | token | slot."""
+    (`wait_token_s`). `waited_on` names the refusal: lock | gate | estimate | token | slot | mutex."""
     append_log({
         "v": LOG_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "worktree": os.getcwd(), "agent": agent, "prio": prio, "eff_prio": prio,
@@ -3049,5 +3125,108 @@ def main(argv: list[str]) -> int:
         return 130
 
 
+# Staged versions older than this, other than the current one, are pruned.
+STAGED_KEEP_S = 86400.0
+
+
+def _staged_broker() -> Path | None:
+    """The master version of the broker, staged under `<dev home>/run/broker/<stamp>/`, or None to
+    run this file as it is.
+
+    Owner decision, 2026-10-27: one broker per machine, not one per worktree. Every worktree used
+    to run its own `scripts/heavy.py`, so a broker fix reached a session only once its branch
+    merged master, and sessions on different versions shared one queue. Now every copy forwards
+    to master's, staged from the git objects (never a checkout), so it is refreshed by the first
+    run after a land and needs no daemon. The staged files are master's `scripts/heavy*.py`, read
+    from master itself, so a module master adds later is staged too. A version is a directory
+    written once and renamed into place, so a refresh never touches a version already in use.
+
+    None (run locally) when NUCLEOS_HEAVY_LOCAL is set (the broker's tests, or trying a broker
+    change), when NUCLEOS_HEAVY_DIR is set (an isolated broker is the code under test), when this
+    file is already a staged copy, or when git cannot say what master holds."""
+    if os.environ.get("NUCLEOS_HEAVY_LOCAL") or os.environ.get("NUCLEOS_HEAVY_DIR"):
+        return None
+    try:
+        here = Path(__file__).resolve().parent
+        root = _dev_home() / "run" / "broker"
+        if here.parent == root.resolve():
+            return None
+        ref = os.environ.get("NUCLEOS_HEAVY_MASTER_REF") or "master"
+        out = subprocess.run(
+            ["git", "-C", str(here), "ls-tree", "--full-tree", ref, "--", "scripts/"],
+            capture_output=True, text=True, timeout=20)
+        if out.returncode != 0:
+            return None
+        blobs: dict[str, str] = {}
+        for line in out.stdout.splitlines():
+            meta, _, name = line.partition("	")
+            parts = meta.split()
+            base = name.rsplit("/", 1)[-1]
+            if (len(parts) == 3 and parts[1] == "blob" and base.startswith("heavy")
+                    and base.endswith(".py")):
+                blobs[base] = parts[2]
+        if "heavy.py" not in blobs:
+            return None
+        stamp = hashlib.sha256(
+            "".join(f"{n}={blobs[n]};" for n in sorted(blobs)).encode()).hexdigest()[:16]
+        target = root / stamp
+        if (target / "heavy.py").is_file():
+            os.utime(target)  # in use: keep it out of the prune
+        else:
+            tmp = root / f".tmp-{stamp}-{os.getpid()}"
+            tmp.mkdir(parents=True, exist_ok=True)
+            for name, sha in blobs.items():
+                blob = subprocess.run(
+                    ["git", "-C", str(here), "cat-file", "blob", sha],
+                    capture_output=True, timeout=20, check=True).stdout
+                (tmp / name).write_bytes(blob)
+            try:
+                tmp.rename(target)
+            except OSError:
+                # Another run staged the same version first.
+                shutil.rmtree(tmp, ignore_errors=True)
+            _prune_staged(root, stamp)
+        return target / "heavy.py" if (target / "heavy.py").is_file() else None
+    except Exception:
+        return None
+
+
+def _prune_staged(root: Path, keep: str) -> None:
+    """Remove staged versions other than `keep` that no run has used for STAGED_KEEP_S (every
+    forwarded run touches its version), and leftover temp dirs of the same age."""
+    try:
+        now = time.time()
+        for d in root.iterdir():
+            if d.name != keep and d.is_dir() and now - d.stat().st_mtime > STAGED_KEEP_S:
+                shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _load_staged(path: Path):
+    """The staged broker's `main`, or None when it cannot even load: a broken land must fall back
+    to this copy, never stop the command (fail-open). It runs in this process, so the caller's
+    pid, console and job object are the broker's, exactly as when it is run directly. This
+    checkout's `scripts/` leaves sys.path, so the staged code imports only staged siblings."""
+    import runpy
+
+    here = str(Path(__file__).resolve().parent)
+    saved = list(sys.path)
+    sys.path[:] = [str(path.parent)] + [p for p in sys.path
+                                        if p and Path(p).resolve() != Path(here)]
+    try:
+        entry = runpy.run_path(str(path), run_name="heavy_staged").get("main")
+        if callable(entry):
+            sys.argv[0] = str(path)
+            return entry
+    except Exception as exc:
+        print(f"heavy: staged broker {path.parent.name} failed to load ({exc!r}); "
+              "running this checkout's copy", file=sys.stderr)
+    sys.path[:] = saved
+    return None
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    _staged = _staged_broker()
+    _main = (_load_staged(_staged) if _staged else None) or main
+    sys.exit(_main(sys.argv[1:]))

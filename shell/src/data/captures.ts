@@ -27,6 +27,8 @@ export interface CaptureRequest {
   note_id: number | null;
   created_at: string;
   closed_at: string | null;
+  /** The daily digest that asked this question; `null` for one asked before digests existed. */
+  digest_id: number | null;
 }
 
 /**
@@ -72,7 +74,7 @@ function useCaptureMutation<V, R>(mutationFn: (input: V) => Promise<R>) {
 
 export function useAnswerCapture() {
   return useCaptureMutation(({ jobId, text }: { jobId: number; text: string }) =>
-    apiFetch<{ note_id: number; released: boolean }>(`/capture-requests/${jobId}/answer`, {
+    apiFetch<{ note_id: number; requeued: boolean }>(`/capture-requests/${jobId}/answer`, {
       method: "POST",
       body: JSON.stringify({ text, origin: "shell" }),
     }),

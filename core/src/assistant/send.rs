@@ -2,69 +2,6 @@
 
 use super::*;
 
-/// Which client sent a chat message, as the client states it.
-///
-/// Stated rather than inferred, and that is why this type exists at all. A Telegram group id is
-/// negative, so the origin is guessable from the shape of `chat_id` — and guessing would make a
-/// routing decision depend on a numbering scheme Telegram owns and can change without telling
-/// anybody. A client that says nothing is `Shell`, which keeps every existing caller where it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    Shell,
-    /// Spoken into the microphone of the machine this daemon runs on.
-    ///
-    /// A variant and not a flag on `Shell`, because the two differ in what happens to the ANSWER:
-    /// a shell turn is read, a voice turn is spoken. Recorded on the row for the same reason the
-    /// other two are — a queued message must be sent as the thing it was.
-    Voice,
-    /// Typed in the panel of a NucleOS browser window on this machine; answered like `Shell`.
-    BrowserPanel,
-    /// A message that arrived through a channel sidecar, named by its registry id.
-    ///
-    /// The id is the manifest's `&'static str`, so the type stays `Copy`; an id that is not in the
-    /// registry cannot be built from the wire (see `from_wire`).
-    Channel(&'static str),
-}
-
-impl Origin {
-    /// An unknown spelling resolves to `Shell` for the same reason absence does: this is a
-    /// ship-dark feature, so anything not explicitly asking for the new path gets the old one.
-    pub fn from_wire(value: Option<&str>) -> Self {
-        match value {
-            // Legacy spelling of the Telegram origin, kept so a message queued before the
-            // channel registry still resolves; never built from any other bare wire string.
-            Some("telegram") => Self::Channel(crate::channels::registry::TELEGRAM.id),
-            Some("voice") => Self::Voice,
-            Some("browser-panel") => Self::BrowserPanel,
-            Some(wire) => wire
-                .strip_prefix("channel:")
-                .and_then(crate::channels::registry::by_id)
-                .map_or(Self::Shell, |manifest| Self::Channel(manifest.id)),
-            None => Self::Shell,
-        }
-    }
-
-    /// Whether the sender is somebody on the far side of a network rather than at this machine.
-    pub fn is_remote(self) -> bool {
-        matches!(self, Self::Channel(_))
-    }
-
-    /// How this origin is written down, so a message that waits is sent as the thing it was.
-    ///
-    /// The inverse of `from_wire` and asserted against it: a queued message carries its origin
-    /// through the database, and an origin that did not survive the round trip would route a
-    /// Telegram turn back into the shell.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            Self::Voice => "voice",
-            Self::BrowserPanel => "browser-panel",
-            Self::Shell => "shell",
-            Self::Channel(id) => crate::channels::registry::by_id(id)
-                .map_or("shell", |manifest| manifest.origin_wire),
-        }
-    }
-}
-
 /// The channel-wide doctrine pushed onto a turn, by the door the message came in by.
 ///
 /// Written out per origin rather than swept up by a wildcard, so that the next origin — which will
@@ -84,45 +21,6 @@ fn undeclared_brain_wants_local(origin: Origin) -> bool {
     origin.is_remote()
 }
 
-/// Why a turn was refused before it cost anything: the chat says `local` and this machine has none.
-///
-/// A named constant rather than a sentence written twice, because `http.rs` turns it into the one
-/// status code that tells this apart from a daemon that broke. Matched exactly there — a refusal
-/// recognised by a substring is a refusal that stops being recognised when someone edits the words.
-pub const NO_LOCAL_MODEL: &str = "this chat is set to the local model and none is configured";
-
-/// Why a turn was refused before it cost anything: the chat says `openrouter` and this daemon has
-/// no hosted model wired up to answer it.
-///
-/// `NO_LOCAL_MODEL`'s sibling and not its synonym, and the two have to stay apart because the
-/// failure they each guard is aimed at a different wallet. A chat that says `local` and finds no
-/// local model falls back to the CLI today when the choice was only inferred (`origin ==
-/// Origin::Channel(_)`) and refuses only when a person SAID `local` outright — because
-/// the CLI has always answered an unmarked Telegram message, so refusing there would take the bot
-/// off the air to enforce a promise nobody made. `openrouter` has no such history: nothing before
-/// this brain existed could ever have chosen it, so there is no old behaviour to preserve and no
-/// argument for falling through at all. Every turn that reaches this brain is refused, full stop,
-/// until the hosted route is actually wired — the placeholder this constant replaces the silence
-/// of (`(None, Some(crate::chats::Brain::OpenRouter)) => false` in `send_message_with`) is exactly
-/// what let that turn go to the cloud CLI instead: silently, and on the bill.
-///
-/// A named constant for the same reason `NO_LOCAL_MODEL` is one: `http.rs` will need to turn this
-/// into a status code a client can act on, and a refusal recognised by a fragment of its wording
-/// stops being recognised the day somebody improves the sentence.
-///
-pub const NO_HOSTED_MODEL: &str = "this chat is set to the hosted model and none is configured";
-
-/// What became of a message somebody sent: a turn, or a place in the queue.
-///
-/// Two outcomes rather than an `Option<i64>`, because the caller has something different to say
-/// about each and a null id says neither. A turn is answered by watching it; a queued message is
-/// answered by showing it waiting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sent {
-    Turn(i64),
-    Queued,
-}
-
 /// Sends a message, or keeps it until the conversation has a turn free.
 ///
 /// The wall this removes: a second message used to take `TURN_IN_PROGRESS` and vanish, so a person
@@ -139,6 +37,29 @@ pub async fn send_or_queue(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
+    images: &[crate::execution::runner::Attachment],
+    origin: Origin,
+) -> Result<Sent, String> {
+    send_or_queue_inner(state, chat_id, text, None, images, origin).await
+}
+
+/// [`send_or_queue`] for a slash command that expanded: `typed` is what the person wrote (the
+/// transcript and the queue keep it), `model_text` is what the model reads. Never carries pictures.
+pub async fn send_expanded_or_queue(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    typed: &str,
+    model_text: &str,
+    origin: Origin,
+) -> Result<Sent, String> {
+    send_or_queue_inner(state, chat_id, typed, Some(model_text), &[], origin).await
+}
+
+async fn send_or_queue_inner(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    text: &str,
+    model_text: Option<&str>,
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<Sent, String> {
@@ -171,19 +92,35 @@ pub async fn send_or_queue(
     let waiting = crate::chats::queued(&state.pool, chat_id)
         .await
         .map_err(|error| error.to_string())?;
+    let enqueue = || async {
+        let written = match model_text {
+            Some(model_text) => {
+                crate::chats::enqueue_expanded(
+                    &state.pool,
+                    chat_id,
+                    text,
+                    model_text,
+                    origin.as_wire(),
+                    &carried(),
+                )
+                .await
+            }
+            None => {
+                crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
+                    .await
+            }
+        };
+        written.map_err(|error| error.to_string())
+    };
     if !waiting.is_empty() {
-        crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
-            .await
-            .map_err(|error| error.to_string())?;
+        enqueue().await?;
         spawn_drain_if_free(state, chat_id);
         return Ok(Sent::Queued);
     }
-    match send_message_with(state, chat_id, text, images, origin).await {
+    match send_message_inner(state, chat_id, text, model_text, images, origin, None).await {
         Ok(id) => Ok(Sent::Turn(id)),
         Err(refusal) if refusal == TURN_IN_PROGRESS => {
-            crate::chats::enqueue(&state.pool, chat_id, text, origin.as_wire(), &carried())
-                .await
-                .map_err(|error| error.to_string())?;
+            enqueue().await?;
             // The turn may have ended between the refusal and the write; then nobody would drain it.
             spawn_drain_if_free(state, chat_id);
             Ok(Sent::Queued)
@@ -361,6 +298,7 @@ async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold
     // `take_queued`'s own doc. It decides which of the two doors below the resend goes back
     // through, so a message that waited still produces a run recording where it came from.
     let text = taken.text.clone();
+    let model_text = taken.model_text.clone();
     let origin = Origin::from_wire(taken.origin.as_deref());
     let carried = taken.images.clone();
     let relay_id = taken.relay_id;
@@ -478,7 +416,16 @@ async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold
                     })
                 })
                 .collect();
-            Box::pin(send_message_with(state, chat_id, &text, &images, origin)).await
+            Box::pin(send_message_inner(
+                state,
+                chat_id,
+                &text,
+                model_text.as_deref(),
+                &images,
+                origin,
+                None,
+            ))
+            .await
         }
     };
     let Err(refusal) = sent else {
@@ -552,17 +499,6 @@ pub async fn drain_waiting_queues(state: crate::state::AppState) {
         drain_queued(&state, &chat).await;
     }
 }
-
-/// Why a turn was refused before it cost anything: this conversation is already answering one.
-///
-/// A constant because two callers now have to recognise it and act differently on it. `http.rs`
-/// turns it into the one status a client can retry on, and `scheduler.rs` reads it as "nothing was
-/// started" and hands the window back so the rule tries again on the next tick.
-///
-/// Matched by value at both, never by substring. A refusal recognised by a fragment of its wording
-/// stops being recognised the moment somebody improves the sentence, and the two behaviours that
-/// depend on it would fail apart and silently.
-pub const TURN_IN_PROGRESS: &str = "a turn is already in progress for this chat";
 
 /// How many pictures one turn may carry.
 ///
@@ -674,7 +610,7 @@ pub async fn send_message_with(
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<i64, String> {
-    send_message_inner(state, chat_id, text, images, origin, None).await
+    send_message_inner(state, chat_id, text, None, images, origin, None).await
 }
 
 /// Sends a message that arrived by relay from another conversation, recording which relay bore it.
@@ -691,7 +627,7 @@ pub async fn send_relayed_message(
     origin: Origin,
     relay_id: i64,
 ) -> Result<i64, String> {
-    send_message_inner(state, chat_id, text, &[], origin, Some(relay_id)).await
+    send_message_inner(state, chat_id, text, None, &[], origin, Some(relay_id)).await
 }
 
 /// Sends a relayed message, or keeps it until the destination has a turn free.
@@ -752,10 +688,13 @@ pub(super) async fn send_message_inner(
     state: &crate::state::AppState,
     chat_id: &str,
     text: &str,
+    model_text: Option<&str>,
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
     relay_id: Option<i64>,
 ) -> Result<i64, String> {
+    // What the model reads. `runs.prompt` keeps `text`, the words that were typed (spec D1).
+    let model_text = model_text.unwrap_or(text);
     // Refused before the slot is taken, so a turn nobody can send costs nothing and leaves the
     // conversation answerable.
     check_images(images)?;
@@ -805,6 +744,7 @@ pub(super) async fn send_message_inner(
                     state,
                     slot,
                     text.to_string(),
+                    model_text.to_string(),
                     assistant,
                     relay_id,
                     origin,
@@ -844,6 +784,7 @@ pub(super) async fn send_message_inner(
                     state,
                     slot,
                     text.to_string(),
+                    model_text.to_string(),
                     assistant,
                     relay_id,
                     origin,
@@ -998,6 +939,12 @@ pub(super) async fn send_message_inner(
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+    // A relay whose sender read third-party text hands this turn that text as its prompt, so the
+    // run is marked here, before the turn is spawned: `handover_of` above only keeps THIS turn
+    // `McpOnly`, and an unmarked row would let it leave a resumable session that the next typed turn
+    // picks up with full tools. A mark that fails ends the run as failed and returns the refusal;
+    // the slot and the MCP file are released by their own drops, as for every early return here.
+    inherit_relay_taint(&state.pool, id, relay_id).await?;
     crate::chats::stamp_project(&state.pool, id, chat_id).await;
     // A channel conversation sees "working" as soon as its turn exists. A no-op for any other chat.
     crate::channels::replies::turn_started(state, id, chat_id).await;
@@ -1036,7 +983,7 @@ pub(super) async fn send_message_inner(
         tracing::warn!(%error, id, "the turn was sent but its pictures were not recorded");
     }
 
-    let prompt = text.to_string();
+    let prompt = model_text.to_string();
     // The conversation so far, for a turn that has no session to hold it.
     //
     // `resume` is `None` on a first turn — where there is nothing to replay and this adds nothing —
@@ -1084,6 +1031,57 @@ pub(super) async fn send_message_inner(
                 }
             },
         },
+    };
+    // A browser agent's reply that could not be delivered is said to the model once, in front of
+    // whatever else this turn sends (resumed or replayed alike); `runs.prompt` keeps what the person
+    // typed, so a later replay of the history cannot repeat it. A read failure sends no prefix.
+    // The bodies are the browser agent's own output, web text it read included, so the turn that
+    // sees them is marked `read_untrusted` before it is spawned; a mark that fails sends no prefix.
+    //
+    // Peek, mark, THEN take: taking stamps the notices consumed by this run, so taking before the
+    // mark would lose them whenever the mark failed — consumed by a turn that never saw them. A
+    // failed mark leaves them unconsumed for the next turn. A notice posted between the peek and
+    // the take is taken too, which is safe: the run is already marked by then.
+    let pending = crate::chats::notices::has_unconsumed(
+        &state.pool,
+        chat_id,
+        crate::chats::notices::KIND_BROWSER_REPLY,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, chat_id, "could not read the pending browser replies");
+        false
+    });
+    let marked = pending
+        && match crate::execution::runs::mark_untrusted_context(&state.pool, id).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    run_id = id,
+                    "could not mark a turn carrying browser replies; leaving them for the next turn"
+                );
+                false
+            }
+        };
+    let prompt = if !marked {
+        prompt
+    } else {
+        match crate::chats::notices::take_unconsumed(
+            &state.pool,
+            chat_id,
+            crate::chats::notices::KIND_BROWSER_REPLY,
+            id,
+        )
+        .await
+        {
+            Ok(bodies) if !bodies.is_empty() => format!("{}\n\n{prompt}", bodies.join("\n\n")),
+            Ok(_) => prompt,
+            Err(error) => {
+                tracing::warn!(%error, chat_id, "could not read the pending browser replies");
+                prompt
+            }
+        }
     };
     let cwd = cwd.map(std::path::PathBuf::from);
 
@@ -1562,6 +1560,7 @@ mod tests {
             run_messages: Arc::new(Mutex::new(HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -1622,6 +1621,166 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("turn {id} never settled");
+    }
+
+    /// A browser agent's reply that could not be delivered reaches the mother's NEXT turn: once,
+    /// in front of what the person typed, and only the `browser_reply` kind. `runs.prompt` keeps
+    /// the typed words, so a later replay of the history cannot repeat the notice.
+    #[tokio::test]
+    async fn a_pending_browser_reply_notice_prefixes_the_parents_next_turn_exactly_once() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = AppState {
+            runner: fake.clone(),
+            ..test_state().await
+        };
+        let chat = a_chat("browser-reply-parent");
+        let refused = "Not delivered (owner_away): [browser agent · Hotels] Found three hotels.";
+        let notice_id = crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_BROWSER_REPLY,
+            0,
+            refused,
+        )
+        .await
+        .unwrap();
+        crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_RESTART,
+            0,
+            crate::chats::notices::RESTART_NOTICE,
+        )
+        .await
+        .unwrap();
+
+        let first = send_message(&state, &chat, "what next?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, first).await;
+
+        let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            handed.contains(refused),
+            "the notice did not reach the turn: {handed:?}"
+        );
+        assert!(handed.contains("what next?"), "{handed:?}");
+        assert!(
+            handed.find(refused) < handed.find("what next?"),
+            "the notice comes before the typed words: {handed:?}"
+        );
+        assert!(
+            !handed.contains(crate::chats::notices::RESTART_NOTICE),
+            "only browser_reply notices reach the model: {handed:?}"
+        );
+        let stored: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+            .bind(first)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, "what next?",
+            "runs.prompt keeps what the person typed"
+        );
+        let consumed: Option<i64> =
+            sqlx::query_scalar("SELECT consumed_by_run FROM chat_notices WHERE id = ?")
+                .bind(notice_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            consumed,
+            Some(first),
+            "the notice names the turn that saw it"
+        );
+        let marked: i64 = sqlx::query_scalar("SELECT read_untrusted FROM runs WHERE id = ?")
+            .bind(first)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            marked, 1,
+            "a turn handed a browser agent's reply has read untrusted text"
+        );
+
+        *fake.last_prompt.lock().unwrap() = None;
+        fake.later_turns.lock().unwrap().clear();
+        let second = send_message(&state, &chat, "and then?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, second).await;
+
+        let mut handed_again: Vec<String> =
+            fake.last_prompt.lock().unwrap().iter().cloned().collect();
+        handed_again.extend(
+            fake.later_turns
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|turn| turn.text.clone()),
+        );
+        assert!(
+            handed_again.iter().any(|text| text.contains("and then?")),
+            "the second turn was never handed over: {handed_again:?}"
+        );
+        assert!(
+            handed_again.iter().all(|text| !text.contains(refused)),
+            "a consumed notice reached a second turn: {handed_again:?}"
+        );
+        crate::assistant::evict_live(&chat);
+    }
+
+    /// A turn whose `read_untrusted` mark cannot be written is handed no browser reply AND takes
+    /// none: the notice stays unconsumed for the next turn instead of being stamped consumed by a
+    /// turn that never saw it.
+    #[tokio::test]
+    async fn a_browser_reply_notice_outlives_a_turn_whose_mark_failed() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = AppState {
+            runner: fake.clone(),
+            ..test_state().await
+        };
+        let chat = a_chat("browser-reply-unmarkable");
+        let refused = "Not delivered (owner_away): [browser agent · Flights] Two flights found.";
+        let notice_id = crate::chats::notices::post_system(
+            &state.pool,
+            &chat,
+            crate::chats::notices::KIND_BROWSER_REPLY,
+            0,
+            refused,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_untrusted_marks BEFORE UPDATE OF read_untrusted ON runs
+             BEGIN SELECT RAISE(ABORT, 'marks refused for this test'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let first = send_message(&state, &chat, "what next?", Origin::Shell)
+            .await
+            .unwrap();
+        settled(&state.pool, first).await;
+
+        let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+        assert!(handed.contains("what next?"), "{handed:?}");
+        assert!(
+            !handed.contains(refused),
+            "an unmarked turn was handed a browser reply: {handed:?}"
+        );
+        let consumed: Option<i64> =
+            sqlx::query_scalar("SELECT consumed_by_run FROM chat_notices WHERE id = ?")
+                .bind(notice_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            consumed, None,
+            "the notice waits for a turn that can be marked"
+        );
+        crate::assistant::evict_live(&chat);
     }
 
     /// A state whose `telegram` channel has a routing row and was launched, so its turns are acked.
@@ -1817,6 +1976,7 @@ mod tests {
                 origin: Some("shell".to_string()),
                 images: Some("[]".to_string()),
                 relay_id: None,
+                model_text: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
             },
             TURN_IN_PROGRESS,
@@ -2018,6 +2178,7 @@ mod tests {
             origin: Some("shell".to_string()),
             images: Some("[]".to_string()),
             relay_id: None,
+            model_text: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
@@ -2192,6 +2353,7 @@ mod tests {
             origin: Some("telegram".to_string()),
             images: Some("[]".to_string()),
             relay_id: None,
+            model_text: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
@@ -2422,6 +2584,161 @@ mod tests {
         let leaked = path.exists();
         let _ = std::fs::remove_file(&path);
         assert!(!leaked, "the MCP config outlived a turn that never started");
+    }
+
+    // --- Expanded slash commands: the model reads `model_text`, the transcript keeps `typed` ---
+
+    /// A local chat client that remembers every message list it was asked with.
+    struct RecordingLocal(Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>);
+
+    #[async_trait::async_trait]
+    impl crate::models::local_agent::LocalChat for RecordingLocal {
+        async fn exchange(
+            &self,
+            messages: Vec<serde_json::Value>,
+            _tools: Option<Vec<serde_json::Value>>,
+        ) -> std::io::Result<serde_json::Value> {
+            self.0.lock().unwrap().push(messages);
+            Ok(serde_json::json!({"role": "assistant", "content": "done"}))
+        }
+    }
+
+    struct NoLocalTools;
+
+    #[async_trait::async_trait]
+    impl crate::models::local_agent::ToolBox for NoLocalTools {
+        fn schemas(&self) -> Vec<serde_json::Value> {
+            Vec::new()
+        }
+        async fn call(
+            &self,
+            _name: &str,
+            _arguments: &serde_json::Value,
+        ) -> crate::models::local_agent::ToolAnswer {
+            unreachable!("this assistant answers without calling tools")
+        }
+    }
+
+    /// The text of the last `user` message of the first exchange a recording client saw, polled.
+    async fn last_user_message_seen(
+        seen: &Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>,
+    ) -> Option<String> {
+        for _ in 0..200 {
+            if let Some(first) = seen.lock().unwrap().first() {
+                return first
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "user")
+                    .and_then(|message| message["content"].as_str())
+                    .map(str::to_string);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    /// The CLI path: the runner is handed the expansion, while the run row keeps what was typed.
+    #[tokio::test]
+    async fn slash_model_text_reaches_cli_runner_runs_prompt_stays_typed() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("slash-cli");
+        let typed = "/expand-me 7";
+        let model_text = "EXPANDED BODY for seven";
+
+        let sent = send_expanded_or_queue(&state, &chat, typed, model_text, Origin::Shell).await;
+
+        let Ok(Sent::Turn(id)) = sent else {
+            panic!("a free chat starts a turn: {sent:?}");
+        };
+        settled(&state.pool, id).await;
+        assert_eq!(prompts_of(&state.pool, &chat, 1).await, vec![typed]);
+        let handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            handed.contains(model_text),
+            "the CLI must receive the expansion: {handed:?}"
+        );
+        assert!(
+            !handed.contains(typed),
+            "the typed words are for the transcript, not for the model: {handed:?}"
+        );
+    }
+
+    /// The local path: the model's last user message is the expansion, the run row the typed text.
+    #[tokio::test]
+    async fn slash_model_text_reaches_local_turn_runs_prompt_stays_typed() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = test_state().await;
+        state.assistants = Arc::new(crate::assistants::FixedAssistants(Arc::new(
+            crate::models::local_agent::LocalAssistant::new(
+                Box::new(RecordingLocal(seen.clone())),
+                Box::new(NoLocalTools),
+            ),
+        )));
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Local, None)
+            .await
+            .unwrap();
+        let typed = "/expand-me 7";
+        let model_text = "EXPANDED BODY for seven";
+
+        let sent = send_expanded_or_queue(&state, &chat, typed, model_text, Origin::Shell).await;
+
+        let Ok(Sent::Turn(id)) = sent else {
+            panic!("a free chat starts a turn: {sent:?}");
+        };
+        assert_eq!(
+            last_user_message_seen(&seen).await.as_deref(),
+            Some(model_text)
+        );
+        settled(&state.pool, id).await;
+        assert_eq!(prompts_of(&state.pool, &chat, 1).await, vec![typed]);
+    }
+
+    /// A busy chat keeps both halves: the queue shows what was typed, and the drain sends the
+    /// expansion that was stored beside it.
+    #[tokio::test]
+    async fn slash_model_text_survives_queue_and_drain() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = test_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("slash-queue");
+        *fake.delay.lock().unwrap() = Some(Duration::from_millis(400));
+        let first = send_message(&state, &chat, "first words", Origin::Shell)
+            .await
+            .unwrap();
+        let typed = "/expand-me 7";
+        let model_text = "EXPANDED BODY for seven";
+
+        let outcome = send_expanded_or_queue(&state, &chat, typed, model_text, Origin::Shell).await;
+
+        assert_eq!(outcome, Ok(Sent::Queued));
+        let waiting = crate::chats::queued(&state.pool, &chat).await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].text, typed, "the queue shows what was typed");
+        assert_eq!(waiting[0].model_text.as_deref(), Some(model_text));
+
+        settled(&state.pool, first).await;
+        let asked = prompts_of(&state.pool, &chat, 2).await;
+        assert_eq!(
+            asked.len(),
+            2,
+            "the drain starts the queued turn: {asked:?}"
+        );
+        assert_eq!(asked[1], typed, "runs.prompt stays typed after a drain");
+        let mut handed = String::new();
+        for _ in 0..200 {
+            handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
+            if handed.contains(model_text) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            handed.contains(model_text),
+            "the drain must send the stored expansion: {handed:?}"
+        );
+        assert!(!handed.contains(typed), "{handed:?}");
     }
 
     // --- Rotation summary (chats-dev-env spec P6 (ii)) ---

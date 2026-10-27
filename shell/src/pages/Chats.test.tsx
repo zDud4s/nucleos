@@ -47,6 +47,21 @@ vi.mock("../data/dictation", () => ({
   },
 }));
 
+/* `holdMessage` is wrapped so a test can see WHETHER a message was held. In a conversation that
+   already has a project the hold is taken straight back out and sent, so the store cannot be read
+   afterwards; `passThrough` lets a test keep the words held for good. */
+const held = vi.hoisted(() => ({ hold: vi.fn(), passThrough: true }));
+vi.mock("../chats/held", async (original) => {
+  const real = await original<typeof import("../chats/held")>();
+  return {
+    ...real,
+    holdMessage: (...args: Parameters<typeof real.holdMessage>) => {
+      held.hold(...args);
+      if (held.passThrough) real.holdMessage(...args);
+    },
+  };
+});
+
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { PaletteProvider } from "../ui";
@@ -3276,98 +3291,6 @@ describe("Chats - giving a conversation a project", () => {
     await waitFor(() => expect(screen.queryByText(/never copied into/i)).toBeNull());
   });
 
-  // `/orchestrate x` is a shortcut, and the CLI's own slash expansion was only measured for
-  // `claude -p`, so the window says in words what it wants.
-  it("sends /orchestrate <task> as a request to run the orchestrate skill", async () => {
-    daemon.apiFetch.mockImplementation(
-      chatsFetch(
-        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/nucleos" })],
-        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        {
-          projects: {
-            "c-1": {
-              cwd: "C:/Projects/nucleos",
-              tools: true,
-              session: null,
-              permission_mode: "auto",
-              workflow_missing: false,
-            },
-          },
-        },
-      ),
-    );
-    await renderChats("/chats/c-1");
-
-    fireEvent.change(await screen.findByLabelText("Message"), {
-      target: { value: "/orchestrate fix the login" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Send" }));
-
-    await waitFor(() =>
-      expect(sentMessages()).toEqual([
-        { chat_id: "c-1", text: "Use the orchestrate skill to run this task:\n\nfix the login" },
-      ]),
-    );
-  });
-
-  it("does not send /orchestrate where the workflow or the tools are missing, and says why", async () => {
-    daemon.apiFetch.mockImplementation(
-      chatsFetch(
-        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/fresh-worktree" })],
-        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        {
-          projects: {
-            "c-1": {
-              cwd: "C:/Projects/fresh-worktree",
-              tools: false,
-              session: null,
-              permission_mode: "auto",
-              workflow_missing: true,
-            },
-          },
-        },
-      ),
-    );
-    await renderChats("/chats/c-1");
-
-    // The project read has to land first: the guard reads it, and a send before it would pass.
-    expect(await screen.findByText(/never copied into/i)).toBeTruthy();
-    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "/orchestrate x" } });
-    fireEvent.click(screen.getByRole("button", { name: "Send" }));
-
-    expect(await screen.findByText(/orchestrate needs this conversation/i)).toBeTruthy();
-    expect(sentMessages()).toEqual([]);
-  });
-
-  it("does not send /orchestrate where the project has no tools even though its workflow is present", async () => {
-    daemon.apiFetch.mockImplementation(
-      chatsFetch(
-        [chatSummary({ chat_id: "c-1", cwd: "C:/Projects/unwired" })],
-        { "c-1": [turnRow({ id: 1, asked: "ola", answer: "ola" })] },
-        {
-          projects: {
-            "c-1": {
-              cwd: "C:/Projects/unwired",
-              tools: false,
-              session: null,
-              permission_mode: "auto",
-              workflow_missing: false,
-            },
-          },
-        },
-      ),
-    );
-    await renderChats("/chats/c-1");
-
-    // The project read has to land first: the guard reads it, and a send before it would pass.
-    expect(await screen.findByRole("button", { name: "Give it the tools" })).toBeTruthy();
-    fireEvent.change(await screen.findByLabelText("Message"), { target: { value: "/orchestrate x" } });
-    fireEvent.click(screen.getByRole("button", { name: "Send" }));
-
-    expect(await screen.findByText(/orchestrate needs this conversation/i)).toBeTruthy();
-    expect(sentMessages()).toEqual([]);
-  });
-
   it("says nothing about the workflow for a conversation in the main checkout", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch(
@@ -4513,6 +4436,318 @@ describe("running a command with /", () => {
 
     await screen.findByRole("list", { name: "Commands to run" });
     expect(screen.queryByRole("list", { name: "Files to mention" })).toBeNull();
+  });
+});
+
+/* ------------------------------------------------- slash commands: /command -- */
+
+describe("slash commands routed to /command", () => {
+  const help = { name: "help", description: "List commands", hint: null, source: "builtin", kind: "command" } as unknown as Command;
+  const frob = { name: "frob", description: "Frobnicate", hint: null, source: "project", kind: "command" } as unknown as Command;
+  const orchestrate = { name: "orchestrate", description: "Run the workflow", hint: "<task>", source: "project", kind: "skill" } as unknown as Command;
+
+  const COMMAND_PATH = "/assistant/chats/c-1/command";
+
+  /**
+   * The chat fetch, plus an answer for `POST .../command`. `cwd` defaults to a project; `null` is a
+   * conversation with none, which the roster's picker can give one (a PATCH moves the row, as in
+   * `gatedFetch`).
+   */
+  function slashFetch(
+    commands: Command[],
+    reply: (body: { text: string }) => unknown,
+    opts: { cwd?: string | null } = {},
+  ) {
+    const rows = [
+      chatSummary({ chat_id: "c-1", cwd: opts.cwd === undefined ? "C:/Projects/nucleos" : opts.cwd }),
+    ];
+    const base = chatsFetch(
+      rows,
+      { "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })] },
+      { commands: { "c-1": commands }, roster: ROSTER },
+    );
+    return async (path: string, init?: RequestInit) => {
+      if (path === COMMAND_PATH && init?.method === "POST") {
+        return reply(JSON.parse(String(init.body)) as { text: string });
+      }
+      if (path === "/assistant/chats/c-1" && init?.method === "PATCH") {
+        const body = JSON.parse(String(init.body)) as { cwd?: string };
+        if (typeof body.cwd === "string") rows[0].cwd = body.cwd;
+      }
+      return base(path, init);
+    };
+  }
+
+  /** Types `/` first and waits for the list, so the window has the command names before Send. */
+  async function typeWhenListed(text: string) {
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "/", selectionStart: 1 } });
+    await screen.findByRole("list", { name: "Commands to run" });
+    fireEvent.change(box, { target: { value: text, selectionStart: text.length } });
+    return box;
+  }
+
+  const posted = () => callsTo(COMMAND_PATH, "POST");
+
+  it("slash posts a typed /help to the command route, not to the message route", async () => {
+    daemon.apiFetch.mockImplementation(
+      slashFetch([help], () => ({ kind: "card", card: { kind: "help", data: { groups: [] } } })),
+    );
+    await renderChats("/chats/c-1");
+
+    await typeWhenListed("/help");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(posted()).toHaveLength(1));
+    expect(JSON.parse(String((posted()[0][1] as RequestInit).body))).toMatchObject({ text: "/help" });
+    expect(sentMessages()).toEqual([]);
+  });
+
+  it("slash renders a help card in the chat from the command answer", async () => {
+    daemon.apiFetch.mockImplementation(
+      slashFetch([help], () => ({
+        kind: "card",
+        card: {
+          kind: "help",
+          data: {
+            groups: [
+              {
+                source: "builtin",
+                entries: [
+                  {
+                    name: "cardonly",
+                    kind: "command",
+                    hint: null,
+                    description: "Only the card says this",
+                    aliases: [],
+                    partial: [],
+                    shadowed_by: null,
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      })),
+    );
+    await renderChats("/chats/c-1");
+
+    await typeWhenListed("/help");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/Only the card says this/)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
+  it("slash shows an unknown_command error as a quiet line with suggestion buttons", async () => {
+    daemon.apiFetch.mockImplementation(
+      slashFetch([help, frob], () => {
+        throw new ApiRefusal(404, "unknown_command", "There is no command /frob", {
+          error: "unknown_command",
+          detail: "There is no command /frob",
+          suggestions: ["frobnicate", "frobulate"],
+        });
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = await typeWhenListed("/frob");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText(/There is no command \/frob/)).toBeTruthy();
+    // The words stay where they were typed; nothing was sent as a message either.
+    expect(box.value).toBe("/frob");
+    expect(sentMessages()).toEqual([]);
+    expect(screen.getByRole("button", { name: /frobulate/ })).toBeTruthy();
+    fireEvent.click(await screen.findByRole("button", { name: /frobnicate/ }));
+    await waitFor(() => expect(box.value.startsWith("/frobnicate")).toBe(true));
+  });
+
+  // A path or a slash in prose is not a command; routing it to /command would answer a person who
+  // typed /etc/hosts with "unknown command".
+  it("slash sends an unregistered /foo bar as plain text", async () => {
+    daemon.apiFetch.mockImplementation(slashFetch([help], () => ({ kind: "card", card: { kind: "help", data: {} } })));
+    await renderChats("/chats/c-1");
+
+    await typeWhenListed("/foo bar");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(sentMessages()).toEqual([{ chat_id: "c-1", text: "/foo bar" }]));
+    expect(posted()).toHaveLength(0);
+  });
+
+  // Spec: "um erro mantém o texto e mostra o `detail`" -- the words are not held, they stay typed.
+  it("slash keeps the text and shows the detail on a 422 workflow_unavailable", async () => {
+    held.hold.mockReset();
+    held.passThrough = false;
+    try {
+      daemon.apiFetch.mockImplementation(
+        slashFetch([help, orchestrate], () => {
+          throw new ApiRefusal(422, "workflow_unavailable", "This project has no workflow", {
+            error: "workflow_unavailable",
+            detail: "This project has no workflow",
+          });
+        }),
+      );
+      await renderChats("/chats/c-1");
+
+      const box = await typeWhenListed("/orchestrate fix it");
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+      expect(await screen.findByText(/This project has no workflow/)).toBeTruthy();
+      expect(box.value).toBe("/orchestrate fix it");
+      expect(held.hold).not.toHaveBeenCalled();
+      expect(sentMessages()).toEqual([]);
+    } finally {
+      held.passThrough = true;
+    }
+  });
+
+  // Spec: "`needs_project` retém e abre o picker" -- held like a plain message that has no project.
+  it("slash holds the message and opens the project picker on a 409 needs_project", async () => {
+    held.hold.mockReset();
+    held.passThrough = false;
+    try {
+      daemon.apiFetch.mockImplementation(
+        slashFetch([help], () => {
+          throw new ApiRefusal(409, "needs_project", "Choose a project first", {
+            error: "needs_project",
+            detail: "Choose a project first",
+          });
+        }),
+      );
+      await renderChats("/chats/c-1");
+
+      await typeWhenListed("/help");
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+      await waitFor(() => expect(held.hold).toHaveBeenCalled());
+      expect(held.hold).toHaveBeenCalledWith("c-1", expect.objectContaining({ text: "/help" }), expect.anything());
+      expect(
+        await screen.findByRole("dialog", { name: /where this conversation runs/i }),
+      ).toBeTruthy();
+      expect(sentMessages()).toEqual([]);
+    } finally {
+      held.passThrough = true;
+    }
+  });
+
+  it("slash labels each command in the picker with where it came from", async () => {
+    const mine = { name: "mine", description: "Personal one", hint: null, source: "personal", kind: "command" } as unknown as Command;
+    const plug = { name: "plug:thing", description: "From a plugin", hint: null, source: "plugin", kind: "command" } as unknown as Command;
+    const skill = { name: "review", description: "Review a change", hint: null, source: "project", kind: "skill" } as unknown as Command;
+    daemon.apiFetch.mockImplementation(slashFetch([help, frob, mine, plug, skill], () => undefined));
+    await renderChats("/chats/c-1");
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/", selectionStart: 1 } });
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+
+    expect(await within(list).findByText("built-in")).toBeTruthy();
+    expect(within(list).getByText("projeto")).toBeTruthy();
+    expect(within(list).getByText("pessoal")).toBeTruthy();
+    expect(within(list).getByText("plugin")).toBeTruthy();
+    expect(within(list).getByText("skill · projeto")).toBeTruthy();
+  });
+
+  const mine = { name: "mine", description: "Personal one", hint: "<arg>", source: "personal", kind: "command" } as unknown as Command;
+
+  /** Opens an unrooted c-1 and closes the picker it opens with, so the box can be typed in. */
+  async function unrootedChat(reply: (body: { text: string }) => unknown) {
+    daemon.apiFetch.mockImplementation(slashFetch([help, mine], reply, { cwd: null }));
+    await renderChats("/chats/c-1");
+    const dialog = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Not now" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  }
+
+  // Spec: a non-builtin command in a conversation with no directory waits for one, like a message.
+  it("slash holds a personal command said to an unrooted chat, without posting it", async () => {
+    held.hold.mockReset();
+    held.passThrough = false;
+    try {
+      await unrootedChat(() => ({ kind: "prompt", turn_id: 7 }));
+
+      await typeWhenListed("/mine arg");
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+      await waitFor(() =>
+        expect(held.hold).toHaveBeenCalledWith(
+          "c-1",
+          expect.objectContaining({ text: "/mine arg", command: true }),
+          expect.anything(),
+        ),
+      );
+      expect(
+        await screen.findByRole("dialog", { name: /where this conversation runs/i }),
+      ).toBeTruthy();
+      expect(posted()).toHaveLength(0);
+      expect(sentMessages()).toEqual([]);
+    } finally {
+      held.passThrough = true;
+    }
+  });
+
+  it("slash resends a held command to the command route once a project is chosen", async () => {
+    await unrootedChat(() => ({ kind: "prompt", turn_id: 7 }));
+
+    await typeWhenListed("/mine arg");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    const again = await screen.findByRole("dialog", { name: /where this conversation runs/i });
+    expect(posted()).toHaveLength(0);
+    fireEvent.click(await within(again).findByRole("radio", { name: /site/i }));
+    fireEvent.click(within(again).getByRole("button", { name: "Use this" }));
+
+    await waitFor(() => expect(posted()).toHaveLength(1));
+    expect(JSON.parse(String((posted()[0][1] as RequestInit).body))).toMatchObject({ text: "/mine arg" });
+    expect(sentMessages()).toEqual([]);
+    await waitFor(() => expect(screen.queryByRole("status", { name: "Held message" })).toBeNull());
+  });
+
+  it("slash still posts a builtin at once in an unrooted chat", async () => {
+    held.hold.mockReset();
+    await unrootedChat(() => ({ kind: "card", card: { kind: "help", data: { groups: [] } } }));
+
+    await typeWhenListed("/help");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(posted()).toHaveLength(1));
+    expect(held.hold).not.toHaveBeenCalled();
+  });
+
+  it("slash matches a command name whatever its case", async () => {
+    daemon.apiFetch.mockImplementation(
+      slashFetch([help], () => ({ kind: "card", card: { kind: "help", data: { groups: [] } } })),
+    );
+    await renderChats("/chats/c-1");
+
+    await typeWhenListed("/Help");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(posted()).toHaveLength(1));
+    expect(JSON.parse(String((posted()[0][1] as RequestInit).body))).toMatchObject({ text: "/Help" });
+    expect(sentMessages()).toEqual([]);
+  });
+
+  // `/help frbo` asks about a command; the suggestion is the command it meant, not another `help`.
+  it("slash suggestion after /help rewrites the argument, not the command", async () => {
+    daemon.apiFetch.mockImplementation(
+      slashFetch([help, frob], () => {
+        throw new ApiRefusal(404, "unknown_command", "There is no command /frbo", {
+          error: "unknown_command",
+          detail: "There is no command /frbo",
+          suggestions: ["frob"],
+        });
+      }),
+    );
+    await renderChats("/chats/c-1");
+
+    const box = await typeWhenListed("/help frbo");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "/frob" }));
+    await waitFor(() => expect(box.value).toBe("/help frob"));
   });
 });
 
