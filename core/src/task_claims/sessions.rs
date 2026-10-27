@@ -140,6 +140,8 @@ pub async fn take_notices(
             && let Some(new_holder) = task.holder()
             && !(new_holder.kind == HolderKind::Session && new_holder.id == session_id)
         {
+            // One notice per task per call: a later event for the same task supersedes the earlier one.
+            notices.retain(|n| !matches!(n, Notice::ClaimLost { task: seen, .. } if seen.id == task.id));
             notices.push(Notice::ClaimLost { task, new_holder });
         }
     }
@@ -167,9 +169,11 @@ mod tests {
     }
 
     fn task(key: &str) -> NewTask {
+        // `master-red` is the daemon's alone: a declared claim on it is refused, so its fixtures are incidents.
+        let kind = if key == crate::task_claims::MASTER_RED_KEY { TaskKind::Incident } else { TaskKind::Declared };
         NewTask {
             key: crate::task_claims::keys::normalize(key, std::path::Path::new("/repo")).unwrap(),
-            kind: TaskKind::Declared,
+            kind,
             title: "t".into(),
             detail: serde_json::json!({}),
             guard_paths: vec![],
@@ -229,6 +233,37 @@ mod tests {
         assert_eq!(task.key.as_str(), "file:core/a.rs");
         assert_eq!(new_holder.id, "s2");
         assert!(take_notices(&pool, "s1", late).await.unwrap().is_empty(), "the cursor advanced");
+    }
+
+    #[tokio::test]
+    async fn two_losses_of_one_task_in_one_window_give_one_notice() {
+        let pool = pool().await;
+        touch_session(&pool, "s1", "/wt/s1", "p", t0()).await.unwrap();
+        claimed(&pool, "file:core/a.rs", &holder("s1"), t0()).await;
+        let expire = |at: DateTime<Utc>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE task_claims SET lease_until = ?")
+                    .bind(stamp(at - secs(1)))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        let t1 = t0() + secs(SESSION_LEASE_SECONDS + 1);
+        claimed(&pool, "file:core/a.rs", &holder("s2"), t1).await;
+        expire(t1).await;
+        let t2 = t1 + secs(10);
+        claimed(&pool, "file:core/a.rs", &holder("s1"), t2).await;
+        expire(t2).await;
+        let t3 = t2 + secs(10);
+        claimed(&pool, "file:core/a.rs", &holder("s3"), t3).await;
+
+        let notices = take_notices(&pool, "s1", t3).await.unwrap();
+        let [Notice::ClaimLost { new_holder, .. }] = notices.as_slice() else {
+            panic!("expected one ClaimLost, got {notices:?}")
+        };
+        assert_eq!(new_holder.id, "s3");
     }
 
     #[tokio::test]

@@ -390,6 +390,7 @@ pub async fn claim(
     holder: &Holder,
     now: DateTime<Utc>,
 ) -> sqlx::Result<ClaimOutcome> {
+    refuse_declared_master_red(new.kind, &new.key)?;
     let mut tx = begin(pool).await?;
     let task_id = match unresolved_by_key(&mut tx, project_id, &new.key).await? {
         None => insert_open(&mut tx, project_id, &new, now).await?,
@@ -398,6 +399,19 @@ pub async fn claim(
                 delete_task(&mut tx, row.id).await?;
                 insert_open(&mut tx, project_id, &new, now).await?
             } else {
+                if row.status != Status::Probing {
+                    // Adopting the row: what the claimer knows goes on top of it; the title stays.
+                    let detail = merge_detail(&row.detail, &new.detail).to_string();
+                    let guard = encode_list(&union(&row.guard_paths, &new.guard_paths));
+                    let hint = encode_list(&union(&row.hint_paths, &new.hint_paths));
+                    sqlx::query("UPDATE task_claims SET detail = ?, guard_paths = ?, hint_paths = ? WHERE id = ?")
+                        .bind(detail)
+                        .bind(guard)
+                        .bind(hint)
+                        .bind(row.id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 row.id
             }
         }
@@ -416,9 +430,22 @@ pub async fn claim_by_id(
     now: DateTime<Utc>,
 ) -> sqlx::Result<ClaimOutcome> {
     let mut tx = begin(pool).await?;
+    let row = row_by_id(&mut tx, task_id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    refuse_declared_master_red(row.kind, &row.key)?;
     let outcome = cas(&mut tx, task_id, holder, now).await?;
     tx.commit().await?;
     Ok(outcome)
+}
+
+/// Only the daemon creates `master-red` (through `create_or_adopt_open` / `begin_probe`); an agent's
+/// `declared` claim on it is refused. The store has no refusal shape, so this is a `Protocol` error.
+fn refuse_declared_master_red(kind: TaskKind, key: &TaskKey) -> sqlx::Result<()> {
+    if kind == TaskKind::Declared && key.as_str() == super::MASTER_RED_KEY {
+        return Err(sqlx::Error::Protocol(
+            "the master-red task is created by the daemon only; it cannot be declared".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn cas(
@@ -985,9 +1012,11 @@ mod tests {
     }
 
     pub(super) fn task(key: &str) -> NewTask {
+        // `master-red` is the daemon's alone: a declared claim on it is refused, so its fixtures are incidents.
+        let kind = if key == super::super::MASTER_RED_KEY { TaskKind::Incident } else { TaskKind::Declared };
         NewTask {
             key: super::super::keys::normalize(key, std::path::Path::new("/repo")).unwrap(),
-            kind: TaskKind::Declared,
+            kind,
             title: format!("fix {key}"),
             detail: serde_json::json!({}),
             guard_paths: vec![],
@@ -1257,6 +1286,49 @@ mod tests {
         assert!(similar.is_empty());
         let log: Vec<String> = events(&pool, task.id).await.into_iter().map(|e| e.0).collect();
         assert_eq!(log, vec!["created", "claimed"]);
+    }
+
+    #[tokio::test]
+    async fn claiming_an_open_incident_adds_the_claimers_guard_paths_and_keeps_the_title() {
+        let pool = test_pool().await;
+        let mut incident = task("topic:flaky-ci");
+        incident.kind = TaskKind::Incident;
+        incident.title = "original".into();
+        create_or_adopt_open(&pool, "p", incident, t0()).await.unwrap();
+
+        let mut mine = task("topic:flaky-ci");
+        mine.title = "mine".into();
+        mine.guard_paths = vec!["core/src".into()];
+        mine.hint_paths = vec!["core/src/a.rs".into()];
+        mine.detail = serde_json::json!({"note": "seen"});
+        let ClaimOutcome::Won { task: won, .. } = claim(&pool, "p", mine, &session("s1"), t0()).await.unwrap()
+            else { panic!("expected a win") };
+        assert_eq!(won.title, "original");
+        assert_eq!(won.guard_paths, vec!["core/src".to_owned()]);
+        assert_eq!(won.hint_paths, vec!["core/src/a.rs".to_owned()]);
+        assert_eq!(won.detail["note"], "seen");
+
+        let changed = vec!["core/src/x.rs".to_owned()];
+        let guarded = guarding(&pool, "p", &changed, t0()).await.unwrap();
+        assert_eq!(guarded.len(), 1, "the claimed incident now guards the claimer's paths");
+        assert_eq!(guarded[0].id, won.id);
+    }
+
+    #[tokio::test]
+    async fn a_declared_claim_on_master_red_is_refused_and_leaves_no_row() {
+        let pool = test_pool().await;
+        let mut declared = task("master-red");
+        declared.kind = TaskKind::Declared;
+        let refused = claim(&pool, "p", declared, &session("s1"), t0()).await;
+        assert!(matches!(refused, Err(sqlx::Error::Protocol(_))), "a declared master-red claim is refused");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims").fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 0);
+
+        let id = seed(&pool, Seed { key: "master-red", status: "open", ..Seed::default() }).await;
+        sqlx::query("UPDATE task_claims SET kind = 'declared' WHERE id = ?").bind(id).execute(&pool).await.unwrap();
+        let by_id = claim_by_id(&pool, id, &session("s1"), t0()).await;
+        assert!(matches!(by_id, Err(sqlx::Error::Protocol(_))), "claim_by_id refuses it too");
+        assert_eq!(row(&pool, id).await.status, Status::Open, "the refused claim changed nothing");
     }
 
     #[tokio::test]
