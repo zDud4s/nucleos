@@ -283,6 +283,8 @@ pub struct Known {
     pub created_at: String,
     pub activated_at: Option<String>,
     pub ended_at: Option<String>,
+    /// Who the lesson is about: `None` is the code, `Some("owner")` the person.
+    pub about: Option<String>,
 }
 
 /// The kind of node whose work is being briefed, in the order the job graph uses them.
@@ -418,7 +420,7 @@ pub const COLUMNS: &str =
     "id, layer, scope_kind, scope_id, source, generator, evidence, observations,
                        fingerprint, points_at, expires_after_runs, last_confirmed_at, shown_count,
                        outcome_count, green_count, last_shown_at, kind, title, body, status,
-                       proposal_id, supersedes, origin_run_id, created_at, activated_at, ended_at";
+                       proposal_id, supersedes, origin_run_id, created_at, activated_at, ended_at, about";
 
 #[cfg(test)]
 mod tests {
@@ -1847,6 +1849,21 @@ mod tests {
         assert_eq!(events, 3, "the row's history is not reviewable");
     }
 
+    #[tokio::test]
+    async fn about_round_trips_through_known_and_defaults_to_null() {
+        let pool = test_pool().await;
+        for (title, about) in [("about the code", None), ("about the owner", Some("owner"))] {
+            sqlx::query(
+                "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at, about)
+                 VALUES ('semantic', 'machine', NULL, 'distiller', 'memory', ?, 'b', 'proposed', '2026-10-22T00:00:00+00:00', ?)")
+                .bind(title).bind(about).execute(&pool).await.unwrap();
+        }
+        let rows = all(&pool).await.unwrap();
+        let about = |t: &str| rows.iter().find(|r| r.title == t).unwrap().about.clone();
+        assert_eq!(about("about the code"), None);
+        assert_eq!(about("about the owner").as_deref(), Some("owner"));
+    }
+
     fn one(id: i64, kind: &str, title: &str, body: &str) -> Known {
         Known {
             id,
@@ -1877,6 +1894,7 @@ mod tests {
             created_at: "2026-08-19T00:00:00+00:00".into(),
             activated_at: Some("2026-08-19T00:00:00+00:00".into()),
             ended_at: None,
+            about: None,
         }
     }
 
