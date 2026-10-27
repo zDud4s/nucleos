@@ -238,6 +238,64 @@ pub fn plan(
     })
 }
 
+/// The daemon's probe: the named groups run whole (their `command`, never `select`), uncached.
+/// A name the map lacks is a skipped unit, not an error; no map means no group to prove.
+pub fn plan_groups(map: &MapState, kind: Kind, names: &[String]) -> Result<Plan, PlanError> {
+    let map = match map {
+        MapState::Invalid(errors) => return Err(PlanError::InvalidMap(errors.clone())),
+        MapState::Absent => {
+            return Ok(Plan {
+                units: Vec::new(),
+                unclaimed: Vec::new(),
+                note: Some("no test map at this commit; no group to prove".into()),
+            });
+        }
+        MapState::Valid(map) => map,
+    };
+    let mut seen = BTreeSet::new();
+    let units = names
+        .iter()
+        .filter(|name| seen.insert(name.as_str()))
+        .map(|name| {
+            let (argv, skipped) = match (map.tests.groups.get(name), kind) {
+                (None, _) => (
+                    Vec::new(),
+                    Some(format!("group {name} is not in the map at this commit")),
+                ),
+                (Some(group), Kind::Test) => (
+                    crate::gate::split_command(&group.command).unwrap_or_default(),
+                    None,
+                ),
+                (Some(group), Kind::Check) => match group.check.as_deref() {
+                    Some(check) => (
+                        crate::gate::split_command(check).unwrap_or_default(),
+                        None,
+                    ),
+                    None => (
+                        Vec::new(),
+                        Some("this group has no `check` command".to_string()),
+                    ),
+                },
+            };
+            PlannedUnit {
+                group: Some(name.clone()),
+                argv,
+                why: "named by the daemon's probe".into(),
+                fingerprint: None,
+                cacheable: false,
+                run_id: None,
+                cached_from: None,
+                skipped,
+            }
+        })
+        .collect();
+    Ok(Plan {
+        units,
+        unclaimed: Vec::new(),
+        note: Some("probe: the named groups run whole".into()),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Progress {
     pub total: usize,
@@ -426,6 +484,33 @@ tests:
 
     fn valid() -> MapState {
         MapState::Valid(crate::tests_map::parse(MAP).unwrap())
+    }
+
+    #[test]
+    fn plan_groups_runs_the_named_groups_whole_and_skips_the_ones_the_map_lacks() {
+        let names = vec!["core".to_owned(), "gone".to_owned(), "core".to_owned()];
+        let plan = plan_groups(&valid(), Kind::Test, &names).unwrap();
+        assert_eq!(plan.units.len(), 2, "a repeated name is one unit");
+        assert_eq!(plan.units[0].group.as_deref(), Some("core"));
+        assert_eq!(plan.units[0].argv, ["cargo", "test", "-p", "nucleos-core"]); // the group's `command`, not `select`
+        assert!(!plan.units[0].cacheable);
+        assert!(
+            plan.units[1]
+                .skipped
+                .as_deref()
+                .unwrap()
+                .contains("not in the map")
+        );
+        assert!(
+            plan_groups(&MapState::Absent, Kind::Test, &names)
+                .unwrap()
+                .units
+                .is_empty()
+        );
+        assert!(matches!(
+            plan_groups(&MapState::Invalid(vec!["x".into()]), Kind::Test, &names),
+            Err(PlanError::InvalidMap(_))
+        ));
     }
 
     fn paths(list: &[&str]) -> Vec<String> {

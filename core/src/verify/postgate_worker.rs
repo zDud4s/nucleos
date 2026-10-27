@@ -667,6 +667,7 @@ async fn submit_full(
         wait: false,
         cover: false,
         task_id: None,
+        groups: None,
     };
     verify::submit(executor, caller, &args)
         .await

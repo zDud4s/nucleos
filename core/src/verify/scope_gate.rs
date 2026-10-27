@@ -143,6 +143,7 @@ pub async fn gate_scope_ticketed(
         wait: false,
         cover: false,
         task_id: None,
+        groups: None,
     };
     // F3-12 (decision 3): the merge queue's integration worktree can vanish right after its ticket
     // ends, so the confirmation is awaited here as well as detached in `submit`. Idempotent. The

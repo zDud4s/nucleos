@@ -2228,6 +2228,46 @@ gate_command: git --version
         assert!(path.join("feature.txt").exists());
     }
 
+    /// The proof tree of `verify::probe` is its own directory, apart from the post-merge gate's.
+    #[tokio::test]
+    async fn the_probe_worktree_is_its_own_directory_and_moves_to_the_sha() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-probe-");
+        let roots = space_free_tempdir("nucleos-gitexec-pbwt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let master = sha_of(&repo, "master");
+        let feature = sha_of(&repo, "feat/x");
+
+        let postgate = prepare_postgate_worktree(&repo, &feature, deadline())
+            .await
+            .expect("postgate tree");
+        let probe = prepare_probe_worktree(&repo, &master, deadline())
+            .await
+            .expect("probe tree");
+
+        assert_ne!(postgate, probe);
+        assert_eq!(
+            probe.file_name().and_then(|n| n.to_str()),
+            Some("postgate-probe-repo")
+        );
+        assert_eq!(sha_of(&probe, "HEAD"), master);
+        assert_eq!(
+            sha_of(&postgate, "HEAD"),
+            feature,
+            "the postgate tree is untouched"
+        );
+
+        // Dirty, then re-prepared: the same directory, reset.
+        std::fs::write(probe.join("litter.txt"), "left behind
+").expect("write");
+        let again = prepare_probe_worktree(&repo, &feature, deadline())
+            .await
+            .expect("re-prepare");
+        assert_eq!(again, probe);
+        assert_eq!(sha_of(&probe, "HEAD"), feature);
+        assert!(!probe.join("litter.txt").exists());
+    }
+
     /// The bisection's candidate list: the first-parent commits of `(base, tip]`, oldest first,
     /// with the commits of a merged side branch left out and a flag on whoever changes the map.
     #[tokio::test]

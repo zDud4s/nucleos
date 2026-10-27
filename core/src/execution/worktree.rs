@@ -4004,6 +4004,8 @@ mod tests {
 
         let postgate = crate::verify::postgate::postgate_worktree(&project_root);
         std::fs::create_dir_all(&postgate).expect("create the postgate worktree directory");
+        let probe = crate::verify::probe::probe_worktree(&project_root);
+        std::fs::create_dir_all(&probe).expect("create the probe worktree directory");
         std::fs::create_dir_all(roots.join("run-99")).expect("create the control directory");
 
         let orphans = orphaned_worktrees(&pool, &project_root, Duration::ZERO)
@@ -4018,7 +4020,12 @@ mod tests {
             !orphans.contains(&postgate),
             "the post-merge gate's worktree must never be swept"
         );
+        assert!(
+            !orphans.contains(&probe),
+            "the proof worktree must never be swept"
+        );
         assert_eq!(owner_from_dir_name("postgate-repo"), None);
+        assert_eq!(owner_from_dir_name("postgate-probe-repo"), None);
     }
 
     #[tokio::test(flavor = "current_thread")]

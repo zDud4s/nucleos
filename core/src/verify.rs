@@ -20,11 +20,11 @@ pub mod observe;
 pub mod plan;
 pub mod postgate;
 pub mod postgate_worker;
+pub mod probe;
 pub mod provision;
 pub mod runs;
 pub mod store;
 
-mod probe;
 mod resolve;
 mod scope_gate;
 
@@ -105,6 +105,10 @@ pub struct VerifyArgs {
     /// this task run" is a GROUP BY. Absent for the daemon's own gates.
     #[serde(default)]
     pub task_id: Option<String>,
+    /// The daemon's probe only (`Caller::Probe`): run exactly these map groups, whole, instead of
+    /// selecting them from a diff. Anyone else naming it is refused before a row exists.
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
 }
 
 /// The body of `POST /verify/status`.
@@ -132,6 +136,8 @@ pub enum Caller {
     FlakeCheck,
     /// One probe of the post-merge gate's bisection. `from_scope` never produces it.
     Bisect,
+    /// The daemon's proof of a red group at the master head. `from_scope` never produces it.
+    Probe,
 }
 
 impl Caller {
@@ -151,7 +157,7 @@ impl Caller {
             Caller::Merge(_) => PRIORITY_AUTONOMOUS,
             Caller::Owner => PRIORITY_INTERACTIVE,
             Caller::Run(_) | Caller::Job(_) => PRIORITY_AUTONOMOUS,
-            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
+            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect | Caller::Probe => {
                 verify_runs::PRIORITY_POSTGATE
             }
         }
@@ -165,6 +171,7 @@ impl Caller {
             Caller::Run(id) => format!("run:{id}"),
             Caller::Job(id) => format!("job:{id}"),
             Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => "postgate".to_owned(),
+            Caller::Probe => "probe".to_owned(),
         }
     }
 
@@ -175,7 +182,18 @@ impl Caller {
             Caller::Postgate => verify_runs::REQUESTED_BY_POSTGATE.to_owned(),
             Caller::FlakeCheck => verify_runs::REQUESTED_BY_FLAKE_CHECK.to_owned(),
             Caller::Bisect => verify_runs::REQUESTED_BY_BISECT.to_owned(),
+            // Named on purpose: `Executor::gate_env` treats a probe like the post-merge gate.
+            Caller::Probe => verify_runs::REQUESTED_BY_PROBE.to_owned(),
             _ => scope.to_owned(),
+        }
+    }
+
+    /// A proof unit is cut off well before its lease (`PROBE_LEASE_SECONDS`) lapses; every other
+    /// caller keeps the executor's configured timeout (0 = "derive it").
+    pub fn unit_timeout_ms(self) -> i64 {
+        match self {
+            Caller::Probe => i64::try_from(probe::UNIT_TIMEOUT.as_millis()).unwrap_or(i64::MAX),
+            _ => 0,
         }
     }
 }
@@ -190,7 +208,8 @@ pub fn may_read(caller: Caller, row_caller: &str) -> bool {
         | Caller::Job(_)
         | Caller::Postgate
         | Caller::FlakeCheck
-        | Caller::Bisect => row_caller == caller.label(),
+        | Caller::Bisect
+        | Caller::Probe => row_caller == caller.label(),
     }
 }
 
@@ -325,6 +344,12 @@ async fn submit_checked(
     args: &VerifyArgs,
 ) -> Result<(i64, bool), VerifyError> {
     let pool = &executor.pool;
+    // Naming groups is the daemon's probe alone: refused before any row or git read.
+    if args.groups.is_some() && caller != Caller::Probe {
+        return Err(VerifyError::BadRequest(
+            "groups is for the daemon's probe".into(),
+        ));
+    }
     // The same bound the workflow ledger holds a task id to, so a task that verifies can be joined
     // to the records it filed.
     if args
@@ -407,8 +432,10 @@ async fn submit_checked(
     }
 
     let own_files = args.scope == ScopeArg::Own && args.files.is_some();
-    let needs_base =
-        args.scope != ScopeArg::Full && matches!(map, MapState::Valid(_)) && !own_files;
+    let needs_base = caller != Caller::Probe
+        && args.scope != ScopeArg::Full
+        && matches!(map, MapState::Valid(_))
+        && !own_files;
     let base = if needs_base {
         let project_root = inspect::project_root(pool, &project_id)
             .await
@@ -459,20 +486,23 @@ async fn submit_checked(
 
     // `true` until a project can declare that it gates after landing (there is no
     // `gate_after_land` yet); the planner already knows how to refuse `full` once there is.
-    let plan = verify_plan::plan(
-        &map,
-        args.kind,
-        args.scope,
-        &changed,
-        &fillable,
-        rules.gate_command.as_deref(),
-        true,
-        // Filters narrow only a session's own iteration run. A scope run (the daemon's item and
-        // merge gates, the evidence a green run leaves for a tip) and any daemon caller measure
-        // the whole group.
-        args.scope == ScopeArg::Own && matches!(caller, Caller::Owner | Caller::Run(_)),
-    )
-    .map_err(|error| match error {
+    let planned = match (caller, args.groups.as_deref()) {
+        (Caller::Probe, Some(groups)) => verify_plan::plan_groups(&map, args.kind, groups),
+        _ => verify_plan::plan(
+            &map,
+            args.kind,
+            args.scope,
+            &changed,
+            &fillable,
+            rules.gate_command.as_deref(),
+            true,
+            // Filters narrow only a session's own iteration run. A scope run (the daemon's item
+            // and merge gates, the evidence a green run leaves for a tip) and any daemon caller
+            // measure the whole group.
+            args.scope == ScopeArg::Own && matches!(caller, Caller::Owner | Caller::Run(_)),
+        ),
+    };
+    let plan = planned.map_err(|error| match error {
         PlanError::InvalidMap(errors) => VerifyError::Unprocessable(format!(
             "nucleos.tests.yaml is invalid: {}",
             errors.join("; ")
@@ -578,6 +608,12 @@ async fn submit_checked(
                 unit.cacheable = false;
             }
         }
+        if caller == Caller::Probe {
+            // A proof neither feeds the cache (`settle` is spawned for any cacheable unit, whatever
+            // the priority) nor joins an equal unit of another tree: it runs in its own tree, now.
+            unit.fingerprint = None;
+            unit.cacheable = false;
+        }
 
         // The post-gate never reads the cache: it is the check that a cache could be wrong.
         if unit.cacheable
@@ -638,7 +674,7 @@ async fn submit_checked(
                 priority,
                 // Zero lets the executor derive both from the argv and its own config.
                 weight: 0,
-                timeout_ms: 0,
+                timeout_ms: caller.unit_timeout_ms(),
             })
             .await;
         let submitted = match submitted {
@@ -1253,6 +1289,7 @@ tests:
             wait: true,
             cover: false,
             task_id: None,
+            groups: None,
         }
     }
 
@@ -3046,5 +3083,269 @@ tests:
             }
             other => panic!("expected Errored, got {other:?}"),
         }
+    }
+
+    // ---- task claims: case 2, suspect groups and the single proof (chunk 4 Task 5) -----------------
+
+    use crate::task_claims::Status as ClaimStatus;
+    use crate::task_claims::store as claims;
+
+    #[test]
+    fn the_probe_caller_runs_at_postgate_priority_is_labelled_probe_and_no_key_can_claim_it() {
+        assert_eq!(Caller::Probe.priority(), verify_runs::PRIORITY_POSTGATE);
+        assert_eq!(Caller::Probe.label(), "probe");
+        assert_eq!(Caller::Probe.requested_by("own"), verify_runs::REQUESTED_BY_PROBE);
+        assert!(may_read(Caller::Probe, "probe") && !may_read(Caller::Probe, "owner"));
+        assert!(may_read(Caller::Owner, "probe"), "the owner reads every ticket");
+        assert_ne!(Caller::from_scope(&Scope::Control), Some(Caller::Probe));
+        assert!(Caller::Probe.unit_timeout_ms() > 0);
+        assert_eq!(Caller::Owner.unit_timeout_ms(), 0, "everyone else keeps the configured timeout");
+    }
+
+    /// `Caller::Probe` runs the named groups whole, never feeds nor reads the cache, never joins another
+    /// run, and cannot be asked for by anyone else.
+    #[tokio::test]
+    async fn a_probe_request_runs_its_groups_whole_and_is_refused_to_anyone_else() {
+        let f = fixture(Some(&plain_map()), None, true).await;
+        let mut request = args(Kind::Test, ScopeArg::Own, f.repo.path(), None, None);
+        request.groups = Some(vec!["core".to_owned()]);
+
+        // Anyone but the daemon's probe is refused before a row exists.
+        let refused = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+        assert!(matches!(refused, VerifyError::BadRequest(_)), "{refused:?}");
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+
+        let id = submit(&f.ex, Caller::Probe, &request).await.unwrap();
+        let (ticket, caller) = finished(&f.pool, id).await;
+        assert_eq!(caller, "probe");
+        assert_eq!(groups(&ticket), [Some("core".to_owned())]);
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+        let_settle_decide().await; // `settle` would have written by now if a candidate had been queued
+        assert_eq!(cache_rows(&f.pool).await, 0, "a probe never feeds the green cache");
+        let (timeout_ms, requested_by): (i64, String) = sqlx::query_as(
+            "SELECT timeout_ms, requested_by FROM verify_runs WHERE origin = 'verify' AND origin_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(timeout_ms, Caller::Probe.unit_timeout_ms());
+        assert_eq!(requested_by, verify_runs::REQUESTED_BY_PROBE);
+    }
+
+    // ---- case 2 end to end (spec section 5: "Verify") ------------------------------------------------
+
+    /// Probe worktrees go under a space-free temp root, as the postgate worktree tests do; the env override
+    /// is process-wide, hence the lock. Field order is drop order: env first, lock last.
+    struct ProbeRoot {
+        _env: crate::execution::git_exec::tests::WorktreeRootEnv,
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn probe_root() -> ProbeRoot {
+        let lock = crate::execution::worktree::test_env_lock();
+        let dir = crate::execution::git_exec::tests::space_free_tempdir("nucleos-probe-");
+        let env = crate::execution::git_exec::tests::WorktreeRootEnv::set(dir.path());
+        ProbeRoot { _env: env, _dir: dir, _lock: lock }
+    }
+
+    /// A probe root that cannot hold a worktree: the override names a regular file.
+    fn blocked_probe_root() -> ProbeRoot {
+        let lock = crate::execution::worktree::test_env_lock();
+        let dir = crate::execution::git_exec::tests::space_free_tempdir("nucleos-probe-");
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+        let env = crate::execution::git_exec::tests::WorktreeRootEnv::set(&file);
+        ProbeRoot { _env: env, _dir: dir, _lock: lock }
+    }
+
+    /// A linked worktree `name` of `f.repo`, branched from `main` (so it contains c1 and c2), that commits
+    /// a change to `core/a.rs` only. The session "touched" `core` and never `py`.
+    fn side_touching_core(f: &Fixture, holder: &Path, name: &str, content: &str) -> PathBuf {
+        let side = holder.join(name);
+        git_in(f.repo.path(), &["worktree", "add", "-q", "-b", name, &path_arg(&side)]);
+        std::fs::write(side.join("core/a.rs"), content).unwrap();
+        git_in(&side, &["commit", "-q", "-am", "core change"]);
+        side
+    }
+
+    /// A scope request that also claims `py/b.py`, so `py` runs although the session never touched it.
+    /// The diff-aware selection (diff only) does not pick `py`: that is what makes it suspect.
+    fn scope_with_py(side: &Path) -> VerifyArgs {
+        args(Kind::Test, ScopeArg::Scope, side, Some(&["py/b.py"]), None)
+    }
+
+    async fn probe_requests(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM verify_requests WHERE caller = 'probe'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn live_master_red(pool: &SqlitePool) -> Option<crate::task_claims::TaskRow> {
+        claims::live_by_key(pool, "alpha", &TaskKey::master_red(), chrono::Utc::now()).await.unwrap()
+    }
+
+    /// Master gains `flag.txt`, which the sessions branched before it lack.
+    fn master_gains_flag(f: &Fixture) -> String {
+        std::fs::write(f.repo.path().join("flag.txt"), "x\n").unwrap();
+        git_in(f.repo.path(), &["add", "flag.txt"]);
+        git_in(f.repo.path(), &["commit", "-q", "-m", "three"]);
+        git_in(f.repo.path(), &["rev-parse", "HEAD"])
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_suspect_group_without_an_incident_is_proven_on_master_and_the_incident_opens() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side)).await.unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("inherited"), "{ticket:?}");
+        let incident = live_master_red(&f.pool).await.expect("the proof opened the incident");
+        assert_eq!(incident.status, ClaimStatus::Open);
+        assert_eq!(incident.detail["red_tests"], serde_json::json!(["a::boom"]));
+        assert_eq!(incident.detail["red_groups"], serde_json::json!(["py"]));
+        assert_eq!(incident.detail["red_sha"], serde_json::json!(f.c2));
+        assert_eq!(incident.detail["red_since_sha"], serde_json::json!(f.c2));
+        assert_eq!(incident.checked_sha.as_deref(), Some(f.c2.as_str()));
+        assert_eq!(ticket.inherited_task_ids, [incident.id]);
+        assert_eq!(probe_requests(&f.pool).await, 1);
+        let py = ticket.units.iter().find(|u| u.group.as_deref() == Some("py")).unwrap();
+        assert!(py.inherited.is_some() && py.pending.is_none(), "{py:?}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_suspect_group_that_passes_on_master_is_the_tasks_failure_and_one_pass_serves_the_next_ticket() {
+        let _root = probe_root();
+        let f = fixture(Some(&scripted_map("py", "test -f flag.txt || exit 1")), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
+        let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
+        master_gains_flag(&f); // py passes on master; the sessions branched before the flag
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&one)).await.unwrap();
+        let (first, _) = finished_with(&f, id).await;
+        assert_eq!(first.verdict.as_deref(), Some("failed"), "{first:?}");
+        let py = first.units.iter().find(|u| u.group.as_deref() == Some("py")).unwrap();
+        assert!(py.not_inherited.as_deref().unwrap().contains("passes on master"), "{py:?}");
+        assert!(live_master_red(&f.pool).await.is_none(), "the probing row is gone");
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
+        assert_eq!(probe_requests(&f.pool).await, 1);
+
+        // A second session with the same suspect group, right after: the pass is remembered per master
+        // head, so no second proof starts.
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&two)).await.unwrap();
+        let (second, _) = finished_with(&f, id).await;
+        assert_eq!(second.verdict.as_deref(), Some("failed"), "{second:?}");
+        assert_eq!(probe_requests(&f.pool).await, 1, "one proof per master sha");
+        // And a re-read of the first ticket is stable.
+        let (again, _) = finished_with(&f, first.ticket).await;
+        assert_eq!(again.verdict.as_deref(), Some("failed"));
+        assert_eq!(probe_requests(&f.pool).await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn two_tickets_with_suspect_groups_share_one_probe() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
+        let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
+        let first = submit(&f.ex, Caller::Owner, &scope_with_py(&one)).await.unwrap();
+        let second = submit(&f.ex, Caller::Owner, &scope_with_py(&two)).await.unwrap();
+
+        // Both are read at once: one gets `Started`, the other finds the `probing` row and waits.
+        let ((a, _), (b, _)) = tokio::join!(finished_with(&f, first), finished_with(&f, second));
+
+        let incident = live_master_red(&f.pool).await.expect("incident");
+        assert_eq!((a.verdict.as_deref(), b.verdict.as_deref()), (Some("inherited"), Some("inherited")));
+        assert_eq!((a.inherited_task_ids, b.inherited_task_ids), (vec![incident.id], vec![incident.id]));
+        assert_eq!(probe_requests(&f.pool).await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_probing_row_with_an_expired_lease_is_taken_over_and_proven_again() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        // A verify that crashed two hours ago left its `probing` row behind.
+        let stale = match claims::begin_probe(
+            &f.pool,
+            "alpha",
+            "999",
+            "/gone",
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        )
+        .await
+        .unwrap()
+        {
+            crate::task_claims::ProbeStart::Started(row) => row,
+            other => panic!("{other:?}"),
+        };
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side)).await.unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("inherited"), "{ticket:?}");
+        let incident = live_master_red(&f.pool).await.expect("incident");
+        assert_eq!(incident.id, stale.id, "the lapsed row was taken over, not duplicated");
+        assert_eq!(incident.status, ClaimStatus::Open);
+        assert_eq!(probe_requests(&f.pool).await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_probe_that_cannot_run_is_the_tasks_failure_and_is_not_repeated() {
+        let _root = blocked_probe_root(); // the proof tree cannot be created
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side)).await.unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        let py = ticket.units.iter().find(|u| u.group.as_deref() == Some("py")).unwrap();
+        assert!(py.not_inherited.as_deref().unwrap().contains("did not finish"), "{py:?}");
+        assert!(live_master_red(&f.pool).await.is_none(), "an aborted proof leaves no probing row");
+        assert_eq!(probe_requests(&f.pool).await, 0, "nothing was ever submitted");
+        let (again, _) = finished_with(&f, id).await;
+        assert_eq!(again.verdict.as_deref(), Some("failed"));
+        assert_eq!(count(&f.pool, "task_claims").await, 0, "and a second read starts no second probe");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_land_evidence_read_never_starts_a_probe() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side)).await.unwrap();
+
+        // `covering_request` and the access check read like this: no classification, no side effects.
+        let (ticket, _) = wait_ticket_with(&f.pool, Some(&f.ex), id, WAIT, false).await.unwrap().unwrap();
+
+        assert!(ticket.done);
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert!(ticket.inherited_task_ids.is_empty());
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
+        assert_eq!(probe_requests(&f.pool).await, 0);
+        let stored: Option<String> = sqlx::query_scalar("SELECT classification FROM verify_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, None);
     }
 }

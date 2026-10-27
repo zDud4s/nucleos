@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use crate::task_claims::{Status, TaskKey, TaskRow, store};
+use crate::task_claims::{ProbeStart, Status, TaskKey, TaskRow, store};
 use crate::test_select;
 use crate::tests_map::{self, MapState};
 use crate::verify::exec::Executor;
@@ -499,9 +499,7 @@ pub(super) enum Freshness {
 
 enum ProbeStep {
     Task(String),
-    #[allow(dead_code)]
     Pending(i64),
-    #[allow(dead_code)]
     Incident(TaskRow),
 }
 
@@ -520,17 +518,50 @@ pub(super) async fn ensure_fresh(
     Ok(Freshness::Fresh)
 }
 
-/// Task 4 body; Task 5 replaces it with the real probe.
+/// Case 2: the suspect groups need a proof on the master head. One proof per project serves every
+/// ticket waiting on it.
 async fn probe_step(
-    _pool: &SqlitePool,
-    _executor: Option<&Arc<Executor>>,
-    _request: &RequestRow,
-    _project_root: &Path,
-    _groups: &[String],
-    _head: Option<&str>,
-    _now: DateTime<Utc>,
+    pool: &SqlitePool,
+    executor: Option<&Arc<Executor>>,
+    request: &RequestRow,
+    project_root: &Path,
+    groups: &[String],
+    head: Option<&str>,
+    now: DateTime<Utc>,
 ) -> Result<ProbeStep, String> {
-    Ok(ProbeStep::Task("not proved on master (no probe yet)".to_owned()))
+    // This ticket already has its answer: never repeat a proof for it.
+    if let Some(outcome) = probe::ProbeOutcome::of(request) {
+        return Ok(ProbeStep::Task(outcome.note(head)));
+    }
+    // Somebody proved these groups green on this very head a moment ago.
+    if let Some(head) = head
+        && probe::passed_recently(&request.project_id, head, groups, Instant::now())
+    {
+        return Ok(ProbeStep::Task(format!("passes on master at {}: the failure is yours", short(head))));
+    }
+    let Some(executor) = executor else {
+        return Ok(ProbeStep::Task("no verify executor to prove it on master; treated as your failure".to_owned()));
+    };
+    let started = store::begin_probe(pool, &request.project_id, &request.id.to_string(), &request.worktree, now)
+        .await
+        .map_err(|error| error.to_string())?;
+    match started {
+        ProbeStart::Started(row) => {
+            probe::spawn_proof(
+                executor.clone(),
+                probe::ProofJob::Probe {
+                    project_id: request.project_id.clone(),
+                    project_root: project_root.to_path_buf(),
+                    task_id: row.id,
+                    ticket_id: request.id,
+                    groups: groups.to_vec(),
+                },
+            );
+            Ok(ProbeStep::Pending(row.id))
+        }
+        ProbeStart::InFlight(row) => Ok(ProbeStep::Pending(row.id)),
+        ProbeStart::Exists(row) => Ok(ProbeStep::Incident(row)),
+    }
 }
 
 #[cfg(test)]

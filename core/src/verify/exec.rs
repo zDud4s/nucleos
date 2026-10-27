@@ -375,15 +375,19 @@ impl Executor {
         }
     }
 
-    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate requested; empty for any other unit.
+    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate or the daemon's probe requested; empty
+    /// for any other unit.
     ///
     /// The gate runs in a worktree at the target's tip, where `gate-diff.sh` defaults its base to
-    /// the merge base with `master` — `HEAD` itself — and so gates nothing. Computed here, from
-    /// the stored state, rather than when the unit is queued: crash recovery and bisect probes run
-    /// units the tick that queued them never saw.
+    /// the merge base with `master` — `HEAD` itself — and so gates nothing. A probe runs at the
+    /// master head, the very same situation, so a `gate_command` proof would gate nothing too.
+    /// Computed here, from the stored state, rather than when the unit is queued: crash recovery
+    /// and bisect probes run units the tick that queued them never saw.
     async fn gate_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
-        let (verify_runs::REQUESTED_BY_POSTGATE, Some(project)) =
-            (claimed.requested_by.as_str(), claimed.project_id.as_deref())
+        let (
+            verify_runs::REQUESTED_BY_POSTGATE | verify_runs::REQUESTED_BY_PROBE,
+            Some(project),
+        ) = (claimed.requested_by.as_str(), claimed.project_id.as_deref())
         else {
             return Vec::new();
         };
@@ -1070,6 +1074,19 @@ mod tests {
         let ex = executor(4, root.path()).await;
         store_postgate(&ex.pool, Some(&shas[1]), None).await;
         let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_probe_unit_diffs_from_the_last_green_like_the_postgate() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        // A probe of `gate_command` runs at the master head, where gate-diff.sh would default its
+        // base to HEAD itself and gate nothing.
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_PROBE);
         let env = ex.gate_env(&claimed).await;
         assert_eq!(gate_base(&env), Some(shas[1].as_str()));
     }
