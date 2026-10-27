@@ -25117,6 +25117,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_with_an_empty_body_answers_with_counts() {
+        let state = test_state().await;
+        let (status, body) = call(
+            state,
+            "POST",
+            "/distill/chats/ingest",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["seeded"].is_number() && body["skipped"].is_number());
+    }
+
+    #[tokio::test]
+    async fn ingest_with_both_chat_ids_and_project_is_a_bad_request() {
+        let state = test_state().await;
+        let (status, _) = call(
+            state,
+            "POST",
+            "/distill/chats/ingest",
+            Some(serde_json::json!({ "chat_ids": ["x"], "project": "alpha" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn switching_chats_back_on_moves_the_history_cut_to_now() {
         let state = test_state().await;
         let pool = state.pool.clone();

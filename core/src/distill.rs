@@ -687,6 +687,35 @@ fn raw_item_count(answer: &str) -> usize {
         .map_or(0, |values| values.len())
 }
 
+/// One vector per item, parallel to `items`. The first embedding error ends embedding for the
+/// rest: those items take the fingerprint path.
+async fn embed_items(embedder: Option<&dyn Embedder>, items: &[Item]) -> Vec<Option<Vec<f32>>> {
+    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(items.len());
+    if let Some(embedder) = embedder {
+        let mut failed = false;
+        for item in items {
+            if failed {
+                vectors.push(None);
+                continue;
+            }
+            match embedder
+                .embed(&crate::embed::text_of(&item.title, &item.body))
+                .await
+            {
+                Ok(vector) => vectors.push(Some(vector)),
+                Err(error) => {
+                    tracing::warn!("distillation: embedding failed: {:?}", error.kind());
+                    failed = true;
+                    vectors.push(None);
+                }
+            }
+        }
+    } else {
+        vectors.resize(items.len(), None);
+    }
+    vectors
+}
+
 /// Distil one claimed row. Every failure ends in [`fail`]; nothing is returned.
 pub async fn process_one(
     pool: &SqlitePool,
@@ -710,6 +739,11 @@ pub async fn process_one_with(
         fail(pool, &row, "vocabulary", "unknown cause", now).await;
         return;
     };
+    // A chat batch reads no job: its own path, which never takes the `gone` branch below.
+    if cause == Cause::ChatExchanges {
+        chats::process(pool, asked, embedder, &row, now).await;
+        return;
+    }
     let inputs = match gather(pool, &row).await {
         Ok(Some(inputs)) => inputs,
         Ok(None) => {
@@ -756,30 +790,7 @@ pub async fn process_one_with(
         }
     };
     let job_id = row.job_id.unwrap_or_default();
-    // The first embedding error ends embedding for the rest: those items take the fingerprint path.
-    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(items.len());
-    if let Some(embedder) = embedder {
-        let mut failed = false;
-        for item in &items {
-            if failed {
-                vectors.push(None);
-                continue;
-            }
-            match embedder
-                .embed(&crate::embed::text_of(&item.title, &item.body))
-                .await
-            {
-                Ok(vector) => vectors.push(Some(vector)),
-                Err(error) => {
-                    tracing::warn!("distillation: embedding failed: {:?}", error.kind());
-                    failed = true;
-                    vectors.push(None);
-                }
-            }
-        }
-    } else {
-        vectors.resize(items.len(), None);
-    }
+    let vectors = embed_items(embedder, &items).await;
     let model = embedder.map(|e| e.model());
     let written = write_items(
         pool,
@@ -840,6 +851,19 @@ pub async fn run_distill_loop(state: crate::state::AppState) {
 /// One pass of the worker: drain the queue, and only when it ended empty spend the idle time
 /// embedding rows that lack a vector.
 pub async fn tick(pool: &SqlitePool, asked: Extractor<'_>, embedder: Option<&dyn Embedder>) {
+    // Queue idle chats and forget old observations before draining; neither needs the model.
+    if let Err(error) = chats::sweep(
+        pool,
+        Utc::now(),
+        chats::local_day_start(chrono::Local::now()),
+    )
+    .await
+    {
+        tracing::warn!(%error, "distillation: could not sweep the chats");
+    }
+    if let Err(error) = crate::knowledge::sweep_observations(pool, Utc::now()).await {
+        tracing::warn!(%error, "distillation: could not sweep the observations");
+    }
     let drained = loop {
         let row = match claim_next(pool, Utc::now()).await {
             Ok(Some(row)) => row,
@@ -2728,5 +2752,308 @@ mod tests {
             .position(|c| c == &crate::embed::text_of("Old rule", "Never embedded."))
             .expect("the old row was embedded");
         assert!(item < backfilled, "queue first, backfill after: {calls:?}");
+    }
+
+    // ---- chat batches (spec 2026-10-22, B8/B10/B14) ----
+
+    use super::chats::fixtures;
+
+    const SEMANTIC_THREE: &str = r#"[
+      {"layer":"episodic","title":"Owner chose sqlite for the cache","body":"On this day the owner decided sqlite."},
+      {"layer":"semantic","title":"Prefer small commits","body":"The owner wants one change per commit."},
+      {"layer":"procedural","title":"Run the gate before pushing","body":"The owner asks for a green gate first."}]"#;
+
+    /// A pending `chat_exchanges` row for `chat`, watermarked at `last_run`.
+    async fn chat_row(pool: &SqlitePool, project: &str, chat: &str, last_run: i64) -> i64 {
+        no_capture_wait(pool).await;
+        sqlx::query(
+            "INSERT INTO distill_queue (cause, project_id, run_id, chat_id, status, attempts, created_at)
+             VALUES ('chat_exchanges', ?, ?, ?, 'pending', 0, '2026-10-05T00:00:00Z')",
+        )
+        .bind(project)
+        .bind(last_run)
+        .bind(chat)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    /// Four exchanges of `chat` stamped with `project`; returns the last run id.
+    async fn four_turns(pool: &SqlitePool, chat: &str, project: Option<&str>) -> i64 {
+        let mut last = 0;
+        for i in 0..4 {
+            last = fixtures::turn(pool, chat, project, &format!("q{i}"), "a").await;
+        }
+        last
+    }
+
+    /// Claims the next row and distils it with a runner that answers `answer`.
+    async fn distil(
+        pool: &SqlitePool,
+        answer: &str,
+        embedder: Option<&dyn Embedder>,
+    ) -> crate::execution::runner::FakeCommandRunner {
+        let runner = fake_answering(answer);
+        let row = claim_next(pool, noon()).await.unwrap().expect("a due row");
+        super::process_one_with(pool, Extractor::Cli(&runner), embedder, row, noon()).await;
+        runner
+    }
+
+    async fn events_noted(pool: &SqlitePool, note: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_events WHERE note = ?")
+            .bind(note)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn project_candidates(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project' AND status = 'proposed'
+               AND distill_cause = 'chat_exchanges'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_single_project_batch_writes_proposed_candidates_and_observed_observations() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let last = four_turns(&pool, &chat, Some("alpha")).await;
+        chat_row(&pool, "alpha", &chat, last).await;
+        distil(&pool, SEMANTIC_THREE, None).await;
+
+        let cands: Vec<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT scope_kind, status, scope_id, about, evidence FROM knowledge
+              WHERE distill_cause = 'chat_exchanges' AND scope_kind = 'project'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cands.len(), 2);
+        for (kind, status, scope_id, about, evidence) in cands {
+            assert_eq!(
+                (kind.as_str(), status.as_str(), scope_id.as_deref(), about),
+                ("project", "proposed", Some("alpha"), None)
+            );
+            assert!(evidence.contains(r#""t":"chat""#) && evidence.contains(r#""t":"run""#));
+        }
+        let key = fixtures::chat_key(&pool, &chat).await;
+        let obs: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT status, scope_id, about FROM knowledge WHERE scope_kind = 'observation'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            obs,
+            vec![("observed".into(), format!("alpha:chat:{key}"), None)]
+        );
+        let active: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE status = 'active'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(active, 0, "a conversation never writes active knowledge");
+        let evidence: String = sqlx::query_scalar(
+            "SELECT evidence FROM knowledge WHERE scope_kind = 'observation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            evidence.starts_with(&format!(r#"[{{"t":"chat","id":{key}}}"#)),
+            "the evidence names the chat by its key, not its uuid: {evidence}"
+        );
+        assert_eq!(queue_state_of_chat(&pool).await, ("done".into(), None));
+    }
+
+    async fn queue_state_of_chat(pool: &SqlitePool) -> (String, Option<String>) {
+        sqlx::query_as("SELECT status, error FROM distill_queue WHERE cause = 'chat_exchanges'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_a_project_no_candidates_are_written_and_the_observation_stays() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let last = four_turns(&pool, &chat, None).await;
+        chat_row(&pool, "", &chat, last).await;
+        distil(&pool, SEMANTIC_THREE, None).await;
+
+        let projects: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'project'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(projects, 0);
+        let key = fixtures::chat_key(&pool, &chat).await;
+        let scopes: Vec<String> =
+            sqlx::query_scalar("SELECT scope_id FROM knowledge WHERE scope_kind = 'observation'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(scopes, vec![format!("-:chat:{key}")]);
+        assert_eq!(queue_state_of_chat(&pool).await.0, "done");
+    }
+
+    #[tokio::test]
+    async fn candidates_stop_at_the_per_row_cap() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let last = four_turns(&pool, &chat, Some("alpha")).await;
+        chat_row(&pool, "alpha", &chat, last).await;
+        distil(
+            &pool,
+            r#"[
+              {"layer":"semantic","title":"Prefer tabs over spaces","body":"b1"},
+              {"layer":"semantic","title":"Keep functions short","body":"b2"},
+              {"layer":"procedural","title":"Run the linter first","body":"b3"},
+              {"layer":"semantic","title":"Name tests after behaviour","body":"b4"},
+              {"layer":"semantic","title":"Avoid global state","body":"b5"}]"#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            project_candidates(&pool).await as usize,
+            super::chats::MAX_CHAT_CANDIDATES_PER_ROW
+        );
+    }
+
+    #[tokio::test]
+    async fn an_observation_that_quotes_the_owner_stays_observed_with_the_event() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let mut last = 0;
+        for _ in 0..4 {
+            last = fixtures::turn(&pool, &chat, Some("alpha"), PROJECT_NOTE, "ok").await;
+        }
+        chat_row(&pool, "alpha", &chat, last).await;
+        distil(&pool, QUOTING_EPISODE, None).await;
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM knowledge WHERE scope_kind = 'observation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "observed");
+        assert_eq!(events_noted(&pool, "quoted_owner_text").await, 1);
+    }
+
+    #[tokio::test]
+    async fn observations_stop_at_the_per_chat_day_cap() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let last = four_turns(&pool, &chat, None).await;
+        let key = fixtures::chat_key(&pool, &chat).await;
+        let scope = super::chats::chat_scope_id("", key);
+        for i in 0..super::chats::MAX_OBS_PER_CHAT_DAY {
+            sqlx::query(
+                "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('episodic', 'observation', ?, 'distiller', 'memory', ?, 'b', 'observed', ?)",
+            )
+            .bind(&scope)
+            .bind(format!("earlier {i}"))
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        chat_row(&pool, "", &chat, last).await;
+        distil(
+            &pool,
+            r#"[{"layer":"episodic","title":"One more thing","body":"x"},
+                {"layer":"episodic","title":"And another","body":"y"}]"#,
+            None,
+        )
+        .await;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM knowledge WHERE scope_kind = 'observation' AND scope_id = ?",
+        )
+        .bind(&scope)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, super::chats::MAX_OBS_PER_CHAT_DAY);
+        assert_eq!(queue_state_of_chat(&pool).await.0, "done");
+    }
+
+    #[tokio::test]
+    async fn a_switched_off_source_closes_done_as_disabled_without_asking() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let last = four_turns(&pool, &chat, Some("alpha")).await;
+        let row = chat_row(&pool, "alpha", &chat, last).await;
+        super::sources::set(&pool, super::sources::CHAT_KEY, false)
+            .await
+            .unwrap();
+        let runner = distil(&pool, "[]", None).await;
+        let (status, _, _, error) = queue_state(&pool, row).await;
+        assert_eq!((status.as_str(), error.as_deref()), ("done", Some("disabled")));
+        assert!(runner.last_prompt.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_window_closes_done_without_asking() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let last = four_turns(&pool, &chat, Some("alpha")).await;
+        sqlx::query("UPDATE chats SET cleared_after_run_id = ? WHERE chat_id = ?")
+            .bind(last)
+            .bind(&chat)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row = chat_row(&pool, "alpha", &chat, last).await;
+        let runner = distil(&pool, "[]", None).await;
+        let (status, _, _, error) = queue_state(&pool, row).await;
+        assert_eq!((status.as_str(), error), ("done", None));
+        assert!(runner.last_prompt.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_chat_prompt_is_the_conversation_and_never_the_notes() {
+        let pool = test_pool().await;
+        let chat = fixtures::chat_with(&pool).await;
+        let last = four_turns(&pool, &chat, Some("alpha")).await;
+        chat_row(&pool, "alpha", &chat, last).await;
+        link_project_note(&pool, PROJECT_NOTE).await;
+        let runner = distil(&pool, "[]", None).await;
+        let prompt = runner.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("## Conversation") && !prompt.contains("## Owner context"));
+        assert_eq!(
+            runner.last_append_system_prompt.lock().unwrap().clone(),
+            Some(Some(super::standing_for(Cause::ChatExchanges)))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tick_queues_idle_chats_serves_them_and_sweeps_old_observations() {
+        let pool = test_pool().await;
+        no_capture_wait(&pool).await;
+        let chat = fixtures::chat_with(&pool).await;
+        four_turns(&pool, &chat, None).await;
+        let stale = fixtures::stale_observation(&pool, 61).await;
+        let runner = fake_answering("[]");
+        super::tick(&pool, Extractor::Cli(&runner), None).await;
+        let (status, _): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, error FROM distill_queue WHERE cause = 'chat_exchanges'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "done");
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM knowledge WHERE id = ?")
+            .bind(stale)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0, "the sweep needs no embedder");
     }
 }
