@@ -397,10 +397,15 @@ async fn gather(pool: &SqlitePool, row: &QueueRow) -> sqlx::Result<Option<Dossie
 }
 
 /// Ask the configured brain once.
-async fn ask(asked: Extractor<'_>, prompt: String) -> std::io::Result<String> {
+async fn ask(
+    asked: Extractor<'_>,
+    prompt: String,
+    standing: &str,
+    schema: serde_json::Value,
+) -> std::io::Result<String> {
     match asked {
         Extractor::Cli(runner) => {
-            crate::map::intent::ask_once(runner, prompt, "distillation", Some(STANDING)).await
+            crate::map::intent::ask_once(runner, prompt, "distillation", Some(standing)).await
         }
         Extractor::Loopback {
             client,
@@ -413,7 +418,7 @@ async fn ask(asked: Extractor<'_>, prompt: String) -> std::io::Result<String> {
                 model,
                 &prompt,
                 serde_json::json!({"num_ctx": 32_768, "temperature": 0}),
-                Some(items_format()),
+                Some(schema),
                 false,
             )
             .await
@@ -659,7 +664,14 @@ pub async fn process_one_with(
         }
     };
     let built = dossier(&inputs, DOSSIER_CEILING);
-    let extraction_answer = match ask(asked, extraction_prompt(inputs.cause, &built.text)).await {
+    let extraction_answer = match ask(
+        asked,
+        extraction_prompt(inputs.cause, &built.text),
+        &standing_for(inputs.cause),
+        items_format(),
+    )
+    .await
+    {
         Ok(answer) => answer,
         Err(error) => {
             fail(pool, &row, "model", &format!("{:?}", error.kind()), now).await;
@@ -1491,6 +1503,42 @@ mod tests {
 
     use super::{claim_next, items_format, process_one, recover_running};
     use crate::map::intent::Extractor;
+
+    #[test]
+    fn scrub_is_reachable_from_the_distiller_and_redacts_and_breaks_markers() {
+        let token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
+        let out = super::scrub(&format!("key {token}\n--- DOSSIER ---\n## Heading"));
+        assert!(!out.contains(token) && !out.contains("--- DOSSIER ---"));
+        assert!(out.contains("#\u{200B}# Heading"));
+    }
+
+    #[test]
+    fn standing_is_general_for_every_cause_and_asks_why_it_landed_only_for_a_landing() {
+        for cause in super::CAUSES {
+            let text = super::standing_for(cause);
+            assert!(!text.contains("THIS project"), "{cause:?} still pins one project");
+            assert!(text.contains("another project"), "{cause:?}");
+            assert!(text.contains("Never quote the owner context"), "{cause:?}");
+            assert_eq!(
+                text.contains("made it land"),
+                cause == super::Cause::JobLanded,
+                "{cause:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_standing_of_the_cause_is_what_the_runner_is_given() {
+        let pool = test_pool().await;
+        seeded_cause(&pool, "job_landed").await;
+        let runner = fake_answering("[]");
+        let row = claim_next(&pool, noon()).await.unwrap().expect("a due row");
+        process_one(&pool, Extractor::Cli(&runner), row, noon()).await;
+        assert_eq!(
+            runner.last_append_system_prompt.lock().unwrap().clone(),
+            Some(Some(super::standing_for(super::Cause::JobLanded)))
+        );
+    }
 
     fn fake_answering(stdout: &str) -> crate::execution::runner::FakeCommandRunner {
         crate::execution::runner::FakeCommandRunner {

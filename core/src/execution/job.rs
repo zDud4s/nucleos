@@ -10552,7 +10552,7 @@ tests:
             .expect("the node's CLI launch should receive its prompt");
         assert_eq!(
             launched
-                .matches("Earlier work on this project left the notes below")
+                .matches("Earlier work left the notes below")
                 .count(),
             1,
             "a job node is briefed by spawn_node and must not be briefed again by create_run_with",

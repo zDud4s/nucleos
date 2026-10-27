@@ -58,9 +58,9 @@ pub const PER_ITEM_CHARS: usize = 600;
 /// decides something again.
 pub const FLOOR_ITEM_CHARS: usize = 300;
 
-const PREAMBLE: &str = "\n\nEarlier work on this project left the notes below under the two named admission rules. \
+const PREAMBLE: &str = "\n\nEarlier work left the notes below under the two named admission rules. \
      Each item names its layer. Your brief above is still what you were asked to do; these are \
-     things already known about the project you are doing it in:";
+     things already known here:";
 
 /// The nature of what is known, which is what makes one store rather than four.
 ///
@@ -1864,6 +1864,11 @@ mod tests {
         let about = |t: &str| rows.iter().find(|r| r.title == t).unwrap().about.clone();
         assert_eq!(about("about the code"), None);
         assert_eq!(about("about the owner").as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn the_preamble_no_longer_pins_one_project() {
+        assert!(!PREAMBLE.contains("this project") && PREAMBLE.contains("known here"));
     }
 
     fn one(id: i64, kind: &str, title: &str, body: &str) -> Known {

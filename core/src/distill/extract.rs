@@ -78,7 +78,7 @@ fn break_dossier_markers(text: &str) -> String {
 
 /// Every raw text leaves redacted (`judge::redact_for_judge`: it goes to a cloud model by default)
 /// and with the dossier's markers broken.
-fn scrub(text: &str) -> String {
+pub(crate) fn scrub(text: &str) -> String {
     break_dossier_markers(&crate::judge::redact_for_judge(text))
 }
 
@@ -254,20 +254,29 @@ pub fn dossier(inputs: &DossierInputs, ceiling: usize) -> Dossier {
     Dossier { text, runs }
 }
 
-/// The standing instruction of every extraction call.
-pub const STANDING: &str = "You read the dossier below, about one finished piece of work in ONE \
-software project, and write down what is worth remembering for the next time. Answer with a JSON \
-array and nothing else: 0 to 5 items, each an object with `layer` (episodic, semantic or \
-procedural), `title` (one line), `body` (short) and `files` (repository paths it concerns). Only \
-lessons about THIS project. Never quote the owner context. Do not repeat the known titles. `[]` \
-is a good answer when nothing is worth keeping.";
+const STANDING_HEAD: &str = "You read the dossier below, about one finished piece of work, and write \
+down what is worth remembering the next time. Answer with a JSON array and nothing else: 0 to 5 items, \
+each an object with `layer` (episodic, semantic or procedural), `title` (one line), `body` (short) and \
+`files` (repository paths it concerns). Prefer lessons that would still hold in another project, and say \
+in the body when one is specific to this repository. Never quote the owner context. Do not repeat the \
+known titles. `[]` is a good answer when nothing is worth keeping.";
+
+/// The standing instruction of an extraction call, by the cause that queued the work (spec B10).
+pub fn standing_for(cause: Cause) -> String {
+    let tail = match cause {
+        Cause::JobLanded => " The work landed: ask what made it land, not only what went wrong.",
+        Cause::JobFailed | Cause::GateRecovered | Cause::ReviewBlocking | Cause::RunExhausted => "",
+    };
+    format!("{STANDING_HEAD}{tail}")
+}
 
 /// The whole extraction prompt: the standing instruction, one line naming why the work was queued
 /// (the closed [`Cause`] vocabulary, never free text), then the dossier.
 pub fn extraction_prompt(cause: Cause, dossier: &str) -> String {
     let why = cause.as_str();
+    let standing = standing_for(cause);
     format!(
-        "{STANDING}\n\nWhy this was queued: {why}\n\n--- DOSSIER ---\n{dossier}\n--- END OF DOSSIER ---"
+        "{standing}\n\nWhy this was queued: {why}\n\n--- DOSSIER ---\n{dossier}\n--- END OF DOSSIER ---"
     )
 }
 

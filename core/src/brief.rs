@@ -2690,7 +2690,7 @@ mod tests {
                 );
             }
             if file != "knowledge.rs"
-                && source.contains("Earlier work on this project left the notes below")
+                && source.contains("Earlier work left the notes below")
             {
                 panic!(
                     "{file} writes the knowledge preamble outside knowledge.rs; keep PREAMBLE's only definition in knowledge.rs"
