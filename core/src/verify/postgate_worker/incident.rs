@@ -409,21 +409,35 @@ pub(super) enum RevertEnd {
     Dropped,
 }
 
-/// A revert of `merge_sha` ended without a fix: let go of the incident (the gate's own claim only),
-/// so a session or a person can take it, and for a real failure remember on the incident that this
-/// culprit's revert failed. The incident stays `open` either way and the feed line is `fail_revert`'s.
-pub(super) async fn settle_after_revert(
+/// Remembers on the incident that the revert of `merge_sha` really failed, so the gate does not
+/// retry the same culprit for ever. It runs BEFORE `fail_revert` clears the state: a crash between
+/// the two leaves a harmless marker (the revert is simply still recorded and settled on the next
+/// tick), never a free state with no marker, which would let `takeover_step` start the revert again.
+/// `Dropped` marks nothing. `false` means the marker could not be written; the caller must not clear
+/// the state then, so the next tick tries again.
+pub(super) async fn mark_revert_failed(
     pool: &sqlx::SqlitePool,
     project_id: &str,
     merge_sha: &str,
     end: RevertEnd,
-) {
+) -> bool {
+    if end != RevertEnd::Failed {
+        return true;
+    }
     let Some(mut row) = live_master_red(pool, project_id).await else {
+        return true;
+    };
+    store_detail(pool, &mut row, &json!({"revert_failed_for": merge_sha}), None, None).await;
+    row.detail.get("revert_failed_for").and_then(Value::as_str) == Some(merge_sha)
+}
+
+/// A revert of `merge_sha` ended without a fix and `fail_revert` cleared it: let go of the incident
+/// (the gate's own claim only), so a session or a person can take it. The incident stays `open` and
+/// the feed line is `fail_revert`'s. The failure marker is `mark_revert_failed`'s, written earlier.
+pub(super) async fn settle_after_revert(pool: &sqlx::SqlitePool, project_id: &str) {
+    let Some(row) = live_master_red(pool, project_id).await else {
         return;
     };
-    if end == RevertEnd::Failed {
-        store_detail(pool, &mut row, &json!({"revert_failed_for": merge_sha}), None, None).await;
-    }
     if let Some(holder) = holder_of(&row)
         && holder.kind == HolderKind::Postgate
         && let Err(error) =

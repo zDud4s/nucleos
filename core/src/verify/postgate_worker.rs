@@ -2119,6 +2119,29 @@ mod tests {
         assert!(matches!(won, ClaimOutcome::Won { .. }));
     }
 
+    /// The failure marker is written before `fail_revert` clears the state. A crash after both but
+    /// before the incident is released leaves the gate's own claim in place and the state free: with
+    /// the marker already there, no pass starts a second revert (a revert loop).
+    #[tokio::test]
+    async fn a_failed_revert_whose_release_never_happened_is_not_started_again() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+
+        assert!(incident::mark_revert_failed(&f.pool, "alpha", &c3, incident::RevertEnd::Failed).await);
+        assert!(verify_postgate::fail_revert(&f.pool, "alpha", &c3, "the revert conflicted").await.unwrap());
+        // Crash here: `settle_after_revert` (the release) never runs.
+        let row = incident(&f).await.unwrap();
+        assert_eq!(row.holder_kind, Some(HolderKind::Postgate), "still the gate's claim");
+        assert_eq!(row.detail["revert_failed_for"], serde_json::json!(c3));
+
+        for _ in 0..3 {
+            let step = step_of(&f).await;
+            assert!(!matches!(step, Some(Step::IncidentTaken { .. } | Step::Reverting { .. })), "{step:?}");
+        }
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "only the first revert");
+    }
+
     /// `revert_on_red` switched off before the queue got the revert is the owner changing their mind,
     /// not a failed revert: the gate lets go of the incident (a session may take it) but marks
     /// nothing, so switching the revert back on resumes it.

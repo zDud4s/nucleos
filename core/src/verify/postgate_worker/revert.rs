@@ -260,9 +260,13 @@ pub(super) async fn settle_failed_revert(
     reason: String,
     end: incident::RevertEnd,
 ) -> Step {
+    // The marker first: see `incident::mark_revert_failed`.
+    if !incident::mark_revert_failed(pool, project_id, merge_sha, end).await {
+        return Step::Failed("cannot mark the incident with the failed revert".to_owned());
+    }
     match verify_postgate::fail_revert(pool, project_id, merge_sha, summary).await {
         Ok(true) => {
-            incident::settle_after_revert(pool, project_id, merge_sha, end).await;
+            incident::settle_after_revert(pool, project_id).await;
             Step::RevertFailed {
                 merge_sha: merge_sha.to_owned(),
                 reason,
