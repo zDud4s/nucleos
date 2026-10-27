@@ -64,7 +64,15 @@ pub(super) async fn fix_branch_step(
                 ticket_note(state),
                 short(revert_sha)
             );
-            settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await
+            settle_failed_revert(
+                pool,
+                project_id,
+                merge_sha,
+                &summary,
+                reason,
+                incident::RevertEnd::Failed,
+            )
+            .await
         }
     }
 }

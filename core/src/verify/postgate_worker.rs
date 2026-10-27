@@ -22,6 +22,14 @@
 //! ticket, and once the queue has published it `fix/<source>-<sha7>` is built on top of it. The
 //! correction run on that branch is opened by `run_correction_loop`, which holds an `AppState`.
 //!
+//! The `master-red` incident (task claims, `incident.rs`) mirrors the red for sessions, runs and the
+//! land gate. It is opened when the red is confirmed, claimed by the gate before the revert starts,
+//! respected when another live owner holds it (the report then starts no revert), taken over by
+//! `incident::takeover_step` once that owner lets go (which then starts the skipped revert, once per
+//! culprit: a revert that failed for real marks the incident and is not repeated), and closed by
+//! `incident::close_if_green` when the gate is green on a descendant of the red. The correction run
+//! never reads or writes it.
+//!
 //! F3-12 spares a gate that would only repeat a proof. When a new tip appears, the tick asks
 //! whether a daemon `verify` already passed on that tip's exact tree over the last full green or the
 //! last covered tip (`verify::covering_request`); if so the tip is recorded as covered, with one
@@ -228,6 +236,9 @@ pub enum Step {
     RevertFailed { merge_sha: String, reason: String },
     /// The correction branch `branch` was created on top of the published revert.
     FixBranch { branch: String },
+    /// The incident's earlier owner let go; the gate claimed it and started the revert of
+    /// `merge_sha` it had skipped.
+    IncidentTaken { incident: i64, merge_sha: String },
 }
 
 /// One project's step in one tick.
@@ -373,7 +384,20 @@ async fn tick_project(
         covered: evidence.is_some(),
     }];
     match verify_batch::decide(&view, &since_green) {
-        Decision::Idle(idle) => Step::Idle(idle),
+        Decision::Idle(idle) => {
+            // A red that was reported while someone else held the incident has no revert: if that
+            // claim has lapsed, take it and start the revert now (spec §3 Postgate, "O passo de
+            // revert pode repetir-se"). Only here: `Idle` means the tip is the one already
+            // attempted, so the red is not stale. `retry` (unmeasured) never reaches this arm.
+            if let Some(state) = stored
+                && let Some(step) =
+                    incident::takeover_step(executor, project_id, project_root, state, &tip, rules)
+                        .await
+            {
+                return step;
+            }
+            Step::Idle(idle)
+        }
         Decision::MarkCovered { sha } => {
             let Some(evidence) = evidence else {
                 return Step::Failed(format!("cover of {sha} has no proof"));
@@ -1045,6 +1069,12 @@ pub async fn run_postgate_worker(executor: Arc<Executor>) {
                 Step::FixBranch { branch } => {
                     tracing::info!(
                         project = %pass.project_id, %branch, "postgate: fix branch ready"
+                    );
+                }
+                Step::IncidentTaken { incident, merge_sha } => {
+                    tracing::info!(
+                        project = %pass.project_id, incident, %merge_sha,
+                        "postgate: took over the incident"
                     );
                 }
                 _ => {}
@@ -1993,6 +2023,158 @@ mod tests {
             .unwrap()
     }
 
+    async fn lapse(pool: &sqlx::SqlitePool, id: i64) {
+        let old = crate::execution::wave::stamp(chrono::Utc::now() - chrono::Duration::hours(1));
+        sqlx::query("UPDATE task_claims SET lease_until = ? WHERE id = ?")
+            .bind(old)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn when_the_session_lease_lapses_the_next_pass_claims_and_reverts() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = red_until_probe(&f).await;
+        let row = incident(&f).await.unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now()).await.unwrap();
+        tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        // Still live: passes change nothing.
+        let _ = step_of(&f).await;
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        lapse(&f.pool, row.id).await;
+        let step = tick_until(&f, |s| matches!(s, Step::IncidentTaken { .. })).await;
+        assert!(matches!(&step, Step::IncidentTaken { incident, merge_sha } if *incident == row.id && *merge_sha == c3), "{step:?}");
+        let taken = incident(&f).await.unwrap();
+        assert_eq!(taken.holder_kind, Some(HolderKind::Postgate));
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_claim_events WHERE task_id = ? AND event = 'expired_reclaimed'",
+        )
+        .bind(row.id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(expired, 1);
+
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "exactly one revert");
+    }
+
+    #[tokio::test]
+    async fn with_revert_on_red_off_the_incident_stays_open_through_any_number_of_passes() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let _ = confirmed_culprit(&f).await;
+        for _ in 0..3 {
+            let _ = step_of(&f).await;
+        }
+        assert_eq!(incident(&f).await.unwrap().status, Status::Open);
+        assert!(queue_rows(&f.pool).await.is_empty());
+    }
+
+    /// A revert the queue really could not perform (publication or conflict) is not tried again for
+    /// the same culprit: that would loop. The incident stays `open`, announced in the feed by
+    /// `fail_revert`, and any session may claim it.
+    #[tokio::test]
+    async fn a_revert_that_failed_for_real_frees_the_incident_and_is_not_tried_again() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+        let step = tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        let Step::Reverting { request, .. } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+        sqlx::query("UPDATE vcs_requests SET status = 'failed', failure_reason = ? WHERE id = ?")
+            .bind("the revert conflicted")
+            .bind(request)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
+
+        let row = incident(&f).await.unwrap();
+        assert_eq!(row.status, Status::Open, "the gate let go of the incident");
+        assert_eq!(row.detail["revert_failed_for"], serde_json::json!(c3));
+        assert!(
+            feed_summaries(&f.pool).await.last().is_some_and(|line| line.contains("the revert conflicted")),
+            "the owner is told"
+        );
+
+        // Still on: no second attempt for the same culprit, however many passes.
+        for _ in 0..3 {
+            let step = step_of(&f).await;
+            assert!(!matches!(step, Some(Step::IncidentTaken { .. } | Step::Reverting { .. })), "{step:?}");
+        }
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "only the request that failed");
+        // Open means a session can have it.
+        let session = Holder { kind: HolderKind::Session, id: "sess-2".to_owned(), worktree: "C:/wt/two".to_owned() };
+        let won = crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now()).await.unwrap();
+        assert!(matches!(won, ClaimOutcome::Won { .. }));
+    }
+
+    /// `revert_on_red` switched off before the queue got the revert is the owner changing their mind,
+    /// not a failed revert: the gate lets go of the incident (a session may take it) but marks
+    /// nothing, so switching the revert back on resumes it.
+    #[tokio::test]
+    async fn a_revert_dropped_by_the_switch_going_off_resumes_when_the_switch_is_back_on() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+        crate::project::state::write_for_test(f._machine.path(), "alpha", crate::project::state::AUTOPILOT_FILE, REVERT_OFF);
+        tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
+
+        let row = incident(&f).await.unwrap();
+        assert_eq!(row.status, Status::Open, "the gate let go of the incident");
+        assert_eq!(row.holder_kind, None);
+        assert!(row.detail.get("revert_failed_for").is_none(), "{:?}", row.detail);
+        // Off: any number of passes change nothing.
+        for _ in 0..2 {
+            let _ = step_of(&f).await;
+        }
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        crate::project::state::write_for_test(f._machine.path(), "alpha", crate::project::state::AUTOPILOT_FILE, REVERT_ON);
+        let step = tick_until(&f, |s| matches!(s, Step::IncidentTaken { .. })).await;
+        assert!(matches!(&step, Step::IncidentTaken { merge_sha, .. } if *merge_sha == c3), "{step:?}");
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "exactly one revert");
+    }
+
+    /// `takeover_step` only acts on the tip the red was found on. A target that moved on since is
+    /// judged again by the gate, never reverted on the strength of a red that is out of date.
+    #[tokio::test]
+    async fn a_takeover_never_reverts_a_stale_red() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (_c3, _c4) = red_until_probe(&f).await;
+        let row = incident(&f).await.unwrap();
+        let session = Holder { kind: HolderKind::Session, id: "sess-1".to_owned(), worktree: "C:/wt/session".to_owned() };
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now()).await.unwrap();
+        tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+        lapse(&f.pool, row.id).await;
+
+        // Called with a tip the gate never attempted: nothing, though the claim has lapsed.
+        let state = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let rules = crate::config::load_schedule_rules(f.ex.machine_root.as_deref(), "alpha").unwrap();
+        let stale_tip = "0000000000000000000000000000000000000001";
+        assert!(incident::takeover_step(&f.ex, "alpha", &f.root, &state, stale_tip, &rules).await.is_none());
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        // And through the tick: the target moves on (a fix landed by hand) before the lapse is seen.
+        let c5 = commit_file(&f.root, "d.txt", "d\n", "c5 moves the target");
+        let step = step_of(&f).await;
+        assert!(!matches!(step, Some(Step::IncidentTaken { .. })), "{step:?}");
+        let after = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(after.revert_merge_sha, None);
+        assert!(queue_rows(&f.pool).await.is_empty());
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c5);
+    }
+
     /// With the switch off (every project today) the owner gets the same line as before F3-4 and
     /// nothing else moves: no queued request, no revert columns, `main` where it was. This is the
     /// default's whole contract, so it is pinned beside the tests that turn the switch on.
@@ -2594,6 +2776,36 @@ mod tests {
             "a branch that has its run gets no second one"
         );
         assert_eq!(count(&f.state.pool, "runs").await, 1);
+    }
+
+    /// Spec §3 Postgate: the correction run reintroduces the reverted change, which is other work.
+    /// It claims the fix branch (`fix_run_id`) and nothing else; the incident is not read or written.
+    #[tokio::test]
+    async fn opening_a_correction_run_does_not_touch_the_incident() {
+        let f = correction_fixture().await;
+        let pool = &f.state.pool;
+        let key = crate::task_claims::keys::normalize(crate::task_claims::MASTER_RED_KEY, Path::new("/")).unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        let new = crate::task_claims::NewTask {
+            key,
+            kind: crate::task_claims::TaskKind::Incident,
+            title: "main is red".to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: vec![],
+            hint_paths: vec![],
+        };
+        crate::task_claims::store::claim(pool, "alpha", new, &session, chrono::Utc::now()).await.unwrap();
+        let events_before = count(pool, "task_claim_events").await;
+
+        assert_eq!(open_corrections(&f.state).await.len(), 1);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM task_claims").fetch_one(pool).await.unwrap();
+        assert_eq!(status, "claimed");
+        assert_eq!(count(pool, "task_claim_events").await, events_before);
     }
 
     /// A full project is not a failure: the claim is given back so a later pass tries again, and

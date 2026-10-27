@@ -178,7 +178,15 @@ pub(super) async fn queue_revert(
             target = state.target
         );
         let reason = "revert_on_red was turned off before the revert was queued".to_owned();
-        return settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await;
+        return settle_failed_revert(
+            pool,
+            project_id,
+            merge_sha,
+            &summary,
+            reason,
+            incident::RevertEnd::Dropped,
+        )
+        .await;
     }
     let (Ok(sha), Ok(target)) = (CommitSha::new(merge_sha), Branch::new(&state.target)) else {
         let reason = "the culprit or the target is not something the queue accepts".to_owned();
@@ -224,7 +232,15 @@ pub(super) async fn revert_failed(
         ticket_note(state),
         target = state.target
     );
-    settle_failed_revert(pool, project_id, merge_sha, &summary, reason).await
+    settle_failed_revert(
+        pool,
+        project_id,
+        merge_sha,
+        &summary,
+        reason,
+        incident::RevertEnd::Failed,
+    )
+    .await
 }
 
 /// ` (vcs request #N)` when the state holds the revert's ticket, nothing otherwise.
@@ -242,12 +258,16 @@ pub(super) async fn settle_failed_revert(
     merge_sha: &str,
     summary: &str,
     reason: String,
+    end: incident::RevertEnd,
 ) -> Step {
     match verify_postgate::fail_revert(pool, project_id, merge_sha, summary).await {
-        Ok(true) => Step::RevertFailed {
-            merge_sha: merge_sha.to_owned(),
-            reason,
-        },
+        Ok(true) => {
+            incident::settle_after_revert(pool, project_id, merge_sha, end).await;
+            Step::RevertFailed {
+                merge_sha: merge_sha.to_owned(),
+                reason,
+            }
+        }
         Ok(false) => Step::Waiting {
             sha: merge_sha.to_owned(),
         },

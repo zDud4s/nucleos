@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::task_claims::{
-    self, ClaimOutcome, Closer, Holder, HolderKind, MASTER_RED_KEY, NewTask, TaskKind, TaskRow, keys,
+    self, ClaimOutcome, Closer, Holder, HolderKind, MASTER_RED_KEY, NewTask, Status, TaskKind, TaskRow,
+    keys,
 };
 
 /// The postgate as a claimant: its id is the project, its worktree the one the gate checks out.
@@ -335,6 +336,100 @@ pub(super) async fn claim_for_revert(
             tracing::warn!(project = project_id, incident = row.id, %error, "postgate: cannot claim the incident");
             RevertRight::Unknown
         }
+    }
+}
+
+/// One poll of "red, reported, unreverted, and the incident is free or already the gate's": claim
+/// it and start the revert. `None` means nothing to do, and the tick carries on.
+///
+/// `tip` is the target's current tip. The step acts only when it is the sha the red was attempted
+/// on (`state.last_attempted_sha`): a target that moved on since is judged again by the gate, and a
+/// stale red must never start a revert. The caller (the `Decision::Idle` arm) already implies this;
+/// the check keeps the function safe on its own.
+pub(super) async fn takeover_step(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    state: &State,
+    tip: &str,
+    rules: &crate::config::AutopilotRules,
+) -> Option<Step> {
+    let culprit = state.culprit_sha.as_deref()?;
+    if !rules.revert_on_red
+        || state.red_groups.is_empty()
+        || state.red_phase.is_some()
+        || state.revert_merge_sha.is_some()
+        || state.reported_sha.is_none()
+        || state.last_attempted_sha.as_deref() != Some(tip)
+    {
+        return None;
+    }
+    let pool = &executor.pool;
+    let row = live_master_red(pool, project_id).await?;
+    // A revert of this culprit already failed once: the gate does not retry it for ever.
+    if row.detail.get("revert_failed_for").and_then(Value::as_str) == Some(culprit) {
+        return None;
+    }
+    let now = Utc::now();
+    let mine = row.holder_kind == Some(HolderKind::Postgate) && row.holder_id.as_deref() == Some(project_id);
+    if row.status == Status::Claimed
+        && !mine
+        && task_claims::store::is_live(pool, &row, now).await.unwrap_or(true)
+    {
+        return None;
+    }
+    // The gate's own claim without a revert is the crash gap between claim and report: go on.
+    match claim_for_revert(pool, project_id, project_root, state, &row).await {
+        RevertRight::Mine => {}
+        RevertRight::HeldBy { .. } | RevertRight::Unknown => return None,
+    }
+    let summary = format!(
+        "post-merge gate on {target}: incident #{id} has no live owner, so the daemon claimed it \
+         and is reverting {culprit} on {target} through the queue, then a correction run follows \
+         on a fix/ branch.",
+        target = state.target,
+        id = row.id,
+        culprit = short(culprit),
+    );
+    match verify_postgate::restart_revert(pool, project_id, culprit, &summary).await {
+        Ok(true) => Some(Step::IncidentTaken { incident: row.id, merge_sha: culprit.to_owned() }),
+        Ok(false) => None,
+        Err(error) => Some(Step::Failed(format!("cannot start the revert: {error}"))),
+    }
+}
+
+/// Why the revert of a culprit ended without a fix on the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RevertEnd {
+    /// The queue or the correction branch really failed (publication, conflict). Marked on the
+    /// incident so the gate does not retry the same culprit for ever.
+    Failed,
+    /// `revert_on_red` was switched off before the queue received the revert: the owner changed their
+    /// mind, nothing failed. Not marked, so switching it back on resumes the revert.
+    Dropped,
+}
+
+/// A revert of `merge_sha` ended without a fix: let go of the incident (the gate's own claim only),
+/// so a session or a person can take it, and for a real failure remember on the incident that this
+/// culprit's revert failed. The incident stays `open` either way and the feed line is `fail_revert`'s.
+pub(super) async fn settle_after_revert(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    merge_sha: &str,
+    end: RevertEnd,
+) {
+    let Some(mut row) = live_master_red(pool, project_id).await else {
+        return;
+    };
+    if end == RevertEnd::Failed {
+        store_detail(pool, &mut row, &json!({"revert_failed_for": merge_sha}), None, None).await;
+    }
+    if let Some(holder) = holder_of(&row)
+        && holder.kind == HolderKind::Postgate
+        && let Err(error) =
+            task_claims::store::release(pool, row.id, &holder, "the daemon's revert ended without a fix", Utc::now()).await
+    {
+        tracing::warn!(incident = row.id, %error, "postgate: cannot release the incident");
     }
 }
 
