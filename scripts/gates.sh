@@ -206,6 +206,10 @@ heavy_broker() {
   [ -d "${NUCLEOS_HEAVY_DIR:-${HOME:-/nonexistent}/.nucleos/heavy}" ]
 }
 
+# This file's directory, resolved once when it is read: steps run in subdirectories (`run` cds into
+# shell/, sidecars/...), where a relative BASH_SOURCE no longer leads here.
+gates_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })"
+
 heavy_entry() {
   # heavy_entry <main>: the heavy.py to run. <main>'s, unless it predates the single broker and this
   # checkout's copy forwards to master's staged one (`_staged_broker`): the main checkout is the
@@ -213,7 +217,7 @@ heavy_entry() {
   # explicit NUCLEOS_HEAVY_MAIN is taken as it is. The path is one the native python can open.
   local own=""
   if [ -z "${NUCLEOS_HEAVY_MAIN:-}" ] && ! grep -q _staged_broker "$1/scripts/heavy.py" 2>/dev/null; then
-    own="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })/heavy.py"
+    own="$gates_dir/heavy.py"
     grep -q _staged_broker "$own" 2>/dev/null || own=""
   fi
   printf '%s\n' "${own:-$1/scripts/heavy.py}"
