@@ -182,6 +182,12 @@ fn nextest(output: &str) -> Reading {
         if !line[status.len()..].trim_start().starts_with('[') {
             continue;
         }
+        // Recent nextest prints a progress counter `( 376/8074)` before the binary id.
+        let after = after.trim_start();
+        let after = match after.strip_prefix('(').and_then(|r| r.split_once(')')) {
+            Some((_, rest)) => rest,
+            None => after,
+        };
         let mut ids = after.split_whitespace();
         if let (Some(binary), Some(test)) = (ids.next(), ids.next()) {
             let key = (binary.to_owned(), test.to_owned());
@@ -494,6 +500,24 @@ mod tests {
         assert_eq!(extract(&out.replace("2 failed", "3 failed")), None);
         // No summary at all (killed run): not trusted.
         assert_eq!(extract(&out.replace("Summary", "Other")), None);
+    }
+
+    #[test]
+    fn nextest_progress_counter_and_nested_binary_ids_from_a_real_log() {
+        // Verbatim excerpt of a real gate log (nextest with the `( n/total)` counter column).
+        let out = "        PASS [   0.107s] (8075/8075) nucleos-daemon::bin/nucleos-core http::tests::a\n\
+                   ────────────\n\
+                   \x20    Summary [66006.982s] 8075 tests run: 8066 passed (13 slow), \
+                   2 failed, 22 skipped\n\
+                   \x20       FAIL [10805.829s] ( 830/8075) nucleos-app devtime::unexplained::tests::one\n\
+                   \x20       FAIL [54851.162s] (1073/8075) nucleos-app hooks::tests::two\n\
+                   error: test run failed\n\
+                   \x20             FAIL [54851.162s] (1073/8075) nucleos-app hooks::tests::two\n";
+        let failures = extract(out).expect("ids");
+        assert_eq!(
+            ids(&failures),
+            ["devtime::unexplained::tests::one", "hooks::tests::two"]
+        );
     }
 
     #[test]
