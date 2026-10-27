@@ -138,6 +138,50 @@ class WatchTests(unittest.TestCase):
         self.assertIn("free 0/4", back)
         self.assertIn("admitting", W.queue_reason(1, {"weight": 1}, 0, 4))
 
+    def dynamic(self, probe: dict) -> None:
+        """Dynamic admission with a fixed probe, for the rest of the test."""
+        env = mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_FAKE_PROBE": json.dumps(probe),
+                                           "NUCLEOS_HEAVY_ADMISSION": "dynamic"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("NUCLEOS_HEAVY_CAPACITY", None)
+
+    def test_dynamic_view_names_what_holds_the_head(self) -> None:
+        # 0.6 idle cores and 0.4 GB free with one job held: both thresholds fail, weight is moot.
+        self.dynamic({"logical": 12, "total_mb": 16000, "avail_mb": 400, "busy_cores": 11.4})
+        f = self.dir / "held" / "1"
+        f.write_text(json.dumps(self.live()), encoding="utf-8")
+        held = [(f, self.live())]
+        dyn = W.dynamic_state(held, 4)
+        reason = W.queue_reason(1, {"weight": 1}, 1, 4, dyn)
+        self.assertIn("idle 0.6 < 1.0 cores", reason)
+        self.assertIn("RAM 0.4 < 1.5 GB", reason)
+        self.assertNotIn("weight must be freed", reason)
+        self.assertIn("1 ahead", W.queue_reason(2, {"weight": 1}, 1, 4, dyn))
+        # A head whose weight does not fit is flagged: an old broker would still refuse it.
+        self.assertIn("weight-based", W.queue_reason(1, {"weight": 3}, 2, 4, dyn))
+
+    def test_dynamic_view_admits_with_room(self) -> None:
+        self.dynamic({"logical": 12, "total_mb": 16000, "avail_mb": 8000, "busy_cores": 2.0})
+        f = self.dir / "held" / "1"
+        f.write_text(json.dumps(self.live()), encoding="utf-8")
+        os.utime(f, (time.time() - 60, time.time() - 60))
+        dyn = W.dynamic_state([(f, self.live())], 4)
+        self.assertEqual(dyn["short"], [])
+        self.assertIn("admitting", W.queue_reason(1, {"weight": 1}, 1, 4, dyn))
+
+    def test_dynamic_frame_counts_jobs_and_shows_the_probe(self) -> None:
+        self.dynamic({"logical": 12, "total_mb": 16000, "avail_mb": 8000, "busy_cores": 2.0})
+        text = W.frame({})
+        self.assertIn("jobs ", text)
+        self.assertIn("admission dynamic:", text)
+        self.assertIn("idle 10.0/1.0 cores", text)
+
+    def test_static_frame_keeps_the_weight_bar(self) -> None:
+        text = W.frame({})
+        self.assertIn("capacity ", text)
+        self.assertNotIn("admission dynamic:", text)
+
     def test_badges_mark_warm_and_prio(self) -> None:
         warm = W.badges({"agent": "warm", "prio": 3})
         self.assertIn("WARM", warm)
