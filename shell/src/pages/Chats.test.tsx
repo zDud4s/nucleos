@@ -4456,14 +4456,20 @@ describe("slash commands routed to /command", () => {
   function slashFetch(
     commands: Command[],
     reply: (body: { text: string }) => unknown,
-    opts: { cwd?: string | null } = {},
+    opts: { cwd?: string | null; running?: boolean } = {},
   ) {
     const rows = [
       chatSummary({ chat_id: "c-1", cwd: opts.cwd === undefined ? "C:/Projects/nucleos" : opts.cwd }),
     ];
     const base = chatsFetch(
       rows,
-      { "c-1": [turnRow({ id: 1, asked: "ola", answer: "tudo bem" })] },
+      {
+        "c-1": [
+          opts.running
+            ? turnRow({ id: 1, asked: "ola", status: "running", answer: null })
+            : turnRow({ id: 1, asked: "ola", answer: "tudo bem" }),
+        ],
+      },
       { commands: { "c-1": commands }, roster: ROSTER },
     );
     return async (path: string, init?: RequestInit) => {
@@ -4644,10 +4650,27 @@ describe("slash commands routed to /command", () => {
     const list = await screen.findByRole("list", { name: "Commands to run" });
 
     expect(await within(list).findByText("built-in")).toBeTruthy();
-    expect(within(list).getByText("projeto")).toBeTruthy();
-    expect(within(list).getByText("pessoal")).toBeTruthy();
+    expect(within(list).getByText("project")).toBeTruthy();
+    expect(within(list).getByText("personal")).toBeTruthy();
     expect(within(list).getByText("plugin")).toBeTruthy();
-    expect(within(list).getByText("skill · projeto")).toBeTruthy();
+    expect(within(list).getByText("skill · project")).toBeTruthy();
+  });
+
+  // F9: the labels are English, like the rest of the shell; the Portuguese ones must be gone.
+  it("slash b picker labels are english", async () => {
+    const mine = { name: "mine", description: "Personal one", hint: null, source: "personal", kind: "command" } as unknown as Command;
+    const skill = { name: "review", description: "Review a change", hint: null, source: "project", kind: "skill" } as unknown as Command;
+    daemon.apiFetch.mockImplementation(slashFetch([help, frob, mine, skill], () => undefined));
+    await renderChats("/chats/c-1");
+
+    const box = await screen.findByLabelText("Message");
+    fireEvent.change(box, { target: { value: "/", selectionStart: 1 } });
+    const list = await screen.findByRole("list", { name: "Commands to run" });
+
+    expect(await within(list).findByText("personal")).toBeTruthy();
+    expect(within(list).queryByText("pessoal")).toBeNull();
+    expect(within(list).queryByText("projeto")).toBeNull();
+    expect(within(list).queryByText("skill · projeto")).toBeNull();
   });
 
   const mine = { name: "mine", description: "Personal one", hint: "<arg>", source: "personal", kind: "command" } as unknown as Command;
@@ -4748,6 +4771,188 @@ describe("slash commands routed to /command", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "/frob" }));
     await waitFor(() => expect(box.value).toBe("/help frob"));
+  });
+
+  /* ------------------------------------------------ phase b: cards and controls -- */
+
+  const builtin = (name: string, hint: string | null = null) =>
+    ({ name, description: `Built-in ${name}`, hint, source: "builtin", kind: "command" }) as unknown as Command;
+
+  /** Says `text` to a chat whose command route answers `reply`, then waits for the post. */
+  async function sayCommand(
+    text: string,
+    reply: () => unknown,
+    names: string[],
+    opts: { running?: boolean } = {},
+  ) {
+    daemon.apiFetch.mockImplementation(slashFetch([help, ...names.map((n) => builtin(n))], reply, opts));
+    await renderChats("/chats/c-1");
+    await typeWhenListed(text);
+    fireEvent.click(await screen.findByRole("button", { name: "Send" }));
+    await waitFor(() => expect(posted()).toHaveLength(1));
+  }
+
+  // Card payloads (core side): notice {text}; context {engine, model, used_tokens, window_tokens,
+  // percent, turns}; cost {total_usd, turns, unmeasured_turns, since_clear_usd, turn_budget_usd}; effort {current,
+  // efforts}; dirs {cwd, extra_dirs}; budget {turn_budget_usd, warning}.
+  it("slash b notice card renders", async () => {
+    await sayCommand(
+      "/stop",
+      () => ({ kind: "card", card: { kind: "notice", data: { text: "Nothing running" } } }),
+      ["stop"],
+    );
+    expect(await screen.findByText("Nothing running")).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
+  it("slash b context card shows no measure on local", async () => {
+    await sayCommand(
+      "/context",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "context",
+          data: {
+            engine: "local",
+            model: "qwen3",
+            used_tokens: null,
+            window_tokens: null,
+            percent: null,
+            turns: 3,
+          },
+        },
+      }),
+      ["context"],
+    );
+    expect(await screen.findByText(/no measure on this engine/i)).toBeTruthy();
+  });
+
+  it("slash b cost card shows unmeasured turns", async () => {
+    await sayCommand(
+      "/cost",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "cost",
+          data: { total_usd: 1.25, turns: 5, unmeasured_turns: 2, since_clear_usd: 1.25, turn_budget_usd: null },
+        },
+      }),
+      ["cost"],
+    );
+    expect(await screen.findByText(/\$1\.25/)).toBeTruthy();
+    expect(screen.getByText(/2 turns? (with no cost|unmeasured)/i)).toBeTruthy();
+  });
+
+  it("slash b effort card lists levels", async () => {
+    await sayCommand(
+      "/effort",
+      () => ({
+        kind: "card",
+        card: { kind: "effort", data: { current: "high", efforts: ["low", "medium", "high"] } },
+      }),
+      ["effort"],
+    );
+    expect(await screen.findByText(/low/)).toBeTruthy();
+    expect(screen.getByText(/medium/)).toBeTruthy();
+    expect(screen.getAllByText(/high/).length).toBeGreaterThan(0);
+  });
+
+  it("slash b dirs card lists cwd and extra dirs", async () => {
+    await sayCommand(
+      "/add-dir",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "dirs",
+          data: { cwd: "C:/Projects/nucleos", extra_dirs: ["C:/Projects/other", "D:/shared"] },
+        },
+      }),
+      ["add-dir"],
+    );
+    expect(await screen.findByText(/C:\/Projects\/other/)).toBeTruthy();
+    expect(screen.getByText(/D:\/shared/)).toBeTruthy();
+    expect(screen.getAllByText(/C:\/Projects\/nucleos/).length).toBeGreaterThan(0);
+  });
+
+  it("slash b budget card shows warning", async () => {
+    await sayCommand(
+      "/budget 2",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "budget",
+          data: { turn_budget_usd: 2, warning: "This engine does not report cost, so the budget is not enforced." },
+        },
+      }),
+      ["budget"],
+    );
+    expect(await screen.findByText(/does not report cost/i)).toBeTruthy();
+  });
+
+  it("slash b budget card shows the global budget snapshot", async () => {
+    await sayCommand(
+      "/budget",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "budget",
+          data: {
+            turn_budget_usd: null,
+            global: {
+              limit_usd: 50,
+              period: "week",
+              hourly_limit_usd: null,
+              per_run_reserve_usd: 0.5,
+              time_cost_per_hour_usd: 0,
+              window_spend_usd: 12.3,
+              hourly_spend_usd: 0,
+              paused: true,
+              reason: "weekly limit reached",
+              relay_chain_limit_usd: 5,
+            },
+          },
+        },
+      }),
+      ["budget"],
+    );
+    expect(await screen.findByText(/Global budget \$50\.00 per week, \$12\.30 spent/)).toBeTruthy();
+    expect(await screen.findByText(/Paused: weekly limit reached/)).toBeTruthy();
+  });
+
+  it("slash b open model_menu opens the model menu", async () => {
+    await sayCommand("/model", () => ({ kind: "open", control: "model_menu" }), ["model"]);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /change the model/i, hidden: true }).getAttribute("aria-expanded")).toBe("true"),
+    );
+    expect(await screen.findByRole("menu")).toBeTruthy();
+  });
+
+  it("slash b open permission_menu opens the permission menu", async () => {
+    await sayCommand("/permissions", () => ({ kind: "open", control: "permission_menu" }), ["permissions"]);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^Permissions:/, hidden: true }).getAttribute("aria-expanded")).toBe("true"),
+    );
+    expect(await screen.findByRole("menu")).toBeTruthy();
+  });
+
+  it("slash b open project_picker opens the picker", async () => {
+    await sayCommand("/project", () => ({ kind: "open", control: "project_picker" }), ["project"]);
+    expect(await screen.findByRole("dialog", { name: /where this conversation runs/i })).toBeTruthy();
+  });
+
+  // Spec §9: a built-in that only reads state, or stops, must not wait behind a running turn.
+  it("slash b builtin accepted while a turn runs", async () => {
+    await sayCommand(
+      "/cost",
+      () => ({
+        kind: "card",
+        card: { kind: "cost", data: { total_usd: 0.5, turns: 1, unmeasured_turns: 0, since_clear_usd: 0.5, turn_budget_usd: null } },
+      }),
+      ["cost"],
+      { running: true },
+    );
+    expect(await screen.findByText(/\$0\.50/)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
   });
 });
 
