@@ -632,7 +632,9 @@ HINTS_FILE = "ide-verify-hints.json"  # equals verify_box::HINTS_FILE
 HINT_VALUE_FLAGS = ("-C", "--manifest-path", "--config", "--color", "-Z", "--prefix", "--cwd")
 VERIFY_HINT = (
     "this project verifies through the daemon: call mcp__nucleos__verify to run this "
-    "worktree's build, test and gate commands in its queue and cache, and wait on it with "
+    "worktree's build, test and gate commands in its queue and cache; it answers within "
+    "seconds with the verdict or a ticket, which you wait on in the background with "
+    "`nucleos-core --verify-ticket <id>` (Monitor or Bash run_in_background); never poll "
     "mcp__nucleos__verify_status. Nothing was refused; this command runs as written."
 )
 
@@ -652,12 +654,46 @@ def _norm_path(path: str) -> str:
     return plain.lower() if os.name == "nt" else plain
 
 
+# Words that run the word after them: a launcher, an interpreter or the heavy-command broker.
+# `_program_words` steps over them (and their own flags) to reach what actually runs.
+HINT_LAUNCHERS = {
+    "env", "time", "nice", "sudo", "npx", "call", "exec", "command",
+    "python", "python3", "py", "bash", "sh", "node", "pwsh", "powershell", "heavy.py",
+}
+
+
+def _program_words(words: list) -> list:
+    """The indexes of `words` that sit in command position.
+
+    The first word that is not a `NAME=value` assignment runs; a launcher in that position hands
+    command position on to the first word after it that is not a flag or an assignment. Every other
+    word is an argument: `echo cargo test` or `grep cargo src` runs `echo` and `grep`, not cargo.
+    """
+    positions = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if "=" in word.split("/", 1)[0] and not word.startswith("-"):
+            index += 1
+            continue
+        if positions and word.startswith("-"):
+            index += 1
+            continue
+        positions.append(index)
+        if word.rsplit("/", 1)[-1].lower().removesuffix(".exe") not in HINT_LAUNCHERS:
+            break
+        index += 1
+    return positions
+
+
 def _runs_verification(command: str, entry: dict) -> bool:
     """Whether `command` runs one of the entry's gated tools or gate entrypoints.
 
-    Deliberately over-broad, like governed_git_verb: an over-match costs one sentence of context,
-    never a decision. A gated tool with allowed subcommands needs a subcommand that is not one of
-    them (a bare call or `--version` does not match); a tool with none matches any use.
+    Over-broad where it is cheap, like governed_git_verb: an over-match costs one sentence of
+    context, never a decision. But only a word in command position counts (`_program_words`), so a
+    tool's name as an argument (`echo cargo test`, `git commit -m "cargo test"`) is not a run. A
+    gated tool with allowed subcommands needs a subcommand that is not one of them (a bare call or
+    `--version` does not match); a tool with none matches any use.
     """
     tools = entry.get("tools")
     tools = {str(k).lower(): v for k, v in tools.items()} if isinstance(tools, dict) else {}
@@ -670,7 +706,8 @@ def _runs_verification(command: str, entry: dict) -> bool:
         segments = [part for chunk in segments for part in chunk.split(separator)]
     for segment in segments:
         words = [w.strip("\"'") for w in segment.replace("\\", "/").split()]
-        for index, word in enumerate(words):
+        for index in _program_words(words):
+            word = words[index]
             base = word.rsplit("/", 1)[-1].lower()
             if base.endswith(".exe"):
                 base = base[:-4]

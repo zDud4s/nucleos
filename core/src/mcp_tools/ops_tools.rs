@@ -414,10 +414,14 @@ impl NucleosTools {
 
     #[tool(
         description = "Verify a worktree: only the daemon runs verification, so call this instead of \
-                       running tests or checks yourself. Blocks for about 45 seconds and returns the \
-                       result, or a ticket with progress to read back through verify_status. \
-                       worktree is required outside a job node. In a project with no \
-                       nucleos.tests.yaml, scope own runs nothing."
+                       running tests or checks yourself. Returns within seconds, with the result \
+                       if it is already known, otherwise with a ticket and a wait_with field \
+                       saying how to wait: in a daemon worktree run, end your turn and the daemon \
+                       resumes you with the verdict; in an IDE session, run the nucleos-core \
+                       --verify-ticket command it names in the background (Monitor or Bash \
+                       run_in_background) and you are woken when it exits. Never poll \
+                       verify_status. worktree is required outside a job node. In a project with \
+                       no nucleos.tests.yaml, scope own runs nothing."
     )]
     pub(super) async fn verify(
         &self,
@@ -444,7 +448,8 @@ impl NucleosTools {
                     base.as_deref(),
                     task_id.as_deref(),
                 )
-                .await,
+                .await
+                .map(|answer| with_wait_hint(&self.served, answer)),
         )
     }
 
@@ -613,8 +618,10 @@ impl NucleosTools {
     }
 
     #[tool(
-        description = "Read a verification ticket: per-unit status, durations and output tails. \
-                       Blocks up to about 45 seconds for it to finish unless wait is false."
+        description = "Read a verification ticket once: per-unit status, durations and output \
+                       tails. It returns within seconds, finished or not. It is for reading a \
+                       ticket, not for waiting: do not call it in a loop. A ticket that is not \
+                       done carries a wait_with field saying how to wait for it without polling."
     )]
     pub(super) async fn verify_status(
         &self,
@@ -622,9 +629,98 @@ impl NucleosTools {
     ) -> String {
         json_result(
             self.client
-                .verify_status(ticket, wait.unwrap_or(true))
+                .verify_status(ticket, wait.unwrap_or(true), None)
                 .await
-                .and_then(|answer| ticket_for_box(&self.served, ticket, answer)),
+                .and_then(|answer| ticket_for_box(&self.served, ticket, answer))
+                .map(|answer| with_wait_hint(&self.served, answer)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn description_of(name: &str) -> String {
+        NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.description.map(|text| text.into_owned()))
+            .unwrap_or_else(|| panic!("no tool {name} registered"))
+    }
+
+    /// **An unfinished ticket tells an IDE session the exact command to wait with, and a daemon run
+    /// to end its turn.** A done ticket gets no field.
+    #[test]
+    fn verify_answer_names_ticket_command_for_ide_box() {
+        let pending = serde_json::json!({ "ticket": 42, "done": false, "verdict": null });
+        let ide = McpBox::Worktree("/work/a".to_string());
+
+        let answer = with_wait_hint(&ide, pending.clone());
+        let text = answer["wait_with"].as_str().expect("wait_with is set");
+        // The daemon's own path, not a bare `nucleos-core` that is on nobody's PATH.
+        assert!(
+            text.starts_with(&format!("{} --verify-ticket 42:", verify_client_program())),
+            "the IDE box gets the exact command: {text:?}"
+        );
+        assert!(
+            text.contains("run_in_background") && text.contains("do not poll verify_status"),
+            "and how to run it: {text:?}"
+        );
+
+        let job = with_wait_hint(&McpBox::JobNode(7), pending.clone());
+        let text = job["wait_with"].as_str().expect("wait_with is set");
+        assert!(
+            text.contains("item gate") && !text.contains("resumes you"),
+            "a job node is never resumed with a verdict: {text:?}"
+        );
+
+        for served in [McpBox::All, McpBox::Team(8)] {
+            let answer = with_wait_hint(&served, pending.clone());
+            let text = answer["wait_with"].as_str().expect("wait_with is set");
+            assert!(
+                text.contains("end your turn") && !text.contains("--verify-ticket"),
+                "a daemon-run box ends its turn instead: {text:?}"
+            );
+            // Chats, councils and non-worktree runs are never woken: they read the verdict once.
+            assert!(
+                text.contains("read it once with verify_status")
+                    && text.contains("never loop on verify_status"),
+                "any other session is not promised a resume: {text:?}"
+            );
+        }
+
+        let done = serde_json::json!({ "ticket": 42, "done": true, "verdict": "passed" });
+        assert_eq!(
+            with_wait_hint(&ide, done.clone()),
+            done,
+            "a finished ticket carries no wait_with"
+        );
+    }
+
+    /// **Neither description invites a model to sit in a verify_status loop.**
+    #[test]
+    fn tool_descriptions_do_not_invite_polling() {
+        let verify = description_of("verify");
+        let status = description_of("verify_status");
+        for (name, text) in [("verify", &verify), ("verify_status", &status)] {
+            assert!(
+                !text.contains("45 seconds") && !text.contains("Blocks"),
+                "{name} must not promise a long block: {text:?}"
+            );
+            assert!(
+                text.contains("within seconds"),
+                "{name} says it returns within seconds: {text:?}"
+            );
+        }
+        assert!(
+            verify.contains("Never poll verify_status"),
+            "verify says not to poll: {verify:?}"
+        );
+        assert!(
+            status.contains("not for waiting") && status.contains("do not call it in a loop"),
+            "verify_status is for reading, not waiting: {status:?}"
+        );
     }
 }

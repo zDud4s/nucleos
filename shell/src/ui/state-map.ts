@@ -277,6 +277,10 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     postgate_red: { tone: "danger", label: "target went red after a merge" },
     // The post-merge gate did not run, and says why: a daemon verification already passed on the same tree, waiting for the interval, or waiting for an idle machine (`verify/postgate.rs`). A fact, not a question.
     postgate_held: { tone: "info", label: "post-merge gate held" },
+    // A run that asked for a verification was not resumed with its verdict (`execution/runs/
+    // verify_wake.rs`): no slot, a non-completed origin, or a ticket that never finished. The
+    // verdict stays readable with verify_status, so it is a fact, not a failure.
+    verify_wake_refused: { tone: "info", label: "verify wake refused" },
     // Teams.
     team_run_started: { tone: "info", label: "team run started" },
     team_run_finished: { tone: "info", label: "team run settled" },
