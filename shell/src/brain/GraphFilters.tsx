@@ -8,7 +8,7 @@ import { Segments } from "./Segments";
  * and orphans. A bar, never laid over the nodes.
  */
 
-export const NODE_KINDS: readonly GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file", "job"];
+export const NODE_KINDS: readonly GNodeKind[] = ["note", "knowledge", "project", "contact", "mail", "file", "job", "theme"];
 
 export const EDGE_TYPES: readonly GEdgeType[] = [
   "relates",
@@ -18,16 +18,18 @@ export const EDGE_TYPES: readonly GEdgeType[] = [
   "supersedes",
   "supersedes_k",
   "scope",
+  "member",
 ];
 
 /** The two edge types that are not a note's `link_type` get words of their own. */
 const EDGE_LABELS: Partial<Record<GEdgeType, string>> = {
   supersedes_k: "replaces (knowledge)",
   scope: "project scope",
+  member: "theme member",
 };
 
 /** Node kinds in the same case as the list's Type segments; link types stay the daemon's words. */
-const KIND_LABELS: Record<GNodeKind, string> = {
+export const KIND_LABELS: Record<GNodeKind, string> = {
   note: "Note",
   knowledge: "Knowledge",
   project: "Project",
@@ -35,6 +37,7 @@ const KIND_LABELS: Record<GNodeKind, string> = {
   mail: "Mail",
   file: "File",
   job: "Job",
+  theme: "Theme",
 };
 
 const STATES: readonly (readonly [GFilters["state"], string])[] = [

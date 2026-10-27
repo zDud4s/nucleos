@@ -1025,7 +1025,7 @@ pub async fn expire_orphaned_approvals(pool: &SqlitePool) -> sqlx::Result<u64> {
     Ok(expired.len() as u64)
 }
 
-async fn record_expiries(
+pub(crate) async fn record_expiries(
     transaction: &mut Transaction<'_, Sqlite>,
     ids: &[i64],
     note: &str,

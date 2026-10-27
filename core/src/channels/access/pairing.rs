@@ -252,7 +252,8 @@ pub async fn pairing_status(
 
 /// `/pair <code>`, called by `ingest` BEFORE `admit`. Compares `sha256(channel + code)` with the
 /// channel's ONE live code. On success, in one transaction: the code is marked used, the identity
-/// rows are written (a thread writes its parent too, `home = 0`) and the confirmation is queued.
+/// rows are written (a thread writes its parent too, `home = 0`), a channel taking its first home
+/// becomes primary when none is set, and the confirmation is queued.
 /// A wrong code counts an attempt; an expired, used, cancelled, superseded or exhausted code is
 /// refused without counting.
 pub async fn pair(
@@ -339,6 +340,9 @@ pub async fn pair(
         now,
     )
     .await?;
+    if takes_home {
+        super::identities::adopt_primary_if_unset(&mut tx, channel).await?;
+    }
 
     outbox::enqueue(
         &mut tx,
@@ -966,5 +970,82 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(paired, 1);
+    }
+
+    async fn stored_primary(pool: &SqlitePool) -> Option<String> {
+        sqlx::query_scalar("SELECT primary_channel FROM channels_global WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn feed_cursor(pool: &SqlitePool, channel: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT feed_cursor FROM channel_routing_state WHERE channel = ?")
+            .bind(channel)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn pair_fresh(st: &AppState, channel: &'static str, conversation: &str) -> PairOutcome {
+        let minted = mint_pairing_code(&st.pool, channel, now()).await.unwrap();
+        pair(
+            st,
+            channel,
+            &minted.code,
+            &private(conversation),
+            &who("u1"),
+            now(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pairing_the_first_channel_makes_it_primary_and_reseeds_it() {
+        let st = state().await;
+        assert_eq!(stored_primary(&st.pool).await, None);
+        let old = nucleos_base::feed::append(&st.pool, None, "summary", "old news", None, None)
+            .await
+            .unwrap();
+
+        let outcome = pair_fresh(&st, "telegram", "c1").await;
+        assert_eq!(outcome, PairOutcome::Paired { home: true });
+        assert_eq!(stored_primary(&st.pool).await.as_deref(), Some("telegram"));
+        assert_eq!(
+            feed_cursor(&st.pool, "telegram").await,
+            Some(old),
+            "the new primary starts at the newest line, so the backlog is not announced"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_another_channel_keeps_the_existing_primary() {
+        let st = state().await;
+        pair_fresh(&st, "telegram", "c1").await;
+        assert_eq!(stored_primary(&st.pool).await.as_deref(), Some("telegram"));
+
+        let outcome = pair_fresh(&st, "fake", "f1").await;
+        assert_eq!(outcome, PairOutcome::Paired { home: true });
+        assert_eq!(stored_primary(&st.pool).await.as_deref(), Some("telegram"));
+        assert_eq!(
+            feed_cursor(&st.pool, "fake").await,
+            None,
+            "a channel that did not become primary is not reseeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_without_taking_the_home_does_not_adopt_a_cleared_primary() {
+        let st = state().await;
+        pair_fresh(&st, "telegram", "c1").await;
+        sqlx::query("UPDATE channels_global SET primary_channel = NULL WHERE id = 1")
+            .execute(&st.pool)
+            .await
+            .unwrap();
+
+        let outcome = pair_fresh(&st, "telegram", "c2").await;
+        assert_eq!(outcome, PairOutcome::Paired { home: false });
+        assert_eq!(stored_primary(&st.pool).await, None);
     }
 }

@@ -145,11 +145,28 @@ pub const MAX_READ: usize = 200;
 /// column list is [`COLUMNS`] and nothing else, so a reader outside this module cannot fall behind
 /// the table by naming twelve of its twenty-six columns — which is precisely how the handler that
 /// used to hold this query would have survived `0143` by silently returning nothing.
+///
+/// Conversation observations are left out: they are the owner's raw material, listed only by
+/// [`observations`] when asked for by name, so a screen that shows what the brain knows never
+/// mixes them in.
 pub async fn all(pool: &SqlitePool) -> sqlx::Result<Vec<Known>> {
     // `AssertSqlSafe`, audited: the only interpolation is [`COLUMNS`], a literal.
     sqlx::query_as::<_, Known>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM knowledge ORDER BY id DESC LIMIT 500"
+        "SELECT {COLUMNS} FROM knowledge WHERE scope_kind <> 'observation' \
+         ORDER BY id DESC LIMIT 500"
     )))
+    .fetch_all(pool)
+    .await
+}
+
+/// The conversation observations, newest first, at most `limit`.
+pub async fn observations(pool: &SqlitePool, limit: i64) -> sqlx::Result<Vec<Known>> {
+    // `AssertSqlSafe`, audited: the only interpolation is [`COLUMNS`], a literal.
+    sqlx::query_as::<_, Known>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM knowledge WHERE scope_kind = 'observation' \
+         ORDER BY id DESC LIMIT ?"
+    )))
+    .bind(limit)
     .fetch_all(pool)
     .await
 }

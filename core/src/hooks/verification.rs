@@ -3,7 +3,7 @@
 use super::*;
 
 /// What a refused verification command is told: the daemon verifies, the run does not.
-pub(super) const VERIFY_GUARD_REFUSAL: &str = "this project verifies through the daemon: call mcp__nucleos__verify and wait on it with mcp__nucleos__verify_status instead of running build, test or gate commands yourself";
+pub(super) const VERIFY_GUARD_REFUSAL: &str = "this project verifies through the daemon: call mcp__nucleos__verify instead of running build, test or gate commands yourself; it answers within seconds with the verdict or a ticket whose verdict is delivered to you (a daemon worktree run: end your turn and it resumes you with it; a job node is not resumed, its item gate verifies after it ends) or waited on with `nucleos-core --verify-ticket <id>` in the background (IDE sessions); never poll verify_status";
 
 /// F2b steps 1-2: records a verification command the run executed by itself, and says whether
 /// the call must be refused (`true`).

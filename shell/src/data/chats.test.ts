@@ -15,6 +15,7 @@ import { createAppQueryClient } from "../app/queryClient";
 import type { Turn } from "../lib/turns";
 import {
   conversationInterval,
+  postChatCommand,
   useChatTranscript,
   useLiveTurn,
   useLiveTurnSnapshot,
@@ -249,5 +250,19 @@ describe("chat data layer", () => {
 
     expect(result.current).toEqual(live);
     expect(daemon.apiFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("postChatCommand", () => {
+  it("slash posts to the command route", async () => {
+    daemon.apiFetch.mockResolvedValue({ kind: "open", control: "model_menu" });
+
+    await postChatCommand("c-1", "/model");
+
+    expect(daemon.apiFetch).toHaveBeenCalledTimes(1);
+    const [path, init] = daemon.apiFetch.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe("/assistant/chats/c-1/command");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toMatchObject({ text: "/model" });
   });
 });

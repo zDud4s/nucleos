@@ -52,6 +52,9 @@ pub struct ChatNotice {
 pub const KIND_RESTART: &str = "restart";
 /// A rooted turn that has just read third-party text and is read-only from here on.
 pub const KIND_UNTRUSTED: &str = "untrusted";
+/// A linked browser agent's reply that could not be delivered to its parent conversation. Unlike
+/// every other kind, the parent's next turn sees it once (`take_unconsumed`).
+pub const KIND_BROWSER_REPLY: &str = "browser_reply";
 /// What a `restart` notice says.
 pub const RESTART_NOTICE: &str = "The daemon restarted during this turn; the session is intact.";
 /// What an `untrusted` notice says.
@@ -162,6 +165,48 @@ pub async fn for_chat_since(
     .bind(since)
     .fetch_all(pool)
     .await
+}
+
+/// Whether this conversation has a notice of `kind` that no turn has consumed yet. Consumes nothing:
+/// a caller that must do something BEFORE it may take them (mark its run, say) asks this first, so a
+/// step that fails in between leaves the notices for the next turn instead of losing them.
+pub async fn has_unconsumed(pool: &SqlitePool, chat_id: &str, kind: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM chat_notices
+                         WHERE chat_id = ? AND kind = ? AND consumed_by_run IS NULL)",
+    )
+    .bind(chat_id)
+    .bind(kind)
+    .fetch_one(pool)
+    .await
+}
+
+/// The bodies of this conversation's notices of `kind` that no turn has consumed yet, oldest
+/// first, stamped `consumed_by_run = run_id` so the next turn does not see them again.
+pub async fn take_unconsumed(
+    pool: &SqlitePool,
+    chat_id: &str,
+    kind: &str,
+    run_id: i64,
+) -> sqlx::Result<Vec<String>> {
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, body FROM chat_notices
+          WHERE chat_id = ? AND kind = ? AND consumed_by_run IS NULL ORDER BY id",
+    )
+    .bind(chat_id)
+    .bind(kind)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (id, _) in &rows {
+        sqlx::query("UPDATE chat_notices SET consumed_by_run = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(rows.into_iter().map(|(_, body)| body).collect())
 }
 
 #[cfg(test)]

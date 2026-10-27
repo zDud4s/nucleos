@@ -32,6 +32,8 @@ pub struct DossierInputs {
     pub recovery: Option<Recovery>,
     pub known_titles: Vec<String>,
     pub gate_outputs: Vec<(i64, String)>,
+    /// Chat exchanges: run id, what the owner wrote, the answer.
+    pub conversation: Vec<(i64, String, String)>,
 }
 
 /// The text handed to the model and the runs whose text survived the cut.
@@ -41,7 +43,7 @@ pub struct Dossier {
 }
 
 /// Keep the first `width` characters (char-safe).
-fn clip_head(s: &str, width: usize) -> String {
+pub(crate) fn clip_head(s: &str, width: usize) -> String {
     s.chars().take(width).collect()
 }
 
@@ -78,7 +80,7 @@ fn break_dossier_markers(text: &str) -> String {
 
 /// Every raw text leaves redacted (`judge::redact_for_judge`: it goes to a cloud model by default)
 /// and with the dossier's markers broken.
-fn scrub(text: &str) -> String {
+pub(crate) fn scrub(text: &str) -> String {
     break_dossier_markers(&crate::judge::redact_for_judge(text))
 }
 
@@ -104,6 +106,11 @@ fn scrubbed(inputs: &DossierInputs) -> DossierInputs {
             .gate_outputs
             .iter()
             .map(|(id, t)| (*id, scrub(t)))
+            .collect(),
+        conversation: inputs
+            .conversation
+            .iter()
+            .map(|(id, asked, answered)| (*id, scrub(asked), scrub(answered)))
             .collect(),
     }
 }
@@ -142,6 +149,25 @@ fn blocks(inputs: &DossierInputs) -> Vec<(String, Vec<i64>)> {
         out.push((
             format!("## Review output\n{}", body.join("\n\n")),
             reviews.iter().map(|(id, _)| *id).collect(),
+        ));
+    }
+
+    // 2b. A conversation: the exchanges of one chat, each named by its run.
+    let exchanges: Vec<&(i64, String, String)> = inputs
+        .conversation
+        .iter()
+        .filter(|(_, asked, answered)| present(asked) || present(answered))
+        .collect();
+    if !exchanges.is_empty() {
+        let body: Vec<String> = exchanges
+            .iter()
+            .map(|(id, asked, answered)| {
+                format!("Run #{id}:\nOwner: {asked}\nAssistant: {answered}")
+            })
+            .collect();
+        out.push((
+            format!("## Conversation\n{}", body.join("\n\n")),
+            exchanges.iter().map(|(id, _, _)| *id).collect(),
         ));
     }
 
@@ -254,20 +280,39 @@ pub fn dossier(inputs: &DossierInputs, ceiling: usize) -> Dossier {
     Dossier { text, runs }
 }
 
-/// The standing instruction of every extraction call.
-pub const STANDING: &str = "You read the dossier below, about one finished piece of work in ONE \
-software project, and write down what is worth remembering for the next time. Answer with a JSON \
-array and nothing else: 0 to 5 items, each an object with `layer` (episodic, semantic or \
-procedural), `title` (one line), `body` (short) and `files` (repository paths it concerns). Only \
-lessons about THIS project. Never quote the owner context. Do not repeat the known titles. `[]` \
-is a good answer when nothing is worth keeping.";
+const STANDING_HEAD: &str = "You read the dossier below, about one finished piece of work, and write \
+down what is worth remembering the next time. Answer with a JSON array and nothing else: 0 to 5 items, \
+each an object with `layer` (episodic, semantic or procedural), `title` (one line), `body` (short) and \
+`files` (repository paths it concerns). Prefer lessons that would still hold in another project, and say \
+in the body when one is specific to this repository. Never quote the owner context. Do not repeat the \
+known titles. `[]` is a good answer when nothing is worth keeping.";
+
+/// The standing instruction of an extraction call, by the cause that queued the work (spec B10).
+pub fn standing_for(cause: Cause) -> String {
+    let tail = match cause {
+        Cause::JobLanded => " The work landed: ask what made it land, not only what went wrong.",
+        Cause::CalendarWeek => {
+            " The dossier is one week of the owner's calendar, read from another project's point of view: ask for rhythms and habits of the owner (days, hours, durations), as `episodic` items, never the names of third parties."
+        }
+        Cause::ChatExchanges => {
+            " This dossier is a conversation between the owner and an assistant. Write down the preferences, decisions and corrections the owner stated that would still matter in a later session, never a summary of the conversation."
+        }
+        Cause::JobFailed
+        | Cause::GateRecovered
+        | Cause::ReviewBlocking
+        | Cause::RunExhausted
+        | Cause::OwnerAnswered => "",
+    };
+    format!("{STANDING_HEAD}{tail}")
+}
 
 /// The whole extraction prompt: the standing instruction, one line naming why the work was queued
 /// (the closed [`Cause`] vocabulary, never free text), then the dossier.
 pub fn extraction_prompt(cause: Cause, dossier: &str) -> String {
     let why = cause.as_str();
+    let standing = standing_for(cause);
     format!(
-        "{STANDING}\n\nWhy this was queued: {why}\n\n--- DOSSIER ---\n{dossier}\n--- END OF DOSSIER ---"
+        "{standing}\n\nWhy this was queued: {why}\n\n--- DOSSIER ---\n{dossier}\n--- END OF DOSSIER ---"
     )
 }
 

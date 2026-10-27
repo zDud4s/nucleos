@@ -654,7 +654,18 @@ pub(super) fn spawn_run(
             // way here. First writer wins; no rows means someone else finalised the run, which is an
             // outcome rather than a failure — the loop breaks either way.
             match result {
-                Ok(Ok(o)) => {
+                Ok(Ok(mut o)) => {
+                    // A steerable run that ended its turn to wait for a verdict, as it is told to,
+                    // then sits listening until its progress deadline. That silence is the wait,
+                    // not a stall: the run finished its turn, so it ends `completed` and its open
+                    // ticket wakes it below, instead of a `timed_out` nothing would ever wake.
+                    if o.exit_code == crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE
+                        && steerable
+                        && crate::execution::runs::verify_wake::ended_listening(&o.stdout)
+                        && crate::execution::runs::verify_wake::awaits_verdict(&pool, id).await
+                    {
+                        o.exit_code = 0;
+                    }
                     // A CLI that exited non-zero did not do the work, and recording it `completed`
                     // announced a success its own exit code denies — including in the feed row the
                     // user reads. The runner now also reports -1 for a stream that broke after
@@ -914,7 +925,19 @@ pub(super) fn spawn_run(
                     // A handed-off run starts a chain that is still live, so sweep only after the
                     // handoff has had the chance to link its successor. The verdict reader leaves
                     // that chain for a later terminal pass.
-                    if terminal_write_won && let Err(error) = crate::brief::sweep(&pool).await {
+                    //
+                    // A run that asked for a verification and ended before its verdict arrived opens
+                    // a wake (`verify_wake`): the daemon is about to continue it, so the judge-side
+                    // work below (sweep, observation, the judge's look at a failed gate) is deferred
+                    // to the wake's outcome rather than done on a run that is not over.
+                    let wake_open = terminal_status == "completed"
+                        && terminal_write_won
+                        && crate::execution::runs::verify_wake::open_for_exit(&handoff_state, id)
+                            .await;
+                    if terminal_write_won
+                        && !wake_open
+                        && let Err(error) = crate::brief::sweep(&pool).await
+                    {
                         tracing::warn!(%error, run_id = id, "briefing credit not recorded");
                     }
 
@@ -931,6 +954,7 @@ pub(super) fn spawn_run(
                     // `spawn_handoff_if_needed` for a second reason: `successor_run_id` is what
                     // tells `ContextSwelling` the handoff already happened.
                     if terminal_write_won
+                        && !wake_open
                         && let Err(error) = crate::token_efficiency::observe_run(&pool, id).await
                     {
                         // Warned rather than swallowed, like every other best-effort call on this
@@ -949,12 +973,22 @@ pub(super) fn spawn_run(
                     // that did not run, not the code.
                     if terminal_status == "completed"
                         && terminal_write_won
+                        && !wake_open
                         && let Some(exit_code) = gate_failed_exit
                     {
                         tokio::spawn(crate::judge::correction::after_gate_failed(
                             handoff_state.clone(),
                             id,
                             exit_code,
+                        ));
+                    }
+                    // Last, so a continuation never starts while this arm is still working on the
+                    // run: a ticket that finished before its run did is delivered now. One still
+                    // open is delivered by its watcher.
+                    if wake_open {
+                        tokio::spawn(crate::execution::runs::verify_wake::deliver_ready(
+                            handoff_state.clone(),
+                            id,
                         ));
                     }
                     break;

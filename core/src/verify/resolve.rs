@@ -1,6 +1,7 @@
 //! Resolving the repository state and paths to verify.
 
 use super::*;
+use crate::execution::vcs;
 
 /// One git read inside a request's budget.
 ///

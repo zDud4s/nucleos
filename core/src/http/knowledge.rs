@@ -61,6 +61,7 @@ pub(super) fn routes() -> Router<AppState> {
         // Capture requests (spec 2026-10-07-pedidos-captura). In no `auth.rs` table on purpose:
         // Control and Admin only, like the notes an answer becomes.
         .route("/capture-requests", get(get_capture_requests))
+        .route("/capture-digests", get(get_capture_digests))
         .route(
             "/capture-requests/{job_id}/dismiss",
             post(post_capture_dismiss),
@@ -293,6 +294,8 @@ pub(super) struct LeaveNoteResponse {
 pub(super) struct KnowledgeNarrow {
     pub(super) scope_kind: Option<String>,
     pub(super) scope_id: Option<String>,
+    /// Only read with `scope_kind=observation`.
+    pub(super) limit: Option<i64>,
 }
 
 /// Everything the layer holds, in every status.
@@ -301,11 +304,22 @@ pub(super) struct KnowledgeNarrow {
 /// showed only what is in force could not answer "what did it try to learn that I said no to".
 ///
 /// `?scope_kind=&scope_id=` narrows it to one project, team or agent: both or neither, or 422.
+/// The one exception is `?scope_kind=observation[&limit=]`, which lists the conversation
+/// observations and nothing else; the plain list never carries them.
 pub(super) async fn list_knowledge(
     State(state): State<AppState>,
     Query(narrow): Query<KnowledgeNarrow>,
 ) -> Result<Json<Vec<crate::knowledge::Known>>, StatusCode> {
     let scope = match (narrow.scope_kind, narrow.scope_id) {
+        (Some(kind), None) if kind == "observation" => {
+            return crate::knowledge::observations(&state.pool, narrow.limit.unwrap_or(100).clamp(1, 500))
+                .await
+                .map(Json)
+                .map_err(|error| {
+                    tracing::warn!(%error, "listing observations failed");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                });
+        }
         (None, None) => None,
         (Some(kind), Some(id)) => Some(
             refinement_target(&format!("{kind}:{id}")).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?,
@@ -722,6 +736,22 @@ pub(super) async fn get_capture_requests(
         })
 }
 
+/// The digests of the last 14 local days (today included), newest first.
+pub(super) async fn get_capture_digests(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::capture::digest::DigestRow>>, (StatusCode, Json<serde_json::Value>)> {
+    let since = (chrono::Local::now() - chrono::Duration::days(13))
+        .format("%Y-%m-%d")
+        .to_string();
+    crate::capture::digest::list(&state.pool, &since)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "listing capture digests failed");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        })
+}
+
 pub(super) async fn post_capture_dismiss(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
@@ -752,8 +782,9 @@ pub(super) struct CaptureAnswerRequest {
     pub(super) origin: Option<String>,
 }
 
-/// The owner's answer becomes a note linked to the job; it also closes the request and releases the
-/// job when the request is still open. A late answer keeps its note and releases nothing.
+/// The owner's answer becomes a note linked to the job; it also closes the request when it is
+/// still open and re-enqueues the job for a new reading (`requeued`). A late answer keeps its note
+/// and is re-enqueued too, up to the per-job ceiling.
 pub(super) async fn post_capture_answer(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
@@ -761,7 +792,7 @@ pub(super) async fn post_capture_answer(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     use crate::capture::AnswerError;
     let origin = body.origin.as_deref().unwrap_or("shell");
-    let (note_id, released) =
+    let (note_id, requeued) =
         match crate::capture::answer(&state.pool, job_id, &body.note_text, origin).await {
             Ok(done) => done,
             Err(AnswerError::NotFound) => return Err(refusal(StatusCode::NOT_FOUND, "not_found")),
@@ -776,7 +807,7 @@ pub(super) async fn post_capture_answer(
         };
     Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({ "note_id": note_id, "released": released })),
+        Json(serde_json::json!({ "note_id": note_id, "requeued": requeued })),
     ))
 }
 

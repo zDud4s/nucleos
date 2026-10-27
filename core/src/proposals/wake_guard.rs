@@ -15,9 +15,8 @@
 //! 2. The enclosing function of an insert is the last `fn name(` line above it. It has to be in
 //!    [`LISTED`] (or in [`EXEMPT`]). The list is of functions, not a count: the spec says twelve
 //!    creators, but there are thirteen signal sites, because two callers own the transaction.
-//! 3. [`EXEMPT`] holds helpers that insert outside `cfg(test)` without being creators. It is empty
-//!    today: the three sites the plan named (a test helper in `execution/runs.rs` and two lines in
-//!    `governance/autopilot.rs`) turned out not to insert proposals at all in production. An entry
+//! 3. [`EXEMPT`] holds helpers that insert outside `cfg(test)` without being creators (today
+//!    `reopen_proposal_in`, whose caller bumps after its commit). An entry
 //!    that stops matching fails its own test, so the list cannot rot.
 //! 4. `create_team_action_in_transaction` and `propose_in_with` do not bump, because the
 //!    transaction belongs to the caller and the signal must come after its commit. For those two
@@ -65,7 +64,12 @@ const BUMP_IN_BODY: &[(&str, &str)] = &[
 
 /// Helpers that insert a proposal outside `cfg(test)` without being creators:
 /// `(file, function, reason)`. Empty on purpose, see the module comment.
-const EXEMPT: &[(&str, &str, &str)] = &[];
+const EXEMPT: &[(&str, &str, &str)] = &[(
+    "src/knowledge/propose.rs",
+    "reopen_proposal_in",
+    "a helper inside the caller's transaction (`cover::uncover_in`); its only production caller, \
+     `decide::revert`, bumps `Topic::Proposals` after the commit when anything was reopened",
+)];
 
 /// `(file, function, name the body must mention)` for the creators whose transaction is the
 /// caller's: the caller commits and then bumps.
@@ -76,10 +80,11 @@ fn bump_in_callers() -> Vec<(String, &'static str, &'static str)> {
             "propose_action",
             "create_team_action_in_transaction",
         ),
+        // `write_items` owns the transaction; `write_one_item` is where `propose_in_with` is called.
         (
             "src/distill.rs".to_string(),
             "write_items",
-            "propose_in_with",
+            "write_one_item",
         ),
         // The file name is assembled: a guard elsewhere keeps that word out of every other module.
         (format!("src/{}_notes.rs", "owner"), "teach", "propose_in"),
@@ -137,7 +142,8 @@ fn test_only(files: &[(PathBuf, String)]) -> (HashSet<PathBuf>, Vec<PathBuf>) {
             .and_then(|stem| stem.to_str())
             .unwrap_or_default();
         let parent = path.parent().unwrap_or(Path::new(""));
-        let children = if matches!(stem, "mod" | "lib" | "main") {
+        // `app.rs` is a crate root too (`nucleos-app`), so its modules sit beside it.
+        let children = if matches!(stem, "mod" | "lib" | "main" | "app") {
             parent.to_path_buf()
         } else {
             parent.join(stem)
@@ -166,6 +172,19 @@ fn test_only(files: &[(PathBuf, String)]) -> (HashSet<PathBuf>, Vec<PathBuf>) {
                 continue;
             };
             let name = name.trim();
+            // Declared inside an inline `mod outer { ... }` (app.rs's `channels`): the file is
+            // under `outer/`. One level is all the tree has.
+            let indent = line.len() - line.trim_start().len();
+            let children = lines[..index]
+                .iter()
+                .rev()
+                .filter(|above| above.len() - above.trim_start().len() < indent)
+                .find_map(|above| {
+                    let above = above.trim();
+                    let above = above.strip_prefix("pub ").unwrap_or(above);
+                    above.strip_prefix("mod ")?.strip_suffix(" {")
+                })
+                .map_or_else(|| children.clone(), |outer| children.join(outer.trim()));
             test_files.insert(children.join(format!("{name}.rs")));
             test_files.insert(children.join(name).join("mod.rs"));
             test_dirs.push(children.join(name));

@@ -78,7 +78,8 @@ pub fn module_path(path: &Path) -> String {
 
 /// Whether `path` is a module its parent declares as `#[cfg(test)] mod <stem>;`, so the whole
 /// file is test code. The parent is `mod.rs` (or `lib.rs`/`main.rs`) in the same directory, or
-/// `<dir>.rs` beside that directory.
+/// `<dir>.rs` beside that directory, or `app.rs` beside it: `nucleos-app` declares the modules it
+/// adds under `channels` inside an inline `mod channels { ... }` there.
 pub fn is_test_only_module(path: &Path) -> bool {
     let (Some(dir), Some(stem)) = (
         path.parent(),
@@ -89,6 +90,7 @@ pub fn is_test_only_module(path: &Path) -> bool {
     let mut parents = vec![dir.join("mod.rs"), dir.join("lib.rs"), dir.join("main.rs")];
     if let (Some(grand), Some(name)) = (dir.parent(), dir.file_name()) {
         parents.push(grand.join(name).with_extension("rs"));
+        parents.push(grand.join("app.rs"));
     }
     parents
         .iter()
@@ -101,8 +103,28 @@ fn declares_test_only_mod(source: &str, stem: &str) -> bool {
     let lines: Vec<&str> = source.lines().map(str::trim).collect();
     lines.windows(2).any(|w| {
         w[0] == "#[cfg(test)]"
-            && (w[1] == format!("mod {stem};") || w[1] == format!("pub(crate) mod {stem};"))
+            && [
+                format!("mod {stem};"),
+                format!("pub(crate) mod {stem};"),
+                format!("pub mod {stem};"),
+            ]
+            .contains(&w[1].to_owned())
     })
+}
+
+/// `source` up to its test module. Cut at the test module itself, not at any `#[cfg(test)]`:
+/// a test-only helper above it would otherwise hide the production code that follows from
+/// the sweep.
+pub fn production_code(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let end = lines
+        .windows(2)
+        .position(|w| w[0].trim() == "#[cfg(test)]" && w[1].trim_start().starts_with("mod tests"))
+        .unwrap_or(lines.len());
+    lines[..end].join(
+        "
+",
+    )
 }
 
 fn is_rust(path: &Path) -> bool {

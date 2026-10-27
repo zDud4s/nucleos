@@ -7,10 +7,10 @@ export function nodeRadius(degree: number): number {
 
 /**
  * The CSS custom property NAME that colours this node; the canvas reads its value, never writes style.
- * One neutral token for every kind: identity is the node's shape (`markKey` in `marks.tsx`), not its hue.
+ * One token per kind, defined in `force-graph.css`.
  */
-export function colorToken(_node: GNode): string {
-  return "--brain-node";
+export function colorToken(node: GNode): string {
+  return `--brain-node-${node.kind}`;
 }
 
 /** `id` and every node within `depth` edges of it, edges taken in both directions. */

@@ -408,12 +408,13 @@ pub(super) async fn owner_decided(
         Some(_) => DismissError::NotOpen,
     })
 }
-/// The longest a caller that asked to wait is held before it gets a ticket instead.
+/// The longest a vcs ticket wait holds its caller before it gets a ticket instead.
 ///
 /// Spec decision 3. The common case — an empty queue — answers from the first read and never
 /// approaches this. The bad case is two merges queued behind a slow one, and the number exists so
 /// that case stops killing the caller's run by timeout: the agent gets a ticket back and decides for
-/// itself whether to keep waiting.
+/// itself whether to keep waiting. It bounds vcs waits only: verify callers are held
+/// `verify::HOLD` and get their verdict pushed instead of polling for it.
 ///
 /// **The constraint to check this against is `state.rs`'s `DEFAULT_PROGRESS_TIMEOUT` (300s), not the
 /// 600s wall clock.** A CLI blocked on a call for this long streams no events, and the progress

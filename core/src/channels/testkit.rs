@@ -22,6 +22,7 @@ pub async fn state() -> AppState {
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Default::default(),
         fleet: Default::default(),
+        turns: Default::default(),
         utility_model: None,
         files_root: None,
         files_trash: None,

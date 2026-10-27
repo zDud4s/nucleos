@@ -2689,9 +2689,7 @@ mod tests {
                     "{file} produces a knowledge block outside brief.rs; route it through brief::of, brief::for_prompt or loadout::resolve"
                 );
             }
-            if file != "knowledge.rs"
-                && source.contains("Earlier work on this project left the notes below")
-            {
+            if file != "knowledge.rs" && source.contains("Earlier work left the notes below") {
                 panic!(
                     "{file} writes the knowledge preamble outside knowledge.rs; keep PREAMBLE's only definition in knowledge.rs"
                 );

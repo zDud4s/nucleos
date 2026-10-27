@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -174,6 +175,43 @@ class TimeoutLogTests(unittest.TestCase):
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0].get("waited_on"), "gate")
         self.assertEqual(rows[0]["wait_token_s"], 0.0)
+
+    def _attempt(self, heavy, token_error: Exception):
+        """Run one in-process broker attempt whose token acquisition raises `token_error`;
+        returns (exit code, argvs the child was started with)."""
+        started: list = []
+
+        def fake_run_child(argv, env, job, **kw):
+            started.append(list(argv))
+            return 0, {"compiled": False, "test_failed": False, "compile_error": False}
+
+        def boom(*a, **kw):
+            raise token_error
+
+        env = {"NUCLEOS_HEAVY_DIR": self.state}
+        with mock.patch.dict(os.environ, env),                 mock.patch.object(heavy, "acquire_token", boom),                 mock.patch.object(heavy, "run_child", fake_run_child):
+            for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD"):
+                os.environ.pop(k, None)
+            code = heavy._broker_attempt(["--kind", "node", "--", "npm", "test"])
+        return code, started
+
+    def test_a_busy_mutex_in_admission_returns_75_and_never_runs_the_child(self) -> None:
+        heavy = load_heavy()
+        code, started = self._attempt(heavy, heavy.MutexBusy("broker mutex busy"))
+        self.assertEqual(code, heavy.EXIT_QUEUE_TIMEOUT)
+        self.assertEqual(started, [])
+        rows = [r for r in _rows(Path(self.state)) if r.get("exit") == 75]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0].get("waited_on"), "mutex")
+        self.assertNotIn("broker_error", rows[0])
+
+    def test_another_broker_exception_still_fails_open(self) -> None:
+        heavy = load_heavy()
+        code, started = self._attempt(heavy, RuntimeError("bug"))
+        self.assertEqual(code, 0)
+        self.assertEqual(started, [["npm", "test"]])
+        rows = _rows(Path(self.state))
+        self.assertTrue(any("RuntimeError" in str(r.get("broker_error")) for r in rows), rows)
 
     def test_report_splits_exit_75_by_waited_on(self) -> None:
         heavy = load_heavy()

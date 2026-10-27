@@ -4,6 +4,11 @@ mod startup;
 
 use nucleos_app::*;
 use nucleos_core::*;
+// Both crates have a `channels`; the app's is the lib's plus ingest, media and commands, so name it
+// explicitly or the two globs collide (this import also makes `crate::channels` in `http` resolve).
+use nucleos_app::channels;
+// The same for `map`: the library's holds only `intent`, the app's is the whole map.
+use nucleos_app::map;
 
 use auth::Token;
 use state::AppState;
@@ -816,9 +821,13 @@ async fn main() {
         run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         run_tails: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         fleet: Default::default(),
+        turns: Default::default(),
         progress_timeout: state::DEFAULT_PROGRESS_TIMEOUT,
         run_timeout: state::DEFAULT_RUN_TIMEOUT,
     };
+    // Voice and the browser panel start turns through this hook; `nucleos-core` cannot name the
+    // assistant. The slot is shared by every clone of the state, so installing it here covers them all.
+    assistant::install_turns(&state);
 
     let app = http::build_router(state.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", daemon_client::port()))
@@ -979,10 +988,12 @@ async fn main() {
     // `run_events`, and eventually its line in the feed. Nothing removed any of those, so all three
     // grew for as long as the daemon was ever used — and a transcript is stored twice and indexed a
     // third time, so they grew at three times the obvious rate.
-    // The same loop takes the weekly database copy, on the primary instance only.
+    // The same loop takes the weekly database copy, on the primary instance only, and runs the
+    // consolidator, which lives in `nucleos-app` and so is handed in here.
     tokio::spawn(execution::runs::run_retention_loop(
         state.clone(),
         is_primary,
+        Some(std::sync::Arc::new(consolidate::Consolidator)),
     ));
     // Slot occupancy every minute, rolled into daily rows, for the analytics page's pressure
     // metric (spec analytics-pipeline §5.3). Its own loop: the retention loop is hourly and this
@@ -1060,6 +1071,7 @@ async fn main() {
     // for every project there is never one, and a pass reads an empty query.
     tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
     tokio::spawn(verify::exec::run_executor(verify_executor));
+    startup::rearm_verify_wakes(&state).await;
     tokio::spawn(execution::vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(execution::git_exec::GitExecutor {

@@ -6,8 +6,9 @@ use super::*;
 pub enum McpBox {
     All,
     JobNode(i64),
-    /// An interactive (IDE/terminal) session's box: it serves `EVERY_BOX_TOOLS` and nothing else,
-    /// and every call is held to this absolute worktree path. See `worktree_for_call`.
+    /// An interactive (IDE/terminal) session's box: it serves `WORKTREE_BOX_TOOLS` (the verify tools,
+    /// `record` and the work-node tools) and nothing else, and every call is held to this absolute
+    /// worktree path. See `worktree_for_call`.
     Worktree(String),
     /// A team agent's NODE run id; the box serves `TEAM_BASE` and `TEAM_EXTRAS`.
     Team(i64),

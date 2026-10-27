@@ -83,3 +83,15 @@
   outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
+
+.capture-digest + .capture-digest,
+.capture-digest + .capture-item {
+  margin-top: var(--space-4);
+}
+
+.capture-digest-head {
+  margin: 0 0 var(--space-3);
+  font-size: inherit;
+  font-weight: 600;
+  color: var(--text-muted);
+}

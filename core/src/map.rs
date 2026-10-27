@@ -24,7 +24,8 @@
 
 pub mod anchor;
 pub mod flows;
-pub mod intent;
+// `intent` compiles in `nucleos-core`, below this crate, because `distill` asks a model through it.
+pub use nucleos_core::map::intent;
 pub mod items;
 pub mod join;
 pub mod layers;

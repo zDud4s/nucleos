@@ -371,6 +371,21 @@ pub async fn occurrences(
     Ok(found)
 }
 
+/// The recurrence word (`weekly`, ...) of each of `ids` that repeats; a one-off has no entry.
+pub async fn recurrence_of(
+    pool: &sqlx::SqlitePool,
+    ids: &[i64],
+) -> sqlx::Result<std::collections::HashMap<i64, String>> {
+    let rows: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, freq FROM calendar_events WHERE freq IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .filter(|(id, _)| ids.contains(id))
+        .collect())
+}
+
 /// Whether an event is running at `at`.
 ///
 /// **Fails open.** A read error answers `false` — not busy — and the caller notifies. This inverts
@@ -1058,6 +1073,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recurrence_of_names_only_the_repeating_events() {
+        let pool = test_pool().await;
+        let once = one_off(&pool, "2026-08-03T09:00:00", 60).await;
+        let weekly = insert_event(
+            &pool,
+            "gym",
+            local("2026-08-04T07:00:00"),
+            60,
+            LISBON,
+            "human",
+            None,
+            Some(RecurrenceSpec {
+                freq: "weekly",
+                interval: 1,
+                byday: None,
+                until_local: None,
+                count: None,
+            }),
+        )
+        .await
+        .expect("the event to insert");
+        let found = recurrence_of(&pool, &[once, weekly])
+            .await
+            .expect("the read");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found.get(&weekly).map(String::as_str), Some("weekly"));
+    }
+
+    #[tokio::test]
     async fn busy_is_true_inside_an_event_and_false_on_either_side() {
         let pool = test_pool().await;
         // 09:00 Lisbon in August is 08:00Z, so the event runs 08:00Z-09:00Z.
@@ -1406,6 +1450,7 @@ mod tests {
             )),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
