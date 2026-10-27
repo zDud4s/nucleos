@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod changed;
 mod compute;
 mod executor;
 mod ops;
@@ -23,6 +24,7 @@ mod resolution;
 mod transport;
 mod worktrees;
 
+pub use self::changed::*;
 pub use self::compute::*;
 pub use self::executor::*;
 use self::ops::*;
