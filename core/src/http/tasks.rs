@@ -177,6 +177,19 @@ fn internal(error: impl std::fmt::Display) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("task claims: {error}"))
 }
 
+/// The store's refusal of a claim it will not take (a declared `master-red`) is a
+/// `sqlx::Error::Protocol` carrying a message for the agent: a 409, not a server fault.
+fn claim_error(error: sqlx::Error) -> Fail {
+    match error {
+        sqlx::Error::Protocol(message) => (StatusCode::CONFLICT, message),
+        other => internal(other),
+    }
+}
+
+/// How long `SessionStart` waits for the re-proof of a stale `master-red` before listing the
+/// incident as it stands (spec §3 Verify, "Também no SessionStart").
+const SESSION_REFRESH_WAIT: Duration = Duration::from_secs(2);
+
 /// The shape the hook also checks (`SESSION_ID_SHAPE` in `ask_daemon.py`).
 fn valid_session_id(id: &str) -> bool {
     (1..=128).contains(&id.len())
@@ -334,7 +347,7 @@ pub(super) async fn claim_task(
         guard_paths: normalize_paths(body.guard_paths.as_deref(), at)?,
         hint_paths: normalize_paths(body.hint_paths.as_deref(), at)?,
     };
-    match store::claim(pool, &at.project_id, new, holder, now).await.map_err(internal)? {
+    match store::claim(pool, &at.project_id, new, holder, now).await.map_err(claim_error)? {
         ClaimOutcome::Won { task, similar } => {
             Ok(json!({ "won": true, "task": task, "holder": null, "similar": similar }))
         }
@@ -400,14 +413,29 @@ pub(super) async fn session_step(
     project_id: &str,
     root: &str,
     want_incidents: bool,
+    executor: Option<&std::sync::Arc<crate::verify::exec::Executor>>,
     now: Now,
 ) -> sqlx::Result<Value> {
     sessions::touch_session(pool, session_id, root, project_id, now).await?;
     let notices: Vec<String> =
         sessions::take_notices(pool, session_id, now).await?.iter().map(render_notice).collect();
     let incidents: Vec<String> = if want_incidents {
-        // Chunk 4 calls its re-probe of a stale `master-red` right here, before the list
-        // (spec §3 Verify, "Também no SessionStart").
+        // Re-prove a stale `master-red` before the list, so only what is still live is told.
+        // The executor is a process global (`verify::installed`); without one (early startup,
+        // tests) the list goes out as it stands.
+        if let Some(executor) = executor {
+            let refresh = crate::verify::inherit::refresh_master_red(
+                pool,
+                executor,
+                project_id,
+                SESSION_REFRESH_WAIT,
+                chrono::Utc::now(),
+            )
+            .await;
+            if let crate::verify::inherit::Refresh::Unavailable(why) = refresh {
+                tracing::warn!(%why, project_id, "could not refresh master-red at SessionStart");
+            }
+        }
         store::list_live(pool, project_id, now)
             .await?
             .iter()
@@ -478,8 +506,17 @@ pub(super) async fn post_session(State(state): State<AppState>, Json(body): Json
     let Some((project_id, root)) = resolve_cwd(&state.pool, &body.cwd).await else {
         return Ok(away());
     };
-    match session_step(&state.pool, &body.session_id, &project_id, &root, body.want_incidents, chrono::Utc::now())
-        .await
+    let executor = crate::verify::installed();
+    match session_step(
+        &state.pool,
+        &body.session_id,
+        &project_id,
+        &root,
+        body.want_incidents,
+        executor.as_ref(),
+        chrono::Utc::now(),
+    )
+    .await
     {
         Ok(answer) => Ok(Json(answer)),
         Err(error) => {
@@ -829,6 +866,18 @@ mod tests {
         assert_eq!(again["won"], true, "the same holder renews, it does not lose to itself");
     }
 
+    #[tokio::test]
+    async fn a_declared_claim_on_master_red_is_a_409_not_a_500() {
+        let pool = crate::testdb::fresh_pool().await;
+        let body = ClaimBody { key: Some("master-red".into()), ..Default::default() };
+        let refused = claim_task(&pool, &located("alpha", "/w"), &holder(HolderKind::Run, "7", "/w"), &body, chrono::Utc::now())
+            .await
+            .err()
+            .expect("the store refuses a declared master-red");
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("created by the daemon only"), "{}", refused.1);
+    }
+
     fn located_in(worktree: &str, project_root: &str) -> Located {
         Located { project_id: "alpha".into(), root: worktree.into(), project_root: project_root.into() }
     }
@@ -937,11 +986,11 @@ mod tests {
         let later = t0 + chrono::Duration::seconds(crate::task_claims::SESSION_LEASE_SECONDS + 60);
         claim_task(&pool, &located("alpha", "/w2"), &holder(HolderKind::Run, "9", "/w2"), &body, later).await.unwrap();
 
-        let first = session_step(&pool, "s1", "alpha", "/w", false, later).await.unwrap();
+        let first = session_step(&pool, "s1", "alpha", "/w", false, None, later).await.unwrap();
         assert_eq!(first["registered"], true);
         assert_eq!(first["notices"].as_array().unwrap().len(), 1, "{first}");
         assert!(first["notices"][0].as_str().unwrap().contains("run #9"));
-        let second = session_step(&pool, "s1", "alpha", "/w", false, later).await.unwrap();
+        let second = session_step(&pool, "s1", "alpha", "/w", false, None, later).await.unwrap();
         assert!(second["notices"].as_array().unwrap().is_empty(), "the cursor advanced");
         assert!(sessions::session_seen_in(&pool, "s1", "/w").await.unwrap());
         assert!(first.get("incidents").is_none() || first["incidents"].as_array().unwrap().is_empty());
@@ -956,9 +1005,9 @@ mod tests {
         let declared = ClaimBody { key: Some("file:core/a.rs".into()), ..Default::default() };
         claim_task(&pool, &located("alpha", "/w"), &holder(HolderKind::Run, "7", "/w"), &declared, t0).await.unwrap();
 
-        let quiet = session_step(&pool, "s1", "alpha", "/w", false, t0).await.unwrap();
+        let quiet = session_step(&pool, "s1", "alpha", "/w", false, None, t0).await.unwrap();
         assert!(quiet.get("incidents").is_none() || quiet["incidents"].as_array().unwrap().is_empty());
-        let asked = session_step(&pool, "s1", "alpha", "/w", true, t0).await.unwrap();
+        let asked = session_step(&pool, "s1", "alpha", "/w", true, None, t0).await.unwrap();
         let lines = asked["incidents"].as_array().unwrap();
         assert_eq!(lines.len(), 1, "a declared task is not an incident: {asked}");
         assert!(lines[0].as_str().unwrap().contains("master-red"));
