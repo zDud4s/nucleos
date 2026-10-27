@@ -1,5 +1,6 @@
 // §spec pilar-de-browser
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useBrowserSessions } from "../data/browser";
 import {
@@ -13,6 +14,7 @@ import {
 import { useActiveTab } from "../data/browser-store";
 import { NO_PROJECT } from "../data/browser-tabs";
 import { useChats, useChatTranscript, useSendMessage } from "../data/chats";
+import { keys } from "../data/keys";
 import { ComposerBox } from "../chats/ComposerBox";
 import { MessageList, type ListedMessage } from "../chats/MessageList";
 import type { Turn } from "../lib/turns";
@@ -74,6 +76,14 @@ export function AgentPanel() {
   const send = useSendMessage(chatId ?? "");
   const linkState = useBrowserChatLink(chatId).data;
 
+  const queryClient = useQueryClient();
+  // This file's reads (link, last) and the chat list. The root is spelled out rather than
+  // imported: the panel's tests mock `browser-agent-chat` whole.
+  const refreshLinks = () => {
+    void queryClient.invalidateQueries({ queryKey: ["browser-agent"] });
+    void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+  };
+
   const [text, setText] = useState("");
   const [drafting, setDrafting] = useState<string | null>(null);
   const [relinking, setRelinking] = useState(false);
@@ -81,8 +91,42 @@ export function AgentPanel() {
   const [error, setError] = useState<string | null>(null);
   const boxRef = useRef<HTMLTextAreaElement | null>(null);
 
+  // What the panel shows: the draft, the relink picker and the error belong to one tab and one
+  // conversation, so a change of either starts them afresh (adjusted during render, not in an
+  // effect, so the old draft never paints under the new conversation).
+  const viewKey = `${tabKey}|${chatId ?? ""}`;
+  const [shownKey, setShownKey] = useState(viewKey);
+  if (shownKey !== viewKey) {
+    setShownKey(viewKey);
+    setText("");
+    setRelinking(false);
+    setError(null);
+  }
+  // The same key for answers that land later: a write that settles after the view moved on
+  // must not drop its text or its error into another conversation.
+  const viewRef = useRef(viewKey);
+  useEffect(() => {
+    viewRef.current = viewKey;
+  }, [viewKey]);
+
   const titleOf = (id: string): string | null =>
     chats?.find((chat) => chat.chat_id === id)?.title ?? null;
+
+  // An agent tab whose session the rows do not carry yet (still loading, or opened since the
+  // last poll): not knowing is not the same as "no conversation".
+  const tabSession = agentTab ? (tab.sessionId ?? null) : null;
+  const sessionPending =
+    agentTab &&
+    (tabSession === null ||
+      sessionRows === undefined ||
+      !sessionRows.some((row) => row.id === Number(tabSession)));
+  if (sessionPending) {
+    return (
+      <section className="agent-panel" aria-label="Agent">
+        <p className="agent-panel-note">Loading the conversation of this tab…</p>
+      </section>
+    );
+  }
 
   if (agentTab && chatId === null) {
     return (
@@ -121,17 +165,34 @@ export function AgentPanel() {
       // "New task": a conversation with no mother, its first message carried by the creation.
       setBusy(true);
       const key = tabKey;
+      const view = viewKey;
       createBrowserTask(words)
         .then((started) => {
+          // The scope's newest conversation and the chat list both changed: without this a
+          // return to the tab would show the empty state again and invite a duplicate task.
+          refreshLinks();
           setCreated({ key, chatId: started.chat_id });
           setDrafting(null);
           setText("");
         })
-        .catch((e: unknown) => setError(message(e)))
+        .catch((e: unknown) => {
+          if (viewRef.current === view) setError(message(e));
+        })
         .finally(() => setBusy(false));
       return;
     }
-    send.mutate({ text: words, images: [] });
+    const view = viewKey;
+    send.mutate(
+      { text: words, images: [] },
+      {
+        // A refused send gives the words back rather than losing them.
+        onError: (e: unknown) => {
+          if (viewRef.current !== view) return;
+          setText(words);
+          setError(message(e));
+        },
+      },
+    );
     setText("");
   };
 
@@ -143,13 +204,23 @@ export function AgentPanel() {
   const unlink = () => {
     if (chatId === null) return;
     setError(null);
-    unlinkBrowserChat(chatId).catch((e: unknown) => setError(message(e)));
+    const view = viewKey;
+    unlinkBrowserChat(chatId)
+      .then(refreshLinks)
+      .catch((e: unknown) => {
+        if (viewRef.current === view) setError(message(e));
+      });
   };
   const relink = (parent: string) => {
     if (chatId === null || parent === "") return;
     setError(null);
     setRelinking(false);
-    relinkBrowserChat(chatId, parent).catch((e: unknown) => setError(message(e)));
+    const view = viewKey;
+    relinkBrowserChat(chatId, parent)
+      .then(refreshLinks)
+      .catch((e: unknown) => {
+        if (viewRef.current === view) setError(message(e));
+      });
   };
 
   return (

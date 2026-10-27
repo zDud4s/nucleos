@@ -3,6 +3,7 @@ import type { UseQueryResult } from "@tanstack/react-query";
 import { apiFetch } from "./client";
 import { scopeProject } from "./browser-tabs";
 import { keys } from "./keys";
+import { POLL } from "./poll";
 
 /**
  * The shell's side of the linked browser agent: which conversation drives an
@@ -115,13 +116,18 @@ export async function unlinkBrowserChat(childChatId: string): Promise<BrowserCha
   return postLink(childChatId, null);
 }
 
-/** The active link of a browser conversation and its last delivery; idle while `chatId` is null. */
+/**
+ * The active link of a browser conversation and its last delivery; idle while `chatId` is null.
+ * Polled at `POLL.queue`: `last_delivery` is written when the child's turn ends, which nothing
+ * on the shell's side announces.
+ */
 export function useBrowserChatLink(chatId: string | null): UseQueryResult<BrowserChatLinkState> {
   return useQuery({
     queryKey: browserAgentKeys.link(chatId ?? ""),
     queryFn: () =>
       apiFetch<BrowserChatLinkState>(`/assistant/chats/${encodeURIComponent(chatId ?? "")}/link`),
     enabled: chatId !== null,
+    refetchInterval: POLL.queue,
   });
 }
 
