@@ -456,6 +456,205 @@ pub async fn run_weekly(pool: &SqlitePool, model: &str, now: DateTime<Utc>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Accept,
+    Refuse,
+    Merge,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThemeError {
+    NotAllowed,
+    BadName,
+    BadTarget,
+    NotFound,
+    Db(String),
+}
+
+impl From<sqlx::Error> for ThemeError {
+    /// Only the driver's error text, never a row.
+    fn from(error: sqlx::Error) -> Self {
+        ThemeError::Db(error.to_string())
+    }
+}
+
+/// The table of spec 6.3: which action moves which state where.
+pub fn transition(from: &str, action: Action) -> Result<&'static str, ThemeError> {
+    match (from, action) {
+        ("proposed", Action::Accept) | ("refused", Action::Accept) => Ok("accepted"),
+        ("proposed", Action::Refuse) | ("accepted", Action::Refuse) => Ok("refused"),
+        ("proposed", Action::Merge) | ("accepted", Action::Merge) => Ok("merged"),
+        _ => Err(ThemeError::NotAllowed),
+    }
+}
+
+const NAME_CHARS: usize = 80;
+
+fn clean_name(name: &str) -> Result<&str, ThemeError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > NAME_CHARS {
+        return Err(ThemeError::BadName);
+    }
+    Ok(name)
+}
+
+async fn state_of(pool: &SqlitePool, id: i64) -> Result<String, ThemeError> {
+    sqlx::query_scalar("SELECT state FROM themes WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(ThemeError::NotFound)
+}
+
+/// Accept a `proposed` or `refused` theme, optionally renaming it in the same step.
+pub async fn accept(pool: &SqlitePool, id: i64, name: Option<&str>) -> Result<(), ThemeError> {
+    let to = transition(&state_of(pool, id).await?, Action::Accept)?;
+    let name = name.map(clean_name).transpose()?;
+    sqlx::query(
+        "UPDATE themes SET state = ?, decided_at = ?, name = COALESCE(?, name) WHERE id = ?",
+    )
+    .bind(to)
+    .bind(Utc::now().to_rfc3339())
+    .bind(name)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Refuse a theme. The synthesis it may hold is derived from the members of a theme the owner no
+/// longer stands behind, so it is deleted with the refusal.
+pub async fn refuse(pool: &SqlitePool, id: i64) -> Result<(), ThemeError> {
+    let to = transition(&state_of(pool, id).await?, Action::Refuse)?;
+    sqlx::query(
+        "UPDATE themes SET state = ?, decided_at = ?, synthesis = NULL, synthesis_at = NULL,
+                synthesis_model = NULL, synthesis_basis = NULL
+          WHERE id = ?",
+    )
+    .bind(to)
+    .bind(Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn rename(pool: &SqlitePool, id: i64, name: &str) -> Result<(), ThemeError> {
+    let name = clean_name(name)?;
+    let done = sqlx::query("UPDATE themes SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(ThemeError::NotFound);
+    }
+    Ok(())
+}
+
+/// Merge `from` into the live theme `into`. Members move over as `owner`-origin rows, `from` becomes
+/// `merged`, and every theme that pointed at `from` now points at `into`, so `merged_into` never
+/// forms a chain.
+pub async fn merge(pool: &SqlitePool, from: i64, into: i64) -> Result<(), ThemeError> {
+    if from == into {
+        return Err(ThemeError::BadTarget);
+    }
+    let mut tx = pool.begin().await?;
+    let from_state: String = sqlx::query_scalar("SELECT state FROM themes WHERE id = ?")
+        .bind(from)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ThemeError::NotFound)?;
+    transition(&from_state, Action::Merge)?;
+    let into_state: String = sqlx::query_scalar("SELECT state FROM themes WHERE id = ?")
+        .bind(into)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ThemeError::NotFound)?;
+    if !matches!(into_state.as_str(), "proposed" | "accepted") {
+        return Err(ThemeError::BadTarget);
+    }
+    let stamp = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT OR IGNORE INTO theme_members
+           (theme_id, member_kind, member_id, origin, excluded, added_at)
+         SELECT ?, member_kind, member_id, 'owner', excluded, ? FROM theme_members WHERE theme_id = ?",
+    )
+    .bind(into)
+    .bind(&stamp)
+    .bind(from)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM theme_members WHERE theme_id = ?")
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE themes SET state = 'merged', merged_into = ?, decided_at = ?, synthesis = NULL,
+                synthesis_at = NULL, synthesis_model = NULL, synthesis_basis = NULL
+          WHERE id = ?",
+    )
+    .bind(into)
+    .bind(&stamp)
+    .bind(from)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE themes SET merged_into = ? WHERE merged_into = ?")
+        .bind(into)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn set_member(
+    pool: &SqlitePool,
+    theme_id: i64,
+    kind: MemberKind,
+    member_id: i64,
+    excluded: bool,
+) -> Result<(), ThemeError> {
+    if state_of(pool, theme_id).await? == "merged" {
+        return Err(ThemeError::NotAllowed);
+    }
+    sqlx::query(
+        "INSERT INTO theme_members (theme_id, member_kind, member_id, origin, excluded, added_at)
+         VALUES (?, ?, ?, 'owner', ?, ?)
+         ON CONFLICT(theme_id, member_kind, member_id)
+         DO UPDATE SET excluded = excluded.excluded, origin = 'owner'",
+    )
+    .bind(theme_id)
+    .bind(kind.as_str())
+    .bind(member_id)
+    .bind(i64::from(excluded))
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The owner puts a member into a theme (or takes back one they had excluded).
+pub async fn add_member(
+    pool: &SqlitePool,
+    theme_id: i64,
+    kind: MemberKind,
+    member_id: i64,
+) -> Result<(), ThemeError> {
+    set_member(pool, theme_id, kind, member_id, false).await
+}
+
+/// The owner takes a member out; the row stays, marked `excluded`, so the pass does not bring it back.
+pub async fn exclude_member(
+    pool: &SqlitePool,
+    theme_id: i64,
+    kind: MemberKind,
+    member_id: i64,
+) -> Result<(), ThemeError> {
+    set_member(pool, theme_id, kind, member_id, true).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +980,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(null, 0);
+    }
+
+    #[test]
+    fn the_transition_table_allows_exactly_the_cells_of_section_6_3() {
+        use Action::*;
+        let allowed = [
+            ("proposed", Accept, "accepted"),
+            ("proposed", Refuse, "refused"),
+            ("proposed", Merge, "merged"),
+            ("accepted", Refuse, "refused"),
+            ("accepted", Merge, "merged"),
+            ("refused", Accept, "accepted"),
+        ];
+        for from in STATES {
+            for action in [Accept, Refuse, Merge] {
+                let expected = allowed
+                    .iter()
+                    .find(|(f, a, _)| *f == from && *a == action)
+                    .map(|c| c.2);
+                assert_eq!(transition(from, action).ok(), expected, "{from} {action:?}");
+            }
+        }
+        assert!(transition("merged", Accept).is_err(), "merged is terminal");
+        assert!(transition("proposed", Accept).is_ok() && transition("accepted", Accept).is_err());
+    }
+
+    async fn theme(pool: &sqlx::SqlitePool, state: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO themes (name, state, model, dim, created_at) VALUES ('t', ?, 'm', 3, 't') RETURNING id",
+        )
+        .bind(state)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+    async fn member(pool: &sqlx::SqlitePool, t: i64, kind: &str, id: i64) {
+        sqlx::query(
+            "INSERT INTO theme_members (theme_id, member_kind, member_id, added_at) VALUES (?, ?, ?, 't')",
+        )
+        .bind(t)
+        .bind(kind)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn merging_moves_members_as_owner_origin_and_repoints_without_chains() {
+        let pool = crate::testdb::fresh_pool().await;
+        let (a, b, c) = (
+            theme(&pool, "proposed").await,
+            theme(&pool, "accepted").await,
+            theme(&pool, "accepted").await,
+        );
+        member(&pool, a, "note", 1).await;
+        merge(&pool, a, b).await.unwrap();
+        let origin: String = sqlx::query_scalar(
+            "SELECT origin FROM theme_members WHERE theme_id = ? AND member_id = 1",
+        )
+        .bind(b)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(origin, "owner");
+        merge(&pool, b, c).await.unwrap();
+        let into: Vec<(i64, Option<i64>)> =
+            sqlx::query_as("SELECT id, merged_into FROM themes ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            into,
+            vec![(a, Some(c)), (b, Some(c)), (c, None)],
+            "a points at the live theme"
+        );
+        // Never into a refused, merged or itself.
+        let r = theme(&pool, "refused").await;
+        assert!(
+            merge(&pool, c, r).await.is_err()
+                && merge(&pool, c, a).await.is_err()
+                && merge(&pool, c, c).await.is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_is_non_empty_and_at_most_80_chars_and_members_obey_the_state() {
+        let pool = crate::testdb::fresh_pool().await;
+        let t = theme(&pool, "proposed").await;
+        assert!(rename(&pool, t, "  ").await.is_err());
+        assert!(rename(&pool, t, &"x".repeat(81)).await.is_err());
+        rename(&pool, t, "Sleep").await.unwrap();
+        add_member(&pool, t, MemberKind::Note, 5).await.unwrap();
+        exclude_member(&pool, t, MemberKind::Note, 5).await.unwrap();
+        let merged = theme(&pool, "merged").await;
+        assert!(add_member(&pool, merged, MemberKind::Note, 5).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refusing_an_accepted_theme_deletes_its_synthesis() {
+        let pool = crate::testdb::fresh_pool().await;
+        let t = theme(&pool, "accepted").await;
+        sqlx::query("UPDATE themes SET synthesis = 's', synthesis_basis = '[1]', synthesis_at = 't', synthesis_model = 'm' WHERE id = ?")
+            .bind(t)
+            .execute(&pool)
+            .await
+            .unwrap();
+        refuse(&pool, t).await.unwrap();
+        let s: Option<String> = sqlx::query_scalar("SELECT synthesis FROM themes WHERE id = ?")
+            .bind(t)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(s, None);
     }
 }
 
