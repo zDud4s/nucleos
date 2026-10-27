@@ -14,6 +14,7 @@ pub mod failures;
 pub mod fingerprint;
 pub mod flaky;
 pub mod guard;
+pub mod inherit;
 pub mod ide_box;
 pub mod observe;
 pub mod plan;
