@@ -99,6 +99,11 @@ const PROJECT_SCOPED: &[&str] = &[
     // house's rows (`project_id` NULL raw, '' daily) never match a project id, so they stay.
     "slot_samples",
     "slot_samples_daily",
+    // The project's unresolved and past task claims (migration 0244) and the sessions registered for it:
+    // working history, so forgetting the project takes them. Their event log hangs off task_claims
+    // (VIA_PARENT below).
+    "task_claims",
+    "task_sessions",
     "vcs_requests",
     // What a project's verification asked, cached, did and observed is its history.
     "verification_observations",
@@ -148,6 +153,9 @@ const VIA_PARENT: &[(&str, &str, &str)] = &[
     // A run's frozen tool loadout (migration 0190). It belongs to the project through its run only,
     // exactly like `run_knowledge`; the CASCADE would take it anyway, listing it keeps the forget explicit.
     ("run_loadout", "run_id", "runs"),
+    // A task claim's event log (migration 0244): who held it, and when. It belongs to the project only
+    // through its task, like the two run tables above.
+    ("task_claim_events", "task_id", "task_claims"),
 ];
 
 /// What a project has on record, in the nouns somebody would recognise.
@@ -1488,6 +1496,50 @@ mod tests {
             left, 0,
             "a forgotten project's capture requests outlived it"
         );
+    }
+
+    /// A task claim is the project's working history: forgetting the project takes its claims, their
+    /// event log and the sessions that were registered for it, and leaves every other project's.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_task_claims_and_their_history() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        register(&pool, "bravo").await;
+        for project in ["alpha", "bravo"] {
+            let task_id = sqlx::query(
+                "INSERT INTO task_claims (project_id, task_key, kind, title, status, created_at)
+                 VALUES (?, 'master-red', 'incident', 't', 'open', 'x')",
+            )
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            sqlx::query("INSERT INTO task_claim_events (task_id, event, at) VALUES (?, 'created', 'x')")
+                .bind(task_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO task_sessions (session_id, project_id, worktree, last_seen)
+                 VALUES (?, ?, '/w', 'x')",
+            )
+            .bind(format!("s-{project}"))
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        for (table, expected) in [("task_claims", 1_i64), ("task_claim_events", 1), ("task_sessions", 1)] {
+            let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(left, expected, "{table}: alpha's rows must go and bravo's must stay");
+        }
     }
 
     /// A slot taken here is work in flight, and nothing is removed under it.
