@@ -2248,7 +2248,7 @@ gate_command: git --version
         assert_ne!(postgate, probe);
         assert_eq!(
             probe.file_name().and_then(|n| n.to_str()),
-            Some("postgate-probe-repo")
+            Some("probe-repo")
         );
         assert_eq!(sha_of(&probe, "HEAD"), master);
         assert_eq!(

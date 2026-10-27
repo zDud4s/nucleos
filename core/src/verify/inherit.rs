@@ -573,7 +573,8 @@ pub(super) async fn ensure_fresh(
     if !store::begin_reprobe(pool, incident.id, now).await.map_err(|error| error.to_string())? {
         return Ok(Freshness::InFlight { started: false }); // somebody else got the flight
     }
-    probe::spawn_proof(
+    // `false`: an earlier proof of this task still runs, so this read did not start one.
+    let started = probe::spawn_proof(
         executor.clone(),
         probe::ProofJob::Reprobe {
             project_id: project_id.to_owned(),
@@ -581,7 +582,7 @@ pub(super) async fn ensure_fresh(
             task: incident.clone(),
         },
     );
-    Ok(Freshness::InFlight { started: true })
+    Ok(Freshness::InFlight { started })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
