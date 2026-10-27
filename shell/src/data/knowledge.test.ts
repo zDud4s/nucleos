@@ -92,6 +92,7 @@ describe("distilledOrigin", () => {
 
     expect(distilledOrigin(row, new Map([[5, "job_failed"]]))).toEqual({
       job: 7,
+      chat: null,
       runs: [3, 4],
       cause: "job_failed",
       causeLabel: "the job failed",
@@ -107,6 +108,16 @@ describe("distilledOrigin", () => {
       cause: null,
       causeLabel: null,
     });
+  });
+
+  it("reads a chat piece of evidence and labels the cause", () => {
+    expect(parseEvidence('[{"t":"chat","id":12},{"t":"run","id":3}]')).toEqual([
+      { t: "chat", id: 12 },
+      { t: "run", id: 3 },
+    ]);
+    const row = known({ source: "distiller", evidence: '[{"t":"chat","id":12},{"t":"run","id":3}]' });
+    const origin = distilledOrigin(row, new Map([[row.id, "chat_exchanges"]]));
+    expect(origin).toMatchObject({ job: null, chat: 12, causeLabel: "a conversation" });
   });
 
   it("distilledOrigin is null for a row the distiller did not write", () => {

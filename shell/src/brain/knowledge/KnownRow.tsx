@@ -61,12 +61,14 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
       {origin !== null && (
         <p className="learned-origin">
           distilled from{" "}
-          {origin.job === null ? (
+          {origin.chat !== null ? (
+            "a conversation"
+          ) : origin.job === null ? (
             "a job"
           ) : (
             <Link to="/fleet">job #{origin.job}</Link>
           )}
-          {origin.causeLabel !== null && <> · {origin.causeLabel}</>}
+          {origin.chat === null && origin.causeLabel !== null && <> · {origin.causeLabel}</>}
         </p>
       )}
       {duplicateOf !== null && (

@@ -56,6 +56,13 @@ describe("buildModel nodes", () => {
     expect(m.nodes.find((n) => n.id === "n:1")).toMatchObject({ kind: "note", ref: "1", bucket: "in_force" });
   });
 
+  it("draws no node, edge or project stub for an observation", () => {
+    const rows = [known(1, { scope_kind: "observation", scope_id: "api:chat:5", status: "observed" }), known(2)];
+    const m = buildModel(graph([]), rows, [], filters());
+    expect(ids(m)).toEqual(["k:2"]);
+    expect(ids(m).some((id) => id.startsWith("project:"))).toBe(false);
+  });
+
   it("drops archived notes unless showArchived", () => {
     const g = graph([note(1), note(2, { state: "archived" })]);
     expect(ids(buildModel(g, [], [], filters({ showArchived: false })))).toEqual(["n:1"]);
