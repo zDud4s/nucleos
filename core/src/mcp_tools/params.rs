@@ -509,3 +509,36 @@ pub(super) struct NodeActiveParams {
     /// Find the open tree of this chat.
     pub(super) chat_id: Option<String>,
 }
+
+// The `session_id` of the task tools is filled in by the NucleOS hook of an interactive session
+// before the call runs; a run or a job node leaves it out (the daemon knows them by their key).
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TaskListParams {
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TaskClaimParams {
+    /// What is being claimed: `master-red`, `test:<path>::<name>`, `file:<path>`, `spec-item:<spec>#<n>` or `topic:<slug>`.
+    pub(super) key: String,
+    /// One line saying what is wrong. Defaults to the key.
+    pub(super) title: Option<String>,
+    /// Paths (relative to the repo root) that only the owner may change when landing.
+    pub(super) guard_paths: Option<Vec<String>>,
+    /// Paths that merely hint where the problem is; they never block anyone.
+    pub(super) hint_paths: Option<Vec<String>>,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TaskCloseParams {
+    /// The task id `task_list` or `task_claim` gave back.
+    pub(super) id: i64,
+    /// Why: it is the task history.
+    pub(super) note: String,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
+}

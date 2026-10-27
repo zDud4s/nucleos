@@ -9,6 +9,7 @@ mod local_box;
 mod ops_tools;
 mod params;
 mod server;
+mod task_tools;
 mod tools;
 
 pub use self::boxes::*;
@@ -2775,7 +2776,18 @@ mod tests {
     /// worktree it names, and a job node verifies its own. `record` goes wherever `verify` goes.
     #[test]
     fn verify_is_served_in_both_boxes() {
-        assert_eq!(EVERY_BOX_TOOLS, ["record", "verify", "verify_status"]);
+        assert_eq!(
+            EVERY_BOX_TOOLS,
+            [
+                "record",
+                "verify",
+                "verify_status",
+                "task_list",
+                "task_claim",
+                "task_release",
+                "task_done"
+            ]
+        );
         for name in EVERY_BOX_TOOLS {
             assert!(
                 JOB_NODE_TOOLS.contains(name),
@@ -2795,6 +2807,75 @@ mod tests {
             assert!(
                 registered.iter().any(|r| r == name),
                 "{name} is not registered"
+            );
+        }
+    }
+
+    /// The task tools are served wherever `verify` is, and `Worktree` boxes (an IDE session) get
+    /// them too: that box serves exactly `EVERY_BOX_TOOLS`.
+    #[test]
+    fn the_task_tools_ride_with_verify_into_every_box() {
+        for name in TASK_TOOL_NAMES {
+            assert!(
+                EVERY_BOX_TOOLS.contains(&name)
+                    && JOB_NODE_TOOLS.contains(&name)
+                    && JOB_NODE_BASE.contains(&name),
+                "{name}"
+            );
+            for served in [
+                McpBox::All,
+                McpBox::JobNode(1),
+                McpBox::Worktree("/w".into()),
+            ] {
+                assert!(served_in_box(&served, name), "{served:?} lost {name}");
+            }
+            assert!(
+                !served_in_box(&McpBox::Team(1), name),
+                "a team agent claims nothing: {name}"
+            );
+            for list in [LOCAL_TOOLS, COUNCIL_TOOLS, TEAM_TOOLS, HOSTED_TOOLS] {
+                assert!(
+                    !list.contains(&name),
+                    "{name} must stay off the chat/council/team/hosted lists"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn listing_is_a_read_and_the_rest_write_only_the_daemons_own_rows() {
+        assert_eq!(tool_effect("task_list"), ToolEffect::ReadsOwn);
+        for name in ["task_claim", "task_release", "task_done"] {
+            assert_eq!(tool_effect(name), ToolEffect::WritesOwn, "{name}");
+        }
+    }
+
+    /// No `worktree` and no `project_id`: the holder's worktree comes from the box, so a model
+    /// cannot claim in a place it names. `session_id` is there for the hook to stamp (plan A).
+    #[test]
+    fn the_task_tools_take_no_worktree_and_announce_a_hook_filled_session_id() {
+        for name in TASK_TOOL_NAMES {
+            let tool = NucleosTools::tool_router()
+                .list_all()
+                .into_iter()
+                .find(|t| t.name == name)
+                .expect(name);
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .expect("properties");
+            assert!(
+                !props.contains_key("worktree") && !props.contains_key("project_id"),
+                "{name}"
+            );
+            assert!(
+                props.contains_key("session_id"),
+                "{name} must carry the field the hook stamps"
+            );
+            assert!(
+                tool.description.as_deref().unwrap_or_default().len() < 600,
+                "{name}: every box pays for this text on every request"
             );
         }
     }
