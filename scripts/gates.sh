@@ -206,6 +206,19 @@ heavy_broker() {
   [ -d "${NUCLEOS_HEAVY_DIR:-${HOME:-/nonexistent}/.nucleos/heavy}" ]
 }
 
+heavy_entry() {
+  # heavy_entry <main>: the heavy.py to run. <main>'s, unless it predates the single broker and this
+  # checkout's copy forwards to master's staged one (`_staged_broker`): the main checkout is the
+  # owner's and can sit on a branch from before that, which kept every gate on an old broker. An
+  # explicit NUCLEOS_HEAVY_MAIN is taken as it is. The path is one the native python can open.
+  local own=""
+  if [ -z "${NUCLEOS_HEAVY_MAIN:-}" ] && ! grep -q _staged_broker "$1/scripts/heavy.py" 2>/dev/null; then
+    own="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })/heavy.py"
+    grep -q _staged_broker "$own" 2>/dev/null || own=""
+  fi
+  printf '%s\n' "${own:-$1/scripts/heavy.py}"
+}
+
 heavy_run() {
   # heavy_run <command...>: hand the command to the machine-wide broker (<main>/scripts/heavy.py)
   # when the main checkout has one; otherwise fall back to the build slot (cargo) or run it plainly.
@@ -215,7 +228,7 @@ heavy_run() {
   main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
   if [ "${OS:-}" = Windows_NT ]; then py="${NUCLEOS_HEAVY_PYTHON:-python}"; else py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
   if heavy_broker "$main"; then
-    "$py" "$main/scripts/heavy.py" -- "$@"
+    "$py" "$(heavy_entry "$main")" -- "$@"
   elif [ "$1" = cargo ] || [ -n "${heavy_slot_any:-}" ]; then
     # build-slot.sh sets heavy_slot_any: whatever it is asked to run takes a slot, as before.
     slot_run "$@"
@@ -311,7 +324,7 @@ if [ -z "${NUCLEOS_HEAVY_HELD:-}" ] && [ "${NUCLEOS_HEAVY:-}" != 0 ] && [ "$targ
     # The broker is a native program: under Git bash `$BASH` is `/usr/bin/bash`, which it cannot open.
     heavy_bash="$BASH"
     command -v cygpath >/dev/null 2>&1 && heavy_bash="$(cygpath -m "$BASH")"
-    exec "$heavy_py" "$heavy_main/scripts/heavy.py" hold-worktree -- "$heavy_bash" "$repo_root/scripts/gates.sh" "$target"
+    exec "$heavy_py" "$(heavy_entry "$heavy_main")" hold-worktree -- "$heavy_bash" "$repo_root/scripts/gates.sh" "$target"
   fi
 fi
 
