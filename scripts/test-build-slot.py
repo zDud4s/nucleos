@@ -386,6 +386,12 @@ def test_an_old_main_broker_gives_way_to_the_forwarding_one() -> None:
 
         old.write_text("# a broker from before the forwarder\n")
         assert entry() == own
+        # Sourced by a relative path, then called from a subdirectory, as `run` does for a step.
+        env = {k: v for k, v in os.environ.items() if k != "NUCLEOS_HEAVY_MAIN"}
+        script = f'source scripts/gates.sh || exit 2; cd shell && heavy_entry "{main.as_posix()}"'
+        out = subprocess.run([BASH, "-c", script], cwd=GATES.parent.parent, env=env,
+                             capture_output=True, text=True, timeout=60)
+        assert Path(out.stdout.strip()).resolve() == own, (out.stdout, out.stderr)
         assert entry(NUCLEOS_HEAVY_MAIN=main.as_posix()) == old.resolve()
         old.write_text("def _staged_broker(): ...\n")
         assert entry() == old.resolve()
