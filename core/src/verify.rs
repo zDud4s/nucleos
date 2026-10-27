@@ -3349,9 +3349,10 @@ tests:
         assert_eq!(stored, None);
     }
 
-    /// `group` fails with `ids` unless `flag.txt` exists in the tree it runs in.
+    /// `group` fails with `ids` unless `flag.txt` exists in the tree it runs in. A subshell and not a
+    /// `{ ...; }` group: the tests map rejects any command word holding both braces as a marker.
     fn red_unless_flag(ids: &[&str]) -> String {
-        format!("test -f flag.txt || {{ {}; }}", failing_script(ids))
+        format!("test -f flag.txt || ( {} )", failing_script(ids))
     }
 
     fn own_core_in(side: &Path) -> VerifyArgs {
