@@ -282,13 +282,24 @@ fn bad_request(message: &str) -> Fail {
     (StatusCode::BAD_REQUEST, message.to_owned())
 }
 
+/// Runs `make` against the caller's worktree root first, then the project root: an absolute path
+/// is under one or the other (or the worktree sits outside the repo), and either way it must end
+/// up as the same project-relative text, so one file claimed from two worktrees is one key.
+fn under_either_root<T>(
+    at: &Located,
+    make: impl Fn(&std::path::Path) -> Result<T, keys::KeyError>,
+) -> Result<T, Fail> {
+    match make(std::path::Path::new(&at.root)) {
+        Err(keys::KeyError::OutsideRoot(_)) => make(&at.project_root),
+        other => other,
+    }
+    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
+}
+
 fn normalize_paths(raw: Option<&[String]>, at: &Located) -> Result<Vec<String>, Fail> {
     raw.unwrap_or_default()
         .iter()
-        .map(|path| {
-            keys::normalize_path(path, &at.project_root)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
-        })
+        .map(|path| under_either_root(at, |root| keys::normalize_path(path, root)))
         .collect()
 }
 
@@ -308,8 +319,7 @@ pub(super) async fn claim_task(
         .filter(|key| !key.is_empty())
         .ok_or_else(|| bad_request("key is required"))?;
     // `KeyError`'s message lists the accepted prefixes; it goes to the agent as it is.
-    let key = keys::normalize(raw, &at.project_root)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let key = under_either_root(at, |root| keys::normalize(raw, root))?;
     let title = body
         .title
         .as_deref()
@@ -509,8 +519,13 @@ async fn post_list(
     Extension(scope): Extension<Scope>,
     Json(body): Json<ListBody>,
 ) -> Reply {
-    let (at, _holder) = acting(&state, &scope, body.worktree.as_deref(), body.session_id.as_deref()).await?;
-    list_tasks(&state.pool, &at.project_id, chrono::Utc::now()).await.map(Json)
+    list_in(&state.pool, &scope, body.worktree.as_deref()).await.map(Json)
+}
+
+/// A listing is a read: it needs the worktree, never a registered session or a holder.
+async fn list_in(pool: &sqlx::SqlitePool, scope: &Scope, worktree: Option<&str>) -> Result<Value, Fail> {
+    let at = locate(pool, scope, worktree).await?;
+    list_tasks(pool, &at.project_id, chrono::Utc::now()).await
 }
 
 async fn post_claim(
@@ -812,6 +827,55 @@ mod tests {
         assert_eq!(second["task"]["id"], first["task"]["id"]);
         let again = claim_task(&pool, &at, &run, &body, chrono::Utc::now()).await.unwrap();
         assert_eq!(again["won"], true, "the same holder renews, it does not lose to itself");
+    }
+
+    fn located_in(worktree: &str, project_root: &str) -> Located {
+        Located { project_id: "alpha".into(), root: worktree.into(), project_root: project_root.into() }
+    }
+
+    #[tokio::test]
+    async fn one_file_claimed_from_two_worktrees_is_one_key() {
+        let pool = crate::testdb::fresh_pool().await;
+        // One worktree inside the repo, one outside it.
+        let inside = located_in("/repo/.claude/worktrees/a", "/repo");
+        let outside = located_in("/elsewhere/b", "/repo");
+        let first_body = ClaimBody { key: Some("file:/repo/.claude/worktrees/a/core/a.rs".into()), ..Default::default() };
+        let second_body = ClaimBody { key: Some("file:/elsewhere/b/core/a.rs".into()), ..Default::default() };
+        let first = claim_task(&pool, &inside, &holder(HolderKind::Run, "1", "/repo/.claude/worktrees/a"), &first_body, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(first["won"], true);
+        assert_eq!(first["task"]["key"], "file:core/a.rs");
+        let second = claim_task(&pool, &outside, &holder(HolderKind::Run, "2", "/elsewhere/b"), &second_body, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(second["won"], false, "the same file from another worktree is the same task");
+        assert_eq!(second["holder"]["id"], "1");
+        // A path under the project root still resolves when the worktree is elsewhere.
+        let under_project = ClaimBody { key: Some("file:/repo/core/a.rs".into()), ..Default::default() };
+        let third = claim_task(&pool, &outside, &holder(HolderKind::Run, "2", "/elsewhere/b"), &under_project, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(third["task"]["id"], first["task"]["id"]);
+    }
+
+    #[tokio::test]
+    async fn a_listing_asks_for_no_session() {
+        let pool = crate::testdb::fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let cwd = dir.path().to_string_lossy().into_owned();
+        // Owner, no session: the refusal is about the checkout (not on the roster), never about a
+        // missing session. Registering a project in a unit test is not available here, so this
+        // pins the error `list_in` can raise.
+        let refused = list_in(&pool, &Scope::Control, Some(&cwd)).await.unwrap_err();
+        assert_eq!(refused.0, StatusCode::NOT_FOUND);
+        assert!(!refused.1.contains("session"), "{}", refused.1);
     }
 
     #[tokio::test]
