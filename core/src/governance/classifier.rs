@@ -1159,14 +1159,18 @@ pub enum Unrecognized {
 /// (`std::env::current_exe`), which is what the IDE box's `wait_with` names because the binary is
 /// not on PATH; a double-quoted path may hold spaces. Any other path, even to a file with the same
 /// name, is not the daemon and is left to the rest of the classifier.
-fn is_verify_client_call(command: &str) -> bool {
+///
+/// `command` is the normalized (lower-cased) segment and `raw` the same segment as written: the
+/// flags are read from the first, but a path is compared as written, since only Windows folds case.
+fn is_verify_client_call(command: &str, raw: &str) -> bool {
     fn digits(text: &str) -> bool {
         !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
     }
     let Some((program, arguments)) = split_program(command) else {
         return false;
     };
-    if program != "nucleos-core" && !is_daemon_exe(&program) {
+    let named_as_written = split_program(raw).is_some_and(|(word, _)| is_daemon_exe(&word));
+    if program != "nucleos-core" && !named_as_written {
         return false;
     }
     let words = flag_words(arguments);
@@ -1205,8 +1209,7 @@ fn split_program(command: &str) -> Option<(String, &str)> {
     Some((command[..end].to_owned(), &command[end..]))
 }
 
-/// Whether `program` (already lower-cased, as the classifier normalizes a command) names the
-/// running daemon's own executable.
+/// Whether `program`, as written in the command, names the running daemon's own executable.
 fn is_daemon_exe(program: &str) -> bool {
     std::env::current_exe().is_ok_and(|exe| same_executable(program, &exe.to_string_lossy()))
 }
@@ -1268,7 +1271,7 @@ fn classify_segment(
     }
     // The daemon's own verification client: it only asks the running daemon and waits. Beside
     // `is_safe_command` and behind the same shape guards, so nothing extra rides on the line.
-    if shell_form_is_readable(&normalized) && is_verify_client_call(&normalized) {
+    if shell_form_is_readable(&normalized) && is_verify_client_call(&normalized, segment) {
         return Segment::ReadLocal;
     }
     // Spec A D13: PowerShell's output shapers, and only under PowerShell — under Bash these names

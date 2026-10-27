@@ -651,7 +651,18 @@ pub(super) fn spawn_run(
             // way here. First writer wins; no rows means someone else finalised the run, which is an
             // outcome rather than a failure — the loop breaks either way.
             match result {
-                Ok(Ok(o)) => {
+                Ok(Ok(mut o)) => {
+                    // A steerable run that ended its turn to wait for a verdict, as it is told to,
+                    // then sits listening until its progress deadline. That silence is the wait,
+                    // not a stall: the run finished its turn, so it ends `completed` and its open
+                    // ticket wakes it below, instead of a `timed_out` nothing would ever wake.
+                    if o.exit_code == crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE
+                        && steerable
+                        && crate::execution::runs::verify_wake::ended_listening(&o.stdout)
+                        && crate::execution::runs::verify_wake::awaits_verdict(&pool, id).await
+                    {
+                        o.exit_code = 0;
+                    }
                     // A CLI that exited non-zero did not do the work, and recording it `completed`
                     // announced a success its own exit code denies — including in the feed row the
                     // user reads. The runner now also reports -1 for a stream that broke after

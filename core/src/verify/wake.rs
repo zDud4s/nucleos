@@ -26,10 +26,16 @@ const SEEN_GRACE: Duration = Duration::from_secs(2);
 
 /// Watches ticket `id` in its own task and, once it is done, delivers it to run `run_id`.
 pub fn spawn_watch(state: AppState, id: i64, run_id: i64) {
-    tokio::spawn(async move { watch(&state, id, run_id).await });
+    spawn_watch_for(state, id, run_id, WATCH_LIMIT);
 }
 
-async fn watch(state: &AppState, id: i64, run_id: i64) {
+/// `spawn_watch` with its own span: `verify_wake::rearm` watches a ticket the restart requeued for
+/// less than a full `WATCH_LIMIT`.
+pub fn spawn_watch_for(state: AppState, id: i64, run_id: i64, limit: Duration) {
+    tokio::spawn(async move { watch(&state, id, run_id, limit).await });
+}
+
+async fn watch(state: &AppState, id: i64, run_id: i64, limit: Duration) {
     let started = Instant::now();
     loop {
         match wait_ticket(&state.pool, id, WATCH_POLL).await {
@@ -49,7 +55,7 @@ async fn watch(state: &AppState, id: i64, run_id: i64) {
                 tokio::time::sleep(WATCH_POLL).await;
             }
         }
-        if started.elapsed() >= WATCH_LIMIT {
+        if started.elapsed() >= limit {
             tracing::warn!(
                 id,
                 "verify watcher: gave up on a ticket that never finished"
@@ -58,7 +64,7 @@ async fn watch(state: &AppState, id: i64, run_id: i64) {
                 state,
                 run_id,
                 id,
-                "its verification never finished (the daemon stopped waiting after 3 hours)",
+                "its verification never finished (the daemon stopped waiting for it)",
             )
             .await;
             return;

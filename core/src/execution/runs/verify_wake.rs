@@ -19,6 +19,14 @@ pub(super) const WAKES_PER_LINEAGE: i64 = 3;
 /// (a wake is a launch too, but one the owner did not have to ask for, so the ceiling is looser).
 pub(super) const WAKES_PER_PROJECT_PER_DAY: i64 = 10;
 
+/// How long a wake that found every slot taken waits before it asks again, and how many times it
+/// asks before it is refused: a full project frees a slot within minutes, a stuck one never does.
+#[cfg(not(test))]
+const SLOT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const SLOT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+const SLOT_RETRIES: u32 = 30;
+
 const ST_PENDING: &str = "pending";
 const ST_DELIVERED: &str = "delivered";
 const ST_REFUSED: &str = "refused";
@@ -145,12 +153,42 @@ async fn settle(
                     )
                 }
                 Err(super::WakeRefusal::AlreadyHandled) => {}
+                // A full project is a wait, not a no: the wake stays pending and asks again.
+                Err(super::WakeRefusal::NoSlot(_)) => {
+                    tokio::spawn(retry_for_slot(state.clone(), run_id, ticket_id, value));
+                }
                 Err(refusal) => refuse(state, run_id, ticket_id, &refusal.reason()).await?,
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Asks for the continuation again every `SLOT_RETRY` while the project has no free slot, and
+/// refuses the wake (running the exit's deferred work) after `SLOT_RETRIES` tries. Every other
+/// answer is final at once, exactly as in `settle`; a wake settled elsewhere meanwhile is
+/// `AlreadyHandled`.
+async fn retry_for_slot(state: AppState, run_id: i64, ticket_id: i64, value: serde_json::Value) {
+    let mut reason = String::from("no slot to run it in");
+    for _ in 0..SLOT_RETRIES {
+        tokio::time::sleep(SLOT_RETRY).await;
+        match super::resume_for_verify(&state, run_id, ticket_id, &value).await {
+            Ok(child) => {
+                tracing::info!(run_id, ticket_id, child, "run resumed with its verification verdict");
+                return;
+            }
+            Err(super::WakeRefusal::AlreadyHandled) => return,
+            Err(refusal @ super::WakeRefusal::NoSlot(_)) => reason = refusal.reason(),
+            Err(refusal) => {
+                reason = refusal.reason();
+                break;
+            }
+        }
+    }
+    if let Err(error) = refuse(&state, run_id, ticket_id, &reason).await {
+        tracing::warn!(%error, run_id, ticket_id, "could not refuse a verify wake");
+    }
 }
 
 /// A refused wake: recorded, said in the feed, and the judge-side work the exit deferred is run now,
@@ -286,6 +324,29 @@ pub async fn abandon(state: &AppState, run_id: i64, ticket_id: i64, reason: &str
     }
 }
 
+/// PURE: whether a run's stdout ends on the `result` that closes a turn, i.e. the run was listening
+/// for its next turn when it stopped, not in the middle of one.
+pub fn ended_listening(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .is_some_and(|event| event.get("type").and_then(|kind| kind.as_str()) == Some("result"))
+}
+
+/// Whether run `id` asked for a verification whose verdict it has not read. An unreadable answer
+/// is `false`: the run is then recorded as its runner reported it.
+pub async fn awaits_verdict(pool: &sqlx::SqlitePool, id: i64) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM verify_requests WHERE caller = ? AND seen_at IS NULL)",
+    )
+    .bind(Caller::Run(id).label())
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
 /// Called by the terminal arm when run `id` ended `completed` and that write won: opens a `pending`
 /// wake for every ticket the run asked for and never saw the verdict of. Returns whether the run
 /// has a wake open, in which case the arm skips its judge-side work (`run_deferred_work` does it
@@ -359,10 +420,17 @@ fn past_watch_limit(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> boo
         .is_some_and(|age| age >= crate::verify::wake::WATCH_LIMIT)
 }
 
+/// How long `rearm` still watches a ticket older than `WATCH_LIMIT`: the restart requeued its units
+/// (`verify::runs::requeue_interrupted`), so it may yet finish, but it is not given another full span.
+#[cfg(not(test))]
+const RESTART_SPAN: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+#[cfg(test)]
+const RESTART_SPAN: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Re-arms the watcher of every pending wake after a restart: the tasks that were waiting died with
 /// the daemon, and the tickets themselves were requeued by `verify::runs::requeue_interrupted`.
-/// A wake whose ticket is already older than the watcher's span is abandoned instead: re-watching
-/// it would grant it another full span on every restart.
+/// A wake whose ticket is already older than the watcher's span is delivered if the ticket finished
+/// while the daemon was down, and otherwise watched for `RESTART_SPAN` only, not a full span.
 pub async fn rearm(state: &AppState) {
     let pending: sqlx::Result<Vec<(i64, i64, Option<String>)>> = sqlx::query_as(
         "SELECT w.ticket_id, w.run_id, r.created_at
@@ -378,7 +446,7 @@ pub async fn rearm(state: &AppState) {
                 match created_at {
                     None => abandon(state, run_id, ticket_id, "its ticket no longer exists").await,
                     // An old ticket that finished while the daemon was down is still delivered;
-                    // only one that never finished is given up on.
+                    // one that did not gets the requeue's chance, for a shorter span.
                     Some(created) if past_watch_limit(&created, now) => {
                         match crate::verify::wait_ticket(
                             &state.pool,
@@ -390,15 +458,12 @@ pub async fn rearm(state: &AppState) {
                             Ok(Some((ticket, _))) if ticket.done => {
                                 deliver(state, run_id, ticket_id, &ticket).await;
                             }
-                            _ => {
-                                abandon(
-                                    state,
-                                    run_id,
-                                    ticket_id,
-                                    "its verification never finished (the daemon stopped waiting after 3 hours)",
-                                )
-                                .await;
-                            }
+                            _ => crate::verify::wake::spawn_watch_for(
+                                state.clone(),
+                                ticket_id,
+                                run_id,
+                                RESTART_SPAN,
+                            ),
                         }
                     }
                     Some(_) => crate::verify::wake::spawn_watch(state.clone(), ticket_id, run_id),
@@ -551,6 +616,30 @@ mod tests {
         panic!("the continuation never launched");
     }
 
+    #[test]
+    fn ended_listening_reads_the_last_event() {
+        let turn = r#"{"type":"assistant"}
+{"type":"result","subtype":"success"}
+"#;
+        assert!(ended_listening(turn));
+        assert!(!ended_listening(r#"{"type":"result"}
+{"type":"assistant"}"#));
+        assert!(!ended_listening(""));
+        assert!(!ended_listening("not json"));
+    }
+
+    #[tokio::test]
+    async fn awaits_verdict_only_for_an_unseen_ticket() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (run, _repo) = seed_run(&state, "running", 1, "sess-1", 0).await;
+        assert!(!awaits_verdict(&state.pool, run).await);
+        seed_ticket(&state, run, true).await;
+        assert!(!awaits_verdict(&state.pool, run).await);
+        seed_ticket(&state, run, false).await;
+        assert!(awaits_verdict(&state.pool, run).await);
+    }
+
     #[tokio::test]
     async fn seen_ticket_is_not_woken() {
         let (state, runner) =
@@ -631,7 +720,7 @@ mod tests {
     /// An old pending wake is given up on only when its ticket never finished; one whose ticket
     /// finished while the daemon was down is still delivered.
     #[tokio::test]
-    async fn rearm_abandons_an_old_pending_wake() {
+    async fn rearm_watches_an_old_unfinished_wake_only_briefly() {
         let (state, _runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
         // `seed_ticket` stamps 2026-09-27, long before any 3 h span ends.
@@ -658,7 +747,17 @@ mod tests {
 
         rearm(&state).await;
 
-        assert_eq!(wake_state(&state, ticket).await.as_deref(), Some("refused"));
+        // The restart requeued its work, so it is watched again, but only for `RESTART_SPAN`.
+        assert_eq!(wake_state(&state, ticket).await.as_deref(), Some("pending"));
+        let mut settled = None;
+        for _ in 0..100 {
+            settled = wake_state(&state, ticket).await;
+            if settled.as_deref() != Some("pending") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(settled.as_deref(), Some("refused"));
 
         // An empty plan is a finished ticket: the same old wake is delivered instead.
         let (done_run, _done_repo) = seed_run(&state, "completed", 1, "sess-2", 1).await;
@@ -696,6 +795,46 @@ mod tests {
             Some("delivered")
         );
         assert_eq!(runs_count(&state).await, 1, "a live run is not resumed");
+    }
+
+    /// A full project keeps the wake pending, and it resumes the run once a slot frees.
+    #[tokio::test]
+    async fn no_slot_waits_and_resumes_when_one_frees() {
+        let (state, runner) =
+            test_state_with_runner(Some(Duration::from_millis(200)), Duration::from_secs(600))
+                .await;
+        let (run, _repo) = seed_run(&state, "completed", 1, "sess-1", 0).await;
+        let ticket = seed_ticket(&state, run, false).await;
+        record(&state.pool, run, ticket, ST_PENDING).await.unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, created_at)
+             VALUES (4242, 'x', 'running', 'worktree', '2026-09-27T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE project_slots SET owner_id = 4242")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE autopilot_state SET max_concurrent_slots = 1")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        deliver(&state, run, ticket, &finished(ticket)).await;
+
+        assert_eq!(wake_state(&state, ticket).await.as_deref(), Some("pending"));
+        assert_eq!(refusal_rows(&state).await, 0);
+        sqlx::query("DELETE FROM project_slots")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(wait_for_resume(&runner).await, "sess-1");
+        assert_eq!(
+            wake_state(&state, ticket).await.as_deref(),
+            Some("delivered")
+        );
     }
 
     #[tokio::test]

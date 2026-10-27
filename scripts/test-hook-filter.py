@@ -1176,6 +1176,10 @@ def verify_hint_cases():
                 _bash("tsc -b"),
                 _bash("bash scripts/gates.sh core"),
                 _bash("./scripts/gates.sh core"),
+                _bash("RUST_LOG=debug cargo test"),
+                _bash("env RUST_LOG=debug cargo test"),
+                _bash("python scripts/heavy.py cargo test -p nucleos-core"),
+                _bash("cd core && cargo test"),
                 dict(_bash("cargo test"), tool_name="PowerShell"),
             ]
             for payload in hits:
@@ -1208,6 +1212,10 @@ def verify_hint_cases():
                 _bash("cargo"),
                 _bash("ls -la"),
                 _bash("git status"),
+                _bash("echo cargo test"),
+                _bash("grep -n cargo Cargo.toml"),
+                _bash('git commit -m "run cargo test"'),
+                _bash("cat scripts/gates.sh"),
                 _bash("cargo test", cwd="/elsewhere"),
                 read_it,
                 not_text,
