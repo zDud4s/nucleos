@@ -183,17 +183,49 @@ pub async fn are_linked(pool: &SqlitePool, a: &str, b: &str) -> sqlx::Result<boo
     .map(|n| n > 0)
 }
 
-/// Closes every active link `chat_id` is an end of, as child or as parent (archiving).
+/// What archiving `chat_id` does to the links it is an end of. The two ends are not symmetric
+/// (spec §5):
+///
+/// - As CHILD, its own active link is closed: an archived browser agent answers to nobody.
+/// - As PARENT, each child that answered to it is relinked to the panel only (`parent_chat_id`
+///   NULL, still active): the child "continua só com o painel" rather than vanishing from the
+///   panel's list along with its mother. Relinked the way `open` relinks — the active row closed,
+///   a new one opened, one transaction — so the history still says who the child answered to.
+///   `kind` and `created_by_run` travel to the new row: the child is the same agent, made by the
+///   same turn.
 pub async fn close_all_for(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let orphans: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT child_chat_id, kind, created_by_run FROM chat_links
+          WHERE unlinked_at IS NULL AND parent_chat_id = ?",
+    )
+    .bind(chat_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    // Closed before the panel-only rows are opened: `chat_links_one_active` allows one active row
+    // per child, so the old one has to be history first.
     sqlx::query(
         "UPDATE chat_links SET unlinked_at = ?1
           WHERE unlinked_at IS NULL AND (child_chat_id = ?2 OR parent_chat_id = ?2)",
     )
-    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&now)
     .bind(chat_id)
-    .execute(pool)
-    .await
-    .map(|_| ())
+    .execute(&mut *tx)
+    .await?;
+    for (child, kind, created_by_run) in orphans {
+        sqlx::query(
+            "INSERT INTO chat_links (child_chat_id, parent_chat_id, kind, created_by_run, created_at)
+             VALUES (?, NULL, ?, ?, ?)",
+        )
+        .bind(&child)
+        .bind(&kind)
+        .bind(created_by_run)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
 }
 
 #[cfg(test)]
@@ -377,21 +409,31 @@ mod tests {
             .expect("no active path from c back to a any more");
     }
 
+    /// Spec §5: archiving the mother leaves her child with the panel only (an active link, no
+    /// parent, the old row kept as history); archiving the child closes its own link.
     #[tokio::test]
-    async fn archiving_either_end_closes_the_active_link() {
+    async fn archiving_the_mother_leaves_the_child_on_the_panel_and_archiving_the_child_closes_it()
+    {
         let pool = test_pool().await;
         let mother = chat(&pool).await;
         let child = chat(&pool).await;
-        open(&pool, &child, Some(&mother), "browser", None)
+        let first = open(&pool, &child, Some(&mother), "browser", Some(7))
             .await
             .unwrap();
         crate::chats::archive(&pool, &mother).await.unwrap();
-        assert_eq!(
-            active(&pool, &child).await.unwrap(),
-            None,
-            "archiving the mother closes her child's link"
-        );
-        assert!(rows_of(&pool, &child).await[0].unlinked_at.is_some());
+        let panel_only = active(&pool, &child)
+            .await
+            .unwrap()
+            .expect("the child keeps an active link to the panel");
+        assert_eq!(panel_only.parent_chat_id, None);
+        assert_eq!(panel_only.kind, "browser");
+        assert_eq!(panel_only.created_by_run, Some(7));
+        assert_ne!(panel_only.id, first.id);
+        let history = rows_of(&pool, &child).await;
+        assert_eq!(history.len(), 2, "the link to the mother is kept as history");
+        assert_eq!(history[0].parent_chat_id.as_deref(), Some(mother.as_str()));
+        assert!(history[0].unlinked_at.is_some());
+        assert!(!are_linked(&pool, &child, &mother).await.unwrap());
 
         let other_mother = chat(&pool).await;
         let other_child = chat(&pool).await;

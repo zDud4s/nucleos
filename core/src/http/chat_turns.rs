@@ -2022,6 +2022,49 @@ mod tests {
         assert_eq!(ids(&none), vec![panel_only.clone()]);
     }
 
+    /// Spec §5 through the panel's own list: a child whose mother was archived is still listed,
+    /// with no parent; a child that was itself archived is not.
+    #[tokio::test]
+    async fn get_browser_agents_keeps_a_child_whose_mother_was_archived_and_drops_an_archived_child()
+    {
+        let state = state().await;
+        let mother = chat(&state).await;
+        let child = chat(&state).await;
+        crate::chats::links::open(&state.pool, &child, Some(&mother), "browser", None)
+            .await
+            .unwrap();
+
+        crate::chats::archive(&state.pool, &mother).await.unwrap();
+
+        let (status, listed) = call(
+            &state,
+            "GET",
+            "/assistant/browser-agents?limit=20",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let items = listed.as_array().unwrap_or_else(|| panic!("a list, got {listed}"));
+        assert_eq!(items.len(), 1, "{listed}");
+        assert_eq!(items[0]["chat_id"], child.as_str());
+        assert!(items[0]["parent_chat_id"].is_null(), "{listed}");
+        assert!(items[0]["parent_title"].is_null(), "{listed}");
+
+        crate::chats::archive(&state.pool, &child).await.unwrap();
+
+        let (status, listed) = call(
+            &state,
+            "GET",
+            "/assistant/browser-agents?limit=20",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed, serde_json::json!([]), "an archived child is not listed");
+    }
+
     /// One POST to `/assistant/browser-agents` with `bearer` instead of the control token.
     async fn post_browser_agents_as(
         state: &AppState,

@@ -493,9 +493,47 @@ pub async fn handover_of(pool: &sqlx::SqlitePool, relay_id: Option<i64>) -> Hand
     let Some(relay_id) = relay_id else {
         return Handover::Typed;
     };
-    let row: sqlx::Result<Option<(Option<i64>, i64)>> = sqlx::query_as(
-        "SELECT s.from_relay_id,
-                (SELECT COALESCE(MAX(r.read_untrusted), 1) FROM runs r
+    let row: sqlx::Result<Option<Option<i64>>> = sqlx::query_scalar(
+        "SELECT s.from_relay_id
+           FROM chat_relays c
+           JOIN runs s ON s.id = c.sending_run_id
+          WHERE c.id = ?",
+    )
+    .bind(relay_id)
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some(None)) => {
+            if sender_read_untrusted(pool, relay_id).await {
+                Handover::Withheld
+            } else {
+                Handover::FirstHop
+            }
+        }
+        Ok(_) => Handover::Withheld,
+        Err(error) => {
+            tracing::warn!(%error, relay_id, "a relayed turn's chain could not be read; it keeps McpOnly");
+            Handover::Withheld
+        }
+    }
+}
+
+/// Whether the conversation that sent `relay_id` has third-party text behind the words: its sending
+/// run, or any run of that run's session, read untrusted context. The reach is `handover_of`'s, and
+/// for its reason — a live process carries what every earlier turn of its session read.
+///
+/// Two readers, one question. `handover_of` uses it to withhold the shell; `send_message_inner` and
+/// `spawn_local_turn` use it to mark the run the relay starts `read_untrusted` before it is spawned.
+/// The second is what keeps the taint from being laundered by one hop: a turn whose prompt IS a
+/// tainted sender's words holds that text exactly as if it had read it, so left clean it would leave
+/// a resumable session behind (`turn.rs` resumes any session whose run reads clean), and the next
+/// typed turn would resume web text with full tools — and a relay out of that session would read
+/// clean to `handover_of` in turn. Marked, the taint travels the chain hop by hop.
+///
+/// Fails closed: a relay, a sending run, or a session that cannot be read answers `true`.
+pub async fn sender_read_untrusted(pool: &sqlx::SqlitePool, relay_id: i64) -> bool {
+    let row: sqlx::Result<Option<i64>> = sqlx::query_scalar(
+        "SELECT (SELECT COALESCE(MAX(r.read_untrusted), 1) FROM runs r
                   WHERE r.id = s.id
                      OR (s.session_id IS NOT NULL AND r.session_id = s.session_id))
            FROM chat_relays c
@@ -506,11 +544,11 @@ pub async fn handover_of(pool: &sqlx::SqlitePool, relay_id: Option<i64>) -> Hand
     .fetch_optional(pool)
     .await;
     match row {
-        Ok(Some((None, 0))) => Handover::FirstHop,
-        Ok(_) => Handover::Withheld,
+        Ok(Some(0)) => false,
+        Ok(_) => true,
         Err(error) => {
-            tracing::warn!(%error, relay_id, "a relayed turn's chain could not be read; it keeps McpOnly");
-            Handover::Withheld
+            tracing::warn!(%error, relay_id, "a relay's sender could not be read; it counts as tainted");
+            true
         }
     }
 }
@@ -1052,6 +1090,52 @@ mod tests {
         assert_eq!(handover_of(&pool, Some(relay)).await, Handover::Withheld);
 
         assert_eq!(handover_of(&pool, Some(9_999)).await, Handover::Withheld);
+    }
+
+    /// The taint `send_message_inner` carries onto a relay-born run: a clean sender is clean, a
+    /// sender whose own row or whose session read untrusted text is not, and a relay that names no
+    /// row fails closed. Depth is not taint — a clean second hop is still clean here.
+    #[tokio::test]
+    async fn a_relays_sender_is_tainted_by_its_own_row_or_its_session_and_by_nothing_else() {
+        let pool = test_pool().await;
+
+        let clean = seed_chain(&pool, &["A", "B"]).await;
+        assert!(!sender_read_untrusted(&pool, relay_of(&pool, clean).await).await);
+        let deep = seed_chain(&pool, &["C", "D", "E"]).await;
+        assert!(!sender_read_untrusted(&pool, relay_of(&pool, deep).await).await);
+
+        let tainted = seed_chain(&pool, &["F", "G"]).await;
+        let relay = relay_of(&pool, tainted).await;
+        sqlx::query(
+            "UPDATE runs SET read_untrusted = 1
+              WHERE id = (SELECT sending_run_id FROM chat_relays WHERE id = ?)",
+        )
+        .bind(relay)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sender_read_untrusted(&pool, relay).await);
+
+        let session = seed_chain(&pool, &["H", "I"]).await;
+        let relay = relay_of(&pool, session).await;
+        sqlx::query(
+            "UPDATE runs SET session_id = 'shared-taint'
+              WHERE id = (SELECT sending_run_id FROM chat_relays WHERE id = ?)",
+        )
+        .bind(relay)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at, chat_id, session_id, read_untrusted)
+             VALUES ('read the page', 'completed', '2026-08-22T00:00:00Z', 'H', 'shared-taint', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sender_read_untrusted(&pool, relay).await);
+
+        assert!(sender_read_untrusted(&pool, 9_999).await);
     }
 
     /// The third brake: a chain that has spent its ceiling is refused another hop, and both figures

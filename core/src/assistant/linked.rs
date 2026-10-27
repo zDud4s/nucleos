@@ -554,6 +554,100 @@ mod tests {
         settled(&state.pool, turn_id).await;
     }
 
+    /// The child read the web, so the mother's turn its reply opens holds web text as its prompt:
+    /// that turn is marked `read_untrusted` before it starts, not merely kept `McpOnly`, so it leaves
+    /// no resumable session for the next typed turn to pick up with its tools.
+    #[tokio::test]
+    async fn a_reply_from_a_child_that_read_untrusted_text_marks_the_parents_turn() {
+        let state = test_state().await;
+        owner_present(&state.pool).await;
+        let (mother, child, _link_id, child_run) = a_linked_pair(&state.pool, None).await;
+        crate::execution::runs::mark_untrusted_context(&state.pool, child_run)
+            .await
+            .unwrap();
+
+        let outcome = deliver_reply(&state, &child, child_run, "Read three pages.").await;
+
+        let turn_id = match outcome {
+            DeliveryOutcome::Delivered { turn_id } => turn_id,
+            other => panic!("the reply should have opened a turn in the mother: {other:?}"),
+        };
+        assert!(
+            crate::execution::runs::read_untrusted_context(&state.pool, turn_id)
+                .await
+                .unwrap(),
+            "a turn handed a tainted sender's words has read untrusted text"
+        );
+        settled(&state.pool, turn_id).await;
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, &mother)
+                .await
+                .unwrap(),
+            None,
+            "the marked turn leaves no session to resume"
+        );
+    }
+
+    /// A child that read nothing untrusted taints nothing: the mother's turn stays unmarked.
+    #[tokio::test]
+    async fn a_reply_from_a_clean_child_leaves_the_parents_turn_unmarked() {
+        let state = test_state().await;
+        owner_present(&state.pool).await;
+        let (_mother, child, _link_id, child_run) = a_linked_pair(&state.pool, None).await;
+
+        let outcome = deliver_reply(&state, &child, child_run, "Nothing to report.").await;
+
+        let turn_id = match outcome {
+            DeliveryOutcome::Delivered { turn_id } => turn_id,
+            other => panic!("the reply should have opened a turn in the mother: {other:?}"),
+        };
+        assert!(
+            !crate::execution::runs::read_untrusted_context(&state.pool, turn_id)
+                .await
+                .unwrap()
+        );
+        settled(&state.pool, turn_id).await;
+    }
+
+    /// Fail closed: when the mark cannot be written the mother's turn is not started — its row
+    /// ends `failed` — and the reply falls to a notice like any other refused delivery.
+    #[tokio::test]
+    async fn a_tainted_reply_whose_mark_cannot_be_written_starts_no_turn() {
+        let state = test_state().await;
+        owner_present(&state.pool).await;
+        let (mother, child, _link_id, child_run) = a_linked_pair(&state.pool, None).await;
+        crate::execution::runs::mark_untrusted_context(&state.pool, child_run)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_untrusted_marks BEFORE UPDATE OF read_untrusted ON runs
+             BEGIN SELECT RAISE(ABORT, 'marks refused for this test'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let outcome = deliver_reply(&state, &child, child_run, "Read three pages.").await;
+
+        assert_eq!(
+            outcome,
+            DeliveryOutcome::Refused {
+                reason: "internal".to_string()
+            }
+        );
+        let statuses: Vec<String> = sqlx::query_scalar(
+            "SELECT status FROM runs WHERE chat_id = ? AND from_relay_id IS NOT NULL",
+        )
+        .bind(&mother)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(statuses, vec!["failed".to_string()], "the turn was never started");
+        let notices = browser_reply_notices(&state.pool, &mother).await;
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].starts_with("Not delivered (internal)"), "{notices:?}");
+    }
+
     /// Nothing to say, or nobody to say it to: no relay, no notice, no delivery row.
     #[tokio::test]
     async fn an_empty_reply_and_an_unlinked_child_deliver_nothing() {

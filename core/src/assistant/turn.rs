@@ -99,6 +99,9 @@ pub(super) async fn spawn_local_turn(
     .await
     .map_err(|e| e.to_string())?
     .last_insert_rowid();
+    // A relay from a tainted sender marks this run before anything else learns it exists; a mark
+    // that fails ends it here, unstarted. The CLI path makes the same call at the same point.
+    inherit_relay_taint(&state.pool, id, relay_id).await?;
     crate::chats::stamp_project(&state.pool, id, &slot.chat_id).await;
     // A channel conversation sees "working" as soon as its turn exists. A no-op for any other chat.
     crate::channels::replies::turn_started(state, id, &slot.chat_id).await;
@@ -236,6 +239,45 @@ pub(super) async fn spawn_local_turn(
     });
 
     Ok(id)
+}
+
+/// Marks the just-inserted run `id` `read_untrusted` when the relay that bore it was sent by a
+/// conversation with third-party text behind it (`relay::sender_read_untrusted`). A no-op for a
+/// typed turn and for a relay from a clean sender.
+///
+/// Called by both turn launchers between their INSERT and their spawn, so the hooks see the mark
+/// from the first tool call and `turn.rs` never leaves a resumable session behind a prompt made of a
+/// stranger's words. `handover_of` already keeps such a turn `McpOnly`; that limits THIS turn, and
+/// only the mark limits what comes after it.
+///
+/// Fails closed: a mark that cannot be written ends the run as `failed` before it starts and returns
+/// the refusal, so the caller spawns nothing — a turn holding tainted words on a row that reads clean
+/// is the one state every barrier downstream assumes does not exist.
+pub(super) async fn inherit_relay_taint(
+    pool: &SqlitePool,
+    id: i64,
+    relay_id: Option<i64>,
+) -> Result<(), String> {
+    let Some(relay_id) = relay_id else {
+        return Ok(());
+    };
+    if !crate::relay::sender_read_untrusted(pool, relay_id).await {
+        return Ok(());
+    }
+    let Err(error) = crate::execution::runs::mark_untrusted_context(pool, id).await else {
+        return Ok(());
+    };
+    tracing::error!(run_id = id, relay_id, %error, "could not mark a turn relayed from a tainted sender; not starting it");
+    let written = sqlx::query(
+        "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind("this turn was relayed from a conversation that read third-party text and the daemon could not record that; it was not started")
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await;
+    crate::execution::runs::warn_on_terminal_write_err(&written, id, "failed");
+    Err(format!("could not record that the relayed turn carries untrusted text: {error}"))
 }
 
 /// What tools a conversation's turn may reach.

@@ -167,6 +167,20 @@ pub async fn for_chat_since(
     .await
 }
 
+/// Whether this conversation has a notice of `kind` that no turn has consumed yet. Consumes nothing:
+/// a caller that must do something BEFORE it may take them (mark its run, say) asks this first, so a
+/// step that fails in between leaves the notices for the next turn instead of losing them.
+pub async fn has_unconsumed(pool: &SqlitePool, chat_id: &str, kind: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM chat_notices
+                         WHERE chat_id = ? AND kind = ? AND consumed_by_run IS NULL)",
+    )
+    .bind(chat_id)
+    .bind(kind)
+    .fetch_one(pool)
+    .await
+}
+
 /// The bodies of this conversation's notices of `kind` that no turn has consumed yet, oldest
 /// first, stamped `consumed_by_run = run_id` so the next turn does not see them again.
 pub async fn take_unconsumed(
