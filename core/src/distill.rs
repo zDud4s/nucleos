@@ -7,6 +7,8 @@
 
 pub mod model;
 pub mod origin;
+pub mod sources;
+pub(crate) mod chats;
 
 mod extract;
 pub use extract::*;

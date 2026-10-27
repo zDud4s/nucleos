@@ -3240,6 +3240,8 @@ mod tests {
             (Method::POST, "/capture-requests/7/answer"),
             (Method::GET, "/config/capture-wait"),
             (Method::POST, "/config/capture-wait"),
+            (Method::GET, "/config/distiller-sources"),
+            (Method::POST, "/config/distiller-sources"),
         ];
         let refused = [
             Scope::Run(1),

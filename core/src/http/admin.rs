@@ -21,6 +21,11 @@ pub(super) fn routes() -> Router<AppState> {
             get(crate::distill::model::get_distiller_config)
                 .post(crate::distill::model::post_distiller_config),
         )
+        // In no `auth.rs` table on purpose, like `/config/distiller`.
+        .route(
+            "/config/distiller-sources",
+            get(crate::distill::sources::get_sources).post(crate::distill::sources::post_sources),
+        )
         .route(
             "/config/capture-wait",
             get(get_capture_wait).post(post_capture_wait),

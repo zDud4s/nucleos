@@ -25090,7 +25090,63 @@ mod tests {
         assert_eq!(body["minutes"], 30);
     }
 
-    async fn loadout_seed_agent_and_team(pool: &sqlx::SqlitePool) {
+    #[tokio::test]
+    async fn the_distiller_sources_default_on_and_round_trip_each_alone() {
+        let state = test_state().await;
+        let (status, body) = call(state.clone(), "GET", "/config/distiller-sources", None).await;
+        assert_eq!(
+            (status, body["chat"].as_bool(), body["calendar"].as_bool()),
+            (StatusCode::OK, Some(true), Some(true))
+        );
+        let (_, body) = call(
+            state.clone(),
+            "POST",
+            "/config/distiller-sources",
+            Some(serde_json::json!({ "chat": false })),
+        )
+        .await;
+        assert_eq!(
+            (body["chat"].as_bool(), body["calendar"].as_bool()),
+            (Some(false), Some(true))
+        );
+        let (_, body) = call(state, "GET", "/config/distiller-sources", None).await;
+        assert_eq!(
+            (body["chat"].as_bool(), body["calendar"].as_bool()),
+            (Some(false), Some(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_chats_back_on_moves_the_history_cut_to_now() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let chat = crate::distill::chats::fixtures::chat_with(&pool).await;
+        let old = crate::distill::chats::fixtures::turn(&pool, &chat, None, "q", "a").await;
+        let post = |on: bool| {
+            call(
+                state.clone(),
+                "POST",
+                "/config/distiller-sources",
+                Some(serde_json::json!({ "chat": on })),
+            )
+        };
+        // Already on (absent = on): posting `chat: true` leaves the cut where the migration put it.
+        let before = crate::distill::sources::chat_floor(&pool).await;
+        post(true).await;
+        assert_eq!(crate::distill::sources::chat_floor(&pool).await, before);
+        // off -> on: the cut jumps to MAX(runs.id), so the turns written meanwhile are history too.
+        post(false).await;
+        let newer = crate::distill::chats::fixtures::turn(&pool, &chat, None, "q", "a").await;
+        post(true).await;
+        assert_eq!(crate::distill::sources::chat_floor(&pool).await, newer);
+        assert!(newer > old);
+        // on -> on again: untouched.
+        crate::distill::chats::fixtures::turn(&pool, &chat, None, "q", "a").await;
+        post(true).await;
+        assert_eq!(crate::distill::sources::chat_floor(&pool).await, newer);
+    }
+
+
         sqlx::query(
             "INSERT OR IGNORE INTO agents
                  (id, name, speciality, prompt, engine, model, capabilities, created_at, updated_at)
