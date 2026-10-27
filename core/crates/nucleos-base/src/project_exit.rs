@@ -346,6 +346,63 @@ pub async fn remove(
         // cannot outlive it, and it reads `knowledge` to find its rows, so it goes before that
         // table does.
         //
+        // Derived (b) + (d), spec 2026-10-22 section 9: the themes. They read the knowledge rows the
+        // statements below delete, so they run first, for the reason given above. A theme that loses a
+        // knowledge member keeps living with a NULL centroid (recomputed next run) and without the
+        // synthesis built on that member; a `proposed` theme left with fewer than 3 members is deleted
+        // with them. Notes have no project and keep counting as live members.
+        const GONE: &str = "SELECT id FROM knowledge
+             WHERE (scope_kind = 'project' AND scope_id = ?1)
+                OR (scope_kind = 'job'
+                    AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))";
+        sqlx::query("CREATE TEMP TABLE _theme_affected (id INTEGER PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO _theme_affected (id)
+             SELECT DISTINCT theme_id FROM theme_members
+              WHERE member_kind = 'knowledge' AND member_id IN ({GONE})"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM theme_members
+              WHERE member_kind = 'knowledge' AND member_id IN ({GONE})"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE themes
+                SET centroid = NULL, synthesis = NULL, synthesis_basis = NULL,
+                    synthesis_at = NULL, synthesis_model = NULL
+              WHERE id IN (SELECT id FROM _theme_affected)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TEMP TABLE _theme_thin AS
+             SELECT id FROM themes
+              WHERE state = 'proposed' AND id IN (SELECT id FROM _theme_affected)
+                AND (SELECT COUNT(*) FROM theme_members m
+                      WHERE m.theme_id = themes.id AND m.excluded = 0) < 3",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM theme_members WHERE theme_id IN (SELECT id FROM _theme_thin)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM themes WHERE id IN (SELECT id FROM _theme_thin)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TABLE _theme_thin")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TABLE _theme_affected")
+            .execute(&mut *tx)
+            .await?;
+        //
         // Derived (a), spec 9: the general lessons whose `knowledge` evidence is ALL this project's rows.
         // Chosen into a temp table BEFORE the statements below, which delete the very rows this one reads;
         // `note` references have no project and do not make the evidence mixed. Ids compare by equality, never
@@ -1133,6 +1190,156 @@ mod tests {
     /// One row of `knowledge_embeddings` for `knowledge_id`. Written here rather than through
     /// `embed::store_in`, which lives in nucleos-core above this crate; the vector's bytes do not
     /// matter to a forget, only that the row exists.
+    async fn theme_row(pool: &SqlitePool, state: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO themes (name, state, model, dim, centroid, synthesis, synthesis_basis,
+                                 synthesis_at, synthesis_model, created_at)
+             VALUES ('t', ?, 'm', 3, zeroblob(12), 's', '[]', 't', 'm', 't') RETURNING id",
+        )
+        .bind(state)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn theme_member(pool: &SqlitePool, theme: i64, kind: &str, id: i64) {
+        sqlx::query(
+            "INSERT INTO theme_members (theme_id, member_kind, member_id, added_at)
+             VALUES (?, ?, ?, 't')",
+        )
+        .bind(theme)
+        .bind(kind)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn project_knowledge_id(pool: &SqlitePool, project_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT id FROM knowledge WHERE scope_kind = 'project' AND scope_id = ?")
+            .bind(project_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_project_nulls_the_centroid_and_drops_a_thin_proposed_theme() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+        let alpha = project_knowledge_id(&pool, "alpha").await;
+        let bravo = project_knowledge_id(&pool, "bravo").await;
+        let acc = theme_row(&pool, "accepted").await;
+        let prop = theme_row(&pool, "proposed").await;
+        for (t, kind, id) in [
+            (acc, "knowledge", alpha),
+            (acc, "knowledge", bravo),
+            (acc, "note", 1),
+            (acc, "note", 2),
+            (prop, "knowledge", alpha),
+            (prop, "knowledge", bravo),
+            (prop, "note", 1),
+        ] {
+            theme_member(&pool, t, kind, id).await;
+        }
+        remove(&pool, "alpha", true).await.unwrap();
+        let centroid: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT centroid FROM themes WHERE id = ?")
+                .bind(acc)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(centroid, None);
+        let left: Vec<i64> = sqlx::query_scalar("SELECT id FROM themes ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec![acc], "the proposed theme fell under 3 members");
+        let orphans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM theme_members WHERE theme_id = ?")
+                .bind(prop)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphans, 0);
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM theme_members WHERE theme_id = ?")
+            .bind(acc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 3, "the accepted theme keeps bravo and the notes");
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_project_leaves_themes_without_its_members_untouched() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+        let bravo = project_knowledge_id(&pool, "bravo").await;
+        let t = theme_row(&pool, "accepted").await;
+        theme_member(&pool, t, "knowledge", bravo).await;
+        theme_member(&pool, t, "note", 1).await;
+        remove(&pool, "alpha", true).await.unwrap();
+        let row: (Option<Vec<u8>>, Option<String>) =
+            sqlx::query_as("SELECT centroid, synthesis FROM themes WHERE id = ?")
+                .bind(t)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0.is_some());
+        assert_eq!(row.1.as_deref(), Some("s"));
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_project_clears_the_synthesis_of_a_theme_that_loses_a_member() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+        let alpha = project_knowledge_id(&pool, "alpha").await;
+        let bravo = project_knowledge_id(&pool, "bravo").await;
+        let loses = theme_row(&pool, "accepted").await;
+        let keeps = theme_row(&pool, "accepted").await;
+        for (t, kind, id) in [
+            (loses, "knowledge", alpha),
+            (loses, "knowledge", bravo),
+            (loses, "note", 1),
+            (keeps, "knowledge", bravo),
+            (keeps, "note", 1),
+            (keeps, "note", 2),
+        ] {
+            theme_member(&pool, t, kind, id).await;
+        }
+        remove(&pool, "alpha", true).await.unwrap();
+        let cleared: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT synthesis, synthesis_basis, synthesis_at, synthesis_model
+               FROM themes WHERE id = ?",
+        )
+        .bind(loses)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cleared, (None, None, None, None));
+        let members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM theme_members WHERE theme_id = ?")
+                .bind(loses)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(members, 2, "the members of bravo and the note stay");
+        let kept: Option<String> = sqlx::query_scalar("SELECT synthesis FROM themes WHERE id = ?")
+            .bind(keeps)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("s"));
+    }
+
     async fn store_vector(pool: &SqlitePool, knowledge_id: i64) {
         sqlx::query(
             "INSERT INTO knowledge_embeddings (knowledge_id, model, dim, vector, created_at)
