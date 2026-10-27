@@ -422,7 +422,7 @@ mod tests {
 
     /// How git prints a toplevel: forward slashes, whatever the platform.
     fn git_form(dir: &tempfile::TempDir) -> String {
-        native(dir).replace('\', "/")
+        native(dir).replace('\\', "/")
     }
 
     #[tokio::test]
@@ -488,15 +488,15 @@ mod tests {
 
     #[test]
     fn worktree_keys_ignore_the_verbatim_prefix_the_slash_direction_and_a_trailing_slash() {
-        assert_eq!(worktree_key(r"\?\C:\Repo\wt"), worktree_key("C:/Repo/wt/"));
-        assert_eq!(worktree_key(r"\?\UNC\srv\share\wt"), worktree_key("//srv/share/wt"));
+        assert_eq!(worktree_key(r"\\?\C:\Repo\wt"), worktree_key("C:/Repo/wt/"));
+        assert_eq!(worktree_key(r"\\?\UNC\srv\share\wt"), worktree_key("//srv/share/wt"));
         assert_ne!(worktree_key("/r/wt-a"), worktree_key("/r/wt-b"));
     }
 
     #[test]
     #[cfg(windows)]
     fn on_windows_worktree_keys_ignore_case() {
-        assert_eq!(worktree_key(r"\?\C:\Repo\WT"), worktree_key("c:/repo/wt"));
+        assert_eq!(worktree_key(r"\\?\C:\Repo\WT"), worktree_key("c:/repo/wt"));
     }
 
     #[test]
