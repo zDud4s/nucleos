@@ -302,8 +302,9 @@ mod tests {
     }
 }
 
-/// Fixtures for the tests of the HTTP, MCP and run-lifecycle layers.
-#[cfg(test)]
+/// Fixtures for the tests of the HTTP, MCP and run-lifecycle layers. `testkit` too: the daemon
+/// binary compiles `http/tasks.rs` into its own tests and reaches this module through the lib.
+#[cfg(any(test, feature = "testkit"))]
 pub mod testing {
     use super::*;
     use sqlx::SqlitePool;
