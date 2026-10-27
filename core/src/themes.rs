@@ -300,6 +300,86 @@ async fn insert_theme(
     tx.commit().await
 }
 
+/// For every live theme of `model`: an `accepted` one takes in each candidate close to its centroid
+/// that is not already a member (an `excluded` member stays out), and every `proposed`/`accepted` one
+/// gets its centroid recomputed from the live vectors of its members (the excluded and the vanished
+/// do not count). A theme with a NULL centroid is recomputed here, which is how it recovers.
+async fn absorb_and_recompute(
+    pool: &SqlitePool,
+    model: &str,
+    found: &[Candidate],
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    let by_key: std::collections::HashMap<MemberKey, &Vec<f32>> =
+        found.iter().map(|c| (c.key, &c.vector)).collect();
+    let themes: Vec<(i64, String, Option<Vec<u8>>, i64)> = sqlx::query_as(
+        "SELECT id, state, centroid, dim FROM themes
+          WHERE model = ? AND state IN ('proposed', 'accepted') ORDER BY id",
+    )
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+    for (theme_id, state, blob, dim) in themes {
+        let known: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT member_kind, member_id, excluded FROM theme_members WHERE theme_id = ?",
+        )
+        .bind(theme_id)
+        .fetch_all(pool)
+        .await?;
+        let mut members: std::collections::HashMap<MemberKey, bool> = Default::default();
+        for (kind, id, excluded) in known {
+            if let Some(kind) = MemberKind::parse(&kind) {
+                members.insert((kind, id), excluded != 0);
+            }
+        }
+        let stamp = now.to_rfc3339();
+        if state == "accepted"
+            && let Some(center) = blob.as_deref().and_then(|b| crate::embed::decode(b, dim))
+        {
+            for candidate in found {
+                let close = crate::embed::cosine(&candidate.vector, &center)
+                    .is_some_and(|c| c >= CLUSTER_THRESHOLD);
+                if close && !members.contains_key(&candidate.key) {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO theme_members
+                           (theme_id, member_kind, member_id, origin, added_at)
+                         VALUES (?, ?, ?, 'system', ?)",
+                    )
+                    .bind(theme_id)
+                    .bind(candidate.key.0.as_str())
+                    .bind(candidate.key.1)
+                    .bind(&stamp)
+                    .execute(pool)
+                    .await?;
+                    members.insert(candidate.key, false);
+                }
+            }
+        }
+        let live: Vec<Vec<f32>> = {
+            let mut keys: Vec<&MemberKey> = members
+                .iter()
+                .filter(|(_, excluded)| !**excluded)
+                .map(|(key, _)| key)
+                .collect();
+            keys.sort();
+            keys.into_iter()
+                .filter_map(|key| by_key.get(key).map(|v| (*v).clone()))
+                .collect()
+        };
+        if live.is_empty() {
+            continue;
+        }
+        let fresh = centroid(&live);
+        sqlx::query("UPDATE themes SET centroid = ?, dim = ? WHERE id = ?")
+            .bind(crate::embed::encode(&fresh))
+            .bind(fresh.len() as i64)
+            .bind(theme_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 /// One clustering pass: absorb close members into `accepted` themes, recompute centroids, then propose
 /// at most `MAX_NEW_THEMES_PER_RUN` new themes. Returns how many new themes it proposed.
 pub async fn cluster_pass(
@@ -308,6 +388,7 @@ pub async fn cluster_pass(
     now: DateTime<Utc>,
 ) -> sqlx::Result<usize> {
     let found = candidates(pool, model).await?;
+    absorb_and_recompute(pool, model, &found, now).await?;
     let blocking = blocking_sets(pool).await?;
     let planned = plan_new_themes(&found, &blocking);
     let by_key: std::collections::HashMap<MemberKey, &Vec<f32>> =
@@ -635,6 +716,71 @@ mod tests {
             cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_theme_absorbs_a_new_close_member_and_recomputes_its_centroid() {
+        let pool = crate::testdb::fresh_pool().await;
+        for i in 0..3 {
+            knowledge_row(&pool, "x", "distiller", "active", [1.0, 0.01 * i as f32, 0.0]).await;
+        }
+        cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
+        sqlx::query("UPDATE themes SET state = 'accepted'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let near = knowledge_row(&pool, "y", "distiller", "active", [1.0, 0.04, 0.0]).await;
+        let far = knowledge_row(&pool, "z", "distiller", "active", [0.0, 1.0, 0.0]).await;
+        cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT member_id FROM theme_members WHERE member_kind = 'knowledge' ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(ids.contains(&near) && !ids.contains(&far));
+        let blob: Vec<u8> = sqlx::query_scalar("SELECT centroid FROM themes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(
+            blob,
+            crate::embed::encode(&[1.0, 0.01, 0.0]),
+            "the centroid moved with the new member"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_excluded_member_does_not_come_back_and_a_null_centroid_is_recomputed() {
+        let pool = crate::testdb::fresh_pool().await;
+        let ids = [
+            knowledge_row(&pool, "a", "distiller", "active", [1.0, 0.0, 0.0]).await,
+            knowledge_row(&pool, "b", "distiller", "active", [1.0, 0.02, 0.0]).await,
+            knowledge_row(&pool, "c", "distiller", "active", [1.0, 0.04, 0.0]).await,
+        ];
+        cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
+        sqlx::query("UPDATE themes SET state = 'accepted', centroid = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE theme_members SET excluded = 1 WHERE member_id = ?")
+            .bind(ids[2])
+            .execute(&pool)
+            .await
+            .unwrap();
+        cluster_pass(&pool, "m", chrono::Utc::now()).await.unwrap();
+        let excluded: i64 =
+            sqlx::query_scalar("SELECT excluded FROM theme_members WHERE member_id = ?")
+                .bind(ids[2])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(excluded, 1);
+        let null: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM themes WHERE centroid IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(null, 0);
     }
 }
 
