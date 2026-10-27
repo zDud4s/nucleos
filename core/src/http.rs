@@ -58,6 +58,7 @@ mod repo;
 mod run_queue;
 mod tasks;
 mod team;
+mod themes;
 mod workflows;
 
 #[cfg(test)]
@@ -146,6 +147,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(repo::routes())
         .merge(run_queue::routes())
         .merge(team::routes())
+        .merge(themes::routes())
         .merge(workflows::routes())
         // While the daemon drains for an update, the routes that start work answer 503
         // (`shutdown.rs`). Added before the token check, so it runs inside it: only a caller that
@@ -356,6 +358,7 @@ mod tests {
                 run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 run_tails: Default::default(),
                 fleet: Default::default(),
+                turns: Default::default(),
                 files_root: None,
                 files_trash: None,
                 workflow_library: None,
@@ -1542,6 +1545,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -18985,6 +18989,7 @@ mod tests {
             run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             files_root: None,
             files_trash: None,
             workflow_library: None,
@@ -24990,6 +24995,14 @@ mod tests {
 
     async fn open_capture_request(state: &AppState, job_id: i64) {
         sqlx::query(
+            "INSERT OR IGNORE INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (?, 'p', '/tmp', 'failed', 3, 't')",
+        )
+        .bind(job_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at)
              VALUES (?, 'p', '[{\"row\":1,\"cause\":\"job_failed\",\"fact\":\"f\"}]', 'q', 'open',
                      '2999-01-01T00:00:00+00:00', '2026-10-07T10:00:00+00:00')",
@@ -25010,6 +25023,7 @@ mod tests {
         assert_eq!(list[0]["job_id"], 7);
         assert_eq!(list[0]["causes"][0], "job_failed");
         assert!(list[0]["seconds_left"].as_i64().unwrap() > 0);
+        assert!(list[0]["digest_id"].is_null());
 
         let (status, _) = call(state.clone(), "POST", "/capture-requests/7/dismiss", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -25045,7 +25059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answer_becomes_a_job_note_and_releases_the_job() {
+    async fn an_answer_becomes_a_job_note_and_requeues_the_job() {
         let state = test_state().await;
         open_capture_request(&state, 7).await;
 
@@ -25057,7 +25071,13 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(body["released"], true);
+        assert_eq!(body["requeued"], true);
+        assert!(body.get("released").is_none());
+        let cause: String = sqlx::query_scalar("SELECT cause FROM distill_queue WHERE job_id = 7")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(cause, "owner_answered");
         let note_id = body["note_id"].as_i64().unwrap();
 
         let link: (String, String, String) = sqlx::query_as(
@@ -25072,7 +25092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_late_answer_is_kept_but_releases_nothing() {
+    async fn a_late_answer_to_a_dismissed_request_keeps_the_note_and_still_requeues() {
         let state = test_state().await;
         open_capture_request(&state, 7).await;
         let (status, _) = call(state.clone(), "POST", "/capture-requests/7/dismiss", None).await;
@@ -25086,7 +25106,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(body["released"], false);
+        assert_eq!(body["requeued"].as_bool(), Some(true));
         assert_eq!(note_count(&state).await, 1);
         assert_eq!(request_state(&state, 7).await, "dismissed");
     }
@@ -25128,43 +25148,227 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_capture_wait_round_trips_and_refuses_out_of_range() {
+    async fn the_capture_config_round_trips_refuses_out_of_range_and_reads_the_old_key() {
         let state = test_state().await;
-        let (status, body) = call(state.clone(), "GET", "/config/capture-wait", None).await;
+        let (status, body) = call(state.clone(), "GET", "/config/capture", None).await;
         assert_eq!(
-            (status, body["minutes"].as_i64()),
-            (StatusCode::OK, Some(120))
+            (
+                status,
+                body["answer_days"].as_i64(),
+                body["digest_hour"].as_i64()
+            ),
+            (StatusCode::OK, Some(5), Some(18))
         );
-
         let (status, body) = call(
             state.clone(),
             "POST",
-            "/config/capture-wait",
-            Some(serde_json::json!({ "minutes": 30 })),
+            "/config/capture",
+            Some(serde_json::json!({ "answer_days": 7, "digest_hour": 9 })),
         )
         .await;
         assert_eq!(
-            (status, body["minutes"].as_i64()),
-            (StatusCode::OK, Some(30))
+            (
+                status,
+                body["answer_days"].as_i64(),
+                body["digest_hour"].as_i64()
+            ),
+            (StatusCode::OK, Some(7), Some(9))
         );
-        let (_, body) = call(state.clone(), "GET", "/config/capture-wait", None).await;
-        assert_eq!(body["minutes"], 30);
-
-        for minutes in [10_081, -1] {
-            let (status, body) = call(
-                state.clone(),
-                "POST",
-                "/config/capture-wait",
-                Some(serde_json::json!({ "minutes": minutes })),
-            )
-            .await;
+        for bad in [
+            serde_json::json!({ "answer_days": 31 }),
+            serde_json::json!({ "digest_hour": 24 }),
+        ] {
+            let (status, body) = call(state.clone(), "POST", "/config/capture", Some(bad)).await;
             assert_eq!(
                 (status, body["error"].as_str()),
                 (StatusCode::UNPROCESSABLE_ENTITY, Some("out_of_range"))
             );
         }
-        let (_, body) = call(state, "GET", "/config/capture-wait", None).await;
-        assert_eq!(body["minutes"], 30);
+        // The old key: only a stored 0 survives the move.
+        let old = test_state().await;
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES ('distiller.capture_wait_minutes', '0')",
+        )
+        .execute(&old.pool)
+        .await
+        .unwrap();
+        let (_, body) = call(old, "GET", "/config/capture", None).await;
+        assert_eq!(body["answer_days"], 0);
+    }
+
+    #[tokio::test]
+    async fn the_digests_list_the_last_14_days_with_their_open_count() {
+        let state = test_state().await;
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let old_day = (chrono::Local::now() - chrono::Duration::days(20))
+            .format("%Y-%m-%d")
+            .to_string();
+        for (day, jobs) in [(&old_day, "[1]"), (&today, "[7,8]")] {
+            sqlx::query(
+                "INSERT INTO capture_digests (day, job_ids, created_at) VALUES (?, ?, 't')",
+            )
+            .bind(day)
+            .bind(jobs)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let digest: i64 = sqlx::query_scalar("SELECT id FROM capture_digests WHERE day = ?")
+            .bind(&today)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        open_capture_request(&state, 7).await;
+        open_capture_request(&state, 8).await;
+        sqlx::query("UPDATE capture_requests SET digest_id = ?")
+            .bind(digest)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE capture_requests SET state = 'answered' WHERE job_id = 8")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = call(state.clone(), "GET", "/capture-digests", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let list = body.as_array().unwrap();
+        assert_eq!(list.len(), 1, "the 20-day-old digest is outside the window");
+        assert_eq!(list[0]["id"], digest);
+        assert_eq!(list[0]["day"], today.as_str());
+        assert_eq!(list[0]["job_ids"], serde_json::json!([7, 8]));
+        assert_eq!(list[0]["open"], 1);
+    }
+
+    #[tokio::test]
+    async fn the_distiller_sources_default_on_and_round_trip_each_alone() {
+        let state = test_state().await;
+        let (status, body) = call(state.clone(), "GET", "/config/distiller-sources", None).await;
+        assert_eq!(
+            (status, body["chat"].as_bool(), body["calendar"].as_bool()),
+            (StatusCode::OK, Some(true), Some(true))
+        );
+        let (_, body) = call(
+            state.clone(),
+            "POST",
+            "/config/distiller-sources",
+            Some(serde_json::json!({ "chat": false })),
+        )
+        .await;
+        assert_eq!(
+            (body["chat"].as_bool(), body["calendar"].as_bool()),
+            (Some(false), Some(true))
+        );
+        let (_, body) = call(state, "GET", "/config/distiller-sources", None).await;
+        assert_eq!(
+            (body["chat"].as_bool(), body["calendar"].as_bool()),
+            (Some(false), Some(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_with_an_empty_body_answers_with_counts() {
+        let state = test_state().await;
+        let (status, body) = call(
+            state,
+            "POST",
+            "/distill/chats/ingest",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["seeded"].is_number() && body["skipped"].is_number());
+    }
+
+    #[tokio::test]
+    async fn ingest_with_both_chat_ids_and_project_is_a_bad_request() {
+        let state = test_state().await;
+        let (status, _) = call(
+            state,
+            "POST",
+            "/distill/chats/ingest",
+            Some(serde_json::json!({ "chat_ids": ["x"], "project": "alpha" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn switching_chats_back_on_moves_the_history_cut_to_now() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let chat = crate::distill::chats::fixtures::chat_with(&pool).await;
+        let old = crate::distill::chats::fixtures::turn(&pool, &chat, None, "q", "a").await;
+        let post = |on: bool| {
+            call(
+                state.clone(),
+                "POST",
+                "/config/distiller-sources",
+                Some(serde_json::json!({ "chat": on })),
+            )
+        };
+        // Already on (absent = on): posting `chat: true` leaves the cut where the migration put it.
+        let before = crate::distill::sources::chat_floor(&pool).await;
+        post(true).await;
+        assert_eq!(crate::distill::sources::chat_floor(&pool).await, before);
+        // off -> on: the cut jumps to MAX(runs.id), so the turns written meanwhile are history too.
+        post(false).await;
+        let newer = crate::distill::chats::fixtures::turn(&pool, &chat, None, "q", "a").await;
+        post(true).await;
+        assert_eq!(crate::distill::sources::chat_floor(&pool).await, newer);
+        assert!(newer > old);
+        // on -> on again: untouched.
+        crate::distill::chats::fixtures::turn(&pool, &chat, None, "q", "a").await;
+        post(true).await;
+        assert_eq!(crate::distill::sources::chat_floor(&pool).await, newer);
+    }
+
+    #[tokio::test]
+    async fn knowledge_lists_observations_only_when_asked_for_them() {
+        let state = test_state().await;
+        for (scope_kind, scope_id, status) in [
+            ("observation", "alpha:chat:5", "observed"),
+            ("project", "alpha", "proposed"),
+        ] {
+            sqlx::query(
+                "INSERT INTO knowledge
+                   (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+                 VALUES ('episodic', ?, ?, 'distiller', 'memory', 't', 'b', ?,
+                         '2026-10-22T00:00:00+00:00')",
+            )
+            .bind(scope_kind)
+            .bind(scope_id)
+            .bind(status)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let (_, plain) = call(state.clone(), "GET", "/knowledge", None).await;
+        assert!(
+            plain
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["scope_kind"] != "observation")
+        );
+        let (status, seen) = call(
+            state.clone(),
+            "GET",
+            "/knowledge?scope_kind=observation&limit=1",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.as_array().unwrap().len(), 1);
+        assert_eq!(seen[0]["scope_kind"], "observation");
+        let (status, _) = call(
+            state,
+            "GET",
+            "/knowledge?scope_kind=observation&scope_id=x",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     async fn loadout_seed_agent_and_team(pool: &sqlx::SqlitePool) {
@@ -26137,6 +26341,7 @@ mod triage_barrier_tests {
             council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
             run_tails: Default::default(),
             fleet: Default::default(),
+            turns: Default::default(),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }

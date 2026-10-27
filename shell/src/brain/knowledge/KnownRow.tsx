@@ -60,13 +60,17 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
       <p className="learned-title">{row.title}</p>
       {origin !== null && (
         <p className="learned-origin">
-          distilled from{" "}
-          {origin.job === null ? (
-            "a job"
+          {origin.cause === "generalised" ? (
+            <>distilled from {origin.members} similar rows</>
+          ) : origin.chat !== null ? (
+            <>distilled from a conversation</>
           ) : (
-            <Link to="/fleet">job #{origin.job}</Link>
+            <>
+              distilled from{" "}
+              {origin.job === null ? "a job" : <Link to="/fleet">job #{origin.job}</Link>}
+            </>
           )}
-          {origin.causeLabel !== null && <> · {origin.causeLabel}</>}
+          {origin.chat === null && origin.causeLabel !== null && <> · {origin.causeLabel}</>}
         </p>
       )}
       {duplicateOf !== null && (
@@ -105,6 +109,10 @@ export function KnownRow({ row, decisions }: KnownRowProps) {
                 >
                   knowledge {ref.id}
                 </Button>
+              ) : ref.t === "note" ? (
+                <Link to="/brain" search={{ item: `note:${String(ref.id)}` }}>
+                  note #{ref.id}
+                </Link>
               ) : (
                 <span>
                   {ref.t} {ref.id}

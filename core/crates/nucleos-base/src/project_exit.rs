@@ -21,6 +21,16 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 
+/// The observations of one project's chats, by the exact shape `<project>:chat:<digits>`. Never
+/// `LIKE`: a project id may hold `_`, `%` or `:` (ids are not validated on creation).
+/// `a:chat:5:chat:9` belongs to the project `a:chat:5`, not to `a`: its tail `5:chat:9` is not
+/// digits. `-:chat:N` (no project) and `week:...` have no project and fall to the 60-day sweep.
+const CHAT_OBSERVATIONS: &str = "SELECT id FROM knowledge
+     WHERE scope_kind = 'observation'
+       AND substr(scope_id, 1, length(?1) + 6) = ?1 || ':chat:'
+       AND length(scope_id) > length(?1) + 6
+       AND substr(scope_id, length(?1) + 7) NOT GLOB '*[^0-9]*'";
+
 /// Every table in this database that carries a `project_id`, minus `autopilot_state` itself.
 ///
 /// **Written out, and held honest by a test rather than by a loop.** Deriving this from
@@ -41,6 +51,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "browser_writes",
     // A forgotten project's open questions must hold nothing, nor be answered later.
     "capture_requests",
+    // `capture_digests` has no `project_id`: it is not here on purpose; `remove` deletes it
+    // through `json_each(job_ids)`.
     // Dev time is project history, and it goes with the project. Its file offsets in
     // `devtime_files` are deliberately KEPT (owner's decision, 2026-10-05): re-adding the folder
     // then counts time from that moment on, instead of resurrecting the old time from transcripts
@@ -354,6 +366,106 @@ pub async fn remove(
         // cannot outlive it, and it reads `knowledge` to find its rows, so it goes before that
         // table does.
         //
+        //
+        // Derived (a), spec 9: the general lessons whose `knowledge` evidence is ALL this project's rows.
+        // Chosen into a temp table BEFORE the statements below, which delete the very rows this one reads;
+        // `note` references have no project and do not make the evidence mixed. Ids compare by equality, never
+        // LIKE. The observation arm is `<project>:chat:<n>` by `substr`, since a project id may hold a LIKE wildcard.
+        sqlx::query("CREATE TEMP TABLE forgotten_lessons (id INTEGER PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO forgotten_lessons (id)
+             SELECT g.id FROM knowledge g
+              WHERE g.distill_cause = 'generalised' AND json_valid(g.evidence)
+                AND EXISTS (SELECT 1 FROM json_each(g.evidence) e
+                             WHERE json_extract(e.value, '$.t') = 'knowledge')
+                AND NOT EXISTS (SELECT 1 FROM json_each(g.evidence) e
+                     WHERE json_extract(e.value, '$.t') = 'knowledge'
+                       AND COALESCE(json_extract(e.value, '$.id'), -1) NOT IN (
+                           SELECT id FROM knowledge
+                            WHERE (scope_kind = 'project' AND scope_id = ?1)
+                               OR (scope_kind = 'job'
+                                   AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))
+                               OR id IN ({CHAT_OBSERVATIONS})))"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        // Derived (b) + (d), spec 2026-10-22 section 9: the themes. They read the knowledge rows the
+        // statements below delete, so they run first, for the reason given above. A theme that loses a
+        // knowledge member keeps living with a NULL centroid (recomputed next run) and without the
+        // synthesis built on that member; a `proposed` theme left with fewer than 3 members is deleted
+        // with them. Notes have no project and keep counting as live members.
+        // Also the project's chat observations and the general lessons about to go (`forgotten_lessons`,
+        // chosen above): `themes::candidates` takes `observed` and `distiller` rows as members too.
+        let gone = format!(
+            "SELECT id FROM knowledge
+              WHERE (scope_kind = 'project' AND scope_id = ?1)
+                 OR (scope_kind = 'job'
+                     AND scope_id IN (SELECT CAST(id AS TEXT) FROM jobs WHERE project_id = ?1))
+                 OR id IN ({CHAT_OBSERVATIONS})
+                 OR id IN (SELECT id FROM forgotten_lessons)"
+        );
+        sqlx::query("CREATE TEMP TABLE _theme_affected (id INTEGER PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO _theme_affected (id)
+             SELECT DISTINCT theme_id FROM theme_members
+              WHERE member_kind = 'knowledge' AND member_id IN ({gone})"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM theme_members
+              WHERE member_kind = 'knowledge' AND member_id IN ({gone})"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE themes
+                SET centroid = NULL, synthesis = NULL, synthesis_basis = NULL,
+                    synthesis_at = NULL, synthesis_model = NULL
+              WHERE id IN (SELECT id FROM _theme_affected)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE TEMP TABLE _theme_thin AS
+             SELECT id FROM themes
+              WHERE state = 'proposed' AND id IN (SELECT id FROM _theme_affected)
+                AND (SELECT COUNT(*) FROM theme_members m
+                      WHERE m.theme_id = themes.id AND m.excluded = 0) < 3",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM theme_members WHERE theme_id IN (SELECT id FROM _theme_thin)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM themes WHERE id IN (SELECT id FROM _theme_thin)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TABLE _theme_thin")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DROP TABLE _theme_affected")
+            .execute(&mut *tx)
+            .await?;
+        for sql in [
+            "DELETE FROM knowledge_embeddings WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
+            "DELETE FROM knowledge_embed_failures WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
+            "DELETE FROM knowledge_events WHERE knowledge_id IN (SELECT id FROM forgotten_lessons)",
+            "DELETE FROM knowledge WHERE id IN (SELECT id FROM forgotten_lessons)",
+        ] {
+            forgotten += sqlx::query(sql).execute(&mut *tx).await?.rows_affected();
+        }
+        sqlx::query("DROP TABLE forgotten_lessons")
+            .execute(&mut *tx)
+            .await?;
+
         // `machine` appears in none of the statements, and that is correct: machine rows are not a
         // project's.
         forgotten += sqlx::query(
@@ -408,6 +520,31 @@ pub async fn remove(
         .await?
         .rows_affected();
 
+        // The project's chat observations, children first and the rows last, like the statements
+        // above (and before the `PROJECT_SCOPED` loop for the same reason).
+        for table in [
+            "knowledge_embeddings",
+            "knowledge_embed_failures",
+            "knowledge_events",
+        ] {
+            // SAFETY: interpolates a literal table name and the `CHAT_OBSERVATIONS` const only; the
+            // project id is bound.
+            forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE knowledge_id IN ({CHAT_OBSERVATIONS})"
+            )))
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM knowledge WHERE id IN ({CHAT_OBSERVATIONS})"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
         // The devtime children hang off `devtime_sessions` by `session_id` (TEXT, no foreign key, and
         // the parent's key is `session_id`, not `id`), which `VIA_PARENT`'s join cannot express.
         // BEFORE the `PROJECT_SCOPED` loop for the reason given above: the subquery reads
@@ -441,6 +578,27 @@ pub async fn remove(
               WHERE session_id IN (SELECT session_id FROM devtime_sessions WHERE project_id = ?1)
                  OR finding_key IN (SELECT finding_key FROM devtime_findings WHERE project_id = ?1)",
         )
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // A digest names jobs of several projects (`job_ids` JSON) and has no `project_id`, so no
+        // loop reaches it. BEFORE the `PROJECT_SCOPED` loop, which deletes `jobs`: this reads
+        // them. The feed line goes first, because it is found through the digest row.
+        let cited = "EXISTS (SELECT 1 FROM json_each(d.job_ids) je
+                              JOIN jobs j ON j.id = je.value WHERE j.project_id = ?1)";
+        forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM feed WHERE subject IN
+                 (SELECT 'capture_digest:' || d.id FROM capture_digests d WHERE {cited})"
+        )))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM capture_digests WHERE id IN (SELECT d.id FROM capture_digests d WHERE {cited})"
+        )))
         .bind(project_id)
         .execute(&mut *tx)
         .await?
@@ -1103,6 +1261,156 @@ mod tests {
     /// One row of `knowledge_embeddings` for `knowledge_id`. Written here rather than through
     /// `embed::store_in`, which lives in nucleos-core above this crate; the vector's bytes do not
     /// matter to a forget, only that the row exists.
+    async fn theme_row(pool: &SqlitePool, state: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO themes (name, state, model, dim, centroid, synthesis, synthesis_basis,
+                                 synthesis_at, synthesis_model, created_at)
+             VALUES ('t', ?, 'm', 3, zeroblob(12), 's', '[]', 't', 'm', 't') RETURNING id",
+        )
+        .bind(state)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn theme_member(pool: &SqlitePool, theme: i64, kind: &str, id: i64) {
+        sqlx::query(
+            "INSERT INTO theme_members (theme_id, member_kind, member_id, added_at)
+             VALUES (?, ?, ?, 't')",
+        )
+        .bind(theme)
+        .bind(kind)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn project_knowledge_id(pool: &SqlitePool, project_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT id FROM knowledge WHERE scope_kind = 'project' AND scope_id = ?")
+            .bind(project_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_project_nulls_the_centroid_and_drops_a_thin_proposed_theme() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+        let alpha = project_knowledge_id(&pool, "alpha").await;
+        let bravo = project_knowledge_id(&pool, "bravo").await;
+        let acc = theme_row(&pool, "accepted").await;
+        let prop = theme_row(&pool, "proposed").await;
+        for (t, kind, id) in [
+            (acc, "knowledge", alpha),
+            (acc, "knowledge", bravo),
+            (acc, "note", 1),
+            (acc, "note", 2),
+            (prop, "knowledge", alpha),
+            (prop, "knowledge", bravo),
+            (prop, "note", 1),
+        ] {
+            theme_member(&pool, t, kind, id).await;
+        }
+        remove(&pool, "alpha", true).await.unwrap();
+        let centroid: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT centroid FROM themes WHERE id = ?")
+                .bind(acc)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(centroid, None);
+        let left: Vec<i64> = sqlx::query_scalar("SELECT id FROM themes ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec![acc], "the proposed theme fell under 3 members");
+        let orphans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM theme_members WHERE theme_id = ?")
+                .bind(prop)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphans, 0);
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM theme_members WHERE theme_id = ?")
+            .bind(acc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 3, "the accepted theme keeps bravo and the notes");
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_project_leaves_themes_without_its_members_untouched() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+        let bravo = project_knowledge_id(&pool, "bravo").await;
+        let t = theme_row(&pool, "accepted").await;
+        theme_member(&pool, t, "knowledge", bravo).await;
+        theme_member(&pool, t, "note", 1).await;
+        remove(&pool, "alpha", true).await.unwrap();
+        let row: (Option<Vec<u8>>, Option<String>) =
+            sqlx::query_as("SELECT centroid, synthesis FROM themes WHERE id = ?")
+                .bind(t)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0.is_some());
+        assert_eq!(row.1.as_deref(), Some("s"));
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_project_clears_the_synthesis_of_a_theme_that_loses_a_member() {
+        let pool = pool().await;
+        briefed_project(&pool, "alpha").await;
+        briefed_project(&pool, "bravo").await;
+        let alpha = project_knowledge_id(&pool, "alpha").await;
+        let bravo = project_knowledge_id(&pool, "bravo").await;
+        let loses = theme_row(&pool, "accepted").await;
+        let keeps = theme_row(&pool, "accepted").await;
+        for (t, kind, id) in [
+            (loses, "knowledge", alpha),
+            (loses, "knowledge", bravo),
+            (loses, "note", 1),
+            (keeps, "knowledge", bravo),
+            (keeps, "note", 1),
+            (keeps, "note", 2),
+        ] {
+            theme_member(&pool, t, kind, id).await;
+        }
+        remove(&pool, "alpha", true).await.unwrap();
+        let cleared: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT synthesis, synthesis_basis, synthesis_at, synthesis_model
+               FROM themes WHERE id = ?",
+        )
+        .bind(loses)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cleared, (None, None, None, None));
+        let members: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM theme_members WHERE theme_id = ?")
+                .bind(loses)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(members, 2, "the members of bravo and the note stay");
+        let kept: Option<String> = sqlx::query_scalar("SELECT synthesis FROM themes WHERE id = ?")
+            .bind(keeps)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.as_deref(), Some("s"));
+    }
+
     async fn store_vector(pool: &SqlitePool, knowledge_id: i64) {
         sqlx::query(
             "INSERT INTO knowledge_embeddings (knowledge_id, model, dim, vector, created_at)
@@ -1184,6 +1492,126 @@ mod tests {
             left,
             vec![ids[1]],
             "the vector of a forgotten project's job knowledge outlived it, or bravo's job's went with it"
+        );
+    }
+
+    /// An observation with a vector, a failure mark and an event, like the ones the distiller writes.
+    async fn put_observation(pool: &SqlitePool, scope_id: &str) -> i64 {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at)
+             VALUES ('episodic', 'observation', ?, 'distiller', 'memory', 't', 'b', 'observed',
+                     '2026-10-22T00:00:00+00:00') RETURNING id",
+        )
+        .bind(scope_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        store_vector(pool, id).await;
+        sqlx::query(
+            "INSERT INTO knowledge_embed_failures (knowledge_id, model, failed_at) VALUES (?, 'test-model', 't')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_events (knowledge_id, from_status, to_status, note, at)
+             VALUES (?, NULL, 'observed', 'created', 't')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn observation_scopes(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT scope_id FROM knowledge WHERE scope_kind = 'observation' ORDER BY scope_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Exact shape `<project>:chat:<digits>`, compared with `=`/`substr`/`GLOB`, never `LIKE`: ids with
+    /// `_`, `%` and `:` must not reach a neighbour, and neither must a nested `:chat:`.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_exactly_its_chat_observations() {
+        let pool = pool().await;
+        for p in ["a", "a_b", "axb", "a%b", "a:chat:5"] {
+            register(&pool, p).await;
+        }
+        for s in [
+            "a:chat:5",
+            "a:chat:5:chat:9",
+            "axb:chat:7",
+            "a_b:chat:2",
+            "a%b:chat:3",
+            "week:2026-W43",
+            "-:chat:4",
+            "a:chat:",
+        ] {
+            put_observation(&pool, s).await;
+        }
+        let ours = put_observation(&pool, "a:chat:6").await;
+
+        remove(&pool, "a", true).await.unwrap();
+        let left = observation_scopes(&pool).await;
+        assert!(!left.contains(&"a:chat:5".into()) && !left.contains(&"a:chat:6".into()));
+        for kept in [
+            "a:chat:5:chat:9",
+            "axb:chat:7",
+            "a_b:chat:2",
+            "a%b:chat:3",
+            "week:2026-W43",
+            "-:chat:4",
+            "a:chat:",
+        ] {
+            assert!(left.contains(&kept.to_string()), "{kept} was taken by forgetting `a`");
+        }
+        for table in [
+            "knowledge_embeddings",
+            "knowledge_embed_failures",
+            "knowledge_events",
+        ] {
+            let orphans: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE knowledge_id = {ours}"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(orphans, 0, "{table} outlived the observation");
+        }
+        remove(&pool, "a_b", true).await.unwrap();
+        remove(&pool, "a%b", true).await.unwrap();
+        let left = observation_scopes(&pool).await;
+        assert!(!left.contains(&"a_b:chat:2".into()) && !left.contains(&"a%b:chat:3".into()));
+        assert!(left.contains(&"axb:chat:7".to_string()), "`_` or `%` matched the `x`");
+        remove(&pool, "a:chat:5", true).await.unwrap();
+        assert!(!observation_scopes(&pool).await.contains(&"a:chat:5:chat:9".into()));
+    }
+
+    /// A chat's candidates are plain `project` rows: the existing statements already take them.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_chat_candidates_too() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        sqlx::query(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, status, created_at, distill_cause)
+             VALUES ('semantic','project','alpha','distiller','memory','c','b','proposed','t','chat_exchanges')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        remove(&pool, "alpha", true).await.unwrap();
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM knowledge WHERE distill_cause = 'chat_exchanges'"
+            )
+            .await,
+            0
         );
     }
 
@@ -1550,6 +1978,77 @@ mod tests {
                 "{table}: alpha's rows must go and bravo's must stay"
             );
         }
+    }
+
+    /// A digest names jobs of several projects and its feed line quotes their headers, so it goes
+    /// with any one of them; the other project's questions stay answerable.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_the_digests_that_cite_its_jobs_and_their_feed_lines() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        register(&pool, "bravo").await;
+        for (id, project) in [(7, "alpha"), (8, "bravo")] {
+            sqlx::query(
+                "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+                 VALUES (?, ?, '/tmp', 'failed', 3, 't')",
+            )
+            .bind(id)
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO capture_requests (job_id, project_id, causes, prompt_text, state, deadline, created_at, digest_id)
+                 VALUES (?, ?, '[]', 'q', 'open', '2999-01-01T00:00:00+00:00', 't', 1)",
+            )
+            .bind(id)
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // A digest of bravo alone must survive alpha's forget.
+        sqlx::query("INSERT INTO capture_digests (id, day, job_ids, created_at) VALUES (1, '2026-10-07', '[7,8]', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO capture_digests (id, day, job_ids, created_at) VALUES (2, '2026-10-08', '[8]', 't')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in [1, 2] {
+            sqlx::query("INSERT INTO feed (project_id, kind, summary, subject, created_at) VALUES (NULL, 'capture_digest', 's', ?, 't')")
+                .bind(format!("capture_digest:{id}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM capture_digests").await,
+            1
+        );
+        let kept: String =
+            sqlx::query_scalar("SELECT subject FROM feed WHERE kind = 'capture_digest'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept, "capture_digest:2",
+            "the digest and its feed line go together, only the cited ones"
+        );
+        let requests: Vec<i64> =
+            sqlx::query_scalar("SELECT job_id FROM capture_requests ORDER BY job_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            requests,
+            vec![8],
+            "bravo's question stays answerable; alpha's went with its project"
+        );
     }
 
     /// A slot taken here is work in flight, and nothing is removed under it.
@@ -1976,5 +2475,175 @@ mod tests {
 
         remove_tree(&d).unwrap();
         assert!(!d.exists(), "the locked tree is still there");
+    }
+
+    async fn lesson_row(
+        pool: &SqlitePool,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        evidence: &str,
+        cause: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO knowledge (layer, scope_kind, scope_id, source, kind, title, body, evidence, distill_cause, status, created_at)
+             VALUES ('semantic', ?, ?, 'distiller', 'memory', 't', 'b', ?, ?, 'active', '2026-10-20T00:00:00Z')",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(evidence)
+        .bind(cause)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+    async fn present(pool: &SqlitePool, id: i64) -> bool {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            > 0
+    }
+    fn refs(ids: &[i64]) -> String {
+        format!(
+            "[{}]",
+            ids.iter()
+                .map(|i| format!(r#"{{"t":"knowledge","id":{i}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    /// A note reference has no project, so it never makes a lesson's `knowledge` evidence mixed: the lesson
+    /// whose knowledge evidence is all alpha's goes with alpha even with a note beside it; its twin that also
+    /// rests on bravo stays.
+    #[tokio::test]
+    async fn forgetting_a_project_deletes_a_lesson_whose_knowledge_evidence_is_all_its_own_even_with_note_refs()
+     {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        let a = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let b = lesson_row(&pool, "project", Some("bravo"), "[]", None).await;
+        let with_note = lesson_row(
+            &pool,
+            "machine",
+            None,
+            &format!(r#"[{{"t":"knowledge","id":{a}}},{{"t":"note","id":3}}]"#),
+            Some("generalised"),
+        )
+        .await;
+        let mixed = lesson_row(&pool, "machine", None, &refs(&[a, b]), Some("generalised")).await;
+        remove(&pool, "alpha", true).await.unwrap();
+        assert!(!present(&pool, with_note).await);
+        assert!(present(&pool, mixed).await);
+        assert!(present(&pool, b).await);
+    }
+
+    /// The observation arm uses the exact chat shape: a lesson resting only on `a:chat:5`'s (another
+    /// project's) or a malformed scope's observations is not `a`'s to forget.
+    #[tokio::test]
+    async fn forgetting_a_project_keeps_a_lesson_resting_on_a_look_alike_observation_scope() {
+        let pool = pool().await;
+        register(&pool, "a").await;
+        let other = put_observation(&pool, "a:chat:5:chat:9").await;
+        let bad = put_observation(&pool, "a:chat:").await;
+        let l1 = lesson_row(&pool, "machine", None, &refs(&[other]), Some("generalised")).await;
+        let l2 = lesson_row(&pool, "machine", None, &refs(&[bad]), Some("generalised")).await;
+        let own = put_observation(&pool, "a:chat:6").await;
+        let l3 = lesson_row(&pool, "machine", None, &refs(&[own]), Some("generalised")).await;
+        remove(&pool, "a", true).await.unwrap();
+        assert!(present(&pool, l1).await && present(&pool, l2).await);
+        assert!(!present(&pool, l3).await);
+    }
+
+    /// A chat observation and a general lesson are theme members too: forgetting their project takes
+    /// them out of the theme and clears its synthesis.
+    #[tokio::test]
+    async fn forgetting_a_project_removes_its_observations_and_lessons_from_themes() {
+        let pool = pool().await;
+        register(&pool, "a").await;
+        let obs = put_observation(&pool, "a:chat:6").await;
+        let other = put_observation(&pool, "b:chat:1").await;
+        let lesson = lesson_row(&pool, "machine", None, &refs(&[obs]), Some("generalised")).await;
+        let theme = theme_row(&pool, "accepted").await;
+        theme_member(&pool, theme, "knowledge", obs).await;
+        theme_member(&pool, theme, "knowledge", lesson).await;
+        theme_member(&pool, theme, "knowledge", other).await;
+        remove(&pool, "a", true).await.unwrap();
+        let members: Vec<i64> =
+            sqlx::query_scalar("SELECT member_id FROM theme_members WHERE theme_id = ?")
+                .bind(theme)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(members, vec![other]);
+        let synthesis: Option<String> =
+            sqlx::query_scalar("SELECT synthesis FROM themes WHERE id = ?")
+                .bind(theme)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(synthesis.is_none());
+    }
+
+    /// Derived (a), spec 9: a general lesson whose `knowledge` evidence is ALL the forgotten project's goes with it;
+    /// one that also rests on another project stays (the owner approved its text). The lesson is selected BEFORE its
+    /// evidence rows are deleted: afterwards every id would look foreign and the lesson would read as mixed.
+    #[tokio::test]
+    async fn forgetting_a_project_selects_its_general_lessons_before_deleting_their_evidence() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        let a1 = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let a2 = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let a3 = lesson_row(&pool, "observation", Some("alpha:chat:4"), "[]", None).await;
+        let b1 = lesson_row(&pool, "project", Some("bravo"), "[]", None).await;
+        let only_alpha = lesson_row(
+            &pool,
+            "machine",
+            None,
+            &refs(&[a1, a2, a3]).replace(']', r#",{"t":"note","id":9}]"#),
+            Some("generalised"),
+        )
+        .await;
+        let mixed = lesson_row(
+            &pool,
+            "machine",
+            None,
+            &refs(&[a1, b1]),
+            Some("generalised"),
+        )
+        .await;
+        let not_general =
+            lesson_row(&pool, "machine", None, &refs(&[a1]), Some("job_failed")).await;
+        let no_evidence = lesson_row(&pool, "machine", None, "[]", Some("generalised")).await;
+        store_vector(&pool, only_alpha).await;
+
+        remove(&pool, "alpha", true).await.unwrap();
+
+        assert!(
+            !present(&pool, only_alpha).await,
+            "a lesson resting only on alpha's rows outlived them"
+        );
+        let vectors: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM knowledge_embeddings WHERE knowledge_id = ?")
+                .bind(only_alpha)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(vectors, 0);
+        for kept in [mixed, not_general, no_evidence, b1] {
+            assert!(present(&pool, kept).await, "{kept} should stay");
+        }
+    }
+
+    #[tokio::test]
+    async fn keeping_the_history_keeps_every_general_lesson() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        let a1 = lesson_row(&pool, "project", Some("alpha"), "[]", None).await;
+        let g = lesson_row(&pool, "machine", None, &refs(&[a1]), Some("generalised")).await;
+        remove(&pool, "alpha", false).await.unwrap();
+        assert!(present(&pool, g).await);
     }
 }

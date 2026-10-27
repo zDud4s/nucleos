@@ -250,6 +250,211 @@
   }
 }
 
+/* ------------------------------------------------------------ graph stage -- */
+
+/**
+ * Graph view is full-bleed: the canvas takes everything under the header, edge to edge, and the
+ * page does not scroll. Reached with `:has()` as the chat and voice pages do, so the other pages
+ * keep `.app-page`'s measure and padding. Capture, the weekly review and the filters are a tool
+ * overlay on the canvas, and the selected node is a drawer over its right edge.
+ */
+.app-main:has(> .app-page > .brain-page-graph) {
+  overflow: hidden;
+}
+
+.app-page:has(> .brain-page-graph) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  max-width: none;
+  padding-inline: 0;
+  padding-bottom: 0;
+}
+
+.app-page:has(> .brain-page-graph) > .ui-page-header {
+  padding-inline: var(--space-6);
+  /* The canvas starts right at the header rule: no band of page ground between them. */
+  margin-bottom: 0;
+}
+
+.brain-page-graph {
+  flex: 1 1 auto;
+  min-height: 0;
+  gap: 0;
+}
+
+.brain-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.brain-stage > .brain-force {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+/* The zoom buttons step aside for the drawer instead of hiding under it. */
+.brain-stage.has-drawer .brain-force-controls {
+  right: calc(min(23rem, 100%) + var(--space-3));
+}
+
+.brain-tools {
+  position: absolute;
+  top: var(--space-3);
+  left: var(--space-3);
+  z-index: var(--z-cover);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: min(30rem, calc(100% - var(--space-6)));
+  max-height: calc(100% - var(--space-6));
+  overflow-y: auto;
+}
+
+.brain-tools-bar {
+  display: flex;
+  gap: var(--space-1);
+  padding: var(--space-1);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.brain-tool {
+  min-height: 1.75rem;
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.brain-tool:hover {
+  color: var(--text);
+}
+
+.brain-tool[aria-pressed="true"] {
+  background: var(--surface-raised);
+  box-shadow: inset 0 -2px 0 var(--text);
+  color: var(--text);
+}
+
+.brain-tool:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.brain-pop {
+  align-self: stretch;
+  padding: var(--space-3);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+
+.brain-pop[hidden],
+.brain-compose[hidden],
+.brain-drawer[hidden] {
+  display: none;
+}
+
+/* The popover already is the card: the composer inside loses its own frame. */
+.brain-pop > .brain-compose {
+  border: 0;
+  box-shadow: none;
+}
+
+.brain-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: var(--z-cover);
+  width: min(23rem, 100%);
+  overflow-y: auto;
+  padding: var(--space-5);
+  border-left: var(--hairline) solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+
+.brain-drawer > .ui-quiet,
+.brain-drawer > .ui-quiet-compact {
+  padding: var(--space-6) var(--space-2);
+  text-align: center;
+}
+
+.brain-legend {
+  position: absolute;
+  left: var(--space-3);
+  bottom: var(--space-3);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  max-width: calc(100% - var(--space-6));
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  list-style: none;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.brain-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.brain-legend-swatch {
+  width: 0.65rem;
+  height: 0.65rem;
+  border-radius: 50%;
+  background: var(--brain-node);
+}
+
+.brain-legend-swatch[data-kind="note"] { background: var(--brain-node-note); }
+.brain-legend-swatch[data-kind="knowledge"] { background: var(--brain-node-knowledge); }
+.brain-legend-swatch[data-kind="project"] { background: var(--brain-node-project); }
+.brain-legend-swatch[data-kind="contact"] { background: var(--brain-node-contact); }
+.brain-legend-swatch[data-kind="mail"] { background: var(--brain-node-mail); }
+.brain-legend-swatch[data-kind="file"] { background: var(--brain-node-file); }
+.brain-legend-swatch[data-kind="job"] { background: var(--brain-node-job); }
+.brain-legend-swatch[data-kind="theme"] { background: var(--brain-node-theme); }
+
+@media (max-width: 40rem) {
+  /* A narrow window: the drawer takes the lower half instead of the right edge. */
+  .brain-drawer {
+    top: auto;
+    width: 100%;
+    max-height: 60%;
+    border-left: 0;
+    border-top: var(--hairline) solid var(--border);
+  }
+
+  .brain-stage.has-drawer .brain-force-controls {
+    right: var(--space-2);
+  }
+
+  .brain-stage.has-drawer .brain-legend {
+    display: none;
+  }
+}
+
 /* ------------------------------------------------------------- graph bar -- */
 
 .brain-bar {

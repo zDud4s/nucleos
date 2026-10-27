@@ -3,7 +3,6 @@ import { useEffect, useId, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { Search } from "lucide-react";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
-import { useBrowserHealth } from "../data/browser";
 import {
   useWebPage,
   useWebPages,
@@ -111,24 +110,6 @@ export function Web({ embedded = false }: { embedded?: boolean } = {}) {
       <PageHeader title="Web" headline={headline(rows)} />
       {body}
     </>
-  );
-}
-
-/**
- * The archive tab's header, for `WebTabs`, which keeps the tab list outside both tabs.
- * It reads the whole archive, so the count no longer follows the filter box.
- */
-export function WebHeader() {
-  const health = useBrowserHealth();
-  const subsystem = health.data?.subsystem ?? null;
-  // The sidecar's state is the pillar's, not the Sessions tab's: with the archive open a down
-  // browser would otherwise be invisible.
-  return (
-    <PageHeader
-      title="Web"
-      headline={headline(useWebPages(undefined).data)}
-      actions={subsystem === null ? undefined : <StateBadge domain="pillar" state={subsystem.status} />}
-    />
   );
 }
 

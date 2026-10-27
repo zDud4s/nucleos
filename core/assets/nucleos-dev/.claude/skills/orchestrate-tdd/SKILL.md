@@ -89,7 +89,7 @@ This is the single home of the batched flow (Rule 3 in workflow.md points here).
 
 ## Large TDD tasks: root node
 
-When Size is `large`, or the plan would not fit one controller within `nodes.orchestrator_budget`, follow `orchestrate` §"Large tasks: become the root node": open a root node (`mcp__nucleos__node_open`, no `parent_id`, with `task_id`) and decompose into child nodes per the `orchestrate-node` skill. Medium tasks run the phases below unchanged. For a node tree:
+When Size is `large`, or the plan would not fit one controller within `nodes.orchestrator_budget`, follow `orchestrate` §"Large tasks: run a node tree": open a root node (`mcp__nucleos__node_open`, no `parent_id`, with `task_id`) and decompose into child nodes per the `orchestrate-node` skill. Medium tasks run the phases below unchanged. For a node tree:
 
 - Each node's leaves still author the tests and the code through `wf-executor` packets (RED and GREEN objectives and boundaries as below); a node dispatches only its direct children and returns a summary.
 - Nodes never run tests. Every packet stays `Test runs: batched`, and a node hands back the exact test commands and refs it would have run.

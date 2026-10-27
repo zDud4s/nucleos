@@ -21,7 +21,8 @@ pub const EXIT_PASSED: i32 = 0;
 /// The verdict was `failed` or `errored`.
 pub const EXIT_FAILED: i32 = 1;
 /// A ticket id is known but no verdict arrived (the wait limit, a lost status call, a ticket done
-/// without a verdict this client knows). Re-running joins the same units.
+/// without a verdict this client knows). Re-running joins the same units (`--verify-ticket <id>`
+/// waits on that ticket again).
 pub const EXIT_NO_VERDICT: i32 = 3;
 /// Nothing was verified: no token, a refusal, an unreachable daemon, or a verdict that covered
 /// nothing. 2 is skipped on purpose: it is the conventional usage-error code.
@@ -38,11 +39,16 @@ const POLL_FLOOR: Duration = Duration::from_millis(500);
 /// What `nucleos-core --verify --help` prints, and what a refused `--verify-wait` repeats.
 pub const USAGE: &str = "\
 usage: nucleos-core --verify [--verify-wait <secs>]
+       nucleos-core --verify-ticket <id> [--verify-wait <secs>]
 
 Asks the running daemon to verify the worktree this command is run from, with covered
 verification (the daemon picks the base), and waits for the verdict. It never starts a daemon.
 Prints one line per unit, the tail of every unit that failed, the ticket's note and the files
 no unit covers.
+
+--verify-ticket <id> (also --verify-ticket=<id>) submits nothing: it waits on a ticket that
+already exists, with no model turns, and prints the same listing and exit codes. Run it in the
+background and let its exit wake you instead of polling.
 
   --verify-wait <secs>   longest the whole run may take, in whole seconds (also --verify-wait=<secs>).
                          Else the NUCLEOS_VERIFY_WAIT environment variable, else 3600.
@@ -53,7 +59,8 @@ exit codes:
   3  the ticket has no verdict yet (wait limit reached, or its status could not be read):
      it prints `ticket <id>`; re-run `nucleos-core --verify` to join its units
   4  not verified: no daemon token, a refusal from the daemon (including a covered verification
-     it cannot do), an unreachable daemon, a bad --verify-wait, or a verdict that ran nothing
+     it cannot do, or a ticket it does not know), an unreachable daemon, a bad --verify-wait or
+     --verify-ticket, or a verdict that ran nothing
 ";
 
 /// What a run prints and how it ends. `main` prints the two streams and exits with `code`.
@@ -101,6 +108,37 @@ pub enum Invocation {
     BadWait(String),
     /// Verify the current worktree, waiting up to this long.
     Run(Duration),
+    /// `--verify-ticket <id>`: wait on an EXISTING ticket, up to this long, submitting nothing.
+    Ticket(i64, Duration),
+    /// `--verify-ticket` was refused (the reason): usage and [`EXIT_NOT_VERIFIED`].
+    BadTicket(String),
+}
+
+/// The ticket id of `--verify-ticket <id>` or `--verify-ticket=<id>`: `None` when the flag is
+/// absent, `Some(Err(reason))` when it has no value or the value is not a positive whole number.
+fn ticket_id(args: &[String]) -> Option<Result<i64, String>> {
+    for (at, arg) in args.iter().enumerate() {
+        let raw = if arg == "--verify-ticket" {
+            match args.get(at + 1) {
+                Some(value) => value,
+                None => return Some(Err("--verify-ticket needs a ticket id".to_string())),
+            }
+        } else if let Some(value) = arg.strip_prefix("--verify-ticket=") {
+            value
+        } else {
+            continue;
+        };
+        let raw = raw.trim();
+        let id = if !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            raw.parse::<i64>().ok().filter(|id| *id > 0)
+        } else {
+            None
+        };
+        return Some(id.ok_or_else(|| {
+            format!("--verify-ticket must be a positive whole number, got {raw:?}")
+        }));
+    }
+    None
 }
 
 /// Decide what the arguments ask of `--verify`, in this order: no `--verify` and no `--verify-*`
@@ -118,12 +156,23 @@ pub fn invocation(args: &[String], env_wait: Option<&str>) -> Invocation {
     if args.iter().any(|a| a == "--help") {
         return Invocation::Help;
     }
-    if !args.iter().any(|a| a == "--verify") {
+    let verify = args.iter().any(|a| a == "--verify");
+    let ticket = ticket_id(args);
+    if !verify && ticket.is_none() {
         return Invocation::NeedsVerify;
     }
-    match wait_limit(args, env_wait) {
-        Ok(limit) => Invocation::Run(limit),
-        Err(reason) => Invocation::BadWait(reason),
+    let limit = match wait_limit(args, env_wait) {
+        Ok(limit) => limit,
+        Err(reason) => return Invocation::BadWait(reason),
+    };
+    match ticket {
+        None => Invocation::Run(limit),
+        Some(_) if verify => Invocation::BadTicket(
+            "--verify-ticket waits on an existing ticket and cannot be combined with --verify"
+                .to_string(),
+        ),
+        Some(Ok(id)) => Invocation::Ticket(id, limit),
+        Some(Err(reason)) => Invocation::BadTicket(reason),
     }
 }
 
@@ -150,73 +199,8 @@ fn verdict_code(ticket: &Value) -> Option<i32> {
     }
 }
 
-/// One line per unit: its status, then its group, or its argv when it has none. A unit that was
-/// red before the change says so, and the tail of a failed or errored unit is indented below it.
-fn render_units(ticket: &Value) -> String {
-    let mut out = String::new();
-    let Some(units) = ticket["units"].as_array() else {
-        return out;
-    };
-    for unit in units {
-        let status = unit["status"].as_str().unwrap_or("unknown");
-        let label = match unit["group"].as_str() {
-            Some(group) if !group.is_empty() => group.to_string(),
-            _ => unit["argv"]
-                .as_array()
-                .map(|argv| {
-                    argv.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default(),
-        };
-        out.push_str(&format!("{status:<14} {label}"));
-        if let Some(already) = unit["already_failing"].as_str() {
-            out.push_str(&format!(" (already failing on the target: {already})"));
-        }
-        if let Some(text) = unit["inherited"].as_str() {
-            out.push_str(&format!(" (inherited: {text})"));
-        }
-        if let Some(text) = unit["not_inherited"].as_str() {
-            out.push_str(&format!(" (not yours? {text})"));
-        }
-        if let Some(text) = unit["pending"].as_str() {
-            out.push_str(&format!(" (pending: {text})"));
-        }
-        out.push('\n');
-        if matches!(status, "failed" | "errored")
-            && let Some(tail) = unit["output_tail"].as_str()
-        {
-            for line in tail.lines() {
-                out.push_str(&format!("    {line}\n"));
-            }
-        }
-    }
-    out
-}
-
-/// The listing of a finished ticket: its units, the ticket's note and the files no unit covers
-/// (each only when there is one), then the verdict and the ticket it belongs to.
-pub fn render(ticket: &Value) -> String {
-    let id = ticket["ticket"].as_i64().unwrap_or_default();
-    let verdict = ticket["verdict"].as_str().unwrap_or("none");
-    let mut out = render_units(ticket);
-    if let Some(note) = ticket["note"].as_str().filter(|note| !note.is_empty()) {
-        out.push_str(&format!("note: {note}\n"));
-    }
-    if let Some(unclaimed) = ticket["unclaimed"]
-        .as_array()
-        .filter(|list| !list.is_empty())
-    {
-        out.push_str("unclaimed (no unit covers these files):\n");
-        for path in unclaimed.iter().filter_map(Value::as_str) {
-            out.push_str(&format!("    {path}\n"));
-        }
-    }
-    out.push_str(&format!("verdict: {verdict} (ticket {id})\n"));
-    out
-}
+pub use crate::verify::render::render;
+use crate::verify::render::render_units;
 
 fn not_verified(reason: &str) -> Outcome {
     Outcome {
@@ -234,7 +218,8 @@ fn no_verdict(ticket: &Value, id: i64, reason: &str) -> Outcome {
         stdout: render_units(ticket),
         stderr: format!(
             "ticket {id}: no verdict arrived ({reason}). \
-             re-run `nucleos-core --verify` to join its units.\n"
+             re-run `nucleos-core --verify`, or `nucleos-core --verify-ticket {id}`, to join its \
+             units.\n"
         ),
     }
 }
@@ -267,7 +252,7 @@ fn finished(ticket: &Value, id: i64) -> Outcome {
 /// returns what to print and how to exit. The limit bounds the whole run, submit included.
 pub async fn run(client: &DaemonClient, worktree: &str, limit: Duration) -> Outcome {
     let started = Instant::now();
-    let mut ticket = match tokio::time::timeout(limit, client.verify_cover(worktree)).await {
+    let ticket = match tokio::time::timeout(limit, client.verify_cover(worktree)).await {
         Ok(Ok(ticket)) => ticket,
         Ok(Err(reason)) => return not_verified(&reason),
         // The id is unknown, so a ticket the daemon did queue cannot be joined by number.
@@ -281,6 +266,43 @@ pub async fn run(client: &DaemonClient, worktree: &str, limit: Duration) -> Outc
     let Some(id) = ticket["ticket"].as_i64() else {
         return not_verified("the daemon's reply names no ticket");
     };
+    poll(client, ticket, id, started, limit, None).await
+}
+
+/// How long one `/verify/status` call may hold the line when [`follow`] asks, in seconds. The
+/// daemon caps it; the point is that a ticket that finishes is answered the moment it does.
+const FOLLOW_HOLD_SECS: u64 = 45;
+
+/// Waits on an EXISTING ticket for at most `limit` and returns what to print and how to exit,
+/// with the same exit codes as [`run`]. It NEVER submits: it only reads `/verify/status`, so it
+/// costs the daemon nothing and no model turn, and can be left running in the background until the
+/// verdict arrives. A ticket the daemon does not know (or any refusal of the first read) is "not
+/// verified"; once the ticket has been read, losing the line or the limit is exit 3, as in `run`.
+pub async fn follow(client: &DaemonClient, id: i64, limit: Duration) -> Outcome {
+    let started = Instant::now();
+    let first = tokio::time::timeout(
+        limit,
+        client.verify_status(id, true, Some(FOLLOW_HOLD_SECS)),
+    )
+    .await;
+    match first {
+        Ok(Ok(ticket)) => poll(client, ticket, id, started, limit, Some(FOLLOW_HOLD_SECS)).await,
+        Ok(Err(reason)) => not_verified(&reason),
+        Err(_) => no_verdict(&Value::Null, id, "the wait limit was reached"),
+    }
+}
+
+/// The poll loop `run` and `follow` share: from the ticket as last read, ask `/verify/status`
+/// (holding the line, up to `wait_secs` when given) until it is done or `limit`, counted from
+/// `started`, runs out.
+async fn poll(
+    client: &DaemonClient,
+    mut ticket: Value,
+    id: i64,
+    started: Instant,
+    limit: Duration,
+    wait_secs: Option<u64>,
+) -> Outcome {
     loop {
         if ticket["done"].as_bool() == Some(true) {
             return finished(&ticket, id);
@@ -290,7 +312,7 @@ pub async fn run(client: &DaemonClient, worktree: &str, limit: Duration) -> Outc
             return no_verdict(&ticket, id, "the wait limit was reached");
         }
         let asked = Instant::now();
-        match tokio::time::timeout(remaining, client.verify_status(id, true)).await {
+        match tokio::time::timeout(remaining, client.verify_status(id, true, wait_secs)).await {
             Ok(Ok(next)) => ticket = next,
             Ok(Err(reason)) => {
                 return no_verdict(
@@ -818,6 +840,131 @@ mod tests {
         );
         let said = format!("{}{}", outcome.stdout, outcome.stderr);
         assert!(said.contains("57"), "the ticket id is named: {said:?}");
+    }
+
+    /// **`--verify-ticket <id>` and its `=` spelling name an existing ticket; a bad id is a usage
+    /// error and never reaches the daemon.**
+    #[test]
+    fn invocation_parses_verify_ticket_id() {
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--verify-ticket", "42"]), None),
+            Invocation::Ticket(42, DEFAULT_WAIT)
+        );
+        assert_eq!(
+            invocation(&args(&["nucleos-core", "--verify-ticket=42"]), Some("120")),
+            Invocation::Ticket(42, Duration::from_secs(120)),
+            "the env wait applies to a ticket too"
+        );
+        assert_eq!(
+            invocation(
+                &args(&["nucleos-core", "--verify-ticket", "42", "--verify-wait=30"]),
+                Some("120")
+            ),
+            Invocation::Ticket(42, Duration::from_secs(30)),
+            "the flag beats the env"
+        );
+        for bad in [
+            args(&["nucleos-core", "--verify-ticket"]),
+            args(&["nucleos-core", "--verify-ticket", "abc"]),
+            args(&["nucleos-core", "--verify-ticket", "0"]),
+            args(&["nucleos-core", "--verify-ticket", "-3"]),
+            args(&["nucleos-core", "--verify-ticket", "+3"]),
+            args(&["nucleos-core", "--verify-ticket=1.5"]),
+            args(&["nucleos-core", "--verify-ticket="]),
+            args(&["nucleos-core", "--verify", "--verify-ticket", "42"]),
+        ] {
+            assert!(
+                matches!(invocation(&bad, None), Invocation::BadTicket(_)),
+                "{bad:?} must be a usage error"
+            );
+        }
+        assert!(
+            matches!(
+                invocation(
+                    &args(&[
+                        "nucleos-core",
+                        "--verify-ticket",
+                        "42",
+                        "--verify-wait",
+                        "0"
+                    ]),
+                    None
+                ),
+                Invocation::BadWait(_)
+            ),
+            "a zero wait is refused beside a ticket too"
+        );
+        assert_eq!(
+            invocation(
+                &args(&["nucleos-core", "--verify-ticket", "42", "--help"]),
+                None
+            ),
+            Invocation::Help
+        );
+    }
+
+    /// **Following a ticket submits nothing, asks for a long hold, and maps the verdict as `--verify`
+    /// does.** The assertion is on the bodies that travelled: an exit code alone would be the same
+    /// with a stray submission.
+    #[tokio::test]
+    async fn verify_ticket_never_submits_and_maps_verdict() {
+        let (url, submitted, polled) = ticket_daemon(
+            ticket(5, true, Some("passed"), vec![]),
+            ticket(
+                5,
+                true,
+                Some("failed"),
+                vec![unit(
+                    Some("core"),
+                    &["cargo", "test"],
+                    "failed",
+                    Some("assertion failed"),
+                )],
+            ),
+        )
+        .await;
+
+        let outcome = follow(&client(url), 5, Duration::from_secs(30)).await;
+
+        assert_eq!(
+            outcome.code, EXIT_FAILED,
+            "stderr said {:?}",
+            outcome.stderr
+        );
+        assert!(
+            outcome.stdout.contains("verdict: failed")
+                && outcome.stdout.contains("assertion failed"),
+            "the listing comes from the status reply: {:?}",
+            outcome.stdout
+        );
+        assert!(
+            submitted.lock().unwrap().is_empty(),
+            "following a ticket never POSTs /verify"
+        );
+        assert_eq!(
+            *polled.lock().unwrap(),
+            vec![json!({ "ticket": 5, "wait": true, "wait_secs": 45 })],
+            "one status read, holding the line for the long wait"
+        );
+
+        // A passed ticket is exit 0.
+        let url = answering(ticket(6, true, Some("passed"), vec![])).await;
+        let outcome = follow(&client(url), 6, Duration::from_secs(30)).await;
+        assert_eq!(
+            outcome.code, EXIT_PASSED,
+            "stderr said {:?}",
+            outcome.stderr
+        );
+
+        // A ticket the daemon does not know is "not verified", with the daemon's words.
+        let url = refusing_daemon(axum::http::StatusCode::NOT_FOUND, "no ticket 9").await;
+        let outcome = follow(&client(url), 9, Duration::from_secs(30)).await;
+        assert_eq!(outcome.code, EXIT_NOT_VERIFIED);
+        assert!(
+            outcome.stderr.contains("no ticket 9"),
+            "{:?}",
+            outcome.stderr
+        );
     }
 
     /// **A verdict that covered nothing is not a pass.**

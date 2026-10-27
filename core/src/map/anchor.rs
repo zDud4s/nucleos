@@ -3417,7 +3417,9 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
+                    // `core/crates/nucleos-app`: three levels below the repository.
+                    .ancestors()
+                    .nth(3)
                     .expect("the crate sits inside the repository")
                     .to_path_buf()
             })

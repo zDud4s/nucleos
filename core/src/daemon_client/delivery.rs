@@ -171,13 +171,20 @@ impl DaemonClient {
         .await
     }
 
-    /// One verification ticket's state; `wait` holds the line up to the daemon's ceiling.
-    pub async fn verify_status(&self, ticket: i64, wait: bool) -> Result<Value, String> {
-        self.verify_request(
-            "/verify/status",
-            &serde_json::json!({ "ticket": ticket, "wait": wait }),
-        )
-        .await
+    /// One verification ticket's state; `wait` holds the line up to the daemon's ceiling, or up to
+    /// `wait_secs` when given (the daemon caps it). `wait_secs` is sent only when `Some`, so an
+    /// older daemon, which would not know the key, sees the body it always saw.
+    pub async fn verify_status(
+        &self,
+        ticket: i64,
+        wait: bool,
+        wait_secs: Option<u64>,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::json!({ "ticket": ticket, "wait": wait });
+        if let Some(secs) = wait_secs {
+            body["wait_secs"] = serde_json::json!(secs);
+        }
+        self.verify_request("/verify/status", &body).await
     }
 
     /// Tells the daemon an IDE session's verify box is still there (`POST /verify/box/beat`).

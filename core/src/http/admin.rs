@@ -21,9 +21,15 @@ pub(super) fn routes() -> Router<AppState> {
             get(crate::distill::model::get_distiller_config)
                 .post(crate::distill::model::post_distiller_config),
         )
+        // In no `auth.rs` table on purpose, like `/config/distiller`.
         .route(
-            "/config/capture-wait",
-            get(get_capture_wait).post(post_capture_wait),
+            "/config/distiller-sources",
+            get(crate::distill::sources::get_sources).post(crate::distill::sources::post_sources),
+        )
+        .route("/distill/chats/ingest", post(post_ingest_chats))
+        .route(
+            "/config/capture",
+            get(get_capture_config).post(post_capture_config),
         )
         .route(
             "/config/embedding",
@@ -765,28 +771,72 @@ pub(super) async fn get_email_config(State(state): State<AppState>) -> Json<Emai
     })
 }
 
-pub(super) async fn get_capture_wait(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "minutes": crate::capture::wait_minutes(&state.pool).await }))
+async fn capture_config_body(pool: &sqlx::SqlitePool) -> serde_json::Value {
+    serde_json::json!({
+        "answer_days": crate::capture::answer_days(pool).await,
+        "digest_hour": crate::capture::digest_hour(pool).await,
+    })
+}
+
+pub(super) async fn get_capture_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(capture_config_body(&state.pool).await)
 }
 
 #[derive(serde::Deserialize)]
-pub(super) struct CaptureWaitRequest {
-    pub(super) minutes: i64,
+pub(super) struct CaptureConfigRequest {
+    pub(super) answer_days: Option<i64>,
+    pub(super) digest_hour: Option<i64>,
 }
 
-pub(super) async fn post_capture_wait(
+pub(super) async fn post_capture_config(
     State(state): State<AppState>,
-    Json(body): Json<CaptureWaitRequest>,
+    Json(body): Json<CaptureConfigRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    use crate::capture::WaitError;
-    match crate::capture::set_wait_minutes(&state.pool, body.minutes, chrono::Utc::now()).await {
-        Ok(()) => Ok(Json(serde_json::json!({ "minutes": body.minutes }))),
-        Err(WaitError::OutOfRange) => Err((
+    use crate::capture::ConfigError;
+    match crate::capture::set_config(
+        &state.pool,
+        body.answer_days,
+        body.digest_hour,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(()) => Ok(Json(capture_config_body(&state.pool).await)),
+        Err(ConfigError::OutOfRange) => Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": "out_of_range" })),
         )),
-        Err(WaitError::Db(error)) => {
-            tracing::warn!(%error, "setting the capture wait failed");
+        Err(ConfigError::Db(error)) => {
+            tracing::warn!(%error, "setting the capture config failed");
+            Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+pub(super) struct IngestChatsRequest {
+    chat_ids: Option<Vec<String>>,
+    project: Option<String>,
+}
+
+/// `POST /distill/chats/ingest`: the owner's explicit request to let the distiller read past chats
+/// (P8). Seeds, never asks a model; answers `{seeded, skipped}`. `chat_ids` and `project` together
+/// are ambiguous: 400.
+pub(super) async fn post_ingest_chats(
+    State(state): State<AppState>,
+    Json(body): Json<IngestChatsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::distill::chats::{Selection, ingest};
+    let selection = match (body.chat_ids, body.project) {
+        (Some(_), Some(_)) => return Err(refusal(StatusCode::BAD_REQUEST, "chat_ids_or_project")),
+        (Some(ids), None) => Selection::Chats(ids),
+        (None, Some(project)) => Selection::Project(project),
+        (None, None) => Selection::All,
+    };
+    match ingest(&state.pool, selection).await {
+        Ok((seeded, skipped)) => Ok(Json(serde_json::json!({ "seeded": seeded, "skipped": skipped }))),
+        Err(error) => {
+            tracing::warn!(%error, "ingesting past chats failed");
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }

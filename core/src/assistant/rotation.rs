@@ -541,6 +541,10 @@ pub async fn rotate_with_soft(
     .bind(chrono::Utc::now().to_rfc3339())
     .execute(pool)
     .await?;
+    // A rotation closes a conversation: let the distiller read it. Never fails the rotation.
+    if let Err(error) = crate::distill::chats::enqueue_rotated(pool, chat_id).await {
+        tracing::warn!(%error, "could not queue the rotated chat for distillation");
+    }
     super::forget_session(pool, chat_id).await?;
     Ok(true)
 }
@@ -876,6 +880,33 @@ mod tests {
                 .as_deref(),
             Some("sess")
         );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_queues_the_chat_for_distillation() {
+        let pool = pool().await;
+        run(&pool, "c", "first question", "first answer", 0).await;
+        let id = run(&pool, "c", "the last request", "done", 0).await;
+        assert!(
+            rotate_with_soft(
+                &pool,
+                &fake(true),
+                &DeterministicSummarizer,
+                "c",
+                id,
+                Some(500),
+                100
+            )
+            .await
+            .unwrap()
+        );
+        let queued: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT chat_id, run_id FROM distill_queue WHERE cause = 'chat_exchanges'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queued, vec![("c".to_string(), Some(id))]);
     }
 
     #[tokio::test]

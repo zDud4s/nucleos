@@ -367,7 +367,7 @@ pub(super) fn write_mcp_config(path: &std::path::Path) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|error| error.to_string())?;
-    let bytes = serde_json::to_vec(&crate::assistant::build_mcp_config(&exe))
+    let bytes = serde_json::to_vec(&crate::assistant_types::build_mcp_config(&exe))
         .map_err(|error| error.to_string())?;
     crate::storage::write_atomic(path, &bytes).map_err(|error| error.to_string())
 }

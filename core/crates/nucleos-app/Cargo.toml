@@ -25,6 +25,8 @@ base64 = "0.23.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 notify = "8"
+# `channels/media.rs` only (media ids).
+rand = "0.10.2"
 regex = "1"
 # Same features as `nucleos-core`'s, which explains why `native-tls` must stay.
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "native-tls"] }
@@ -46,5 +48,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 [dev-dependencies]
 nucleos-core = { path = "../..", features = ["testkit"] }
 tempfile = "3.27.0"
+# `channels::port_tests_commands` captures the log lines a refused command writes.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 sqlx = { version = "0.9.0", features = ["sqlite-deserialize"] }
 tokio = { version = "1.53.0", features = ["test-util"] }

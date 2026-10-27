@@ -1028,6 +1028,39 @@ mod tests {
         assert_eq!(filled, 0);
     }
 
+    /// Migration `0247` cuts the automatic chat history at the newest run (P8).
+    #[tokio::test]
+    async fn migration_0247_seeds_the_history_cut_at_the_newest_run() {
+        let pool = crate::testdb::pool_migrated_through(246).await;
+        for _ in 0..3 {
+            sqlx::query(
+                "INSERT INTO runs (prompt, status, mode, created_at) \
+                 VALUES ('p', 'completed', 'assistant', '2026-10-01T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        crate::testdb::apply_migrations_after(&pool, 246).await;
+        let cut: String = sqlx::query_scalar(
+            "SELECT value FROM schema_meta WHERE key = 'distiller.chat_floor_run_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cut, "3");
+
+        let empty = crate::testdb::pool_migrated_through(246).await;
+        crate::testdb::apply_migrations_after(&empty, 246).await;
+        let cut: String = sqlx::query_scalar(
+            "SELECT value FROM schema_meta WHERE key = 'distiller.chat_floor_run_id'",
+        )
+        .fetch_one(&empty)
+        .await
+        .unwrap();
+        assert_eq!(cut, "0");
+    }
+
     /// Migrations `0198` and `0202` index the `runs` lookups that were full scans of a 229 MB table.
     #[tokio::test]
     async fn the_runs_lookups_by_job_status_and_project_use_an_index() {
@@ -1149,11 +1182,12 @@ mod tests {
         let db = TempDb::new().await;
 
         assert!(db.path().join("nucleos.db").exists());
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM schema_meta")
-            .fetch_one(&db.pool)
+        // The table exists and holds only what migrations seed: the chat history cut (0247).
+        let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM schema_meta ORDER BY key")
+            .fetch_all(&db.pool)
             .await
             .unwrap();
-        assert_eq!(row.0, 0);
+        assert_eq!(keys, vec!["distiller.chat_floor_run_id".to_string()]);
         db.close().await;
     }
 

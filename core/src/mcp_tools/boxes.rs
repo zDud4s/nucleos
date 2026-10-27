@@ -195,6 +195,32 @@ pub const EVERY_BOX_TOOLS: &[&str] = &[
 /// so they ride with `verify` into every box that has a worktree or a run behind it.
 pub const TASK_TOOL_NAMES: [&str; 4] = ["task_list", "task_claim", "task_release", "task_done"];
 
+/// What an interactive (IDE/terminal) session's worktree box serves: `EVERY_BOX_TOOLS` plus the five
+/// work-node tools, so the `orchestrate` skill can run a node tree there. Sorted.
+///
+/// Not `EVERY_BOX_TOOLS`: that list is also served by `McpBox::All` and `McpBox::JobNode`, and a job
+/// node holds a `Scope::Run` token the `/nodes` routes refuse, so offering it `node_*` would be a
+/// rain of 403s (the failure `TEAM_TOOLS` names). `McpBox::All` already serves them.
+///
+/// No new authority: this box's client already holds the owner's control token (the stored-token
+/// fallback of `client_for_box`), `/nodes` admits exactly that token and an Admin key, and the same
+/// session's SessionStart hook forwarder calls them already. The box only decides what the MODEL is
+/// offered. The effects stay low: `node_open/update/close` are `WritesOwn`, `node_tree/active` are
+/// `ReadsOwn`; none `Acts`, none `ReadsUntrusted`, and this box serves no untrusted read, so the taint
+/// rule has nothing to guard. The daemon enforces depth, sibling and `owned_paths` limits itself.
+/// Accepted residual: node ids are not fenced to the worktree; they are the owner's own bookkeeping
+/// rows and run nothing.
+pub const WORKTREE_BOX_TOOLS: &[&str] = &[
+    "node_active",
+    "node_close",
+    "node_open",
+    "node_tree",
+    "node_update",
+    "record",
+    "verify",
+    "verify_status",
+];
+
 /// What a team agent's box serves by default: today's `TEAM_TOOLS` plus the door that asks for more
 /// and `read_context`, the door onto the context files the agent was given.
 pub const TEAM_BASE: &[&str] = &[
@@ -298,7 +324,7 @@ pub(super) fn served_in_box(served: &McpBox, tool: &str) -> bool {
         // extras from that row, so the box announces the base and the extras alike.
         McpBox::JobNode(_) => JOB_NODE_BASE.contains(&tool) || JOB_NODE_EXTRAS.contains(&tool),
         McpBox::Team(_) => TEAM_BASE.contains(&tool) || TEAM_EXTRAS.contains(&tool),
-        McpBox::Worktree(_) => EVERY_BOX_TOOLS.contains(&tool),
+        McpBox::Worktree(_) => WORKTREE_BOX_TOOLS.contains(&tool),
     }
 }
 
@@ -350,6 +376,60 @@ pub fn ticket_for_box(
         Some(theirs) if !theirs.is_empty() && fence_key(theirs) == fence_key(own) => Ok(answer),
         _ => Err(format!("no ticket {ticket}")),
     }
+}
+
+/// How a session of this box waits for a ticket that is not done, the text of the `wait_with` field
+/// (`ticket` is the ticket's id).
+///
+/// The worktree box is an IDE or terminal session: the daemon cannot resume it, so it waits with
+/// `<daemon> --verify-ticket <id>` in the background and is woken when that exits. A job node is
+/// never resumed with a verdict: the job's item gate verifies its files once it ends. Every other
+/// box (`McpBox::All` also serves chats, councils and runs outside a worktree) is NOT woken: only a
+/// daemon worktree run is resumed with the verdict, so the text says what each case does.
+pub fn wait_with_text(served: &McpBox, ticket: i64) -> String {
+    match served {
+        McpBox::Worktree(_) => format!(
+            "{} --verify-ticket {ticket}: run it with Monitor or Bash \
+             run_in_background; you will be woken when it exits (exit 0 passed, 1 failed, \
+             3 no verdict yet, 4 not verified); do not poll verify_status",
+            verify_client_program()
+        ),
+        McpBox::JobNode(_) => "carry on or finish; the job's item gate verifies your files after \
+                                you end; do not poll verify_status"
+            .to_string(),
+        _ => "a daemon worktree run: end your turn and the daemon resumes you with the verdict; \
+              any other session: read it once with verify_status (wait true) when you need it; \
+              never loop on verify_status"
+            .to_string(),
+    }
+}
+
+/// How the IDE box names the daemon's own binary: its full path, which is on nobody's PATH, quoted
+/// when it holds a space; the bare name only when the daemon cannot tell where it runs from. The
+/// classifier allows this exact program word (`is_verify_client_call`).
+pub fn verify_client_program() -> String {
+    match std::env::current_exe() {
+        Ok(path) => {
+            let path = path.to_string_lossy();
+            if path.contains(char::is_whitespace) {
+                format!("\"{path}\"")
+            } else {
+                path.into_owned()
+            }
+        }
+        Err(_) => "nucleos-core".to_owned(),
+    }
+}
+
+/// An unfinished ticket's answer with the additive `wait_with` field naming how this box waits for
+/// it. A finished ticket, or an answer that is not a ticket, goes through untouched.
+pub fn with_wait_hint(served: &McpBox, mut answer: serde_json::Value) -> serde_json::Value {
+    if answer["done"].as_bool() == Some(false)
+        && let Some(ticket) = answer["ticket"].as_i64()
+    {
+        answer["wait_with"] = serde_json::Value::String(wait_with_text(served, ticket));
+    }
+    answer
 }
 
 /// The daemon client a box starts with. The environment's token wins; only the worktree box, which

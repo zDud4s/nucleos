@@ -23,6 +23,8 @@ pub const GC_CANDIDATES_SQL: &str =
            AND w.removed_at IS NULL
            AND r.status IN ('completed','failed','cancelled','timed_out','interrupted','superseded')
            AND COALESCE(r.completed_at, w.created_at) <= ?
+           AND NOT EXISTS (SELECT 1 FROM verify_wakes v
+                           WHERE v.run_id = w.owner_id AND v.state = 'pending')
          UNION ALL
          SELECT w.owner_kind, w.owner_id, w.project_id, w.project_root, w.path, w.branch
          FROM worktrees w

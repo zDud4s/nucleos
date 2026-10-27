@@ -186,6 +186,13 @@ pub(super) async fn reconcile_after_restart(pool: &sqlx::SqlitePool) {
     }
 }
 
+/// Re-arms the per-ticket watchers of verify wakes a previous daemon left `pending`: the tasks that
+/// were waiting on those tickets died with it. After the verify executor is installed and started,
+/// because the tickets themselves were requeued by `reconcile_after_restart` and finish only then.
+pub(super) async fn rearm_verify_wakes(state: &AppState) {
+    execution::runs::rearm_verify_wakes(state).await;
+}
+
 /// Installs the embedded agent packages under `~/.nucleos/agents` and registers their catalog rows.
 ///
 /// Never stops the daemon: a package that cannot install is an agent that is unavailable, said out
