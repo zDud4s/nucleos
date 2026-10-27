@@ -59,6 +59,9 @@ pub fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
                 );
             ScopeVerdict::Measured(GateOutcome::Failed { exit_code, output })
         }
+        Some("inherited") => ScopeVerdict::Measured(GateOutcome::Errored {
+            reason: "every red unit is inherited from a master incident; wait for it to close".to_owned(),
+        }),
         other => ScopeVerdict::Measured(GateOutcome::Errored {
             reason: format!(
                 "scope verification ended {}",
@@ -140,6 +143,7 @@ pub async fn gate_scope_ticketed(
         wait: false,
         cover: false,
         task_id: None,
+        groups: None,
     };
     // F3-12 (decision 3): the merge queue's integration worktree can vanish right after its ticket
     // ends, so the confirmation is awaited here as well as detached in `submit`. Idempotent. The

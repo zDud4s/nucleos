@@ -144,6 +144,8 @@ fn verdict_code(ticket: &Value) -> Option<i32> {
         "failed" | "errored" => Some(EXIT_FAILED),
         // Covers nothing (verify.rs): not a pass, and not a failure either.
         "nothing_ran" => Some(EXIT_NOT_VERIFIED),
+        // Neither a pass nor a failure to fix: the red belongs to a master incident.
+        "inherited" => Some(EXIT_NOT_VERIFIED),
         _ => None,
     }
 }
@@ -172,6 +174,15 @@ fn render_units(ticket: &Value) -> String {
         out.push_str(&format!("{status:<14} {label}"));
         if let Some(already) = unit["already_failing"].as_str() {
             out.push_str(&format!(" (already failing on the target: {already})"));
+        }
+        if let Some(text) = unit["inherited"].as_str() {
+            out.push_str(&format!(" (inherited: {text})"));
+        }
+        if let Some(text) = unit["not_inherited"].as_str() {
+            out.push_str(&format!(" (not yours? {text})"));
+        }
+        if let Some(text) = unit["pending"].as_str() {
+            out.push_str(&format!(" (pending: {text})"));
         }
         out.push('\n');
         if matches!(status, "failed" | "errored")
@@ -234,7 +245,10 @@ fn finished(ticket: &Value, id: i64) -> Outcome {
         Some(code) => Outcome {
             code,
             stdout: render(ticket),
-            stderr: if code == EXIT_NOT_VERIFIED {
+            stderr: if code == EXIT_NOT_VERIFIED && ticket["verdict"].as_str() == Some("inherited") {
+                "not verified: every failed unit is inherited from a master incident; keep working and re-verify when it closes\n"
+                    .to_string()
+            } else if code == EXIT_NOT_VERIFIED {
                 "not verified: the daemon ran nothing for this change\n".to_string()
             } else {
                 String::new()
@@ -401,6 +415,20 @@ mod tests {
 
     fn client(url: String) -> DaemonClient {
         DaemonClient::new(url, TOKEN.to_string())
+    }
+
+    #[test]
+    fn an_inherited_verdict_is_not_verified_and_tells_the_asker_to_wait_for_the_incident() {
+        let ticket = serde_json::json!({
+            "ticket": 7, "done": true, "verdict": "inherited", "inherited_task_ids": [3],
+            "units": [{ "status": "failed", "group": "py",
+                        "inherited": "incident #3 (claimed by session abc): do not fix it" }],
+        });
+        assert_eq!(verdict_code(&ticket), Some(EXIT_NOT_VERIFIED));
+        let outcome = finished(&ticket, 7);
+        assert_eq!(outcome.code, EXIT_NOT_VERIFIED);
+        assert!(outcome.stdout.contains("(inherited: incident #3"), "{}", outcome.stdout);
+        assert!(outcome.stderr.contains("inherited") && !outcome.stderr.contains("ran nothing"), "{}", outcome.stderr);
     }
 
     /// **One hour unless told otherwise, and the flag outranks the environment.**

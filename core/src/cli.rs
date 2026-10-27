@@ -298,6 +298,64 @@ fn print_token() {
     }
 }
 
+/// What `--land` does with the owner's claims override.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ClaimedOverride {
+    /// The variable is not set: nothing extra goes on the wire.
+    Absent,
+    /// Set by a person at a terminal: the body carries `override_claimed`.
+    Send,
+    /// Set, but not by a person: refused with this message.
+    Refused(&'static str),
+}
+
+/// The pure decision behind the override. A run of the daemon (`NUCLEOS_RUN_ID` set) or a stdin that
+/// is not a terminal is an agent or a script, never the owner, so the override is refused there
+/// rather than silently dropped.
+pub(super) fn claimed_override_decision(
+    requested: bool,
+    run_id: Option<&str>,
+    interactive: bool,
+) -> ClaimedOverride {
+    if !requested {
+        return ClaimedOverride::Absent;
+    }
+    if run_id.is_some_and(|id| !id.is_empty()) {
+        return ClaimedOverride::Refused(
+            "the claims override is the project owner's: it is refused inside an agent run (NUCLEOS_RUN_ID is set).",
+        );
+    }
+    if !interactive {
+        return ClaimedOverride::Refused(
+            "the claims override is the project owner's: it needs an interactive terminal, and stdin is not one.",
+        );
+    }
+    ClaimedOverride::Send
+}
+
+#[cfg(test)]
+mod claimed_override_tests {
+    use super::*;
+
+    #[test]
+    fn unset_sends_nothing() {
+        assert_eq!(claimed_override_decision(false, None, true), ClaimedOverride::Absent);
+        assert_eq!(claimed_override_decision(false, Some("r1"), false), ClaimedOverride::Absent);
+    }
+
+    #[test]
+    fn an_owner_at_a_terminal_sends_it() {
+        assert_eq!(claimed_override_decision(true, None, true), ClaimedOverride::Send);
+        assert_eq!(claimed_override_decision(true, Some(""), true), ClaimedOverride::Send);
+    }
+
+    #[test]
+    fn an_agent_run_or_a_pipe_is_refused() {
+        assert!(matches!(claimed_override_decision(true, Some("r1"), true), ClaimedOverride::Refused(_)));
+        assert!(matches!(claimed_override_decision(true, None, false), ClaimedOverride::Refused(_)));
+    }
+}
+
 // `nucleos-core --land`, run from inside a worktree: "I am finished, take this branch."
 //
 // A subcommand rather than a documented `curl`, for the reason `--print-token` is one: the
@@ -324,11 +382,34 @@ async fn land() {
     let target = land_target_from(&args);
     // Omitted rather than sent as an explicit `null` when there is none, so a bare `--land`
     // puts on the wire the same body every caller put there before the field existed.
-    let body = match &target {
-        Some(target) => serde_json::json!({ "cwd": cwd, "target": target }),
-        None => serde_json::json!({ "cwd": cwd }),
+    let mut body = serde_json::json!({ "cwd": cwd });
+    if let Some(target) = &target {
+        body["target"] = serde_json::json!(target);
     }
-    .to_string();
+    // The task-claims override belongs to the project owner; the PreToolUse hook (`ask_daemon.py`)
+    // is what stops agents from using it. This side adds a second wall: an agent run (NUCLEOS_RUN_ID)
+    // or a non-interactive stdin never carries it.
+    let override_requested =
+        std::env::var("NUCLEOS_ALLOW_CLAIMED_LAND").is_ok_and(|value| value == "1");
+    let run_id = std::env::var("NUCLEOS_RUN_ID").ok();
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    match claimed_override_decision(override_requested, run_id.as_deref(), interactive) {
+        ClaimedOverride::Absent => {}
+        ClaimedOverride::Refused(reason) => {
+            eprintln!("{reason}");
+            std::process::exit(1);
+        }
+        ClaimedOverride::Send => {
+            // Omitted unless set, like `target`: a bare `--land` puts on the wire what it always did.
+            body["override_claimed"] = serde_json::json!(true);
+            // Said every time, because the variable may have been inherited from a shell profile
+            // the owner forgot about (the hook cannot see the environment).
+            eprintln!(
+                "claims override sent: NUCLEOS_ALLOW_CLAIMED_LAND is set in this environment."
+            );
+        }
+    }
+    let body = body.to_string();
     let response = reqwest::Client::new()
         .post(format!("{}/vcs/land", daemon_client::daemon_url()))
         .bearer_auth(token)
