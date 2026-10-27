@@ -555,6 +555,7 @@ async fn write_items(
             points_at: points_at.as_deref(),
             fingerprint: Some(&fingerprint),
             layer: Some(item.layer),
+            ..Default::default()
         };
         let new_id = match how {
             Door::Record => {
@@ -2513,6 +2514,7 @@ mod tests {
                 points_at: None,
                 fingerprint: Some("title:old rule"),
                 layer: Some(crate::knowledge::Layer::Episodic),
+                ..Default::default()
             };
             crate::knowledge::record_distilled(&mut tx, &declaration, &provenance)
                 .await

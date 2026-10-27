@@ -111,6 +111,10 @@ pub struct Provenance<'a> {
     pub fingerprint: Option<&'a str>,
     /// Replaces the layer derived from the kind.
     pub layer: Option<Layer>,
+    /// Who the lesson is about; `None` is the code, the work, the project.
+    pub about: Option<&'a str>,
+    /// Replaces the scope derived from `project_id`; the generalisation pass writes `machine`.
+    pub scope: Option<Scope>,
 }
 
 /// `propose_in` with the provenance a caller other than a run or the owner brings. Nothing is
@@ -130,7 +134,10 @@ pub async fn propose_in_with(
         supersedes,
     } = declaration;
 
-    let scope = Scope::of_project(project_id);
+    let scope = provenance
+        .scope
+        .clone()
+        .unwrap_or_else(|| Scope::of_project(project_id));
     let (scope_kind, scope_id) = scope.columns();
     let derived_fingerprint =
         failure_signature(body).map(|signature| format!("gate:{}", signature.fingerprint));
@@ -159,8 +166,8 @@ pub async fn propose_in_with(
     let knowledge_id = sqlx::query(
         "INSERT INTO knowledge
            (layer, scope_kind, scope_id, source, kind, title, body, fingerprint, status, supersedes,
-            origin_run_id, created_at, evidence, points_at, distill_cause)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?)",
+            origin_run_id, created_at, evidence, points_at, distill_cause, about)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(provenance.layer.unwrap_or_else(|| kind.layer()).as_str())
     .bind(scope_kind)
@@ -526,5 +533,67 @@ mod wake_tests {
         .unwrap();
 
         assert!(rx.borrow().wrapping_sub(before) >= 1);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    async fn propose_with(
+        pool: &sqlx::SqlitePool,
+        provenance: Provenance<'_>,
+    ) -> (String, Option<String>, Option<String>, String) {
+        let mut tx = pool.begin().await.unwrap();
+        let (id, _) = propose_in_with(
+            &mut tx,
+            Declaration {
+                project_id: Some("alpha"),
+                origin_run_id: None,
+                kind: Kind::Memory,
+                title: "A general lesson",
+                body: "It holds everywhere.",
+                reasoning: "seen three times",
+                supersedes: None,
+            },
+            &provenance,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query_as("SELECT scope_kind, scope_id, about, status FROM knowledge WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provenance_carries_about_and_overrides_the_derived_scope() {
+        let pool = crate::testdb::fresh_pool().await;
+        let got = propose_with(
+            &pool,
+            Provenance {
+                source: Some("distiller"),
+                about: Some("owner"),
+                scope: Some(Scope::Machine),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            got,
+            ("machine".into(), None, Some("owner".into()), "proposed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn without_about_or_scope_the_door_behaves_as_before() {
+        let pool = crate::testdb::fresh_pool().await;
+        let got = propose_with(&pool, Provenance::default()).await;
+        assert_eq!(
+            got,
+            ("project".into(), Some("alpha".into()), None, "proposed".into())
+        );
     }
 }

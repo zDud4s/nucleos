@@ -1286,6 +1286,7 @@ mod tests {
                 points_at: None,
                 fingerprint: None,
                 layer: Some(Layer::Episodic),
+                ..Default::default()
             },
         )
         .await
@@ -1488,6 +1489,7 @@ mod tests {
                 points_at: Some("scripts/gates.sh"),
                 fingerprint: Some("title:format before gating"),
                 layer: Some(Layer::Procedural),
+                ..Default::default()
             },
         )
         .await
