@@ -50,6 +50,7 @@ use crate::verify::runs::{STATUS_FAILED, STATUS_PASSED};
 use crate::verify::{self, Caller, VerifyArgs};
 
 mod correction;
+mod incident;
 mod revert;
 
 pub use self::correction::*;
@@ -686,6 +687,19 @@ async fn handle_red(
             };
         }
         let status = ticket.verdict.as_deref().unwrap_or("");
+        if matches!(phase, RedPhase::FlakeCheck) && verify_flaky::rerun_verdict(status) != Rerun::Flaky
+        {
+            // Confirmed (spec §3 Postgate): open the incident now, with what the failing units
+            // named. A crash before `begin_bisect` repeats this on the next pass: the ticket is
+            // still there.
+            let failures = incident::failures_of_ticket(&ticket);
+            if let Err(reason) =
+                incident::ensure_incident(pool, project_id, project_root, state, Some(&failures))
+                    .await
+            {
+                tracing::warn!(project = project_id, %reason, "postgate: cannot open the incident");
+            }
+        }
         return settle(pool, project_id, phase, sha, status).await;
     }
 
@@ -810,19 +824,24 @@ async fn bisect_step(
     deadline: Instant,
 ) -> Step {
     let pool = &executor.pool;
+    if let Err(reason) = incident::ensure_incident(pool, project_id, project_root, state, None).await
+    {
+        tracing::warn!(project = project_id, %reason, "postgate: cannot open the incident");
+    }
     let inconclusive = || Verdict::Inconclusive {
         candidates: Vec::new(),
         also_suspect: Vec::new(),
     };
     let Some(base) = state.red_base_sha.as_deref() else {
-        return report_red(executor, project_id, state, red_sha, inconclusive()).await;
+        return report_red(executor, project_id, project_root, state, red_sha, inconclusive()).await;
     };
     let commits = match git_exec::first_parent_commits(project_root, base, red_sha, deadline).await
     {
         Ok(commits) => commits,
         Err(reason) => {
             tracing::warn!(project = project_id, %reason, "postgate: cannot list the range");
-            return report_red(executor, project_id, state, red_sha, inconclusive()).await;
+            return report_red(executor, project_id, project_root, state, red_sha, inconclusive())
+                .await;
         }
     };
     let mut bisection = Bisection::new(
@@ -841,7 +860,9 @@ async fn bisect_step(
         }
     }
     match bisection.next() {
-        Next::Done(verdict) => report_red(executor, project_id, state, red_sha, verdict).await,
+        Next::Done(verdict) => {
+            report_red(executor, project_id, project_root, state, red_sha, verdict).await
+        }
         Next::Probe(sha) => {
             let claimed = verify_postgate::claim_probe(pool, project_id, &sha).await;
             match claimed {
@@ -864,11 +885,25 @@ async fn bisect_step(
 async fn report_red(
     executor: &Arc<Executor>,
     project_id: &str,
+    project_root: &Path,
     state: &State,
     red_sha: &str,
     verdict: Verdict,
 ) -> Step {
     let pool = &executor.pool;
+    let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
+    let incident_row =
+        match incident::ensure_incident(pool, project_id, project_root, state, None).await {
+            Ok(row) => {
+                Some(incident::record_verdict(pool, row, project_root, &verdict, deadline).await)
+            }
+            Err(reason) => {
+                tracing::warn!(project = project_id, %reason, "postgate: cannot update the incident");
+                None
+            }
+        };
+    // Used by the claim-before-revert step (Task 4).
+    let _ = &incident_row;
     let base = state.red_base_sha.as_deref();
     let reverting = matches!(verdict, Verdict::Culprit { .. })
         && crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id)
@@ -1047,6 +1082,7 @@ mod tests {
     use crate::execution::git_exec::tests::{WorktreeRootEnv, space_free_tempdir};
     use crate::verify::exec::{self as verify_exec, Executor};
     use crate::verify::postgate as verify_postgate;
+    use crate::task_claims::Status;
     use crate::verify::runs::PRIORITY_POSTGATE;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, MutexGuard};
@@ -1828,6 +1864,90 @@ mod tests {
             "the culprit is c3: {step:?}"
         );
         (c3, c4)
+    }
+
+    /// `master-red` of `alpha`, as the claims store sees it.
+    async fn incident(f: &Fixture) -> Option<crate::task_claims::TaskRow> {
+        incident::live_master_red(&f.pool, "alpha").await
+    }
+
+    /// Drives `alpha` as `confirmed_culprit` does but stops as soon as the first bisection probe is
+    /// submitted: the incident exists, the owner has not been told yet. Returns `(c3, c4)`.
+    async fn red_until_probe(f: &Fixture) -> (String, String) {
+        let c1 = commit_file(&f.root, "a.txt", "good\n", "c1");
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        tick_until(f, |s| matches!(s, Step::Green(sha) if *sha == c1)).await;
+        commit_file(&f.root, "b.txt", "b\n", "c2");
+        let c3 = commit_file(&f.root, "a.txt", "bad\n", "c3 breaks the gate");
+        let c4 = commit_file(&f.root, "c.txt", "c\n", "c4");
+        tick_until(f, |s| matches!(s, Step::Probe { .. })).await;
+        (c3, c4)
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_red_opens_the_master_red_incident_with_its_context() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+
+        let row = incident(&f).await.expect("a confirmed red opens the incident");
+        assert_eq!(row.status, Status::Open, "without revert_on_red nobody claims it");
+        assert_eq!(row.holder_kind, None);
+        let state = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        assert_eq!(row.detail["red_since_sha"], serde_json::json!(state.red_since_sha));
+        assert_eq!(row.detail["red_groups"], serde_json::json!(["gate_command"]));
+        // The fixture's gate_command prints no test ids, so the runner gave none: empty, not guessed.
+        assert_eq!(row.detail["red_tests"], serde_json::json!([]), "this runner names no tests");
+        assert_eq!(row.detail["culprit_sha"], serde_json::json!(c3));
+        assert!(row.guard_paths.is_empty(), "no ids from the runner, so nothing to guard");
+        assert_eq!(row.hint_paths, vec!["a.txt".to_owned()], "the culprit's own files");
+
+        // Further passes neither duplicate it nor claim it.
+        let _ = step_of(&f).await;
+        assert_eq!(count(&f.pool, "task_claims").await, 1);
+        assert_eq!(incident(&f).await.unwrap().status, Status::Open);
+    }
+
+    /// What the gate ticket's failing units named reaches the incident: the tests in `red_tests`,
+    /// their files in `guard_paths` (the land gate bites on those, spec §3 Land), and a later pass
+    /// without ids (`bisect_step`, `report_red`) wipes neither. The ticket-to-`RedFailures` step is
+    /// `fold_failures`, tested pure in Task 2; the runner output that fills the ticket is chunk 4's.
+    #[tokio::test]
+    async fn the_failing_tests_and_files_of_the_gate_ticket_reach_the_incident() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let (_c3, _c4) = red_until_probe(&f).await;
+        let state = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let named = incident::RedFailures {
+            tests: vec!["core::a::boom".to_owned()],
+            files: vec!["core/src/a.rs".to_owned()],
+        };
+        let row = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, Some(&named))
+            .await
+            .unwrap();
+        assert_eq!(row.detail["red_tests"], serde_json::json!(["core::a::boom"]));
+        assert_eq!(row.guard_paths, vec!["core/src/a.rs".to_owned()]);
+
+        // A later pass that has no ids (the bisection's) keeps what the ticket named.
+        let again = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, None).await.unwrap();
+        assert_eq!(again.id, row.id, "adopted, not duplicated");
+        assert_eq!(again.detail["red_tests"], serde_json::json!(["core::a::boom"]));
+        assert_eq!(again.guard_paths, vec!["core/src/a.rs".to_owned()]);
+        let stored = incident(&f).await.unwrap();
+        assert_eq!(stored.guard_paths, vec!["core/src/a.rs".to_owned()], "persisted, not only returned");
+    }
+
+    #[tokio::test]
+    async fn a_red_that_passes_on_recheck_opens_no_incident() {
+        let f = fixture(Some(
+            "gate_command: \"git rev-parse --verify --quiet refs/heads/pass\"\n\
+             gate_after_land: true\n",
+        ))
+        .await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        tick_until(&f, |s| matches!(s, Step::Red { .. })).await;
+        assert_eq!(count(&f.pool, "task_claims").await, 0, "an unconfirmed red is not an incident");
+        git_in(&f.root, &["branch", "pass"]);
+        tick_until(&f, |s| matches!(s, Step::Flaky(_))).await;
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
     }
 
     /// Every summary the feed holds, oldest first.
