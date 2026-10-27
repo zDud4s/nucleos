@@ -114,7 +114,7 @@ export interface Known {
   source: "owner" | "run" | "consolidator" | "distiller";
   /**
    * Who the lesson is about: `owner` is the person, `null` the code, the work, the project.
-   * Optional: a daemon older than migration `0246` does not send it.
+   * Optional: a daemon older than migration `0249` does not send it.
    */
   about?: "owner" | null;
   generator: string | null;
