@@ -1663,6 +1663,13 @@ mod tests {
     async fn capture_answer_accepts_a_channel_origin() {
         let pool = test_pool().await;
         sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (7, 'web', '/tmp', 'failed', 3, 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO capture_requests
                  (job_id, project_id, causes, prompt_text, state, deadline, created_at)
              VALUES (7, 'web', '[]', 'why?', 'open', '2099-01-01T00:00:00', '2026-10-07T10:00:00')",
@@ -1670,10 +1677,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let (note_id, released) = crate::capture::answer(&pool, 7, "x", "channel:telegram")
+        let (note_id, requeued) = crate::capture::answer(&pool, 7, "x", "channel:telegram")
             .await
             .unwrap();
-        assert!(released);
+        assert!(requeued);
         let note = get(&pool, note_id).await.unwrap();
         assert_eq!(note.origin, "channel:telegram");
         let (state, linked): (String, Option<i64>) =

@@ -55,8 +55,10 @@ MUTEX_TRACE_S = 1.0
 STILL_ACTIVE = 259
 DEFAULT_CAPACITY = 4
 # Predicted peak memory (p90 of the class, costs.json) from which a request weighs
-# capacity - 1. Between node's 4.7 GB and core clippy's 6.2 GB (costs.json, 2026-10-21).
-BIG_MEM_MB = 5120.0
+# capacity - 1. Off unless NUCLEOS_HEAVY_BIG_MEM_MB sets it. Measured 2026-10-27 (log.jsonl): with
+# it on at 5120, every nucleos-core run weighed 3 and ran alone, yet ran no faster (run p50
+# 415 s vs 230-490 s two-to-four abreast on 10-15..10-20) while its wait p50 went 0 s -> 1865 s.
+BIG_MEM_MB = float("inf")
 AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
@@ -2301,10 +2303,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             costs = hc.load_costs(directory)
             rec["cls"] = hc.class_key(argv, filtered, True)
             rec["pred_cores"], rec["pred_mem_mb"] = hc.predict(costs, rec["cls"], weight)
-            # Measured 2026-10-21: a nucleos-core compile peaks at 6-9 GB on a 16 GB machine,
-            # and two at once (static weight 2 + 2) swapped (one ran 2557 s at 0.47 cores). A
-            # class past the threshold takes capacity - 1, so it never overlaps another one
-            # but a go/npm/tsc still fits beside it.
+            # Opt-in (BIG_MEM_MB): a class past the threshold takes capacity - 1, so it never
+            # overlaps another one but a go/npm/tsc still fits beside it.
             if rec["pred_mem_mb"] >= _env_float("NUCLEOS_HEAVY_BIG_MEM_MB", BIG_MEM_MB):
                 weight = max(weight, capacity() - 1)
                 rec["weight"] = weight

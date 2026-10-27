@@ -97,7 +97,11 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   // `announce_once` binds `crate::execution::land::RESOLUTION_FAILED_KIND` to a local first.
   "resolver.rs": { kind: ["land_resolution_failed"] },
   // The channels' own `say` queues a chat reply in `channel_outbox`; it is no feed writer, so it names no kind.
-  "channels/commands.rs": { reply: [], "strings::render(&Text::CaptureNeedsText)": [] },
+  "channels/commands.rs": {
+    reply: [],
+    "strings::render(&Text::CaptureNeedsText)": [],
+    "strings::render(&Text::CaptureDigestHint{jobs})": [],
+  },
   "channels/ingest.rs": {
     "Text::PairInvalid": [],
     "Text::Unsupported{label:label.clone(),}": [],
