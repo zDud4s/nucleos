@@ -1722,7 +1722,10 @@ mod tests {
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(consumed, None, "the notice waits for a turn that can be marked");
+        assert_eq!(
+            consumed, None,
+            "the notice waits for a turn that can be marked"
+        );
         crate::assistant::evict_live(&chat);
     }
 

@@ -254,7 +254,9 @@ pub(super) async fn inherit_relay_taint(
     .execute(pool)
     .await;
     crate::execution::runs::warn_on_terminal_write_err(&written, id, "failed");
-    Err(format!("could not record that the relayed turn carries untrusted text: {error}"))
+    Err(format!(
+        "could not record that the relayed turn carries untrusted text: {error}"
+    ))
 }
 
 /// What tools a conversation's turn may reach.

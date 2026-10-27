@@ -69,6 +69,7 @@ pub struct ActBody {
 /// Absent or `null` passes through as `None` (resolved from the calling run by [`resolve_scope`]).
 /// An explicit `""` or [`NO_PROJECT_KEY`] is a 400: the no-project scope is reached only by
 /// omitting the field, never by spelling one of its internal names.
+#[allow(clippy::result_large_err)] // the error is the ready-made axum response, as in access::resolve_channel
 pub(crate) fn explicit_project(
     requested: Option<&str>,
 ) -> Result<Option<&str>, axum::response::Response> {

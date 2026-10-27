@@ -29,7 +29,7 @@ pub async fn deliver_reply(
     reply: &str,
 ) -> DeliveryOutcome {
     use crate::assistant::Origin;
-    use crate::assistant::send::{Sent, send_relayed_or_queue};
+    use crate::assistant::{Sent, send_relayed_or_queue};
     use crate::chats::notices;
 
     if reply.trim().is_empty() {
@@ -218,6 +218,7 @@ mod tests {
             council: Arc::new(crate::council::CouncilRuntime::default()),
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+            turns: Default::default(),
         }
     }
 
@@ -642,10 +643,17 @@ mod tests {
         .fetch_all(&state.pool)
         .await
         .unwrap();
-        assert_eq!(statuses, vec!["failed".to_string()], "the turn was never started");
+        assert_eq!(
+            statuses,
+            vec!["failed".to_string()],
+            "the turn was never started"
+        );
         let notices = browser_reply_notices(&state.pool, &mother).await;
         assert_eq!(notices.len(), 1, "{notices:?}");
-        assert!(notices[0].starts_with("Not delivered (internal)"), "{notices:?}");
+        assert!(
+            notices[0].starts_with("Not delivered (internal)"),
+            "{notices:?}"
+        );
     }
 
     /// Nothing to say, or nobody to say it to: no relay, no notice, no delivery row.

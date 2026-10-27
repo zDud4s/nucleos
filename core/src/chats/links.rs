@@ -73,11 +73,11 @@ pub async fn open(
         return Err(LinkError::ToSelf);
     }
     let mut tx = pool.begin().await?;
-    if !is_live(&mut *tx, child).await? {
+    if !is_live(&mut tx, child).await? {
         return Err(LinkError::ChildNotFound);
     }
     if let Some(parent) = parent {
-        if !is_live(&mut *tx, parent).await? {
+        if !is_live(&mut tx, parent).await? {
             return Err(LinkError::ParentNotFound);
         }
         // Walk the active parents up from the new parent; reaching the child closes a loop. The
@@ -430,7 +430,11 @@ mod tests {
         assert_eq!(panel_only.created_by_run, Some(7));
         assert_ne!(panel_only.id, first.id);
         let history = rows_of(&pool, &child).await;
-        assert_eq!(history.len(), 2, "the link to the mother is kept as history");
+        assert_eq!(
+            history.len(),
+            2,
+            "the link to the mother is kept as history"
+        );
         assert_eq!(history[0].parent_chat_id.as_deref(), Some(mother.as_str()));
         assert!(history[0].unlinked_at.is_some());
         assert!(!are_linked(&pool, &child, &mother).await.unwrap());

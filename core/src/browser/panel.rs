@@ -900,6 +900,7 @@ mod tests {
 
         let db = TempDb::new().await;
         let state = state_over(db.pool.clone(), runtime);
+        let turns = crate::assistant_types::RecordingTurns::install(&state);
         a_chat(&db.pool, "no-project-chat").await;
         run_seven(&db.pool, "completed", Some("no-project-chat")).await;
         let id = sqlx::query(
@@ -937,13 +938,15 @@ mod tests {
             state.browser.seats.take_held_return(id).is_none(),
             "nothing is held back waiting for an answer"
         );
-        let told: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM runs WHERE chat_id = 'no-project-chat' \
-             AND origin = 'browser-panel'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+        // The turn itself is the assistant's (another crate); here it is enough that the owner's
+        // chat was asked to hear it, once, as the panel.
+        let told = turns
+            .calls()
+            .into_iter()
+            .filter(|(chat, _, origin)| {
+                chat == "no-project-chat" && *origin == Origin::BrowserPanel
+            })
+            .count();
         assert_eq!(
             told, 1,
             "the owner heard the wheel came back, straight away"

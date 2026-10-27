@@ -1560,12 +1560,11 @@ mod tests {
             Some(cwd.as_str()),
             "the child works in the mother's folder"
         );
-        let title: Option<String> =
-            sqlx::query_scalar("SELECT title FROM chats WHERE chat_id = ?")
-                .bind(&child)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM chats WHERE chat_id = ?")
+            .bind(&child)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         let first_forty: String = task.chars().take(40).collect();
         assert_eq!(title, Some(format!("Browser · {first_forty}")));
 
@@ -1674,6 +1673,7 @@ mod tests {
         let mother = chat(&state).await;
         let mother_turn = running_turn(&state, &mother, Some("shell")).await;
         let uri = "/assistant/browser-agents";
+        let chats_before = count(&state, "SELECT COUNT(*) FROM chats").await;
 
         let (status, body) = call(
             &state,
@@ -1728,7 +1728,7 @@ mod tests {
 
         assert_eq!(
             count(&state, "SELECT COUNT(*) FROM chats").await,
-            1,
+            chats_before,
             "a malformed request creates no conversation"
         );
         assert_eq!(count(&state, "SELECT COUNT(*) FROM chat_links").await, 0);
@@ -1912,7 +1912,12 @@ mod tests {
         // (child, parent, link created_at, unlinked_at)
         for (child, parent, created_at, unlinked_at) in [
             (&oldest, Some(&mother), "2026-10-22T09:00:00+00:00", None),
-            (&in_project, Some(&mother), "2026-10-22T10:00:00+00:00", None),
+            (
+                &in_project,
+                Some(&mother),
+                "2026-10-22T10:00:00+00:00",
+                None,
+            ),
             (&panel_only, None, "2026-10-22T11:00:00+00:00", None),
             (
                 &closed,
@@ -1977,7 +1982,10 @@ mod tests {
         assert_eq!(item["title"], "Browser · one");
         assert_eq!(item["parent_chat_id"], mother.as_str());
         assert_eq!(item["parent_title"], "Mother");
-        assert_eq!(item["project_id"], "p1", "the newest run decides the project");
+        assert_eq!(
+            item["project_id"], "p1",
+            "the newest run decides the project"
+        );
         assert!(item["created_at"].is_string());
         let panel = &all[0];
         assert!(panel["title"].is_null());
@@ -2026,7 +2034,7 @@ mod tests {
     /// with no parent; a child that was itself archived is not.
     #[tokio::test]
     async fn get_browser_agents_keeps_a_child_whose_mother_was_archived_and_drops_an_archived_child()
-    {
+     {
         let state = state().await;
         let mother = chat(&state).await;
         let child = chat(&state).await;
@@ -2045,7 +2053,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{listed}");
-        let items = listed.as_array().unwrap_or_else(|| panic!("a list, got {listed}"));
+        let items = listed
+            .as_array()
+            .unwrap_or_else(|| panic!("a list, got {listed}"));
         assert_eq!(items.len(), 1, "{listed}");
         assert_eq!(items[0]["chat_id"], child.as_str());
         assert!(items[0]["parent_chat_id"].is_null(), "{listed}");
@@ -2062,7 +2072,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{listed}");
-        assert_eq!(listed, serde_json::json!([]), "an archived child is not listed");
+        assert_eq!(
+            listed,
+            serde_json::json!([]),
+            "an archived child is not listed"
+        );
     }
 
     /// One POST to `/assistant/browser-agents` with `bearer` instead of the control token.
@@ -2112,17 +2126,27 @@ mod tests {
             .unwrap();
 
         let (status, body) = post_browser_agents_as(&state, &run_bearer, turn).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "a run token is not a chat key: {body}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a run token is not a chat key: {body}"
+        );
 
         let other = chat(&state).await;
         let other_turn = running_turn(&state, &other, Some("shell")).await;
-        let key = crate::auth::mint_chat_token(&state.pool, &mother).await.unwrap();
+        let key = crate::auth::mint_chat_token(&state.pool, &mother)
+            .await
+            .unwrap();
         let (status, body) = post_browser_agents_as(&state, &key, other_turn).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["refusal"], "run_mismatch");
 
         let (status, body) = post_browser_agents_as(&state, &key, turn).await;
-        assert_eq!(status, StatusCode::OK, "the chat key of the running turn is admitted: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the chat key of the running turn is admitted: {body}"
+        );
         assert!(body["chat_id"].is_string(), "{body}");
     }
 
@@ -2142,7 +2166,9 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        let key = crate::auth::mint_chat_token(&state.pool, &mother).await.unwrap();
+        let key = crate::auth::mint_chat_token(&state.pool, &mother)
+            .await
+            .unwrap();
 
         let (status, body) = post_browser_agents_as(&state, &key, turn).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -2151,6 +2177,9 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(chats_after, chats_before, "a refused sender creates no child");
+        assert_eq!(
+            chats_after, chats_before,
+            "a refused sender creates no child"
+        );
     }
 }
