@@ -265,7 +265,11 @@ known titles. `[]` is a good answer when nothing is worth keeping.";
 pub fn standing_for(cause: Cause) -> String {
     let tail = match cause {
         Cause::JobLanded => " The work landed: ask what made it land, not only what went wrong.",
-        Cause::JobFailed | Cause::GateRecovered | Cause::ReviewBlocking | Cause::RunExhausted => "",
+        Cause::JobFailed
+        | Cause::GateRecovered
+        | Cause::ReviewBlocking
+        | Cause::RunExhausted
+        | Cause::ChatExchanges => "",
     };
     format!("{STANDING_HEAD}{tail}")
 }

@@ -23,14 +23,17 @@ pub enum Cause {
     GateRecovered,
     ReviewBlocking,
     RunExhausted,
+    /// A batch of exchanges of one chat; the row names its chat in `chat_id`.
+    ChatExchanges,
 }
 
-pub const CAUSES: [Cause; 5] = [
+pub const CAUSES: [Cause; 6] = [
     Cause::JobLanded,
     Cause::JobFailed,
     Cause::GateRecovered,
     Cause::ReviewBlocking,
     Cause::RunExhausted,
+    Cause::ChatExchanges,
 ];
 
 impl Cause {
@@ -41,6 +44,7 @@ impl Cause {
             Cause::GateRecovered => "gate_recovered",
             Cause::ReviewBlocking => "review_blocking",
             Cause::RunExhausted => "run_exhausted",
+            Cause::ChatExchanges => "chat_exchanges",
         }
     }
 
@@ -185,6 +189,7 @@ pub struct QueueRow {
     pub job_id: Option<i64>,
     pub item_id: Option<i64>,
     pub run_id: Option<i64>,
+    pub chat_id: Option<String>,
     pub attempts: i64,
 }
 
@@ -218,7 +223,7 @@ pub async fn claim_next(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<O
                                   WHERE c.job_id = q.job_id AND c.state = 'open'
                                     AND c.deadline > ?))
                            ORDER BY q.id LIMIT 1)
-             RETURNING id, cause, project_id, job_id, item_id, run_id, attempts",
+             RETURNING id, cause, project_id, job_id, item_id, run_id, chat_id, attempts",
         )
         .bind(STATUS_RUNNING)
         .bind(STATUS_PENDING)
@@ -913,6 +918,34 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn chat_exchanges_is_in_the_cause_vocabulary() {
+        assert_eq!(Cause::ChatExchanges.as_str(), "chat_exchanges");
+        assert_eq!(Cause::parse("chat_exchanges"), Some(Cause::ChatExchanges));
+        assert!(CAUSES.contains(&Cause::ChatExchanges));
+    }
+
+    #[tokio::test]
+    async fn a_chat_row_is_claimed_with_its_chat_id_and_is_queued_once_per_last_run() {
+        let pool = test_pool().await;
+        no_capture_wait(&pool).await;
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT OR IGNORE INTO distill_queue (cause, project_id, run_id, chat_id, status, attempts, created_at)
+                 VALUES ('chat_exchanges', 'alpha', 7, 'chat-uuid', 'pending', 0, '2026-10-05T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(queued_total(&pool).await, 1);
+        let row = claim_next(&pool, noon()).await.unwrap().expect("a due row");
+        assert_eq!(
+            (row.job_id, row.run_id, row.chat_id.as_deref()),
+            (None, Some(7), Some("chat-uuid"))
+        );
+    }
+
     async fn queued_total(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue")
             .fetch_one(pool)
@@ -1043,14 +1076,15 @@ mod tests {
 
         let spellings: std::collections::HashSet<&str> =
             CAUSES.iter().map(|c| c.as_str()).collect();
-        assert_eq!(CAUSES.len(), 5);
-        assert_eq!(spellings.len(), 5, "two causes share a spelling");
+        assert_eq!(CAUSES.len(), 6);
+        assert_eq!(spellings.len(), 6, "two causes share a spelling");
         for expected in [
             "job_landed",
             "job_failed",
             "gate_recovered",
             "review_blocking",
             "run_exhausted",
+            "chat_exchanges",
         ] {
             assert!(spellings.contains(expected), "{expected} is not a cause");
         }
