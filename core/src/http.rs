@@ -856,7 +856,13 @@ mod tests {
         let worktree = container.path().join("wt");
         assert!(git_in(
             &repo,
-            &["worktree", "add", "-q", &worktree.to_string_lossy(), "feature"]
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "feature"
+            ]
         ));
         std::fs::write(worktree.join("feature.txt"), "from the branch\n").unwrap();
         assert!(git_in(&worktree, &["add", "-A"]));

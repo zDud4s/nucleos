@@ -136,8 +136,15 @@ impl TaskRow {
 
 #[derive(Debug, Clone)]
 pub enum ClaimOutcome {
-    Won { task: TaskRow, similar: Vec<TaskRow> },
-    Lost { task: TaskRow, holder: Holder, similar: Vec<TaskRow> },
+    Won {
+        task: TaskRow,
+        similar: Vec<TaskRow>,
+    },
+    Lost {
+        task: TaskRow,
+        holder: Holder,
+        similar: Vec<TaskRow>,
+    },
 }
 
 impl ClaimOutcome {
@@ -192,10 +199,22 @@ mod tests {
 
     #[test]
     fn every_enum_round_trips_through_its_stored_text() {
-        for status in [Status::Probing, Status::Open, Status::Claimed, Status::Done, Status::Abandoned] {
+        for status in [
+            Status::Probing,
+            Status::Open,
+            Status::Claimed,
+            Status::Done,
+            Status::Abandoned,
+        ] {
             assert_eq!(Status::parse(status.as_str()), Some(status));
         }
-        for kind in [HolderKind::Session, HolderKind::Run, HolderKind::Job, HolderKind::Postgate, HolderKind::Verify] {
+        for kind in [
+            HolderKind::Session,
+            HolderKind::Run,
+            HolderKind::Job,
+            HolderKind::Postgate,
+            HolderKind::Verify,
+        ] {
             assert_eq!(HolderKind::parse(kind.as_str()), Some(kind));
         }
         for kind in [TaskKind::Incident, TaskKind::Declared] {
@@ -206,15 +225,31 @@ mod tests {
 
     #[test]
     fn serde_uses_the_stored_text() {
-        assert_eq!(serde_json::to_string(&Status::Claimed).unwrap(), "\"claimed\"");
-        assert_eq!(serde_json::to_string(&HolderKind::Postgate).unwrap(), "\"postgate\"");
+        assert_eq!(
+            serde_json::to_string(&Status::Claimed).unwrap(),
+            "\"claimed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HolderKind::Postgate).unwrap(),
+            "\"postgate\""
+        );
     }
 
     #[test]
     fn owners_compare_by_kind_and_id_not_by_worktree() {
-        let here = Holder { kind: HolderKind::Session, id: "s1".into(), worktree: "/a".into() };
-        let moved = Holder { worktree: "/b".into(), ..here.clone() };
-        let other = Holder { id: "s2".into(), ..here.clone() };
+        let here = Holder {
+            kind: HolderKind::Session,
+            id: "s1".into(),
+            worktree: "/a".into(),
+        };
+        let moved = Holder {
+            worktree: "/b".into(),
+            ..here.clone()
+        };
+        let other = Holder {
+            id: "s2".into(),
+            ..here.clone()
+        };
         assert!(here.same_owner(&moved));
         assert!(!here.same_owner(&other));
     }
@@ -229,7 +264,11 @@ mod tests {
             detail: serde_json::json!({}),
             guard_paths: vec![],
             hint_paths: vec![],
-            status: if holder.is_some() { Status::Claimed } else { Status::Open },
+            status: if holder.is_some() {
+                Status::Claimed
+            } else {
+                Status::Open
+            },
             holder_kind: holder.map(|h| h.0),
             holder_id: holder.map(|h| h.1.to_owned()),
             holder_worktree: holder.and_then(|h| h.2.map(str::to_owned)),
@@ -246,8 +285,13 @@ mod tests {
     #[test]
     fn a_row_exposes_its_holder_only_when_it_has_one() {
         assert_eq!(row_with(None).holder(), None);
-        let held = row_with(Some((HolderKind::Run, "7", Some("/wt")))).holder().unwrap();
-        assert_eq!((held.kind, held.id.as_str(), held.worktree.as_str()), (HolderKind::Run, "7", "/wt"));
+        let held = row_with(Some((HolderKind::Run, "7", Some("/wt"))))
+            .holder()
+            .unwrap();
+        assert_eq!(
+            (held.kind, held.id.as_str(), held.worktree.as_str()),
+            (HolderKind::Run, "7", "/wt")
+        );
     }
 
     #[test]
@@ -304,7 +348,10 @@ pub mod testing {
     /// Claims `key` (a `declared` task of project `alpha`) for `holder` now; returns the task id.
     pub async fn claimed_by(pool: &SqlitePool, holder: &Holder, key: &str) -> i64 {
         let new = new_task(key, TaskKind::Declared);
-        match store::claim(pool, "alpha", new, holder, chrono::Utc::now()).await.unwrap() {
+        match store::claim(pool, "alpha", new, holder, chrono::Utc::now())
+            .await
+            .unwrap()
+        {
             ClaimOutcome::Won { task, .. } => task.id,
             ClaimOutcome::Lost { .. } => panic!("{key} was already held"),
         }

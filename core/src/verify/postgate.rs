@@ -971,7 +971,15 @@ pub async fn restart_revert(
     if done.rows_affected() == 0 {
         return Ok(false);
     }
-    crate::feed::append_on(&mut tx, Some(project_id), POSTGATE_RED_KIND, summary, None, None).await?;
+    crate::feed::append_on(
+        &mut tx,
+        Some(project_id),
+        POSTGATE_RED_KIND,
+        summary,
+        None,
+        None,
+    )
+    .await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -1183,14 +1191,23 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(restart_revert(&pool, "p", "c3", "taking over").await.unwrap());
+        assert!(
+            restart_revert(&pool, "p", "c3", "taking over")
+                .await
+                .unwrap()
+        );
         let s = load(&pool, "p").await.unwrap().unwrap();
         assert_eq!(s.revert_merge_sha.as_deref(), Some("c3"));
         assert!(
-            !restart_revert(&pool, "p", "c3", "taking over").await.unwrap(),
+            !restart_revert(&pool, "p", "c3", "taking over")
+                .await
+                .unwrap(),
             "a revert already started is not started twice"
         );
-        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed").fetch_one(&pool).await.unwrap();
+        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(lines, 1);
     }
 

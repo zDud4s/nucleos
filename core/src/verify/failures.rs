@@ -130,7 +130,15 @@ fn panic_file(location: &str) -> Option<&str> {
 /// `failed` (timeouts are counted either inside it or beside it, depending on the version).
 /// The id is the test path alone; files come from `panicked at <file>:<line>:<col>`.
 fn nextest(output: &str) -> Reading {
-    const STATUSES: [&str; 7] = ["FAIL", "LEAK-FAIL", "EXEC-FAIL", "TIMEOUT", "SIGSEGV", "SIGABRT", "ABORT"];
+    const STATUSES: [&str; 7] = [
+        "FAIL",
+        "LEAK-FAIL",
+        "EXEC-FAIL",
+        "TIMEOUT",
+        "SIGSEGV",
+        "SIGABRT",
+        "ABORT",
+    ];
     let mut found = Failures::default();
     let mut outcomes: BTreeSet<(String, String)> = BTreeSet::new();
     let mut timeouts: BTreeSet<(String, String)> = BTreeSet::new();
@@ -145,7 +153,10 @@ fn nextest(output: &str) -> Reading {
             summarized = true;
             for part in counts.split(',') {
                 let mut words = part.split_whitespace();
-                let count = words.next().and_then(|word| word.parse::<usize>().ok()).unwrap_or(0);
+                let count = words
+                    .next()
+                    .and_then(|word| word.parse::<usize>().ok())
+                    .unwrap_or(0);
                 match (words.next(), words.next()) {
                     (Some("failed"), _) => failed += count,
                     (Some("timed"), Some("out")) => timed_out += count,
@@ -161,9 +172,13 @@ fn nextest(output: &str) -> Reading {
             continue;
         }
         let mut words = line.split_whitespace();
-        let Some(status) = words.next().filter(|word| STATUSES.contains(word)) else { continue };
+        let Some(status) = words.next().filter(|word| STATUSES.contains(word)) else {
+            continue;
+        };
         // `[`, the duration and `]` (nextest pads the duration inside the brackets).
-        let Some((_, after)) = line.split_once(']') else { continue };
+        let Some((_, after)) = line.split_once(']') else {
+            continue;
+        };
         if !line[status.len()..].trim_start().starts_with('[') {
             continue;
         }
@@ -181,8 +196,15 @@ fn nextest(output: &str) -> Reading {
         return Reading::Absent;
     }
     let seen = outcomes.len();
-    let complete = summarized && (seen == failed || (!timeouts.is_empty() && seen == failed + timed_out));
-    if complete { Reading::Ids(found) } else if seen == 0 && failed == 0 && timed_out == 0 { Reading::Absent } else { Reading::Incomplete }
+    let complete =
+        summarized && (seen == failed || (!timeouts.is_empty() && seen == failed + timed_out));
+    if complete {
+        Reading::Ids(found)
+    } else if seen == 0 && failed == 0 && timed_out == 0 {
+        Reading::Absent
+    } else {
+        Reading::Incomplete
+    }
 }
 
 /// pytest: `FAILED <nodeid>[ - msg]` / `ERROR <nodeid>[ - msg]` summary lines (a node id names a
@@ -194,7 +216,10 @@ fn pytest(output: &str) -> Reading {
     let mut footer: Option<usize> = None;
     for line in output.lines() {
         let line = line.trim_end();
-        if let Some(rest) = line.strip_prefix("FAILED ").or_else(|| line.strip_prefix("ERROR ")) {
+        if let Some(rest) = line
+            .strip_prefix("FAILED ")
+            .or_else(|| line.strip_prefix("ERROR "))
+        {
             let id = rest.split_once(" - ").map_or(rest, |(id, _)| id).trim();
             if id.contains(".py") {
                 found.tests.insert(id.to_owned());
@@ -258,7 +283,9 @@ fn vitest_failed_count(summary: &str) -> usize {
         .split('|')
         .find_map(|part| {
             let (count, word) = part.trim().split_once(' ')?;
-            word.starts_with("failed").then(|| count.parse::<usize>().ok()).flatten()
+            word.starts_with("failed")
+                .then(|| count.parse::<usize>().ok())
+                .flatten()
         })
         .unwrap_or(0)
 }
@@ -325,8 +352,15 @@ mod tests {
                    assertion failed\n\n\
                    test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n";
         let failures = extract(out).expect("ids");
-        assert_eq!(ids(&failures), ["verify::tests::bang", "verify::tests::boom"]);
-        assert!(failures.files.contains("core/src/verify.rs"), "{:?}", failures.files);
+        assert_eq!(
+            ids(&failures),
+            ["verify::tests::bang", "verify::tests::boom"]
+        );
+        assert!(
+            failures.files.contains("core/src/verify.rs"),
+            "{:?}",
+            failures.files
+        );
 
         // The runner says 3 failed but only 2 lines were seen: the list is incomplete.
         let short = out.replace("2 failed", "3 failed");
@@ -340,7 +374,14 @@ mod tests {
                    thread 'a::b' panicked at ./core/src/a.rs:7:9:\n\
                    test result: FAILED. 0 passed; 1 failed; 0 ignored\n";
         let failures = extract(out).expect("ids");
-        assert_eq!(failures.files.iter().map(String::as_str).collect::<Vec<_>>(), ["core/src/a.rs"]);
+        assert_eq!(
+            failures
+                .files
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["core/src/a.rs"]
+        );
     }
 
     #[test]
@@ -350,7 +391,10 @@ mod tests {
                   ERROR tests/test_c.py - ImportError\n\
                   === 1 failed, 1 error, 4 passed in 0.31s ===\n";
         let failures = extract(py).expect("pytest ids");
-        assert_eq!(ids(&failures), ["tests/test_a.py::test_b", "tests/test_c.py"]);
+        assert_eq!(
+            ids(&failures),
+            ["tests/test_a.py::test_b", "tests/test_c.py"]
+        );
         assert!(failures.files.contains("tests/test_a.py"));
 
         let vi = " FAIL  src/a.test.ts > suite > does x\n\
@@ -372,7 +416,11 @@ mod tests {
         let failures = extract(go).expect("go ids");
         assert_eq!(
             ids(&failures),
-            ["example.com/m/a.TestA", "example.com/m/a.TestA/sub", "example.com/m/b.TestB"]
+            [
+                "example.com/m/a.TestA",
+                "example.com/m/a.TestA/sub",
+                "example.com/m/b.TestB"
+            ]
         );
     }
 
@@ -386,12 +434,22 @@ mod tests {
         assert_eq!(extract(""), None);
         assert_eq!(extract("error: could not compile `x`\n"), None);
         // Jest prints `FAIL <file>` and `Tests:`; neither is read.
-        assert_eq!(extract("FAIL src/a.test.js\nTests:       1 failed, 3 passed, 4 total\n"), None);
+        assert_eq!(
+            extract("FAIL src/a.test.js\nTests:       1 failed, 3 passed, 4 total\n"),
+            None
+        );
         // A truncated tail may hide failures: never a partial list.
-        let truncated = format!("{TRUNCATION_MARK}\ntest a ... FAILED\ntest result: FAILED. 0 passed; 1 failed;\n");
+        let truncated = format!(
+            "{TRUNCATION_MARK}\ntest a ... FAILED\ntest result: FAILED. 0 passed; 1 failed;\n"
+        );
         assert_eq!(extract(&truncated), None);
         // Everything passed: nothing to report.
-        assert_eq!(extract("test a ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.00s\n"), None);
+        assert_eq!(
+            extract(
+                "test a ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.00s\n"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -426,7 +484,11 @@ mod tests {
                    error: test run failed\n";
         let failures = extract(out).expect("ids");
         assert_eq!(ids(&failures), ["run::tests::bang", "verify::tests::boom"]);
-        assert!(failures.files.contains("core/src/verify.rs"), "{:?}", failures.files);
+        assert!(
+            failures.files.contains("core/src/verify.rs"),
+            "{:?}",
+            failures.files
+        );
 
         // The summary says 3 failed but only 2 were seen.
         assert_eq!(extract(&out.replace("2 failed", "3 failed")), None);
@@ -446,11 +508,22 @@ mod tests {
                    \x20     FLAKY 2/2 [   0.020s] c flaky::passes_later\n\
                    \x20    Summary [   3.000s] 5 tests run: 1 passed, 3 failed, 0 skipped\n";
         let failures = extract(out).expect("ids");
-        assert_eq!(ids(&failures), ["crash::segv", "real::fails", "slow::hangs"]);
+        assert_eq!(
+            ids(&failures),
+            ["crash::segv", "real::fails", "slow::hangs"]
+        );
         // The same run where this version counts the timeout beside `failed`.
         let beside = out.replace("3 failed, 0 skipped", "2 failed, 1 timed out, 0 skipped");
-        assert_eq!(ids(&extract(&beside).expect("ids")), ["crash::segv", "real::fails", "slow::hangs"]);
+        assert_eq!(
+            ids(&extract(&beside).expect("ids")),
+            ["crash::segv", "real::fails", "slow::hangs"]
+        );
         // A fully passing run reports nothing.
-        assert_eq!(extract("        PASS [ 0.1s] c a\n     Summary [ 0.1s] 1 test run: 1 passed, 0 skipped\n"), None);
+        assert_eq!(
+            extract(
+                "        PASS [ 0.1s] c a\n     Summary [ 0.1s] 1 test run: 1 passed, 0 skipped\n"
+            ),
+            None
+        );
     }
 }

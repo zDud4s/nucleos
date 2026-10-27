@@ -31,7 +31,9 @@ impl TaskKey {
 
     /// The part before the first `:` (the whole key for `master-red`).
     pub fn prefix(&self) -> &str {
-        self.0.split_once(':').map_or(self.0.as_str(), |(prefix, _)| prefix)
+        self.0
+            .split_once(':')
+            .map_or(self.0.as_str(), |(prefix, _)| prefix)
     }
 
     /// The file the key points at, for the kinds that have one (`test`, `file`, `spec-item`).
@@ -56,7 +58,10 @@ impl std::fmt::Display for TaskKey {
 pub enum KeyError {
     Empty,
     UnknownPrefix(String),
-    Malformed { prefix: String, expected: &'static str },
+    Malformed {
+        prefix: String,
+        expected: &'static str,
+    },
     OutsideRoot(String),
 }
 
@@ -71,7 +76,9 @@ impl std::fmt::Display for KeyError {
             Self::Malformed { prefix, expected } => {
                 write!(formatter, "malformed '{prefix}' key: expected {expected}")
             }
-            Self::OutsideRoot(path) => write!(formatter, "path '{path}' is outside the project root"),
+            Self::OutsideRoot(path) => {
+                write!(formatter, "path '{path}' is outside the project root")
+            }
         }
     }
 }
@@ -79,7 +86,10 @@ impl std::fmt::Display for KeyError {
 impl std::error::Error for KeyError {}
 
 fn malformed(prefix: &str, expected: &'static str) -> KeyError {
-    KeyError::Malformed { prefix: prefix.to_owned(), expected }
+    KeyError::Malformed {
+        prefix: prefix.to_owned(),
+        expected,
+    }
 }
 
 /// Normalises `raw`: lowercase prefix, `\` to `/`, absolute paths made relative to `project_root`,
@@ -97,7 +107,10 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
     let key = match prefix.as_str() {
         "master-red" => {
             if !body.is_empty() {
-                return Err(malformed("master-red", "no body (the shas live in the detail)"));
+                return Err(malformed(
+                    "master-red",
+                    "no body (the shas live in the detail)",
+                ));
             }
             super::MASTER_RED_KEY.to_owned()
         }
@@ -108,7 +121,10 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
                 .ok_or_else(|| malformed("test", "test:<path>::<name>"))?;
             let name = name.trim();
             if name.is_empty() {
-                return Err(malformed("test", "test:<path>::<name> with a non-empty name"));
+                return Err(malformed(
+                    "test",
+                    "test:<path>::<name> with a non-empty name",
+                ));
             }
             format!("test:{}::{name}", normalize_path_in(path.trim(), &root)?)
         }
@@ -120,9 +136,15 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
                 .trim()
                 .parse()
                 .map_err(|_| malformed("spec-item", "a numeric item index after '#'"))?;
-            format!("spec-item:{}#{index}", normalize_path_in(spec.trim(), &root)?)
+            format!(
+                "spec-item:{}#{index}",
+                normalize_path_in(spec.trim(), &root)?
+            )
         }
-        "topic" => format!("topic:{}", slug(body).ok_or_else(|| malformed("topic", "a slug with letters or digits"))?),
+        "topic" => format!(
+            "topic:{}",
+            slug(body).ok_or_else(|| malformed("topic", "a slug with letters or digits"))?
+        ),
         other => return Err(KeyError::UnknownPrefix(other.to_owned())),
     };
     Ok(TaskKey(key))
@@ -184,7 +206,11 @@ fn strip_root<'a>(text: &'a str, root: &str) -> Option<&'a str> {
         return None;
     }
     let head = text.get(..root.len())?;
-    let same = if is_drive(root) { head.eq_ignore_ascii_case(root) } else { head == root };
+    let same = if is_drive(root) {
+        head.eq_ignore_ascii_case(root)
+    } else {
+        head == root
+    };
     if !same {
         return None;
     }
@@ -218,13 +244,22 @@ mod tests {
     fn the_prefix_is_lowercased_and_master_red_takes_no_body() {
         assert_eq!(key("MASTER-RED").unwrap(), "master-red");
         assert_eq!(key("  master-red  ").unwrap(), "master-red");
-        assert!(matches!(key("master-red:abc123"), Err(KeyError::Malformed { .. })));
+        assert!(matches!(
+            key("master-red:abc123"),
+            Err(KeyError::Malformed { .. })
+        ));
     }
 
     #[test]
     fn unknown_prefixes_and_empty_keys_are_refused() {
-        assert_eq!(key("bug:foo"), Err(KeyError::UnknownPrefix("bug".to_owned())));
-        assert_eq!(key("nocolon"), Err(KeyError::UnknownPrefix("nocolon".to_owned())));
+        assert_eq!(
+            key("bug:foo"),
+            Err(KeyError::UnknownPrefix("bug".to_owned()))
+        );
+        assert_eq!(
+            key("nocolon"),
+            Err(KeyError::UnknownPrefix("nocolon".to_owned()))
+        );
         assert_eq!(key("   "), Err(KeyError::Empty));
     }
 
@@ -233,19 +268,31 @@ mod tests {
         assert_eq!(key("file:/repo/core/a.rs").unwrap(), "file:core/a.rs");
         assert_eq!(key("File:.\\core\\\\a.rs").unwrap(), "file:core/a.rs");
         assert_eq!(key("file:core/../core/a.rs").unwrap(), "file:core/a.rs");
-        assert!(matches!(key("file:/elsewhere/a.rs"), Err(KeyError::OutsideRoot(_))));
+        assert!(matches!(
+            key("file:/elsewhere/a.rs"),
+            Err(KeyError::OutsideRoot(_))
+        ));
         assert!(matches!(key("file:../a.rs"), Err(KeyError::OutsideRoot(_))));
-        assert!(matches!(key("file:/repo"), Err(KeyError::Malformed { .. })), "the root is not a file");
+        assert!(
+            matches!(key("file:/repo"), Err(KeyError::Malformed { .. })),
+            "the root is not a file"
+        );
     }
 
     #[test]
     fn windows_roots_match_ignoring_case_and_the_verbatim_prefix() {
         let root = Path::new("C:\\Projects\\repo");
         let got = |raw: &str| normalize(raw, root).map(|k| k.as_str().to_owned());
-        assert_eq!(got("file:C:\\Projects\\repo\\core\\src\\a.rs").unwrap(), "file:core/src/a.rs");
+        assert_eq!(
+            got("file:C:\\Projects\\repo\\core\\src\\a.rs").unwrap(),
+            "file:core/src/a.rs"
+        );
         assert_eq!(got("file:c:\\projects\\REPO\\x.rs").unwrap(), "file:x.rs");
         assert_eq!(got("file://?/C:/Projects/repo/x.rs").unwrap(), "file:x.rs");
-        assert!(matches!(got("file:C:\\Projects\\repo-other\\x.rs"), Err(KeyError::OutsideRoot(_))));
+        assert!(matches!(
+            got("file:C:\\Projects\\repo-other\\x.rs"),
+            Err(KeyError::OutsideRoot(_))
+        ));
     }
 
     #[test]
@@ -254,20 +301,38 @@ mod tests {
             key("TEST:core\\src\\a.rs::mod_x::It_Works").unwrap(),
             "test:core/src/a.rs::mod_x::It_Works"
         );
-        assert!(matches!(key("test:core/a.rs"), Err(KeyError::Malformed { .. })));
-        assert!(matches!(key("test:core/a.rs::  "), Err(KeyError::Malformed { .. })));
+        assert!(matches!(
+            key("test:core/a.rs"),
+            Err(KeyError::Malformed { .. })
+        ));
+        assert!(matches!(
+            key("test:core/a.rs::  "),
+            Err(KeyError::Malformed { .. })
+        ));
     }
 
     #[test]
     fn spec_item_keys_carry_a_numeric_index() {
-        assert_eq!(key("spec-item:.ai/specs/x.md#03").unwrap(), "spec-item:.ai/specs/x.md#3");
-        assert!(matches!(key("spec-item:x.md#a"), Err(KeyError::Malformed { .. })));
-        assert!(matches!(key("spec-item:x.md"), Err(KeyError::Malformed { .. })));
+        assert_eq!(
+            key("spec-item:.ai/specs/x.md#03").unwrap(),
+            "spec-item:.ai/specs/x.md#3"
+        );
+        assert!(matches!(
+            key("spec-item:x.md#a"),
+            Err(KeyError::Malformed { .. })
+        ));
+        assert!(matches!(
+            key("spec-item:x.md"),
+            Err(KeyError::Malformed { .. })
+        ));
     }
 
     #[test]
     fn topic_slugs_are_lowercase_ascii_with_single_dashes() {
-        assert_eq!(key("topic:Fix the CI!!  now").unwrap(), "topic:fix-the-ci-now");
+        assert_eq!(
+            key("topic:Fix the CI!!  now").unwrap(),
+            "topic:fix-the-ci-now"
+        );
         assert!(matches!(key("topic:!!!"), Err(KeyError::Malformed { .. })));
     }
 
@@ -285,7 +350,13 @@ mod tests {
 
     #[test]
     fn normalize_path_serves_guard_and_hint_paths_too() {
-        assert_eq!(normalize_path("\\repo\\core\\a.rs", Path::new("/repo")).unwrap(), "core/a.rs");
-        assert_eq!(normalize_path("core/a.rs", Path::new("/repo")).unwrap(), "core/a.rs");
+        assert_eq!(
+            normalize_path("\\repo\\core\\a.rs", Path::new("/repo")).unwrap(),
+            "core/a.rs"
+        );
+        assert_eq!(
+            normalize_path("core/a.rs", Path::new("/repo")).unwrap(),
+            "core/a.rs"
+        );
     }
 }

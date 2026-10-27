@@ -3208,7 +3208,10 @@ mod tests {
             Scope::Service(Service::Council),
         ] {
             for route in TASK_ROUTES {
-                assert!(!permits(&scope, &Method::POST, route), "{scope:?} reached {route}");
+                assert!(
+                    !permits(&scope, &Method::POST, route),
+                    "{scope:?} reached {route}"
+                );
             }
         }
     }

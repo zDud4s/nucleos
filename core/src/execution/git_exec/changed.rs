@@ -22,7 +22,15 @@ pub async fn changed_by_commit(
     let parent = format!("{sha}^1");
     let listed = git_read(
         project_root,
-        &["diff", "--name-only", "-z", "--no-renames", &parent, sha, "--"],
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &parent,
+            sha,
+            "--",
+        ],
         deadline,
     )
     .await?;
@@ -114,7 +122,11 @@ mod tests {
         let files = changed_since_merge_base(&repo, "master", "feat", deadline())
             .await
             .unwrap();
-        assert_eq!(files, vec!["a.txt".to_owned()], "m.txt is master's, not feat's");
+        assert_eq!(
+            files,
+            vec!["a.txt".to_owned()],
+            "m.txt is master's, not feat's"
+        );
     }
 
     #[tokio::test]
@@ -124,9 +136,13 @@ mod tests {
         let files = changed_by_commit(&repo, &tip, deadline()).await.unwrap();
         assert_eq!(files, vec!["a.txt".to_owned()]);
         assert!(
-            changed_by_commit(&repo, "0000000000000000000000000000000000000000", deadline())
-                .await
-                .is_err(),
+            changed_by_commit(
+                &repo,
+                "0000000000000000000000000000000000000000",
+                deadline()
+            )
+            .await
+            .is_err(),
             "an unknown sha is an error, never an empty list"
         );
     }
@@ -134,8 +150,13 @@ mod tests {
     #[tokio::test]
     async fn the_worktree_of_a_branch_is_the_checkout_that_holds_it() {
         let (_container, repo) = forked();
-        let held = worktree_of_branch(&repo, "master", deadline()).await.unwrap();
+        let held = worktree_of_branch(&repo, "master", deadline())
+            .await
+            .unwrap();
         assert!(held.is_some(), "the main checkout holds master");
-        assert_eq!(worktree_of_branch(&repo, "feat", deadline()).await.unwrap(), None);
+        assert_eq!(
+            worktree_of_branch(&repo, "feat", deadline()).await.unwrap(),
+            None
+        );
     }
 }

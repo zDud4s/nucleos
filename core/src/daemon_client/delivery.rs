@@ -233,7 +233,11 @@ mod task_path_tests {
                 Some(format!("/tasks/{op}").as_str())
             );
         }
-        assert_eq!(task_path("session"), None, "the registry is the hook's, not a tool's");
+        assert_eq!(
+            task_path("session"),
+            None,
+            "the registry is the hook's, not a tool's"
+        );
         assert_eq!(task_path("../verify"), None);
     }
 }

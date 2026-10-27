@@ -6,7 +6,7 @@
 //! delivered once.
 
 use super::store::{green_sha, row_by_id};
-use super::{HolderKind, Notice, Status, SESSION_LEASE_SECONDS};
+use super::{HolderKind, Notice, SESSION_LEASE_SECONDS, Status};
 use crate::execution::wave::stamp;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -54,7 +54,11 @@ pub async fn touch_session(
 
 /// Was `session_id` registered from this worktree? Plan B validates a session id passed by an agent
 /// against this: the id must have been seen coming from the very worktree the MCP box serves.
-pub async fn session_seen_in(pool: &SqlitePool, session_id: &str, worktree: &str) -> sqlx::Result<bool> {
+pub async fn session_seen_in(
+    pool: &SqlitePool,
+    session_id: &str,
+    worktree: &str,
+) -> sqlx::Result<bool> {
     let found: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM task_sessions WHERE session_id = ? AND worktree = ?)",
     )
@@ -132,17 +136,24 @@ pub async fn take_notices(
 
     let mut notices = Vec::new();
     for (task_id, event, note) in events {
-        let Some(task) = row_by_id(&mut tx, task_id).await? else { continue };
+        let Some(task) = row_by_id(&mut tx, task_id).await? else {
+            continue;
+        };
         if event == "done" {
             if let Some(sha) = green_sha(&note) {
-                notices.push(Notice::IncidentClosed { task, sha: Some(sha) });
+                notices.push(Notice::IncidentClosed {
+                    task,
+                    sha: Some(sha),
+                });
             }
         } else if task.status == Status::Claimed
             && let Some(new_holder) = task.holder()
             && !(new_holder.kind == HolderKind::Session && new_holder.id == session_id)
         {
             // One notice per task per call: a later event for the same task supersedes the earlier one.
-            notices.retain(|n| !matches!(n, Notice::ClaimLost { task: seen, .. } if seen.id == task.id));
+            notices.retain(
+                |n| !matches!(n, Notice::ClaimLost { task: seen, .. } if seen.id == task.id),
+            );
             notices.push(Notice::ClaimLost { task, new_holder });
         }
     }
@@ -159,11 +170,18 @@ pub async fn take_notices(
 pub(super) fn worktree_key(canonical: &str) -> String {
     let path = match canonical.strip_prefix(r"\\?\UNC\") {
         Some(rest) => format!("//{rest}"),
-        None => canonical.strip_prefix(r"\\?\").unwrap_or(canonical).to_owned(),
+        None => canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(canonical)
+            .to_owned(),
     };
     let path = path.replace('\\', "/");
     let path = path.trim_end_matches('/');
-    if cfg!(windows) { path.to_lowercase() } else { path.to_owned() }
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_owned()
+    }
 }
 
 /// `None` when the path cannot be canonicalised (a deleted worktree): the caller skips it.
@@ -205,14 +223,21 @@ async fn inherited_notices(
             .bind(session_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let Some((worktree, project_id)) = session else { return Ok(()) };
-    let Some(mine) = worktree_key_of(&worktree).await else { return Ok(()) };
+    let Some((worktree, project_id)) = session else {
+        return Ok(());
+    };
+    let Some(mine) = worktree_key_of(&worktree).await else {
+        return Ok(());
+    };
     for (task_id, holder_kind, holder_id) in closed {
-        let held_it = holder_kind.as_deref() == Some("session") && holder_id.as_deref() == Some(session_id);
+        let held_it =
+            holder_kind.as_deref() == Some("session") && holder_id.as_deref() == Some(session_id);
         if held_it {
             continue;
         }
-        let Some(task) = row_by_id(&mut *conn, task_id).await? else { continue };
+        let Some(task) = row_by_id(&mut *conn, task_id).await? else {
+            continue;
+        };
         if task.project_id != project_id {
             continue;
         }
@@ -227,7 +252,10 @@ async fn inherited_notices(
         .await?;
         let mut waited = false;
         for candidate in worktrees {
-            if worktree_key_of(&candidate).await.is_some_and(|key| key == mine) {
+            if worktree_key_of(&candidate)
+                .await
+                .is_some_and(|key| key == mine)
+            {
                 waited = true;
                 break;
             }
@@ -256,12 +284,20 @@ mod tests {
     }
 
     fn holder(id: &str) -> Holder {
-        Holder { kind: HolderKind::Session, id: id.into(), worktree: format!("/wt/{id}") }
+        Holder {
+            kind: HolderKind::Session,
+            id: id.into(),
+            worktree: format!("/wt/{id}"),
+        }
     }
 
     fn task(key: &str) -> NewTask {
         // `master-red` is the daemon's alone: a declared claim on it is refused, so its fixtures are incidents.
-        let kind = if key == crate::task_claims::MASTER_RED_KEY { TaskKind::Incident } else { TaskKind::Declared };
+        let kind = if key == crate::task_claims::MASTER_RED_KEY {
+            TaskKind::Incident
+        } else {
+            TaskKind::Declared
+        };
         NewTask {
             key: crate::task_claims::keys::normalize(key, std::path::Path::new("/repo")).unwrap(),
             kind,
@@ -289,22 +325,48 @@ mod tests {
         let me = holder("s1");
         let live = claimed(&pool, "file:a.rs", &me, t0()).await;
         let other = claimed(&pool, "file:b.rs", &holder("s2"), t0()).await;
-        let expired = claimed(&pool, "file:c.rs", &me, t0() - secs(SESSION_LEASE_SECONDS + 5)).await;
+        let expired = claimed(
+            &pool,
+            "file:c.rs",
+            &me,
+            t0() - secs(SESSION_LEASE_SECONDS + 5),
+        )
+        .await;
 
-        touch_session(&pool, "s1", "/wt/s1", "p", t0() + secs(600)).await.unwrap();
+        touch_session(&pool, "s1", "/wt/s1", "p", t0() + secs(600))
+            .await
+            .unwrap();
 
         let lease = |id: i64| {
             let pool = pool.clone();
             async move {
                 let mut conn = pool.acquire().await.unwrap();
-                store::row_by_id(&mut conn, id).await.unwrap().unwrap().lease_until
+                store::row_by_id(&mut conn, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .lease_until
             }
         };
-        assert_eq!(lease(live).await, Some(stamp(t0() + secs(600 + SESSION_LEASE_SECONDS))));
-        assert_eq!(lease(other).await, Some(stamp(t0() + secs(SESSION_LEASE_SECONDS))), "another session's claim is untouched");
-        assert_eq!(lease(expired).await, Some(stamp(t0() - secs(5))), "a lapsed lease is not revived");
+        assert_eq!(
+            lease(live).await,
+            Some(stamp(t0() + secs(600 + SESSION_LEASE_SECONDS)))
+        );
+        assert_eq!(
+            lease(other).await,
+            Some(stamp(t0() + secs(SESSION_LEASE_SECONDS))),
+            "another session's claim is untouched"
+        );
+        assert_eq!(
+            lease(expired).await,
+            Some(stamp(t0() - secs(5))),
+            "a lapsed lease is not revived"
+        );
         assert!(session_seen_in(&pool, "s1", "/wt/s1").await.unwrap());
-        assert!(!session_seen_in(&pool, "s1", "/wt/elsewhere").await.unwrap(), "only the worktree it was seen in");
+        assert!(
+            !session_seen_in(&pool, "s1", "/wt/elsewhere").await.unwrap(),
+            "only the worktree it was seen in"
+        );
         assert!(!session_seen_in(&pool, "ghost", "/wt/s1").await.unwrap());
     }
 
@@ -312,7 +374,9 @@ mod tests {
     async fn a_session_is_told_once_that_its_claim_was_taken() {
         let pool = pool().await;
         let me = holder("s1");
-        touch_session(&pool, "s1", "/wt/s1", "p", t0()).await.unwrap();
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
         claimed(&pool, "file:core/a.rs", &me, t0()).await;
         let late = t0() + secs(SESSION_LEASE_SECONDS + 1);
         claimed(&pool, "file:core/a.rs", &holder("s2"), late).await;
@@ -323,13 +387,18 @@ mod tests {
         };
         assert_eq!(task.key.as_str(), "file:core/a.rs");
         assert_eq!(new_holder.id, "s2");
-        assert!(take_notices(&pool, "s1", late).await.unwrap().is_empty(), "the cursor advanced");
+        assert!(
+            take_notices(&pool, "s1", late).await.unwrap().is_empty(),
+            "the cursor advanced"
+        );
     }
 
     #[tokio::test]
     async fn two_losses_of_one_task_in_one_window_give_one_notice() {
         let pool = pool().await;
-        touch_session(&pool, "s1", "/wt/s1", "p", t0()).await.unwrap();
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
         claimed(&pool, "file:core/a.rs", &holder("s1"), t0()).await;
         let expire = |at: DateTime<Utc>| {
             let pool = pool.clone();
@@ -361,53 +430,105 @@ mod tests {
     async fn a_session_that_took_the_claim_back_hears_nothing() {
         let pool = pool().await;
         let me = holder("s1");
-        touch_session(&pool, "s1", "/wt/s1", "p", t0()).await.unwrap();
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
         claimed(&pool, "file:core/a.rs", &me, t0()).await;
         let late = t0() + secs(SESSION_LEASE_SECONDS + 1);
         claimed(&pool, "file:core/a.rs", &holder("s2"), late).await;
-        sqlx::query("UPDATE task_claims SET lease_until = ?").bind(stamp(late - secs(1))).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE task_claims SET lease_until = ?")
+            .bind(stamp(late - secs(1)))
+            .execute(&pool)
+            .await
+            .unwrap();
         claimed(&pool, "file:core/a.rs", &me, late + secs(1)).await;
-        assert!(take_notices(&pool, "s1", late).await.unwrap().is_empty(), "it holds the task again");
+        assert!(
+            take_notices(&pool, "s1", late).await.unwrap().is_empty(),
+            "it holds the task again"
+        );
     }
 
     #[tokio::test]
     async fn the_owner_is_told_when_the_incident_closes_by_green_but_not_for_its_own_done() {
         let pool = pool().await;
         let me = holder("s1");
-        touch_session(&pool, "s1", "/wt/s1", "p", t0()).await.unwrap();
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
         let red = claimed(&pool, "master-red", &me, t0()).await;
-        done(&pool, red, Closer::Green { sha: "abc123".into() }, "revert", t0() + secs(5)).await.unwrap();
+        done(
+            &pool,
+            red,
+            Closer::Green {
+                sha: "abc123".into(),
+            },
+            "revert",
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
         let own = claimed(&pool, "file:own.rs", &me, t0()).await;
-        done(&pool, own, Closer::Holder(&me), "fixed", t0() + secs(6)).await.unwrap();
+        done(&pool, own, Closer::Holder(&me), "fixed", t0() + secs(6))
+            .await
+            .unwrap();
 
         let notices = take_notices(&pool, "s1", t0() + secs(7)).await.unwrap();
         let [Notice::IncidentClosed { task, sha }] = notices.as_slice() else {
             panic!("expected one IncidentClosed, got {notices:?}")
         };
-        assert_eq!((task.id, task.status, sha.as_deref()), (red, Status::Done, Some("abc123")));
+        assert_eq!(
+            (task.id, task.status, sha.as_deref()),
+            (red, Status::Done, Some("abc123"))
+        );
     }
 
     #[tokio::test]
     async fn a_new_session_does_not_replay_history_and_an_unknown_one_gets_nothing() {
         let pool = pool().await;
         claimed(&pool, "file:old.rs", &holder("s1"), t0()).await;
-        claimed(&pool, "file:old.rs", &holder("s2"), t0() + secs(SESSION_LEASE_SECONDS + 1)).await;
+        claimed(
+            &pool,
+            "file:old.rs",
+            &holder("s2"),
+            t0() + secs(SESSION_LEASE_SECONDS + 1),
+        )
+        .await;
         // s1 shows up only now: the events above happened before it was registered.
-        touch_session(&pool, "s1", "/wt/s1", "p", t0() + secs(SESSION_LEASE_SECONDS + 2)).await.unwrap();
+        touch_session(
+            &pool,
+            "s1",
+            "/wt/s1",
+            "p",
+            t0() + secs(SESSION_LEASE_SECONDS + 2),
+        )
+        .await
+        .unwrap();
         assert!(take_notices(&pool, "s1", t0()).await.unwrap().is_empty());
-        assert!(take_notices(&pool, "never-seen", t0()).await.unwrap().is_empty());
+        assert!(
+            take_notices(&pool, "never-seen", t0())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let _ = TaskKey::master_red(); // keeps the import honest if the fixtures above change
     }
 
-    use crate::verify::store::{insert_request, set_classification, NewRequest};
+    use crate::verify::store::{NewRequest, insert_request, set_classification};
 
     /// A verify ticket of project `p` over `worktree`, classified as having inherited `incidents`.
     async fn ticket_at(pool: &SqlitePool, worktree: &str, incidents: &[i64]) -> i64 {
         let id = insert_request(
             pool,
             &NewRequest {
-                project_id: "p", worktree, kind: "test", scope: "scope", base: None,
-                priority: 0, caller: "owner", note: None, unclaimed: &[],
+                project_id: "p",
+                worktree,
+                kind: "test",
+                scope: "scope",
+                base: None,
+                priority: 0,
+                caller: "owner",
+                note: None,
+                unclaimed: &[],
             },
         )
         .await
@@ -428,9 +549,15 @@ mod tests {
     #[tokio::test]
     async fn a_session_whose_ticket_inherited_the_incident_is_told_when_it_closes() {
         let pool = pool().await;
-        let (a, b, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b, c) = (
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        );
         for (session, dir) in [("s1", &a), ("s2", &b), ("s3", &c)] {
-            touch_session(&pool, session, &native(dir), "p", t0()).await.unwrap();
+            touch_session(&pool, session, &native(dir), "p", t0())
+                .await
+                .unwrap();
         }
         let red = claimed(&pool, "master-red", &holder("owner"), t0()).await;
         let unrelated = claimed(&pool, "file:x.rs", &holder("owner"), t0()).await;
@@ -439,29 +566,70 @@ mod tests {
         ticket_at(&pool, &git_form(&b), &[red]).await; // s2's
         ticket_at(&pool, &git_form(&c), &[unrelated]).await; // s3 inherited something else
 
-        done(&pool, red, Closer::Green { sha: "abc123".into() }, "revert", t0() + secs(5)).await.unwrap();
+        done(
+            &pool,
+            red,
+            Closer::Green {
+                sha: "abc123".into(),
+            },
+            "revert",
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
 
         let s1 = take_notices(&pool, "s1", t0() + secs(6)).await.unwrap();
-        let [Notice::InheritedClosed { task, sha }] = s1.as_slice() else { panic!("expected one InheritedClosed, got {s1:?}") };
+        let [Notice::InheritedClosed { task, sha }] = s1.as_slice() else {
+            panic!("expected one InheritedClosed, got {s1:?}")
+        };
         assert_eq!((task.id, sha.as_deref()), (red, Some("abc123")));
-        assert!(take_notices(&pool, "s1", t0() + secs(7)).await.unwrap().is_empty(), "the cursor advanced");
+        assert!(
+            take_notices(&pool, "s1", t0() + secs(7))
+                .await
+                .unwrap()
+                .is_empty(),
+            "the cursor advanced"
+        );
         let s2 = take_notices(&pool, "s2", t0() + secs(6)).await.unwrap();
-        assert!(matches!(s2.as_slice(), [Notice::InheritedClosed { .. }]), "{s2:?}");
-        assert!(take_notices(&pool, "s3", t0() + secs(6)).await.unwrap().is_empty());
+        assert!(
+            matches!(s2.as_slice(), [Notice::InheritedClosed { .. }]),
+            "{s2:?}"
+        );
+        assert!(
+            take_notices(&pool, "s3", t0() + secs(6))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn the_holder_keeps_its_own_notice_and_does_not_get_the_inherited_one_twice() {
         let pool = pool().await;
         let a = tempfile::tempdir().unwrap();
-        touch_session(&pool, "s1", &native(&a), "p", t0()).await.unwrap();
+        touch_session(&pool, "s1", &native(&a), "p", t0())
+            .await
+            .unwrap();
         let red = claimed(&pool, "master-red", &holder("s1"), t0()).await;
         ticket_at(&pool, &git_form(&a), &[red]).await;
 
-        done(&pool, red, Closer::Green { sha: "abc123".into() }, "revert", t0() + secs(5)).await.unwrap();
+        done(
+            &pool,
+            red,
+            Closer::Green {
+                sha: "abc123".into(),
+            },
+            "revert",
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
 
         let notices = take_notices(&pool, "s1", t0() + secs(6)).await.unwrap();
-        assert!(matches!(notices.as_slice(), [Notice::IncidentClosed { .. }]), "{notices:?}");
+        assert!(
+            matches!(notices.as_slice(), [Notice::IncidentClosed { .. }]),
+            "{notices:?}"
+        );
     }
 
     #[tokio::test]
@@ -470,18 +638,44 @@ mod tests {
         let (live, gone) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let gone_path = git_form(&gone);
         drop(gone); // the worktree was removed: `canonicalize` fails for it
-        touch_session(&pool, "s-live", &native(&live), "p", t0()).await.unwrap();
-        touch_session(&pool, "s-gone", &gone_path.replace('/', std::path::MAIN_SEPARATOR_STR), "p", t0()).await.unwrap();
+        touch_session(&pool, "s-live", &native(&live), "p", t0())
+            .await
+            .unwrap();
+        touch_session(
+            &pool,
+            "s-gone",
+            &gone_path.replace('/', std::path::MAIN_SEPARATOR_STR),
+            "p",
+            t0(),
+        )
+        .await
+        .unwrap();
         let red = claimed(&pool, "master-red", &holder("owner"), t0()).await;
         ticket_at(&pool, &gone_path, &[red]).await; // skipped: cannot be canonicalised
         ticket_at(&pool, &git_form(&live), &[red]).await;
 
-        done(&pool, red, Closer::Green { sha: "abc123".into() }, "revert", t0() + secs(5)).await.unwrap();
+        done(
+            &pool,
+            red,
+            Closer::Green {
+                sha: "abc123".into(),
+            },
+            "revert",
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
 
         let live_notices = take_notices(&pool, "s-live", t0() + secs(6)).await.unwrap();
-        assert!(matches!(live_notices.as_slice(), [Notice::InheritedClosed { .. }]), "{live_notices:?}");
         assert!(
-            take_notices(&pool, "s-gone", t0() + secs(6)).await.unwrap().is_empty(),
+            matches!(live_notices.as_slice(), [Notice::InheritedClosed { .. }]),
+            "{live_notices:?}"
+        );
+        assert!(
+            take_notices(&pool, "s-gone", t0() + secs(6))
+                .await
+                .unwrap()
+                .is_empty(),
             "a session whose own worktree is gone hears nothing, and nothing panics"
         );
     }
@@ -489,7 +683,10 @@ mod tests {
     #[test]
     fn worktree_keys_ignore_the_verbatim_prefix_the_slash_direction_and_a_trailing_slash() {
         assert_eq!(worktree_key(r"\\?\C:\Repo\wt"), worktree_key("C:/Repo/wt/"));
-        assert_eq!(worktree_key(r"\\?\UNC\srv\share\wt"), worktree_key("//srv/share/wt"));
+        assert_eq!(
+            worktree_key(r"\\?\UNC\srv\share\wt"),
+            worktree_key("//srv/share/wt")
+        );
         assert_ne!(worktree_key("/r/wt-a"), worktree_key("/r/wt-b"));
     }
 

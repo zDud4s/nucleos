@@ -1234,14 +1234,21 @@ mod wake_tests {
     use crate::task_claims::{Holder, HolderKind, testing};
 
     fn run_holder(id: i64) -> Holder {
-        Holder { kind: HolderKind::Run, id: id.to_string(), worktree: "/w".into() }
+        Holder {
+            kind: HolderKind::Run,
+            id: id.to_string(),
+            worktree: "/w".into(),
+        }
     }
 
     /// The claim's status reads back as `open`, or the test fails after five seconds.
     async fn wait_until_open(pool: &sqlx::SqlitePool, task: i64) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while testing::state_of(pool, task).await.0 != "open" {
-            assert!(std::time::Instant::now() < deadline, "the claim was never handed back");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the claim was never handed back"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -1265,13 +1272,19 @@ mod wake_tests {
     #[tokio::test]
     async fn task_claims_of_one_run_do_not_release_another() {
         let state = crate::channels::testkit::state().await;
-        let (a, b) = (seed_running(&state.pool).await, seed_running(&state.pool).await);
+        let (a, b) = (
+            seed_running(&state.pool).await,
+            seed_running(&state.pool).await,
+        );
         let first = testing::claimed_by(&state.pool, &run_holder(a), "file:a.rs").await;
         let second = testing::claimed_by(&state.pool, &run_holder(b), "file:b.rs").await;
 
         crate::execution::runs::lifecycle::release_claims_of_run(&state.pool, a).await;
 
-        assert_eq!(testing::state_of(&state.pool, first).await, ("open".to_owned(), None));
+        assert_eq!(
+            testing::state_of(&state.pool, first).await,
+            ("open".to_owned(), None)
+        );
         assert_eq!(
             testing::state_of(&state.pool, second).await,
             ("claimed".to_owned(), Some(b.to_string()))
@@ -1311,7 +1324,11 @@ mod wake_tests {
         let id = seed_running(&state.pool).await;
         let task = testing::claimed_by(&state.pool, &run_holder(id), "file:core/a.rs").await;
 
-        spawn_registered(&state, id, body_ending_in(state.pool.clone(), id, "awaiting_approval"));
+        spawn_registered(
+            &state,
+            id,
+            body_ending_in(state.pool.clone(), id, "awaiting_approval"),
+        );
 
         // The supervisor finishes after the handle is released; give it a beat to (not) act.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

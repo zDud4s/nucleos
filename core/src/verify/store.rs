@@ -415,20 +415,36 @@ mod tests {
         .unwrap();
         let fresh = get_request(&pool, id).await.unwrap().unwrap();
         assert_eq!(
-            (fresh.classification, fresh.probe_outcome, fresh.inherited_task_ids),
+            (
+                fresh.classification,
+                fresh.probe_outcome,
+                fresh.inherited_task_ids
+            ),
             (None, None, vec![])
         );
 
-        set_classification_draft(&pool, id, r#"{"done":false}"#).await.unwrap();
-        set_probe_outcome(&pool, id, r#"{"task_id":4,"result":"passed"}"#).await.unwrap();
+        set_classification_draft(&pool, id, r#"{"done":false}"#)
+            .await
+            .unwrap();
+        set_probe_outcome(&pool, id, r#"{"task_id":4,"result":"passed"}"#)
+            .await
+            .unwrap();
         let draft = get_request(&pool, id).await.unwrap().unwrap();
         assert_eq!(draft.classification.as_deref(), Some(r#"{"done":false}"#));
-        assert!(draft.inherited_task_ids.is_empty(), "a draft never claims the incident");
+        assert!(
+            draft.inherited_task_ids.is_empty(),
+            "a draft never claims the incident"
+        );
 
-        set_classification(&pool, id, r#"{"done":true}"#, &[3, 5]).await.unwrap();
+        set_classification(&pool, id, r#"{"done":true}"#, &[3, 5])
+            .await
+            .unwrap();
         let done = get_request(&pool, id).await.unwrap().unwrap();
         assert_eq!(done.inherited_task_ids, [3, 5]);
-        assert_eq!(done.probe_outcome.as_deref(), Some(r#"{"task_id":4,"result":"passed"}"#));
+        assert_eq!(
+            done.probe_outcome.as_deref(),
+            Some(r#"{"task_id":4,"result":"passed"}"#)
+        );
     }
 
     #[tokio::test]
@@ -455,15 +471,30 @@ mod tests {
             value["reprobes"].as_i64().unwrap()
         };
         // Writer A started the re-proof; writer B read before that and writes a stale draft.
-        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":1}"#).await.unwrap();
-        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":0,"contains":{"abc":true}}"#)
+        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":1}"#)
             .await
             .unwrap();
+        set_classification_draft(
+            &pool,
+            id,
+            r#"{"done":false,"reprobes":0,"contains":{"abc":true}}"#,
+        )
+        .await
+        .unwrap();
         let row = get_request(&pool, id).await.unwrap().unwrap();
-        assert_eq!(reprobes(row.classification.clone()), 1, "the stale writer must not reset reprobes");
-        assert!(row.classification.unwrap().contains("\"abc\""), "the rest of the draft is last-writer");
+        assert_eq!(
+            reprobes(row.classification.clone()),
+            1,
+            "the stale writer must not reset reprobes"
+        );
+        assert!(
+            row.classification.unwrap().contains("\"abc\""),
+            "the rest of the draft is last-writer"
+        );
         // A higher count still goes through.
-        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":2}"#).await.unwrap();
+        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":2}"#)
+            .await
+            .unwrap();
         let row = get_request(&pool, id).await.unwrap().unwrap();
         assert_eq!(reprobes(row.classification), 2);
     }

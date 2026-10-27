@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 use crate::auth::{ApiTokenLevel, Scope};
 use crate::state::AppState;
 use crate::task_claims::{
-    ClaimOutcome, Closer, Holder, HolderKind, NewTask, Notice, Status, TaskKind, TaskRow, keys, sessions, store,
+    ClaimOutcome, Closer, Holder, HolderKind, NewTask, Notice, Status, TaskKind, TaskRow, keys,
+    sessions, store,
 };
 
 /// The result of resolving one `cwd`: `(project_id, canonical worktree root)`, or `None` when no
@@ -43,7 +44,11 @@ impl CwdCache {
     /// `None` is a miss; `Some(None)` is a cached "not registered".
     pub(super) fn get(&self, cwd: &str, now: Instant) -> Option<Resolved> {
         let (at, resolved) = self.entries.get(cwd)?;
-        let ttl = if resolved.is_some() { Self::POSITIVE_TTL } else { Self::NEGATIVE_TTL };
+        let ttl = if resolved.is_some() {
+            Self::POSITIVE_TTL
+        } else {
+            Self::NEGATIVE_TTL
+        };
         (now.saturating_duration_since(*at) <= ttl).then(|| resolved.clone())
     }
 
@@ -73,7 +78,9 @@ pub(super) fn holder_label(holder: &Holder) -> String {
 
 /// The first seven characters of a sha, cut on a character boundary.
 fn short(sha: &str) -> &str {
-    sha.char_indices().nth(7).map_or(sha, |(end, _)| &sha[..end])
+    sha.char_indices()
+        .nth(7)
+        .map_or(sha, |(end, _)| &sha[..end])
 }
 
 /// A notice as the agent reads it: what happened and what to do about it.
@@ -86,7 +93,10 @@ pub(super) fn render_notice(notice: &Notice) -> String {
             holder_label(new_holder),
         ),
         Notice::IncidentClosed { task, sha } => {
-            let at = sha.as_deref().map(|sha| format!(" at {}", short(sha))).unwrap_or_default();
+            let at = sha
+                .as_deref()
+                .map(|sha| format!(" at {}", short(sha)))
+                .unwrap_or_default();
             format!(
                 "Incident #{} `{}` was closed{at}: master is green again. If you were fixing it, stop; \
                  if your verify inherited it, rebase on master and verify again.",
@@ -95,7 +105,10 @@ pub(super) fn render_notice(notice: &Notice) -> String {
         }
         // Delivered by chunk 4; the same call to action as `IncidentClosed`, for the verify side.
         Notice::InheritedClosed { task, sha } => {
-            let at = sha.as_deref().map(|sha| format!(" at {}", short(sha))).unwrap_or_default();
+            let at = sha
+                .as_deref()
+                .map(|sha| format!(" at {}", short(sha)))
+                .unwrap_or_default();
             format!(
                 "Incident #{} `{}` was closed{at}: master is green again. Your verify inherited it: \
                  rebase on master and verify again.",
@@ -142,8 +155,10 @@ pub(super) async fn locate(
     scope: &Scope,
     worktree: Option<&str>,
 ) -> Result<Located, Fail> {
-    let caller = crate::verify::Caller::from_scope(scope)
-        .ok_or((StatusCode::FORBIDDEN, "this key cannot use task claims".to_owned()))?;
+    let caller = crate::verify::Caller::from_scope(scope).ok_or((
+        StatusCode::FORBIDDEN,
+        "this key cannot use task claims".to_owned(),
+    ))?;
     if matches!(caller, crate::verify::Caller::Owner) && worktree.is_none() {
         return Err((StatusCode::FORBIDDEN, NEEDS_SESSION_OR_RUN.to_owned()));
     }
@@ -170,11 +185,18 @@ pub(super) async fn locate(
                 "task claims unavailable: project not registered (no root recorded)".to_owned(),
             )
         })?;
-    Ok(Located { project_id, root, project_root: project_root.into() })
+    Ok(Located {
+        project_id,
+        root,
+        project_root: project_root.into(),
+    })
 }
 
 fn internal(error: impl std::fmt::Display) -> Fail {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("task claims: {error}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("task claims: {error}"),
+    )
 }
 
 /// The store's refusal of a claim it will not take (a declared `master-red`) is a
@@ -193,7 +215,9 @@ const SESSION_REFRESH_WAIT: Duration = Duration::from_secs(2);
 /// The shape the hook also checks (`SESSION_ID_SHAPE` in `ask_daemon.py`).
 fn valid_session_id(id: &str) -> bool {
     (1..=128).contains(&id.len())
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Who the caller is, as a claim holder. The run's identity comes from the key's scope, the
@@ -209,24 +233,34 @@ pub(super) async fn holder_for(
         Scope::Run(run_id) => {
             // A job node is a run whose row carries the job: the claim belongs to the job, which
             // outlives the node. A plain run holds by its own id.
-            let job: Option<Option<i64>> = sqlx::query_scalar("SELECT job_id FROM runs WHERE id = ?")
-                .bind(run_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(internal)?;
+            let job: Option<Option<i64>> =
+                sqlx::query_scalar("SELECT job_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(internal)?;
             let (kind, id) = match job.flatten() {
                 Some(job_id) => (HolderKind::Job, job_id.to_string()),
                 None => (HolderKind::Run, run_id.to_string()),
             };
-            Ok(Holder { kind, id, worktree: at.root.clone() })
+            Ok(Holder {
+                kind,
+                id,
+                worktree: at.root.clone(),
+            })
         }
         Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => {
             let session = session_id
                 .ok_or_else(|| (StatusCode::FORBIDDEN, NEEDS_SESSION_OR_RUN.to_owned()))?;
             if !valid_session_id(session) {
-                return Err((StatusCode::BAD_REQUEST, "session_id has an unexpected shape".to_owned()));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "session_id has an unexpected shape".to_owned(),
+                ));
             }
-            let seen = sessions::session_seen_in(pool, session, &at.root).await.map_err(internal)?;
+            let seen = sessions::session_seen_in(pool, session, &at.root)
+                .await
+                .map_err(internal)?;
             if !seen {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -236,9 +270,16 @@ pub(super) async fn holder_for(
                     ),
                 ));
             }
-            Ok(Holder { kind: HolderKind::Session, id: session.to_owned(), worktree: at.root.clone() })
+            Ok(Holder {
+                kind: HolderKind::Session,
+                id: session.to_owned(),
+                worktree: at.root.clone(),
+            })
         }
-        _ => Err((StatusCode::FORBIDDEN, "this key cannot use task claims".to_owned())),
+        _ => Err((
+            StatusCode::FORBIDDEN,
+            "this key cannot use task claims".to_owned(),
+        )),
     }
 }
 
@@ -276,14 +317,23 @@ fn age_seconds(created_at: &str, now: Now) -> i64 {
 }
 
 /// The live tasks of one project, each with its age.
-pub(super) async fn list_tasks(pool: &sqlx::SqlitePool, project_id: &str, now: Now) -> Result<Value, Fail> {
-    let rows = store::list_live(pool, project_id, now).await.map_err(internal)?;
+pub(super) async fn list_tasks(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    now: Now,
+) -> Result<Value, Fail> {
+    let rows = store::list_live(pool, project_id, now)
+        .await
+        .map_err(internal)?;
     let tasks: Vec<Value> = rows
         .iter()
         .map(|row| {
             let mut task = serde_json::to_value(row).unwrap_or(Value::Null);
             if let Some(fields) = task.as_object_mut() {
-                fields.insert("age_seconds".to_owned(), json!(age_seconds(&row.created_at, now)));
+                fields.insert(
+                    "age_seconds".to_owned(),
+                    json!(age_seconds(&row.created_at, now)),
+                );
             }
             task
         })
@@ -347,26 +397,38 @@ pub(super) async fn claim_task(
         guard_paths: normalize_paths(body.guard_paths.as_deref(), at)?,
         hint_paths: normalize_paths(body.hint_paths.as_deref(), at)?,
     };
-    match store::claim(pool, &at.project_id, new, holder, now).await.map_err(claim_error)? {
+    match store::claim(pool, &at.project_id, new, holder, now)
+        .await
+        .map_err(claim_error)?
+    {
         ClaimOutcome::Won { task, similar } => {
             Ok(json!({ "won": true, "task": task, "holder": null, "similar": similar }))
         }
-        ClaimOutcome::Lost { task, holder, similar } => {
-            Ok(json!({ "won": false, "task": task, "holder": holder, "similar": similar }))
-        }
+        ClaimOutcome::Lost {
+            task,
+            holder,
+            similar,
+        } => Ok(json!({ "won": false, "task": task, "holder": holder, "similar": similar })),
     }
 }
 
 /// A note is required: the history in `task_claim_events` is read by people.
 fn required_note(note: &str) -> Result<&str, Fail> {
     let note = note.trim();
-    if note.is_empty() { Err(bad_request("note is required")) } else { Ok(note) }
+    if note.is_empty() {
+        Err(bad_request("note is required"))
+    } else {
+        Ok(note)
+    }
 }
 
 /// One answer for "no such task", "not yours" and "no longer live": it must not tell which, or the
 /// route would let a caller probe task ids.
 fn not_held(id: i64) -> Fail {
-    (StatusCode::CONFLICT, format!("task #{id} is not held by you (or is no longer live)"))
+    (
+        StatusCode::CONFLICT,
+        format!("task #{id} is not held by you (or is no longer live)"),
+    )
 }
 
 /// `task_release`: back to `open`. No project check: a holder only ever matches its own rows (run,
@@ -379,7 +441,10 @@ pub(super) async fn release_task(
     now: Now,
 ) -> Result<Value, Fail> {
     let note = required_note(note)?;
-    if store::release(pool, id, holder, note, now).await.map_err(internal)? {
+    if store::release(pool, id, holder, note, now)
+        .await
+        .map_err(internal)?
+    {
         Ok(json!({ "id": id, "status": "open" }))
     } else {
         Err(not_held(id))
@@ -395,7 +460,10 @@ pub(super) async fn done_task(
     now: Now,
 ) -> Result<Value, Fail> {
     let note = required_note(note)?;
-    if store::done(pool, id, Closer::Holder(holder), note, now).await.map_err(internal)? {
+    if store::done(pool, id, Closer::Holder(holder), note, now)
+        .await
+        .map_err(internal)?
+    {
         Ok(json!({ "id": id, "status": "done" }))
     } else {
         Err(not_held(id))
@@ -417,8 +485,11 @@ pub(super) async fn session_step(
     now: Now,
 ) -> sqlx::Result<Value> {
     sessions::touch_session(pool, session_id, root, project_id, now).await?;
-    let notices: Vec<String> =
-        sessions::take_notices(pool, session_id, now).await?.iter().map(render_notice).collect();
+    let notices: Vec<String> = sessions::take_notices(pool, session_id, now)
+        .await?
+        .iter()
+        .map(render_notice)
+        .collect();
     let incidents: Vec<String> = if want_incidents {
         // Re-prove a stale `master-red` before the list, so only what is still live is told.
         // The executor is a process global (`verify::installed`); without one (early startup,
@@ -440,14 +511,17 @@ pub(super) async fn session_step(
             .await?
             .iter()
             .filter(|task| {
-                task.kind == TaskKind::Incident && matches!(task.status, Status::Open | Status::Claimed)
+                task.kind == TaskKind::Incident
+                    && matches!(task.status, Status::Open | Status::Claimed)
             })
             .map(render_incident)
             .collect()
     } else {
         Vec::new()
     };
-    Ok(json!({ "registered": true, "project_id": project_id, "notices": notices, "incidents": incidents }))
+    Ok(
+        json!({ "registered": true, "project_id": project_id, "notices": notices, "incidents": incidents }),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,11 +538,17 @@ static CWD_CACHE: std::sync::LazyLock<std::sync::Mutex<CwdCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(CwdCache::default()));
 
 fn cached_cwd(cwd: &str, now: Instant) -> Option<Resolved> {
-    CWD_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(cwd, now)
+    CWD_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(cwd, now)
 }
 
 fn remember_cwd(cwd: &str, resolved: Resolved, now: Instant) {
-    CWD_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).put(cwd, resolved, now);
+    CWD_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .put(cwd, resolved, now);
 }
 
 /// The roster project a hook's `cwd` belongs to, as `fleet.rs:683-696` finds it: the git toplevel,
@@ -481,8 +561,12 @@ async fn resolve_cwd(pool: &sqlx::SqlitePool, cwd: &str) -> Resolved {
     }
     let deadline = now + crate::execution::git_exec::OPERATION_TIMEOUT;
     let resolved = async {
-        let top = crate::execution::git_exec::toplevel(std::path::Path::new(cwd), deadline).await.ok()?;
-        let project_id = crate::execution::vcs::project_for_worktree(pool, &top, deadline).await.ok()?;
+        let top = crate::execution::git_exec::toplevel(std::path::Path::new(cwd), deadline)
+            .await
+            .ok()?;
+        let project_id = crate::execution::vcs::project_for_worktree(pool, &top, deadline)
+            .await
+            .ok()?;
         let root = crate::execution::git_exec::canonical(&top).await.ok()?;
         Some((project_id, root))
     }
@@ -495,7 +579,10 @@ type Reply = Result<Json<Value>, Fail>;
 
 /// `POST /tasks/session`, the hook's call. Fail-open: any git or database trouble answers 200
 /// `{registered: false}` (and a warning), because a 500 would only make the hook spend its backoff.
-pub(super) async fn post_session(State(state): State<AppState>, Json(body): Json<SessionBody>) -> Reply {
+pub(super) async fn post_session(
+    State(state): State<AppState>,
+    Json(body): Json<SessionBody>,
+) -> Reply {
     if !valid_session_id(&body.session_id) {
         return Err(bad_request("session_id has an unexpected shape"));
     }
@@ -535,7 +622,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/tasks/session", post(post_session))
         .route("/projects/{id}/tasks", get(get_project_tasks))
         .route("/projects/{id}/tasks/claim", post(post_project_claim))
-        .route("/projects/{id}/tasks/{task}/release", post(post_project_release))
+        .route(
+            "/projects/{id}/tasks/{task}/release",
+            post(post_project_release),
+        )
         .route("/projects/{id}/tasks/{task}/done", post(post_project_done))
 }
 
@@ -556,11 +646,17 @@ async fn post_list(
     Extension(scope): Extension<Scope>,
     Json(body): Json<ListBody>,
 ) -> Reply {
-    list_in(&state.pool, &scope, body.worktree.as_deref()).await.map(Json)
+    list_in(&state.pool, &scope, body.worktree.as_deref())
+        .await
+        .map(Json)
 }
 
 /// A listing is a read: it needs the worktree, never a registered session or a holder.
-async fn list_in(pool: &sqlx::SqlitePool, scope: &Scope, worktree: Option<&str>) -> Result<Value, Fail> {
+async fn list_in(
+    pool: &sqlx::SqlitePool,
+    scope: &Scope,
+    worktree: Option<&str>,
+) -> Result<Value, Fail> {
     let at = locate(pool, scope, worktree).await?;
     list_tasks(pool, &at.project_id, chrono::Utc::now()).await
 }
@@ -570,8 +666,16 @@ async fn post_claim(
     Extension(scope): Extension<Scope>,
     Json(body): Json<ClaimBody>,
 ) -> Reply {
-    let (at, holder) = acting(&state, &scope, body.worktree.as_deref(), body.session_id.as_deref()).await?;
-    claim_task(&state.pool, &at, &holder, &body, chrono::Utc::now()).await.map(Json)
+    let (at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
+    claim_task(&state.pool, &at, &holder, &body, chrono::Utc::now())
+        .await
+        .map(Json)
 }
 
 async fn post_release(
@@ -579,11 +683,23 @@ async fn post_release(
     Extension(scope): Extension<Scope>,
     Json(body): Json<CloseBody>,
 ) -> Reply {
-    let (_at, holder) = acting(&state, &scope, body.worktree.as_deref(), body.session_id.as_deref()).await?;
+    let (_at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
     let id = body.id.ok_or_else(|| bad_request("id is required"))?;
-    release_task(&state.pool, &holder, id, body.note.as_deref().unwrap_or(""), chrono::Utc::now())
-        .await
-        .map(Json)
+    release_task(
+        &state.pool,
+        &holder,
+        id,
+        body.note.as_deref().unwrap_or(""),
+        chrono::Utc::now(),
+    )
+    .await
+    .map(Json)
 }
 
 async fn post_done(
@@ -591,11 +707,23 @@ async fn post_done(
     Extension(scope): Extension<Scope>,
     Json(body): Json<CloseBody>,
 ) -> Reply {
-    let (_at, holder) = acting(&state, &scope, body.worktree.as_deref(), body.session_id.as_deref()).await?;
+    let (_at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
     let id = body.id.ok_or_else(|| bad_request("id is required"))?;
-    done_task(&state.pool, &holder, id, body.note.as_deref().unwrap_or(""), chrono::Utc::now())
-        .await
-        .map(Json)
+    done_task(
+        &state.pool,
+        &holder,
+        id,
+        body.note.as_deref().unwrap_or(""),
+        chrono::Utc::now(),
+    )
+    .await
+    .map(Json)
 }
 
 /// A project route acts on a worktree of that project and no other.
@@ -605,7 +733,10 @@ fn ensure_project(at: &Located, project_id: &str) -> Result<(), Fail> {
     } else {
         Err((
             StatusCode::FORBIDDEN,
-            format!("that worktree belongs to project {}, not {project_id}", at.project_id),
+            format!(
+                "that worktree belongs to project {}, not {project_id}",
+                at.project_id
+            ),
         ))
     }
 }
@@ -615,7 +746,9 @@ async fn get_project_tasks(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Reply {
-    list_tasks(&state.pool, &id, chrono::Utc::now()).await.map(Json)
+    list_tasks(&state.pool, &id, chrono::Utc::now())
+        .await
+        .map(Json)
 }
 
 async fn post_project_claim(
@@ -624,9 +757,17 @@ async fn post_project_claim(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<ClaimBody>,
 ) -> Reply {
-    let (at, holder) = acting(&state, &scope, body.worktree.as_deref(), body.session_id.as_deref()).await?;
+    let (at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
     ensure_project(&at, &id)?;
-    claim_task(&state.pool, &at, &holder, &body, chrono::Utc::now()).await.map(Json)
+    claim_task(&state.pool, &at, &holder, &body, chrono::Utc::now())
+        .await
+        .map(Json)
 }
 
 async fn post_project_release(
@@ -635,11 +776,23 @@ async fn post_project_release(
     axum::extract::Path((id, task)): axum::extract::Path<(String, i64)>,
     Json(body): Json<CloseBody>,
 ) -> Reply {
-    let (at, holder) = acting(&state, &scope, body.worktree.as_deref(), body.session_id.as_deref()).await?;
+    let (at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
     ensure_project(&at, &id)?;
-    release_task(&state.pool, &holder, task, body.note.as_deref().unwrap_or(""), chrono::Utc::now())
-        .await
-        .map(Json)
+    release_task(
+        &state.pool,
+        &holder,
+        task,
+        body.note.as_deref().unwrap_or(""),
+        chrono::Utc::now(),
+    )
+    .await
+    .map(Json)
 }
 
 async fn post_project_done(
@@ -648,11 +801,23 @@ async fn post_project_done(
     axum::extract::Path((id, task)): axum::extract::Path<(String, i64)>,
     Json(body): Json<CloseBody>,
 ) -> Reply {
-    let (at, holder) = acting(&state, &scope, body.worktree.as_deref(), body.session_id.as_deref()).await?;
+    let (at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
     ensure_project(&at, &id)?;
-    done_task(&state.pool, &holder, task, body.note.as_deref().unwrap_or(""), chrono::Utc::now())
-        .await
-        .map(Json)
+    done_task(
+        &state.pool,
+        &holder,
+        task,
+        body.note.as_deref().unwrap_or(""),
+        chrono::Utc::now(),
+    )
+    .await
+    .map(Json)
 }
 
 #[cfg(test)]
@@ -662,20 +827,31 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn holder(kind: HolderKind, id: &str, worktree: &str) -> Holder {
-        Holder { kind, id: id.to_owned(), worktree: worktree.to_owned() }
+        Holder {
+            kind,
+            id: id.to_owned(),
+            worktree: worktree.to_owned(),
+        }
     }
 
     #[test]
     fn the_cwd_cache_remembers_a_project_and_forgets_it_after_the_ttl() {
         let t0 = Instant::now();
         let mut cache = CwdCache::default();
-        assert_eq!(cache.get("/w", t0), None, "a miss is None, not a cached refusal");
+        assert_eq!(
+            cache.get("/w", t0),
+            None,
+            "a miss is None, not a cached refusal"
+        );
         cache.put("/w", Some(("alpha".into(), "/w".into())), t0);
         assert_eq!(
             cache.get("/w", t0 + Duration::from_secs(599)),
             Some(Some(("alpha".into(), "/w".into())))
         );
-        assert_eq!(cache.get("/w", t0 + CwdCache::POSITIVE_TTL + Duration::from_secs(1)), None);
+        assert_eq!(
+            cache.get("/w", t0 + CwdCache::POSITIVE_TTL + Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]
@@ -724,15 +900,24 @@ mod tests {
         });
         assert!(text.contains("#12") && text.contains("test:a::b"), "{text}");
         assert!(text.contains("run #9"), "{text}");
-        assert!(text.contains("stop"), "an agent must be told to stop, not only informed: {text}");
+        assert!(
+            text.contains("stop"),
+            "an agent must be told to stop, not only informed: {text}"
+        );
     }
 
     #[test]
     fn a_closed_incident_tells_the_session_to_stop_and_rebase() {
         let task = crate::task_claims::testing::row("master-red", 4);
-        let text = render_notice(&Notice::IncidentClosed { task, sha: Some("abcdef1234567".into()) });
+        let text = render_notice(&Notice::IncidentClosed {
+            task,
+            sha: Some("abcdef1234567".into()),
+        });
         assert!(text.contains("#4") && text.contains("abcdef1"), "{text}");
-        assert!(!text.contains("abcdef1234567"), "the sha is shortened to 7: {text}");
+        assert!(
+            !text.contains("abcdef1234567"),
+            "the sha is shortened to 7: {text}"
+        );
         assert!(text.contains("rebase") && text.contains("verify"), "{text}");
     }
 
@@ -747,11 +932,18 @@ mod tests {
 
         task.holder_kind = None;
         task.holder_id = None;
-        assert_eq!(render_incident(&task), "#4 master-red since 1234567: unclaimed");
+        assert_eq!(
+            render_incident(&task),
+            "#4 master-red since 1234567: unclaimed"
+        );
     }
 
     fn located(project: &str, root: &str) -> Located {
-        Located { project_id: project.into(), root: root.into(), project_root: root.into() }
+        Located {
+            project_id: project.into(),
+            root: root.into(),
+            project_root: root.into(),
+        }
     }
 
     /// The smallest `jobs` row (the columns `consolidate.rs`'s tests insert): `runs.job_id` is a
@@ -783,8 +975,17 @@ mod tests {
     async fn a_plain_run_holds_by_its_run_id() {
         let pool = crate::testdb::fresh_pool().await;
         let run = insert_run(&pool, "/w", None).await;
-        let holder = holder_for(&pool, &Scope::Run(run), &located("alpha", "/w"), None).await.unwrap();
-        assert_eq!(holder, Holder { kind: HolderKind::Run, id: run.to_string(), worktree: "/w".into() });
+        let holder = holder_for(&pool, &Scope::Run(run), &located("alpha", "/w"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            holder,
+            Holder {
+                kind: HolderKind::Run,
+                id: run.to_string(),
+                worktree: "/w".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -792,22 +993,50 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let job = insert_job(&pool).await;
         let run = insert_run(&pool, "/w", Some(job)).await;
-        let holder = holder_for(&pool, &Scope::Run(run), &located("alpha", "/w"), None).await.unwrap();
-        assert_eq!((holder.kind, holder.id.as_str()), (HolderKind::Job, job.to_string().as_str()));
+        let holder = holder_for(&pool, &Scope::Run(run), &located("alpha", "/w"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            (holder.kind, holder.id.as_str()),
+            (HolderKind::Job, job.to_string().as_str())
+        );
     }
 
     #[tokio::test]
     async fn a_session_is_only_believed_where_it_was_seen() {
         let pool = crate::testdb::fresh_pool().await;
         let now = chrono::Utc::now();
-        sessions::touch_session(&pool, "s1", "/w", "alpha", now).await.unwrap();
+        sessions::touch_session(&pool, "s1", "/w", "alpha", now)
+            .await
+            .unwrap();
 
-        let ok = holder_for(&pool, &Scope::Control, &located("alpha", "/w"), Some("s1")).await.unwrap();
-        assert_eq!((ok.kind, ok.id.as_str(), ok.worktree.as_str()), (HolderKind::Session, "s1", "/w"));
+        let ok = holder_for(&pool, &Scope::Control, &located("alpha", "/w"), Some("s1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (ok.kind, ok.id.as_str(), ok.worktree.as_str()),
+            (HolderKind::Session, "s1", "/w")
+        );
 
-        let elsewhere = holder_for(&pool, &Scope::Control, &located("alpha", "/other"), Some("s1")).await;
-        assert_eq!(elsewhere.unwrap_err().0, StatusCode::FORBIDDEN, "seen in /w, not in /other");
-        let unknown = holder_for(&pool, &Scope::Control, &located("alpha", "/w"), Some("nope")).await;
+        let elsewhere = holder_for(
+            &pool,
+            &Scope::Control,
+            &located("alpha", "/other"),
+            Some("s1"),
+        )
+        .await;
+        assert_eq!(
+            elsewhere.unwrap_err().0,
+            StatusCode::FORBIDDEN,
+            "seen in /w, not in /other"
+        );
+        let unknown = holder_for(
+            &pool,
+            &Scope::Control,
+            &located("alpha", "/w"),
+            Some("nope"),
+        )
+        .await;
         assert_eq!(unknown.unwrap_err().0, StatusCode::FORBIDDEN);
         let missing = holder_for(&pool, &Scope::Control, &located("alpha", "/w"), None).await;
         assert_eq!(missing.unwrap_err().0, StatusCode::FORBIDDEN);
@@ -819,14 +1048,27 @@ mod tests {
         )
         .await;
         assert!(admin.is_ok());
-        let shaped = holder_for(&pool, &Scope::Control, &located("alpha", "/w"), Some("../etc")).await;
-        assert_eq!(shaped.unwrap_err().0, StatusCode::BAD_REQUEST, "the id shape is checked first");
+        let shaped = holder_for(
+            &pool,
+            &Scope::Control,
+            &located("alpha", "/w"),
+            Some("../etc"),
+        )
+        .await;
+        assert_eq!(
+            shaped.unwrap_err().0,
+            StatusCode::BAD_REQUEST,
+            "the id shape is checked first"
+        );
     }
 
     #[tokio::test]
     async fn other_keys_hold_nothing() {
         let pool = crate::testdb::fresh_pool().await;
-        for scope in [Scope::ApiToken(ApiTokenLevel::ReadOnly), Scope::TeamRun("t".into())] {
+        for scope in [
+            Scope::ApiToken(ApiTokenLevel::ReadOnly),
+            Scope::TeamRun("t".into()),
+        ] {
             let refused = holder_for(&pool, &scope, &located("alpha", "/w"), Some("s1")).await;
             assert_eq!(refused.unwrap_err().0, StatusCode::FORBIDDEN);
         }
@@ -843,9 +1085,18 @@ mod tests {
             .unwrap();
         assert!(init.success());
         let cwd = dir.path().to_string_lossy().into_owned();
-        let refused = locate(&pool, &Scope::Control, Some(&cwd)).await.err().expect("not on the roster");
+        let refused = locate(&pool, &Scope::Control, Some(&cwd))
+            .await
+            .err()
+            .expect("not on the roster");
         assert_eq!(refused.0, StatusCode::NOT_FOUND);
-        assert!(refused.1.starts_with("task claims unavailable: project not registered"), "{}", refused.1);
+        assert!(
+            refused
+                .1
+                .starts_with("task claims unavailable: project not registered"),
+            "{}",
+            refused.1
+        );
     }
 
     #[tokio::test]
@@ -854,32 +1105,62 @@ mod tests {
         let at = located("alpha", "/w");
         let run = holder(HolderKind::Run, "7", "/w");
         let other = holder(HolderKind::Run, "8", "/w2");
-        let body = ClaimBody { key: Some("test:core/a.rs::b".into()), title: Some("b fails".into()), ..Default::default() };
+        let body = ClaimBody {
+            key: Some("test:core/a.rs::b".into()),
+            title: Some("b fails".into()),
+            ..Default::default()
+        };
 
-        let first = claim_task(&pool, &at, &run, &body, chrono::Utc::now()).await.unwrap();
+        let first = claim_task(&pool, &at, &run, &body, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(first["won"], true);
-        let second = claim_task(&pool, &at, &other, &body, chrono::Utc::now()).await.unwrap();
+        let second = claim_task(&pool, &at, &other, &body, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(second["won"], false);
         assert_eq!(second["holder"]["id"], "7");
         assert_eq!(second["task"]["id"], first["task"]["id"]);
-        let again = claim_task(&pool, &at, &run, &body, chrono::Utc::now()).await.unwrap();
-        assert_eq!(again["won"], true, "the same holder renews, it does not lose to itself");
+        let again = claim_task(&pool, &at, &run, &body, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            again["won"], true,
+            "the same holder renews, it does not lose to itself"
+        );
     }
 
     #[tokio::test]
     async fn a_declared_claim_on_master_red_is_a_409_not_a_500() {
         let pool = crate::testdb::fresh_pool().await;
-        let body = ClaimBody { key: Some("master-red".into()), ..Default::default() };
-        let refused = claim_task(&pool, &located("alpha", "/w"), &holder(HolderKind::Run, "7", "/w"), &body, chrono::Utc::now())
-            .await
-            .err()
-            .expect("the store refuses a declared master-red");
+        let body = ClaimBody {
+            key: Some("master-red".into()),
+            ..Default::default()
+        };
+        let refused = claim_task(
+            &pool,
+            &located("alpha", "/w"),
+            &holder(HolderKind::Run, "7", "/w"),
+            &body,
+            chrono::Utc::now(),
+        )
+        .await
+        .err()
+        .expect("the store refuses a declared master-red");
         assert_eq!(refused.0, StatusCode::CONFLICT);
-        assert!(refused.1.contains("created by the daemon only"), "{}", refused.1);
+        assert!(
+            refused.1.contains("created by the daemon only"),
+            "{}",
+            refused.1
+        );
     }
 
     fn located_in(worktree: &str, project_root: &str) -> Located {
-        Located { project_id: "alpha".into(), root: worktree.into(), project_root: project_root.into() }
+        Located {
+            project_id: "alpha".into(),
+            root: worktree.into(),
+            project_root: project_root.into(),
+        }
     }
 
     #[tokio::test]
@@ -888,23 +1169,53 @@ mod tests {
         // One worktree inside the repo, one outside it.
         let inside = located_in("/repo/.claude/worktrees/a", "/repo");
         let outside = located_in("/elsewhere/b", "/repo");
-        let first_body = ClaimBody { key: Some("file:/repo/.claude/worktrees/a/core/a.rs".into()), ..Default::default() };
-        let second_body = ClaimBody { key: Some("file:/elsewhere/b/core/a.rs".into()), ..Default::default() };
-        let first = claim_task(&pool, &inside, &holder(HolderKind::Run, "1", "/repo/.claude/worktrees/a"), &first_body, chrono::Utc::now())
-            .await
-            .unwrap();
+        let first_body = ClaimBody {
+            key: Some("file:/repo/.claude/worktrees/a/core/a.rs".into()),
+            ..Default::default()
+        };
+        let second_body = ClaimBody {
+            key: Some("file:/elsewhere/b/core/a.rs".into()),
+            ..Default::default()
+        };
+        let first = claim_task(
+            &pool,
+            &inside,
+            &holder(HolderKind::Run, "1", "/repo/.claude/worktrees/a"),
+            &first_body,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(first["won"], true);
         assert_eq!(first["task"]["key"], "file:core/a.rs");
-        let second = claim_task(&pool, &outside, &holder(HolderKind::Run, "2", "/elsewhere/b"), &second_body, chrono::Utc::now())
-            .await
-            .unwrap();
-        assert_eq!(second["won"], false, "the same file from another worktree is the same task");
+        let second = claim_task(
+            &pool,
+            &outside,
+            &holder(HolderKind::Run, "2", "/elsewhere/b"),
+            &second_body,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second["won"], false,
+            "the same file from another worktree is the same task"
+        );
         assert_eq!(second["holder"]["id"], "1");
         // A path under the project root still resolves when the worktree is elsewhere.
-        let under_project = ClaimBody { key: Some("file:/repo/core/a.rs".into()), ..Default::default() };
-        let third = claim_task(&pool, &outside, &holder(HolderKind::Run, "2", "/elsewhere/b"), &under_project, chrono::Utc::now())
-            .await
-            .unwrap();
+        let under_project = ClaimBody {
+            key: Some("file:/repo/core/a.rs".into()),
+            ..Default::default()
+        };
+        let third = claim_task(
+            &pool,
+            &outside,
+            &holder(HolderKind::Run, "2", "/elsewhere/b"),
+            &under_project,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(third["task"]["id"], first["task"]["id"]);
     }
 
@@ -922,7 +1233,9 @@ mod tests {
         // Owner, no session: the refusal is about the checkout (not on the roster), never about a
         // missing session. Registering a project in a unit test is not available here, so this
         // pins the error `list_in` can raise.
-        let refused = list_in(&pool, &Scope::Control, Some(&cwd)).await.unwrap_err();
+        let refused = list_in(&pool, &Scope::Control, Some(&cwd))
+            .await
+            .unwrap_err();
         assert_eq!(refused.0, StatusCode::NOT_FOUND);
         assert!(!refused.1.contains("session"), "{}", refused.1);
     }
@@ -930,10 +1243,25 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_key_is_a_400_that_says_what_is_accepted() {
         let pool = crate::testdb::fresh_pool().await;
-        let body = ClaimBody { key: Some("bug in the thing".into()), ..Default::default() };
-        let refused = claim_task(&pool, &located("alpha", "/w"), &holder(HolderKind::Run, "7", "/w"), &body, chrono::Utc::now()).await.unwrap_err();
+        let body = ClaimBody {
+            key: Some("bug in the thing".into()),
+            ..Default::default()
+        };
+        let refused = claim_task(
+            &pool,
+            &located("alpha", "/w"),
+            &holder(HolderKind::Run, "7", "/w"),
+            &body,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(refused.0, StatusCode::BAD_REQUEST);
-        assert!(refused.1.contains("test:") && refused.1.contains("topic:"), "{}", refused.1);
+        assert!(
+            refused.1.contains("test:") && refused.1.contains("topic:"),
+            "{}",
+            refused.1
+        );
     }
 
     #[tokio::test]
@@ -942,32 +1270,85 @@ mod tests {
         let at = located("alpha", "/w");
         let mine = holder(HolderKind::Run, "7", "/w");
         let theirs = holder(HolderKind::Run, "8", "/w2");
-        let body = ClaimBody { key: Some("file:core/a.rs".into()), ..Default::default() };
-        let id = claim_task(&pool, &at, &mine, &body, chrono::Utc::now()).await.unwrap()["task"]["id"].as_i64().unwrap();
+        let body = ClaimBody {
+            key: Some("file:core/a.rs".into()),
+            ..Default::default()
+        };
+        let id = claim_task(&pool, &at, &mine, &body, chrono::Utc::now())
+            .await
+            .unwrap()["task"]["id"]
+            .as_i64()
+            .unwrap();
 
-        let refused = release_task(&pool, &theirs, id, "mine now", chrono::Utc::now()).await.unwrap_err();
+        let refused = release_task(&pool, &theirs, id, "mine now", chrono::Utc::now())
+            .await
+            .unwrap_err();
         assert_eq!(refused.0, StatusCode::CONFLICT);
-        assert_eq!(done_task(&pool, &theirs, id, "done", chrono::Utc::now()).await.unwrap_err().0, StatusCode::CONFLICT);
+        assert_eq!(
+            done_task(&pool, &theirs, id, "done", chrono::Utc::now())
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
 
-        release_task(&pool, &mine, id, "not mine after all", chrono::Utc::now()).await.unwrap();
-        let listed = list_tasks(&pool, "alpha", chrono::Utc::now()).await.unwrap();
-        assert_eq!(listed["tasks"][0]["status"], "open", "released goes back to open: {listed}");
+        release_task(&pool, &mine, id, "not mine after all", chrono::Utc::now())
+            .await
+            .unwrap();
+        let listed = list_tasks(&pool, "alpha", chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["tasks"][0]["status"], "open",
+            "released goes back to open: {listed}"
+        );
 
-        claim_task(&pool, &at, &theirs, &body, chrono::Utc::now()).await.unwrap();
-        done_task(&pool, &theirs, id, "fixed", chrono::Utc::now()).await.unwrap();
-        assert_eq!(list_tasks(&pool, "alpha", chrono::Utc::now()).await.unwrap()["tasks"].as_array().unwrap().len(), 0);
+        claim_task(&pool, &at, &theirs, &body, chrono::Utc::now())
+            .await
+            .unwrap();
+        done_task(&pool, &theirs, id, "fixed", chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            list_tasks(&pool, "alpha", chrono::Utc::now())
+                .await
+                .unwrap()["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn the_list_carries_owner_and_age_and_is_per_project() {
         let pool = crate::testdb::fresh_pool().await;
         let t0 = chrono::Utc::now();
-        let body = ClaimBody { key: Some("file:core/a.rs".into()), ..Default::default() };
-        claim_task(&pool, &located("alpha", "/w"), &holder(HolderKind::Run, "7", "/w"), &body, t0).await.unwrap();
-        let listed = list_tasks(&pool, "alpha", t0 + chrono::Duration::seconds(90)).await.unwrap();
+        let body = ClaimBody {
+            key: Some("file:core/a.rs".into()),
+            ..Default::default()
+        };
+        claim_task(
+            &pool,
+            &located("alpha", "/w"),
+            &holder(HolderKind::Run, "7", "/w"),
+            &body,
+            t0,
+        )
+        .await
+        .unwrap();
+        let listed = list_tasks(&pool, "alpha", t0 + chrono::Duration::seconds(90))
+            .await
+            .unwrap();
         assert_eq!(listed["tasks"][0]["holder_id"], "7");
         assert_eq!(listed["tasks"][0]["age_seconds"], 90);
-        assert_eq!(list_tasks(&pool, "beta", t0).await.unwrap()["tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            list_tasks(&pool, "beta", t0).await.unwrap()["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -975,41 +1356,91 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let t0 = chrono::Utc::now();
         let mine = holder(HolderKind::Session, "s1", "/w");
-        let body = ClaimBody { key: Some("file:core/a.rs".into()), ..Default::default() };
+        let body = ClaimBody {
+            key: Some("file:core/a.rs".into()),
+            ..Default::default()
+        };
         // The session registers BEFORE it claims, as the hook makes it: `touch_session` starts a
         // new session's notice cursor at the newest event id, so a session first seen after the
         // takeover would (rightly) hear nothing about it.
-        sessions::touch_session(&pool, "s1", "/w", "alpha", t0).await.unwrap();
-        claim_task(&pool, &located("alpha", "/w"), &mine, &body, t0).await.unwrap();
+        sessions::touch_session(&pool, "s1", "/w", "alpha", t0)
+            .await
+            .unwrap();
+        claim_task(&pool, &located("alpha", "/w"), &mine, &body, t0)
+            .await
+            .unwrap();
 
         // The claim lapses and a run takes it: s1 has a ClaimLost waiting.
         let later = t0 + chrono::Duration::seconds(crate::task_claims::SESSION_LEASE_SECONDS + 60);
-        claim_task(&pool, &located("alpha", "/w2"), &holder(HolderKind::Run, "9", "/w2"), &body, later).await.unwrap();
+        claim_task(
+            &pool,
+            &located("alpha", "/w2"),
+            &holder(HolderKind::Run, "9", "/w2"),
+            &body,
+            later,
+        )
+        .await
+        .unwrap();
 
-        let first = session_step(&pool, "s1", "alpha", "/w", false, None, later).await.unwrap();
+        let first = session_step(&pool, "s1", "alpha", "/w", false, None, later)
+            .await
+            .unwrap();
         assert_eq!(first["registered"], true);
         assert_eq!(first["notices"].as_array().unwrap().len(), 1, "{first}");
         assert!(first["notices"][0].as_str().unwrap().contains("run #9"));
-        let second = session_step(&pool, "s1", "alpha", "/w", false, None, later).await.unwrap();
-        assert!(second["notices"].as_array().unwrap().is_empty(), "the cursor advanced");
+        let second = session_step(&pool, "s1", "alpha", "/w", false, None, later)
+            .await
+            .unwrap();
+        assert!(
+            second["notices"].as_array().unwrap().is_empty(),
+            "the cursor advanced"
+        );
         assert!(sessions::session_seen_in(&pool, "s1", "/w").await.unwrap());
-        assert!(first.get("incidents").is_none() || first["incidents"].as_array().unwrap().is_empty());
+        assert!(
+            first.get("incidents").is_none() || first["incidents"].as_array().unwrap().is_empty()
+        );
     }
 
     #[tokio::test]
     async fn incidents_are_listed_only_when_asked_and_only_incidents() {
         let pool = crate::testdb::fresh_pool().await;
         let t0 = chrono::Utc::now();
-        let new = crate::task_claims::testing::new_task("master-red", crate::task_claims::TaskKind::Incident);
-        crate::task_claims::store::create_or_adopt_open(&pool, "alpha", new, t0).await.unwrap();
-        let declared = ClaimBody { key: Some("file:core/a.rs".into()), ..Default::default() };
-        claim_task(&pool, &located("alpha", "/w"), &holder(HolderKind::Run, "7", "/w"), &declared, t0).await.unwrap();
+        let new = crate::task_claims::testing::new_task(
+            "master-red",
+            crate::task_claims::TaskKind::Incident,
+        );
+        crate::task_claims::store::create_or_adopt_open(&pool, "alpha", new, t0)
+            .await
+            .unwrap();
+        let declared = ClaimBody {
+            key: Some("file:core/a.rs".into()),
+            ..Default::default()
+        };
+        claim_task(
+            &pool,
+            &located("alpha", "/w"),
+            &holder(HolderKind::Run, "7", "/w"),
+            &declared,
+            t0,
+        )
+        .await
+        .unwrap();
 
-        let quiet = session_step(&pool, "s1", "alpha", "/w", false, None, t0).await.unwrap();
-        assert!(quiet.get("incidents").is_none() || quiet["incidents"].as_array().unwrap().is_empty());
-        let asked = session_step(&pool, "s1", "alpha", "/w", true, None, t0).await.unwrap();
+        let quiet = session_step(&pool, "s1", "alpha", "/w", false, None, t0)
+            .await
+            .unwrap();
+        assert!(
+            quiet.get("incidents").is_none() || quiet["incidents"].as_array().unwrap().is_empty()
+        );
+        let asked = session_step(&pool, "s1", "alpha", "/w", true, None, t0)
+            .await
+            .unwrap();
         let lines = asked["incidents"].as_array().unwrap();
-        assert_eq!(lines.len(), 1, "a declared task is not an incident: {asked}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "a declared task is not an incident: {asked}"
+        );
         assert!(lines[0].as_str().unwrap().contains("master-red"));
     }
 

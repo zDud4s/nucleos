@@ -1515,11 +1515,13 @@ mod tests {
             .await
             .unwrap()
             .last_insert_rowid();
-            sqlx::query("INSERT INTO task_claim_events (task_id, event, at) VALUES (?, 'created', 'x')")
-                .bind(task_id)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO task_claim_events (task_id, event, at) VALUES (?, 'created', 'x')",
+            )
+            .bind(task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
             sqlx::query(
                 "INSERT INTO task_sessions (session_id, project_id, worktree, last_seen)
                  VALUES (?, ?, '/w', 'x')",
@@ -1533,12 +1535,20 @@ mod tests {
 
         remove(&pool, "alpha", true).await.unwrap();
 
-        for (table, expected) in [("task_claims", 1_i64), ("task_claim_events", 1), ("task_sessions", 1)] {
-            let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(left, expected, "{table}: alpha's rows must go and bravo's must stay");
+        for (table, expected) in [
+            ("task_claims", 1_i64),
+            ("task_claim_events", 1),
+            ("task_sessions", 1),
+        ] {
+            let left: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                left, expected,
+                "{table}: alpha's rows must go and bravo's must stay"
+            );
         }
     }
 

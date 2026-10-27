@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::task_claims::{
-    self, ClaimOutcome, Closer, Holder, HolderKind, MASTER_RED_KEY, NewTask, Status, TaskKind, TaskRow,
-    keys,
+    self, ClaimOutcome, Closer, Holder, HolderKind, MASTER_RED_KEY, NewTask, Status, TaskKind,
+    TaskRow, keys,
 };
 
 /// The postgate as a claimant: its id is the project, its worktree the one the gate checks out.
@@ -26,7 +26,11 @@ pub(super) fn gate_holder(project_id: &str, project_root: &Path) -> Holder {
 
 /// `"session abc"`: what the feed and the refusal messages call a holder.
 pub(super) fn describe(holder: &Holder) -> String {
-    format!("{} {}", format!("{:?}", holder.kind).to_lowercase(), holder.id)
+    format!(
+        "{} {}",
+        format!("{:?}", holder.kind).to_lowercase(),
+        holder.id
+    )
 }
 
 /// The holder a row records, if it records a whole one.
@@ -105,7 +109,14 @@ pub(super) fn new_incident_detail(
     red_groups: &[String],
     failures: &RedFailures,
 ) -> Value {
-    let mut detail = red_patch(target, red_since_sha, red_sha, red_base_sha, red_groups, failures);
+    let mut detail = red_patch(
+        target,
+        red_since_sha,
+        red_sha,
+        red_base_sha,
+        red_groups,
+        failures,
+    );
     if detail.get("red_tests").is_none() {
         detail["red_tests"] = json!([]);
     }
@@ -130,7 +141,9 @@ pub(super) fn merge_detail(base: &Value, patch: &Value) -> Value {
 /// callers that have no `project_root` at hand (a failed revert) need none.
 pub(super) async fn live_master_red(pool: &sqlx::SqlitePool, project_id: &str) -> Option<TaskRow> {
     match task_claims::store::list_live(pool, project_id, Utc::now()).await {
-        Ok(rows) => rows.into_iter().find(|row| row.key.as_str() == MASTER_RED_KEY),
+        Ok(rows) => rows
+            .into_iter()
+            .find(|row| row.key.as_str() == MASTER_RED_KEY),
         Err(error) => {
             tracing::warn!(project = project_id, %error, "postgate: cannot list the live incidents");
             None
@@ -170,7 +183,9 @@ async fn store_detail(
                 row.hint_paths = hints;
             }
         }
-        Err(error) => tracing::warn!(incident = row.id, %error, "postgate: cannot update the incident"),
+        Err(error) => {
+            tracing::warn!(incident = row.id, %error, "postgate: cannot update the incident")
+        }
     }
 }
 
@@ -200,7 +215,8 @@ pub(super) async fn ensure_incident(
     state: &State,
     failures: Option<&RedFailures>,
 ) -> Result<TaskRow, String> {
-    let key = keys::normalize(MASTER_RED_KEY, project_root).map_err(|error| format!("{error:?}"))?;
+    let key =
+        keys::normalize(MASTER_RED_KEY, project_root).map_err(|error| format!("{error:?}"))?;
     let none = RedFailures::default();
     let failures = failures.unwrap_or(&none);
     // The patch, not `new_incident_detail`: `create_or_adopt_open` merges `detail` over an adopted
@@ -267,14 +283,19 @@ pub(super) async fn record_verdict(
             json!({"culprit_sha": sha, "also_suspect": also_suspect}),
             Some(sha.as_str()),
         ),
-        Verdict::Inconclusive { candidates, also_suspect } => (
+        Verdict::Inconclusive {
+            candidates,
+            also_suspect,
+        } => (
             json!({"candidates": candidates, "also_suspect": also_suspect}),
             None,
         ),
         Verdict::NoCandidates => (json!({}), None),
     };
     let hints = match culprit {
-        Some(sha) => git_exec::changed_by_commit(project_root, sha, deadline).await.ok(),
+        Some(sha) => git_exec::changed_by_commit(project_root, sha, deadline)
+            .await
+            .ok(),
         None => None,
     };
     store_detail(pool, &mut row, &patch, None, hints).await;
@@ -303,13 +324,15 @@ async fn try_claim(
     row: &TaskRow,
 ) -> sqlx::Result<RevertRight> {
     let me = gate_holder(project_id, project_root);
-    Ok(match task_claims::store::claim_by_id(pool, row.id, &me, Utc::now()).await? {
-        ClaimOutcome::Won { .. } => RevertRight::Mine,
-        ClaimOutcome::Lost { holder, .. } => RevertRight::HeldBy {
-            incident: row.id,
-            who: describe(&holder),
+    Ok(
+        match task_claims::store::claim_by_id(pool, row.id, &me, Utc::now()).await? {
+            ClaimOutcome::Won { .. } => RevertRight::Mine,
+            ClaimOutcome::Lost { holder, .. } => RevertRight::HeldBy {
+                incident: row.id,
+                who: describe(&holder),
+            },
         },
-    })
+    )
 }
 
 /// Claims `row` for the gate. `claim_by_id` is idempotent for the same holder, so repeating this
@@ -380,10 +403,13 @@ pub(super) async fn takeover_step(
         return None;
     }
     let now = Utc::now();
-    let mine = row.holder_kind == Some(HolderKind::Postgate) && row.holder_id.as_deref() == Some(project_id);
+    let mine = row.holder_kind == Some(HolderKind::Postgate)
+        && row.holder_id.as_deref() == Some(project_id);
     if row.status == Status::Claimed
         && !mine
-        && task_claims::store::is_live(pool, &row, now).await.unwrap_or(true)
+        && task_claims::store::is_live(pool, &row, now)
+            .await
+            .unwrap_or(true)
     {
         return None;
     }
@@ -401,7 +427,10 @@ pub(super) async fn takeover_step(
         culprit = short(culprit),
     );
     match verify_postgate::restart_revert(pool, project_id, culprit, &summary).await {
-        Ok(true) => Some(Step::IncidentTaken { incident: row.id, merge_sha: culprit.to_owned() }),
+        Ok(true) => Some(Step::IncidentTaken {
+            incident: row.id,
+            merge_sha: culprit.to_owned(),
+        }),
         Ok(false) => None,
         Err(error) => Some(Step::Failed(format!("cannot start the revert: {error}"))),
     }
@@ -436,7 +465,14 @@ pub(super) async fn mark_revert_failed(
     let Some(mut row) = live_master_red(pool, project_id).await else {
         return true;
     };
-    store_detail(pool, &mut row, &json!({"revert_failed_for": merge_sha}), None, None).await;
+    store_detail(
+        pool,
+        &mut row,
+        &json!({"revert_failed_for": merge_sha}),
+        None,
+        None,
+    )
+    .await;
     row.detail.get("revert_failed_for").and_then(Value::as_str) == Some(merge_sha)
 }
 
@@ -449,8 +485,14 @@ pub(super) async fn settle_after_revert(pool: &sqlx::SqlitePool, project_id: &st
     };
     if let Some(holder) = holder_of(&row)
         && holder.kind == HolderKind::Postgate
-        && let Err(error) =
-            task_claims::store::release(pool, row.id, &holder, "the daemon's revert ended without a fix", Utc::now()).await
+        && let Err(error) = task_claims::store::release(
+            pool,
+            row.id,
+            &holder,
+            "the daemon's revert ended without a fix",
+            Utc::now(),
+        )
+        .await
     {
         tracing::warn!(incident = row.id, %error, "postgate: cannot release the incident");
     }
@@ -493,9 +535,21 @@ pub(super) async fn close_if_green(
         }
     }
     let note = format!("green at {}", short(green));
-    match task_claims::store::done(pool, row.id, Closer::Green { sha: green.to_owned() }, &note, Utc::now()).await {
+    match task_claims::store::done(
+        pool,
+        row.id,
+        Closer::Green {
+            sha: green.to_owned(),
+        },
+        &note,
+        Utc::now(),
+    )
+    .await
+    {
         Ok(_) => {}
-        Err(error) => tracing::warn!(incident = row.id, %error, "postgate: cannot close the incident"),
+        Err(error) => {
+            tracing::warn!(incident = row.id, %error, "postgate: cannot close the incident")
+        }
     }
 }
 
@@ -510,27 +564,65 @@ mod tests {
         // carries none, and a null it does carry must not wipe a value.
         let probed = json!({"red_tests": ["core::a::t"], "red_since_sha": "old"});
         let none = RedFailures::default();
-        let patch = red_patch("main", Some("s1"), Some("r1"), None, &["core".to_owned()], &none);
+        let patch = red_patch(
+            "main",
+            Some("s1"),
+            Some("r1"),
+            None,
+            &["core".to_owned()],
+            &none,
+        );
         let merged = merge_detail(&probed, &patch);
-        assert_eq!(merged["red_tests"], json!(["core::a::t"]), "a runner with no ids wipes nothing");
-        assert_eq!(merged["red_since_sha"], json!("s1"), "a known sha is the postgate's word");
+        assert_eq!(
+            merged["red_tests"],
+            json!(["core::a::t"]),
+            "a runner with no ids wipes nothing"
+        );
+        assert_eq!(
+            merged["red_since_sha"],
+            json!("s1"),
+            "a known sha is the postgate's word"
+        );
         assert_eq!(merged["red_groups"], json!(["core"]));
-        assert!(merged.get("red_base_sha").is_none(), "None is left out, not written as null");
+        assert!(
+            merged.get("red_base_sha").is_none(),
+            "None is left out, not written as null"
+        );
 
         // The ids the gate's own ticket gave do win over the probe's.
-        let named = RedFailures { tests: vec!["core::a::boom".to_owned()], files: vec![] };
+        let named = RedFailures {
+            tests: vec!["core::a::boom".to_owned()],
+            files: vec![],
+        };
         let patch = red_patch("main", Some("s1"), None, None, &["core".to_owned()], &named);
-        assert_eq!(merge_detail(&probed, &patch)["red_tests"], json!(["core::a::boom"]));
+        assert_eq!(
+            merge_detail(&probed, &patch)["red_tests"],
+            json!(["core::a::boom"])
+        );
     }
 
     #[test]
     fn a_new_incident_starts_with_the_ids_the_gate_named_and_none_when_it_named_none() {
         let groups = ["core".to_owned()];
-        let bare = new_incident_detail("main", Some("s1"), Some("r1"), Some("b0"), &groups, &RedFailures::default());
-        assert_eq!(bare["red_tests"], json!([]), "a runner that prints no ids leaves the list empty");
+        let bare = new_incident_detail(
+            "main",
+            Some("s1"),
+            Some("r1"),
+            Some("b0"),
+            &groups,
+            &RedFailures::default(),
+        );
+        assert_eq!(
+            bare["red_tests"],
+            json!([]),
+            "a runner that prints no ids leaves the list empty"
+        );
         assert_eq!(bare["source"], json!("postgate"));
         assert_eq!(bare["red_since_sha"], json!("s1"));
-        let named = RedFailures { tests: vec!["core::a::boom".to_owned()], files: vec!["core/src/a.rs".to_owned()] };
+        let named = RedFailures {
+            tests: vec!["core::a::boom".to_owned()],
+            files: vec!["core/src/a.rs".to_owned()],
+        };
         let detail = new_incident_detail("main", Some("s1"), None, None, &groups, &named);
         assert_eq!(detail["red_tests"], json!(["core::a::boom"]));
     }
@@ -548,7 +640,10 @@ mod tests {
             (None, no_files.as_slice()),
         ]);
         assert_eq!(folded.tests, vec!["a::t1".to_owned(), "b::t2".to_owned()]);
-        assert_eq!(folded.files, vec!["core/src/a.rs".to_owned(), "core/src/b.rs".to_owned()]);
+        assert_eq!(
+            folded.files,
+            vec!["core/src/a.rs".to_owned(), "core/src/b.rs".to_owned()]
+        );
         assert_eq!(
             fold_failures([(None, no_files.as_slice())]),
             RedFailures::default(),

@@ -339,20 +339,38 @@ mod claimed_override_tests {
 
     #[test]
     fn unset_sends_nothing() {
-        assert_eq!(claimed_override_decision(false, None, true), ClaimedOverride::Absent);
-        assert_eq!(claimed_override_decision(false, Some("r1"), false), ClaimedOverride::Absent);
+        assert_eq!(
+            claimed_override_decision(false, None, true),
+            ClaimedOverride::Absent
+        );
+        assert_eq!(
+            claimed_override_decision(false, Some("r1"), false),
+            ClaimedOverride::Absent
+        );
     }
 
     #[test]
     fn an_owner_at_a_terminal_sends_it() {
-        assert_eq!(claimed_override_decision(true, None, true), ClaimedOverride::Send);
-        assert_eq!(claimed_override_decision(true, Some(""), true), ClaimedOverride::Send);
+        assert_eq!(
+            claimed_override_decision(true, None, true),
+            ClaimedOverride::Send
+        );
+        assert_eq!(
+            claimed_override_decision(true, Some(""), true),
+            ClaimedOverride::Send
+        );
     }
 
     #[test]
     fn an_agent_run_or_a_pipe_is_refused() {
-        assert!(matches!(claimed_override_decision(true, Some("r1"), true), ClaimedOverride::Refused(_)));
-        assert!(matches!(claimed_override_decision(true, None, false), ClaimedOverride::Refused(_)));
+        assert!(matches!(
+            claimed_override_decision(true, Some("r1"), true),
+            ClaimedOverride::Refused(_)
+        ));
+        assert!(matches!(
+            claimed_override_decision(true, None, false),
+            ClaimedOverride::Refused(_)
+        ));
     }
 }
 

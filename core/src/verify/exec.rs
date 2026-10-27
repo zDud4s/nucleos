@@ -384,10 +384,8 @@ impl Executor {
     /// Computed here, from the stored state, rather than when the unit is queued: crash recovery
     /// and bisect probes run units the tick that queued them never saw.
     async fn gate_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
-        let (
-            verify_runs::REQUESTED_BY_POSTGATE | verify_runs::REQUESTED_BY_PROBE,
-            Some(project),
-        ) = (claimed.requested_by.as_str(), claimed.project_id.as_deref())
+        let (verify_runs::REQUESTED_BY_POSTGATE | verify_runs::REQUESTED_BY_PROBE, Some(project)) =
+            (claimed.requested_by.as_str(), claimed.project_id.as_deref())
         else {
             return Vec::new();
         };
@@ -696,7 +694,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let wt = tempfile::tempdir().unwrap();
         let ex = executor(2, root.path()).await;
-        for argv in [["git", "--version"], ["git", "definitely-not-a-git-subcommand"]] {
+        for argv in [
+            ["git", "--version"],
+            ["git", "definitely-not-a-git-subcommand"],
+        ] {
             let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
             assert_eq!(ex.start_ready().await, 1);
             let state = wait_terminal(&ex, submitted.id).await;

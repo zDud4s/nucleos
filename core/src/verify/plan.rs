@@ -267,10 +267,7 @@ pub fn plan_groups(map: &MapState, kind: Kind, names: &[String]) -> Result<Plan,
                     None,
                 ),
                 (Some(group), Kind::Check) => match group.check.as_deref() {
-                    Some(check) => (
-                        crate::gate::split_command(check).unwrap_or_default(),
-                        None,
-                    ),
+                    Some(check) => (crate::gate::split_command(check).unwrap_or_default(), None),
                     None => (
                         Vec::new(),
                         Some("this group has no `check` command".to_string()),
@@ -829,18 +826,27 @@ tests:
             files: ["core/a.rs".to_owned()].into(),
         });
         let ticket = assemble(&request(vec![unit("core", Some(2))]), &live(vec![failed]));
-        assert_eq!(ticket.units[0].failed_tests.as_deref(), Some(&["a::boom".to_owned()][..]));
+        assert_eq!(
+            ticket.units[0].failed_tests.as_deref(),
+            Some(&["a::boom".to_owned()][..])
+        );
         assert_eq!(ticket.units[0].failed_files, ["core/a.rs"]);
         assert!(ticket.inherited_task_ids.is_empty());
         let json = serde_json::to_value(&ticket.units[0]).unwrap();
         for absent in ["inherited", "pending", "not_inherited"] {
-            assert!(json.get(absent).is_none(), "{absent} must be absent: {json}");
+            assert!(
+                json.get(absent).is_none(),
+                "{absent} must be absent: {json}"
+            );
         }
         let json = serde_json::to_value(&ticket).unwrap();
         assert!(json.get("inherited_task_ids").is_none(), "{json}");
 
         // A passed unit never reports ids.
-        let passed = assemble(&request(vec![unit("core", Some(3))]), &live(vec![state(3, STATUS_PASSED)]));
+        let passed = assemble(
+            &request(vec![unit("core", Some(3))]),
+            &live(vec![state(3, STATUS_PASSED)]),
+        );
         assert_eq!(passed.units[0].failed_tests, None);
     }
 

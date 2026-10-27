@@ -4,8 +4,10 @@ use super::*;
 
 #[tool_router(router = task_tools, vis = "pub(super)")]
 impl NucleosTools {
-    #[tool(description = "List the live tasks of this project with owner and age. Check it before fixing \
-                          anything outside your own task.")]
+    #[tool(
+        description = "List the live tasks of this project with owner and age. Check it before fixing \
+                          anything outside your own task."
+    )]
     pub(super) async fn task_list(
         &self,
         Parameters(TaskListParams { session_id }): Parameters<TaskListParams>,
@@ -17,9 +19,11 @@ impl NucleosTools {
         )
     }
 
-    #[tool(description = "Claim a task by key before fixing something that is not yours (a red master, a \
+    #[tool(
+        description = "Claim a task by key before fixing something that is not yours (a red master, a \
                           failing test). Returns {won, task, holder, similar}. If won is false another \
-                          owner has it: do not fix it, carry on with your own work.")]
+                          owner has it: do not fix it, carry on with your own work."
+    )]
     pub(super) async fn task_claim(
         &self,
         Parameters(TaskClaimParams {
@@ -38,7 +42,9 @@ impl NucleosTools {
         )
     }
 
-    #[tool(description = "Give a claimed task back (status open) when you cannot finish it. note says why.")]
+    #[tool(
+        description = "Give a claimed task back (status open) when you cannot finish it. note says why."
+    )]
     pub(super) async fn task_release(
         &self,
         Parameters(TaskCloseParams {

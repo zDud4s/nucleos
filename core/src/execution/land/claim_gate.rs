@@ -66,7 +66,9 @@ impl From<&TaskRow> for Guard {
             key: row.key.as_str().to_owned(),
             holder_label: format!(
                 "{} {id}",
-                row.holder_kind.map(|k| format!("{k:?}").to_lowercase()).unwrap_or_default()
+                row.holder_kind
+                    .map(|k| format!("{k:?}").to_lowercase())
+                    .unwrap_or_default()
             ),
             holder_kind: row.holder_kind,
             holder_id: id,
@@ -82,7 +84,11 @@ fn same_path(a: &str, b: &str) -> bool {
     let fold = |p: &str| {
         let p = p.replace('\\', "/");
         let p = p.trim_end_matches('/');
-        if cfg!(windows) { p.to_lowercase() } else { p.to_owned() }
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p.to_owned()
+        }
     };
     !a.is_empty() && fold(a) == fold(b)
 }
@@ -98,7 +104,10 @@ fn path_within(child: &str, root: &str) -> bool {
         return false;
     }
     let (child, root) = (fold(child), fold(root));
-    child == root || child.strip_prefix(&root).is_some_and(|rest| rest.starts_with('/'))
+    child == root
+        || child
+            .strip_prefix(&root)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The guards `landing` is not entitled to cross: the owner (the worktree that holds the branch is
@@ -217,7 +226,10 @@ pub async fn check(
         // (`override_recorded` is true only for an `override_land` event after the current
         // `claimed_at`, so a new owner's claim is not covered by an old override). A read error
         // means "not recorded": the landing is refused, the safe side.
-        if task_claims::store::override_recorded(pool, guard.id, &note).await.unwrap_or(false) {
+        if task_claims::store::override_recorded(pool, guard.id, &note)
+            .await
+            .unwrap_or(false)
+        {
             continue;
         }
         still.push(guard);
@@ -274,10 +286,19 @@ pub async fn refusal_for_op(
     if integration.is_none_or(|branch| branch.as_str() != target.as_str()) {
         return None;
     }
-    let landing = Landing { project_id, project_root, source, target, exempt: from_resolution || matches!(origin, Origin::Daemon), run_id };
+    let landing = Landing {
+        project_id,
+        project_root,
+        source,
+        target,
+        exempt: from_resolution || matches!(origin, Origin::Daemon),
+        run_id,
+    };
     let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
     match check(pool, &landing, false, deadline, Utc::now()).await {
-        Verdict::Refused(message) => Some(format!("refused when the queue came to run it: {message}")),
+        Verdict::Refused(message) => {
+            Some(format!("refused when the queue came to run it: {message}"))
+        }
         _ => None,
     }
 }
@@ -305,7 +326,11 @@ mod pure_tests {
         // Slashes and a trailing separator never matter, on any platform.
         assert!(blocking(&guards, Some("C:\\Work\\Repo-wt\\"), None).is_empty());
         assert_eq!(blocking(&guards, Some("C:/Work/Other"), None).len(), 1);
-        assert_eq!(blocking(&guards, None, None).len(), 1, "no worktree, no ownership");
+        assert_eq!(
+            blocking(&guards, None, None).len(),
+            1,
+            "no worktree, no ownership"
+        );
         // Case folds only where the filesystem does (`same_path`): on Linux `Repo-wt` and
         // `repo-wt` are two directories.
         #[cfg(windows)]
@@ -316,7 +341,12 @@ mod pure_tests {
 
     #[test]
     fn a_holder_worktree_beneath_the_branchs_worktree_is_the_owner_too() {
-        let guards = [guard(1, HolderKind::Session, "s1", "C:/Work/Repo-wt/sub/dir")];
+        let guards = [guard(
+            1,
+            HolderKind::Session,
+            "s1",
+            "C:/Work/Repo-wt/sub/dir",
+        )];
         assert!(blocking(&guards, Some("C:\\Work\\Repo-wt\\"), None).is_empty());
         // A sibling that merely shares the prefix is a stranger.
         let sibling = [guard(2, HolderKind::Session, "s1", "C:/Work/Repo-wt2")];
@@ -338,9 +368,18 @@ mod pure_tests {
         let guards = [guard(12, HolderKind::Session, "s1", "C:/x")];
         let refs: Vec<&Guard> = guards.iter().collect();
         let message = refusal_message(&refs);
-        assert!(message.contains("#12") && message.contains("file:f12.rs"), "{message}");
+        assert!(
+            message.contains("#12") && message.contains("file:f12.rs"),
+            "{message}"
+        );
         assert!(message.contains("session s1"), "{message}");
-        assert!(message.contains("culprit.rs"), "hints are shown, not enforced: {message}");
-        assert!(!message.to_uppercase().contains("NUCLEOS_ALLOW"), "{message}");
+        assert!(
+            message.contains("culprit.rs"),
+            "hints are shown, not enforced: {message}"
+        );
+        assert!(
+            !message.to_uppercase().contains("NUCLEOS_ALLOW"),
+            "{message}"
+        );
     }
 }

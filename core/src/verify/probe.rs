@@ -57,7 +57,12 @@ pub(super) async fn master_head(
     deadline: Instant,
 ) -> Result<String, String> {
     let branch = land::integration_branch(pool, project_id, project_root, deadline).await?;
-    resolve::resolve_commit(project_root, &format!("refs/heads/{}", branch.as_str()), deadline).await
+    resolve::resolve_commit(
+        project_root,
+        &format!("refs/heads/{}", branch.as_str()),
+        deadline,
+    )
+    .await
 }
 
 /// How a proof ended; kept per ticket so a ticket never repeats a proof it already has the answer to.
@@ -77,7 +82,10 @@ pub struct ProbeOutcome {
 
 impl ProbeOutcome {
     pub fn of(request: &verify_store::RequestRow) -> Option<ProbeOutcome> {
-        request.probe_outcome.as_deref().and_then(|raw| serde_json::from_str(raw).ok())
+        request
+            .probe_outcome
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
     }
 
     /// What the unit is told.
@@ -110,23 +118,34 @@ struct ProbeMark {
     at: Instant,
 }
 
-static PASSES: LazyLock<Mutex<HashMap<(String, String), ProbeMark>>> = LazyLock::new(Default::default);
+static PASSES: LazyLock<Mutex<HashMap<(String, String), ProbeMark>>> =
+    LazyLock::new(Default::default);
 
 pub(super) fn remember_pass(project_id: &str, sha: &str, groups: &[String], at: Instant) {
-    let mut passes = PASSES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut passes = PASSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     passes.retain(|_, mark| at.saturating_duration_since(mark.at) <= PASS_TTL);
     let mark = passes
         .entry((project_id.to_owned(), sha.to_owned()))
-        .or_insert_with(|| ProbeMark { groups: BTreeSet::new(), at });
+        .or_insert_with(|| ProbeMark {
+            groups: BTreeSet::new(),
+            at,
+        });
     mark.groups.extend(groups.iter().cloned());
     mark.at = at;
 }
 
 pub(super) fn passed_recently(project_id: &str, sha: &str, groups: &[String], at: Instant) -> bool {
-    let passes = PASSES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    passes.get(&(project_id.to_owned(), sha.to_owned())).is_some_and(|mark| {
-        at.saturating_duration_since(mark.at) <= PASS_TTL && groups.iter().all(|g| mark.groups.contains(g))
-    })
+    let passes = PASSES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    passes
+        .get(&(project_id.to_owned(), sha.to_owned()))
+        .is_some_and(|mark| {
+            at.saturating_duration_since(mark.at) <= PASS_TTL
+                && groups.iter().all(|g| mark.groups.contains(g))
+        })
 }
 
 // ---- single flight inside the process -------------------------------------------------------------
@@ -139,20 +158,26 @@ struct ActiveGuard(i64);
 
 impl ActiveGuard {
     fn enter(task_id: i64) -> Option<ActiveGuard> {
-        let mut active = ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = ACTIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         active.insert(task_id).then_some(ActiveGuard(task_id))
     }
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&self.0);
+        ACTIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
     }
 }
 
 /// One proof per project at a time, held until its units are over. A lapsed lease can let a second
 /// proof start while the first still runs; it then waits here, so the tree is never reset under a unit.
-static TREES: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+static TREES: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Default::default);
 
 fn tree_lock(project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     TREES
@@ -170,7 +195,10 @@ pub(super) enum What {
     Groups(Vec<String>),
     /// Case 3: the incident's red tests -- by the files that hold them when those still exist at the
     /// master head, else by group, else (only `gate_command`) the whole gate.
-    Incident { guard_paths: Vec<String>, red_groups: Vec<String> },
+    Incident {
+        guard_paths: Vec<String>,
+        red_groups: Vec<String>,
+    },
 }
 
 pub(super) struct Proof {
@@ -184,8 +212,18 @@ pub(super) struct Proof {
 }
 
 pub(super) enum ProofJob {
-    Probe { project_id: String, project_root: PathBuf, task_id: i64, ticket_id: i64, groups: Vec<String> },
-    Reprobe { project_id: String, project_root: PathBuf, task: TaskRow },
+    Probe {
+        project_id: String,
+        project_root: PathBuf,
+        task_id: i64,
+        ticket_id: i64,
+        groups: Vec<String>,
+    },
+    Reprobe {
+        project_id: String,
+        project_root: PathBuf,
+        task: TaskRow,
+    },
 }
 
 impl ProofJob {
@@ -199,16 +237,34 @@ impl ProofJob {
 
 /// Launches a proof unless this process already runs one for the task. Returns whether it did.
 pub(super) fn spawn_proof(executor: Arc<Executor>, job: ProofJob) -> bool {
-    let Some(guard) = ActiveGuard::enter(job.task_id()) else { return false };
+    let Some(guard) = ActiveGuard::enter(job.task_id()) else {
+        return false;
+    };
     tokio::spawn(async move {
         let _guard = guard;
         match job {
-            ProofJob::Probe { project_id, project_root, task_id, ticket_id, groups } => {
-                run_probe(&executor, &project_id, &project_root, task_id, ticket_id, groups).await
+            ProofJob::Probe {
+                project_id,
+                project_root,
+                task_id,
+                ticket_id,
+                groups,
+            } => {
+                run_probe(
+                    &executor,
+                    &project_id,
+                    &project_root,
+                    task_id,
+                    ticket_id,
+                    groups,
+                )
+                .await
             }
-            ProofJob::Reprobe { project_id, project_root, task } => {
-                run_reprobe(&executor, &project_id, &project_root, task).await
-            }
+            ProofJob::Reprobe {
+                project_id,
+                project_root,
+                task,
+            } => run_reprobe(&executor, &project_id, &project_root, task).await,
         }
     });
     true
@@ -236,10 +292,21 @@ impl Step {
 /// `gate_command` among the red groups, or no handle at all, means the whole gate.
 fn plan_proof(what: What, exists: impl Fn(&str) -> bool) -> Vec<Step> {
     match what {
-        What::Groups(groups) => vec![Step { scope: ScopeArg::Own, files: None, groups: Some(groups) }],
-        What::Incident { guard_paths, red_groups } => {
+        What::Groups(groups) => vec![Step {
+            scope: ScopeArg::Own,
+            files: None,
+            groups: Some(groups),
+        }],
+        What::Incident {
+            guard_paths,
+            red_groups,
+        } => {
             if red_groups.iter().any(|g| g == GATE_UNIT) {
-                return vec![Step { scope: ScopeArg::Full, files: None, groups: None }];
+                return vec![Step {
+                    scope: ScopeArg::Full,
+                    files: None,
+                    groups: None,
+                }];
             }
             let existing: Vec<String> = guard_paths.into_iter().filter(|p| exists(p)).collect();
             let mut named: Vec<String> = Vec::new();
@@ -250,13 +317,25 @@ fn plan_proof(what: What, exists: impl Fn(&str) -> bool) -> Vec<Step> {
             }
             let mut steps = Vec::new();
             if !existing.is_empty() {
-                steps.push(Step { scope: ScopeArg::Own, files: Some(existing), groups: None });
+                steps.push(Step {
+                    scope: ScopeArg::Own,
+                    files: Some(existing),
+                    groups: None,
+                });
             }
             if !named.is_empty() {
-                steps.push(Step { scope: ScopeArg::Own, files: None, groups: Some(named) });
+                steps.push(Step {
+                    scope: ScopeArg::Own,
+                    files: None,
+                    groups: Some(named),
+                });
             }
             if steps.is_empty() {
-                steps.push(Step { scope: ScopeArg::Full, files: None, groups: None });
+                steps.push(Step {
+                    scope: ScopeArg::Full,
+                    files: None,
+                    groups: None,
+                });
             }
             steps
         }
@@ -265,7 +344,12 @@ fn plan_proof(what: What, exists: impl Fn(&str) -> bool) -> Vec<Step> {
 
 /// A unit that really measured something: it passed (or reused a green), or it failed.
 fn measured(status: &str) -> bool {
-    matches!(status, verify_runs::STATUS_PASSED | verify_runs::STATUS_FAILED | verify_runs::STATUS_SKIPPED_CACHED)
+    matches!(
+        status,
+        verify_runs::STATUS_PASSED
+            | verify_runs::STATUS_FAILED
+            | verify_runs::STATUS_SKIPPED_CACHED
+    )
 }
 
 /// Whether the ticket's units can answer the proof. With `named` groups, each one must have a unit
@@ -273,9 +357,11 @@ fn measured(status: &str) -> bool {
 /// A ticket where nothing ran (all skipped, none selected) answers nothing.
 fn answered(units: &[UnitReport], named: Option<&[String]>) -> bool {
     match named {
-        Some(names) => names
-            .iter()
-            .all(|name| units.iter().any(|u| u.group.as_deref() == Some(name.as_str()) && measured(&u.status))),
+        Some(names) => names.iter().all(|name| {
+            units
+                .iter()
+                .any(|u| u.group.as_deref() == Some(name.as_str()) && measured(&u.status))
+        }),
         None => units.iter().any(|u| measured(&u.status)),
     }
 }
@@ -311,7 +397,12 @@ pub(super) async fn prove(
             Ok(id) => ticket_ids.push(id),
             Err(error) => {
                 for id in &ticket_ids {
-                    let _ = verify::cancel_queued_units(&executor.pool, *id, "the proof could not start").await;
+                    let _ = verify::cancel_queued_units(
+                        &executor.pool,
+                        *id,
+                        "the proof could not start",
+                    )
+                    .await;
                 }
                 return Err(error.message().to_owned());
             }
@@ -342,7 +433,10 @@ pub(super) async fn prove(
                         Some(ids) => proof.failures.tests.extend(ids.iter().cloned()),
                         None => proof.ids_missing = true,
                     }
-                    proof.failures.files.extend(unit.failed_files.iter().cloned());
+                    proof
+                        .failures
+                        .files
+                        .extend(unit.failed_files.iter().cloned());
                 }
                 verify_runs::STATUS_ERRORED | "unknown" => {
                     return Err(format!("a proof unit ended {}", unit.status));
@@ -371,17 +465,27 @@ async fn settle_units(executor: &Arc<Executor>, ticket_ids: &[i64]) -> Result<Ve
             let read = verify::read_ticket_with(&executor.pool, None, ticket_id, false)
                 .await
                 .map_err(|error| error.to_string())?;
-            let Some((ticket, _)) = read else { return Err(format!("proof ticket {ticket_id} vanished")) };
+            let Some((ticket, _)) = read else {
+                return Err(format!("proof ticket {ticket_id} vanished"));
+            };
             tickets.push(ticket);
         }
         if tickets.iter().all(|ticket| ticket.done) {
-            return if cancelled { Err("the proof ran out of time".to_owned()) } else { Ok(tickets) };
+            return if cancelled {
+                Err("the proof ran out of time".to_owned())
+            } else {
+                Ok(tickets)
+            };
         }
         let elapsed = started.elapsed();
         if elapsed >= QUEUE_BUDGET && !cancelled {
             for &ticket_id in ticket_ids {
-                if let Err(error) =
-                    verify::cancel_queued_units(&executor.pool, ticket_id, "the proof ran out of time").await
+                if let Err(error) = verify::cancel_queued_units(
+                    &executor.pool,
+                    ticket_id,
+                    "the proof ran out of time",
+                )
+                .await
                 {
                     tracing::warn!(%error, ticket_id, "verify probe: cannot cancel the queued units");
                 }
@@ -404,7 +508,13 @@ async fn run_probe(
     ticket_id: i64,
     groups: Vec<String>,
 ) {
-    let proved = prove(executor, project_id, project_root, What::Groups(groups.clone())).await;
+    let proved = prove(
+        executor,
+        project_id,
+        project_root,
+        What::Groups(groups.clone()),
+    )
+    .await;
     let (result, failed, passed_head) = match &proved {
         Ok(proof) if proof.any_failed => (
             ProbeResult::Failed,
@@ -431,12 +541,23 @@ async fn run_probe(
     // `None` deletes the probing row (passed, or aborted: either way nothing is proven red).
     // The ticket is passed so a stale probe can never settle another ticket's live probe
     // (chunk 1, Task 8: a foreign probe comes back untouched, still `probing`).
-    let settled = store::finish_probe(&executor.pool, task_id, &ticket_id.to_string(), failed, Utc::now()).await;
+    let settled = store::finish_probe(
+        &executor.pool,
+        task_id,
+        &ticket_id.to_string(),
+        failed,
+        Utc::now(),
+    )
+    .await;
     match settled {
         // Another ticket's proof holds the row: this result says nothing about the task, so
         // neither the answer nor the pass is recorded (the store doc: conclude nothing).
         Ok(Some(row)) if row.status == Status::Probing => {
-            tracing::warn!(task_id, ticket_id, "verify probe: the probing row belongs to another proof; nothing concluded");
+            tracing::warn!(
+                task_id,
+                ticket_id,
+                "verify probe: the probing row belongs to another proof; nothing concluded"
+            );
         }
         Ok(_) => {
             if let Some(head) = passed_head {
@@ -444,7 +565,8 @@ async fn run_probe(
             }
             let outcome = ProbeOutcome { task_id, result };
             if let Ok(json) = serde_json::to_string(&outcome)
-                && let Err(error) = verify_store::set_probe_outcome(&executor.pool, ticket_id, &json).await
+                && let Err(error) =
+                    verify_store::set_probe_outcome(&executor.pool, ticket_id, &json).await
             {
                 tracing::warn!(%error, ticket_id, "verify probe: cannot record the outcome");
             }
@@ -456,7 +578,12 @@ async fn run_probe(
 }
 
 /// Case 3's proof: the incident's red tests on the master head.
-async fn run_reprobe(executor: &Arc<Executor>, project_id: &str, project_root: &Path, task: TaskRow) {
+async fn run_reprobe(
+    executor: &Arc<Executor>,
+    project_id: &str,
+    project_root: &Path,
+    task: TaskRow,
+) {
     let red_tests = detail_strings(&task.detail, "red_tests");
     let what = What::Incident {
         guard_paths: task.guard_paths.clone(),
@@ -470,16 +597,21 @@ async fn run_reprobe(executor: &Arc<Executor>, project_id: &str, project_root: &
             let still_red = proof.any_failed
                 && (red_tests.is_empty()
                     || proof.ids_missing
-                    || red_tests.iter().any(|test| proof.failures.tests.contains(test)));
+                    || red_tests
+                        .iter()
+                        .any(|test| proof.failures.tests.contains(test)));
             if let Err(error) =
-                store::finish_reprobe(&executor.pool, task.id, &proof.head, still_red, Utc::now()).await
+                store::finish_reprobe(&executor.pool, task.id, &proof.head, still_red, Utc::now())
+                    .await
             {
                 tracing::warn!(%error, task = task.id, "verify probe: cannot settle the re-proof");
             }
         }
         // No `finish_reprobe`: the flight lapses by itself and a later read repeats the proof, at
         // most once per PROBE_LEASE_SECONDS. An inconclusive proof (nothing ran) never closes it.
-        Err(error) => tracing::warn!(%error, task = task.id, "verify probe: the re-proof did not finish"),
+        Err(error) => {
+            tracing::warn!(%error, task = task.id, "verify probe: the re-proof did not finish")
+        }
     }
 }
 
@@ -493,19 +625,46 @@ mod tests {
         let groups = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
         remember_pass("proj-pass-test", "sha1", &groups(&["py", "core"]), t0);
 
-        assert!(passed_recently("proj-pass-test", "sha1", &groups(&["py"]), t0 + Duration::from_secs(5)));
-        assert!(passed_recently("proj-pass-test", "sha1", &groups(&["core", "py"]), t0));
-        assert!(!passed_recently("proj-pass-test", "sha1", &groups(&["py", "other"]), t0), "an unproved group");
-        assert!(!passed_recently("proj-pass-test", "sha2", &groups(&["py"]), t0), "another master head");
-        assert!(!passed_recently("other-proj", "sha1", &groups(&["py"]), t0), "another project");
-        assert!(!passed_recently("proj-pass-test", "sha1", &groups(&["py"]), t0 + PASS_TTL + Duration::from_secs(1)));
+        assert!(passed_recently(
+            "proj-pass-test",
+            "sha1",
+            &groups(&["py"]),
+            t0 + Duration::from_secs(5)
+        ));
+        assert!(passed_recently(
+            "proj-pass-test",
+            "sha1",
+            &groups(&["core", "py"]),
+            t0
+        ));
+        assert!(
+            !passed_recently("proj-pass-test", "sha1", &groups(&["py", "other"]), t0),
+            "an unproved group"
+        );
+        assert!(
+            !passed_recently("proj-pass-test", "sha2", &groups(&["py"]), t0),
+            "another master head"
+        );
+        assert!(
+            !passed_recently("other-proj", "sha1", &groups(&["py"]), t0),
+            "another project"
+        );
+        assert!(!passed_recently(
+            "proj-pass-test",
+            "sha1",
+            &groups(&["py"]),
+            t0 + PASS_TTL + Duration::from_secs(1)
+        ));
     }
 
     #[test]
     fn a_whole_proof_ends_inside_the_probe_lease_with_a_margin() {
         let lease = Duration::from_secs(PROBE_LEASE_SECONDS as u64);
         let worst = GIT_BUDGET + QUEUE_BUDGET + UNIT_TIMEOUT + SETTLE_GRACE;
-        assert!(worst + Duration::from_secs(30) <= lease, "git + queue + unit + settle = {worst:?}, lease {lease:?}");
+        assert!(
+            worst + Duration::from_secs(30) <= lease,
+            "git + queue + unit + settle = {worst:?}, lease {lease:?}"
+        );
     }
 
     #[test]
@@ -545,46 +704,89 @@ mod tests {
     #[test]
     fn a_ticket_where_nothing_ran_answers_nothing() {
         assert!(!answered(&[], None), "no unit selected");
-        assert!(!answered(&[unit(Some("core"), "skipped")], None), "all skipped");
-        assert!(answered(&[unit(Some("core"), "skipped"), unit(Some("py"), "passed")], None));
+        assert!(
+            !answered(&[unit(Some("core"), "skipped")], None),
+            "all skipped"
+        );
+        assert!(answered(
+            &[unit(Some("core"), "skipped"), unit(Some("py"), "passed")],
+            None
+        ));
         assert!(answered(&[unit(Some("core"), "failed")], None));
     }
 
     #[test]
     fn a_skipped_or_missing_named_group_is_not_a_pass() {
         let wanted = names(&["core", "py"]);
-        assert!(!answered(&[unit(Some("core"), "passed")], Some(wanted.as_slice())), "py is missing");
-        assert!(!answered(&[unit(Some("core"), "passed"), unit(Some("py"), "skipped")], Some(wanted.as_slice())));
-        assert!(answered(&[unit(Some("core"), "passed"), unit(Some("py"), "failed")], Some(wanted.as_slice())));
+        assert!(
+            !answered(&[unit(Some("core"), "passed")], Some(wanted.as_slice())),
+            "py is missing"
+        );
+        assert!(!answered(
+            &[unit(Some("core"), "passed"), unit(Some("py"), "skipped")],
+            Some(wanted.as_slice())
+        ));
+        assert!(answered(
+            &[unit(Some("core"), "passed"), unit(Some("py"), "failed")],
+            Some(wanted.as_slice())
+        ));
     }
 
     #[test]
     fn an_incident_is_re_proved_by_its_guard_files_and_its_red_groups() {
         let steps = plan_proof(
-            What::Incident { guard_paths: names(&["a.rs", "gone.rs"]), red_groups: names(&["core", "py", "core"]) },
+            What::Incident {
+                guard_paths: names(&["a.rs", "gone.rs"]),
+                red_groups: names(&["core", "py", "core"]),
+            },
             |p| p == "a.rs",
         );
         assert_eq!(
             steps,
             vec![
-                Step { scope: ScopeArg::Own, files: Some(names(&["a.rs"])), groups: None },
-                Step { scope: ScopeArg::Own, files: None, groups: Some(names(&["core", "py"])) },
+                Step {
+                    scope: ScopeArg::Own,
+                    files: Some(names(&["a.rs"])),
+                    groups: None
+                },
+                Step {
+                    scope: ScopeArg::Own,
+                    files: None,
+                    groups: Some(names(&["core", "py"]))
+                },
             ]
         );
     }
 
     #[test]
     fn a_gate_command_red_group_is_never_dropped_and_runs_the_whole_gate() {
-        let full = vec![Step { scope: ScopeArg::Full, files: None, groups: None }];
-        let with_gate = What::Incident { guard_paths: names(&["a.rs"]), red_groups: names(&["core", GATE_UNIT]) };
+        let full = vec![Step {
+            scope: ScopeArg::Full,
+            files: None,
+            groups: None,
+        }];
+        let with_gate = What::Incident {
+            guard_paths: names(&["a.rs"]),
+            red_groups: names(&["core", GATE_UNIT]),
+        };
         assert_eq!(plan_proof(with_gate, |_| true), full);
-        let nothing = What::Incident { guard_paths: names(&["gone.rs"]), red_groups: Vec::new() };
+        let nothing = What::Incident {
+            guard_paths: names(&["gone.rs"]),
+            red_groups: Vec::new(),
+        };
         assert_eq!(plan_proof(nothing, |_| false), full);
     }
 
     #[test]
     fn case_two_runs_exactly_its_groups() {
         let steps = plan_proof(What::Groups(names(&["core"])), |_| false);
-        assert_eq!(steps, vec![Step { scope: ScopeArg::Own, files: None, groups: Some(names(&["core"])) }]);
+        assert_eq!(
+            steps,
+            vec![Step {
+                scope: ScopeArg::Own,
+                files: None,
+                groups: Some(names(&["core"]))
+            }]
+        );
     }
 }

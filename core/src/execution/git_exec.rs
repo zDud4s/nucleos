@@ -2258,8 +2258,12 @@ gate_command: git --version
         );
 
         // Dirty, then re-prepared: the same directory, reset.
-        std::fs::write(probe.join("litter.txt"), "left behind
-").expect("write");
+        std::fs::write(
+            probe.join("litter.txt"),
+            "left behind
+",
+        )
+        .expect("write");
         let again = prepare_probe_worktree(&repo, &feature, deadline())
             .await
             .expect("re-prepare");

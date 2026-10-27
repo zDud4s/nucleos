@@ -60,7 +60,8 @@ pub fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
             ScopeVerdict::Measured(GateOutcome::Failed { exit_code, output })
         }
         Some("inherited") => ScopeVerdict::Measured(GateOutcome::Errored {
-            reason: "every red unit is inherited from a master incident; wait for it to close".to_owned(),
+            reason: "every red unit is inherited from a master incident; wait for it to close"
+                .to_owned(),
         }),
         other => ScopeVerdict::Measured(GateOutcome::Errored {
             reason: format!(

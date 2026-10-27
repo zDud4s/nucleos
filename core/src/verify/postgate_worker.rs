@@ -718,7 +718,8 @@ async fn handle_red(
             };
         }
         let status = ticket.verdict.as_deref().unwrap_or("");
-        if matches!(phase, RedPhase::FlakeCheck) && verify_flaky::rerun_verdict(status) != Rerun::Flaky
+        if matches!(phase, RedPhase::FlakeCheck)
+            && verify_flaky::rerun_verdict(status) != Rerun::Flaky
         {
             // Confirmed (spec §3 Postgate): open the incident now, with what the failing units
             // named. A crash before `begin_bisect` repeats this on the next pass: the ticket is
@@ -855,7 +856,8 @@ async fn bisect_step(
     deadline: Instant,
 ) -> Step {
     let pool = &executor.pool;
-    if let Err(reason) = incident::ensure_incident(pool, project_id, project_root, state, None).await
+    if let Err(reason) =
+        incident::ensure_incident(pool, project_id, project_root, state, None).await
     {
         tracing::warn!(project = project_id, %reason, "postgate: cannot open the incident");
     }
@@ -864,15 +866,30 @@ async fn bisect_step(
         also_suspect: Vec::new(),
     };
     let Some(base) = state.red_base_sha.as_deref() else {
-        return report_red(executor, project_id, project_root, state, red_sha, inconclusive()).await;
+        return report_red(
+            executor,
+            project_id,
+            project_root,
+            state,
+            red_sha,
+            inconclusive(),
+        )
+        .await;
     };
     let commits = match git_exec::first_parent_commits(project_root, base, red_sha, deadline).await
     {
         Ok(commits) => commits,
         Err(reason) => {
             tracing::warn!(project = project_id, %reason, "postgate: cannot list the range");
-            return report_red(executor, project_id, project_root, state, red_sha, inconclusive())
-                .await;
+            return report_red(
+                executor,
+                project_id,
+                project_root,
+                state,
+                red_sha,
+                inconclusive(),
+            )
+            .await;
         }
     };
     let mut bisection = Bisection::new(
@@ -923,16 +940,17 @@ async fn report_red(
 ) -> Step {
     let pool = &executor.pool;
     let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
-    let incident_row =
-        match incident::ensure_incident(pool, project_id, project_root, state, None).await {
-            Ok(row) => {
-                Some(incident::record_verdict(pool, row, project_root, &verdict, deadline).await)
-            }
-            Err(reason) => {
-                tracing::warn!(project = project_id, %reason, "postgate: cannot update the incident");
-                None
-            }
-        };
+    let incident_row = match incident::ensure_incident(pool, project_id, project_root, state, None)
+        .await
+    {
+        Ok(row) => {
+            Some(incident::record_verdict(pool, row, project_root, &verdict, deadline).await)
+        }
+        Err(reason) => {
+            tracing::warn!(project = project_id, %reason, "postgate: cannot update the incident");
+            None
+        }
+    };
     let base = state.red_base_sha.as_deref();
     let reverting = matches!(verdict, Verdict::Culprit { .. })
         && crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id)
@@ -1072,7 +1090,10 @@ pub async fn run_postgate_worker(executor: Arc<Executor>) {
                         project = %pass.project_id, %branch, "postgate: fix branch ready"
                     );
                 }
-                Step::IncidentTaken { incident, merge_sha } => {
+                Step::IncidentTaken {
+                    incident,
+                    merge_sha,
+                } => {
                     tracing::info!(
                         project = %pass.project_id, incident, %merge_sha,
                         "postgate: took over the incident"
@@ -1138,9 +1159,9 @@ mod tests {
     }
     use crate::config::VerifyConfig;
     use crate::execution::git_exec::tests::{WorktreeRootEnv, space_free_tempdir};
+    use crate::task_claims::{ClaimOutcome, Holder, HolderKind, Status};
     use crate::verify::exec::{self as verify_exec, Executor};
     use crate::verify::postgate as verify_postgate;
-    use crate::task_claims::{ClaimOutcome, Holder, HolderKind, Status};
     use crate::verify::runs::PRIORITY_POSTGATE;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, MutexGuard};
@@ -1947,17 +1968,43 @@ mod tests {
         let f = fixture(Some(REVERT_OFF)).await;
         let (c3, _c4) = confirmed_culprit(&f).await;
 
-        let row = incident(&f).await.expect("a confirmed red opens the incident");
-        assert_eq!(row.status, Status::Open, "without revert_on_red nobody claims it");
+        let row = incident(&f)
+            .await
+            .expect("a confirmed red opens the incident");
+        assert_eq!(
+            row.status,
+            Status::Open,
+            "without revert_on_red nobody claims it"
+        );
         assert_eq!(row.holder_kind, None);
-        let state = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
-        assert_eq!(row.detail["red_since_sha"], serde_json::json!(state.red_since_sha));
-        assert_eq!(row.detail["red_groups"], serde_json::json!(["gate_command"]));
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.detail["red_since_sha"],
+            serde_json::json!(state.red_since_sha)
+        );
+        assert_eq!(
+            row.detail["red_groups"],
+            serde_json::json!(["gate_command"])
+        );
         // The fixture's gate_command prints no test ids, so the runner gave none: empty, not guessed.
-        assert_eq!(row.detail["red_tests"], serde_json::json!([]), "this runner names no tests");
+        assert_eq!(
+            row.detail["red_tests"],
+            serde_json::json!([]),
+            "this runner names no tests"
+        );
         assert_eq!(row.detail["culprit_sha"], serde_json::json!(c3));
-        assert!(row.guard_paths.is_empty(), "no ids from the runner, so nothing to guard");
-        assert_eq!(row.hint_paths, vec!["a.txt".to_owned()], "the culprit's own files");
+        assert!(
+            row.guard_paths.is_empty(),
+            "no ids from the runner, so nothing to guard"
+        );
+        assert_eq!(
+            row.hint_paths,
+            vec!["a.txt".to_owned()],
+            "the culprit's own files"
+        );
 
         // Further passes neither duplicate it nor claim it.
         let _ = step_of(&f).await;
@@ -1973,7 +2020,10 @@ mod tests {
     async fn the_failing_tests_and_files_of_the_gate_ticket_reach_the_incident() {
         let f = fixture(Some(REVERT_OFF)).await;
         let (_c3, _c4) = red_until_probe(&f).await;
-        let state = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
         let named = incident::RedFailures {
             tests: vec!["core::a::boom".to_owned()],
             files: vec!["core/src/a.rs".to_owned()],
@@ -1981,16 +2031,28 @@ mod tests {
         let row = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, Some(&named))
             .await
             .unwrap();
-        assert_eq!(row.detail["red_tests"], serde_json::json!(["core::a::boom"]));
+        assert_eq!(
+            row.detail["red_tests"],
+            serde_json::json!(["core::a::boom"])
+        );
         assert_eq!(row.guard_paths, vec!["core/src/a.rs".to_owned()]);
 
         // A later pass that has no ids (the bisection's) keeps what the ticket named.
-        let again = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, None).await.unwrap();
+        let again = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, None)
+            .await
+            .unwrap();
         assert_eq!(again.id, row.id, "adopted, not duplicated");
-        assert_eq!(again.detail["red_tests"], serde_json::json!(["core::a::boom"]));
+        assert_eq!(
+            again.detail["red_tests"],
+            serde_json::json!(["core::a::boom"])
+        );
         assert_eq!(again.guard_paths, vec!["core/src/a.rs".to_owned()]);
         let stored = incident(&f).await.unwrap();
-        assert_eq!(stored.guard_paths, vec!["core/src/a.rs".to_owned()], "persisted, not only returned");
+        assert_eq!(
+            stored.guard_paths,
+            vec!["core/src/a.rs".to_owned()],
+            "persisted, not only returned"
+        );
     }
 
     #[tokio::test]
@@ -2002,7 +2064,11 @@ mod tests {
         .await;
         tokio::spawn(verify_exec::run_executor(f.ex.clone()));
         tick_until(&f, |s| matches!(s, Step::Red { .. })).await;
-        assert_eq!(count(&f.pool, "task_claims").await, 0, "an unconfirmed red is not an incident");
+        assert_eq!(
+            count(&f.pool, "task_claims").await,
+            0,
+            "an unconfirmed red is not an incident"
+        );
         git_in(&f.root, &["branch", "pass"]);
         tick_until(&f, |s| matches!(s, Step::Flaky(_))).await;
         assert_eq!(count(&f.pool, "task_claims").await, 0);
@@ -2044,7 +2110,9 @@ mod tests {
             id: "sess-1".to_owned(),
             worktree: "C:/wt/session".to_owned(),
         };
-        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now()).await.unwrap();
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+            .await
+            .unwrap();
         tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
         assert!(queue_rows(&f.pool).await.is_empty());
 
@@ -2054,7 +2122,10 @@ mod tests {
 
         lapse(&f.pool, row.id).await;
         let step = tick_until(&f, |s| matches!(s, Step::IncidentTaken { .. })).await;
-        assert!(matches!(&step, Step::IncidentTaken { incident, merge_sha } if *incident == row.id && *merge_sha == c3), "{step:?}");
+        assert!(
+            matches!(&step, Step::IncidentTaken { incident, merge_sha } if *incident == row.id && *merge_sha == c3),
+            "{step:?}"
+        );
         let taken = incident(&f).await.unwrap();
         assert_eq!(taken.holder_kind, Some(HolderKind::Postgate));
         let expired: i64 = sqlx::query_scalar(
@@ -2104,19 +2175,39 @@ mod tests {
         assert_eq!(row.status, Status::Open, "the gate let go of the incident");
         assert_eq!(row.detail["revert_failed_for"], serde_json::json!(c3));
         assert!(
-            feed_summaries(&f.pool).await.last().is_some_and(|line| line.contains("the revert conflicted")),
+            feed_summaries(&f.pool)
+                .await
+                .last()
+                .is_some_and(|line| line.contains("the revert conflicted")),
             "the owner is told"
         );
 
         // Still on: no second attempt for the same culprit, however many passes.
         for _ in 0..3 {
             let step = step_of(&f).await;
-            assert!(!matches!(step, Some(Step::IncidentTaken { .. } | Step::Reverting { .. })), "{step:?}");
+            assert!(
+                !matches!(
+                    step,
+                    Some(Step::IncidentTaken { .. } | Step::Reverting { .. })
+                ),
+                "{step:?}"
+            );
         }
-        assert_eq!(queue_rows(&f.pool).await.len(), 1, "only the request that failed");
+        assert_eq!(
+            queue_rows(&f.pool).await.len(),
+            1,
+            "only the request that failed"
+        );
         // Open means a session can have it.
-        let session = Holder { kind: HolderKind::Session, id: "sess-2".to_owned(), worktree: "C:/wt/two".to_owned() };
-        let won = crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now()).await.unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-2".to_owned(),
+            worktree: "C:/wt/two".to_owned(),
+        };
+        let won =
+            crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+                .await
+                .unwrap();
         assert!(matches!(won, ClaimOutcome::Won { .. }));
     }
 
@@ -2129,16 +2220,32 @@ mod tests {
         let (c3, _c4) = confirmed_culprit(&f).await;
         tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
 
-        assert!(incident::mark_revert_failed(&f.pool, "alpha", &c3, incident::RevertEnd::Failed).await);
-        assert!(verify_postgate::fail_revert(&f.pool, "alpha", &c3, "the revert conflicted").await.unwrap());
+        assert!(
+            incident::mark_revert_failed(&f.pool, "alpha", &c3, incident::RevertEnd::Failed).await
+        );
+        assert!(
+            verify_postgate::fail_revert(&f.pool, "alpha", &c3, "the revert conflicted")
+                .await
+                .unwrap()
+        );
         // Crash here: `settle_after_revert` (the release) never runs.
         let row = incident(&f).await.unwrap();
-        assert_eq!(row.holder_kind, Some(HolderKind::Postgate), "still the gate's claim");
+        assert_eq!(
+            row.holder_kind,
+            Some(HolderKind::Postgate),
+            "still the gate's claim"
+        );
         assert_eq!(row.detail["revert_failed_for"], serde_json::json!(c3));
 
         for _ in 0..3 {
             let step = step_of(&f).await;
-            assert!(!matches!(step, Some(Step::IncidentTaken { .. } | Step::Reverting { .. })), "{step:?}");
+            assert!(
+                !matches!(
+                    step,
+                    Some(Step::IncidentTaken { .. } | Step::Reverting { .. })
+                ),
+                "{step:?}"
+            );
         }
         assert_eq!(queue_rows(&f.pool).await.len(), 1, "only the first revert");
     }
@@ -2150,22 +2257,39 @@ mod tests {
     async fn a_revert_dropped_by_the_switch_going_off_resumes_when_the_switch_is_back_on() {
         let f = fixture(Some(REVERT_ON)).await;
         let (c3, _c4) = confirmed_culprit(&f).await;
-        crate::project::state::write_for_test(f._machine.path(), "alpha", crate::project::state::AUTOPILOT_FILE, REVERT_OFF);
+        crate::project::state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project::state::AUTOPILOT_FILE,
+            REVERT_OFF,
+        );
         tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
 
         let row = incident(&f).await.unwrap();
         assert_eq!(row.status, Status::Open, "the gate let go of the incident");
         assert_eq!(row.holder_kind, None);
-        assert!(row.detail.get("revert_failed_for").is_none(), "{:?}", row.detail);
+        assert!(
+            row.detail.get("revert_failed_for").is_none(),
+            "{:?}",
+            row.detail
+        );
         // Off: any number of passes change nothing.
         for _ in 0..2 {
             let _ = step_of(&f).await;
         }
         assert!(queue_rows(&f.pool).await.is_empty());
 
-        crate::project::state::write_for_test(f._machine.path(), "alpha", crate::project::state::AUTOPILOT_FILE, REVERT_ON);
+        crate::project::state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project::state::AUTOPILOT_FILE,
+            REVERT_ON,
+        );
         let step = tick_until(&f, |s| matches!(s, Step::IncidentTaken { .. })).await;
-        assert!(matches!(&step, Step::IncidentTaken { merge_sha, .. } if *merge_sha == c3), "{step:?}");
+        assert!(
+            matches!(&step, Step::IncidentTaken { merge_sha, .. } if *merge_sha == c3),
+            "{step:?}"
+        );
         tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
         assert_eq!(queue_rows(&f.pool).await.len(), 1, "exactly one revert");
     }
@@ -2177,23 +2301,43 @@ mod tests {
         let f = fixture(Some(REVERT_ON)).await;
         let (_c3, _c4) = red_until_probe(&f).await;
         let row = incident(&f).await.unwrap();
-        let session = Holder { kind: HolderKind::Session, id: "sess-1".to_owned(), worktree: "C:/wt/session".to_owned() };
-        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now()).await.unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+            .await
+            .unwrap();
         tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
         lapse(&f.pool, row.id).await;
 
         // Called with a tip the gate never attempted: nothing, though the claim has lapsed.
-        let state = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
-        let rules = crate::config::load_schedule_rules(f.ex.machine_root.as_deref(), "alpha").unwrap();
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let rules =
+            crate::config::load_schedule_rules(f.ex.machine_root.as_deref(), "alpha").unwrap();
         let stale_tip = "0000000000000000000000000000000000000001";
-        assert!(incident::takeover_step(&f.ex, "alpha", &f.root, &state, stale_tip, &rules).await.is_none());
+        assert!(
+            incident::takeover_step(&f.ex, "alpha", &f.root, &state, stale_tip, &rules)
+                .await
+                .is_none()
+        );
         assert!(queue_rows(&f.pool).await.is_empty());
 
         // And through the tick: the target moves on (a fix landed by hand) before the lapse is seen.
         let c5 = commit_file(&f.root, "d.txt", "d\n", "c5 moves the target");
         let step = step_of(&f).await;
-        assert!(!matches!(step, Some(Step::IncidentTaken { .. })), "{step:?}");
-        let after = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        assert!(
+            !matches!(step, Some(Step::IncidentTaken { .. })),
+            "{step:?}"
+        );
+        let after = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(after.revert_merge_sha, None);
         assert!(queue_rows(&f.pool).await.is_empty());
         assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c5);
@@ -2284,41 +2428,65 @@ mod tests {
         assert_eq!(row.status, Status::Claimed);
         assert_eq!(row.holder_kind, Some(HolderKind::Postgate));
         assert_eq!(row.holder_id.as_deref(), Some("alpha"));
-        let expected = verify_postgate::postgate_worktree(&f.root).to_string_lossy().into_owned();
+        let expected = verify_postgate::postgate_worktree(&f.root)
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             row.holder_worktree.as_deref(),
             Some(expected.as_str()),
             "the land gate recognises the gate's own landings by this worktree"
         );
-        let s = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
-        assert_eq!(s.revert_merge_sha.as_deref(), Some(c3.as_str()), "the revert did start");
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.revert_merge_sha.as_deref(),
+            Some(c3.as_str()),
+            "the revert did start"
+        );
 
         // Idempotent: another pass reclaims as the same holder without losing to itself.
         let step = step_of(&f).await;
         assert!(!matches!(step, Some(Step::Failed(_))), "{step:?}");
-        assert_eq!(incident(&f).await.unwrap().holder_id.as_deref(), Some("alpha"));
-        assert!(queue_rows(&f.pool).await.len() <= 1, "never a second revert");
+        assert_eq!(
+            incident(&f).await.unwrap().holder_id.as_deref(),
+            Some("alpha")
+        );
+        assert!(
+            queue_rows(&f.pool).await.len() <= 1,
+            "never a second revert"
+        );
     }
 
     #[tokio::test]
     async fn a_live_session_owner_stops_the_revert_and_the_feed_says_who_has_it() {
         let f = fixture(Some(REVERT_ON)).await;
         let (_c3, c4) = red_until_probe(&f).await;
-        let row = incident(&f).await.expect("the incident exists before the first probe");
+        let row = incident(&f)
+            .await
+            .expect("the incident exists before the first probe");
         let session = Holder {
             kind: HolderKind::Session,
             id: "sess-1".to_owned(),
             worktree: "C:/wt/session".to_owned(),
         };
-        let won = crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
-            .await
-            .unwrap();
+        let won =
+            crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+                .await
+                .unwrap();
         assert!(matches!(won, ClaimOutcome::Won { .. }));
 
         tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
 
-        let s = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
-        assert_eq!(s.revert_merge_sha, None, "a live owner means the daemon does not revert");
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.revert_merge_sha, None,
+            "a live owner means the daemon does not revert"
+        );
         assert!(queue_rows(&f.pool).await.is_empty());
         let lines = feed_summaries(&f.pool).await;
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -2335,15 +2503,29 @@ mod tests {
         let f = fixture(Some(REVERT_ON)).await;
         let (_c3, _c4) = red_until_probe(&f).await;
         let stale = incident(&f).await.expect("the incident");
-        let state = verify_postgate::load(&f.pool, "alpha").await.unwrap().unwrap();
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
         // The row goes away between `ensure_incident` and the claim (a green closing it and a purge
         // is the realistic cause; here it is deleted outright).
-        sqlx::query("DELETE FROM task_claim_events WHERE task_id = ?").bind(stale.id).execute(&f.pool).await.unwrap();
-        sqlx::query("DELETE FROM task_claims WHERE id = ?").bind(stale.id).execute(&f.pool).await.unwrap();
+        sqlx::query("DELETE FROM task_claim_events WHERE task_id = ?")
+            .bind(stale.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM task_claims WHERE id = ?")
+            .bind(stale.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
 
         let right = incident::claim_for_revert(&f.pool, "alpha", &f.root, &state, &stale).await;
 
-        assert!(matches!(right, incident::RevertRight::Mine), "the retry opened a fresh row and won it");
+        assert!(
+            matches!(right, incident::RevertRight::Mine),
+            "the retry opened a fresh row and won it"
+        );
         let fresh = incident(&f).await.expect("a new incident");
         assert_ne!(fresh.id, stale.id);
         assert_eq!(fresh.holder_id.as_deref(), Some("alpha"));
@@ -2355,20 +2537,30 @@ mod tests {
         let (_c3, _c4) = red_until_probe(&f).await;
         let row = incident(&f).await.expect("the incident");
         let now = chrono::Utc::now();
-        crate::task_claims::sessions::touch_session(&f.pool, "sess-1", "C:/wt/session", "alpha", now)
-            .await
-            .unwrap();
+        crate::task_claims::sessions::touch_session(
+            &f.pool,
+            "sess-1",
+            "C:/wt/session",
+            "alpha",
+            now,
+        )
+        .await
+        .unwrap();
         let session = Holder {
             kind: HolderKind::Session,
             id: "sess-1".to_owned(),
             worktree: "C:/wt/session".to_owned(),
         };
-        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, now).await.unwrap();
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, now)
+            .await
+            .unwrap();
         tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
 
         // The session fixes the target itself: a later commit goes green without a gate.
         let c5 = commit_file(&f.root, "d.txt", "d\n", "c5 the session's fix");
-        verify_postgate::mark_covered(&f.pool, "alpha", "main", &c5).await.unwrap();
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &c5)
+            .await
+            .unwrap();
         let _ = step_of(&f).await;
 
         assert!(incident(&f).await.is_none(), "the incident is closed");
@@ -2378,9 +2570,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "done");
-        let notices = crate::task_claims::sessions::take_notices(&f.pool, "sess-1", chrono::Utc::now())
-            .await
-            .unwrap();
+        let notices =
+            crate::task_claims::sessions::take_notices(&f.pool, "sess-1", chrono::Utc::now())
+                .await
+                .unwrap();
         assert!(
             matches!(notices.as_slice(), [crate::task_claims::Notice::IncidentClosed { sha, .. }] if sha.as_deref() == Some(c5.as_str())),
             "the owning session hears it: {notices:?}"
@@ -2392,7 +2585,9 @@ mod tests {
         let f = fixture(Some(REVERT_OFF)).await;
         let (_c3, _c4) = confirmed_culprit(&f).await;
         let root_commit = git_in(&f.root, &["rev-list", "--max-parents=0", "HEAD"]);
-        verify_postgate::mark_covered(&f.pool, "alpha", "main", &root_commit).await.unwrap();
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &root_commit)
+            .await
+            .unwrap();
         let _ = step_of(&f).await;
         assert!(
             incident(&f).await.is_some(),
@@ -2808,7 +3003,9 @@ mod tests {
     async fn opening_a_correction_run_does_not_touch_the_incident() {
         let f = correction_fixture().await;
         let pool = &f.state.pool;
-        let key = crate::task_claims::keys::normalize(crate::task_claims::MASTER_RED_KEY, Path::new("/")).unwrap();
+        let key =
+            crate::task_claims::keys::normalize(crate::task_claims::MASTER_RED_KEY, Path::new("/"))
+                .unwrap();
         let session = Holder {
             kind: HolderKind::Session,
             id: "sess-1".to_owned(),
@@ -2822,12 +3019,17 @@ mod tests {
             guard_paths: vec![],
             hint_paths: vec![],
         };
-        crate::task_claims::store::claim(pool, "alpha", new, &session, chrono::Utc::now()).await.unwrap();
+        crate::task_claims::store::claim(pool, "alpha", new, &session, chrono::Utc::now())
+            .await
+            .unwrap();
         let events_before = count(pool, "task_claim_events").await;
 
         assert_eq!(open_corrections(&f.state).await.len(), 1);
 
-        let status: String = sqlx::query_scalar("SELECT status FROM task_claims").fetch_one(pool).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM task_claims")
+            .fetch_one(pool)
+            .await
+            .unwrap();
         assert_eq!(status, "claimed");
         assert_eq!(count(pool, "task_claim_events").await, events_before);
     }

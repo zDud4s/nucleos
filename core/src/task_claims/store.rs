@@ -9,8 +9,8 @@
 //! expired claim counts as free everywhere.
 
 use super::{
-    ClaimOutcome, Closer, FailedProbe, Holder, HolderKind, NewTask, ProbeStart, Status, TaskKey, TaskKind,
-    TaskRow, PROBE_LEASE_SECONDS, SESSION_LEASE_SECONDS,
+    ClaimOutcome, Closer, FailedProbe, Holder, HolderKind, NewTask, PROBE_LEASE_SECONDS,
+    ProbeStart, SESSION_LEASE_SECONDS, Status, TaskKey, TaskKind, TaskRow,
 };
 use crate::execution::wave::stamp;
 use chrono::{DateTime, Duration, Utc};
@@ -76,7 +76,10 @@ fn decode(raw: RawRow) -> sqlx::Result<TaskRow> {
     })
 }
 
-pub(super) async fn row_by_id(conn: &mut SqliteConnection, id: i64) -> sqlx::Result<Option<TaskRow>> {
+pub(super) async fn row_by_id(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> sqlx::Result<Option<TaskRow>> {
     sqlx::query_as::<_, RawRow>("SELECT * FROM task_claims WHERE id = ?")
         .bind(id)
         .fetch_optional(conn)
@@ -106,7 +109,10 @@ async fn unresolved_by_key(
 /// Whether a path `changed` is the guarded path or lies below it.
 pub(super) fn paths_overlap(guard: &str, changed: &str) -> bool {
     let guard = guard.trim_end_matches('/');
-    changed == guard || changed.strip_prefix(guard).is_some_and(|rest| rest.starts_with('/'))
+    changed == guard
+        || changed
+            .strip_prefix(guard)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 // ---- liveness ------------------------------------------------------------------------------------
@@ -122,10 +128,16 @@ pub async fn is_live(pool: &SqlitePool, row: &TaskRow, now: DateTime<Utc>) -> sq
     is_live_on(&mut conn, row, now).await
 }
 
-async fn is_live_on(conn: &mut SqliteConnection, row: &TaskRow, now: DateTime<Utc>) -> sqlx::Result<bool> {
+async fn is_live_on(
+    conn: &mut SqliteConnection,
+    row: &TaskRow,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
     let leased = || {
         let at = stamp(now);
-        row.lease_until.as_deref().is_some_and(|until| until >= at.as_str())
+        row.lease_until
+            .as_deref()
+            .is_some_and(|until| until >= at.as_str())
     };
     match row.status {
         Status::Open | Status::Done | Status::Abandoned => Ok(false),
@@ -134,7 +146,9 @@ async fn is_live_on(conn: &mut SqliteConnection, row: &TaskRow, now: DateTime<Ut
             (Some(HolderKind::Session | HolderKind::Verify), _) => Ok(leased()),
             (Some(HolderKind::Run), Some(id)) => run_is_live(conn, id).await,
             (Some(HolderKind::Job), Some(id)) => job_is_live(conn, id).await,
-            (Some(HolderKind::Postgate), Some(project_id)) => project_is_red(conn, project_id).await,
+            (Some(HolderKind::Postgate), Some(project_id)) => {
+                project_is_red(conn, project_id).await
+            }
             _ => Ok(false),
         },
     }
@@ -143,7 +157,9 @@ async fn is_live_on(conn: &mut SqliteConnection, row: &TaskRow, now: DateTime<Ut
 /// Spelled out, not assembled from `concurrency::LIVE_RUN_STATUSES`: sqlx refuses SQL built at run
 /// time. `a_run_claim_is_live_only_while_its_run_is_active` walks the constant, so the two cannot drift.
 async fn run_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool> {
-    let Ok(id) = id.parse::<i64>() else { return Ok(false) };
+    let Ok(id) = id.parse::<i64>() else {
+        return Ok(false);
+    };
     let found: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM runs WHERE id = ? AND status IN ('running','awaiting_approval'))",
     )
@@ -155,7 +171,9 @@ async fn run_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool
 
 /// The statuses of `execution::job::store::LIVE_STATUSES`, spelled out for the same reason.
 async fn job_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool> {
-    let Ok(id) = id.parse::<i64>() else { return Ok(false) };
+    let Ok(id) = id.parse::<i64>() else {
+        return Ok(false);
+    };
     let found: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ? AND status IN ('running','awaiting_approval','waiting'))",
     )
@@ -203,7 +221,11 @@ async fn live_rows_on(
 
 /// The project's unresolved tasks: `open`, `claimed` (also with a dead holder: the task is still
 /// undone) and `probing` with a live lease. Whether a `claimed` row has a live owner is `is_live`.
-pub async fn list_live(pool: &SqlitePool, project_id: &str, now: DateTime<Utc>) -> sqlx::Result<Vec<TaskRow>> {
+pub async fn list_live(
+    pool: &SqlitePool,
+    project_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Vec<TaskRow>> {
     let mut conn = pool.acquire().await?;
     live_rows_on(&mut conn, project_id, now).await
 }
@@ -216,7 +238,9 @@ pub async fn live_by_key(
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<TaskRow>> {
     let mut conn = pool.acquire().await?;
-    let Some(row) = unresolved_by_key(&mut conn, project_id, key).await? else { return Ok(None) };
+    let Some(row) = unresolved_by_key(&mut conn, project_id, key).await? else {
+        return Ok(None);
+    };
     if row.status == Status::Probing && !is_live_on(&mut conn, &row, now).await? {
         return Ok(None);
     }
@@ -252,7 +276,8 @@ async fn begin(pool: &SqlitePool) -> sqlx::Result<sqlx::Transaction<'_, sqlx::Sq
 }
 
 fn lease_for(holder: &Holder, now: DateTime<Utc>) -> Option<String> {
-    (holder.kind == HolderKind::Session).then(|| stamp(now + Duration::seconds(SESSION_LEASE_SECONDS)))
+    (holder.kind == HolderKind::Session)
+        .then(|| stamp(now + Duration::seconds(SESSION_LEASE_SECONDS)))
 }
 
 /// Appends one event inside a transaction the caller already holds. `who` is the holder the event is
@@ -345,8 +370,14 @@ async fn insert_open(
 
 /// Deletes a task nobody saw resolve (a discarded probe) together with its events.
 async fn delete_task(conn: &mut SqliteConnection, id: i64) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM task_claim_events WHERE task_id = ?").bind(id).execute(&mut *conn).await?;
-    sqlx::query("DELETE FROM task_claims WHERE id = ?").bind(id).execute(conn).await?;
+    sqlx::query("DELETE FROM task_claim_events WHERE task_id = ?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM task_claims WHERE id = ?")
+        .bind(id)
+        .execute(conn)
+        .await?;
     Ok(())
 }
 
@@ -365,8 +396,9 @@ async fn similar_to(
         if row.id == exclude_id || row.status == Status::Probing {
             continue;
         }
-        let same_file =
-            key.path().is_some() && key.prefix() == row.key.prefix() && key.path() == row.key.path();
+        let same_file = key.path().is_some()
+            && key.prefix() == row.key.prefix()
+            && key.path() == row.key.path();
         let touching = paths.iter().any(|mine| {
             row.guard_paths
                 .iter()
@@ -430,7 +462,9 @@ pub async fn claim_by_id(
     now: DateTime<Utc>,
 ) -> sqlx::Result<ClaimOutcome> {
     let mut tx = begin(pool).await?;
-    let row = row_by_id(&mut tx, task_id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    let row = row_by_id(&mut tx, task_id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
     refuse_declared_master_red(row.kind, &row.key)?;
     let outcome = cas(&mut tx, task_id, holder, now).await?;
     tx.commit().await?;
@@ -454,8 +488,15 @@ async fn cas(
     holder: &Holder,
     now: DateTime<Utc>,
 ) -> sqlx::Result<ClaimOutcome> {
-    let row = row_by_id(conn, task_id).await?.ok_or(sqlx::Error::RowNotFound)?;
-    let paths: Vec<String> = row.guard_paths.iter().chain(&row.hint_paths).cloned().collect();
+    let row = row_by_id(conn, task_id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+    let paths: Vec<String> = row
+        .guard_paths
+        .iter()
+        .chain(&row.hint_paths)
+        .cloned()
+        .collect();
     let similar = similar_to(conn, &row.project_id, &row.key, &paths, row.id, now).await?;
     match (row.status, row.holder()) {
         (Status::Open, _) => take(conn, row, holder, None, now, similar).await,
@@ -464,12 +505,20 @@ async fn cas(
         }
         (Status::Claimed, Some(current)) => {
             if is_live_on(conn, &row, now).await? {
-                Ok(ClaimOutcome::Lost { task: row, holder: current, similar })
+                Ok(ClaimOutcome::Lost {
+                    task: row,
+                    holder: current,
+                    similar,
+                })
             } else {
                 take(conn, row, holder, Some(current), now, similar).await
             }
         }
-        (Status::Probing, Some(current)) => Ok(ClaimOutcome::Lost { task: row, holder: current, similar }),
+        (Status::Probing, Some(current)) => Ok(ClaimOutcome::Lost {
+            task: row,
+            holder: current,
+            similar,
+        }),
         _ => Err(sqlx::Error::RowNotFound),
     }
 }
@@ -502,9 +551,15 @@ async fn take(
     if moved.rows_affected() == 0 {
         // Somebody else changed the row between the read and the write. Inside BEGIN IMMEDIATE this
         // cannot happen; if it ever does, report whoever holds it now rather than pretend a win.
-        let task = row_by_id(conn, row.id).await?.ok_or(sqlx::Error::RowNotFound)?;
+        let task = row_by_id(conn, row.id)
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
         let holder = task.holder().ok_or(sqlx::Error::RowNotFound)?;
-        return Ok(ClaimOutcome::Lost { task, holder, similar });
+        return Ok(ClaimOutcome::Lost {
+            task,
+            holder,
+            similar,
+        });
     }
     match &previous {
         None => record_event_on(conn, row.id, "claimed", Some(holder), "", now).await?,
@@ -517,7 +572,9 @@ async fn take(
             record_event_on(conn, row.id, event, Some(prev), &note, now).await?;
         }
     }
-    let task = row_by_id(conn, row.id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    let task = row_by_id(conn, row.id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
     Ok(ClaimOutcome::Won { task, similar })
 }
 
@@ -535,7 +592,9 @@ async fn renew(
         .bind(row.id)
         .execute(&mut *conn)
         .await?;
-    let task = row_by_id(conn, row.id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    let task = row_by_id(conn, row.id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
     Ok(ClaimOutcome::Won { task, similar })
 }
 
@@ -604,7 +663,15 @@ pub async fn create_or_adopt_open(
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
-                record_event_on(&mut tx, row.id, "created", None, "adopted from a probe", now).await?;
+                record_event_on(
+                    &mut tx,
+                    row.id,
+                    "created",
+                    None,
+                    "adopted from a probe",
+                    now,
+                )
+                .await?;
             } else {
                 sqlx::query("UPDATE task_claims SET detail = ?, guard_paths = ?, hint_paths = ? WHERE id = ?")
                     .bind(detail)
@@ -617,7 +684,9 @@ pub async fn create_or_adopt_open(
             row.id
         }
     };
-    let row = row_by_id(&mut tx, id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    let row = row_by_id(&mut tx, id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
     tx.commit().await?;
     Ok(row)
 }
@@ -634,7 +703,9 @@ pub async fn update_detail(
     _now: DateTime<Utc>,
 ) -> sqlx::Result<()> {
     let mut tx = begin(pool).await?;
-    let row = row_by_id(&mut tx, task_id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    let row = row_by_id(&mut tx, task_id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
     let merged = merge_detail(&row.detail, &detail).to_string();
     let guard = encode_list(guard.as_deref().unwrap_or(&row.guard_paths));
     let hint = encode_list(hint.as_deref().unwrap_or(&row.hint_paths));
@@ -695,8 +766,13 @@ pub async fn release(
     now: DateTime<Utc>,
 ) -> sqlx::Result<bool> {
     let mut tx = begin(pool).await?;
-    let Some(row) = row_by_id(&mut tx, task_id).await? else { return Ok(false) };
-    let owns = row.status == Status::Claimed && row.holder().is_some_and(|current| current.same_owner(holder));
+    let Some(row) = row_by_id(&mut tx, task_id).await? else {
+        return Ok(false);
+    };
+    let owns = row.status == Status::Claimed
+        && row
+            .holder()
+            .is_some_and(|current| current.same_owner(holder));
     if !owns {
         return Ok(false);
     }
@@ -729,7 +805,9 @@ async fn close_in_tx(
     note: &str,
     now: DateTime<Utc>,
 ) -> sqlx::Result<bool> {
-    let Some(row) = row_by_id(conn, task_id).await? else { return Ok(false) };
+    let Some(row) = row_by_id(conn, task_id).await? else {
+        return Ok(false);
+    };
     if !matches!(row.status, Status::Open | Status::Claimed) {
         return Ok(false);
     }
@@ -737,7 +815,9 @@ async fn close_in_tx(
     let event_note = match closer {
         Closer::Holder(owner) => {
             let owns = row.status == Status::Claimed
-                && previous.as_ref().is_some_and(|current| current.same_owner(owner));
+                && previous
+                    .as_ref()
+                    .is_some_and(|current| current.same_owner(owner));
             if !owns {
                 return Ok(false);
             }
@@ -786,7 +866,14 @@ pub async fn release_for_owner(
     let mut released = 0;
     for raw in raws {
         let row = decode(raw)?;
-        reopen(&mut tx, &row, "released", "owner finished without task_done", now).await?;
+        reopen(
+            &mut tx,
+            &row,
+            "released",
+            "owner finished without task_done",
+            now,
+        )
+        .await?;
         released += 1;
     }
     tx.commit().await?;
@@ -826,7 +913,9 @@ pub async fn begin_probe(
             .execute(&mut *tx)
             .await?
             .last_insert_rowid();
-            let row = row_by_id(&mut tx, id).await?.ok_or(sqlx::Error::RowNotFound)?;
+            let row = row_by_id(&mut tx, id)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?;
             ProbeStart::Started(row)
         }
         Some(row) if row.status == Status::Probing => {
@@ -842,7 +931,9 @@ pub async fn begin_probe(
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
-                let row = row_by_id(&mut tx, row.id).await?.ok_or(sqlx::Error::RowNotFound)?;
+                let row = row_by_id(&mut tx, row.id)
+                    .await?
+                    .ok_or(sqlx::Error::RowNotFound)?;
                 ProbeStart::Started(row)
             } else {
                 ProbeStart::InFlight(row)
@@ -874,7 +965,9 @@ pub async fn finish_probe(
     now: DateTime<Utc>,
 ) -> sqlx::Result<Option<TaskRow>> {
     let mut tx = begin(pool).await?;
-    let Some(row) = row_by_id(&mut tx, task_id).await? else { return Ok(None) };
+    let Some(row) = row_by_id(&mut tx, task_id).await? else {
+        return Ok(None);
+    };
     if row.status == Status::Probing && row.holder_id.as_deref() != Some(ticket_id) {
         tx.commit().await?;
         return Ok(Some(row));
@@ -900,7 +993,15 @@ pub async fn finish_probe(
                 .bind(task_id)
                 .execute(&mut *tx)
                 .await?;
-                record_event_on(&mut tx, task_id, "created", None, "proved failing on master", now).await?;
+                record_event_on(
+                    &mut tx,
+                    task_id,
+                    "created",
+                    None,
+                    "proved failing on master",
+                    now,
+                )
+                .await?;
             }
             None => delete_task(&mut tx, task_id).await?,
         }
@@ -914,7 +1015,11 @@ pub async fn finish_probe(
 
 /// Takes the single flight of the master-red re-proof: `true` when the caller may run it. The flight
 /// lapses after `PROBE_LEASE_SECONDS`, so a crashed re-proof does not wedge the incident.
-pub async fn begin_reprobe(pool: &SqlitePool, task_id: i64, now: DateTime<Utc>) -> sqlx::Result<bool> {
+pub async fn begin_reprobe(
+    pool: &SqlitePool,
+    task_id: i64,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
     let taken = sqlx::query(
         "UPDATE task_claims SET probe_lease_until = ?
          WHERE id = ? AND status IN ('open', 'claimed')
@@ -940,14 +1045,23 @@ pub async fn finish_reprobe(
 ) -> sqlx::Result<()> {
     let mut tx = begin(pool).await?;
     if still_red {
-        sqlx::query("UPDATE task_claims SET checked_sha = ?, probe_lease_until = NULL WHERE id = ?")
-            .bind(master_sha)
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE task_claims SET checked_sha = ?, probe_lease_until = NULL WHERE id = ?",
+        )
+        .bind(master_sha)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
     } else {
         let sha = master_sha.to_owned();
-        close_in_tx(&mut tx, task_id, &Closer::Green { sha }, "re-proof passed", now).await?;
+        close_in_tx(
+            &mut tx,
+            task_id,
+            &Closer::Green { sha },
+            "re-proof passed",
+            now,
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -964,9 +1078,10 @@ pub async fn finish_reprobe(
 /// - Session leases are not touched: they lapse lazily, like everywhere else.
 pub async fn reconcile_at_startup(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<()> {
     let mut tx = begin(pool).await?;
-    let probes: Vec<i64> = sqlx::query_scalar("SELECT id FROM task_claims WHERE status = 'probing'")
-        .fetch_all(&mut *tx)
-        .await?;
+    let probes: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM task_claims WHERE status = 'probing'")
+            .fetch_all(&mut *tx)
+            .await?;
     for id in probes {
         delete_task(&mut tx, id).await?;
     }
@@ -981,9 +1096,23 @@ pub async fn reconcile_at_startup(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx
             continue;
         }
         if row.holder_kind == Some(HolderKind::Postgate) {
-            close_in_tx(&mut tx, row.id, &Closer::Reconcile, "the master is no longer red", now).await?;
+            close_in_tx(
+                &mut tx,
+                row.id,
+                &Closer::Reconcile,
+                "the master is no longer red",
+                now,
+            )
+            .await?;
         } else {
-            reopen(&mut tx, &row, "released", "owner finished before the daemon restarted", now).await?;
+            reopen(
+                &mut tx,
+                &row,
+                "released",
+                "owner finished before the daemon restarted",
+                now,
+            )
+            .await?;
         }
     }
     tx.commit().await?;
@@ -1008,12 +1137,20 @@ mod tests {
     }
 
     pub(super) fn session(id: &str) -> Holder {
-        Holder { kind: HolderKind::Session, id: id.into(), worktree: format!("/wt/{id}") }
+        Holder {
+            kind: HolderKind::Session,
+            id: id.into(),
+            worktree: format!("/wt/{id}"),
+        }
     }
 
     pub(super) fn task(key: &str) -> NewTask {
         // `master-red` is the daemon's alone: a declared claim on it is refused, so its fixtures are incidents.
-        let kind = if key == super::super::MASTER_RED_KEY { TaskKind::Incident } else { TaskKind::Declared };
+        let kind = if key == super::super::MASTER_RED_KEY {
+            TaskKind::Incident
+        } else {
+            TaskKind::Declared
+        };
         NewTask {
             key: super::super::keys::normalize(key, std::path::Path::new("/repo")).unwrap(),
             kind,
@@ -1030,12 +1167,17 @@ mod tests {
     }
 
     /// `(event, holder_id, note)` in order.
-    pub(super) async fn events(pool: &SqlitePool, id: i64) -> Vec<(String, Option<String>, String)> {
-        sqlx::query_as("SELECT event, holder_id, note FROM task_claim_events WHERE task_id = ? ORDER BY id")
-            .bind(id)
-            .fetch_all(pool)
-            .await
-            .unwrap()
+    pub(super) async fn events(
+        pool: &SqlitePool,
+        id: i64,
+    ) -> Vec<(String, Option<String>, String)> {
+        sqlx::query_as(
+            "SELECT event, holder_id, note FROM task_claim_events WHERE task_id = ? ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
     }
 
     /// A row written straight into the table, so liveness is tested without the claim code.
@@ -1071,33 +1213,102 @@ mod tests {
     #[tokio::test]
     async fn startup_frees_dead_runs_closes_stale_postgate_claims_and_drops_probes() {
         let pool = test_pool().await;
-        let dead_run = sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'interrupted', 't')")
-            .execute(&pool).await.unwrap().last_insert_rowid();
-        let live_run = sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', 't')")
-            .execute(&pool).await.unwrap().last_insert_rowid();
+        let dead_run = sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'interrupted', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let live_run = sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
         sqlx::query("INSERT INTO postgate_state (project_id, target, red_groups) VALUES ('p', 'main', '[]')")
             .execute(&pool).await.unwrap();
 
-        let probe = seed(&pool, Seed { key: "master-red", status: "probing", holder: Some(("verify", "t")), ..Seed::default() }).await;
-        let dead = seed(&pool, Seed { key: "file:dead.rs", status: "claimed", holder: Some(("run", &dead_run.to_string())), ..Seed::default() }).await;
-        let alive = seed(&pool, Seed { key: "file:alive.rs", status: "claimed", holder: Some(("run", &live_run.to_string())), ..Seed::default() }).await;
-        let stale_postgate = seed(&pool, Seed { key: "file:pg.rs", status: "claimed", holder: Some(("postgate", "p")), ..Seed::default() }).await;
-        let session_claim = seed(&pool, Seed {
-            key: "file:s.rs", status: "claimed", holder: Some(("session", "s1")), lease: Some(t0() - secs(10_000)), ..Seed::default()
-        }).await;
+        let probe = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "probing",
+                holder: Some(("verify", "t")),
+                ..Seed::default()
+            },
+        )
+        .await;
+        let dead = seed(
+            &pool,
+            Seed {
+                key: "file:dead.rs",
+                status: "claimed",
+                holder: Some(("run", &dead_run.to_string())),
+                ..Seed::default()
+            },
+        )
+        .await;
+        let alive = seed(
+            &pool,
+            Seed {
+                key: "file:alive.rs",
+                status: "claimed",
+                holder: Some(("run", &live_run.to_string())),
+                ..Seed::default()
+            },
+        )
+        .await;
+        let stale_postgate = seed(
+            &pool,
+            Seed {
+                key: "file:pg.rs",
+                status: "claimed",
+                holder: Some(("postgate", "p")),
+                ..Seed::default()
+            },
+        )
+        .await;
+        let session_claim = seed(
+            &pool,
+            Seed {
+                key: "file:s.rs",
+                status: "claimed",
+                holder: Some(("session", "s1")),
+                lease: Some(t0() - secs(10_000)),
+                ..Seed::default()
+            },
+        )
+        .await;
 
         reconcile_at_startup(&pool, t0()).await.unwrap();
 
         let gone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims WHERE id = ?")
-            .bind(probe).fetch_one(&pool).await.unwrap();
+            .bind(probe)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(gone, 0, "the proof died with the daemon");
         assert_eq!(row(&pool, dead).await.status, Status::Open);
         assert_eq!(events(&pool, dead).await.last().unwrap().0, "released");
         assert_eq!(row(&pool, alive).await.status, Status::Claimed);
         let closed = row(&pool, stale_postgate).await;
         assert_eq!(closed.status, Status::Done, "the master is green again");
-        assert_eq!(events(&pool, stale_postgate).await.last().unwrap().1.as_deref(), Some("p"));
-        assert_eq!(row(&pool, session_claim).await.status, Status::Claimed, "leases lapse lazily; the sweep does not touch them");
+        assert_eq!(
+            events(&pool, stale_postgate)
+                .await
+                .last()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("p")
+        );
+        assert_eq!(
+            row(&pool, session_claim).await.status,
+            Status::Claimed,
+            "leases lapse lazily; the sweep does not touch them"
+        );
     }
 
     #[test]
@@ -1122,13 +1333,23 @@ mod tests {
     #[tokio::test]
     async fn a_session_claim_is_live_until_its_lease_runs_out() {
         let pool = test_pool().await;
-        let id = seed(&pool, Seed {
-            key: "file:a.rs", status: "claimed", holder: Some(("session", "s1")),
-            lease: Some(t0() + secs(60)), ..Seed::default()
-        }).await;
+        let id = seed(
+            &pool,
+            Seed {
+                key: "file:a.rs",
+                status: "claimed",
+                holder: Some(("session", "s1")),
+                lease: Some(t0() + secs(60)),
+                ..Seed::default()
+            },
+        )
+        .await;
         let held = row(&pool, id).await;
         assert!(is_live(&pool, &held, t0()).await.unwrap());
-        assert!(is_live(&pool, &held, t0() + secs(60)).await.unwrap(), "the lease edge is still live");
+        assert!(
+            is_live(&pool, &held, t0() + secs(60)).await.unwrap(),
+            "the lease edge is still live"
+        );
         assert!(!is_live(&pool, &held, t0() + secs(61)).await.unwrap());
     }
 
@@ -1136,22 +1357,52 @@ mod tests {
     async fn a_run_claim_is_live_only_while_its_run_is_active() {
         let pool = test_pool().await;
         for status in crate::execution::concurrency::LIVE_RUN_STATUSES {
-            let run_id = sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', ?, 't')")
-                .bind(status).execute(&pool).await.unwrap().last_insert_rowid();
-            let id = seed(&pool, Seed {
-                key: &format!("file:{status}.rs"), status: "claimed",
-                holder: Some(("run", &run_id.to_string())), ..Seed::default()
-            }).await;
+            let run_id =
+                sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', ?, 't')")
+                    .bind(status)
+                    .execute(&pool)
+                    .await
+                    .unwrap()
+                    .last_insert_rowid();
+            let id = seed(
+                &pool,
+                Seed {
+                    key: &format!("file:{status}.rs"),
+                    status: "claimed",
+                    holder: Some(("run", &run_id.to_string())),
+                    ..Seed::default()
+                },
+            )
+            .await;
             let held = row(&pool, id).await;
-            assert!(is_live(&pool, &held, t0()).await.unwrap(), "a run '{status}' keeps its claim");
+            assert!(
+                is_live(&pool, &held, t0()).await.unwrap(),
+                "a run '{status}' keeps its claim"
+            );
             sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
-                .bind(run_id).execute(&pool).await.unwrap();
-            assert!(!is_live(&pool, &held, t0()).await.unwrap(), "a finished run does not");
+                .bind(run_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                !is_live(&pool, &held, t0()).await.unwrap(),
+                "a finished run does not"
+            );
         }
-        let id = seed(&pool, Seed {
-            key: "file:odd.rs", status: "claimed", holder: Some(("run", "not-a-number")), ..Seed::default()
-        }).await;
-        assert!(!is_live(&pool, &row(&pool, id).await, t0()).await.unwrap(), "a holder id that names no run is dead");
+        let id = seed(
+            &pool,
+            Seed {
+                key: "file:odd.rs",
+                status: "claimed",
+                holder: Some(("run", "not-a-number")),
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert!(
+            !is_live(&pool, &row(&pool, id).await, t0()).await.unwrap(),
+            "a holder id that names no run is dead"
+        );
     }
 
     #[tokio::test]
@@ -1162,15 +1413,32 @@ mod tests {
             let job_id = sqlx::query(
                 "INSERT INTO jobs (project_id, project_root, status, max_items, created_at)
                  VALUES ('p', '/r', ?, 1, 't')",
-            ).bind(status).execute(&pool).await.unwrap().last_insert_rowid();
-            let id = seed(&pool, Seed {
-                key: &format!("file:{status}.rs"), status: "claimed",
-                holder: Some(("job", &job_id.to_string())), ..Seed::default()
-            }).await;
+            )
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+            let id = seed(
+                &pool,
+                Seed {
+                    key: &format!("file:{status}.rs"),
+                    status: "claimed",
+                    holder: Some(("job", &job_id.to_string())),
+                    ..Seed::default()
+                },
+            )
+            .await;
             let held = row(&pool, id).await;
-            assert!(is_live(&pool, &held, t0()).await.unwrap(), "a job '{status}' keeps its claim");
+            assert!(
+                is_live(&pool, &held, t0()).await.unwrap(),
+                "a job '{status}' keeps its claim"
+            );
             sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = ?")
-                .bind(job_id).execute(&pool).await.unwrap();
+                .bind(job_id)
+                .execute(&pool)
+                .await
+                .unwrap();
             assert!(!is_live(&pool, &held, t0()).await.unwrap());
         }
     }
@@ -1178,16 +1446,28 @@ mod tests {
     #[tokio::test]
     async fn a_postgate_claim_is_live_only_while_the_project_is_red() {
         let pool = test_pool().await;
-        let id = seed(&pool, Seed {
-            key: "master-red", status: "claimed", holder: Some(("postgate", "p")), ..Seed::default()
-        }).await;
+        let id = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "claimed",
+                holder: Some(("postgate", "p")),
+                ..Seed::default()
+            },
+        )
+        .await;
         let held = row(&pool, id).await;
-        assert!(!is_live(&pool, &held, t0()).await.unwrap(), "no postgate_state row: not red");
+        assert!(
+            !is_live(&pool, &held, t0()).await.unwrap(),
+            "no postgate_state row: not red"
+        );
         sqlx::query("INSERT INTO postgate_state (project_id, target, red_groups) VALUES ('p', 'main', '[\"core\"]')")
             .execute(&pool).await.unwrap();
         assert!(is_live(&pool, &held, t0()).await.unwrap());
         sqlx::query("UPDATE postgate_state SET red_groups = '[]' WHERE project_id = 'p'")
-            .execute(&pool).await.unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
         assert!(!is_live(&pool, &held, t0()).await.unwrap(), "back to green");
     }
 
@@ -1195,13 +1475,31 @@ mod tests {
     async fn open_and_closed_rows_are_never_live_and_a_probe_lives_by_its_lease() {
         let pool = test_pool().await;
         for status in ["open", "done", "abandoned"] {
-            let id = seed(&pool, Seed { key: &format!("file:{status}.rs"), status, ..Seed::default() }).await;
-            assert!(!is_live(&pool, &row(&pool, id).await, t0()).await.unwrap(), "{status}");
+            let id = seed(
+                &pool,
+                Seed {
+                    key: &format!("file:{status}.rs"),
+                    status,
+                    ..Seed::default()
+                },
+            )
+            .await;
+            assert!(
+                !is_live(&pool, &row(&pool, id).await, t0()).await.unwrap(),
+                "{status}"
+            );
         }
-        let probe = seed(&pool, Seed {
-            key: "master-red", status: "probing", holder: Some(("verify", "ticket-1")),
-            lease: Some(t0() + secs(600)), ..Seed::default()
-        }).await;
+        let probe = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "probing",
+                holder: Some(("verify", "ticket-1")),
+                lease: Some(t0() + secs(600)),
+                ..Seed::default()
+            },
+        )
+        .await;
         let probing = row(&pool, probe).await;
         assert!(is_live(&pool, &probing, t0() + secs(600)).await.unwrap());
         assert!(!is_live(&pool, &probing, t0() + secs(601)).await.unwrap());
@@ -1210,81 +1508,209 @@ mod tests {
     #[tokio::test]
     async fn the_index_allows_one_unresolved_task_per_key_probing_included() {
         let pool = test_pool().await;
-        seed(&pool, Seed { key: "master-red", status: "probing", holder: Some(("verify", "t")), ..Seed::default() }).await;
+        seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "probing",
+                holder: Some(("verify", "t")),
+                ..Seed::default()
+            },
+        )
+        .await;
         let second = sqlx::query(
             "INSERT INTO task_claims (project_id, task_key, kind, title, status, created_at)
              VALUES ('p', 'master-red', 'incident', 't', 'open', 't')",
-        ).execute(&pool).await;
-        assert!(second.is_err(), "a second unresolved master-red in the same project is refused");
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            second.is_err(),
+            "a second unresolved master-red in the same project is refused"
+        );
         sqlx::query(
             "INSERT INTO task_claims (project_id, task_key, kind, title, status, created_at)
              VALUES ('other', 'master-red', 'incident', 't', 'open', 't')",
-        ).execute(&pool).await.expect("another project may have its own");
+        )
+        .execute(&pool)
+        .await
+        .expect("another project may have its own");
         sqlx::query("UPDATE task_claims SET status = 'done' WHERE project_id = 'p'")
-            .execute(&pool).await.unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO task_claims (project_id, task_key, kind, title, status, created_at)
              VALUES ('p', 'master-red', 'incident', 't', 'open', 't')",
-        ).execute(&pool).await.expect("a closed task leaves the index");
+        )
+        .execute(&pool)
+        .await
+        .expect("a closed task leaves the index");
     }
 
     #[tokio::test]
     async fn list_live_keeps_unresolved_tasks_and_hides_dead_probes_and_other_projects() {
         let pool = test_pool().await;
-        let open = seed(&pool, Seed { key: "file:a.rs", status: "open", ..Seed::default() }).await;
-        let expired = seed(&pool, Seed {
-            key: "file:b.rs", status: "claimed", holder: Some(("session", "s1")),
-            lease: Some(t0() - secs(1)), ..Seed::default()
-        }).await;
-        seed(&pool, Seed { key: "file:c.rs", status: "done", ..Seed::default() }).await;
-        seed(&pool, Seed {
-            key: "master-red", status: "probing", holder: Some(("verify", "t")),
-            lease: Some(t0() - secs(1)), ..Seed::default()
-        }).await;
+        let open = seed(
+            &pool,
+            Seed {
+                key: "file:a.rs",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        let expired = seed(
+            &pool,
+            Seed {
+                key: "file:b.rs",
+                status: "claimed",
+                holder: Some(("session", "s1")),
+                lease: Some(t0() - secs(1)),
+                ..Seed::default()
+            },
+        )
+        .await;
+        seed(
+            &pool,
+            Seed {
+                key: "file:c.rs",
+                status: "done",
+                ..Seed::default()
+            },
+        )
+        .await;
+        seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "probing",
+                holder: Some(("verify", "t")),
+                lease: Some(t0() - secs(1)),
+                ..Seed::default()
+            },
+        )
+        .await;
         let live = list_live(&pool, "p", t0()).await.unwrap();
         let ids: Vec<i64> = live.iter().map(|r| r.id).collect();
-        assert_eq!(ids, vec![open, expired], "an expired claim is still an unresolved task; a dead probe is not");
-        assert!(list_live(&pool, "elsewhere", t0()).await.unwrap().is_empty());
+        assert_eq!(
+            ids,
+            vec![open, expired],
+            "an expired claim is still an unresolved task; a dead probe is not"
+        );
+        assert!(
+            list_live(&pool, "elsewhere", t0())
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let key = TaskKey::master_red();
-        assert!(live_by_key(&pool, "p", &key, t0()).await.unwrap().is_none(), "the dead probe is not an incident");
-        let found = live_by_key(&pool, "p", &super::super::keys::normalize("file:a.rs", std::path::Path::new("/r")).unwrap(), t0())
-            .await.unwrap();
+        assert!(
+            live_by_key(&pool, "p", &key, t0()).await.unwrap().is_none(),
+            "the dead probe is not an incident"
+        );
+        let found = live_by_key(
+            &pool,
+            "p",
+            &super::super::keys::normalize("file:a.rs", std::path::Path::new("/r")).unwrap(),
+            t0(),
+        )
+        .await
+        .unwrap();
         assert_eq!(found.map(|r| r.id), Some(open));
     }
 
     #[tokio::test]
     async fn guarding_returns_only_live_claimed_rows_whose_guard_paths_meet_the_change() {
         let pool = test_pool().await;
-        let live_guard = seed(&pool, Seed {
-            key: "master-red", status: "claimed", holder: Some(("session", "s1")),
-            lease: Some(t0() + secs(60)), guard: &["core/src/a.rs", "core/tests"], ..Seed::default()
-        }).await;
-        seed(&pool, Seed {
-            key: "file:expired.rs", status: "claimed", holder: Some(("session", "s2")),
-            lease: Some(t0() - secs(1)), guard: &["core/src/a.rs"], ..Seed::default()
-        }).await;
-        seed(&pool, Seed { key: "file:open.rs", status: "open", guard: &["core/src/a.rs"], ..Seed::default() }).await;
+        let live_guard = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "claimed",
+                holder: Some(("session", "s1")),
+                lease: Some(t0() + secs(60)),
+                guard: &["core/src/a.rs", "core/tests"],
+                ..Seed::default()
+            },
+        )
+        .await;
+        seed(
+            &pool,
+            Seed {
+                key: "file:expired.rs",
+                status: "claimed",
+                holder: Some(("session", "s2")),
+                lease: Some(t0() - secs(1)),
+                guard: &["core/src/a.rs"],
+                ..Seed::default()
+            },
+        )
+        .await;
+        seed(
+            &pool,
+            Seed {
+                key: "file:open.rs",
+                status: "open",
+                guard: &["core/src/a.rs"],
+                ..Seed::default()
+            },
+        )
+        .await;
         let changed = |paths: &[&str]| paths.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
 
-        let hit = guarding(&pool, "p", &changed(&["core/src/a.rs", "README.md"]), t0()).await.unwrap();
-        assert_eq!(hit.iter().map(|r| r.id).collect::<Vec<_>>(), vec![live_guard]);
-        let below = guarding(&pool, "p", &changed(&["core/tests/x.rs"]), t0()).await.unwrap();
-        assert_eq!(below.len(), 1, "a guarded directory covers the files below it");
-        assert!(guarding(&pool, "p", &changed(&["docs/x.md"]), t0()).await.unwrap().is_empty());
+        let hit = guarding(&pool, "p", &changed(&["core/src/a.rs", "README.md"]), t0())
+            .await
+            .unwrap();
+        assert_eq!(
+            hit.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![live_guard]
+        );
+        let below = guarding(&pool, "p", &changed(&["core/tests/x.rs"]), t0())
+            .await
+            .unwrap();
+        assert_eq!(
+            below.len(),
+            1,
+            "a guarded directory covers the files below it"
+        );
+        assert!(
+            guarding(&pool, "p", &changed(&["docs/x.md"]), t0())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn claiming_a_new_key_creates_it_and_wins() {
         let pool = test_pool().await;
-        let outcome = claim(&pool, "p", task("test:core/a.rs::it_works"), &session("s1"), t0()).await.unwrap();
-        let ClaimOutcome::Won { task, similar } = outcome else { panic!("expected a win") };
+        let outcome = claim(
+            &pool,
+            "p",
+            task("test:core/a.rs::it_works"),
+            &session("s1"),
+            t0(),
+        )
+        .await
+        .unwrap();
+        let ClaimOutcome::Won { task, similar } = outcome else {
+            panic!("expected a win")
+        };
         assert_eq!(task.status, Status::Claimed);
         assert_eq!(task.holder().unwrap().id, "s1");
-        assert_eq!(task.lease_until, Some(stamp(t0() + secs(SESSION_LEASE_SECONDS))));
+        assert_eq!(
+            task.lease_until,
+            Some(stamp(t0() + secs(SESSION_LEASE_SECONDS)))
+        );
         assert_eq!(task.claimed_at, Some(stamp(t0())));
         assert!(similar.is_empty());
-        let log: Vec<String> = events(&pool, task.id).await.into_iter().map(|e| e.0).collect();
+        let log: Vec<String> = events(&pool, task.id)
+            .await
+            .into_iter()
+            .map(|e| e.0)
+            .collect();
         assert_eq!(log, vec!["created", "claimed"]);
     }
 
@@ -1294,15 +1720,20 @@ mod tests {
         let mut incident = task("topic:flaky-ci");
         incident.kind = TaskKind::Incident;
         incident.title = "original".into();
-        create_or_adopt_open(&pool, "p", incident, t0()).await.unwrap();
+        create_or_adopt_open(&pool, "p", incident, t0())
+            .await
+            .unwrap();
 
         let mut mine = task("topic:flaky-ci");
         mine.title = "mine".into();
         mine.guard_paths = vec!["core/src".into()];
         mine.hint_paths = vec!["core/src/a.rs".into()];
         mine.detail = serde_json::json!({"note": "seen"});
-        let ClaimOutcome::Won { task: won, .. } = claim(&pool, "p", mine, &session("s1"), t0()).await.unwrap()
-            else { panic!("expected a win") };
+        let ClaimOutcome::Won { task: won, .. } =
+            claim(&pool, "p", mine, &session("s1"), t0()).await.unwrap()
+        else {
+            panic!("expected a win")
+        };
         assert_eq!(won.title, "original");
         assert_eq!(won.guard_paths, vec!["core/src".to_owned()]);
         assert_eq!(won.hint_paths, vec!["core/src/a.rs".to_owned()]);
@@ -1310,7 +1741,11 @@ mod tests {
 
         let changed = vec!["core/src/x.rs".to_owned()];
         let guarded = guarding(&pool, "p", &changed, t0()).await.unwrap();
-        assert_eq!(guarded.len(), 1, "the claimed incident now guards the claimer's paths");
+        assert_eq!(
+            guarded.len(),
+            1,
+            "the claimed incident now guards the claimer's paths"
+        );
         assert_eq!(guarded[0].id, won.id);
     }
 
@@ -1320,73 +1755,181 @@ mod tests {
         let mut declared = task("master-red");
         declared.kind = TaskKind::Declared;
         let refused = claim(&pool, "p", declared, &session("s1"), t0()).await;
-        assert!(matches!(refused, Err(sqlx::Error::Protocol(_))), "a declared master-red claim is refused");
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims").fetch_one(&pool).await.unwrap();
+        assert!(
+            matches!(refused, Err(sqlx::Error::Protocol(_))),
+            "a declared master-red claim is refused"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(rows, 0);
 
-        let id = seed(&pool, Seed { key: "master-red", status: "open", ..Seed::default() }).await;
-        sqlx::query("UPDATE task_claims SET kind = 'declared' WHERE id = ?").bind(id).execute(&pool).await.unwrap();
+        let id = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        sqlx::query("UPDATE task_claims SET kind = 'declared' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
         let by_id = claim_by_id(&pool, id, &session("s1"), t0()).await;
-        assert!(matches!(by_id, Err(sqlx::Error::Protocol(_))), "claim_by_id refuses it too");
-        assert_eq!(row(&pool, id).await.status, Status::Open, "the refused claim changed nothing");
+        assert!(
+            matches!(by_id, Err(sqlx::Error::Protocol(_))),
+            "claim_by_id refuses it too"
+        );
+        assert_eq!(
+            row(&pool, id).await.status,
+            Status::Open,
+            "the refused claim changed nothing"
+        );
     }
 
     #[tokio::test]
     async fn a_second_holder_loses_and_is_told_who_has_it() {
         let pool = test_pool().await;
-        claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0()).await.unwrap();
-        let outcome = claim(&pool, "p", task("file:core/a.rs"), &session("s2"), t0() + secs(5)).await.unwrap();
-        let ClaimOutcome::Lost { task, holder, .. } = outcome else { panic!("expected a loss") };
+        claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0())
+            .await
+            .unwrap();
+        let outcome = claim(
+            &pool,
+            "p",
+            task("file:core/a.rs"),
+            &session("s2"),
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
+        let ClaimOutcome::Lost { task, holder, .. } = outcome else {
+            panic!("expected a loss")
+        };
         assert_eq!(holder.id, "s1");
         assert_eq!(task.holder().unwrap().id, "s1", "the row did not move");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims").fetch_one(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count, 1);
     }
 
     #[tokio::test]
     async fn the_same_holder_reclaiming_wins_again_and_only_renews() {
         let pool = test_pool().await;
-        let first = claim(&pool, "p", task("master-red"), &session("s1"), t0()).await.unwrap();
-        let id = match first { ClaimOutcome::Won { task, .. } => task.id, _ => panic!() };
-        let again = claim(&pool, "p", task("master-red"), &session("s1"), t0() + secs(600)).await.unwrap();
-        let ClaimOutcome::Won { task, .. } = again else { panic!("the same holder must not lose to itself") };
+        let first = claim(&pool, "p", task("master-red"), &session("s1"), t0())
+            .await
+            .unwrap();
+        let id = match first {
+            ClaimOutcome::Won { task, .. } => task.id,
+            _ => panic!(),
+        };
+        let again = claim(
+            &pool,
+            "p",
+            task("master-red"),
+            &session("s1"),
+            t0() + secs(600),
+        )
+        .await
+        .unwrap();
+        let ClaimOutcome::Won { task, .. } = again else {
+            panic!("the same holder must not lose to itself")
+        };
         assert_eq!(task.id, id);
-        assert_eq!(task.lease_until, Some(stamp(t0() + secs(600 + SESSION_LEASE_SECONDS))));
-        assert_eq!(task.claimed_at, Some(stamp(t0())), "claimed_at keeps the first claim");
-        assert_eq!(events(&pool, id).await.len(), 2, "a renewal writes no event");
+        assert_eq!(
+            task.lease_until,
+            Some(stamp(t0() + secs(600 + SESSION_LEASE_SECONDS)))
+        );
+        assert_eq!(
+            task.claimed_at,
+            Some(stamp(t0())),
+            "claimed_at keeps the first claim"
+        );
+        assert_eq!(
+            events(&pool, id).await.len(),
+            2,
+            "a renewal writes no event"
+        );
     }
 
     #[tokio::test]
     async fn an_expired_session_claim_is_reclaimed_and_the_event_keeps_the_previous_holder() {
         let pool = test_pool().await;
         let ClaimOutcome::Won { task: first, .. } =
-            claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0()).await.unwrap() else { panic!() };
+            claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
         let late = t0() + secs(SESSION_LEASE_SECONDS + 1);
-        let outcome = claim(&pool, "p", task("file:core/a.rs"), &session("s2"), late).await.unwrap();
-        let ClaimOutcome::Won { task, .. } = outcome else { panic!("a lapsed claim is free") };
+        let outcome = claim(&pool, "p", task("file:core/a.rs"), &session("s2"), late)
+            .await
+            .unwrap();
+        let ClaimOutcome::Won { task, .. } = outcome else {
+            panic!("a lapsed claim is free")
+        };
         assert_eq!(task.holder().unwrap().id, "s2");
         let log = events(&pool, first.id).await;
         let last = log.last().unwrap();
         assert_eq!(last.0, "expired_reclaimed");
-        assert_eq!(last.1.as_deref(), Some("s1"), "holder_* are the PREVIOUS owner");
-        assert!(last.2.contains("session:s2"), "the note names the new one: {}", last.2);
+        assert_eq!(
+            last.1.as_deref(),
+            Some("s1"),
+            "holder_* are the PREVIOUS owner"
+        );
+        assert!(
+            last.2.contains("session:s2"),
+            "the note names the new one: {}",
+            last.2
+        );
     }
 
     #[tokio::test]
     async fn a_dead_run_claim_is_taken_over() {
         let pool = test_pool().await;
-        let run_id = sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'completed', 't')")
-            .execute(&pool).await.unwrap().last_insert_rowid();
-        let run = Holder { kind: HolderKind::Run, id: run_id.to_string(), worktree: "/wt/run".into() };
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'completed', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run = Holder {
+            kind: HolderKind::Run,
+            id: run_id.to_string(),
+            worktree: "/wt/run".into(),
+        };
         // `claim` does not ask whether the claimer itself is alive, so a run already finished can still
         // be the fixture's holder; the second claim then finds it dead.
         let ClaimOutcome::Won { task: first, .. } =
-            claim(&pool, "p", task("file:core/a.rs"), &run, t0()).await.unwrap() else { panic!() };
-        let outcome = claim(&pool, "p", task("file:core/a.rs"), &session("s2"), t0() + secs(1)).await.unwrap();
+            claim(&pool, "p", task("file:core/a.rs"), &run, t0())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        let outcome = claim(
+            &pool,
+            "p",
+            task("file:core/a.rs"),
+            &session("s2"),
+            t0() + secs(1),
+        )
+        .await
+        .unwrap();
         assert!(outcome.is_won());
         let log = events(&pool, first.id).await;
         assert_eq!(log.last().unwrap().0, "taken_over");
-        assert_eq!(log.last().unwrap().1.as_deref(), Some(run_id.to_string().as_str()));
+        assert_eq!(
+            log.last().unwrap().1.as_deref(),
+            Some(run_id.to_string().as_str())
+        );
     }
 
     #[tokio::test]
@@ -1395,52 +1938,144 @@ mod tests {
         // A postgate claim is live only while the project is red.
         sqlx::query("INSERT INTO postgate_state (project_id, target, red_groups) VALUES ('p', 'main', '[\"core\"]')")
             .execute(&pool).await.unwrap();
-        let id = seed(&pool, Seed { key: "master-red", status: "open", ..Seed::default() }).await;
-        let postgate = Holder { kind: HolderKind::Postgate, id: "p".into(), worktree: "/wt/postgate".into() };
-        assert!(claim_by_id(&pool, id, &postgate, t0()).await.unwrap().is_won());
-        assert!(claim_by_id(&pool, id, &postgate, t0()).await.unwrap().is_won(), "the postgate repeats its claim");
-        let ClaimOutcome::Lost { holder, .. } = claim_by_id(&pool, id, &session("s1"), t0()).await.unwrap()
-            else { panic!("a session must lose to a live claim") };
+        let id = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        let postgate = Holder {
+            kind: HolderKind::Postgate,
+            id: "p".into(),
+            worktree: "/wt/postgate".into(),
+        };
+        assert!(
+            claim_by_id(&pool, id, &postgate, t0())
+                .await
+                .unwrap()
+                .is_won()
+        );
+        assert!(
+            claim_by_id(&pool, id, &postgate, t0())
+                .await
+                .unwrap()
+                .is_won(),
+            "the postgate repeats its claim"
+        );
+        let ClaimOutcome::Lost { holder, .. } =
+            claim_by_id(&pool, id, &session("s1"), t0()).await.unwrap()
+        else {
+            panic!("a session must lose to a live claim")
+        };
         assert_eq!(holder.kind, HolderKind::Postgate);
-        assert!(matches!(claim_by_id(&pool, 9999, &session("s1"), t0()).await, Err(sqlx::Error::RowNotFound)));
-        sqlx::query("UPDATE task_claims SET status = 'done' WHERE id = ?").bind(id).execute(&pool).await.unwrap();
-        assert!(matches!(claim_by_id(&pool, id, &session("s1"), t0()).await, Err(sqlx::Error::RowNotFound)));
+        assert!(matches!(
+            claim_by_id(&pool, 9999, &session("s1"), t0()).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+        sqlx::query("UPDATE task_claims SET status = 'done' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            claim_by_id(&pool, id, &session("s1"), t0()).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
     }
 
     #[tokio::test]
     async fn a_live_probe_blocks_a_claim_and_a_dead_one_is_replaced() {
         let pool = test_pool().await;
-        seed(&pool, Seed {
-            key: "master-red", status: "probing", holder: Some(("verify", "ticket-1")),
-            lease: Some(t0() + secs(60)), ..Seed::default()
-        }).await;
+        seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "probing",
+                holder: Some(("verify", "ticket-1")),
+                lease: Some(t0() + secs(60)),
+                ..Seed::default()
+            },
+        )
+        .await;
         let ClaimOutcome::Lost { holder, .. } =
-            claim(&pool, "p", task("master-red"), &session("s1"), t0()).await.unwrap() else { panic!() };
+            claim(&pool, "p", task("master-red"), &session("s1"), t0())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
         assert_eq!(holder.kind, HolderKind::Verify);
-        let outcome = claim(&pool, "p", task("master-red"), &session("s1"), t0() + secs(61)).await.unwrap();
-        assert!(outcome.is_won(), "a probe whose lease lapsed is a dead proof, not an incident");
-        let probing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims WHERE status = 'probing'")
-            .fetch_one(&pool).await.unwrap();
+        let outcome = claim(
+            &pool,
+            "p",
+            task("master-red"),
+            &session("s1"),
+            t0() + secs(61),
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.is_won(),
+            "a probe whose lease lapsed is a dead proof, not an incident"
+        );
+        let probing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_claims WHERE status = 'probing'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(probing, 0);
     }
 
     #[tokio::test]
     async fn the_answer_lists_similar_live_tasks_by_file_and_by_overlapping_paths() {
         let pool = test_pool().await;
-        claim(&pool, "p", task("test:core/a.rs::one"), &session("s1"), t0()).await.unwrap();
+        claim(
+            &pool,
+            "p",
+            task("test:core/a.rs::one"),
+            &session("s1"),
+            t0(),
+        )
+        .await
+        .unwrap();
         let mut guarded = task("topic:flaky-ci");
         guarded.guard_paths = vec!["core/src".into()];
-        claim(&pool, "p", guarded, &session("s1"), t0()).await.unwrap();
+        claim(&pool, "p", guarded, &session("s1"), t0())
+            .await
+            .unwrap();
 
-        let ClaimOutcome::Won { similar, .. } =
-            claim(&pool, "p", task("test:core/a.rs::two"), &session("s2"), t0()).await.unwrap() else { panic!() };
-        assert_eq!(similar.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["test:core/a.rs::one"]);
+        let ClaimOutcome::Won { similar, .. } = claim(
+            &pool,
+            "p",
+            task("test:core/a.rs::two"),
+            &session("s2"),
+            t0(),
+        )
+        .await
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            similar.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            vec!["test:core/a.rs::one"]
+        );
 
         let mut overlapping = task("file:core/src/b.rs");
         overlapping.hint_paths = vec!["core/src/b.rs".into()];
         let ClaimOutcome::Won { similar, .. } =
-            claim(&pool, "p", overlapping, &session("s3"), t0()).await.unwrap() else { panic!() };
-        assert_eq!(similar.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["topic:flaky-ci"]);
+            claim(&pool, "p", overlapping, &session("s3"), t0())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            similar.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            vec!["topic:flaky-ci"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1450,7 +2085,9 @@ mod tests {
         for who in ["s1", "s2", "s3", "s4"] {
             let pool = pool.clone();
             handles.push(tokio::spawn(async move {
-                claim(&pool, "p", task("master-red"), &session(who), t0()).await.unwrap()
+                claim(&pool, "p", task("master-red"), &session(who), t0())
+                    .await
+                    .unwrap()
             }));
         }
         let mut winners = 0;
@@ -1459,8 +2096,14 @@ mod tests {
                 winners += 1;
             }
         }
-        assert_eq!(winners, 1, "the compare-and-swap lets only one holder through");
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            winners, 1,
+            "the compare-and-swap lets only one holder through"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(rows, 1);
     }
 
@@ -1468,41 +2111,108 @@ mod tests {
     async fn record_event_writes_one_row_in_its_own_transaction() {
         let pool = test_pool().await;
         let ClaimOutcome::Won { task, .. } =
-            claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0()).await.unwrap() else { panic!() };
-        record_event(&pool, task.id, "override_land", Some(&session("s1")), "landing over a red", t0() + secs(1))
-            .await.unwrap();
-        record_event(&pool, task.id, "note", None, "", t0() + secs(2)).await.unwrap();
+            claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        record_event(
+            &pool,
+            task.id,
+            "override_land",
+            Some(&session("s1")),
+            "landing over a red",
+            t0() + secs(1),
+        )
+        .await
+        .unwrap();
+        record_event(&pool, task.id, "note", None, "", t0() + secs(2))
+            .await
+            .unwrap();
         let log = events(&pool, task.id).await;
         assert_eq!(log.len(), 4, "created, claimed and the two new ones");
         assert_eq!(log[2].0, "override_land");
         assert_eq!(log[2].1.as_deref(), Some("s1"));
         assert_eq!(log[2].2, "landing over a red");
         assert_eq!(log[3].0, "note");
-        assert_eq!(log[3].1, None, "an event about nobody keeps the holder columns empty");
+        assert_eq!(
+            log[3].1, None,
+            "an event about nobody keeps the holder columns empty"
+        );
     }
 
     #[tokio::test]
     async fn override_recorded_is_true_only_for_the_current_claim() {
         let pool = test_pool().await;
         let ClaimOutcome::Won { task: first, .. } =
-            claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0()).await.unwrap() else { panic!() };
-        assert!(!override_recorded(&pool, first.id, "").await.unwrap(), "no override yet");
+            claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            !override_recorded(&pool, first.id, "").await.unwrap(),
+            "no override yet"
+        );
 
         // Same microsecond as `claimed_at`: `at >= claimed_at` must still count it.
-        record_event(&pool, first.id, "override_land", Some(&session("s1")), "why", t0()).await.unwrap();
-        assert!(override_recorded(&pool, first.id, "").await.unwrap(), "same tick counts");
-        assert!(override_recorded(&pool, first.id, "why").await.unwrap(), "the note matches");
-        assert!(!override_recorded(&pool, first.id, "another reason").await.unwrap(), "a different note does not");
+        record_event(
+            &pool,
+            first.id,
+            "override_land",
+            Some(&session("s1")),
+            "why",
+            t0(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            override_recorded(&pool, first.id, "").await.unwrap(),
+            "same tick counts"
+        );
+        assert!(
+            override_recorded(&pool, first.id, "why").await.unwrap(),
+            "the note matches"
+        );
+        assert!(
+            !override_recorded(&pool, first.id, "another reason")
+                .await
+                .unwrap(),
+            "a different note does not"
+        );
 
         // Another owner takes the task over: the old override belongs to the previous claim.
         let late = t0() + secs(SESSION_LEASE_SECONDS + 1);
-        assert!(claim(&pool, "p", task("file:core/a.rs"), &session("s2"), late).await.unwrap().is_won());
-        assert!(!override_recorded(&pool, first.id, "").await.unwrap(), "the old owner's override is stale");
-        record_event(&pool, first.id, "override_land", Some(&session("s2")), "mine", late).await.unwrap();
+        assert!(
+            claim(&pool, "p", task("file:core/a.rs"), &session("s2"), late)
+                .await
+                .unwrap()
+                .is_won()
+        );
+        assert!(
+            !override_recorded(&pool, first.id, "").await.unwrap(),
+            "the old owner's override is stale"
+        );
+        record_event(
+            &pool,
+            first.id,
+            "override_land",
+            Some(&session("s2")),
+            "mine",
+            late,
+        )
+        .await
+        .unwrap();
         assert!(override_recorded(&pool, first.id, "").await.unwrap());
 
         // A released task has no current claim.
-        sqlx::query("UPDATE task_claims SET status = 'open' WHERE id = ?").bind(first.id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE task_claims SET status = 'open' WHERE id = ?")
+            .bind(first.id)
+            .execute(&pool)
+            .await
+            .unwrap();
         assert!(!override_recorded(&pool, first.id, "").await.unwrap());
     }
 
@@ -1539,8 +2249,17 @@ mod tests {
     async fn an_incident_without_a_holder_is_created_open() {
         let pool = test_pool().await;
         let row = create_or_adopt_open(
-            &pool, "p", incident(serde_json::json!({"red_since_sha": "a"}), &["core/a.rs"], &["core/b.rs"]), t0(),
-        ).await.unwrap();
+            &pool,
+            "p",
+            incident(
+                serde_json::json!({"red_since_sha": "a"}),
+                &["core/a.rs"],
+                &["core/b.rs"],
+            ),
+            t0(),
+        )
+        .await
+        .unwrap();
         assert_eq!((row.status, row.kind), (Status::Open, TaskKind::Incident));
         assert_eq!(row.holder(), None);
         assert_eq!(row.guard_paths, vec!["core/a.rs"]);
@@ -1550,15 +2269,43 @@ mod tests {
     #[tokio::test]
     async fn a_second_creator_adopts_the_live_row_and_adds_what_it_knows() {
         let pool = test_pool().await;
-        let first = create_or_adopt_open(&pool, "p", incident(serde_json::json!({"red_since_sha": "a"}), &["core/a.rs"], &[]), t0())
-            .await.unwrap();
-        claim_by_id(&pool, first.id, &session("s1"), t0()).await.unwrap();
+        let first = create_or_adopt_open(
+            &pool,
+            "p",
+            incident(
+                serde_json::json!({"red_since_sha": "a"}),
+                &["core/a.rs"],
+                &[],
+            ),
+            t0(),
+        )
+        .await
+        .unwrap();
+        claim_by_id(&pool, first.id, &session("s1"), t0())
+            .await
+            .unwrap();
         let adopted = create_or_adopt_open(
-            &pool, "p", incident(serde_json::json!({"culprit_sha": "c"}), &["core/b.rs"], &["core/c.rs"]), t0() + secs(5),
-        ).await.unwrap();
+            &pool,
+            "p",
+            incident(
+                serde_json::json!({"culprit_sha": "c"}),
+                &["core/b.rs"],
+                &["core/c.rs"],
+            ),
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
         assert_eq!(adopted.id, first.id);
-        assert_eq!(adopted.status, Status::Claimed, "adopting does not disturb the owner");
-        assert_eq!(adopted.detail, serde_json::json!({"red_since_sha": "a", "culprit_sha": "c"}));
+        assert_eq!(
+            adopted.status,
+            Status::Claimed,
+            "adopting does not disturb the owner"
+        );
+        assert_eq!(
+            adopted.detail,
+            serde_json::json!({"red_since_sha": "a", "culprit_sha": "c"})
+        );
         assert_eq!(adopted.guard_paths, vec!["core/a.rs", "core/b.rs"]);
         assert_eq!(adopted.hint_paths, vec!["core/c.rs"]);
     }
@@ -1566,12 +2313,25 @@ mod tests {
     #[tokio::test]
     async fn adopting_a_probe_turns_it_into_a_plain_open_incident() {
         let pool = test_pool().await;
-        let id = seed(&pool, Seed {
-            key: "master-red", status: "probing", holder: Some(("verify", "t1")),
-            lease: Some(t0() + secs(60)), ..Seed::default()
-        }).await;
-        let adopted = create_or_adopt_open(&pool, "p", incident(serde_json::json!({"red_since_sha": "a"}), &[], &[]), t0())
-            .await.unwrap();
+        let id = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "probing",
+                holder: Some(("verify", "t1")),
+                lease: Some(t0() + secs(60)),
+                ..Seed::default()
+            },
+        )
+        .await;
+        let adopted = create_or_adopt_open(
+            &pool,
+            "p",
+            incident(serde_json::json!({"red_since_sha": "a"}), &[], &[]),
+            t0(),
+        )
+        .await
+        .unwrap();
         assert_eq!((adopted.id, adopted.status), (id, Status::Open));
         assert_eq!((adopted.holder_kind, adopted.lease_until), (None, None));
     }
@@ -1579,12 +2339,29 @@ mod tests {
     #[tokio::test]
     async fn update_detail_merges_and_replaces_paths_only_when_given() {
         let pool = test_pool().await;
-        let created = create_or_adopt_open(&pool, "p", incident(serde_json::json!({"red_since_sha": "a"}), &["g"], &["h"]), t0())
-            .await.unwrap();
-        update_detail(&pool, created.id, serde_json::json!({"culprit_sha": "c"}), None, Some(vec!["culprit.rs".into()]), t0())
-            .await.unwrap();
+        let created = create_or_adopt_open(
+            &pool,
+            "p",
+            incident(serde_json::json!({"red_since_sha": "a"}), &["g"], &["h"]),
+            t0(),
+        )
+        .await
+        .unwrap();
+        update_detail(
+            &pool,
+            created.id,
+            serde_json::json!({"culprit_sha": "c"}),
+            None,
+            Some(vec!["culprit.rs".into()]),
+            t0(),
+        )
+        .await
+        .unwrap();
         let after = row(&pool, created.id).await;
-        assert_eq!(after.detail, serde_json::json!({"red_since_sha": "a", "culprit_sha": "c"}));
+        assert_eq!(
+            after.detail,
+            serde_json::json!({"red_since_sha": "a", "culprit_sha": "c"})
+        );
         assert_eq!(after.guard_paths, vec!["g"], "untouched when None");
         assert_eq!(after.hint_paths, vec!["culprit.rs"], "replaced when Some");
     }
@@ -1592,7 +2369,10 @@ mod tests {
     #[test]
     fn a_green_note_round_trips_its_sha() {
         assert_eq!(green_note("abc", ""), "green abc");
-        assert_eq!(green_sha(&green_note("abc", "reverted")), Some("abc".to_owned()));
+        assert_eq!(
+            green_sha(&green_note("abc", "reverted")),
+            Some("abc".to_owned())
+        );
         assert_eq!(green_sha("released by s1"), None);
     }
 
@@ -1608,13 +2388,35 @@ mod tests {
         let pool = test_pool().await;
         let owner = session("s1");
         let id = claimed_by(&pool, "file:core/a.rs", &owner).await;
-        assert!(!release(&pool, id, &session("s2"), "not mine", t0()).await.unwrap(), "only the owner releases");
-        assert!(release(&pool, id, &owner, "gave up", t0() + secs(1)).await.unwrap());
+        assert!(
+            !release(&pool, id, &session("s2"), "not mine", t0())
+                .await
+                .unwrap(),
+            "only the owner releases"
+        );
+        assert!(
+            release(&pool, id, &owner, "gave up", t0() + secs(1))
+                .await
+                .unwrap()
+        );
         let after = row(&pool, id).await;
-        assert_eq!((after.status, after.holder_kind, after.lease_until), (Status::Open, None, None));
+        assert_eq!(
+            (after.status, after.holder_kind, after.lease_until),
+            (Status::Open, None, None)
+        );
         let log = events(&pool, id).await;
-        assert_eq!(log.last().unwrap(), &("released".to_owned(), Some("s1".to_owned()), "gave up".to_owned()));
-        assert!(!release(&pool, id, &owner, "again", t0()).await.unwrap(), "an open task has no owner to release");
+        assert_eq!(
+            log.last().unwrap(),
+            &(
+                "released".to_owned(),
+                Some("s1".to_owned()),
+                "gave up".to_owned()
+            )
+        );
+        assert!(
+            !release(&pool, id, &owner, "again", t0()).await.unwrap(),
+            "an open task has no owner to release"
+        );
     }
 
     #[tokio::test]
@@ -1623,13 +2425,29 @@ mod tests {
         let owner = session("s1");
         let id = claimed_by(&pool, "file:core/a.rs", &owner).await;
         let other = session("s2");
-        assert!(!done(&pool, id, Closer::Holder(&other), "x", t0()).await.unwrap());
-        assert!(done(&pool, id, Closer::Holder(&owner), "fixed", t0() + secs(5)).await.unwrap());
+        assert!(
+            !done(&pool, id, Closer::Holder(&other), "x", t0())
+                .await
+                .unwrap()
+        );
+        assert!(
+            done(&pool, id, Closer::Holder(&owner), "fixed", t0() + secs(5))
+                .await
+                .unwrap()
+        );
         let after = row(&pool, id).await;
         assert_eq!(after.status, Status::Done);
-        assert_eq!((after.closed_at, after.close_note), (Some(stamp(t0() + secs(5))), Some("fixed".into())));
+        assert_eq!(
+            (after.closed_at, after.close_note),
+            (Some(stamp(t0() + secs(5))), Some("fixed".into()))
+        );
         assert_eq!(after.lease_until, None);
-        assert!(!done(&pool, id, Closer::Holder(&owner), "twice", t0()).await.unwrap(), "closing is not repeatable");
+        assert!(
+            !done(&pool, id, Closer::Holder(&owner), "twice", t0())
+                .await
+                .unwrap(),
+            "closing is not repeatable"
+        );
     }
 
     #[tokio::test]
@@ -1638,7 +2456,17 @@ mod tests {
         let owner = session("s1");
         let id = claimed_by(&pool, "file:core/a.rs", &owner).await;
         let much_later = t0() + secs(SESSION_LEASE_SECONDS * 4);
-        assert!(done(&pool, id, Closer::Holder(&owner), "finished after a long pause", much_later).await.unwrap());
+        assert!(
+            done(
+                &pool,
+                id,
+                Closer::Holder(&owner),
+                "finished after a long pause",
+                much_later
+            )
+            .await
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1646,14 +2474,30 @@ mod tests {
         let pool = test_pool().await;
         let owner = session("s1");
         let id = claimed_by(&pool, "master-red", &owner).await;
-        assert!(done(&pool, id, Closer::Green { sha: "abc123".into() }, "revert landed", t0() + secs(9)).await.unwrap());
+        assert!(
+            done(
+                &pool,
+                id,
+                Closer::Green {
+                    sha: "abc123".into()
+                },
+                "revert landed",
+                t0() + secs(9)
+            )
+            .await
+            .unwrap()
+        );
         let log = events(&pool, id).await;
         let last = log.last().unwrap();
         assert_eq!((last.0.as_str(), last.1.as_deref()), ("done", Some("s1")));
         assert_eq!(green_sha(&last.2), Some("abc123".to_owned()));
         let after = row(&pool, id).await;
         assert_eq!(after.status, Status::Done);
-        assert_eq!(after.checked_sha.as_deref(), Some("abc123"), "a green closure records the sha it was proved on");
+        assert_eq!(
+            after.checked_sha.as_deref(),
+            Some("abc123"),
+            "a green closure records the sha it was proved on"
+        );
     }
 
     #[tokio::test]
@@ -1661,90 +2505,201 @@ mod tests {
         let pool = test_pool().await;
         let owner = session("s1");
         let id = claimed_by(&pool, "master-red", &owner).await;
-        sqlx::query("UPDATE task_claims SET checked_sha = 'm1' WHERE id = ?").bind(id).execute(&pool).await.unwrap();
-        assert!(done(&pool, id, Closer::Holder(&owner), "fixed by hand", t0()).await.unwrap());
-        assert_eq!(row(&pool, id).await.checked_sha.as_deref(), Some("m1"), "the owner's closure leaves it alone");
+        sqlx::query("UPDATE task_claims SET checked_sha = 'm1' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            done(&pool, id, Closer::Holder(&owner), "fixed by hand", t0())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            row(&pool, id).await.checked_sha.as_deref(),
+            Some("m1"),
+            "the owner's closure leaves it alone"
+        );
     }
 
     #[tokio::test]
     async fn green_also_closes_a_task_nobody_held() {
         let pool = test_pool().await;
-        let id = seed(&pool, Seed { key: "master-red", status: "open", ..Seed::default() }).await;
-        assert!(done(&pool, id, Closer::Green { sha: "abc".into() }, "", t0()).await.unwrap());
+        let id = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert!(
+            done(&pool, id, Closer::Green { sha: "abc".into() }, "", t0())
+                .await
+                .unwrap()
+        );
         let log = events(&pool, id).await;
         assert_eq!(log.last().unwrap().1, None, "no previous owner to record");
-        let probing = seed(&pool, Seed { key: "file:p.rs", status: "probing", holder: Some(("verify", "t")), ..Seed::default() }).await;
-        assert!(!done(&pool, probing, Closer::Green { sha: "abc".into() }, "", t0()).await.unwrap(), "a probe is not a task yet");
+        let probing = seed(
+            &pool,
+            Seed {
+                key: "file:p.rs",
+                status: "probing",
+                holder: Some(("verify", "t")),
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert!(
+            !done(
+                &pool,
+                probing,
+                Closer::Green { sha: "abc".into() },
+                "",
+                t0()
+            )
+            .await
+            .unwrap(),
+            "a probe is not a task yet"
+        );
     }
 
     #[tokio::test]
     async fn release_for_owner_reopens_only_that_owners_claims() {
         let pool = test_pool().await;
-        let run = Holder { kind: HolderKind::Run, id: "7".into(), worktree: "/wt/run".into() };
+        let run = Holder {
+            kind: HolderKind::Run,
+            id: "7".into(),
+            worktree: "/wt/run".into(),
+        };
         let mine = claimed_by(&pool, "file:a.rs", &run).await;
         let also_mine = claimed_by(&pool, "file:b.rs", &run).await;
-        let other_run = Holder { id: "8".into(), ..run.clone() };
+        let other_run = Holder {
+            id: "8".into(),
+            ..run.clone()
+        };
         let theirs = claimed_by(&pool, "file:c.rs", &other_run).await;
         let session_claim = claimed_by(&pool, "file:d.rs", &session("7")).await;
 
-        assert_eq!(release_for_owner(&pool, HolderKind::Run, "7", t0()).await.unwrap(), 2);
+        assert_eq!(
+            release_for_owner(&pool, HolderKind::Run, "7", t0())
+                .await
+                .unwrap(),
+            2
+        );
         for id in [mine, also_mine] {
             assert_eq!(row(&pool, id).await.status, Status::Open);
             assert_eq!(events(&pool, id).await.last().unwrap().0, "released");
         }
         assert_eq!(row(&pool, theirs).await.status, Status::Claimed);
-        assert_eq!(row(&pool, session_claim).await.status, Status::Claimed, "a session '7' is not run '7'");
-        assert_eq!(release_for_owner(&pool, HolderKind::Run, "7", t0()).await.unwrap(), 0);
+        assert_eq!(
+            row(&pool, session_claim).await.status,
+            Status::Claimed,
+            "a session '7' is not run '7'"
+        );
+        assert_eq!(
+            release_for_owner(&pool, HolderKind::Run, "7", t0())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn the_first_verify_starts_the_probe_and_a_second_finds_it_in_flight() {
         let pool = test_pool().await;
-        let ProbeStart::Started(row) = begin_probe(&pool, "p", "ticket-1", "/probe", t0()).await.unwrap()
-            else { panic!("the first verify owns the proof") };
+        let ProbeStart::Started(row) = begin_probe(&pool, "p", "ticket-1", "/probe", t0())
+            .await
+            .unwrap()
+        else {
+            panic!("the first verify owns the proof")
+        };
         assert_eq!(row.status, Status::Probing);
         assert_eq!(row.key, TaskKey::master_red());
         assert_eq!(row.holder().unwrap().kind, HolderKind::Verify);
-        assert_eq!(row.lease_until, Some(stamp(t0() + secs(PROBE_LEASE_SECONDS))));
+        assert_eq!(
+            row.lease_until,
+            Some(stamp(t0() + secs(PROBE_LEASE_SECONDS)))
+        );
 
         assert!(matches!(
-            begin_probe(&pool, "p", "ticket-2", "/probe", t0() + secs(5)).await.unwrap(),
+            begin_probe(&pool, "p", "ticket-2", "/probe", t0() + secs(5))
+                .await
+                .unwrap(),
             ProbeStart::InFlight(_)
         ));
         assert!(
-            matches!(begin_probe(&pool, "p", "ticket-1", "/probe", t0() + secs(5)).await.unwrap(), ProbeStart::InFlight(_)),
+            matches!(
+                begin_probe(&pool, "p", "ticket-1", "/probe", t0() + secs(5))
+                    .await
+                    .unwrap(),
+                ProbeStart::InFlight(_)
+            ),
             "the same ticket on its own LIVE probe is in flight too: it must not start a second proof"
         );
-        assert!(matches!(
-            begin_probe(&pool, "other", "ticket-3", "/probe", t0()).await.unwrap(),
-            ProbeStart::Started(_)
-        ), "another project proves on its own");
+        assert!(
+            matches!(
+                begin_probe(&pool, "other", "ticket-3", "/probe", t0())
+                    .await
+                    .unwrap(),
+                ProbeStart::Started(_)
+            ),
+            "another project proves on its own"
+        );
     }
 
     #[tokio::test]
     async fn a_lapsed_probe_is_taken_over_by_the_next_verify() {
         let pool = test_pool().await;
-        begin_probe(&pool, "p", "ticket-1", "/probe", t0()).await.unwrap();
+        begin_probe(&pool, "p", "ticket-1", "/probe", t0())
+            .await
+            .unwrap();
         let late = t0() + secs(PROBE_LEASE_SECONDS + 1);
-        let ProbeStart::Started(row) = begin_probe(&pool, "p", "ticket-2", "/probe", late).await.unwrap()
-            else { panic!("a crashed proof is retaken") };
+        let ProbeStart::Started(row) = begin_probe(&pool, "p", "ticket-2", "/probe", late)
+            .await
+            .unwrap()
+        else {
+            panic!("a crashed proof is retaken")
+        };
         assert_eq!(row.holder_id.as_deref(), Some("ticket-2"));
-        assert_eq!(row.lease_until, Some(stamp(late + secs(PROBE_LEASE_SECONDS))));
+        assert_eq!(
+            row.lease_until,
+            Some(stamp(late + secs(PROBE_LEASE_SECONDS)))
+        );
     }
 
     #[tokio::test]
     async fn the_same_ticket_restarts_its_own_probe_once_the_lease_lapsed() {
         let pool = test_pool().await;
-        begin_probe(&pool, "p", "ticket-1", "/probe", t0()).await.unwrap();
+        begin_probe(&pool, "p", "ticket-1", "/probe", t0())
+            .await
+            .unwrap();
         let late = t0() + secs(PROBE_LEASE_SECONDS + 1);
-        assert!(matches!(begin_probe(&pool, "p", "ticket-1", "/probe", late).await.unwrap(), ProbeStart::Started(_)));
+        assert!(matches!(
+            begin_probe(&pool, "p", "ticket-1", "/probe", late)
+                .await
+                .unwrap(),
+            ProbeStart::Started(_)
+        ));
     }
 
     #[tokio::test]
     async fn an_incident_already_open_or_claimed_needs_no_probe() {
         let pool = test_pool().await;
-        seed(&pool, Seed { key: "master-red", status: "open", ..Seed::default() }).await;
-        assert!(matches!(begin_probe(&pool, "p", "t", "/probe", t0()).await.unwrap(), ProbeStart::Exists(_)));
+        seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert!(matches!(
+            begin_probe(&pool, "p", "t", "/probe", t0()).await.unwrap(),
+            ProbeStart::Exists(_)
+        ));
     }
 
     fn failed(sha: &str) -> FailedProbe {
@@ -1759,85 +2714,212 @@ mod tests {
     #[tokio::test]
     async fn a_failed_probe_opens_the_incident_with_what_it_proved() {
         let pool = test_pool().await;
-        let ProbeStart::Started(probing) = begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap() else { panic!() };
-        let opened = finish_probe(&pool, probing.id, "t1", Some(failed("m1")), t0() + secs(30)).await.unwrap().unwrap();
+        let ProbeStart::Started(probing) =
+            begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap()
+        else {
+            panic!()
+        };
+        let opened = finish_probe(&pool, probing.id, "t1", Some(failed("m1")), t0() + secs(30))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!((opened.id, opened.status), (probing.id, Status::Open));
         assert_eq!((opened.holder_kind, opened.lease_until), (None, None));
         assert_eq!(opened.checked_sha.as_deref(), Some("m1"));
         assert_eq!(opened.guard_paths, vec!["core/a.rs"]);
-        assert_eq!(opened.detail["red_tests"], serde_json::json!(["core/a.rs::it"]));
+        assert_eq!(
+            opened.detail["red_tests"],
+            serde_json::json!(["core/a.rs::it"])
+        );
         // The same keys as the postgate's incident, so verify case 1 can test ancestry against
         // `red_since_sha`; both are the master sha the proof ran on.
         assert_eq!(opened.detail["red_sha"], "m1");
         assert_eq!(opened.detail["red_since_sha"], "m1");
         assert_eq!(opened.detail["red_groups"], serde_json::json!(["core"]));
-        assert!(opened.detail.get("proved_sha").is_none(), "no key of its own: it is red_sha / red_since_sha");
-        assert_eq!(events(&pool, probing.id).await.len(), 1, "created, when it became an incident");
+        assert!(
+            opened.detail.get("proved_sha").is_none(),
+            "no key of its own: it is red_sha / red_since_sha"
+        );
+        assert_eq!(
+            events(&pool, probing.id).await.len(),
+            1,
+            "created, when it became an incident"
+        );
     }
 
     #[tokio::test]
     async fn a_probe_that_passes_on_master_deletes_the_row() {
         let pool = test_pool().await;
-        let ProbeStart::Started(probing) = begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap() else { panic!() };
-        assert!(finish_probe(&pool, probing.id, "t1", None, t0()).await.unwrap().is_none());
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims").fetch_one(&pool).await.unwrap();
+        let ProbeStart::Started(probing) =
+            begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            finish_probe(&pool, probing.id, "t1", None, t0())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(left, 0);
         // And the slot is free: the next verify can start a new proof.
-        assert!(matches!(begin_probe(&pool, "p", "t2", "/probe", t0()).await.unwrap(), ProbeStart::Started(_)));
+        assert!(matches!(
+            begin_probe(&pool, "p", "t2", "/probe", t0()).await.unwrap(),
+            ProbeStart::Started(_)
+        ));
     }
 
     #[tokio::test]
     async fn finishing_a_probe_the_postgate_already_adopted_leaves_the_incident_alone() {
         let pool = test_pool().await;
-        let ProbeStart::Started(probing) = begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap() else { panic!() };
-        create_or_adopt_open(&pool, "p", incident(serde_json::json!({"red_since_sha": "a"}), &[], &[]), t0() + secs(1))
-            .await.unwrap();
-        let kept = finish_probe(&pool, probing.id, "t1", None, t0() + secs(2)).await.unwrap();
-        assert_eq!(kept.map(|r| r.status), Some(Status::Open), "a 'passes on master' must not delete the postgate's incident");
+        let ProbeStart::Started(probing) =
+            begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap()
+        else {
+            panic!()
+        };
+        create_or_adopt_open(
+            &pool,
+            "p",
+            incident(serde_json::json!({"red_since_sha": "a"}), &[], &[]),
+            t0() + secs(1),
+        )
+        .await
+        .unwrap();
+        let kept = finish_probe(&pool, probing.id, "t1", None, t0() + secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.map(|r| r.status),
+            Some(Status::Open),
+            "a 'passes on master' must not delete the postgate's incident"
+        );
     }
 
     #[tokio::test]
     async fn a_stale_ticket_cannot_finish_or_delete_another_tickets_live_probe() {
         let pool = test_pool().await;
-        let ProbeStart::Started(first) = begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap() else { panic!() };
+        let ProbeStart::Started(first) =
+            begin_probe(&pool, "p", "t1", "/probe", t0()).await.unwrap()
+        else {
+            panic!()
+        };
         let late = t0() + secs(PROBE_LEASE_SECONDS + 1);
-        let ProbeStart::Started(second) = begin_probe(&pool, "p", "t2", "/probe", late).await.unwrap() else { panic!() };
-        assert_eq!(first.id, second.id, "the lapsed row is retaken, not duplicated");
+        let ProbeStart::Started(second) =
+            begin_probe(&pool, "p", "t2", "/probe", late).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            first.id, second.id,
+            "the lapsed row is retaken, not duplicated"
+        );
 
         // t1 wakes up late and reports "passes on master": t2's proof must survive.
-        let theirs = finish_probe(&pool, first.id, "t1", None, late).await.unwrap().unwrap();
-        assert_eq!((theirs.status, theirs.holder_id.as_deref()), (Status::Probing, Some("t2")), "returned untouched, still probing");
+        let theirs = finish_probe(&pool, first.id, "t1", None, late)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (theirs.status, theirs.holder_id.as_deref()),
+            (Status::Probing, Some("t2")),
+            "returned untouched, still probing"
+        );
         // Nor can t1 turn it into an incident with its own result.
-        let theirs = finish_probe(&pool, first.id, "t1", Some(failed("m1")), late).await.unwrap().unwrap();
+        let theirs = finish_probe(&pool, first.id, "t1", Some(failed("m1")), late)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(theirs.status, Status::Probing);
         let left = row(&pool, first.id).await;
-        assert_eq!((left.status, left.checked_sha, left.detail), (Status::Probing, None, serde_json::json!({})));
-        assert!(events(&pool, first.id).await.is_empty(), "no event for a probe that is not a task yet");
+        assert_eq!(
+            (left.status, left.checked_sha, left.detail),
+            (Status::Probing, None, serde_json::json!({}))
+        );
+        assert!(
+            events(&pool, first.id).await.is_empty(),
+            "no event for a probe that is not a task yet"
+        );
 
         // The owner of the row finishes normally.
-        assert!(finish_probe(&pool, first.id, "t2", None, late).await.unwrap().is_none());
+        assert!(
+            finish_probe(&pool, first.id, "t2", None, late)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn the_reprobe_is_single_flight() {
         let pool = test_pool().await;
-        let id = seed(&pool, Seed { key: "master-red", status: "open", ..Seed::default() }).await;
+        let id = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
         assert!(begin_reprobe(&pool, id, t0()).await.unwrap());
-        assert!(!begin_reprobe(&pool, id, t0() + secs(5)).await.unwrap(), "one re-proof at a time");
-        assert!(begin_reprobe(&pool, id, t0() + secs(PROBE_LEASE_SECONDS + 1)).await.unwrap(), "a crashed one lapses");
-        let closed = seed(&pool, Seed { key: "file:x.rs", status: "done", ..Seed::default() }).await;
-        assert!(!begin_reprobe(&pool, closed, t0()).await.unwrap(), "only unresolved incidents are re-proved");
+        assert!(
+            !begin_reprobe(&pool, id, t0() + secs(5)).await.unwrap(),
+            "one re-proof at a time"
+        );
+        assert!(
+            begin_reprobe(&pool, id, t0() + secs(PROBE_LEASE_SECONDS + 1))
+                .await
+                .unwrap(),
+            "a crashed one lapses"
+        );
+        let closed = seed(
+            &pool,
+            Seed {
+                key: "file:x.rs",
+                status: "done",
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert!(
+            !begin_reprobe(&pool, closed, t0()).await.unwrap(),
+            "only unresolved incidents are re-proved"
+        );
     }
 
     #[tokio::test]
     async fn a_reprobe_still_red_moves_checked_sha_and_releases_the_flight() {
         let pool = test_pool().await;
-        let id = seed(&pool, Seed { key: "master-red", status: "open", ..Seed::default() }).await;
+        let id = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
         begin_reprobe(&pool, id, t0()).await.unwrap();
-        finish_reprobe(&pool, id, "m2", true, t0() + secs(30)).await.unwrap();
+        finish_reprobe(&pool, id, "m2", true, t0() + secs(30))
+            .await
+            .unwrap();
         let after = row(&pool, id).await;
-        assert_eq!((after.status, after.checked_sha.as_deref(), after.probe_lease_until), (Status::Open, Some("m2"), None));
-        assert!(begin_reprobe(&pool, id, t0() + secs(31)).await.unwrap(), "the flight is free again");
+        assert_eq!(
+            (
+                after.status,
+                after.checked_sha.as_deref(),
+                after.probe_lease_until
+            ),
+            (Status::Open, Some("m2"), None)
+        );
+        assert!(
+            begin_reprobe(&pool, id, t0() + secs(31)).await.unwrap(),
+            "the flight is free again"
+        );
     }
 
     #[tokio::test]
@@ -1846,7 +2928,9 @@ mod tests {
         let owner = session("s1");
         let id = claimed_by(&pool, "master-red", &owner).await;
         begin_reprobe(&pool, id, t0()).await.unwrap();
-        finish_reprobe(&pool, id, "m3", false, t0() + secs(30)).await.unwrap();
+        finish_reprobe(&pool, id, "m3", false, t0() + secs(30))
+            .await
+            .unwrap();
         let after = row(&pool, id).await;
         assert_eq!(after.status, Status::Done);
         let last = events(&pool, id).await.pop().unwrap();

@@ -45,9 +45,15 @@ impl Incident {
             task_id: row.id,
             status: row.status,
             holder: describe_holder(row),
-            red_tests: detail_strings(&row.detail, "red_tests").into_iter().collect(),
+            red_tests: detail_strings(&row.detail, "red_tests")
+                .into_iter()
+                .collect(),
             red_groups: detail_strings(&row.detail, "red_groups"),
-            red_since_sha: row.detail.get("red_since_sha").and_then(Value::as_str).map(str::to_owned),
+            red_since_sha: row
+                .detail
+                .get("red_since_sha")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             fresh,
         }
     }
@@ -58,7 +64,13 @@ pub(super) fn detail_strings(detail: &Value, key: &str) -> Vec<String> {
     detail
         .get(key)
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -81,10 +93,18 @@ pub struct Facts<'a> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Class {
     /// The session's own failure; `note` says why when that is not obvious.
-    Task { note: Option<String> },
-    Inherited { task_id: i64, note: String },
+    Task {
+        note: Option<String>,
+    },
+    Inherited {
+        task_id: i64,
+        note: String,
+    },
     /// Waiting for the (re-)proof of task `task_id` to settle.
-    Pending { task_id: i64, reprobe: bool },
+    Pending {
+        task_id: i64,
+        reprobe: bool,
+    },
     /// No incident and the group is suspect: someone has to prove it on master.
     NeedsProbe,
 }
@@ -96,20 +116,34 @@ fn short(sha: &str) -> String {
 /// `branch_has_red_since`: `Some(bool)` is the ancestry test ("the verified HEAD contains the
 /// incident's `red_since_sha`"); `None` when it was not made (the incident has no such key) and
 /// counts as satisfied.
-pub fn decide(facts: &Facts<'_>, incident: Option<&Incident>, branch_has_red_since: Option<bool>) -> Class {
+pub fn decide(
+    facts: &Facts<'_>,
+    incident: Option<&Incident>,
+    branch_has_red_since: Option<bool>,
+) -> Class {
     let own = |note: Option<String>| Class::Task { note };
     let Some(incident) = incident else {
-        return if facts.suspect { Class::NeedsProbe } else { own(None) };
+        return if facts.suspect {
+            Class::NeedsProbe
+        } else {
+            own(None)
+        };
     };
     if incident.status == Status::Probing {
         return if facts.suspect {
-            Class::Pending { task_id: incident.task_id, reprobe: false }
+            Class::Pending {
+                task_id: incident.task_id,
+                reprobe: false,
+            }
         } else {
             own(None)
         };
     }
     // `open` or `claimed` from here.
-    let ids = facts.failed.map(|failed| &failed.tests).filter(|tests| !tests.is_empty());
+    let ids = facts
+        .failed
+        .map(|failed| &failed.tests)
+        .filter(|tests| !tests.is_empty());
     let by_group = ids.is_none();
     let matches = match ids {
         Some(ids) => !incident.red_tests.is_empty() && ids.is_subset(&incident.red_tests),
@@ -127,7 +161,11 @@ pub fn decide(facts: &Facts<'_>, incident: Option<&Incident>, branch_has_red_sin
         )));
     }
     if branch_has_red_since == Some(false) {
-        let since = incident.red_since_sha.as_deref().map(short).unwrap_or_default();
+        let since = incident
+            .red_since_sha
+            .as_deref()
+            .map(short)
+            .unwrap_or_default();
         return own(Some(format!(
             "your branch predates the break: it branched before the red was proven at {since}, so it \
              does not contain that commit; rebase to check whether this red is yours"
@@ -146,7 +184,10 @@ pub fn decide(facts: &Facts<'_>, incident: Option<&Incident>, branch_has_red_sin
 
 /// A done ticket whose failed units are all inherited has the verdict `inherited`.
 pub fn only_inherited(classes: &[Class]) -> bool {
-    !classes.is_empty() && classes.iter().all(|class| matches!(class, Class::Inherited { .. }))
+    !classes.is_empty()
+        && classes
+            .iter()
+            .all(|class| matches!(class, Class::Inherited { .. }))
 }
 
 // ---- the half that reads git and the claims store ------------------------------------------------
@@ -184,7 +225,9 @@ impl Classification {
         let mut inherited = BTreeSet::new();
         let mut waiting: Vec<String> = Vec::new();
         for entry in &self.classes {
-            let Some(unit) = ticket.units.get_mut(entry.index) else { continue };
+            let Some(unit) = ticket.units.get_mut(entry.index) else {
+                continue;
+            };
             match &entry.class {
                 Class::Inherited { task_id, note } => {
                     unit.inherited = Some(note.clone());
@@ -214,8 +257,15 @@ impl Classification {
             note(ticket, format!("waiting for {}", waiting.join(", ")));
             return;
         }
-        let classes: Vec<Class> = self.classes.iter().map(|entry| entry.class.clone()).collect();
-        let clean = ticket.units.iter().all(|unit| !matches!(unit.status.as_str(), "errored" | "unknown"));
+        let classes: Vec<Class> = self
+            .classes
+            .iter()
+            .map(|entry| entry.class.clone())
+            .collect();
+        let clean = ticket
+            .units
+            .iter()
+            .all(|unit| !matches!(unit.status.as_str(), "errored" | "unknown"));
         if clean && only_inherited(&classes) {
             ticket.verdict = Some("inherited".to_owned());
             let ids: Vec<String> = inherited.iter().map(|id| format!("#{id}")).collect();
@@ -286,7 +336,9 @@ async fn try_apply(
     let worktree = Path::new(&request.worktree);
     let deadline = Instant::now() + GIT_BUDGET;
 
-    let head = probe::master_head(pool, project_id, &project_root, deadline).await.ok();
+    let head = probe::master_head(pool, project_id, &project_root, deadline)
+        .await
+        .ok();
     let incident = store::live_by_key(pool, project_id, &TaskKey::master_red(), now)
         .await
         .map_err(|error| error.to_string())?;
@@ -294,10 +346,23 @@ async fn try_apply(
     // Case 3 first: an incident not re-checked at today's master head is re-proved before anything
     // is decided against it, and the units wait while that runs.
     let mut freshness = Freshness::Fresh;
-    if let Some(row) = incident.as_ref().filter(|row| matches!(row.status, Status::Open | Status::Claimed)) {
+    if let Some(row) = incident
+        .as_ref()
+        .filter(|row| matches!(row.status, Status::Open | Status::Claimed))
+    {
         freshness = match head.as_deref() {
             Some(head) => {
-                ensure_fresh(pool, executor, project_id, &project_root, row, head, stored.reprobes > 0, now).await?
+                ensure_fresh(
+                    pool,
+                    executor,
+                    project_id,
+                    &project_root,
+                    row,
+                    head,
+                    stored.reprobes > 0,
+                    now,
+                )
+                .await?
             }
             None => Freshness::GaveUp,
         };
@@ -306,8 +371,17 @@ async fn try_apply(
         if started {
             stored.reprobes += 1;
         }
-        let class = Class::Pending { task_id: row.id, reprobe: true };
-        stored.classes = failed.iter().map(|&index| UnitClass { index, class: class.clone() }).collect();
+        let class = Class::Pending {
+            task_id: row.id,
+            reprobe: true,
+        };
+        stored.classes = failed
+            .iter()
+            .map(|&index| UnitClass {
+                index,
+                class: class.clone(),
+            })
+            .collect();
         persist(pool, request.id, &stored).await;
         stored.apply_to(ticket);
         return Ok(());
@@ -347,7 +421,9 @@ async fn try_apply(
     .await;
 
     // Units that need a master proof share ONE proof of all their groups.
-    let needing: Vec<usize> = (0..classes.len()).filter(|&i| classes[i] == Class::NeedsProbe).collect();
+    let needing: Vec<usize> = (0..classes.len())
+        .filter(|&i| classes[i] == Class::NeedsProbe)
+        .collect();
     if !needing.is_empty() {
         let mut groups: Vec<String> = Vec::new();
         for &i in &needing {
@@ -357,21 +433,38 @@ async fn try_apply(
                 groups.push(group);
             }
         }
-        match probe_step(pool, executor, request, &project_root, &groups, head.as_deref(), now).await? {
+        match probe_step(
+            pool,
+            executor,
+            request,
+            &project_root,
+            &groups,
+            head.as_deref(),
+            now,
+        )
+        .await?
+        {
             ProbeStep::Task(note) => {
                 for &i in &needing {
-                    classes[i] = Class::Task { note: Some(note.clone()) };
+                    classes[i] = Class::Task {
+                        note: Some(note.clone()),
+                    };
                 }
             }
             ProbeStep::Pending(task_id) => {
                 for &i in &needing {
-                    classes[i] = Class::Pending { task_id, reprobe: false };
+                    classes[i] = Class::Pending {
+                        task_id,
+                        reprobe: false,
+                    };
                 }
             }
             ProbeStep::Incident(row) => {
                 // A proof (ours or someone's) opened the incident meanwhile: decide against it. It was
                 // proved at the master head by definition, so it is fresh when `checked_sha` says so.
-                let proved_fresh = head.as_deref().is_some_and(|h| row.checked_sha.as_deref() == Some(h));
+                let proved_fresh = head
+                    .as_deref()
+                    .is_some_and(|h| row.checked_sha.as_deref() == Some(h));
                 let subset: Vec<usize> = needing.iter().map(|&i| failed[i]).collect();
                 let redone = decide_units(
                     &mut stored,
@@ -392,8 +485,16 @@ async fn try_apply(
         }
     }
 
-    stored.done = !unread && !classes.iter().any(|class| matches!(class, Class::Pending { .. }));
-    stored.classes = failed.iter().copied().zip(classes).map(|(index, class)| UnitClass { index, class }).collect();
+    stored.done = !unread
+        && !classes
+            .iter()
+            .any(|class| matches!(class, Class::Pending { .. }));
+    stored.classes = failed
+        .iter()
+        .copied()
+        .zip(classes)
+        .map(|(index, class)| UnitClass { index, class })
+        .collect();
     persist(pool, request.id, &stored).await;
     stored.apply_to(ticket);
     Ok(())
@@ -401,7 +502,9 @@ async fn try_apply(
 
 /// Final classifications also store the incident ids the close notice joins on.
 async fn persist(pool: &SqlitePool, id: i64, stored: &Classification) {
-    let Ok(json) = serde_json::to_string(stored) else { return };
+    let Ok(json) = serde_json::to_string(stored) else {
+        return;
+    };
     let written = if stored.done {
         let ids: BTreeSet<i64> = stored
             .classes
@@ -436,8 +539,15 @@ async fn decide_units(
     unread: &mut bool,
 ) -> Vec<Class> {
     let incident = row.map(|row| Incident::from_row(row, fresh));
-    let branch_has = match incident.as_ref().and_then(|inc| inc.red_since_sha.as_deref()) {
-        Some(since) if incident.as_ref().is_some_and(|inc| inc.status != Status::Probing) => {
+    let branch_has = match incident
+        .as_ref()
+        .and_then(|inc| inc.red_since_sha.as_deref())
+    {
+        Some(since)
+            if incident
+                .as_ref()
+                .is_some_and(|inc| inc.status != Status::Probing) =>
+        {
             match contains(stored, worktree, since, deadline).await {
                 Some(found) => Some(found),
                 // Unreadable: the side that never masks a failure, but not remembered.
@@ -454,10 +564,10 @@ async fn decide_units(
         .map(|&index| {
             let unit: &UnitReport = &ticket.units[index];
             // The runner's ids live on the unit, not in `Failures`: rebuild them for `decide`.
-            let failures = unit
-                .failed_tests
-                .as_ref()
-                .map(|ids| Failures { tests: ids.iter().cloned().collect(), files: BTreeSet::new() });
+            let failures = unit.failed_tests.as_ref().map(|ids| Failures {
+                tests: ids.iter().cloned().collect(),
+                files: BTreeSet::new(),
+            });
             let facts = Facts {
                 group: unit.group.as_deref().unwrap_or(GATE_UNIT),
                 failed: failures.as_ref(),
@@ -470,12 +580,23 @@ async fn decide_units(
 
 /// Does the verified worktree's HEAD contain `sha`? Memoised. A sha that is not hex is a settled
 /// "no"; a git error is `None` (could not read) and is neither remembered nor taken as an answer.
-async fn contains(stored: &mut Classification, worktree: &Path, sha: &str, deadline: Instant) -> Option<bool> {
+async fn contains(
+    stored: &mut Classification,
+    worktree: &Path,
+    sha: &str,
+    deadline: Instant,
+) -> Option<bool> {
     if let Some(known) = stored.contains.get(sha) {
         return Some(*known);
     }
     let hex = (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit());
-    let found = if hex { resolve::is_ancestor(worktree, sha, "HEAD", deadline).await.ok()? } else { false };
+    let found = if hex {
+        resolve::is_ancestor(worktree, sha, "HEAD", deadline)
+            .await
+            .ok()?
+    } else {
+        false
+    };
     stored.contains.insert(sha.to_owned(), found);
     Some(found)
 }
@@ -491,7 +612,12 @@ async fn suspects_of(
     failed: &[usize],
     deadline: Instant,
 ) -> Option<BTreeMap<usize, bool>> {
-    let none = || failed.iter().map(|&index| (index, false)).collect::<BTreeMap<_, _>>();
+    let none = || {
+        failed
+            .iter()
+            .map(|&index| (index, false))
+            .collect::<BTreeMap<_, _>>()
+    };
     let worktree = PathBuf::from(&request.worktree);
     let map = {
         let worktree = worktree.clone();
@@ -503,24 +629,43 @@ async fn suspects_of(
     };
     let base = match ticket.base.clone() {
         Some(base) => base,
-        None => match resolve::resolve_base(pool, &request.project_id, project_root, &worktree, None, deadline).await {
+        None => match resolve::resolve_base(
+            pool,
+            &request.project_id,
+            project_root,
+            &worktree,
+            None,
+            deadline,
+        )
+        .await
+        {
             Ok(base) => base,
             Err(_) => return None,
         },
     };
-    let Ok(changed) = resolve::changed_paths(&worktree, &base, deadline).await else { return None };
+    let Ok(changed) = resolve::changed_paths(&worktree, &base, deadline).await else {
+        return None;
+    };
     let fillable = {
         let (worktree, changed) = (worktree.clone(), changed.clone());
-        tokio::task::spawn_blocking(move || test_select::vet(&worktree, &changed)).await.unwrap_or_default()
+        tokio::task::spawn_blocking(move || test_select::vet(&worktree, &changed))
+            .await
+            .unwrap_or_default()
     };
     // An empty diff selects nothing, so every group is "untouched by the session": suspect.
-    let picked: BTreeSet<String> =
-        test_select::select(&map, &changed, &fillable, false).units.into_iter().map(|unit| unit.group).collect();
+    let picked: BTreeSet<String> = test_select::select(&map, &changed, &fillable, false)
+        .units
+        .into_iter()
+        .map(|unit| unit.group)
+        .collect();
     Some(
         failed
             .iter()
             .map(|&index| {
-                let suspect = ticket.units[index].group.as_deref().is_some_and(|group| !picked.contains(group));
+                let suspect = ticket.units[index]
+                    .group
+                    .as_deref()
+                    .is_some_and(|group| !picked.contains(group));
                 (index, suspect)
             })
             .collect(),
@@ -532,7 +677,9 @@ async fn suspects_of(
 pub(super) enum Freshness {
     Fresh,
     /// A re-proof is running (`started`: this call launched it).
-    InFlight { started: bool },
+    InFlight {
+        started: bool,
+    },
     /// It is stale, no flight is running, and this ticket already tried once (or nobody can run
     /// one): read the incident as it stands.
     GaveUp,
@@ -569,8 +716,13 @@ pub(super) async fn ensure_fresh(
     if flying {
         return Ok(Freshness::InFlight { started: false });
     }
-    let Some(executor) = executor.filter(|_| !already_tried) else { return Ok(Freshness::GaveUp) };
-    if !store::begin_reprobe(pool, incident.id, now).await.map_err(|error| error.to_string())? {
+    let Some(executor) = executor.filter(|_| !already_tried) else {
+        return Ok(Freshness::GaveUp);
+    };
+    if !store::begin_reprobe(pool, incident.id, now)
+        .await
+        .map_err(|error| error.to_string())?
+    {
         return Ok(Freshness::InFlight { started: false }); // somebody else got the flight
     }
     // `false`: an earlier proof of this task still runs, so this read did not start one.
@@ -592,7 +744,9 @@ pub enum Refresh {
     /// `checked_sha` already was today's master head.
     Fresh,
     /// The re-proof passed: the incident is closed.
-    Closed { sha: String },
+    Closed {
+        sha: String,
+    },
     /// The re-proof ran and the incident is still red (`checked_sha` moved to the head).
     StillRed,
     /// A re-proof is running and `wait` ran out; list the incident as it stands.
@@ -625,22 +779,43 @@ async fn refresh(
 ) -> Result<Refresh, String> {
     let key = TaskKey::master_red();
     let open = |row: &TaskRow| matches!(row.status, Status::Open | Status::Claimed);
-    let live = store::live_by_key(pool, project_id, &key, now).await.map_err(|error| error.to_string())?;
-    let Some(row) = live.filter(open) else { return Ok(Refresh::NoIncident) };
+    let live = store::live_by_key(pool, project_id, &key, now)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(row) = live.filter(open) else {
+        return Ok(Refresh::NoIncident);
+    };
     let project_root = crate::inspect::project_root(pool, project_id)
         .await
         .map_err(|error| error.to_string())?
         .map(PathBuf::from)
         .ok_or_else(|| format!("project {project_id} has no root recorded"))?;
-    let head = probe::master_head(pool, project_id, &project_root, Instant::now() + GIT_BUDGET).await?;
-    match ensure_fresh(pool, Some(executor), project_id, &project_root, &row, &head, false, now).await? {
+    let head =
+        probe::master_head(pool, project_id, &project_root, Instant::now() + GIT_BUDGET).await?;
+    match ensure_fresh(
+        pool,
+        Some(executor),
+        project_id,
+        &project_root,
+        &row,
+        &head,
+        false,
+        now,
+    )
+    .await?
+    {
         Freshness::Fresh => Ok(Refresh::Fresh),
-        Freshness::GaveUp => Ok(Refresh::Unavailable("the incident could not be re-proved".to_owned())),
+        Freshness::GaveUp => Ok(Refresh::Unavailable(
+            "the incident could not be re-proved".to_owned(),
+        )),
         Freshness::InFlight { .. } => {
             let started = Instant::now();
             loop {
                 let now = Utc::now();
-                match store::live_by_key(pool, project_id, &key, now).await.map_err(|error| error.to_string())? {
+                match store::live_by_key(pool, project_id, &key, now)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
                     Some(row) if open(&row) => {
                         if row.checked_sha.as_deref() == Some(head.as_str()) {
                             return Ok(Refresh::StillRed);
@@ -677,14 +852,25 @@ async fn probe_step(
     if let Some(head) = head
         && probe::passed_recently(&request.project_id, head, groups, Instant::now())
     {
-        return Ok(ProbeStep::Task(format!("passes on master at {}: the failure is yours", short(head))));
+        return Ok(ProbeStep::Task(format!(
+            "passes on master at {}: the failure is yours",
+            short(head)
+        )));
     }
     let Some(executor) = executor else {
-        return Ok(ProbeStep::Task("no verify executor to prove it on master; treated as your failure".to_owned()));
+        return Ok(ProbeStep::Task(
+            "no verify executor to prove it on master; treated as your failure".to_owned(),
+        ));
     };
-    let started = store::begin_probe(pool, &request.project_id, &request.id.to_string(), &request.worktree, now)
-        .await
-        .map_err(|error| error.to_string())?;
+    let started = store::begin_probe(
+        pool,
+        &request.project_id,
+        &request.id.to_string(),
+        &request.worktree,
+        now,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     match started {
         ProbeStart::Started(row) => {
             probe::spawn_proof(
@@ -710,7 +896,10 @@ mod pure_tests {
     use std::collections::BTreeSet;
 
     fn failed(ids: &[&str]) -> Option<Failures> {
-        Some(Failures { tests: ids.iter().map(|s| (*s).to_owned()).collect(), files: BTreeSet::new() })
+        Some(Failures {
+            tests: ids.iter().map(|s| (*s).to_owned()).collect(),
+            files: BTreeSet::new(),
+        })
     }
 
     fn incident(status: Status, red: &[&str], groups: &[&str], since: Option<&str>) -> Incident {
@@ -726,7 +915,11 @@ mod pure_tests {
     }
 
     fn facts<'a>(group: &'a str, ids: &'a Option<Failures>, suspect: bool) -> Facts<'a> {
-        Facts { group, failed: ids.as_ref(), suspect }
+        Facts {
+            group,
+            failed: ids.as_ref(),
+            suspect,
+        }
     }
 
     fn task_note(class: Class) -> String {
@@ -739,11 +932,19 @@ mod pure_tests {
     #[test]
     fn ids_contained_in_red_tests_on_a_branch_with_the_break_are_inherited() {
         let ids = failed(&["a::boom"]);
-        let inc = incident(Status::Claimed, &["a::boom", "a::bang"], &["gate_command"], Some("s0"));
+        let inc = incident(
+            Status::Claimed,
+            &["a::boom", "a::bang"],
+            &["gate_command"],
+            Some("s0"),
+        );
         match decide(&facts("core", &ids, false), Some(&inc), Some(true)) {
             Class::Inherited { task_id, note } => {
                 assert_eq!(task_id, 7);
-                assert!(note.contains("#7") && note.contains("session abc"), "{note}");
+                assert!(
+                    note.contains("#7") && note.contains("session abc"),
+                    "{note}"
+                );
                 assert!(note.contains("do not fix"), "{note}");
             }
             other => panic!("{other:?}"),
@@ -754,14 +955,20 @@ mod pure_tests {
     fn the_same_group_failing_other_tests_is_the_tasks_failure() {
         let ids = failed(&["a::boom", "a::mine"]);
         let inc = incident(Status::Claimed, &["a::boom"], &["core"], Some("s0"));
-        assert_eq!(decide(&facts("core", &ids, true), Some(&inc), Some(true)), Class::Task { note: None });
+        assert_eq!(
+            decide(&facts("core", &ids, true), Some(&inc), Some(true)),
+            Class::Task { note: None }
+        );
     }
 
     #[test]
     fn known_ids_against_an_incident_with_no_red_tests_are_the_tasks_failure() {
         let ids = failed(&["a::boom"]);
         let inc = incident(Status::Open, &[], &["core"], Some("s0"));
-        assert_eq!(decide(&facts("core", &ids, true), Some(&inc), Some(true)), Class::Task { note: None });
+        assert_eq!(
+            decide(&facts("core", &ids, true), Some(&inc), Some(true)),
+            Class::Task { note: None }
+        );
     }
 
     #[test]
@@ -777,9 +984,17 @@ mod pure_tests {
         // `red_since_sha` is the head the red was first proven at: a session branched earlier does
         // not contain it. Spec section 3 Verify: its failure, with a rebase note.
         let ids = failed(&["a::boom"]);
-        let inc = incident(Status::Claimed, &["a::boom"], &["core"], Some("abcdef0123456789"));
+        let inc = incident(
+            Status::Claimed,
+            &["a::boom"],
+            &["core"],
+            Some("abcdef0123456789"),
+        );
         let note = task_note(decide(&facts("core", &ids, false), Some(&inc), Some(false)));
-        assert!(note.contains("before the red was proven") && note.contains("abcdef0123"), "{note}");
+        assert!(
+            note.contains("before the red was proven") && note.contains("abcdef0123"),
+            "{note}"
+        );
         assert!(note.contains("rebase"), "{note}");
     }
 
@@ -787,7 +1002,10 @@ mod pure_tests {
     fn an_incident_with_no_red_since_sha_key_skips_the_ancestry_test() {
         let ids = failed(&["a::boom"]);
         let inc = incident(Status::Open, &["a::boom"], &["core"], None);
-        assert!(matches!(decide(&facts("core", &ids, true), Some(&inc), None), Class::Inherited { .. }));
+        assert!(matches!(
+            decide(&facts("core", &ids, true), Some(&inc), None),
+            Class::Inherited { .. }
+        ));
     }
 
     #[test]
@@ -799,9 +1017,15 @@ mod pure_tests {
             other => panic!("{other:?}"),
         }
         // Not suspect: the session touched the group.
-        assert_eq!(decide(&facts("core", &none, false), Some(&inc), Some(true)), Class::Task { note: None });
+        assert_eq!(
+            decide(&facts("core", &none, false), Some(&inc), Some(true)),
+            Class::Task { note: None }
+        );
         // Not one of the incident's red groups.
-        assert_eq!(decide(&facts("py", &none, true), Some(&inc), Some(true)), Class::Task { note: None });
+        assert_eq!(
+            decide(&facts("py", &none, true), Some(&inc), Some(true)),
+            Class::Task { note: None }
+        );
         // The incident was last checked at an older master head.
         let mut old = inc.clone();
         old.fresh = false;
@@ -816,14 +1040,23 @@ mod pure_tests {
     fn an_empty_id_set_counts_as_no_ids() {
         let empty = failed(&[]);
         let inc = incident(Status::Open, &["a::boom"], &["core"], Some("s0"));
-        assert!(matches!(decide(&facts("core", &empty, true), Some(&inc), Some(true)), Class::Inherited { .. }));
+        assert!(matches!(
+            decide(&facts("core", &empty, true), Some(&inc), Some(true)),
+            Class::Inherited { .. }
+        ));
     }
 
     #[test]
     fn without_an_incident_only_a_suspect_group_is_probed() {
         let ids = failed(&["a::boom"]);
-        assert_eq!(decide(&facts("core", &ids, true), None, None), Class::NeedsProbe);
-        assert_eq!(decide(&facts("core", &ids, false), None, None), Class::Task { note: None });
+        assert_eq!(
+            decide(&facts("core", &ids, true), None, None),
+            Class::NeedsProbe
+        );
+        assert_eq!(
+            decide(&facts("core", &ids, false), None, None),
+            Class::Task { note: None }
+        );
     }
 
     #[test]
@@ -832,14 +1065,23 @@ mod pure_tests {
         let probing = incident(Status::Probing, &[], &[], None);
         assert_eq!(
             decide(&facts("core", &ids, true), Some(&probing), None),
-            Class::Pending { task_id: 7, reprobe: false }
+            Class::Pending {
+                task_id: 7,
+                reprobe: false
+            }
         );
-        assert_eq!(decide(&facts("core", &ids, false), Some(&probing), None), Class::Task { note: None });
+        assert_eq!(
+            decide(&facts("core", &ids, false), Some(&probing), None),
+            Class::Task { note: None }
+        );
     }
 
     #[test]
     fn a_ticket_is_inherited_only_when_every_failed_unit_is() {
-        let inh = Class::Inherited { task_id: 7, note: String::new() };
+        let inh = Class::Inherited {
+            task_id: 7,
+            note: String::new(),
+        };
         let task = Class::Task { note: None };
         assert!(only_inherited(&[inh.clone(), inh.clone()]));
         assert!(!only_inherited(&[inh, task]));

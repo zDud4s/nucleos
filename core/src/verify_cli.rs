@@ -245,7 +245,8 @@ fn finished(ticket: &Value, id: i64) -> Outcome {
         Some(code) => Outcome {
             code,
             stdout: render(ticket),
-            stderr: if code == EXIT_NOT_VERIFIED && ticket["verdict"].as_str() == Some("inherited") {
+            stderr: if code == EXIT_NOT_VERIFIED && ticket["verdict"].as_str() == Some("inherited")
+            {
                 "not verified: every failed unit is inherited from a master incident; keep working and re-verify when it closes\n"
                     .to_string()
             } else if code == EXIT_NOT_VERIFIED {
@@ -427,8 +428,16 @@ mod tests {
         assert_eq!(verdict_code(&ticket), Some(EXIT_NOT_VERIFIED));
         let outcome = finished(&ticket, 7);
         assert_eq!(outcome.code, EXIT_NOT_VERIFIED);
-        assert!(outcome.stdout.contains("(inherited: incident #3"), "{}", outcome.stdout);
-        assert!(outcome.stderr.contains("inherited") && !outcome.stderr.contains("ran nothing"), "{}", outcome.stderr);
+        assert!(
+            outcome.stdout.contains("(inherited: incident #3"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stderr.contains("inherited") && !outcome.stderr.contains("ran nothing"),
+            "{}",
+            outcome.stderr
+        );
     }
 
     /// **One hour unless told otherwise, and the flag outranks the environment.**
