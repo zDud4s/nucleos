@@ -920,7 +920,7 @@ mod tests {
         assert!(text.contains("#12") && text.contains("test:a::b"), "{text}");
         assert!(text.contains("run #9"), "{text}");
         assert!(
-            text.contains("stop"),
+            text.to_lowercase().contains("stop"),
             "an agent must be told to stop, not only informed: {text}"
         );
     }
@@ -1122,8 +1122,8 @@ mod tests {
     async fn the_first_claim_wins_and_the_second_is_told_who_has_it() {
         let pool = crate::testdb::fresh_pool().await;
         let at = located("alpha", "/w");
-        let run = holder(HolderKind::Run, "7", "/w");
-        let other = holder(HolderKind::Run, "8", "/w2");
+        let run = holder(HolderKind::Session, "s7", "/w");
+        let other = holder(HolderKind::Session, "s8", "/w2");
         let body = ClaimBody {
             key: Some("test:core/a.rs::b".into()),
             title: Some("b fails".into()),
@@ -1138,7 +1138,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second["won"], false);
-        assert_eq!(second["holder"]["id"], "7");
+        assert_eq!(second["holder"]["id"], "s7");
         assert_eq!(second["task"]["id"], first["task"]["id"]);
         let again = claim_task(&pool, &at, &run, &body, chrono::Utc::now())
             .await
@@ -1239,7 +1239,7 @@ mod tests {
         let first = claim_task(
             &pool,
             &inside,
-            &holder(HolderKind::Run, "1", "/repo/.claude/worktrees/a"),
+            &holder(HolderKind::Session, "s1", "/repo/.claude/worktrees/a"),
             &first_body,
             chrono::Utc::now(),
         )
@@ -1250,7 +1250,7 @@ mod tests {
         let second = claim_task(
             &pool,
             &outside,
-            &holder(HolderKind::Run, "2", "/elsewhere/b"),
+            &holder(HolderKind::Session, "s2", "/elsewhere/b"),
             &second_body,
             chrono::Utc::now(),
         )
@@ -1260,7 +1260,7 @@ mod tests {
             second["won"], false,
             "the same file from another worktree is the same task"
         );
-        assert_eq!(second["holder"]["id"], "1");
+        assert_eq!(second["holder"]["id"], "s1");
         // A path under the project root still resolves when the worktree is elsewhere.
         let under_project = ClaimBody {
             key: Some("file:/repo/core/a.rs".into()),
@@ -1269,7 +1269,7 @@ mod tests {
         let third = claim_task(
             &pool,
             &outside,
-            &holder(HolderKind::Run, "2", "/elsewhere/b"),
+            &holder(HolderKind::Session, "s2", "/elsewhere/b"),
             &under_project,
             chrono::Utc::now(),
         )
