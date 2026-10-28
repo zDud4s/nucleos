@@ -123,7 +123,8 @@ struct CodeBody {
     device_name: String,
 }
 
-/// `POST /remote/pairing-codes`: the owner mints a code, shown once. 409 while remote access is
+/// `POST /remote/pairing-codes`: the owner mints a code, shown once, at `access_level` (read-only
+/// when omitted; Admin only on an explicit request). 409 while remote access is
 /// off, because a code nobody can exchange would only mislead.
 async fn post_pairing_code(
     State(state): State<AppState>,
@@ -137,7 +138,9 @@ async fn post_pairing_code(
         Ok(false) => return refusal(StatusCode::CONFLICT, "remote_disabled").into_response(),
         Err(error) => return storage_failure(error).into_response(),
     }
-    let level = body.access_level.unwrap_or(ApiTokenLevel::Admin);
+    // Least privilege: a code minted without an explicit level pairs a read-only device. Admin has
+    // to be asked for by name.
+    let level = body.access_level.unwrap_or(ApiTokenLevel::ReadOnly);
     match crate::remote::create_pairing_code(
         &state.pool,
         level,
@@ -281,7 +284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_creates_a_code_shown_once_defaulting_to_admin() {
+    async fn owner_creates_a_code_shown_once_defaulting_to_read_only() {
         let state = test_state().await;
         mint_service_token(&state.pool, Service::Remote)
             .await
@@ -300,7 +303,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{text}");
         let created = json(&text);
-        assert_eq!(created["access_level"], "admin");
+        assert_eq!(created["access_level"], "read-only");
         assert_eq!(created["device_name"], "Phone");
         let code = created["code"].as_str().unwrap();
         assert_eq!(code.len(), 11, "{code}");
@@ -341,6 +344,27 @@ mod tests {
         )
         .await;
         assert_eq!(json(&text)["access_level"], "read-only");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_admin_level_still_mints_an_admin_code() {
+        let state = test_state().await;
+        mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let (status, text) = send(
+            &app,
+            "POST",
+            "/remote/pairing-codes",
+            CONTROL,
+            None,
+            Some(serde_json::json!({ "device_name": "Laptop", "access_level": "admin" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{text}");
+        assert_eq!(json(&text)["access_level"], "admin");
     }
 
     #[tokio::test]

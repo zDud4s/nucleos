@@ -622,33 +622,110 @@ const REMOTE_SELF_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/remote/logout"),
 ];
 
-/// First path segments no remote device reaches, Admin included. Each is owner-only by nature:
-/// the shutdown/update handshake (`daemon`, `system`), machine settings and secrets (`config`),
-/// backups and restores (`backup`, `backups`), credential minting (`api-tokens`), sidecar control
-/// (`sidecars`), messaging identity pairing (`channels`, which would let an admin device enrol a
-/// new Telegram operator), the whole remote owner surface including `/remote/pair` (`remote`), and
-/// live browser pixels (`browser`, a host-only feature). A NEW owner-only route family must be
-/// added here: for an Admin device this list is the only thing between it and the route.
+/// The ONLY first path segments a remote device may reach. Derived from what the phone UI calls:
+/// the read tables' families (status, health, projects, runs, ...) plus the run-launching ones
+/// (`jobs`, `presets`). Everything else is refused to every level, Admin included; a new route
+/// family is therefore closed to devices until someone adds it here on purpose.
+///
+/// Within an allowed segment the device is still graded as the API token of its level, so a
+/// read-only device never reaches a write even under `projects`.
+const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
+    "status",
+    "health",
+    "concurrency",
+    "autopilot",
+    "projects",
+    "runs",
+    "jobs",
+    "presets",
+    "fleet",
+    "feed",
+    "analytics",
+    "route",
+    "proposals",
+    "scoreboard",
+    "shadow-decisions",
+];
+
+/// First path segments known to be refused to every remote device, written out so the
+/// classification is total: the guard test fails on a route prefix in neither this list nor
+/// [`REMOTE_ALLOWED_SEGMENTS`]. Each is owner-only or host-local by nature: the shutdown/update
+/// handshake (`daemon`, `system`), machine settings and secrets (`config`), backups, credential
+/// minting (`api-tokens`), sidecar control (`sidecars`), messaging identity pairing (`channels`),
+/// the whole remote owner surface including `/remote/pair` (`remote`), live browser pixels
+/// (`browser`), host files (`files`), tool loadout and hook management (`loadout`, `hooks`), and the
+/// integrations/assistant/team surfaces a phone has no business with. `remote_device_permits`
+/// refuses these and anything unlisted alike; the list exists so that choice is always explicit.
+/// `home` was Admin-only before remote access existed; devices stay out until the owner allows it.
 const REMOTE_DENIED_SEGMENTS: &[&str] = &[
-    "daemon",
-    "system",
-    "config",
+    "admission",
+    "agents",
+    "api-tokens",
+    "assistant",
     "backup",
     "backups",
-    "api-tokens",
-    "sidecars",
-    "channels",
-    "remote",
     "browser",
+    "calendar",
+    "capture-digests",
+    "capture-requests",
+    "channels",
+    "chats",
+    "config",
+    "contacts",
+    "context",
+    "context-refs",
+    "council",
+    "daemon",
+    "distill",
+    "email",
+    "files",
+    "github",
+    "home",
+    "hooks",
+    "judge-resolutions",
+    "judge-verdicts",
+    "knowledge",
+    "loadout",
+    "models",
+    "nodes",
+    "notifications",
+    "owner-notes",
+    "pii",
+    "pricing",
+    "quota",
+    "remote",
+    "sidecars",
+    "system",
+    "team-actions",
+    "team-files",
+    "team-notes",
+    "team-pressure",
+    "team-recruits",
+    "team-reports",
+    "team-runs",
+    "team-triggers",
+    "teams",
+    "themes",
+    "v1",
+    "vcs",
+    "verify",
+    "voice",
+    "waiting",
+    "web",
+    "webhooks",
+    "workflow",
+    "workflows",
+    "worktrees",
 ];
 
 /// What a request carried by a paired remote device may reach. Matched against the route template.
 ///
 /// 1. [`REMOTE_SELF_ROUTES`] are open to every level.
-/// 2. A route whose first segment is in [`REMOTE_DENIED_SEGMENTS`] is refused, whatever the level.
+/// 2. A route whose first segment is not in [`REMOTE_ALLOWED_SEGMENTS`] is refused, whatever the
+///    level (allow-list; [`REMOTE_DENIED_SEGMENTS`] documents the known-refused ones).
 /// 3. Otherwise the device is graded as the API token of the same level (`grants`): read-only gets
-///    `READ_ONLY_ROUTES`, run-creating adds `RUN_CREATING_ROUTES`, admin gets everything not denied
-///    above. Routes in no table (Control/Admin-only) are therefore unreachable to read-only and
+///    `READ_ONLY_ROUTES`, run-creating adds `RUN_CREATING_ROUTES`, admin gets everything under the
+///    allowed segments. Routes in no table (Control/Admin-only) are unreachable to read-only and
 ///    run-creating devices automatically.
 pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str) -> bool {
     if REMOTE_SELF_ROUTES
@@ -657,8 +734,12 @@ pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str)
     {
         return true;
     }
-    let first = route.trim_start_matches('/').split('/').next().unwrap_or("");
-    if REMOTE_DENIED_SEGMENTS.contains(&first) {
+    let first = route
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if !REMOTE_ALLOWED_SEGMENTS.contains(&first) {
         return false;
     }
     grants(&Scope::ApiToken(level), method, route, Target::Route)
@@ -1293,15 +1374,11 @@ pub async fn require_token(
     let mut allowed = match (req.extensions().get::<MatchedPath>(), &device) {
         // A paired device is graded by its own function: the deny list sits in front of `grants`.
         (Some(matched), Some(_)) => match &scope {
-            Scope::ApiToken(level) => {
-                remote_device_permits(*level, req.method(), matched.as_str())
-            }
+            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), matched.as_str()),
             _ => false,
         },
         (None, Some(_)) => match &scope {
-            Scope::ApiToken(level) => {
-                remote_device_permits(*level, req.method(), req.uri().path())
-            }
+            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), req.uri().path()),
             _ => false,
         },
         (Some(matched), None) => permits_route(&scope, req.method(), matched.as_str()),
@@ -1348,7 +1425,9 @@ pub async fn require_token(
         }
     }
     // The browser-agents door: a chat turn's conversation key may start a linked browser agent.
+    // A paired device never uses it: the door is for a chat turn's own key, not a browser session.
     if !allowed
+        && device.is_none()
         && req.method() == Method::POST
         && route.as_deref() == Some(CHAT_BROWSER_AGENT_ROUTE)
         && chat_browser_agent_admits(&state.pool, &presented, &scope).await
@@ -1828,13 +1907,22 @@ mod tests {
             StatusCode::FORBIDDEN
         );
 
+        assert_eq!(code("POST", "/runs", &admin.session).await, StatusCode::OK);
+        // An admin-only route inside an allowed segment: Admin reaches it, the lower levels do not.
         assert_eq!(
-            code("POST", "/runs", &admin.session).await,
+            code("POST", "/proposals/1/approve", &admin.session).await,
             StatusCode::OK
         );
+        for session in [&read_only.session, &run_creating.session] {
+            assert_eq!(
+                code("POST", "/proposals/1/approve", session).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Outside the allow-list even Admin is refused: `/secret` is in no allowed segment.
         assert_eq!(
             code("GET", "/secret", &admin.session).await,
-            StatusCode::OK
+            StatusCode::FORBIDDEN
         );
     }
 
@@ -1849,7 +1937,8 @@ mod tests {
         let pool = state.pool.clone();
         let app = protected_router(state);
 
-        let (before, _) = send_with_session(&app, "GET", "/status", &key, Some(&device.session)).await;
+        let (before, _) =
+            send_with_session(&app, "GET", "/status", &key, Some(&device.session)).await;
         assert_eq!(before, StatusCode::OK);
 
         assert!(
@@ -1882,8 +1971,14 @@ mod tests {
             assert_eq!(body, r#"{"refusal":"session_invalid"}"#);
         }
         // The refusal comes before any route logic, so even the pairing route is shut.
-        let (status, _) =
-            send_with_session(&app, "POST", "/remote/pair", &key, Some("nos_device_unknown")).await;
+        let (status, _) = send_with_session(
+            &app,
+            "POST",
+            "/remote/pair",
+            &key,
+            Some("nos_device_unknown"),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
@@ -1952,26 +2047,200 @@ mod tests {
                 ("DELETE", "/remote/devices/{id}"),
             ] {
                 assert!(
-                    !remote_device_permits(level, &Method::from_bytes(method.as_bytes()).unwrap(), route),
+                    !remote_device_permits(
+                        level,
+                        &Method::from_bytes(method.as_bytes()).unwrap(),
+                        route
+                    ),
                     "{level:?} {method} {route}"
                 );
             }
         }
         assert_eq!(
-            REMOTE_DENIED_SEGMENTS,
+            REMOTE_ALLOWED_SEGMENTS,
             [
-                "daemon",
-                "system",
-                "config",
-                "backup",
-                "backups",
-                "api-tokens",
-                "sidecars",
-                "channels",
-                "remote",
-                "browser",
+                "status",
+                "health",
+                "concurrency",
+                "autopilot",
+                "projects",
+                "runs",
+                "jobs",
+                "presets",
+                "fleet",
+                "feed",
+                "analytics",
+                "route",
+                "proposals",
+                "scoreboard",
+                "shadow-decisions",
             ]
         );
+    }
+
+    /// An Admin device is no longer graded by a deny-list: `loadout`, `hooks` and `files` were open
+    /// to it and are now refused, as is any route family nobody listed.
+    #[test]
+    fn remote_admin_device_is_refused_loadout_hooks_files_and_unlisted_families() {
+        for level in ALL_LEVELS {
+            for (method, route) in [
+                (Method::GET, "/loadout/tools"),
+                (Method::POST, "/loadout/tools/{id}/approve"),
+                (Method::GET, "/hooks"),
+                (Method::POST, "/hooks/{id}"),
+                (Method::GET, "/files"),
+                (Method::GET, "/files/download"),
+                (Method::GET, "/brand-new-family/x"),
+                (Method::GET, "/"),
+            ] {
+                assert!(
+                    !remote_device_permits(level, &method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_device_reaches_an_allow_listed_route_at_the_right_level() {
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/status"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/runs/{id}"
+        ));
+        assert!(!remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::POST,
+            "/runs"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::RunCreating,
+            &Method::POST,
+            "/runs"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::Admin,
+            &Method::POST,
+            "/proposals/{id}/approve"
+        ));
+        assert!(!remote_device_permits(
+            ApiTokenLevel::RunCreating,
+            &Method::POST,
+            "/proposals/{id}/approve"
+        ));
+    }
+
+    /// `GET /email/queue` is granted to read-only API tokens, but `email` is outside the device
+    /// allow-list, so a read-only device is refused it.
+    #[test]
+    fn read_only_device_is_refused_a_read_only_token_route_outside_the_allow_list() {
+        assert!(route_is_listed(
+            READ_ONLY_ROUTES,
+            &Method::GET,
+            "/email/queue"
+        ));
+        assert!(!remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/email/queue"
+        ));
+    }
+
+    /// Local callers are unchanged: the control token (no device session) and an Admin API token
+    /// still reach the routes a device is refused.
+    #[tokio::test]
+    async fn local_callers_still_reach_routes_denied_to_devices() {
+        let state = test_state("expected-token").await;
+        let admin = stored_api_token(&state, "boss", ApiTokenLevel::Admin).await;
+        let app = protected_router(state);
+
+        for (method, uri) in [("GET", "/secret"), ("POST", "/daemon/shutdown")] {
+            for bearer in ["expected-token", admin.as_str()] {
+                assert_eq!(
+                    status_of(&app, method, uri, bearer).await,
+                    StatusCode::OK,
+                    "{method} {uri}"
+                );
+            }
+        }
+        for level in ALL_LEVELS {
+            assert!(!remote_device_permits(level, &Method::GET, "/secret"));
+        }
+    }
+
+    /// Every first segment the daemon registers is classified for devices: in
+    /// [`REMOTE_ALLOWED_SEGMENTS`] or [`REMOTE_DENIED_SEGMENTS`]. Axum cannot enumerate a built
+    /// router, so this scans the sources under `core/src` for `.route(` followed by a `"/..."`
+    /// literal (production code only: each file is cut at its first `#[cfg(test)]`), at test time
+    /// so a new file is covered without touching this test. A new route family fails here until it
+    /// is put in one list on purpose.
+    #[test]
+    fn every_route_prefix_is_classified_for_remote_devices() {
+        fn walk(dir: &std::path::Path, found: &mut std::collections::BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.extension().is_none_or(|e| e != "rs") || name.contains("conformance") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                // Cut at the test module, not at a bare `#[cfg(test)]` attribute: a file may carry
+                // `#[cfg(test)] use ...;` far above its routes.
+                let cut = source
+                    .match_indices("#[cfg(test)]")
+                    .find(|(at, attr)| source[at + attr.len()..].trim_start().starts_with("mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                let production = &source[..cut];
+                for part in production.split(".route(").skip(1) {
+                    let Some(literal) = part.trim_start().strip_prefix("\"/") else {
+                        continue;
+                    };
+                    let segment: String = literal
+                        .chars()
+                        .take_while(|c| !matches!(c, '/' | '"' | '{'))
+                        .collect();
+                    if !segment.is_empty() {
+                        found.insert(segment);
+                    }
+                }
+            }
+        }
+
+        let mut found = std::collections::BTreeSet::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(
+            found.len() > 20 && found.contains("projects") && found.contains("loadout"),
+            "the route scan found too little: {found:?}"
+        );
+        let unclassified: Vec<&String> = found
+            .iter()
+            .filter(|segment| {
+                !REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str())
+                    && !REMOTE_DENIED_SEGMENTS.contains(&segment.as_str())
+            })
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "route prefixes in neither REMOTE_ALLOWED_SEGMENTS nor REMOTE_DENIED_SEGMENTS: {unclassified:?}"
+        );
+        for segment in REMOTE_ALLOWED_SEGMENTS {
+            assert!(
+                !REMOTE_DENIED_SEGMENTS.contains(segment),
+                "{segment} is in both lists"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1995,11 +2264,27 @@ mod tests {
         }
 
         for level in ALL_LEVELS {
-            assert!(remote_device_permits(level, &Method::GET, "/remote/session"));
-            assert!(remote_device_permits(level, &Method::POST, "/remote/logout"));
+            assert!(remote_device_permits(
+                level,
+                &Method::GET,
+                "/remote/session"
+            ));
+            assert!(remote_device_permits(
+                level,
+                &Method::POST,
+                "/remote/logout"
+            ));
             // Right path, wrong method, and every sibling under /remote: all refused.
-            assert!(!remote_device_permits(level, &Method::POST, "/remote/session"));
-            assert!(!remote_device_permits(level, &Method::GET, "/remote/logout"));
+            assert!(!remote_device_permits(
+                level,
+                &Method::POST,
+                "/remote/session"
+            ));
+            assert!(!remote_device_permits(
+                level,
+                &Method::GET,
+                "/remote/logout"
+            ));
             for (method, route) in [
                 (Method::POST, "/remote/pair"),
                 (Method::GET, "/remote/devices"),
@@ -2007,7 +2292,10 @@ mod tests {
                 (Method::POST, "/remote/pairing-codes"),
                 (Method::GET, "/remote/anything-new"),
             ] {
-                assert!(!remote_device_permits(level, &method, route), "{level:?} {route}");
+                assert!(
+                    !remote_device_permits(level, &method, route),
+                    "{level:?} {route}"
+                );
             }
         }
     }
@@ -5307,6 +5595,33 @@ mod tests {
             StatusCode::OK,
             "the control token still reaches it"
         );
+    }
+
+    /// A device-authenticated request never uses the browser-agents door, whatever its level.
+    #[tokio::test]
+    async fn a_paired_device_is_refused_the_browser_agents_door() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let mut sessions = Vec::new();
+        for level in ALL_LEVELS {
+            sessions.push(pair_device(&state, level, now).await.session);
+        }
+        let app = browser_agents_door_router(state);
+
+        for session in &sessions {
+            let (status, _) = send_with_session(
+                &app,
+                "POST",
+                "/assistant/browser-agents",
+                &key,
+                Some(session),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
     }
 
     /// The door needs a chat turn that is running now. Once the turn ends its key authenticates

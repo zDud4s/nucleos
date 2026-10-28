@@ -344,12 +344,70 @@ fn arm_lifeline(cmd: &mut Command) {
     cmd.env(LIFELINE_VAR, "1");
 }
 
+/// The only variables of the daemon's own environment the remote sidecar may inherit (finding M2).
+///
+/// It faces the tailnet, so it must not carry the daemon's provider keys. The Go gateway reads only
+/// the `remote_env` variables (see `sidecars/remote/config`) and calls no `UserHomeDir` or
+/// `UserCacheDir`, so this is just what a Go binary needs to start and talk to loopback: `PATH`;
+/// `SYSTEMROOT`/`WINDIR` (Windows winsock and the system crypto RNG fail without them);
+/// `TEMP`/`TMP`/`TMPDIR` (`os.TempDir`); `HOME` (unix). Names compare case-insensitively because
+/// Windows environment names are.
+const REMOTE_INHERITED: &[&str] = &[
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+];
+
+/// PURE: the complete environment a sidecar is spawned with, given the daemon's own (`parent`).
+///
+/// An isolated sidecar gets only the allow-listed parent variables, then `env`, then the lifeline
+/// variable; any other sidecar keeps the inherited environment, so this returns `None` for the
+/// parent part and the caller leaves it alone. Returned as `(clear, vars)`: when `clear` is true the
+/// caller must `env_clear()` first and set `vars`; otherwise it sets `vars` on top of the inherited
+/// environment. `vars` always ends with the lifeline, so nothing later can displace it.
+fn spawn_env(
+    isolated: bool,
+    parent: &[(String, String)],
+    env: &[(String, String)],
+) -> (bool, Vec<(String, String)>) {
+    let mut vars: Vec<(String, String)> = Vec::new();
+    if isolated {
+        vars.extend(
+            parent
+                .iter()
+                .filter(|(k, _)| REMOTE_INHERITED.iter().any(|a| a.eq_ignore_ascii_case(k)))
+                .cloned(),
+        );
+    }
+    vars.extend(env.iter().cloned());
+    vars.push((LIFELINE_VAR.to_string(), "1".to_string()));
+    (isolated, vars)
+}
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
     let mut delay = RESTART_BASE;
     let mut attempts: u32 = 0;
+    let isolated = name == REMOTE;
     loop {
         let mut cmd = Command::new(&binary_path);
-        for (k, v) in &env {
+        let parent: Vec<(String, String)> = if isolated {
+            std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (clear, vars) = spawn_env(isolated, &parent, &env);
+        if clear {
+            // The remote sidecar faces the network: it starts from nothing, not from the daemon's
+            // environment (provider keys and all).
+            cmd.env_clear();
+        }
+        for (k, v) in &vars {
             cmd.env(k, v);
         }
         // A sidecar's environment holds the daemon token, and for email the IMAP password too.
@@ -809,6 +867,48 @@ mod tests {
         );
         assert_eq!(env_value(&env, "REMOTE_STREAM_MAX_SECONDS"), Some("120"));
         assert_eq!(env_value(&env, "NUCLEOS_DAEMON_URL"), Some("http://127.0.0.1:8791"));
+    }
+
+    fn parent_env() -> Vec<(String, String)> {
+        [
+            ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+            ("OPENAI_API_KEY", "sk-openai-secret"),
+            ("PATH", "/usr/bin"),
+            ("SystemRoot", "C:\\Windows"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn remote_spawn_env_excludes_provider_keys() {
+        let env = remote_env("http://127.0.0.1:8791", "remote.key", &remote_config(), "d");
+        let (clear, vars) = spawn_env(true, &parent_env(), &env);
+        assert!(clear);
+        assert_eq!(env_value(&vars, "ANTHROPIC_API_KEY"), None);
+        assert_eq!(env_value(&vars, "OPENAI_API_KEY"), None);
+    }
+
+    #[test]
+    fn remote_spawn_env_keeps_path_lifeline_and_remote_env() {
+        let env = remote_env("http://127.0.0.1:8791", "remote.key", &remote_config(), "d");
+        let (_, vars) = spawn_env(true, &parent_env(), &env);
+        assert_eq!(env_value(&vars, "PATH"), Some("/usr/bin"));
+        assert_eq!(env_value(&vars, "SystemRoot"), Some("C:\\Windows"));
+        assert_eq!(env_value(&vars, "NUCLEOS_DAEMON_TOKEN"), Some("remote.key"));
+        assert_eq!(env_value(&vars, "REMOTE_ADDR"), Some(REMOTE_ADDR));
+        // Last, so nothing the caller passed can displace it.
+        assert_eq!(vars.last().map(|(k, _)| k.as_str()), Some(LIFELINE_VAR));
+    }
+
+    #[test]
+    fn other_sidecars_keep_the_inherited_environment() {
+        let env = vec![("A".to_string(), "b".to_string())];
+        let (clear, vars) = spawn_env(false, &parent_env(), &env);
+        assert!(!clear);
+        assert_eq!(env_value(&vars, "A"), Some("b"));
+        assert_eq!(env_value(&vars, LIFELINE_VAR), Some("1"));
     }
 
     #[test]
