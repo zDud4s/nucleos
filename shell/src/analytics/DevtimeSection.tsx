@@ -33,6 +33,12 @@ import {
   wastedByClass,
 } from "./devtime-series";
 import { versus, windowShares } from "./series";
+import { hasAgents } from "./agent-effectiveness";
+import { AgentEffectivenessPanel } from "./AgentEffectivenessPanel";
+import { hasToolFailures } from "./tool-failures";
+import { ToolFailuresPanel } from "./ToolFailuresPanel";
+import { hasTurnClasses } from "./turn-efficiency";
+import { TurnEfficiencyPanel } from "./TurnEfficiencyPanel";
 import { Card, MetricCard, joined, summary, unreachable, type Metric } from "./sections";
 
 /**
@@ -101,6 +107,9 @@ function Body({ report, projectId, days, open, onOpen }: BodyProps) {
             ))}
           </div>
           <DevtimePanel id={panelId} report={data} metric={open} />
+          {hasToolFailures(data.tool_failures) ? <ToolFailuresPanel failures={data.tool_failures} /> : null}
+          {hasTurnClasses(data.turn_classes) ? <TurnEfficiencyPanel classes={data.turn_classes} unexplained={data.unexplained} showProject={data.scope === "global"} /> : null}
+          {hasAgents(data.agents) ? <AgentEffectivenessPanel agents={data.agents} /> : null}
         </>
       )}
       {/* Outside the empty branch: it costs nothing until opened. */}

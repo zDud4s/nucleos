@@ -26008,9 +26008,46 @@ mod tests {
         let unpriced = |day: &serde_json::Value| day.get("cost_usd").is_some_and(|c| c.is_null());
         assert!(series.iter().all(unpriced), "{global}");
         assert_eq!(global["quality"]["ingest_enabled"], false, "{global}");
+        // Metric 7 (follow-up A) is always present; with no attempt it is zeroed, rate `null`.
+        assert_eq!(global["tool_failures"]["attempts"], 0, "{global}");
         assert!(
-            global.get("tool_failures").is_none() && global.get("agents").is_none(),
-            "follow-up keys are absent, not null: {global}"
+            global["tool_failures"]["failure_rate"].is_null(),
+            "{global}"
+        );
+        assert!(
+            global["tool_failures"]["by_tool"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{global}"
+        );
+        // Metric 9 (follow-up B) is always present; with no turn stat it is empty, criteria filled.
+        assert_eq!(global["turn_classes"]["turns"], 0, "{global}");
+        assert!(
+            global["turn_classes"]["classes"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{global}"
+        );
+        assert_eq!(global["unexplained"]["turns"], 0, "{global}");
+        assert!(
+            global["unexplained"]["items"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{global}"
+        );
+        assert_eq!(
+            global["unexplained"]["criteria"]["min_turn_ms"], 300_000,
+            "{global}"
+        );
+        // Metric 10 (follow-up C) is always present; with no agent attempt it is zeroed, rates null.
+        assert_eq!(global["agents"]["attempts"], 0, "{global}");
+        assert!(global["agents"]["pass_rate"].is_null(), "{global}");
+        assert!(global["agents"]["failure_rate"].is_null(), "{global}");
+        assert!(
+            global["agents"]["by_type"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{global}"
         );
         // The 10 minutes may straddle midnight UTC; they are in the window either way.
         assert_eq!(global["totals"]["active_ms"], 600_000, "{global}");
@@ -26019,6 +26056,83 @@ mod tests {
         assert_eq!(project["scope"], "project", "{project}");
         assert_eq!(project["days"], 30, "{project}");
         assert_eq!(project["project_id"], "alpha", "{project}");
+    }
+
+    /// Metric 7 reaches both scopes, and a script path in the stored program never leaves the
+    /// daemon: the program is redacted to its name (spec §8).
+    #[tokio::test]
+    async fn analytics_devtime_tool_failures_reach_both_scopes_without_arguments() {
+        let state = test_state().await;
+        seed_devtime(&state).await;
+        sqlx::query(
+            "INSERT INTO devtime_attempts (attempt_id, session_id, lane, tool_use_id, kind,
+                 tool_name, started_at, outcome, error_class, cmd_program, parser_version)
+             VALUES ('a1', 's1', 'main', 't1', 'tool', 'Bash',
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-85 minutes'), 'error',
+                     'exit_nonzero', 'python3 C:/Users/secret/run.py', 2)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        for uri in [
+            "/analytics/devtime?days=7",
+            "/projects/alpha/analytics/devtime?days=7",
+        ] {
+            let body = get_json(&state, uri).await;
+            let block = &body["tool_failures"];
+            assert_eq!(block["failures"], 1, "{uri}: {body}");
+            assert_eq!(
+                block["by_tool"][0]["cmd_program"], "python3",
+                "{uri}: {body}"
+            );
+            assert!(!body.to_string().contains("secret"), "{uri}: {body}");
+        }
+    }
+
+    /// Metric 9 reaches both scopes, and the slow turn's session id never leaves the daemon
+    /// (spec §8).
+    #[tokio::test]
+    async fn analytics_devtime_turn_classes_and_slow_turns_reach_both_scopes_without_a_session() {
+        let state = test_state().await;
+        seed_devtime(&state).await;
+        for seq in 1..=13_i64 {
+            let active_ms: i64 = if seq == 13 { 600_000 } else { 100_000 };
+            sqlx::query(
+                "INSERT INTO devtime_turn_stats (session_id, turn_seq, project_id, turn_class,
+                     started_at, calls, active_ms, explained_ms, rules_version)
+                 VALUES ('sess-secret-9', ?, 'alpha', 'c1',
+                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-100 minutes'), 3, ?, 0, 'v1')",
+            )
+            .bind(seq)
+            .bind(active_ms)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        for uri in [
+            "/analytics/devtime?days=7",
+            "/projects/alpha/analytics/devtime?days=7",
+        ] {
+            let body = get_json(&state, uri).await;
+            assert_eq!(body["turn_classes"]["turns"], 13, "{uri}: {body}");
+            assert_eq!(
+                body["turn_classes"]["classes"][0]["turn_class"], "c1",
+                "{uri}: {body}"
+            );
+            let slow = &body["unexplained"];
+            assert_eq!(slow["turns"], 1, "{uri}: {body}");
+            assert_eq!(
+                slow["items"][0]["class_median_ms"], 100_000,
+                "{uri}: {body}"
+            );
+            assert!(
+                slow["items"][0].get("session_id").is_none(),
+                "{uri}: {body}"
+            );
+            assert!(!body.to_string().contains("sess-secret"), "{uri}: {body}");
+        }
     }
 
     /// F1's order: the window is checked before the roster, so `days=0` is a 400 for a project

@@ -24,11 +24,10 @@ const ACTIVE_KINDS: [&str; 5] = [
 ];
 
 /// A window longer than this is clamped, so the cutoff arithmetic cannot overflow.
-const MAX_WINDOW_DAYS: i64 = 36_500;
+pub(crate) const MAX_WINDOW_DAYS: i64 = 36_500;
 
 /// A turn that took far longer than its class's median and that no rule explains.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))] // SP4's endpoint is the reader
 pub struct UnexplainedTurn {
     pub stat: TurnStatRow,
     /// The median `active_ms` of the turn's class.
@@ -118,7 +117,7 @@ pub fn turn_stats(
 
 /// The median of a sorted, non-empty slice; the mean of the two middle values (rounded down) when the
 /// count is even.
-fn median_of_sorted(values: &[i64]) -> i64 {
+pub(crate) fn median_of_sorted(values: &[i64]) -> i64 {
     let middle = values.len() / 2;
     if values.len() % 2 == 1 {
         values[middle]
@@ -131,8 +130,9 @@ fn median_of_sorted(values: &[i64]) -> i64 {
 ///
 /// Medians are taken per (project, class) over the whole window, and only for classes with at least
 /// `min_class_turns` turns; a turn in a smaller class is never listed. `since`, when given, hides turns
-/// that started earlier (they still count toward the medians).
-fn pick_unexplained(
+/// that started earlier (they still count toward the medians). Also the devtime overview's picker
+/// (metric 9), which passes its own window so `now` is injectable.
+pub(crate) fn pick_unexplained(
     window: &[TurnStatRow],
     since: Option<&str>,
     cfg: &DevtimeRulesConfig,
