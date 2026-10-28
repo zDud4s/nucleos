@@ -64,3 +64,10 @@ f764d37de65f460b702ea97a2a8ef8867162e1c9:core/src/capture.rs:stripe-access-token
 10af9dd9ec7d1303ed3eefac010055c85d1d3c51:sidecars/lib/channelkit/contract/fixtures/events/action-bad-token.json:generic-api-key:1
 489bd496b3d1daa8f4fcac184d1cbc3b7eb84562:core/src/channels/contract/decode.rs:generic-api-key:1666
 2e17e31ade1effc4e70c6093e241a2bf30b847f8:core/src/channels/contract/decode/event.rs:generic-api-key:724
+
+# The same GitHub-shaped PAT fixture, twice more: a conversation block in the distiller must come out
+# scrubbed, and `scrub` must be reachable from it and redact. Plus the same Stripe-shaped restricted
+# key fed to a capture fact, now asserted absent from the digest built from it. Not keys.
+ed91c0db7eb9c9b8843cb3c8787431dd889fcd70:core/src/distill.rs:github-pat:1452
+f272e43ba9358fcc12e79ebba6672f23d9b224a5:core/src/distill.rs:github-pat:1509
+76836b18946b54234e13c78343813e153bc39bc0:core/src/capture/digest.rs:stripe-access-token:460
