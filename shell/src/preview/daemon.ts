@@ -5,6 +5,7 @@ import type { TestsMapView } from "../data/project-tests-map";
 import type { Agent } from "../data/agents";
 import type { Detected } from "../data/detect";
 import type { Known } from "../data/knowledge";
+import type { ThemeDetail, ThemeMember, ThemeRow, ThemeState } from "../data/themes";
 import type { LoadoutTool } from "../data/loadout-tools";
 import type { ClassTally, JudgeResolveStatus, Resolution, JudgeStatus, JudgeVerdict } from "../data/autopilot";
 import type { Concurrency, Job, JobDetail, JobItem, RunSearchResult } from "../data/fleet";
@@ -3514,6 +3515,65 @@ const LOADOUT_PREVIEW = {
 
 export const KNOWLEDGE: Known[] = [...PROJECT_KNOWLEDGE, ...SCOPED_KNOWLEDGE];
 
+/*
+  The themes the Brain groups notes and knowledge under: two accepted (one carrying its synthesis,
+  as the núcleo shows it only for an accepted theme), two proposed and waiting for a decision.
+*/
+const theme = (
+  id: number,
+  name: string,
+  state: ThemeState,
+  synthesis: string | null,
+  members: ThemeMember[],
+): ThemeDetail => ({
+  id,
+  name,
+  state,
+  merged_into: null,
+  synthesis,
+  created_at: "2026-10-20T09:00:00Z",
+  decided_at: state === "accepted" ? "2026-10-21T10:30:00Z" : null,
+  members,
+});
+
+const member = (kind: string, id: number, label: string, origin = "distiller"): ThemeMember => ({
+  kind,
+  id,
+  origin,
+  excluded: false,
+  label,
+  missing: false,
+});
+
+export const THEMES: ThemeDetail[] = [
+  theme(
+    1,
+    "Release discipline",
+    "accepted",
+    "Releases ship from a green master only; every hotfix is merged back the same day.",
+    [member("note", 1, "Release checklist", "owner"), member("knowledge", 1, "Tag after the gates pass")],
+  ),
+  theme(2, "Writing voice", "accepted", null, [
+    member("note", 2, "House voice", "owner"),
+    member("knowledge", 2, "Short sentences, no hedging"),
+  ]),
+  theme(3, "Build cost", "proposed", null, [
+    member("note", 3, "Cargo target pools"),
+    member("knowledge", 3, "Heavy commands go through the broker"),
+  ]),
+  theme(4, "Inbox triage", "proposed", null, [member("note", 4, "Weekly mail sweep")]),
+];
+
+/** The list shape: the detail without its members and synthesis, with the live member count. */
+const themeRow = (t: ThemeDetail): ThemeRow => ({
+  id: t.id,
+  name: t.name,
+  state: t.state,
+  merged_into: t.merged_into,
+  members: t.members.filter((m) => !m.excluded).length,
+  created_at: t.created_at,
+});
+
 /**
  * The tools beyond the base: what the Tools section of the Auditor Sénior's editor and of
  * Finanças's Charter shows, and what the Brain's "Tools to approve" waits on.
@@ -4295,6 +4355,21 @@ export function answer(path: string, init?: RequestInit): unknown {
     );
   }
   if (path === "/knowledge") return KNOWLEDGE;
+  if (splitQuery(path)[0] === "/themes" && init?.method === undefined) {
+    const state = splitQuery(path)[1].get("state");
+    return THEMES.filter((t) => state === null || t.state === state).map(themeRow);
+  }
+  const themeId = /^\/themes\/(\d+)(?:\/(accept|refuse|rename|merge|synthesise))?$/.exec(path);
+  if (themeId !== null) {
+    const found = THEMES.find((t) => t.id === Number(themeId[1])) ?? null;
+    if (init?.method === undefined) return themeId[2] === undefined ? found : null;
+    // Stateless like every other write here: a decision answers as the núcleo would, changes nothing.
+    if (init.method === "POST" && found !== null) {
+      if (themeId[2] === "synthesise") return { synthesis: found.synthesis };
+      if (themeId[2] !== undefined) return undefined;
+    }
+    return null;
+  }
   if (path === "/capture-requests") return OPEN_CAPTURES;
   if (path === "/capture-requests?state=all") return OPEN_CAPTURES;
   const ownerNote = /^\/owner-notes\/(\d+)$/.exec(path);

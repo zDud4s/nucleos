@@ -1,7 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { READINESS_MIN_AGREE_PERCENT, READINESS_MIN_REVIEWED, RESOLVE_MIN_REVIEWED } from "../data/autopilot";
-import { previewPipeline, judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, CHANNELS, CHANNEL_IDENTITIES, CHANNEL_NOTIFY_POLICY, NOW, OWNER_NOTES, PAIRING_CODE, PAIRING_STATUS, answer, PROJECTS, SCOREBOARD, VCS_REQUESTS } from "./daemon";
+import { previewPipeline, judgeResolveFixture, JUDGE_RESOLUTIONS, JUDGE_RESOLVE_STATUS, FEED, FEED_SEEN, FEED_TIMELINE, JUDGE_STATUS, JUDGE_VERDICTS, NOTES_GRAPH, CHANNELS, CHANNEL_IDENTITIES, CHANNEL_NOTIFY_POLICY, NOW, OWNER_NOTES, PAIRING_CODE, PAIRING_STATUS, answer, PROJECTS, SCOREBOARD, THEMES, VCS_REQUESTS } from "./daemon";
+import type { ThemeDetail, ThemeRow } from "../data/themes";
 import type { RelatedNote, TargetNote, WeeklyReview } from "../data/owner-notes";
 import { sidecarKeyOf } from "../data/system";
 import { mergePolicy } from "../data/feed";
@@ -276,6 +277,36 @@ describe("the preview fixtures", () => {
     expect(answer("/owner-notes/by-target?kind=project&ref=nobody")).toEqual([]);
     // The generic list is still reached by its own path, query and all.
     expect((answer("/owner-notes?state=all") as unknown[]).length).toBe(OWNER_NOTES.length);
+  });
+});
+
+describe("the themes fixtures", () => {
+  it("lists every theme as a counted row, and narrows by ?state=", () => {
+    const all = answer("/themes") as ThemeRow[];
+    expect(all.length).toBe(THEMES.length);
+    expect(all.every((row) => !("synthesis" in row) && row.members > 0)).toBe(true);
+    const proposed = answer("/themes?state=proposed") as ThemeRow[];
+    expect(proposed.length).toBe(2);
+    expect(proposed.every((row) => row.state === "proposed")).toBe(true);
+    expect((answer("/themes?state=accepted") as ThemeRow[]).length).toBe(2);
+    expect(answer("/themes?state=refused")).toEqual([]);
+  });
+
+  it("answers one theme with its members, and null for an unknown id", () => {
+    const detail = answer("/themes/1") as ThemeDetail;
+    expect(detail.state).toBe("accepted");
+    expect(detail.synthesis).not.toBeNull();
+    expect(detail.members.length).toBeGreaterThan(0);
+    expect((answer("/themes/3") as ThemeDetail).synthesis).toBeNull();
+    expect(answer("/themes/999")).toBeNull();
+  });
+
+  it("answers a decision without a body, and a synthesis with one", () => {
+    const post = { method: "POST" } as RequestInit;
+    expect(answer("/themes/3/accept", post)).toBeUndefined();
+    expect(answer("/themes/3/refuse", post)).toBeUndefined();
+    expect(answer("/themes/1/synthesise", post)).toEqual({ synthesis: (answer("/themes/1") as ThemeDetail).synthesis });
+    expect(answer("/themes/999/accept", post)).toBeNull();
   });
 });
 
