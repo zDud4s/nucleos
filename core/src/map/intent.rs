@@ -245,7 +245,7 @@ pub fn parse_extraction(answer: &str) -> Vec<Extracted> {
 /// answer containing two separate objects and right for every answer this has actually been handed.
 /// The cost of being wrong is an empty list and a second press.
 ///
-/// Shared with [`crate::map::triage::parse_answer`] rather than respelled there, which is the model's
+/// Shared with `map::triage::parse_answer` rather than respelled there, which is the model's
 /// second entrance (§6) unwrapping the same habit at the other end of the feature. Two spellings of
 /// *find the JSON a model buried in prose* would be two answers to that question, and the one that
 /// drifted would be found by whichever half of the map stopped working.
@@ -292,7 +292,7 @@ fn extraction_format() -> serde_json::Value {
 /// How many `assistant` events one question may emit before the daemon stops reading.
 ///
 /// **Both of the model's entrances, and not just this one.** §6 has the model compress twice — a
-/// spec into decisions here, one node into a judgement in [`crate::map::triage`] — and both go
+/// spec into decisions here, one node into a judgement in `map::triage` — and both go
 /// through [`ask_once`], so this ceiling governs both. It was named for extraction while extraction
 /// was the only caller; the name was corrected rather than left to imply that the triager runs
 /// under a rule nobody wrote down.
@@ -408,7 +408,7 @@ pub async fn extract(
 /// Ask the agent CLI one question, with no tools, and hand back what it said.
 ///
 /// **One builder for both of the model's entrances (§6), and that is the whole reason it exists.**
-/// The extraction here and the triage in [`crate::map::triage`] want precisely the same run — one
+/// The extraction here and the triage in `map::triage` want precisely the same run — one
 /// prompt, no tools, no resume, read the answer, done — and every field below is a decision about
 /// what such a run may do. Spelled out twice, the two copies would agree only while somebody kept
 /// them agreeing, and the fields most likely to drift are the ones it would hurt most to drift on:
@@ -571,7 +571,7 @@ const SPEC_FOLDERS: &[&str] = &["docs/specs", "docs/superpowers/specs"];
 
 /// Every spec of a project, by path from the root, sorted.
 ///
-/// Sorted rather than in filesystem order, for the same reason [`crate::map::structure`]
+/// Sorted rather than in filesystem order, for the same reason `map::structure`
 /// sorts: an order the filesystem chose changes between two reads for no reason anybody can see.
 pub fn specs_in(root: &Path) -> Vec<String> {
     let mut found = Vec::new();

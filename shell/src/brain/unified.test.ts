@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { CaptureRequest } from "../data/captures";
 import type { Known } from "../data/knowledge";
 import type { OwnerNote } from "../data/owner-notes";
-import { filterItems, toItems, type ItemFilters } from "./unified";
+import { filterItems, scopeKey, toItems, type ItemFilters } from "./unified";
 
 function note(over: Partial<OwnerNote> = {}): OwnerNote {
   return {
@@ -144,5 +144,12 @@ describe("filterItems", () => {
     expect(ids({ layer: "semantic" })).toEqual(["knowledge"]);
     // Same instant: note, then knowledge, then captures by id descending.
     expect(ids({})).toEqual(["note", "knowledge", "capture2", "capture1"]);
+  });
+});
+
+describe("scopeKey", () => {
+  it("files an observation under its own key, never under a project bucket", () => {
+    const obs = known({ scope_kind: "observation", scope_id: "api:chat:5", status: "observed" });
+    expect(scopeKey(obs)).toBe("observations");
   });
 });

@@ -369,14 +369,17 @@ pub async fn accept_with_seat(
     // refuses to start on a project with no site at all. The person's own window is then the seat:
     // it is where a first login is made and can be kept (spec browser-com-painel-pela-pagina-web
     // §3.6).
+    // A session opened for no project has no profile to promote into at all, so it gets the window
+    // too, on its own throwaway.
     let seat = if seat == SeatChoice::Panel && !row.visible {
-        let project = row.project_id.clone().unwrap_or_default();
-        let sites = browser::admitted_origins(&state.pool, &project).await?;
-        if sites.read.is_empty() {
-            SeatChoice::Window
-        } else {
-            seat
-        }
+        let promotable = match row.project_id.as_deref() {
+            Some(project) => !browser::admitted_origins(&state.pool, project)
+                .await?
+                .read
+                .is_empty(),
+            None => false,
+        };
+        if promotable { seat } else { SeatChoice::Window }
     } else {
         seat
     };
@@ -429,10 +432,9 @@ pub async fn accept_with_seat(
 
     // Spec §4.5: the destination is the PROJECT's profile, never the throwaway the agent was in.
     // A login made in a profile that is deleted with the run is a login nobody keeps, and the
-    // proposal outlives the run, so it would point at a directory that no longer exists.
-    let project = row.project_id.clone().unwrap_or_default();
-    let sites = browser::admitted_origins(&state.pool, &project).await?;
-    let placement = Placement::project(&project, sites.read);
+    // proposal outlives the run, so it would point at a directory that no longer exists. A session
+    // opened for no project has no such profile and stays on its throwaway.
+    let placement = seat_placement(&state.pool, &row).await?;
     let url = landing(&row);
 
     let wheel = match state
@@ -470,21 +472,19 @@ pub async fn accept_with_seat(
     // in it. Those rows are closed here rather than left to the sweeper: a row saying "open" about a
     // browser that has been stopped is a row the UI would offer to hand over a second time.
     let now = chrono::Utc::now().to_rfc3339();
+    // A throwaway seat (a no-project session) takes over its own profile, so the session itself may
+    // be among the displaced; it is the one row that must stay open.
     for sidecar_id in &wheel.displaced {
-        if let Ok(Some(displaced)) = row_by_sidecar_id(&state.pool, sidecar_id).await {
+        if let Ok(Some(displaced)) = row_by_sidecar_id(&state.pool, sidecar_id).await
+            && displaced != session_id
+        {
             let _ =
                 browser::close_session_row(&state.pool, displaced, "displaced-by-handover", &now)
                     .await;
         }
     }
 
-    browser::rebind_sidecar(
-        &state.pool,
-        session_id,
-        &wheel.session,
-        &placement.profile.id,
-    )
-    .await?;
+    rebind_to(&state.pool, session_id, &wheel.session, &placement).await?;
     if !browser::set_mode_seat(
         &state.pool,
         &state.browser.modes,
@@ -516,9 +516,9 @@ async fn accept_for_panel(
     let session_id = row.id;
 
     if !row.visible {
-        let project = row.project_id.clone().unwrap_or_default();
-        let sites = browser::admitted_origins(&state.pool, &project).await?;
-        let placement = Placement::project(&project, sites.read);
+        // A no-project session never reaches here headless (it is sent to a window instead), and
+        // were it to, it would stay on its throwaway rather than take a project profile.
+        let placement = seat_placement(&state.pool, row).await?;
         let url = landing(row);
 
         // One browser per profile: the throwaway goes first, or the visible one cannot take the
@@ -552,8 +552,7 @@ async fn accept_for_panel(
                 return Err(WheelError::Sidecar(error));
             }
         };
-        browser::rebind_sidecar(&state.pool, session_id, &promoted.id, &placement.profile.id)
-            .await?;
+        rebind_to(&state.pool, session_id, &promoted.id, &placement).await?;
         browser::set_visible(&state.pool, session_id, true).await?;
     }
 
@@ -611,9 +610,7 @@ pub async fn to_window(state: &AppState, session_id: i64) -> Result<SessionRow, 
             row.mode
         )));
     }
-    let project = row.project_id.clone().unwrap_or_default();
-    let sites = browser::admitted_origins(&state.pool, &project).await?;
-    let placement = Placement::project(&project, sites.read);
+    let placement = seat_placement(&state.pool, &row).await?;
     let url = landing(&row);
 
     let wheel = match state
@@ -653,13 +650,7 @@ pub async fn to_window(state: &AppState, session_id: i64) -> Result<SessionRow, 
                     .await;
         }
     }
-    browser::rebind_sidecar(
-        &state.pool,
-        session_id,
-        &wheel.session,
-        &placement.profile.id,
-    )
-    .await?;
+    rebind_to(&state.pool, session_id, &wheel.session, &placement).await?;
     browser::set_mode_seat(
         &state.pool,
         &state.browser.modes,
@@ -843,8 +834,47 @@ pub async fn keep(
     if !keep {
         return Ok(Vec::new());
     }
-    let project = row.project_id.clone().unwrap_or_default();
-    Ok(browser::grant(&state.pool, &project, &chain, writable, &now).await?)
+    // A session opened for no project has nowhere to keep a login. The chain is settled above, so
+    // the question closes, but nothing is granted: a grant under an empty project id would hand
+    // admitted origins to every later no-project open.
+    let Some(project) = row.project_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    Ok(browser::grant(&state.pool, project, &chain, writable, &now).await?)
+}
+
+/// Where the person's seat runs. A project session goes to the project's profile with the sites it
+/// admits (spec §4.5); a session opened for no project has no profile to keep a login in, so it
+/// stays on its own throwaway — never a project placement named after an empty id.
+async fn seat_placement(pool: &SqlitePool, row: &SessionRow) -> Result<Placement, WheelError> {
+    match row.project_id.as_deref() {
+        Some(project) => {
+            let sites = browser::admitted_origins(pool, project).await?;
+            Ok(Placement::project(project, sites.read))
+        }
+        None => Ok(Placement::ephemeral(&row.profile_id)),
+    }
+}
+
+/// Point the row at the browser the seat now runs in, with the profile kind the placement chose.
+///
+/// `browser::rebind_sidecar` records every rebind as a project profile, which is only true when the
+/// placement was one; a no-project throwaway is put back to `ephemeral` here.
+async fn rebind_to(
+    pool: &SqlitePool,
+    session_id: i64,
+    sidecar_id: &str,
+    placement: &Placement,
+) -> Result<(), WheelError> {
+    browser::rebind_sidecar(pool, session_id, sidecar_id, &placement.profile.id).await?;
+    if placement.profile.kind != browser_policy::Profile::Project.as_str() {
+        sqlx::query("UPDATE browser_sessions SET profile_kind = ? WHERE id = ?")
+            .bind(&placement.profile.kind)
+            .bind(session_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Where the session actually is: the landing url when there is one, the requested one otherwise.
@@ -2005,6 +2035,63 @@ mod tests {
         assert_eq!(nonce, None);
         assert!(volante_saw(&seen, "wheel/take"));
         assert!(!volante_saw(&seen, "person/begin"));
+        db.close().await;
+    }
+
+    /// A session opened for no project has nowhere to keep: the approval leaves it on its throwaway
+    /// (no promotion into a profile named after an empty project id), and a "yes, keep" afterwards
+    /// grants nothing anywhere.
+    #[tokio::test]
+    async fn a_no_project_session_stays_ephemeral_and_keeps_nothing() {
+        let (db, state, seen) = wheeled(
+            vec!["https://login.example.org/", "https://app.example.org/home"],
+            false,
+        )
+        .await;
+        let id = sqlx::query(
+            "INSERT INTO browser_sessions \
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                 final_url, rule, mode, opened_at) \
+             VALUES ('s1', 7, NULL, 'ephemeral', 'run-7', 'https://login.example.org/', \
+                     'https://app.example.org/home', 'no-project', ?, \
+                     '2026-08-16T10:00:00Z')",
+        )
+        .bind(mode::WHEEL_REQUESTED)
+        .execute(&state.pool)
+        .await
+        .expect("insert")
+        .last_insert_rowid();
+
+        // The panel seat on a headless session would promote it into a project profile; with no
+        // project it gets the window instead, still on the throwaway.
+        let (row, nonce) = accept_with_seat(&state, id, Some(SeatChoice::Panel))
+            .await
+            .expect("accept");
+        assert_eq!(nonce, None);
+        assert_eq!(row.mode, mode::HUMAN);
+        assert_eq!(row.seat.as_deref(), Some("window"));
+        assert_eq!(row.profile_kind, "ephemeral");
+        assert_eq!(row.profile_id, "run-7");
+        assert_eq!(row.project_id, None);
+        assert!(volante_saw(&seen, "wheel/take"));
+        assert!(
+            !volante_saw(&seen, "open"),
+            "no promotion into a visible project profile"
+        );
+
+        let chain = give_back(&state, id, None).await.expect("give back");
+        assert_eq!(chain.len(), 2);
+        // A throwaway's chain is never recorded (`record_chain` keeps project profiles only), so
+        // there is no keep question to answer at all.
+        assert!(matches!(
+            keep(&state, id, true, true).await,
+            Err(WheelError::WrongState(_))
+        ));
+        let sites: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM browser_sites")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(sites, 0, "a no-project keep must grant nothing anywhere");
         db.close().await;
     }
 

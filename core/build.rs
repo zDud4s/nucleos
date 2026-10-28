@@ -32,8 +32,15 @@ fn main() {
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let abs = file.to_string_lossy().replace('\\', "/");
-        writeln!(code, "    ({rel:?}, include_bytes!({abs:?})),").unwrap();
+        // Resolved against CARGO_MANIFEST_DIR at compile time, never an absolute path baked in
+        // here: every checkout and worktree shares one target dir and cargo reuses this output
+        // across them, so an absolute path pointed a later build at a worktree since deleted.
+        let path = format!("/assets/agents/{rel}");
+        writeln!(
+            code,
+            "    ({rel:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), {path:?}))),"
+        )
+        .unwrap();
     }
     code.push_str("];\n");
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("agents_embedded.rs");

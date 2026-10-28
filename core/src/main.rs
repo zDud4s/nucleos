@@ -7,6 +7,8 @@ use nucleos_core::*;
 // Both crates have a `channels`; the app's is the lib's plus ingest, media and commands, so name it
 // explicitly or the two globs collide (this import also makes `crate::channels` in `http` resolve).
 use nucleos_app::channels;
+// The same for `map`: the library's holds only `intent`, the app's is the whole map.
+use nucleos_app::map;
 
 use auth::Token;
 use state::AppState;
@@ -1080,10 +1082,11 @@ async fn main() {
         &verify_config.admission,
     ));
     let admission_enabled = verify_config.admission.enabled;
-    let verify_executor = verify::exec::Executor::new(
+    let verify_executor = verify::exec::Executor::with_warm_home(
         state.pool.clone(),
         verify_config,
         machine_config_root.clone(),
+        machine_config_root.as_deref().map(nucleos_core::warm::home),
     );
     verify::install(verify_executor.clone());
     // A graph node that names an `agent:` launches as that catalogue agent (agent spec section 13).
@@ -1117,6 +1120,7 @@ async fn main() {
     // for every project there is never one, and a pass reads an empty query.
     tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
     tokio::spawn(verify::exec::run_executor(verify_executor));
+    startup::rearm_verify_wakes(&state).await;
     tokio::spawn(execution::vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(execution::git_exec::GitExecutor {

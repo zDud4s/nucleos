@@ -1,4 +1,5 @@
 pub mod groups;
+pub mod links;
 pub mod notices;
 pub mod seed;
 pub mod tasks;
@@ -736,6 +737,76 @@ pub async fn clear_context(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()>
     Ok(())
 }
 
+/// What a conversation has cost, read off its assistant runs (the `/cost` card).
+///
+/// A run whose engine reports no price (`cost_usd` NULL, as on the local route) counts as 0 and is
+/// tallied in `unmeasured_turns`, so the card can say the total is a floor and not invent a number.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ChatCost {
+    /// Assistant turns of the conversation, cleared ones included.
+    pub turns: i64,
+    /// Turns that reported no cost.
+    pub unmeasured_turns: i64,
+    pub total_usd: f64,
+    /// The same sum over the turns after the last `/clear` (`runs.id > cleared_after_run_id`).
+    pub since_clear_usd: f64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    /// What the newest turn cost, or `None` when it reported no cost or there is no turn.
+    pub last_turn_usd: Option<f64>,
+}
+
+/// The cost of a conversation: sums over `runs WHERE mode = 'assistant' AND chat_id = ?`.
+pub async fn cost_of(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<ChatCost> {
+    let (turns, unmeasured_turns, total_usd, since_clear_usd, input, output, cache_read, cache_new): (
+        i64,
+        i64,
+        f64,
+        f64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(cost_usd), 0.0),
+                COALESCE(SUM(CASE WHEN id > COALESCE(
+                              (SELECT cleared_after_run_id FROM chats WHERE chat_id = ?1), -1)
+                            THEN cost_usd END), 0.0),
+                COALESCE(SUM(input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_creation_tokens), 0)
+           FROM runs
+          WHERE mode = 'assistant' AND chat_id = ?1 AND status != 'running'",
+    )
+    .bind(chat_id)
+    .fetch_one(pool)
+    .await?;
+    let last_turn_usd: Option<Option<f64>> = sqlx::query_scalar(
+        "SELECT cost_usd FROM runs
+          WHERE mode = 'assistant' AND chat_id = ? AND status != 'running'
+          ORDER BY id DESC LIMIT 1",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ChatCost {
+        turns,
+        unmeasured_turns,
+        total_usd,
+        since_clear_usd,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_new,
+        last_turn_usd: last_turn_usd.flatten(),
+    })
+}
+
 /// Sets the standing instructions appended to this conversation's system prompt. Blank clears them.
 ///
 /// Blank stored as NULL rather than as an empty string, so "nobody wrote instructions" and
@@ -1373,8 +1444,9 @@ pub async fn archive(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(chat_id)
         .execute(pool)
-        .await
-        .map(|_| ())
+        .await?;
+    // An archived conversation answers to nobody and nobody answers to it.
+    links::close_all_for(pool, chat_id).await
 }
 
 #[cfg(test)]
@@ -1484,6 +1556,112 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// An assistant run of `chat` with the numbers `/cost` sums; returns its id.
+    async fn seed_cost_run(
+        pool: &SqlitePool,
+        chat: &str,
+        mode: &str,
+        cost: Option<f64>,
+        tokens: (i64, i64, i64, i64),
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at, cost_usd,
+                               input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+             VALUES ('q', 'completed', ?, ?, '2026-10-27T10:00:00+00:00', ?, ?, ?, ?, ?)
+             RETURNING id",
+        )
+        .bind(mode)
+        .bind(chat)
+        .bind(cost)
+        .bind(tokens.0)
+        .bind(tokens.1)
+        .bind(tokens.2)
+        .bind(tokens.3)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn slash_b_cost_of_sums_and_counts_unmeasured() {
+        let pool = test_pool().await;
+        let chat = create(&pool, Brain::Cloud, None).await.unwrap();
+        let other = create(&pool, Brain::Cloud, None).await.unwrap();
+        seed_cost_run(&pool, &chat, "assistant", None, (7, 3, 0, 0)).await;
+        seed_cost_run(&pool, &chat, "assistant", Some(0.5), (100, 10, 1000, 200)).await;
+        seed_cost_run(&pool, &chat, "assistant", Some(0.25), (50, 5, 0, 0)).await;
+        // Neither another conversation's turn nor a run that is not a chat turn is this one's.
+        seed_cost_run(&pool, &other, "assistant", Some(4.0), (1, 1, 1, 1)).await;
+        seed_cost_run(&pool, &chat, "real", Some(9.0), (1, 1, 1, 1)).await;
+
+        let cost = cost_of(&pool, &chat).await.unwrap();
+
+        assert_eq!(cost.turns, 3);
+        assert_eq!(cost.unmeasured_turns, 1, "the NULL cost is counted, as 0");
+        assert_eq!(cost.total_usd, 0.75);
+        assert_eq!(cost.last_turn_usd, Some(0.25));
+        assert_eq!(
+            (
+                cost.input_tokens,
+                cost.output_tokens,
+                cost.cache_read_tokens,
+                cost.cache_creation_tokens
+            ),
+            (157, 18, 1000, 200)
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_b_cost_of_since_clear_uses_cleared_after_run_id() {
+        let pool = test_pool().await;
+        let chat = create(&pool, Brain::Cloud, None).await.unwrap();
+        seed_cost_run(&pool, &chat, "assistant", Some(0.5), (1, 1, 0, 0)).await;
+        seed_cost_run(&pool, &chat, "assistant", Some(0.25), (1, 1, 0, 0)).await;
+        clear_context(&pool, &chat).await.unwrap();
+        seed_cost_run(&pool, &chat, "assistant", Some(0.125), (1, 1, 0, 0)).await;
+        seed_cost_run(&pool, &chat, "assistant", None, (1, 1, 0, 0)).await;
+
+        let cost = cost_of(&pool, &chat).await.unwrap();
+
+        assert_eq!(
+            cost.total_usd, 0.875,
+            "a clear hides turns, it does not refund them"
+        );
+        assert_eq!(cost.since_clear_usd, 0.125);
+        assert_eq!(cost.turns, 4);
+        assert_eq!(cost.last_turn_usd, None, "the newest turn reported no cost");
+    }
+
+    #[tokio::test]
+    async fn slash_b_cost_of_ignores_a_running_turn() {
+        let pool = test_pool().await;
+        let chat = create(&pool, Brain::Cloud, None).await.unwrap();
+        seed_cost_run(&pool, &chat, "assistant", Some(0.5), (1, 1, 0, 0)).await;
+        let running = seed_cost_run(&pool, &chat, "assistant", None, (0, 0, 0, 0)).await;
+        sqlx::query("UPDATE runs SET status = 'running' WHERE id = ?")
+            .bind(running)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cost = cost_of(&pool, &chat).await.unwrap();
+
+        assert_eq!(cost.turns, 1, "a turn in flight is not counted yet");
+        assert_eq!(cost.unmeasured_turns, 0);
+        assert_eq!(cost.last_turn_usd, Some(0.5));
+    }
+
+    #[tokio::test]
+    async fn slash_b_cost_of_empty_chat_is_zero() {
+        let pool = test_pool().await;
+        let chat = create(&pool, Brain::Cloud, None).await.unwrap();
+
+        let cost = cost_of(&pool, &chat).await.unwrap();
+
+        assert_eq!(cost, ChatCost::default());
+        assert_eq!(cost.last_turn_usd, None);
     }
 
     #[test]

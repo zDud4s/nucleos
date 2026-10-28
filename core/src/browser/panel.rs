@@ -39,6 +39,14 @@ pub async fn owner_of(pool: &SqlitePool, row: &SessionRow) -> Owner {
     }
 }
 
+/// The chat a session answers to: `owner_of` when it is a chat, else `None`.
+pub async fn chat_of(pool: &SqlitePool, row: &SessionRow) -> Option<String> {
+    match owner_of(pool, row).await {
+        Owner::Chat(chat) => Some(chat),
+        Owner::Run(_) | Owner::None => None,
+    }
+}
+
 /// Whether the owner is still there to hear: an unarchived chat, or a run still going.
 pub async fn owner_alive(pool: &SqlitePool, owner: &Owner) -> bool {
     match owner {
@@ -222,7 +230,13 @@ pub async fn give_back_from_panel(
         Some(note) => format!("the person handed the wheel back: {note}"),
         None => "the person handed the wheel back".to_string(),
     };
-    let project = row.project_id.clone().unwrap_or_default();
+    // A session opened for no project has nowhere to keep a login: settle the chain without asking
+    // and tell the owner straight away.
+    let Some(project) = row.project_id.clone() else {
+        let _ = browser_wheel::keep(state, session_id, false, false).await;
+        announce_return(state, &row, &text).await;
+        return Ok(());
+    };
     let admitted = browser::admitted_origins(&state.pool, &project).await?;
     let hosts: Vec<String> = crate::browser_policy::granted_origins(&returned.chain)
         .into_iter()
@@ -835,6 +849,108 @@ mod tests {
 
         let second = ask(state.clone()).await;
         assert!(second.get("panel_messages").is_none(), "{second}");
+        db.close().await;
+    }
+
+    /// A session opened for no project has nowhere to keep a login, so handing the wheel back asks no
+    /// keep question even when the person's stretch walked through new hosts: nothing is held and
+    /// the owner hears about it directly.
+    #[tokio::test]
+    async fn giving_the_wheel_back_in_a_no_project_session_asks_no_keep_question() {
+        use axum::response::IntoResponse as _;
+        use axum::routing::post;
+
+        let pushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let kept = pushed.clone();
+        let app = axum::Router::new().route(
+            "/{*path}",
+            post(
+                move |axum::extract::Path(path): axum::extract::Path<String>,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let kept = kept.clone();
+                    async move {
+                        match path.as_str() {
+                            "person/end" => axum::Json(serde_json::json!({
+                                "chain": ["https://login.example.org/", "https://app.example.org/"],
+                            }))
+                            .into_response(),
+                            "panel/push" => {
+                                kept.lock().unwrap().push(body["message"].clone());
+                                axum::http::StatusCode::NO_CONTENT.into_response()
+                            }
+                            _ => axum::http::StatusCode::NO_CONTENT.into_response(),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let runtime = BrowserRuntime {
+            enabled: true,
+            client: BrowserClient::new(&address.to_string(), "tok".into()),
+            modes: Default::default(),
+            seats: Default::default(),
+            embedded: Default::default(),
+            embedded_forced: Default::default(),
+        };
+
+        let db = TempDb::new().await;
+        let state = state_over(db.pool.clone(), runtime);
+        let turns = crate::assistant_types::RecordingTurns::install(&state);
+        a_chat(&db.pool, "no-project-chat").await;
+        run_seven(&db.pool, "completed", Some("no-project-chat")).await;
+        let id = sqlx::query(
+            "INSERT INTO browser_sessions \
+                (sidecar_id, run_id, project_id, profile_kind, profile_id, requested_url, \
+                 final_url, rule, mode, seat, opened_at) \
+             VALUES ('s1', 7, NULL, 'ephemeral', 'embedded-none', 'https://login.example.org/', \
+                     'https://app.example.org/', 'no-project', 'human', 'shell', \
+                     '2026-08-16T10:00:00Z')",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("insert session")
+        .last_insert_rowid();
+        let row = crate::browser::session_row(&db.pool, id)
+            .await
+            .expect("query")
+            .expect("the row");
+        assert_eq!(row.project_id, None);
+
+        give_back_from_panel(&state, &row, None)
+            .await
+            .expect("given back");
+
+        assert!(
+            !pushed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message["kind"] == "ask_keep"),
+            "no keep question for a session with no project: {:?}",
+            pushed.lock().unwrap()
+        );
+        assert!(
+            state.browser.seats.take_held_return(id).is_none(),
+            "nothing is held back waiting for an answer"
+        );
+        // The turn itself is the assistant's (another crate); here it is enough that the owner's
+        // chat was asked to hear it, once, as the panel.
+        let told = turns
+            .calls()
+            .into_iter()
+            .filter(|(chat, _, origin)| {
+                chat == "no-project-chat" && *origin == Origin::BrowserPanel
+            })
+            .count();
+        assert_eq!(
+            told, 1,
+            "the owner heard the wheel came back, straight away"
+        );
         db.close().await;
     }
 

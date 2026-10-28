@@ -49,6 +49,8 @@ const KIND_ORDER: Record<BrainItem["kind"], number> = { note: 0, knowledge: 1, c
 
 /** The scope key a knowledge row answers to in the Scope filter (same keys as the Learned page). */
 export function scopeKey(row: Known): string {
+  // Observations are not a project's: their scope id is `<project|->:chat:<key>`, not a bucket.
+  if (row.scope_kind === "observation") return "observations";
   return row.scope_kind === "machine" ? "machine" : (row.scope_id ?? "machine");
 }
 

@@ -1,0 +1,61 @@
+/* The Agent panel of the Web page: a header (title, link, actions), the thread, and the composer
+   pinned at the foot. It lives in `.web-side`, beside the browser, never over the native webview. */
+
+.agent-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 100%;
+}
+
+.agent-panel-header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-panel-title {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.agent-panel-link,
+.agent-panel-note {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.agent-panel-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.agent-panel-refused {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.agent-panel-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.agent-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.agent-panel-composer {
+  position: sticky;
+  bottom: 0;
+  background: var(--surface);
+  padding-top: var(--space-2);
+}

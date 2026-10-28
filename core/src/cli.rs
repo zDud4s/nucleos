@@ -379,7 +379,7 @@ async fn verify() -> bool {
     let verify_call = verify_cli::invocation(&verify_args, verify_env_wait.as_deref());
     if !matches!(verify_call, verify_cli::Invocation::NotVerify) {
         use std::io::Write;
-        let limit = match verify_call {
+        let (limit, ticket) = match verify_call {
             verify_cli::Invocation::Help => {
                 println!("{}", verify_cli::USAGE);
                 return true;
@@ -395,7 +395,14 @@ async fn verify() -> bool {
                 eprintln!("not verified: {reason}\n\n{}", verify_cli::USAGE);
                 std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
             }
-            verify_cli::Invocation::Run(limit) => limit,
+            verify_cli::Invocation::BadTicket(reason) => {
+                eprintln!("not verified: {reason}\n\n{}", verify_cli::USAGE);
+                std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
+            }
+            verify_cli::Invocation::Run(limit) => (limit, None),
+            // `--verify-ticket <id>`: wait on an existing ticket. Same token, same exit codes,
+            // and it submits nothing, so the worktree is never read.
+            verify_cli::Invocation::Ticket(id, limit) => (limit, Some(id)),
             verify_cli::Invocation::NotVerify => unreachable!("handled by the guard above"),
         };
         let token = match secrets::load_secret(TOKEN_KEY) {
@@ -407,15 +414,20 @@ async fn verify() -> bool {
                 std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
             }
         };
-        let worktree = match std::env::current_dir() {
-            Ok(path) => path.to_string_lossy().into_owned(),
-            Err(error) => {
-                eprintln!("not verified: the current directory is unreadable: {error}");
-                std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
+        let client = daemon_client::DaemonClient::new(daemon_client::daemon_url(), token);
+        let outcome = match ticket {
+            Some(id) => verify_cli::follow(&client, id, limit).await,
+            None => {
+                let worktree = match std::env::current_dir() {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(error) => {
+                        eprintln!("not verified: the current directory is unreadable: {error}");
+                        std::process::exit(verify_cli::EXIT_NOT_VERIFIED);
+                    }
+                };
+                verify_cli::run(&client, &worktree, limit).await
             }
         };
-        let client = daemon_client::DaemonClient::new(daemon_client::daemon_url(), token);
-        let outcome = verify_cli::run(&client, &worktree, limit).await;
         print!("{}", outcome.stdout);
         eprint!("{}", outcome.stderr);
         // `process::exit` does not flush a buffered stdout, and a pipe is block-buffered.

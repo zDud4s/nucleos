@@ -353,6 +353,60 @@ pub fn ticket_for_box(
     }
 }
 
+/// How a session of this box waits for a ticket that is not done, the text of the `wait_with` field
+/// (`ticket` is the ticket's id).
+///
+/// The worktree box is an IDE or terminal session: the daemon cannot resume it, so it waits with
+/// `<daemon> --verify-ticket <id>` in the background and is woken when that exits. A job node is
+/// never resumed with a verdict: the job's item gate verifies its files once it ends. Every other
+/// box (`McpBox::All` also serves chats, councils and runs outside a worktree) is NOT woken: only a
+/// daemon worktree run is resumed with the verdict, so the text says what each case does.
+pub fn wait_with_text(served: &McpBox, ticket: i64) -> String {
+    match served {
+        McpBox::Worktree(_) => format!(
+            "{} --verify-ticket {ticket}: run it with Monitor or Bash \
+             run_in_background; you will be woken when it exits (exit 0 passed, 1 failed, \
+             3 no verdict yet, 4 not verified); do not poll verify_status",
+            verify_client_program()
+        ),
+        McpBox::JobNode(_) => "carry on or finish; the job's item gate verifies your files after \
+                                you end; do not poll verify_status"
+            .to_string(),
+        _ => "a daemon worktree run: end your turn and the daemon resumes you with the verdict; \
+              any other session: read it once with verify_status (wait true) when you need it; \
+              never loop on verify_status"
+            .to_string(),
+    }
+}
+
+/// How the IDE box names the daemon's own binary: its full path, which is on nobody's PATH, quoted
+/// when it holds a space; the bare name only when the daemon cannot tell where it runs from. The
+/// classifier allows this exact program word (`is_verify_client_call`).
+pub fn verify_client_program() -> String {
+    match std::env::current_exe() {
+        Ok(path) => {
+            let path = path.to_string_lossy();
+            if path.contains(char::is_whitespace) {
+                format!("\"{path}\"")
+            } else {
+                path.into_owned()
+            }
+        }
+        Err(_) => "nucleos-core".to_owned(),
+    }
+}
+
+/// An unfinished ticket's answer with the additive `wait_with` field naming how this box waits for
+/// it. A finished ticket, or an answer that is not a ticket, goes through untouched.
+pub fn with_wait_hint(served: &McpBox, mut answer: serde_json::Value) -> serde_json::Value {
+    if answer["done"].as_bool() == Some(false)
+        && let Some(ticket) = answer["ticket"].as_i64()
+    {
+        answer["wait_with"] = serde_json::Value::String(wait_with_text(served, ticket));
+    }
+    answer
+}
+
 /// The daemon client a box starts with. The environment's token wins; only the worktree box, which
 /// an IDE session starts by hand with no `NUCLEOS_DAEMON_TOKEN`, may fall back to the stored one.
 /// The stored token is held in memory and never written into a launch file. Nothing stored, an

@@ -321,6 +321,10 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // barrier is not skipped, it is moved one hop.
     ("send_team_note", ToolEffect::WritesOwn),
     ("send_to_chat", ToolEffect::Acts),
+    // `Acts` for the reason `send_to_chat` is: it hands words to a NEW conversation whose turns
+    // can use the whole surface of this machine, through the same relay gate. It touches no page
+    // itself, so it is not one of the browser verbs.
+    ("browser_agent", ToolEffect::Acts),
     ("set_kill", ToolEffect::Acts),
     // The two shadow reads. `ReadsOwn`, on the argument the project reads above set out, and the
     // honest half of that argument applies here too. A scoreboard row is the daemon's own tally of

@@ -4,11 +4,11 @@ import type { KnownLayer } from "../data/knowledge";
  * The Brain graph as plain data: what `graph-model.ts` builds and `ForceGraph.tsx` draws.
  *
  * Node ids: `n:<id>` a note, `k:<id>` a knowledge row, `<kind>:<ref>` any other target
- * (`project:<id>`, `contact:<id>`, `mail:<id>`, `file:<ref>`, `job:<id>`). One thing is one node however
+ * (`project:<id>`, `contact:<id>`, `mail:<id>`, `file:<ref>`, `job:<id>`, `theme:<id>` a theme). One thing is one node however
  * it is reached.
  */
 
-export type GNodeKind = "note" | "knowledge" | "project" | "contact" | "mail" | "file" | "job";
+export type GNodeKind = "note" | "knowledge" | "project" | "contact" | "mail" | "file" | "job" | "theme";
 
 /** Which way an item leans for the shared Estado filter; `unknown` is a status this shell has no word for. */
 export type StateBucket = "in_force" | "proposed" | "out" | "unknown";
@@ -29,13 +29,21 @@ export interface GNode {
 }
 
 /** A note link carries its `link_type`; `supersedes_k` is knowledge → the row it replaced; `scope` is knowledge → its project. */
-export type GEdgeType = "relates" | "supports" | "contradicts" | "details" | "supersedes" | "supersedes_k" | "scope";
+export type GEdgeType = "relates" | "supports" | "contradicts" | "details" | "supersedes" | "supersedes_k" | "scope" | "member";
 
 export interface GEdge {
   id: string;
   source: string;
   target: string;
   type: GEdgeType;
+}
+
+/** A theme as the graph needs it: its name, whether it is accepted, and the notes and knowledge it gathers. */
+export interface GraphTheme {
+  id: number;
+  name: string;
+  state: "proposed" | "accepted";
+  members: { kind: "note" | "knowledge"; id: number }[];
 }
 
 export interface GModel {
