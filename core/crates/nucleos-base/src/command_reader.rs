@@ -1041,9 +1041,14 @@ mod tests {
             (r"echo \' ; rm x \'", ';'),
             (r"echo \' | rm x \'", '|'),
         ] {
-            let masked = without_quoted_text(line)
-                .unwrap_or_else(|| panic!("read as unterminated: {line}"));
-            assert!(masked.contains(meta), "{meta} was hidden in {line}: {masked}");
+            // Refused (None) or visible are both safe; a masked metacharacter is not. The toggle
+            // reading refuses `$'a\'b'` (odd apostrophes), which sends the line to the judge.
+            if let Some(masked) = without_quoted_text(line) {
+                assert!(
+                    masked.contains(meta),
+                    "{meta} was hidden in {line}: {masked}"
+                );
+            }
         }
     }
 
