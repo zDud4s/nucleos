@@ -2,6 +2,7 @@ import { ApiRefusal } from "../data/client";
 import { DAEMON_NAME } from "../copy";
 import { useSynthesiseTheme, useTheme, useThemes } from "../data/themes";
 import { Button, ErrorNote, Quiet, Skeleton } from "../ui";
+import { ThemeEdit, type ThemeChoice } from "./ThemeEdit";
 import "./ThemesProposed.css";
 
 /** A refused synthesis in the owner's words; anything else means the daemon did not answer. */
@@ -14,7 +15,7 @@ function synthesisFailure(error: unknown): string {
   return `the ${DAEMON_NAME} is not responding: the synthesis was not made`;
 }
 
-function AcceptedTheme({ id, name }: { id: number; name: string }) {
+function AcceptedTheme({ id, name, others }: { id: number; name: string; others: ThemeChoice[] }) {
   const detail = useTheme(id);
   const force = useSynthesiseTheme();
   const synthesis = detail.data?.synthesis ?? null;
@@ -44,6 +45,7 @@ function AcceptedTheme({ id, name }: { id: number; name: string }) {
         >
           {force.isPending ? "Synthesising…" : "Synthesise now"}
         </Button>
+        <ThemeEdit id={id} name={name} others={others} />
       </span>
       {force.isError && <ErrorNote>{synthesisFailure(force.error)}</ErrorNote>}
     </li>
@@ -60,7 +62,7 @@ export function ThemesAccepted() {
       <h4>Themes</h4>
       <ul className="themes-list" aria-label="Accepted themes">
         {rows.map((theme) => (
-          <AcceptedTheme key={theme.id} id={theme.id} name={theme.name} />
+          <AcceptedTheme key={theme.id} id={theme.id} name={theme.name} others={rows} />
         ))}
       </ul>
     </section>

@@ -1,6 +1,7 @@
 import { DAEMON_NAME } from "../copy";
 import { useAcceptTheme, useRefuseTheme, useThemes } from "../data/themes";
 import { Button, ErrorNote } from "../ui";
+import { ThemeEdit } from "./ThemeEdit";
 import "./ThemesProposed.css";
 
 /**
@@ -51,6 +52,7 @@ export function ThemesProposed() {
               >
                 Refuse
               </Button>
+              <ThemeEdit id={theme.id} name={theme.name} others={rows} />
             </span>
           </li>
         ))}
