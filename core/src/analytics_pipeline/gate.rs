@@ -11,8 +11,8 @@ use super::stats::{self, ratio};
 use crate::analytics::Window;
 use crate::verify::observe::{Deviation, deviation};
 use crate::verify::runs::{
-    REQUESTED_BY_BISECT, REQUESTED_BY_FLAKE_CHECK, STATUS_ERRORED, STATUS_FAILED, STATUS_PASSED,
-    STATUS_SKIPPED_CACHED,
+    REQUESTED_BY_BISECT, REQUESTED_BY_FLAKE_CHECK, REQUESTED_BY_PROBE, STATUS_ERRORED,
+    STATUS_FAILED, STATUS_PASSED, STATUS_SKIPPED_CACHED,
 };
 
 /// Both windows in one read: `[previous.from, window.to)`. A queued row has no `started_at`, so
@@ -43,7 +43,9 @@ pub(crate) struct Row {
 
 /// Probes run on a red already known; counting them would bias the rate down (spec §6.1, 4).
 fn is_probe(row: &Row) -> bool {
-    row.requested_by == REQUESTED_BY_FLAKE_CHECK || row.requested_by == REQUESTED_BY_BISECT
+    row.requested_by == REQUESTED_BY_FLAKE_CHECK
+        || row.requested_by == REQUESTED_BY_BISECT
+        || row.requested_by == REQUESTED_BY_PROBE
 }
 
 /// Cached, queued and running rows are outside the denominator.
@@ -437,6 +439,7 @@ mod tests {
                     day,
                 ),
                 ("p", "c", Some("core"), "failed", "bisect", Some(2000), day),
+                ("p", "c", Some("core"), "failed", "probe", Some(2000), day),
             ],
         )
         .await;

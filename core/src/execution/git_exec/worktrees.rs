@@ -59,7 +59,28 @@ pub async fn prepare_postgate_worktree(
     deadline: std::time::Instant,
 ) -> Result<std::path::PathBuf, String> {
     let path = crate::verify::postgate::postgate_worktree(project_root);
-    let path = reset_or_create_worktree(project_root, &path, "postgate", deadline)
+    prepare_daemon_tree_at(project_root, path, "postgate", sha, deadline).await
+}
+
+/// The proof tree of `verify::probe`: its own directory, never the post-merge gate's.
+pub async fn prepare_probe_worktree(
+    project_root: &Path,
+    sha: &str,
+    deadline: std::time::Instant,
+) -> Result<std::path::PathBuf, String> {
+    let path = crate::verify::probe::probe_worktree(project_root);
+    prepare_daemon_tree_at(project_root, path, "probe", sha, deadline).await
+}
+
+/// The shared body of the daemon's detached trees: reset or create `path`, then move it to `sha`.
+async fn prepare_daemon_tree_at(
+    project_root: &Path,
+    path: std::path::PathBuf,
+    what: &str,
+    sha: &str,
+    deadline: std::time::Instant,
+) -> Result<std::path::PathBuf, String> {
+    let path = reset_or_create_worktree(project_root, &path, what, deadline)
         .await
         .map_err(|outcome| match outcome {
             Outcome::Failed {

@@ -238,6 +238,61 @@ pub fn plan(
     })
 }
 
+/// The daemon's probe: the named groups run whole (their `command`, never `select`), uncached.
+/// A name the map lacks is a skipped unit, not an error; no map means no group to prove.
+pub fn plan_groups(map: &MapState, kind: Kind, names: &[String]) -> Result<Plan, PlanError> {
+    let map = match map {
+        MapState::Invalid(errors) => return Err(PlanError::InvalidMap(errors.clone())),
+        MapState::Absent => {
+            return Ok(Plan {
+                units: Vec::new(),
+                unclaimed: Vec::new(),
+                note: Some("no test map at this commit; no group to prove".into()),
+            });
+        }
+        MapState::Valid(map) => map,
+    };
+    let mut seen = BTreeSet::new();
+    let units = names
+        .iter()
+        .filter(|name| seen.insert(name.as_str()))
+        .map(|name| {
+            let (argv, skipped) = match (map.tests.groups.get(name), kind) {
+                (None, _) => (
+                    Vec::new(),
+                    Some(format!("group {name} is not in the map at this commit")),
+                ),
+                (Some(group), Kind::Test) => (
+                    crate::gate::split_command(&group.command).unwrap_or_default(),
+                    None,
+                ),
+                (Some(group), Kind::Check) => match group.check.as_deref() {
+                    Some(check) => (crate::gate::split_command(check).unwrap_or_default(), None),
+                    None => (
+                        Vec::new(),
+                        Some("this group has no `check` command".to_string()),
+                    ),
+                },
+            };
+            PlannedUnit {
+                group: Some(name.clone()),
+                argv,
+                why: "named by the daemon's probe".into(),
+                fingerprint: None,
+                cacheable: false,
+                run_id: None,
+                cached_from: None,
+                skipped,
+            }
+        })
+        .collect();
+    Ok(Plan {
+        units,
+        unclaimed: Vec::new(),
+        note: Some("probe: the named groups run whole".into()),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Progress {
     pub total: usize,
@@ -263,6 +318,23 @@ pub struct UnitReport {
     /// the unit's status or the ticket's verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub already_failing: Option<String>,
+    /// The test ids the runner printed for a failed unit; `None` when it printed none or the
+    /// runner is not covered (`verify::failures`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_tests: Option<Vec<String>>,
+    /// Best-effort repo-relative files those failures point at.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_files: Vec<String>,
+    /// Set on a failed unit whose red already belongs to an incident (`verify::inherit`): "incident
+    /// #N ... do not fix it".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherited: Option<String>,
+    /// Set while the unit classification waits on a master proof (`probe #N` / `reprobe #N`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<String>,
+    /// Why a failed unit is the session own failure (for example "rebase to check ...").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_inherited: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -280,6 +352,9 @@ pub struct Ticket {
     pub unclaimed: Vec<String>,
     pub progress: Progress,
     pub units: Vec<UnitReport>,
+    /// The `task_claims.id` of the incidents this ticket red units were classified as inheriting.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inherited_task_ids: Vec<i64>,
 }
 
 fn report(unit: &PlannedUnit, live: &HashMap<i64, State>) -> UnitReport {
@@ -295,6 +370,11 @@ fn report(unit: &PlannedUnit, live: &HashMap<i64, State>) -> UnitReport {
         run_id: unit.run_id,
         cached_from: unit.cached_from,
         already_failing: None,
+        failed_tests: None,
+        failed_files: Vec::new(),
+        inherited: None,
+        pending: None,
+        not_inherited: None,
     };
     if let Some(reason) = &unit.skipped {
         report.status = "skipped".into();
@@ -311,6 +391,12 @@ fn report(unit: &PlannedUnit, live: &HashMap<i64, State>) -> UnitReport {
         // Only a run that went wrong has a tail worth reading; a green one is noise.
         if state.status == STATUS_FAILED || state.status == STATUS_ERRORED {
             report.output_tail = state.output_tail.clone();
+        }
+        if state.status == STATUS_FAILED
+            && let Some(failures) = &state.failed_tests
+        {
+            report.failed_tests = Some(failures.tests.iter().cloned().collect());
+            report.failed_files = failures.files.iter().cloned().collect();
         }
     }
     report
@@ -370,6 +456,7 @@ pub fn assemble(request: &RequestRow, live: &HashMap<i64, State>) -> Ticket {
             running,
         },
         units,
+        inherited_task_ids: Vec::new(),
     }
 }
 
@@ -394,6 +481,33 @@ tests:
 
     fn valid() -> MapState {
         MapState::Valid(crate::tests_map::parse(MAP).unwrap())
+    }
+
+    #[test]
+    fn plan_groups_runs_the_named_groups_whole_and_skips_the_ones_the_map_lacks() {
+        let names = vec!["core".to_owned(), "gone".to_owned(), "core".to_owned()];
+        let plan = plan_groups(&valid(), Kind::Test, &names).unwrap();
+        assert_eq!(plan.units.len(), 2, "a repeated name is one unit");
+        assert_eq!(plan.units[0].group.as_deref(), Some("core"));
+        assert_eq!(plan.units[0].argv, ["cargo", "test", "-p", "nucleos-core"]); // the group's `command`, not `select`
+        assert!(!plan.units[0].cacheable);
+        assert!(
+            plan.units[1]
+                .skipped
+                .as_deref()
+                .unwrap()
+                .contains("not in the map")
+        );
+        assert!(
+            plan_groups(&MapState::Absent, Kind::Test, &names)
+                .unwrap()
+                .units
+                .is_empty()
+        );
+        assert!(matches!(
+            plan_groups(&MapState::Invalid(vec!["x".into()]), Kind::Test, &names),
+            Err(PlanError::InvalidMap(_))
+        ));
     }
 
     fn paths(list: &[&str]) -> Vec<String> {
@@ -682,6 +796,9 @@ tests:
             unclaimed: vec!["x".into()],
             plan,
             created_at: "now".into(),
+            inherited_task_ids: Vec::new(),
+            classification: None,
+            probe_outcome: None,
         }
     }
 
@@ -693,11 +810,44 @@ tests:
             duration_ms: Some(5),
             output_tail: Some("tail".into()),
             interruptions: 0,
+            failed_tests: None,
         }
     }
 
     fn live(states: Vec<State>) -> HashMap<i64, State> {
         states.into_iter().map(|s| (s.id, s)).collect()
+    }
+
+    #[test]
+    fn a_report_carries_the_failed_ids_and_files_only_when_known() {
+        let mut failed = state(2, STATUS_FAILED);
+        failed.failed_tests = Some(crate::verify::failures::Failures {
+            tests: ["a::boom".to_owned()].into(),
+            files: ["core/a.rs".to_owned()].into(),
+        });
+        let ticket = assemble(&request(vec![unit("core", Some(2))]), &live(vec![failed]));
+        assert_eq!(
+            ticket.units[0].failed_tests.as_deref(),
+            Some(&["a::boom".to_owned()][..])
+        );
+        assert_eq!(ticket.units[0].failed_files, ["core/a.rs"]);
+        assert!(ticket.inherited_task_ids.is_empty());
+        let json = serde_json::to_value(&ticket.units[0]).unwrap();
+        for absent in ["inherited", "pending", "not_inherited"] {
+            assert!(
+                json.get(absent).is_none(),
+                "{absent} must be absent: {json}"
+            );
+        }
+        let json = serde_json::to_value(&ticket).unwrap();
+        assert!(json.get("inherited_task_ids").is_none(), "{json}");
+
+        // A passed unit never reports ids.
+        let passed = assemble(
+            &request(vec![unit("core", Some(3))]),
+            &live(vec![state(3, STATUS_PASSED)]),
+        );
+        assert_eq!(passed.units[0].failed_tests, None);
     }
 
     #[test]

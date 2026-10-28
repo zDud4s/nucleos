@@ -9,7 +9,7 @@ flows:
     steps:
       - { participant: cli, path: core/src/cli.rs, fn: land }
       - { participant: http, path: core/src/http/run_queue.rs, fn: land_worktree, via: "POST /vcs/land" }
-      - { participant: land, path: core/src/execution/land.rs, fn: submit }
+      - { participant: land, path: core/src/execution/land.rs, fn: submit_with }
       - { participant: vcs queue, path: core/src/execution/vcs/queue.rs, fn: submit }
       - { participant: vcs queue, path: core/src/execution/vcs/queue.rs, fn: submit_on }
       - { participant: vcs queue, path: core/src/execution/vcs/queue.rs, fn: admit }

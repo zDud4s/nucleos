@@ -22,6 +22,14 @@
 //! ticket, and once the queue has published it `fix/<source>-<sha7>` is built on top of it. The
 //! correction run on that branch is opened by `run_correction_loop`, which holds an `AppState`.
 //!
+//! The `master-red` incident (task claims, `incident.rs`) mirrors the red for sessions, runs and the
+//! land gate. It is opened when the red is confirmed, claimed by the gate before the revert starts,
+//! respected when another live owner holds it (the report then starts no revert), taken over by
+//! `incident::takeover_step` once that owner lets go (which then starts the skipped revert, once per
+//! culprit: a revert that failed for real marks the incident and is not repeated), and closed by
+//! `incident::close_if_green` when the gate is green on a descendant of the red. The correction run
+//! never reads or writes it.
+//!
 //! F3-12 spares a gate that would only repeat a proof. When a new tip appears, the tick asks
 //! whether a daemon `verify` already passed on that tip's exact tree over the last full green or the
 //! last covered tip (`verify::covering_request`); if so the tip is recorded as covered, with one
@@ -50,6 +58,7 @@ use crate::verify::runs::{STATUS_FAILED, STATUS_PASSED};
 use crate::verify::{self, Caller, VerifyArgs};
 
 mod correction;
+mod incident;
 mod revert;
 
 pub use self::correction::*;
@@ -227,6 +236,9 @@ pub enum Step {
     RevertFailed { merge_sha: String, reason: String },
     /// The correction branch `branch` was created on top of the published revert.
     FixBranch { branch: String },
+    /// The incident's earlier owner let go; the gate claimed it and started the revert of
+    /// `merge_sha` it had skipped.
+    IncidentTaken { incident: i64, merge_sha: String },
 }
 
 /// One project's step in one tick.
@@ -279,6 +291,12 @@ async fn tick_project(
         Ok(state) => state,
         Err(error) => return Step::Failed(format!("cannot read postgate_state: {error}")),
     };
+
+    // The `master-red` incident follows the gate's colour: a green closes it, whichever write
+    // turned the project green (spec 2026-10-22 task-claims §3).
+    if let Some(state) = state.as_ref() {
+        incident::close_if_green(pool, project_id, project_root, state).await;
+    }
 
     // A gate is running: finish it from its ticket, never start another. This needs neither the
     // target nor its tip, so a gate left by a restart is settled even if the branch moved on.
@@ -366,7 +384,20 @@ async fn tick_project(
         covered: evidence.is_some(),
     }];
     match verify_batch::decide(&view, &since_green) {
-        Decision::Idle(idle) => Step::Idle(idle),
+        Decision::Idle(idle) => {
+            // A red that was reported while someone else held the incident has no revert: if that
+            // claim has lapsed, take it and start the revert now (spec §3 Postgate, "O passo de
+            // revert pode repetir-se"). Only here: `Idle` means the tip is the one already
+            // attempted, so the red is not stale. `retry` (unmeasured) never reaches this arm.
+            if let Some(state) = stored
+                && let Some(step) =
+                    incident::takeover_step(executor, project_id, project_root, state, &tip, rules)
+                        .await
+            {
+                return step;
+            }
+            Step::Idle(idle)
+        }
         Decision::MarkCovered { sha } => {
             let Some(evidence) = evidence else {
                 return Step::Failed(format!("cover of {sha} has no proof"));
@@ -636,6 +667,7 @@ async fn submit_full(
         wait: false,
         cover: false,
         task_id: None,
+        groups: None,
     };
     verify::submit(executor, caller, &args)
         .await
@@ -686,6 +718,20 @@ async fn handle_red(
             };
         }
         let status = ticket.verdict.as_deref().unwrap_or("");
+        if matches!(phase, RedPhase::FlakeCheck)
+            && verify_flaky::rerun_verdict(status) != Rerun::Flaky
+        {
+            // Confirmed (spec §3 Postgate): open the incident now, with what the failing units
+            // named. A crash before `begin_bisect` repeats this on the next pass: the ticket is
+            // still there.
+            let failures = incident::failures_of_ticket(&ticket);
+            if let Err(reason) =
+                incident::ensure_incident(pool, project_id, project_root, state, Some(&failures))
+                    .await
+            {
+                tracing::warn!(project = project_id, %reason, "postgate: cannot open the incident");
+            }
+        }
         return settle(pool, project_id, phase, sha, status).await;
     }
 
@@ -810,19 +856,40 @@ async fn bisect_step(
     deadline: Instant,
 ) -> Step {
     let pool = &executor.pool;
+    if let Err(reason) =
+        incident::ensure_incident(pool, project_id, project_root, state, None).await
+    {
+        tracing::warn!(project = project_id, %reason, "postgate: cannot open the incident");
+    }
     let inconclusive = || Verdict::Inconclusive {
         candidates: Vec::new(),
         also_suspect: Vec::new(),
     };
     let Some(base) = state.red_base_sha.as_deref() else {
-        return report_red(executor, project_id, state, red_sha, inconclusive()).await;
+        return report_red(
+            executor,
+            project_id,
+            project_root,
+            state,
+            red_sha,
+            inconclusive(),
+        )
+        .await;
     };
     let commits = match git_exec::first_parent_commits(project_root, base, red_sha, deadline).await
     {
         Ok(commits) => commits,
         Err(reason) => {
             tracing::warn!(project = project_id, %reason, "postgate: cannot list the range");
-            return report_red(executor, project_id, state, red_sha, inconclusive()).await;
+            return report_red(
+                executor,
+                project_id,
+                project_root,
+                state,
+                red_sha,
+                inconclusive(),
+            )
+            .await;
         }
     };
     let mut bisection = Bisection::new(
@@ -841,7 +908,9 @@ async fn bisect_step(
         }
     }
     match bisection.next() {
-        Next::Done(verdict) => report_red(executor, project_id, state, red_sha, verdict).await,
+        Next::Done(verdict) => {
+            report_red(executor, project_id, project_root, state, red_sha, verdict).await
+        }
         Next::Probe(sha) => {
             let claimed = verify_postgate::claim_probe(pool, project_id, &sha).await;
             match claimed {
@@ -864,11 +933,24 @@ async fn bisect_step(
 async fn report_red(
     executor: &Arc<Executor>,
     project_id: &str,
+    project_root: &Path,
     state: &State,
     red_sha: &str,
     verdict: Verdict,
 ) -> Step {
     let pool = &executor.pool;
+    let deadline = Instant::now() + git_exec::OPERATION_TIMEOUT;
+    let incident_row = match incident::ensure_incident(pool, project_id, project_root, state, None)
+        .await
+    {
+        Ok(row) => {
+            Some(incident::record_verdict(pool, row, project_root, &verdict, deadline).await)
+        }
+        Err(reason) => {
+            tracing::warn!(project = project_id, %reason, "postgate: cannot update the incident");
+            None
+        }
+    };
     let base = state.red_base_sha.as_deref();
     let reverting = matches!(verdict, Verdict::Culprit { .. })
         && crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id)
@@ -876,13 +958,36 @@ async fn report_red(
     // A culprit always comes with a base (no base reports inconclusive); the check keeps the line
     // and the state in step should that ever change.
     let in_flight = reverting && state.revert_in_flight();
-    let start_revert = reverting && base.is_some() && !in_flight;
+    // `report_inner` starts no revert for a culprit it already holds (`repeats`); say so up front so
+    // that the incident is never claimed for a revert that will not start.
+    let repeats = matches!(&verdict, Verdict::Culprit { sha, .. } if state.culprit_sha.as_deref() == Some(sha));
+    let mut start_revert = reverting && base.is_some() && !in_flight && !repeats;
+    let mut held_by = None;
+    if start_revert && let Some(row) = incident_row.as_ref() {
+        // BEFORE the revert, spec §3. The claim is its own transaction (`BEGIN IMMEDIATE` in the
+        // store), so it cannot share the one in `report_with_revert`; a crash between the two is
+        // repaired by `incident::takeover_step`, which finds the gate's own claim without a revert.
+        match incident::claim_for_revert(pool, project_id, project_root, state, row).await {
+            // `Unknown` is the fail-open path: the revert goes ahead without a claim.
+            incident::RevertRight::Mine | incident::RevertRight::Unknown => {}
+            incident::RevertRight::HeldBy { incident, who } => {
+                start_revert = false;
+                held_by = Some((incident, who));
+            }
+        }
+    }
     let mut summary = match (&verdict, base) {
         (Verdict::Culprit { sha, also_suspect }, Some(base)) if start_revert => {
             reverting_summary(&state.target, red_sha, base, sha, also_suspect)
         }
         _ => red_summary(&state.target, red_sha, base, &verdict),
     };
+    if let Some((incident, who)) = &held_by {
+        summary.push_str(&format!(
+            " Incident #{incident} is held by {who}, so the fix is theirs; the daemon reverts only \
+             if that claim lapses while the target's tip is still the red one."
+        ));
+    }
     if in_flight {
         summary.push_str(" A revert started earlier is still in flight, so none was queued.");
     }
@@ -985,6 +1090,15 @@ pub async fn run_postgate_worker(executor: Arc<Executor>) {
                         project = %pass.project_id, %branch, "postgate: fix branch ready"
                     );
                 }
+                Step::IncidentTaken {
+                    incident,
+                    merge_sha,
+                } => {
+                    tracing::info!(
+                        project = %pass.project_id, incident, %merge_sha,
+                        "postgate: took over the incident"
+                    );
+                }
                 _ => {}
             }
         }
@@ -1045,6 +1159,7 @@ mod tests {
     }
     use crate::config::VerifyConfig;
     use crate::execution::git_exec::tests::{WorktreeRootEnv, space_free_tempdir};
+    use crate::task_claims::{ClaimOutcome, Holder, HolderKind, Status};
     use crate::verify::exec::{self as verify_exec, Executor};
     use crate::verify::postgate as verify_postgate;
     use crate::verify::runs::PRIORITY_POSTGATE;
@@ -1830,6 +1945,149 @@ mod tests {
         (c3, c4)
     }
 
+    /// `master-red` of `alpha`, as the claims store sees it.
+    async fn incident(f: &Fixture) -> Option<crate::task_claims::TaskRow> {
+        incident::live_master_red(&f.pool, "alpha").await
+    }
+
+    /// Drives `alpha` as `confirmed_culprit` does but stops as soon as the first bisection probe is
+    /// submitted: the incident exists, the owner has not been told yet. Returns `(c3, c4)`.
+    async fn red_until_probe(f: &Fixture) -> (String, String) {
+        let c1 = commit_file(&f.root, "a.txt", "good\n", "c1");
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        tick_until(f, |s| matches!(s, Step::Green(sha) if *sha == c1)).await;
+        commit_file(&f.root, "b.txt", "b\n", "c2");
+        let c3 = commit_file(&f.root, "a.txt", "bad\n", "c3 breaks the gate");
+        let c4 = commit_file(&f.root, "c.txt", "c\n", "c4");
+        tick_until(f, |s| matches!(s, Step::Probe { .. })).await;
+        (c3, c4)
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_red_opens_the_master_red_incident_with_its_context() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+
+        let row = incident(&f)
+            .await
+            .expect("a confirmed red opens the incident");
+        assert_eq!(
+            row.status,
+            Status::Open,
+            "without revert_on_red nobody claims it"
+        );
+        assert_eq!(row.holder_kind, None);
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.detail["red_since_sha"],
+            serde_json::json!(state.red_since_sha)
+        );
+        // Proved failing at the red sha, so a verify finds the incident fresh there and does not
+        // re-prove what the postgate is bisecting.
+        assert!(state.red_sha.is_some());
+        assert_eq!(
+            row.checked_sha, state.red_sha,
+            "the confirmed red sha is the incident's checked_sha"
+        );
+        assert_eq!(
+            row.detail["red_groups"],
+            serde_json::json!(["gate_command"])
+        );
+        // The fixture's gate_command prints no test ids, so the runner gave none: empty, not guessed.
+        assert_eq!(
+            row.detail["red_tests"],
+            serde_json::json!([]),
+            "this runner names no tests"
+        );
+        assert_eq!(row.detail["culprit_sha"], serde_json::json!(c3));
+        assert!(
+            row.guard_paths.is_empty(),
+            "no ids from the runner, so nothing to guard"
+        );
+        assert_eq!(
+            row.hint_paths,
+            vec!["a.txt".to_owned()],
+            "the culprit's own files"
+        );
+
+        // Further passes neither duplicate it nor claim it.
+        let _ = step_of(&f).await;
+        assert_eq!(count(&f.pool, "task_claims").await, 1);
+        assert_eq!(incident(&f).await.unwrap().status, Status::Open);
+    }
+
+    /// What the gate ticket's failing units named reaches the incident: the tests in `red_tests`,
+    /// their files in `guard_paths` (the land gate bites on those, spec §3 Land), and a later pass
+    /// without ids (`bisect_step`, `report_red`) wipes neither. The ticket-to-`RedFailures` step is
+    /// `fold_failures`, tested pure in Task 2; the runner output that fills the ticket is chunk 4's.
+    #[tokio::test]
+    async fn the_failing_tests_and_files_of_the_gate_ticket_reach_the_incident() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let (_c3, _c4) = red_until_probe(&f).await;
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let named = incident::RedFailures {
+            tests: vec!["core::a::boom".to_owned()],
+            files: vec!["core/src/a.rs".to_owned()],
+        };
+        let row = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, Some(&named))
+            .await
+            .unwrap();
+        assert_eq!(
+            row.detail["red_tests"],
+            serde_json::json!(["core::a::boom"])
+        );
+        assert_eq!(row.guard_paths, vec!["core/src/a.rs".to_owned()]);
+        assert!(state.red_sha.is_some());
+        assert_eq!(row.checked_sha, state.red_sha, "returned with the red sha");
+        assert_eq!(
+            incident(&f).await.unwrap().checked_sha,
+            state.red_sha,
+            "and persisted"
+        );
+
+        // A later pass that has no ids (the bisection's) keeps what the ticket named.
+        let again = incident::ensure_incident(&f.pool, "alpha", &f.root, &state, None)
+            .await
+            .unwrap();
+        assert_eq!(again.id, row.id, "adopted, not duplicated");
+        assert_eq!(
+            again.detail["red_tests"],
+            serde_json::json!(["core::a::boom"])
+        );
+        assert_eq!(again.guard_paths, vec!["core/src/a.rs".to_owned()]);
+        let stored = incident(&f).await.unwrap();
+        assert_eq!(
+            stored.guard_paths,
+            vec!["core/src/a.rs".to_owned()],
+            "persisted, not only returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_red_that_passes_on_recheck_opens_no_incident() {
+        let f = fixture(Some(
+            "gate_command: \"git rev-parse --verify --quiet refs/heads/pass\"\n\
+             gate_after_land: true\n",
+        ))
+        .await;
+        tokio::spawn(verify_exec::run_executor(f.ex.clone()));
+        tick_until(&f, |s| matches!(s, Step::Red { .. })).await;
+        assert_eq!(
+            count(&f.pool, "task_claims").await,
+            0,
+            "an unconfirmed red is not an incident"
+        );
+        git_in(&f.root, &["branch", "pass"]);
+        tick_until(&f, |s| matches!(s, Step::Flaky(_))).await;
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
+    }
+
     /// Every summary the feed holds, oldest first.
     async fn feed_summaries(pool: &sqlx::SqlitePool) -> Vec<String> {
         sqlx::query_scalar("SELECT summary FROM feed ORDER BY id")
@@ -1844,6 +2102,259 @@ mod tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    async fn lapse(pool: &sqlx::SqlitePool, id: i64) {
+        let old = crate::execution::wave::stamp(chrono::Utc::now() - chrono::Duration::hours(1));
+        sqlx::query("UPDATE task_claims SET lease_until = ? WHERE id = ?")
+            .bind(old)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn when_the_session_lease_lapses_the_next_pass_claims_and_reverts() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = red_until_probe(&f).await;
+        let row = incident(&f).await.unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+            .await
+            .unwrap();
+        tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        // Still live: passes change nothing.
+        let _ = step_of(&f).await;
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        lapse(&f.pool, row.id).await;
+        let step = tick_until(&f, |s| matches!(s, Step::IncidentTaken { .. })).await;
+        assert!(
+            matches!(&step, Step::IncidentTaken { incident, merge_sha } if *incident == row.id && *merge_sha == c3),
+            "{step:?}"
+        );
+        let taken = incident(&f).await.unwrap();
+        assert_eq!(taken.holder_kind, Some(HolderKind::Postgate));
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_claim_events WHERE task_id = ? AND event = 'expired_reclaimed'",
+        )
+        .bind(row.id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(expired, 1);
+
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "exactly one revert");
+    }
+
+    #[tokio::test]
+    async fn with_revert_on_red_off_the_incident_stays_open_through_any_number_of_passes() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let _ = confirmed_culprit(&f).await;
+        for _ in 0..3 {
+            let _ = step_of(&f).await;
+        }
+        assert_eq!(incident(&f).await.unwrap().status, Status::Open);
+        assert!(queue_rows(&f.pool).await.is_empty());
+    }
+
+    /// A revert the queue really could not perform (publication or conflict) is not tried again for
+    /// the same culprit: that would loop. The incident stays `open`, announced in the feed by
+    /// `fail_revert`, and any session may claim it.
+    #[tokio::test]
+    async fn a_revert_that_failed_for_real_frees_the_incident_and_is_not_tried_again() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+        let step = tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        let Step::Reverting { request, .. } = step else {
+            unreachable!("tick_until returned a step it was not asked for");
+        };
+        sqlx::query("UPDATE vcs_requests SET status = 'failed', failure_reason = ? WHERE id = ?")
+            .bind("the revert conflicted")
+            .bind(request)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
+
+        let row = incident(&f).await.unwrap();
+        assert_eq!(row.status, Status::Open, "the gate let go of the incident");
+        assert_eq!(row.detail["revert_failed_for"], serde_json::json!(c3));
+        assert!(
+            feed_summaries(&f.pool)
+                .await
+                .last()
+                .is_some_and(|line| line.contains("the revert conflicted")),
+            "the owner is told"
+        );
+
+        // Still on: no second attempt for the same culprit, however many passes.
+        for _ in 0..3 {
+            let step = step_of(&f).await;
+            assert!(
+                !matches!(
+                    step,
+                    Some(Step::IncidentTaken { .. } | Step::Reverting { .. })
+                ),
+                "{step:?}"
+            );
+        }
+        assert_eq!(
+            queue_rows(&f.pool).await.len(),
+            1,
+            "only the request that failed"
+        );
+        // Open means a session can have it.
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-2".to_owned(),
+            worktree: "C:/wt/two".to_owned(),
+        };
+        let won =
+            crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+                .await
+                .unwrap();
+        assert!(matches!(won, ClaimOutcome::Won { .. }));
+    }
+
+    /// The failure marker is written before `fail_revert` clears the state. A crash after both but
+    /// before the incident is released leaves the gate's own claim in place and the state free: with
+    /// the marker already there, no pass starts a second revert (a revert loop).
+    #[tokio::test]
+    async fn a_failed_revert_whose_release_never_happened_is_not_started_again() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+
+        assert!(
+            incident::mark_revert_failed(&f.pool, "alpha", &c3, incident::RevertEnd::Failed).await
+        );
+        assert!(
+            verify_postgate::fail_revert(&f.pool, "alpha", &c3, "the revert conflicted")
+                .await
+                .unwrap()
+        );
+        // Crash here: `settle_after_revert` (the release) never runs.
+        let row = incident(&f).await.unwrap();
+        assert_eq!(
+            row.holder_kind,
+            Some(HolderKind::Postgate),
+            "still the gate's claim"
+        );
+        assert_eq!(row.detail["revert_failed_for"], serde_json::json!(c3));
+
+        for _ in 0..3 {
+            let step = step_of(&f).await;
+            assert!(
+                !matches!(
+                    step,
+                    Some(Step::IncidentTaken { .. } | Step::Reverting { .. })
+                ),
+                "{step:?}"
+            );
+        }
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "only the first revert");
+    }
+
+    /// `revert_on_red` switched off before the queue got the revert is the owner changing their mind,
+    /// not a failed revert: the gate lets go of the incident (a session may take it) but marks
+    /// nothing, so switching the revert back on resumes it.
+    #[tokio::test]
+    async fn a_revert_dropped_by_the_switch_going_off_resumes_when_the_switch_is_back_on() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+        crate::project::state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project::state::AUTOPILOT_FILE,
+            REVERT_OFF,
+        );
+        tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
+
+        let row = incident(&f).await.unwrap();
+        assert_eq!(row.status, Status::Open, "the gate let go of the incident");
+        assert_eq!(row.holder_kind, None);
+        assert!(
+            row.detail.get("revert_failed_for").is_none(),
+            "{:?}",
+            row.detail
+        );
+        // Off: any number of passes change nothing.
+        for _ in 0..2 {
+            let _ = step_of(&f).await;
+        }
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        crate::project::state::write_for_test(
+            f._machine.path(),
+            "alpha",
+            crate::project::state::AUTOPILOT_FILE,
+            REVERT_ON,
+        );
+        let step = tick_until(&f, |s| matches!(s, Step::IncidentTaken { .. })).await;
+        assert!(
+            matches!(&step, Step::IncidentTaken { merge_sha, .. } if *merge_sha == c3),
+            "{step:?}"
+        );
+        tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
+        assert_eq!(queue_rows(&f.pool).await.len(), 1, "exactly one revert");
+    }
+
+    /// `takeover_step` only acts on the tip the red was found on. A target that moved on since is
+    /// judged again by the gate, never reverted on the strength of a red that is out of date.
+    #[tokio::test]
+    async fn a_takeover_never_reverts_a_stale_red() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (_c3, _c4) = red_until_probe(&f).await;
+        let row = incident(&f).await.unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+            .await
+            .unwrap();
+        tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+        lapse(&f.pool, row.id).await;
+
+        // Called with a tip the gate never attempted: nothing, though the claim has lapsed.
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let rules =
+            crate::config::load_schedule_rules(f.ex.machine_root.as_deref(), "alpha").unwrap();
+        let stale_tip = "0000000000000000000000000000000000000001";
+        assert!(
+            incident::takeover_step(&f.ex, "alpha", &f.root, &state, stale_tip, &rules)
+                .await
+                .is_none()
+        );
+        assert!(queue_rows(&f.pool).await.is_empty());
+
+        // And through the tick: the target moves on (a fix landed by hand) before the lapse is seen.
+        let c5 = commit_file(&f.root, "d.txt", "d\n", "c5 moves the target");
+        let step = step_of(&f).await;
+        assert!(
+            !matches!(step, Some(Step::IncidentTaken { .. })),
+            "{step:?}"
+        );
+        let after = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.revert_merge_sha, None);
+        assert!(queue_rows(&f.pool).await.is_empty());
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c5);
     }
 
     /// With the switch off (every project today) the owner gets the same line as before F3-4 and
@@ -1919,6 +2430,182 @@ mod tests {
             git_in(&f.root, &["rev-parse", "main"]),
             c4,
             "the queue's executor is not running here: nothing has moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_revert_on_red_the_gate_claims_the_incident_and_then_reverts() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, _c4) = confirmed_culprit(&f).await;
+
+        let row = incident(&f).await.expect("the incident");
+        assert_eq!(row.status, Status::Claimed);
+        assert_eq!(row.holder_kind, Some(HolderKind::Postgate));
+        assert_eq!(row.holder_id.as_deref(), Some("alpha"));
+        let expected = verify_postgate::postgate_worktree(&f.root)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            row.holder_worktree.as_deref(),
+            Some(expected.as_str()),
+            "the land gate recognises the gate's own landings by this worktree"
+        );
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.revert_merge_sha.as_deref(),
+            Some(c3.as_str()),
+            "the revert did start"
+        );
+
+        // Idempotent: another pass reclaims as the same holder without losing to itself.
+        let step = step_of(&f).await;
+        assert!(!matches!(step, Some(Step::Failed(_))), "{step:?}");
+        assert_eq!(
+            incident(&f).await.unwrap().holder_id.as_deref(),
+            Some("alpha")
+        );
+        assert!(
+            queue_rows(&f.pool).await.len() <= 1,
+            "never a second revert"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_session_owner_stops_the_revert_and_the_feed_says_who_has_it() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (_c3, c4) = red_until_probe(&f).await;
+        let row = incident(&f)
+            .await
+            .expect("the incident exists before the first probe");
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        let won =
+            crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, chrono::Utc::now())
+                .await
+                .unwrap();
+        assert!(matches!(won, ClaimOutcome::Won { .. }));
+
+        tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+
+        let s = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.revert_merge_sha, None,
+            "a live owner means the daemon does not revert"
+        );
+        assert!(queue_rows(&f.pool).await.is_empty());
+        let lines = feed_summaries(&f.pool).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(&format!("#{}", row.id)), "{}", lines[0]);
+        assert!(lines[0].contains("session sess-1"), "{}", lines[0]);
+        assert!(lines[0].contains("Nothing was reverted"), "{}", lines[0]);
+        let after = incident(&f).await.unwrap();
+        assert_eq!(after.holder_id.as_deref(), Some("sess-1"));
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
+    }
+
+    #[tokio::test]
+    async fn an_incident_that_vanished_before_the_claim_is_opened_again_once() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (_c3, _c4) = red_until_probe(&f).await;
+        let stale = incident(&f).await.expect("the incident");
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        // The row goes away between `ensure_incident` and the claim (a green closing it and a purge
+        // is the realistic cause; here it is deleted outright).
+        sqlx::query("DELETE FROM task_claim_events WHERE task_id = ?")
+            .bind(stale.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM task_claims WHERE id = ?")
+            .bind(stale.id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        let right = incident::claim_for_revert(&f.pool, "alpha", &f.root, &state, &stale).await;
+
+        assert!(
+            matches!(right, incident::RevertRight::Mine),
+            "the retry opened a fresh row and won it"
+        );
+        let fresh = incident(&f).await.expect("a new incident");
+        assert_ne!(fresh.id, stale.id);
+        assert_eq!(fresh.holder_id.as_deref(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn a_green_on_a_descendant_closes_the_incident_and_tells_the_owning_session() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (_c3, _c4) = red_until_probe(&f).await;
+        let row = incident(&f).await.expect("the incident");
+        let now = chrono::Utc::now();
+        crate::task_claims::sessions::touch_session(
+            &f.pool,
+            "sess-1",
+            "C:/wt/session",
+            "alpha",
+            now,
+        )
+        .await
+        .unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        crate::task_claims::store::claim_by_id(&f.pool, row.id, &session, now)
+            .await
+            .unwrap();
+        tick_until(&f, |s| matches!(s, Step::Reported { .. })).await;
+
+        // The session fixes the target itself: a later commit goes green without a gate.
+        let c5 = commit_file(&f.root, "d.txt", "d\n", "c5 the session's fix");
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &c5)
+            .await
+            .unwrap();
+        let _ = step_of(&f).await;
+
+        assert!(incident(&f).await.is_none(), "the incident is closed");
+        let status: String = sqlx::query_scalar("SELECT status FROM task_claims WHERE id = ?")
+            .bind(row.id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "done");
+        let notices =
+            crate::task_claims::sessions::take_notices(&f.pool, "sess-1", chrono::Utc::now())
+                .await
+                .unwrap();
+        assert!(
+            matches!(notices.as_slice(), [crate::task_claims::Notice::IncidentClosed { sha, .. }] if sha.as_deref() == Some(c5.as_str())),
+            "the owning session hears it: {notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_green_that_is_not_a_descendant_of_the_red_leaves_the_incident_open() {
+        let f = fixture(Some(REVERT_OFF)).await;
+        let (_c3, _c4) = confirmed_culprit(&f).await;
+        let root_commit = git_in(&f.root, &["rev-list", "--max-parents=0", "HEAD"]);
+        verify_postgate::mark_covered(&f.pool, "alpha", "main", &root_commit)
+            .await
+            .unwrap();
+        let _ = step_of(&f).await;
+        assert!(
+            incident(&f).await.is_some(),
+            "a green on a commit from before the break proves nothing about the break"
         );
     }
 
@@ -2322,6 +3009,43 @@ mod tests {
             "a branch that has its run gets no second one"
         );
         assert_eq!(count(&f.state.pool, "runs").await, 1);
+    }
+
+    /// Spec §3 Postgate: the correction run reintroduces the reverted change, which is other work.
+    /// It claims the fix branch (`fix_run_id`) and nothing else; the incident is not read or written.
+    #[tokio::test]
+    async fn opening_a_correction_run_does_not_touch_the_incident() {
+        let f = correction_fixture().await;
+        let pool = &f.state.pool;
+        let key =
+            crate::task_claims::keys::normalize(crate::task_claims::MASTER_RED_KEY, Path::new("/"))
+                .unwrap();
+        let session = Holder {
+            kind: HolderKind::Session,
+            id: "sess-1".to_owned(),
+            worktree: "C:/wt/session".to_owned(),
+        };
+        let new = crate::task_claims::NewTask {
+            key,
+            kind: crate::task_claims::TaskKind::Incident,
+            title: "main is red".to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: vec![],
+            hint_paths: vec![],
+        };
+        crate::task_claims::store::claim(pool, "alpha", new, &session, chrono::Utc::now())
+            .await
+            .unwrap();
+        let events_before = count(pool, "task_claim_events").await;
+
+        assert_eq!(open_corrections(&f.state).await.len(), 1);
+
+        let status: String = sqlx::query_scalar("SELECT status FROM task_claims")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "claimed");
+        assert_eq!(count(pool, "task_claim_events").await, events_before);
     }
 
     /// A full project is not a failure: the claim is given back so a later pass tries again, and

@@ -55,6 +55,12 @@ pub struct RequestRow {
     pub unclaimed: Vec<String>,
     pub plan: Vec<PlannedUnit>,
     pub created_at: String,
+    /// The `task_claims.id` this ticket red units were classified as inheriting (final only).
+    pub inherited_task_ids: Vec<i64>,
+    /// The draft or final per-unit classification, as JSON; `None` until first computed.
+    pub classification: Option<String>,
+    /// How the master proof this ticket started ended, as JSON.
+    pub probe_outcome: Option<String>,
 }
 
 pub struct CacheKey<'a> {
@@ -122,7 +128,8 @@ pub async fn set_plan(pool: &SqlitePool, id: i64, plan: &[PlannedUnit]) -> sqlx:
 pub async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<RequestRow>> {
     let Some(row) = sqlx::query(
         "SELECT id, project_id, worktree, kind, scope, base, priority, caller, note, unclaimed, \
-         plan, created_at FROM verify_requests WHERE id = ?",
+         plan, created_at, inherited_task_ids, classification, probe_outcome \
+         FROM verify_requests WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -132,6 +139,7 @@ pub async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Requ
     };
     let unclaimed: String = row.try_get("unclaimed")?;
     let plan: String = row.try_get("plan")?;
+    let inherited: String = row.try_get("inherited_task_ids")?;
     Ok(Some(RequestRow {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
@@ -146,7 +154,58 @@ pub async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Requ
         unclaimed: serde_json::from_str(&unclaimed).unwrap_or_default(),
         plan: serde_json::from_str(&plan).unwrap_or_default(),
         created_at: row.try_get("created_at")?,
+        inherited_task_ids: serde_json::from_str(&inherited).unwrap_or_default(),
+        classification: row.try_get("classification")?,
+        probe_outcome: row.try_get("probe_outcome")?,
     }))
+}
+
+/// Stores the final classification and the incidents it inherited (the close notice joins on them).
+pub async fn set_classification(
+    pool: &SqlitePool,
+    id: i64,
+    json: &str,
+    inherited: &[i64],
+) -> sqlx::Result<()> {
+    let inherited = serde_json::to_string(inherited).unwrap_or_else(|_| "[]".into());
+    sqlx::query(
+        "UPDATE verify_requests SET classification = ?, inherited_task_ids = ? WHERE id = ?",
+    )
+    .bind(json)
+    .bind(inherited)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stores a draft classification; it never claims an incident. Writers race (a poll and a reader),
+/// so `reprobes` is merged with max inside the one UPDATE: a stale writer cannot reset it.
+pub async fn set_classification_draft(pool: &SqlitePool, id: i64, json: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE verify_requests SET classification = CASE \
+           WHEN json_valid(?1) AND json_valid(classification) \
+             AND json_type(classification, '$.reprobes') = 'integer' \
+             AND json_extract(classification, '$.reprobes') > COALESCE(json_extract(?1, '$.reprobes'), 0) \
+           THEN json_set(?1, '$.reprobes', json_extract(classification, '$.reprobes')) \
+           ELSE ?1 END \
+         WHERE id = ?2",
+    )
+    .bind(json)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Stores how the master proof this ticket started ended.
+pub async fn set_probe_outcome(pool: &SqlitePool, id: i64, json: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE verify_requests SET probe_outcome = ? WHERE id = ?")
+        .bind(json)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Records the tree a request measured. Write-once: a request that already holds one keeps it,
@@ -333,6 +392,111 @@ mod tests {
             cached_from: None,
             skipped: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_classification_a_probe_outcome_and_the_inherited_ids_round_trip() {
+        let pool = test_pool().await;
+        let id = insert_request(
+            &pool,
+            &NewRequest {
+                project_id: "p",
+                worktree: "/wt",
+                kind: "test",
+                scope: "own",
+                base: None,
+                priority: 0,
+                caller: "owner",
+                note: None,
+                unclaimed: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let fresh = get_request(&pool, id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                fresh.classification,
+                fresh.probe_outcome,
+                fresh.inherited_task_ids
+            ),
+            (None, None, vec![])
+        );
+
+        set_classification_draft(&pool, id, r#"{"done":false}"#)
+            .await
+            .unwrap();
+        set_probe_outcome(&pool, id, r#"{"task_id":4,"result":"passed"}"#)
+            .await
+            .unwrap();
+        let draft = get_request(&pool, id).await.unwrap().unwrap();
+        assert_eq!(draft.classification.as_deref(), Some(r#"{"done":false}"#));
+        assert!(
+            draft.inherited_task_ids.is_empty(),
+            "a draft never claims the incident"
+        );
+
+        set_classification(&pool, id, r#"{"done":true}"#, &[3, 5])
+            .await
+            .unwrap();
+        let done = get_request(&pool, id).await.unwrap().unwrap();
+        assert_eq!(done.inherited_task_ids, [3, 5]);
+        assert_eq!(
+            done.probe_outcome.as_deref(),
+            Some(r#"{"task_id":4,"result":"passed"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn two_draft_writers_never_lower_reprobes() {
+        let pool = test_pool().await;
+        let id = insert_request(
+            &pool,
+            &NewRequest {
+                project_id: "alpha",
+                worktree: "/wt",
+                kind: "test",
+                scope: "own",
+                base: None,
+                priority: 0,
+                caller: "owner",
+                note: None,
+                unclaimed: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let reprobes = |row: Option<String>| -> i64 {
+            let value: serde_json::Value = serde_json::from_str(&row.unwrap()).unwrap();
+            value["reprobes"].as_i64().unwrap()
+        };
+        // Writer A started the re-proof; writer B read before that and writes a stale draft.
+        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":1}"#)
+            .await
+            .unwrap();
+        set_classification_draft(
+            &pool,
+            id,
+            r#"{"done":false,"reprobes":0,"contains":{"abc":true}}"#,
+        )
+        .await
+        .unwrap();
+        let row = get_request(&pool, id).await.unwrap().unwrap();
+        assert_eq!(
+            reprobes(row.classification.clone()),
+            1,
+            "the stale writer must not reset reprobes"
+        );
+        assert!(
+            row.classification.unwrap().contains("\"abc\""),
+            "the rest of the draft is last-writer"
+        );
+        // A higher count still goes through.
+        set_classification_draft(&pool, id, r#"{"done":false,"reprobes":2}"#)
+            .await
+            .unwrap();
+        let row = get_request(&pool, id).await.unwrap().unwrap();
+        assert_eq!(reprobes(row.classification), 2);
     }
 
     #[tokio::test]

@@ -372,6 +372,12 @@ pub(super) struct LandBody {
     /// absent field means: `--land` alone is the spelling almost every session uses.
     #[serde(default)]
     pub(super) target: Option<String>,
+    /// The project owner's override of the task-claims gate. Sent by `nucleos-core --land` only when
+    /// `NUCLEOS_ALLOW_CLAIMED_LAND=1` is set in its environment. The daemon cannot tell an agent's
+    /// `--land` from a person's (both read the same token), so the guard against an agent using it
+    /// is the PreToolUse hook refusing any command that mentions the variable (`ask_daemon.py`).
+    #[serde(default)]
+    pub(super) override_claimed: bool,
 }
 
 /// "I am finished — take this branch." The one request a worktree could not previously express.
@@ -435,7 +441,7 @@ pub(super) async fn land_worktree(
             )
         })?;
 
-    let id = crate::execution::land::submit(
+    let id = crate::execution::land::submit_with(
         &state.pool,
         &repo,
         std::path::Path::new(repo.root()),
@@ -443,12 +449,14 @@ pub(super) async fn land_worktree(
         body.target.as_deref(),
         deadline,
         crate::execution::vcs::Origin::Shell,
+        body.override_claimed,
     )
     .await
     .map_err(|refusal| {
         let code = match &refusal {
             crate::execution::land::LandRefusal::AlreadyOnTarget(_)
-            | crate::execution::land::LandRefusal::NothingToLand(_) => StatusCode::CONFLICT,
+            | crate::execution::land::LandRefusal::NothingToLand(_)
+            | crate::execution::land::LandRefusal::Claimed(_) => StatusCode::CONFLICT,
             crate::execution::land::LandRefusal::Refused(_) => StatusCode::UNPROCESSABLE_ENTITY,
             crate::execution::land::LandRefusal::NotAdmitted(error) => {
                 tracing::warn!(%error, "land: admitting the request failed");

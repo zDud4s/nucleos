@@ -338,6 +338,12 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // `ReadsOwn`: it asks this machine's own model adviser, on loopback, and files nothing. What it
     // sends is the director's own description of a candidate; what it answers is a model name.
     ("suggest_model", ToolEffect::ReadsOwn),
+    // `WritesOwn`: a row in this machine's own claim table, keyed to the caller; nothing leaves the
+    // machine and nothing is acted on. A claim is advisory until the land gate reads it.
+    ("task_claim", ToolEffect::WritesOwn),
+    ("task_done", ToolEffect::WritesOwn),
+    ("task_list", ToolEffect::ReadsOwn),
+    ("task_release", ToolEffect::WritesOwn),
     ("triage_email", ToolEffect::Acts),
     ("vcs_request", ToolEffect::Acts),
     ("vcs_ticket", ToolEffect::ReadsOwn),

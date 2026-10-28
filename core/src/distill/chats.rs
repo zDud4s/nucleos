@@ -1009,6 +1009,7 @@ mod tests {
     }
 }
 
+/// `testkit` too: the daemon binary compiles `http.rs` into its own tests and reaches these through the lib.
 #[cfg(any(test, feature = "testkit"))]
 pub mod fixtures {
     use sqlx::SqlitePool;

@@ -231,22 +231,60 @@ pub async fn drain_once(
         }
     }
     let id = claimed.id;
-    let outcome = match CatchUnwind(executor.execute(&claimed)).await {
-        Ok(outcome) => outcome,
-        // A panic in the executor must not leave the row `running`: the partial unique index would
-        // hold the repository's only slot until a restart reconciled it. It becomes an ordinary
-        // failure, written by the same `finish` below.
-        Err(panic) => {
-            let detail = panic
-                .downcast_ref::<&str>()
-                .map(|text| (*text).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_owned());
-            tracing::error!(vcs_request_id = id, %detail, "vcs: the executor panicked");
-            Outcome::Failed {
-                reason: format!("the executor panicked: {detail}"),
-                exit_code: None,
-                output_tail: String::new(),
+    // Spec 2026-10-22 task-claims §3 Land: the claim may have changed between admission and now, so
+    // the merge is judged again. Refused before the executor is entered, so nothing is published.
+    // Only a merge into the integration branch (`claimed.integration_branch`, resolved just above)
+    // is a landing; with none resolved the gate stands aside, as at admission.
+    // Who queued it decides the exemption, as at admission: the daemon's own landings pass. The
+    // claim does not carry the origin, so it is read back; a read error leaves it a non-daemon
+    // request, the safe side.
+    let from_daemon =
+        sqlx::query_scalar::<_, String>("SELECT origin FROM vcs_requests WHERE id = ?")
+            .bind(claimed.id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|origin| origin == Origin::Daemon.as_str());
+    let held = crate::execution::land::claim_gate::refusal_for_op(
+        pool,
+        &claimed.project_id,
+        std::path::Path::new(&claimed.project_root),
+        &claimed.op,
+        claimed.from_resolution,
+        if from_daemon {
+            Origin::Daemon
+        } else {
+            Origin::Shell
+        },
+        claimed.run_id,
+        claimed.integration_branch.as_ref(),
+    )
+    .await;
+    let outcome = if let Some(reason) = held {
+        Outcome::Failed {
+            reason,
+            exit_code: None,
+            output_tail: String::new(),
+        }
+    } else {
+        match CatchUnwind(executor.execute(&claimed)).await {
+            Ok(outcome) => outcome,
+            // A panic in the executor must not leave the row `running`: the partial unique index
+            // would hold the repository's only slot until a restart reconciled it. It becomes an
+            // ordinary failure, written by the same `finish` below.
+            Err(panic) => {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                tracing::error!(vcs_request_id = id, %detail, "vcs: the executor panicked");
+                Outcome::Failed {
+                    reason: format!("the executor panicked: {detail}"),
+                    exit_code: None,
+                    output_tail: String::new(),
+                }
             }
         }
     };

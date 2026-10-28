@@ -1068,6 +1068,9 @@ pub(super) async fn continue_paused_run(
     // Signalled after the commit, never inside the transaction: a woken reader must find the new
     // state, and a rolled-back resume must not wake anyone.
     nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
+    // A superseded run is over: its task claims go back, like any run that ended. Neither
+    // `finalize_termination` nor the supervisor sees this transition (the run had already paused).
+    crate::execution::runs::lifecycle::release_claims_of_run(&state.pool, original_run_id).await;
 
     // The resume continues the paused run's work, so it keeps the tools that run was frozen with,
     // like the handoff successor (`prepare_handoff_successor`). After the commit, for the same

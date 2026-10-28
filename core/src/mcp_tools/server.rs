@@ -68,11 +68,11 @@ impl NucleosTools {
         self
     }
 
-    /// The whole router: the two `#[tool_router]` impls, `tools.rs` and `ops_tools.rs`, added
-    /// together. Split in two only to keep each file under the size ceiling; every caller asks
-    /// for this one.
+    /// The whole router: the three `#[tool_router]` impls, `tools.rs`, `ops_tools.rs` and
+    /// `task_tools.rs`, added together. Split only to keep each file under the size ceiling;
+    /// every caller asks for this one.
     pub(super) fn tool_router() -> ToolRouter<Self> {
-        Self::work_tools() + Self::ops_tools()
+        Self::work_tools() + Self::ops_tools() + Self::task_tools()
     }
 
     /// Whether this instance will announce and dispatch one name.

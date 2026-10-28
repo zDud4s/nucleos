@@ -946,6 +946,46 @@ pub async fn report_with_revert(
     report_inner(pool, project_id, red_sha, verdict, summary, true).await
 }
 
+/// Starts the revert of `culprit` for a red that was already reported without one (the incident was
+/// held by someone else at the time, and the claim has since lapsed). The same five columns
+/// `report_inner` writes, in one transaction with the feed line. Refused (`false`, nothing
+/// written) unless the project is still red on exactly that reported culprit with no revert
+/// started, so it cannot start a second one.
+pub async fn restart_revert(
+    pool: &SqlitePool,
+    project_id: &str,
+    culprit: &str,
+    summary: &str,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "UPDATE postgate_state SET \
+             revert_merge_sha = ?, revert_request_id = NULL, revert_sha = NULL, \
+             fix_branch = NULL, fix_run_id = NULL, updated_at = CURRENT_TIMESTAMP \
+         WHERE project_id = ? AND culprit_sha = ? AND revert_merge_sha IS NULL \
+           AND red_phase IS NULL AND red_groups != '[]'",
+    )
+    .bind(culprit)
+    .bind(project_id)
+    .bind(culprit)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    crate::feed::append_on(
+        &mut tx,
+        Some(project_id),
+        POSTGATE_RED_KIND,
+        summary,
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 async fn report_inner(
     pool: &SqlitePool,
     project_id: &str,
@@ -1142,6 +1182,36 @@ pub async fn set_fix_branch(
 mod tests {
     use super::*;
     use crate::verify::batch::{Decision, Idle, decide};
+
+    #[tokio::test]
+    async fn restart_revert_starts_exactly_one_revert_for_a_reported_unreverted_culprit() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, last_green_sha, red_groups, culprit_sha, \
+             reported_sha, red_sha) VALUES ('p', 'main', 'g', '[\"core\"]', 'c3', 'r', 'r')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            restart_revert(&pool, "p", "c3", "taking over")
+                .await
+                .unwrap()
+        );
+        let s = load(&pool, "p").await.unwrap().unwrap();
+        assert_eq!(s.revert_merge_sha.as_deref(), Some("c3"));
+        assert!(
+            !restart_revert(&pool, "p", "c3", "taking over")
+                .await
+                .unwrap(),
+            "a revert already started is not started twice"
+        );
+        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(lines, 1);
+    }
 
     #[tokio::test]
     async fn a_fresh_database_has_no_postgate_state() {

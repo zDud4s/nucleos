@@ -119,6 +119,8 @@ where
     tokio::spawn(async move {
         let Err(error) = join.await else {
             // A normal end: the body already wrote its terminal state before returning.
+            // Claims go back before the wake, so a woken reader finds them tidy.
+            super::lifecycle::release_claims_if_over(&pool, id).await;
             nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
             return;
         };
@@ -134,6 +136,7 @@ where
         .execute(&pool)
         .await;
         warn_on_terminal_write_err(&failed, id, "failed");
+        super::lifecycle::release_claims_if_over(&pool, id).await;
         // After the UPDATE, so a woken reader finds the run already `failed`.
         nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
     });
@@ -1260,5 +1263,133 @@ mod wake_tests {
             .expect("the watcher never woke")
             .unwrap();
         assert_eq!(seen, "cancelled");
+    }
+
+    use crate::task_claims::{Holder, HolderKind, testing};
+
+    fn run_holder(id: i64) -> Holder {
+        Holder {
+            kind: HolderKind::Run,
+            id: id.to_string(),
+            worktree: "/w".into(),
+        }
+    }
+
+    /// The claim's status reads back as `open`, or the test fails after five seconds.
+    async fn wait_until_open(pool: &sqlx::SqlitePool, task: i64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while testing::state_of(pool, task).await.0 != "open" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the claim was never handed back"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A body that writes `status` for its own run, as the real one does at its terminal writes.
+    async fn body_ending_in(pool: sqlx::SqlitePool, id: i64, status: &'static str) {
+        sqlx::query("UPDATE runs SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_claims_of_one_run_do_not_release_another() {
+        let state = crate::channels::testkit::state().await;
+        let (a, b) = (
+            seed_running(&state.pool).await,
+            seed_running(&state.pool).await,
+        );
+        let first = testing::claimed_by(&state.pool, &run_holder(a), "file:a.rs").await;
+        let second = testing::claimed_by(&state.pool, &run_holder(b), "file:b.rs").await;
+
+        crate::execution::runs::lifecycle::release_claims_of_run(&state.pool, a).await;
+
+        assert_eq!(
+            testing::state_of(&state.pool, first).await,
+            ("open".to_owned(), None)
+        );
+        assert_eq!(
+            testing::state_of(&state.pool, second).await,
+            ("claimed".to_owned(), Some(b.to_string()))
+        );
+    }
+
+    /// Reached through `spawn_registered`, which every real run goes through.
+    #[tokio::test]
+    async fn task_claims_go_back_when_the_body_ends_the_run() {
+        for status in ["completed", "failed", "timed_out"] {
+            let state = crate::channels::testkit::state().await;
+            let id = seed_running(&state.pool).await;
+            let task = testing::claimed_by(&state.pool, &run_holder(id), "file:core/a.rs").await;
+
+            spawn_registered(&state, id, body_ending_in(state.pool.clone(), id, status));
+
+            wait_until_open(&state.pool, task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn task_claims_go_back_when_the_body_panics() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        let task = testing::claimed_by(&state.pool, &run_holder(id), "file:core/a.rs").await;
+
+        spawn_registered(&state, id, async { panic!("run body blew up") });
+
+        wait_until_open(&state.pool, task).await;
+        assert_eq!(status_of(&state.pool, id).await, "failed");
+    }
+
+    /// `awaiting_approval` is a run that resumes: it keeps what it claimed.
+    #[tokio::test]
+    async fn task_claims_stay_with_a_body_that_ends_in_a_pause() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        let task = testing::claimed_by(&state.pool, &run_holder(id), "file:core/a.rs").await;
+
+        spawn_registered(
+            &state,
+            id,
+            body_ending_in(state.pool.clone(), id, "awaiting_approval"),
+        );
+
+        // The supervisor finishes after the handle is released; give it a beat to (not) act.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.run_handles.lock().unwrap().contains_key(&id) {
+            assert!(std::time::Instant::now() < deadline, "the run never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(testing::state_of(&state.pool, task).await.0, "claimed");
+    }
+
+    #[tokio::test]
+    async fn task_claims_go_back_when_a_run_is_cancelled() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        let task = testing::claimed_by(&state.pool, &run_holder(id), "file:core/a.rs").await;
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(finalize_termination(&state, id, "cancelled").await);
+
+        // Inline in `finalize_termination`: no waiting.
+        assert_eq!(testing::state_of(&state.pool, task).await.0, "open");
+    }
+
+    #[tokio::test]
+    async fn task_claims_stay_with_a_run_that_pauses_for_approval() {
+        let state = crate::channels::testkit::state().await;
+        let id = seed_running(&state.pool).await;
+        let task = testing::claimed_by(&state.pool, &run_holder(id), "file:core/a.rs").await;
+        spawn_registered(&state, id, std::future::pending::<()>());
+
+        assert!(finalize_termination(&state, id, "awaiting_approval").await);
+
+        assert_eq!(testing::state_of(&state.pool, task).await.0, "claimed");
     }
 }

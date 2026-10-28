@@ -33,6 +33,8 @@ use serde::Serialize;
 
 use crate::execution::vcs::{Branch, Op, Origin, ResolvedRepo};
 
+pub mod claim_gate;
+
 /// Decision #7's feed kind: a conflict resolution the agent could not produce, or that admission
 /// otherwise refused. Named so it reads as this module's own line among `vcs_request_finished` and
 /// the rest, rather than blending into them.
@@ -70,6 +72,9 @@ pub enum LandRefusal {
     Refused(String),
     /// Every check passed and the queue still would not admit the request.
     NotAdmitted(String),
+    /// The branch changes files a live, claimed task guards, and it does not come from that
+    /// task's owner (spec 2026-10-22 task-claims §3 Land).
+    Claimed(String),
 }
 
 impl LandRefusal {
@@ -78,7 +83,8 @@ impl LandRefusal {
             Self::AlreadyOnTarget(message)
             | Self::NothingToLand(message)
             | Self::Refused(message)
-            | Self::NotAdmitted(message) => message,
+            | Self::NotAdmitted(message)
+            | Self::Claimed(message) => message,
         }
     }
 }
@@ -394,6 +400,29 @@ async fn resolve_target(
     ))
 }
 
+/// Admits a landing for a caller with no claims override. See [`submit_with`].
+pub async fn submit(
+    pool: &sqlx::SqlitePool,
+    repo: &ResolvedRepo,
+    project_root: &Path,
+    source: &str,
+    requested_target: Option<&str>,
+    deadline: Instant,
+    origin: Origin,
+) -> Result<i64, LandRefusal> {
+    submit_with(
+        pool,
+        repo,
+        project_root,
+        source,
+        requested_target,
+        deadline,
+        origin,
+        false,
+    )
+    .await
+}
+
 /// Admits a landing: `source`, into `requested_target` when the caller named one the project
 /// admits, and otherwise into whatever `integration_branch` answers for `repo`.
 ///
@@ -415,7 +444,13 @@ async fn resolve_target(
 /// resolver handing over a resolution it finished on its own (`resolver::land_finished`). Both
 /// carry their own approval, so the row starts `queued` either way; the column is what lets
 /// metric 2 tell a conflict the daemon closed alone from one a person landed.
-pub async fn submit(
+///
+/// `owner_override` is the project owner's override of the task-claims gate
+/// (`NUCLEOS_ALLOW_CLAIMED_LAND`): the landing is admitted and the override is recorded against
+/// each task it crossed. The route wiring that carries it from `POST /vcs/land` comes in chunk 3
+/// Task 10; until then only direct callers can set it.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_with(
     pool: &sqlx::SqlitePool,
     repo: &ResolvedRepo,
     project_root: &Path,
@@ -423,6 +458,7 @@ pub async fn submit(
     requested_target: Option<&str>,
     deadline: Instant,
     origin: Origin,
+    owner_override: bool,
 ) -> Result<i64, LandRefusal> {
     let source = Branch::new(source).map_err(LandRefusal::Refused)?;
     let from_resolution =
@@ -464,6 +500,27 @@ pub async fn submit(
             source.as_str(),
             target.as_str()
         )));
+    }
+
+    // Spec 2026-10-22 task-claims §3 Land. After the two "nothing to do" refusals (a landing
+    // that does nothing crosses nothing) and before a row is written (a refused landing queues
+    // nothing). A conflict resolver's output and the daemon's own landings are exempt.
+    let run_id = match origin {
+        Origin::Run(id) => Some(id),
+        _ => None,
+    };
+    let landing = claim_gate::Landing {
+        project_id: repo.project_id(),
+        project_root,
+        source: &source,
+        target: &target,
+        exempt: from_resolution || matches!(origin, Origin::Daemon),
+        run_id,
+    };
+    if let claim_gate::Verdict::Refused(message) =
+        claim_gate::check(pool, &landing, owner_override, deadline, chrono::Utc::now()).await
+    {
+        return Err(LandRefusal::Claimed(message));
     }
 
     let op = Op::Merge {
@@ -778,6 +835,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
+
+    use crate::task_claims::{
+        self, ClaimOutcome, Holder, HolderKind, NewTask, TaskKind, TaskRow, keys,
+    };
 
     async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await
@@ -2295,6 +2356,530 @@ mod tests {
         assert!(
             target_dir.join("sentinel").exists(),
             "merging INTO a feature branch must never clean the source's target directory"
+        );
+    }
+
+    fn holder(kind: HolderKind, id: &str, worktree: &str) -> Holder {
+        Holder {
+            kind,
+            id: id.to_owned(),
+            worktree: worktree.to_owned(),
+        }
+    }
+
+    /// A claimed task guarding `guard` (and hinting `hint`), held by `by`.
+    async fn claimed_task(
+        pool: &sqlx::SqlitePool,
+        root: &Path,
+        key: &str,
+        guard: &[&str],
+        hint: &[&str],
+        by: Holder,
+    ) -> TaskRow {
+        let new = NewTask {
+            key: keys::normalize(key, root).unwrap(),
+            kind: TaskKind::Declared,
+            title: "t".to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: guard.iter().map(|p| (*p).to_owned()).collect(),
+            hint_paths: hint.iter().map(|p| (*p).to_owned()).collect(),
+        };
+        match task_claims::store::claim(pool, "alpha", new, &by, chrono::Utc::now())
+            .await
+            .unwrap()
+        {
+            ClaimOutcome::Won { task, .. } => task,
+            ClaimOutcome::Lost { .. } => panic!("the fixture claim lost"),
+        }
+    }
+
+    async fn land_feat_x(
+        pool: &sqlx::SqlitePool,
+        repo: &Path,
+        origin: Origin,
+        owner_override: bool,
+    ) -> Result<i64, LandRefusal> {
+        let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
+        submit_with(
+            pool,
+            &repo_id,
+            repo,
+            "feat/x",
+            None,
+            deadline(),
+            origin,
+            owner_override,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_non_owner_that_touches_a_guarded_path_is_refused_and_nothing_is_queued() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-refuse-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let task = claimed_task(
+            &pool,
+            &repo,
+            "file:feature.txt",
+            &["feature.txt"],
+            &["docs/readme.md"],
+            holder(HolderKind::Session, "s1", "C:/elsewhere/wt"),
+        )
+        .await;
+
+        let refusal = land_feat_x(&pool, &repo, Origin::Shell, false)
+            .await
+            .expect_err("guarded");
+        let LandRefusal::Claimed(message) = refusal else {
+            panic!("{refusal:?}")
+        };
+        assert!(
+            message.contains(&format!("#{}", task.id)) && message.contains("file:feature.txt"),
+            "{message}"
+        );
+        assert!(
+            message.contains("session s1") && message.contains("docs/readme.md"),
+            "{message}"
+        );
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
+    }
+
+    #[tokio::test]
+    async fn only_hint_paths_open_and_probing_rows_and_the_daemon_do_not_block() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-pass-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        // Hint only: feature.txt is a hint, the guard is elsewhere.
+        claimed_task(
+            &pool,
+            &repo,
+            "file:other.txt",
+            &["other.txt"],
+            &["feature.txt"],
+            holder(HolderKind::Session, "s1", "C:/elsewhere"),
+        )
+        .await;
+        // Open (unowned) incident that guards the file.
+        let open = NewTask {
+            key: keys::normalize("master-red", &repo).unwrap(),
+            kind: TaskKind::Incident,
+            title: "red".to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: vec!["feature.txt".to_owned()],
+            hint_paths: vec![],
+        };
+        task_claims::store::create_or_adopt_open(&pool, "alpha", open, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        land_feat_x(&pool, &repo, Origin::Shell, false)
+            .await
+            .expect("neither blocks");
+    }
+
+    #[tokio::test]
+    async fn the_owner_is_recognised_by_the_worktree_that_holds_the_branch() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (container, repo) = repo_parked_off_target("nucleos-claims-owner-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let wt = container.path().join("wt");
+        assert!(git_in(
+            &repo,
+            &["worktree", "add", "-q", &wt.to_string_lossy(), "feat/x"]
+        ));
+        let canonical = crate::execution::git_exec::canonical(&wt).await.unwrap();
+        claimed_task(
+            &pool,
+            &repo,
+            "file:feature.txt",
+            &["feature.txt"],
+            &[],
+            holder(HolderKind::Session, "s1", &canonical),
+        )
+        .await;
+
+        land_feat_x(&pool, &repo, Origin::Shell, false)
+            .await
+            .expect("the owner lands from its own worktree");
+    }
+
+    #[tokio::test]
+    async fn the_daemons_own_landing_is_never_gated() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-daemon-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        claimed_task(
+            &pool,
+            &repo,
+            "file:feature.txt",
+            &["feature.txt"],
+            &[],
+            holder(HolderKind::Session, "s1", "C:/elsewhere"),
+        )
+        .await;
+        land_feat_x(&pool, &repo, Origin::Daemon, false)
+            .await
+            .expect("a resolver landing is exempt");
+    }
+
+    #[tokio::test]
+    async fn work_that_landed_on_the_target_meanwhile_is_not_the_branchs_own() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-base-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        // master moves on after the fork and touches the guarded file; feat/x does not.
+        assert!(git_in(&repo, &["checkout", "-q", "master"]));
+        std::fs::write(repo.join("seed.txt"), "master moved\n").unwrap();
+        assert!(git_in(&repo, &["commit", "-am", "master moves"]));
+        assert!(git_in(&repo, &["checkout", "-q", "chore/other"]));
+        claimed_task(
+            &pool,
+            &repo,
+            "file:seed.txt",
+            &["seed.txt"],
+            &[],
+            holder(HolderKind::Session, "s1", "C:/elsewhere"),
+        )
+        .await;
+        land_feat_x(&pool, &repo, Origin::Shell, false)
+            .await
+            .expect("seed.txt is not on the merge-base diff");
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_cannot_read_git_lets_the_landing_through() {
+        let pool = test_pool().await;
+        let missing = std::path::PathBuf::from("Z:/does/not/exist");
+        let source = Branch::new("feat/x").unwrap();
+        let target = Branch::new("master").unwrap();
+        let landing = claim_gate::Landing {
+            project_id: "alpha",
+            project_root: &missing,
+            source: &source,
+            target: &target,
+            exempt: false,
+            run_id: None,
+        };
+        let verdict =
+            claim_gate::check(&pool, &landing, false, deadline(), chrono::Utc::now()).await;
+        assert!(matches!(verdict, claim_gate::Verdict::Clear));
+    }
+
+    #[tokio::test]
+    async fn a_claim_taken_after_admission_stops_the_merge_when_the_queue_runs_it() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-recheck-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let master_before = sha_of(&repo, "master");
+
+        let id = land_feat_x(&pool, &repo, Origin::Shell, false)
+            .await
+            .expect("nothing is claimed yet");
+        claimed_task(
+            &pool,
+            &repo,
+            "file:feature.txt",
+            &["feature.txt"],
+            &[],
+            holder(HolderKind::Session, "s1", "C:/elsewhere"),
+        )
+        .await;
+
+        assert!(
+            crate::execution::vcs::drain_once(
+                &pool,
+                "alpha",
+                &crate::execution::git_exec::GitExecutor::default()
+            )
+            .await
+        );
+        let ticket = crate::execution::vcs::wait_for(&pool, id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(ticket.status, "failed");
+        assert!(
+            ticket
+                .failure_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("task #"),
+            "{:?}",
+            ticket.failure_reason
+        );
+        assert_eq!(
+            sha_of(&repo, "master"),
+            master_before,
+            "nothing was published"
+        );
+    }
+
+    /// A daemon-origin landing is exempt at admission, so it must be exempt when the queue runs it
+    /// too: a claim taken in between does not stop the daemon's own merge.
+    #[tokio::test]
+    async fn a_daemon_landing_admitted_exempt_is_still_exempt_when_the_queue_runs_it() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-daemon-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+
+        let id = land_feat_x(&pool, &repo, Origin::Daemon, false)
+            .await
+            .expect("nothing is claimed yet");
+        claimed_task(
+            &pool,
+            &repo,
+            "file:feature.txt",
+            &["feature.txt"],
+            &[],
+            holder(HolderKind::Session, "s1", "C:/elsewhere"),
+        )
+        .await;
+
+        assert!(
+            crate::execution::vcs::drain_once(
+                &pool,
+                "alpha",
+                &crate::execution::git_exec::GitExecutor::default()
+            )
+            .await
+        );
+        let ticket = crate::execution::vcs::wait_for(&pool, id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(ticket.status, "succeeded", "{:?}", ticket.failure_reason);
+    }
+
+    #[tokio::test]
+    async fn the_owners_override_is_recorded_once_and_holds_at_execution_time() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-override-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        let task = claimed_task(
+            &pool,
+            &repo,
+            "file:feature.txt",
+            &["feature.txt"],
+            &[],
+            holder(HolderKind::Session, "s1", "C:/elsewhere"),
+        )
+        .await;
+
+        assert!(matches!(
+            land_feat_x(&pool, &repo, Origin::Shell, false).await,
+            Err(LandRefusal::Claimed(_))
+        ));
+        let id = land_feat_x(&pool, &repo, Origin::Shell, true)
+            .await
+            .expect("the owner overrides");
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_claim_events WHERE task_id = ? AND event = 'override_land'",
+        )
+        .bind(task.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 1);
+
+        assert!(
+            crate::execution::vcs::drain_once(
+                &pool,
+                "alpha",
+                &crate::execution::git_exec::GitExecutor::default()
+            )
+            .await
+        );
+        let ticket = crate::execution::vcs::wait_for(&pool, id, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(
+            ticket.status, "succeeded",
+            "the recorded override is honoured at execution time"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gates_own_revert_is_never_gated_even_when_its_incident_guards_the_files() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-revert-", "chore/other");
+        seed_project(&pool, "alpha", &repo, None).await;
+        // A postgate claim is live only while the project's `postgate_state` is red (spec §2
+        // `is_live`), so the incident below guards nothing unless master is red.
+        sqlx::query("INSERT INTO postgate_state (project_id, target, red_groups) VALUES ('alpha', 'master', '[\"core\"]')")
+            .execute(&pool).await.unwrap();
+        let postgate = crate::verify::postgate::postgate_worktree(&repo)
+            .to_string_lossy()
+            .into_owned();
+        claimed_task(
+            &pool,
+            &repo,
+            "file:feature.txt",
+            &["feature.txt"],
+            &[],
+            holder(HolderKind::Postgate, "alpha", &postgate),
+        )
+        .await;
+
+        let merge = Op::Merge {
+            source: Branch::new("feat/x").unwrap(),
+            target: Branch::new("master").unwrap(),
+        };
+        let revert = Op::Revert {
+            merge_sha: crate::execution::vcs::CommitSha::new(&sha_of(&repo, "feat/x")).unwrap(),
+            target: Branch::new("master").unwrap(),
+        };
+        let master = Branch::new("master").unwrap();
+        let gated = claim_gate::refusal_for_op(
+            &pool,
+            "alpha",
+            &repo,
+            &merge,
+            false,
+            Origin::Shell,
+            None,
+            Some(&master),
+        )
+        .await;
+        assert!(gated.is_some(), "a merge touching the guarded file is held");
+        assert!(
+            claim_gate::refusal_for_op(
+                &pool,
+                "alpha",
+                &repo,
+                &revert,
+                false,
+                Origin::Shell,
+                None,
+                Some(&master)
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            claim_gate::refusal_for_op(
+                &pool,
+                "alpha",
+                &repo,
+                &merge,
+                true,
+                Origin::Shell,
+                None,
+                Some(&master)
+            )
+            .await
+            .is_none(),
+            "resolver landings are exempt"
+        );
+    }
+
+    /// The queue-time gate only judges a landing: a merge INTO the integration branch. An agent
+    /// merging `master` into its own `feat/x` to catch up crosses a foreign guard path (master moved
+    /// it) and must pass; so must every merge when the integration branch is unknown.
+    #[tokio::test]
+    async fn a_merge_into_another_branch_than_the_integration_branch_is_not_a_landing() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-claims-catchup-", "chore/other");
+        let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-claims-wt-");
+        let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
+        seed_project(&pool, "alpha", &repo, None).await;
+        // master moves on after the fork and touches seed.txt; a foreign session guards that file.
+        assert!(git_in(&repo, &["checkout", "-q", "master"]));
+        std::fs::write(repo.join("seed.txt"), "master moved\n").unwrap();
+        assert!(git_in(&repo, &["commit", "-am", "master moves"]));
+        assert!(git_in(&repo, &["checkout", "-q", "chore/other"]));
+        claimed_task(
+            &pool,
+            &repo,
+            "file:seed.txt",
+            &["seed.txt"],
+            &[],
+            holder(HolderKind::Session, "s1", "C:/elsewhere"),
+        )
+        .await;
+
+        let master = Branch::new("master").unwrap();
+        let feature = Branch::new("feat/x").unwrap();
+        let catch_up = Op::Merge {
+            source: master.clone(),
+            target: feature.clone(),
+        };
+
+        // Control: were feat/x the integration branch, this very merge would be held. So the pass
+        // below is the target check at work, not an absence of anything to guard.
+        let held = claim_gate::refusal_for_op(
+            &pool,
+            "alpha",
+            &repo,
+            &catch_up,
+            false,
+            Origin::Shell,
+            None,
+            Some(&feature),
+        )
+        .await;
+        assert!(
+            held.is_some(),
+            "the guard bites when the target is the integration branch"
+        );
+
+        let into_feature = claim_gate::refusal_for_op(
+            &pool,
+            "alpha",
+            &repo,
+            &catch_up,
+            false,
+            Origin::Shell,
+            None,
+            Some(&master),
+        )
+        .await;
+        assert!(
+            into_feature.is_none(),
+            "master -> feat/x is not a landing: {into_feature:?}"
+        );
+        let unknown = claim_gate::refusal_for_op(
+            &pool,
+            "alpha",
+            &repo,
+            &catch_up,
+            false,
+            Origin::Shell,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            unknown.is_none(),
+            "an unresolved integration branch means no queue-time gate"
         );
     }
 }
