@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { DAEMON_URL, apiText, isApiRefusal, isApiUnavailable } from "../data/client";
+import { apiText, isApiRefusal, isApiUnavailable } from "../data/client";
+import { getTransport } from "../data/transport";
 import { DAEMON_NAME } from "../copy";
 import { keys } from "../data/keys";
 import { POLL, backgroundCadence } from "../data/poll";
@@ -96,7 +97,7 @@ export function ConnectionGate({ children }: ConnectionGateProps) {
         <div className="app-takeover-card">
           <h1 className="app-takeover-title">daemon unreachable</h1>
           <p className="app-takeover-body">
-            The {DAEMON_NAME} is not responding on {DAEMON_URL}. Nothing here is lost. The shell keeps asking, and
+            The {DAEMON_NAME} is not responding on {getTransport().label}. Nothing here is lost. The shell keeps asking, and
             this window comes back on its own the moment the daemon does.
           </p>
           <p className="app-takeover-hint">retrying every {POLL.fast / 1000} seconds</p>

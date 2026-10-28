@@ -317,6 +317,10 @@ async fn main() {
         .as_deref()
         .map(config::load_web_config)
         .unwrap_or_default();
+    let remote_config = machine_file(remote::REMOTE_FILE)
+        .as_deref()
+        .map(remote::RemoteConfig::load)
+        .unwrap_or_default();
     let browser_config = machine_file(machine_config::BROWSER_FILE)
         .as_deref()
         .map(config::load_browser_config)
@@ -899,6 +903,50 @@ async fn main() {
             max_sessions = browser_config.max_sessions,
             "browser sidecar supervised"
         );
+    }
+
+    // The remote gateway. Armed <=> `remote.yaml` enables it AND validates; every other outcome
+    // deletes the gateway's key, so a half-configured or switched-off install authenticates nothing.
+    // Only the key minted for `Service::Remote` reaches the child — never the control token.
+    let remote_valid = match remote_config.validate() {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, "remote.yaml is invalid; remote access stays off");
+            false
+        }
+    };
+    if remote_config.enabled && remote_valid {
+        match auth::mint_service_token(&state.pool, auth::Service::Remote).await {
+            Ok(remote_key) => {
+                let dist_dir = match &remote_config.dist_dir {
+                    Some(dir) => dir.clone(),
+                    None => std::env::current_exe()
+                        .ok()
+                        .and_then(|exe| exe.parent().map(|dir| dir.join("dist-remote")))
+                        .map(|dir| dir.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "dist-remote".to_string()),
+                };
+                let env = sidecar::remote_env(
+                    &daemon_client::daemon_url(),
+                    &remote_key,
+                    &remote_config,
+                    &dist_dir,
+                );
+                if sidecars_wanted {
+                    tokio::spawn(sidecar::supervise(
+                        sidecar::REMOTE.to_string(),
+                        sidecar::binary(sidecar::REMOTE),
+                        env,
+                    ));
+                }
+                tracing::info!(origin = %remote_config.public_origin, "remote gateway supervised");
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not mint the remote gateway's key; it will not start");
+            }
+        }
+    } else if let Err(error) = remote::disarm(&state.pool).await {
+        tracing::error!(%error, "could not delete the remote gateway's key");
     }
 
     // The web sidecar. Started only when the pillar is on: an unstarted one means `/web/*` answers

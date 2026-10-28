@@ -1,5 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { desktopTransport, setTransport } from "../data/transport";
+import { remoteTransport } from "../remote/transport";
 import { startFleetStream } from "./stream";
 import { ndjson, node, snapshot } from "./test-fixtures";
 import type { ConnectionState, FleetEvent } from "./types";
@@ -36,6 +38,24 @@ const flush = () => vi.advanceTimersByTimeAsync(0);
 
 beforeEach(() => void vi.useFakeTimers());
 afterEach(() => void vi.useRealTimers());
+
+describe("startFleetStream under the remote transport", () => {
+  afterEach(() => setTransport(desktopTransport));
+
+  it("reconnects after a clean end of body under the remote transport", async () => {
+    // The gateway closes a stream at its lifetime cap: a clean end, not an error.
+    setTransport(remoteTransport);
+    const { open, states } = setup([
+      async () => new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+      async () => new ReadableStream<Uint8Array>(),
+    ]);
+    await flush();
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(states).toEqual(["connecting", "reconnecting"]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(open).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("startFleetStream", () => {
   it("reads events split across chunks and reports live on the first snapshot", async () => {

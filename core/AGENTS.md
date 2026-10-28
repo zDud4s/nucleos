@@ -159,6 +159,7 @@ the contract, not a snapshot.
 | `http/analytics.rs` | The analytics routes (`/analytics`, `/analytics/quota`, `/projects/{id}/analytics`, and development time's `/analytics/devtime`, `/analytics/devtime/findings`, their `/projects/{id}/…` twins and the global `POST /analytics/devtime/findings/{key}/mark` and `POST /analytics/devtime/prices/refresh`): read `days`, refuse anything but 7/30/90 with a 400 rather than clamping, 404 a project off the roster, refuse a bad findings `order`/`limit`/`cursor` or mark `verdict`/`cause` with a JSON code, and hand the window to `analytics.rs` / `analytics/devtime.rs`. |
 | `http/proposals.rs` | Proposals and the waiting queue (`/proposals/*`, `/waiting/*`). |
 | `http/relay.rs` | Notifications, PII, voice, web and browser seats (`/notifications/*`, `/pii`, `/voice/*`, `/web/*`, `/browser/*`). |
+| `http/remote.rs` | Remote access (`/remote/pair`, `/remote/session`, `/remote/logout`, `/remote/pairing-codes`, `/remote/devices*`): thin over `remote.rs`; who reaches which route is decided in `auth::require_token`. |
 | `http/repo.rs` | Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…). |
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
 | `http/team.rs` | Council and teams (`/council/*`, `/teams/*`, `/team-*`). |
@@ -218,6 +219,7 @@ the contract, not a snapshot.
 | `team/messages.rs` | What members say: reports to the owner (`report`) and notes to a colleague (`send_note`). |
 | `team/recruit.rs` | Recruiting: suggesting a model, proposing a teammate, and approving the hire. |
 | `team/api.rs` | The `/teams` HTTP handlers and their request and response shapes. |
+| `remote.rs` | Secure remote access, domain half: one-time pairing codes (`create_pairing_code`, `exchange`: 5-minute TTL, single use, burned by 5 wrong guesses), device sessions (`authenticate`: refuses revoked, 30-day-absolute and 14-day-idle sessions, all with one outward answer; `revoke_device`, `list_devices`), the armed/disarmed state (`is_armed` <=> a `service_tokens` row `remote`; `disarm`) and `RemoteConfig` (`~/.nucleos/remote.yaml`, off by default, `validate` for the enabled case). Only hashes are stored (migration 0252), and every function takes `now` as an argument. Decides who a paired browser is; never what it may reach (`auth.rs`) and never the HTTP surface (`http/remote.rs`). |
 | `repo_trigger.rs` | The slower (5-minute) poller: watches configured branches for a moved SHA and fires a run the same way the scheduler does, arming first-seen triggers without firing. Shares the scheduler's kill-switch/budget/WIP gates but runs on its own cadence — `git fetch` is too network-heavy for the 30s tick. |
 | `integrations/calendar.rs` | The calendar pillar's domain. (Row added when master's modules met this map; see the note at the end of this table.) |
 | `integrations/mailsend.rs` | Outbound mail submission. (Row added when master's modules met this map.) |
