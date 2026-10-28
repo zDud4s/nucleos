@@ -385,14 +385,14 @@ pub(super) fn flag_words(command: &str) -> Vec<String> {
     // escape rather than per word, and every distinct word the choices produce is emitted: one word
     // can mix `-` and a lowercased `\U00000065`. The guards only refuse, so an extra word
     // costs at most a redundant refusal. A word with too many ambiguous escapes to enumerate keeps
-    // the all-narrow and all-wide readings here, and `has_undecidable_unicode_escape` refuses the
-    // line outright. This join is not reached on the classify path (`normalize_command` already
+    // the all-narrow and all-wide readings here; the allow side never decodes such a word, since
+    // `has_ansi_c_or_locale_quote` refuses every `$'` line outright. This join is not reached on the classify path (`normalize_command` already
     // turned the newline into a space); it is kept for callers that hand over a raw line.
     //
     // A `$'...'` string may hold whitespace (`$'\0 x'-delete` is the one word `-delete` to bash),
     // which the raw split cuts across words. Each such word is ALSO read joined with the raw words
     // after it, up to the one that closes the string, so the guards see the word bash builds as
-    // well as the pieces; `has_split_ansi_c_string` refuses the line outright for the allow side.
+    // well as the pieces; `has_ansi_c_or_locale_quote` refuses the line outright for the allow side.
     // The join is per word, as `dequoted` reads it (a `$'` inside plain quotes counts too); every
     // extra reading it adds can only refuse more.
     let mut words = Vec::new();
@@ -404,7 +404,7 @@ pub(super) fn flag_words(command: &str) -> Vec<String> {
 
 /// The most raw words one `$'...'` span is joined across (see `reading_pieces`). Past it the span
 /// is cut: the join exists for the deny side, and a cut span only costs that side a missed reading,
-/// while the allow side refuses every split string anyway (`has_split_ansi_c_string`). Without a
+/// while the allow side refuses every `$'` line anyway (`has_ansi_c_or_locale_quote`). Without a
 /// cap, `ls` followed by thousands of `'$'` words re-opens a span at every word and each one runs
 /// to the end of the line, quadratic in readings emitted.
 const MAX_ANSI_C_SPAN_WORDS: usize = 64;
@@ -489,29 +489,13 @@ impl AnsiCLexer {
     }
 }
 
-/// PURE: whether some piece `flag_words` reads (a raw word or a `$'...'` span) has other than
-/// exactly one reading: an ambiguous case-lost `\u` it can read two ways, or more of them than
-/// `dequoted_readings` enumerates.
-///
-/// The allow side refuses such a line outright. Its positional consumers read one word at one
-/// index (`checks_formatting_without_writing` takes the second word as the subcommand), and with
-/// several readings of the same raw word the one at that index is whichever came first, not the one
-/// bash runs: `cargo $'\u00000066m't -- --check` read as `fmt` (the wide reading) while bash's
-/// four-digit `\u0000` is a NUL and the program gets `cargo t`, a test run. The multi-reading search
-/// stays on the deny side (`has_destructive_flags`), where every extra reading only refuses.
-fn has_ambiguous_reading(command: &str) -> bool {
-    reading_pieces(command)
-        .iter()
-        .any(|piece| dequoted_readings(piece).is_none_or(|readings| readings.len() != 1))
-}
-
 /// Appends every reading of one word to `words` (see `flag_words`).
 fn push_readings(word: &str, words: &mut Vec<String>) {
     match dequoted_readings(word) {
         Some(readings) => words.extend(readings),
         // Over the cap only the all-wide and all-narrow readings are emitted, so a mix of the two
         // (a flag spelled by a narrow `\u` beside a wide one) is missed here. That gap is the deny
-        // side's alone: the allow side refuses the line whole (`has_ambiguous_reading`), so such a
+        // side's alone: the allow side refuses the line whole (`has_ansi_c_or_locale_quote`), so such a
         // line reaches the judge rather than read-local.
         None => {
             let mut seen = 0;
@@ -525,63 +509,24 @@ fn push_readings(word: &str, words: &mut Vec<String>) {
     }
 }
 
-/// PURE: whether `command` holds a `$'...'` string (opened outside any other quote) with literal
-/// whitespace in it, or one that never closes. The raw whitespace split every flag guard reads cuts
-/// such a string across words, so the line is refused rather than decoded across the split:
-/// `find . $'\0 x'-exec rm {} +` reaches `find` as `-exec`, `go build -o $'x '/../../evil` writes
-/// outside the workspace, and no honest read needs a space inside `$'...'`.
+/// PURE: whether the raw text of `command` holds `$'` or `$"` anywhere, inside other quotes or not.
 ///
-/// Read over the whole line with its quotes tracked, so the `$'` of `rg 'foo bar$' x` (inside a
-/// plain single quote, where bash reads it literally) is not one. The string's extent is the one
-/// `decode_ansi_c_body` lexes; escapes such as `\t` that DECODE to whitespace are not refused.
-fn has_split_ansi_c_string(command: &str) -> bool {
-    let joined = command.replace("\\\r\n", "").replace("\\\n", "");
-    let mut chars = joined.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '\\' => {
-                chars.next();
-            }
-            '\'' => {
-                for quoted in chars.by_ref() {
-                    if quoted == '\'' {
-                        break;
-                    }
-                }
-            }
-            '"' => {
-                while let Some(quoted) = chars.next() {
-                    match quoted {
-                        '\\' => {
-                            chars.next();
-                        }
-                        '"' => break,
-                        _ => {}
-                    }
-                }
-            }
-            '$' if chars.peek() == Some(&'\'') => {
-                chars.next();
-                let start = chars.clone();
-                let total = start.clone().count();
-                let mut sink = String::new();
-                let mut seen = 0;
-                if !decode_ansi_c_body(&mut chars, &mut sink, &|_| false, &mut seen) {
-                    return true;
-                }
-                let consumed = total - chars.clone().count();
-                if start.take(consumed).any(char::is_whitespace) {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
+/// The allow side does not decode ANSI-C (`$'...'`) or locale (`$"..."`) quoting at all: such a
+/// line is never read-local and goes to the judge. Three review rounds each found another way the
+/// decoder and bash disagreed on the allow side (a `$'...'` string split by whitespace, a case-lost
+/// `\u` read two ways, `cargo 'fmt$' --check` and `cargo "$"fmt --check` decoded to `fmt` while
+/// bash runs `cargo-fmt$`), and refusing more is the safe side of that trade. It also refuses
+/// `rg 'foo$' x` and `rg "x$" y`, where bash reads the `$` literally; those cost a judge call. The
+/// deny side (`has_destructive_flags` and the guards beside it) still decodes both forms through
+/// `flag_words`, where every extra reading only refuses.
+pub(super) fn has_ansi_c_or_locale_quote(command: &str) -> bool {
+    command.contains("$'") || command.contains("$\"")
 }
 
 /// The most ambiguous `\u` escapes one word may hold and still have every reading of it emitted:
-/// six escapes is 64 readings. A word over the cap fails closed (`has_undecidable_unicode_escape`).
+/// six escapes is 64 readings. A word over the cap keeps only its all-wide and
+/// all-narrow readings (`push_readings`); the allow side never decodes it
+/// (`has_ansi_c_or_locale_quote`).
 const MAX_AMBIGUOUS_U_ESCAPES: usize = 6;
 
 /// PURE: every distinct way `word` can reach the program, one per choice of four or eight digits
@@ -612,16 +557,6 @@ fn dequoted_readings(word: &str) -> Option<Vec<String>> {
         }
     }
     Some(readings)
-}
-
-/// PURE: whether some word of `command` holds more ambiguous `\u` escapes than
-/// `flag_words` enumerates, so the program's actual word cannot be pinned down. Such a line is
-/// refused: no honest command needs seven case-lost unicode escapes in one word.
-fn has_undecidable_unicode_escape(command: &str) -> bool {
-    let joined = command.replace("\\\r\n", "").replace("\\\n", "");
-    joined
-        .split_whitespace()
-        .any(|word| dequoted_readings(word).is_none())
 }
 
 /// PURE: one word without its quotes and with each backslash escape replaced by the character it
@@ -808,15 +743,13 @@ fn decode_ansi_c_body(
 /// them. Migration `0128` puts it in one line: "Do lado `deny` não há nada a validar — uma recusa a
 /// mais nunca deixou correr nada."
 pub fn shell_form_is_readable(command: &str) -> bool {
-    // A literal NUL is refused outright: where it cuts the line depends on who reads it (the
-    // kernel ends an argument there, `dequoted` drops it), and `find . -delete<NUL>x` read the
-    // second way hid the `-delete`. No honest command carries one.
-    !command.contains('\0')
+    // First, before every flag guard and positional consumer below and in `is_safe_command`.
+    !has_ansi_c_or_locale_quote(command)
+        // A literal NUL is refused outright: where it cuts the line depends on who reads it (the
+        // kernel ends an argument there, `dequoted` drops it), and `find . -delete<NUL>x` read the
+        // second way hid the `-delete`. No honest command carries one.
+        && !command.contains('\0')
         && !has_shell_control(command)
-        && !has_undecidable_unicode_escape(command)
-        && !has_split_ansi_c_string(command)
-        // Before every flag guard and positional consumer below and in `is_safe_command`.
-        && !has_ambiguous_reading(command)
         && !flag_words(command).iter().any(|token| token == "--fix")
         && !writes_an_output_file(command)
         && !forces_external_diff_or_textconv(command)

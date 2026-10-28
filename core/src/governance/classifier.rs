@@ -1166,6 +1166,11 @@ fn is_verify_client_call(command: &str, raw: &str) -> bool {
     fn digits(text: &str) -> bool {
         !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
     }
+    // The words below are decoded by `flag_words`, and the allow side never trusts a decoded
+    // `$'...'` or `$"..."` word: refused here too, not only by the caller's shape guard.
+    if has_ansi_c_or_locale_quote(command) || has_ansi_c_or_locale_quote(raw) {
+        return false;
+    }
     let Some((program, arguments)) = split_program(command) else {
         return false;
     };
@@ -4961,6 +4966,57 @@ mod tests {
         let command = format!("ls {}", "'$' ".repeat(2000));
         let classification = classify("Bash", &json!({"command": command}), None);
         assert!(!classification.action_class.is_empty());
+    }
+
+    /// Tens of thousands of `$'...'` strings in one word classify, and never as read-local: the
+    /// allow side refuses the line on its first `$'` rather than re-counting the tail of the line
+    /// once per string, which was quadratic.
+    #[test]
+    fn many_ansi_c_strings_in_one_word_classify() {
+        let command = format!("ls {}", "$'a'".repeat(25_000));
+        let classification = classify("Bash", &json!({"command": command}), None);
+        assert!(!classification.action_class.is_empty());
+        assert_ne!(classification.action_class, "read-local");
+    }
+
+    /// The allow side does not decode ANSI-C (`$'...'`) or locale (`$"..."`) quoting: any line
+    /// holding `$'` or `$"`, inside other quotes or not, closed or not, is never read-local. Bash
+    /// runs `cargo 'fmt$' --check` and `cargo "$"fmt --check` as the external `cargo-fmt$`, which
+    /// the decoder used to read as `fmt`.
+    #[test]
+    fn an_ansi_c_or_locale_quote_is_never_read_local() {
+        for command in [
+            "cargo 'fmt$' --check",
+            "cargo \"$\"fmt --check",
+            "cargo $'fmt' --check",
+            "cargo $\"fmt\" --check",
+            "find . $'-delete",
+            "nucleos-core $'--verify'",
+            "nucleos-core --verify-ticket $'12'",
+        ] {
+            let classification = classify("Bash", &json!({"command": command}), None);
+            assert_ne!(
+                classification.action_class, "read-local",
+                "{command} must not read as read-local"
+            );
+            assert_ne!(
+                classification.decision.decision, "allow",
+                "{command} must not be allowed"
+            );
+        }
+        // Keep-green: the plain spelling still reads.
+        assert_eq!(
+            classify("Bash", &json!({"command": "cargo fmt --check"}), None).action_class,
+            "read-local"
+        );
+        assert!(!is_verify_client_call(
+            "nucleos-core --verify-ticket $'12'",
+            "nucleos-core --verify-ticket $'12'"
+        ));
+        assert!(is_verify_client_call(
+            "nucleos-core --verify-ticket 12",
+            "nucleos-core --verify-ticket 12"
+        ));
     }
 
     /// A literal NUL is refused outright on the allow side, and the deny side reads the line cut at
