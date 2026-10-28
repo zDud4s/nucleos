@@ -899,7 +899,7 @@ mod tests {
             images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: None,
             effort: None,
             fallback_model: Vec::new(),
@@ -1102,7 +1102,7 @@ mod tests {
             images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: None,
             effort: None,
             fallback_model: Vec::new(),
@@ -3086,24 +3086,25 @@ mod tests {
         );
     }
 
-    /// The escape hatch for the run that genuinely needs an operator's own servers. It is an opt-in
-    /// on the request rather than a default, because the cost is paid by every run that did not ask.
-    /// It must not drag a tool DENIAL in with it: dropping the strict flag widens which servers the
-    /// run inherits, and that is the only thing it is allowed to change.
+    /// A chat's registry servers (spec §8.2) reach the run through `--mcp-config` beside nucleos,
+    /// never by dropping the strict flag: every policy runs strict, so the operator's own ambient
+    /// servers stay out even for a turn that carries registry servers. It must not drag a tool
+    /// DENIAL in with it either; the classifier governs what an Unrestricted run may call.
     #[test]
-    fn ambient_mcp_opt_in_drops_the_strict_flag() {
+    fn unrestricted_runs_strict_even_with_registry_servers() {
         let mut request = baseline_run_request();
-        request.ambient_mcp = true;
+        request.tool_policy = ToolPolicy::Unrestricted;
+        request.mcp_servers = vec!["gh".to_string()];
 
         let args = cli_args(&request, "sonnet");
 
         assert!(
-            !args.iter().any(|a| a == "--strict-mcp-config"),
-            "a run that asked for the ambient servers must be allowed to see them: {args:?}"
+            args.iter().any(|a| a == "--strict-mcp-config"),
+            "registry servers travel in the config file, not through the ambient surface: {args:?}"
         );
         assert!(
             !args.iter().any(|a| a == "--disallowedTools"),
-            "the opt-in governs servers, not tools: {args:?}"
+            "registry servers govern servers, not tools: {args:?}"
         );
     }
 
@@ -3388,7 +3389,7 @@ mod tests {
     /// Every MCP server the user happens to have configured is ambient to a spawned run, including
     /// file-writing connectors. Only the server the daemon passes in may survive.
     #[test]
-    fn mcp_only_drops_the_ambient_mcp_servers() {
+    fn mcp_only_runs_strict() {
         let args = args_for(ToolPolicy::McpOnly, None);
         assert!(args.iter().any(|a| a == "--strict-mcp-config"));
     }

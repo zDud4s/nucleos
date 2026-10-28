@@ -8359,10 +8359,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// An ambient MCP tool is the owner's to allow per conversation, and once allowed it is judged
-    /// like any other tool: classifier, rung and the third-party barrier all still apply.
+    /// A registry MCP server is the owner's to enable per chat, and once enabled its tools are
+    /// judged like any other tool: classifier, rung and the third-party barrier all still apply.
     #[tokio::test]
-    async fn an_ambient_mcp_tool_is_judged_like_any_tool_once_the_conversation_opts_in() {
+    async fn a_registry_mcp_tool_is_judged_like_any_tool_once_enabled_in_the_chat() {
         let state = test_state().await;
         let app = test_router(state.clone());
         let run_id = rooted_turn_on(
@@ -8376,14 +8376,14 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        let ambient = probe(
+        let registry = probe(
             run_id,
             "mcp__context7__resolve-library-id",
             serde_json::json!({"libraryName": "tokio"}),
         );
 
         // (a) Off, which is where every conversation starts: only NucleOS tools exist.
-        let off = decide(&app, &ambient).await;
+        let off = decide(&app, &registry).await;
         assert_eq!(off.decision, "deny");
         assert_eq!(
             off.reason,
@@ -8392,10 +8392,22 @@ mod tests {
 
         // (b) On: the classifier now answers. It does not know the tool, and `dont_ask` turns the
         // question into a refusal that says so.
-        crate::chats::set_ambient_mcp(&state.pool, &chat_id, true)
+        let context7 = crate::chats::mcp_servers::NewMcpServer {
+            name: "context7".to_owned(),
+            command: "npx".to_owned(),
+            args: vec!["-y".to_owned(), "@upstash/context7-mcp".to_owned()],
+            env: Default::default(),
+            imported_from: None,
+        };
+        assert!(
+            crate::chats::mcp_servers::insert_if_absent(&state.pool, &context7)
+                .await
+                .unwrap()
+        );
+        crate::chats::mcp_servers::set_enabled(&state.pool, &chat_id, "context7", true)
             .await
             .unwrap();
-        let on = decide(&app, &ambient).await;
+        let on = decide(&app, &registry).await;
         assert_eq!(on.decision, "deny");
         assert!(
             on.reason.contains("unrecognized tool"),
@@ -8416,11 +8428,19 @@ mod tests {
             ours.reason
         );
 
-        // (d) The barrier still stands in front of an opted-in tool.
+        // (d) A server the chat has not enabled is still outside the NucleOS-only fence.
+        let other = decide(&app, &probe(run_id, "mcp__other__x", serde_json::json!({}))).await;
+        assert_eq!(other.decision, "deny");
+        assert_eq!(
+            other.reason,
+            "the orchestrator is restricted to NucleOS tools"
+        );
+
+        // (e) The barrier still stands in front of an enabled tool.
         crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
             .await
             .unwrap();
-        let barred = decide(&app, &ambient).await;
+        let barred = decide(&app, &registry).await;
         assert_eq!(barred.decision, "deny");
         assert_eq!(barred.reason, UNTRUSTED_CONTEXT_DENY_REASON);
     }

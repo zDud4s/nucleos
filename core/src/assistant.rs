@@ -7,6 +7,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::execution::runner::extract_reply;
 
 mod chat_key;
+pub mod compaction;
 pub mod rotation;
 pub mod slash;
 
@@ -26,7 +27,7 @@ pub use self::turns_impl::install_turns;
 pub use crate::assistant_types::{HeldProcess, hold_process_serving};
 pub use crate::assistant_types::{
     LOCAL_AGENT_ANSWERED_BY, NO_HOSTED_MODEL, NO_LOCAL_MODEL, Origin, PROCESS_BARRIERS,
-    ProcessBarrier, Sent, TURN_IN_PROGRESS, answered_by_a_local_agent_loop,
+    ProcessBarrier, Sent, TURN_IN_PROGRESS, answered_by_a_local_agent_loop, build_chat_mcp_config,
     build_job_node_mcp_config, build_mcp_config, build_team_mcp_config, live_process_served,
     note_served, upsert_session,
 };
@@ -161,9 +162,38 @@ fn mcp_config_path(chat_id: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("nucleos-mcp-{}-{safe}.json", std::process::id()))
 }
 
+/// Writes a turn's MCP config where only this user can read it: the file carries the env values
+/// of the chat's registry servers, which are secrets (spec §8.2).
+///
+/// On unix the file is created `0600` under a sibling name and renamed over `path`, so it is never
+/// readable by anyone else, not even for an instant, and a reader never sees half of it. Elsewhere
+/// `write_atomic` is enough: on Windows `%TEMP%` lives under the user profile, whose ACL already
+/// admits only this user (and the administrators).
 fn write_mcp_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(config).map_err(std::io::Error::other)?;
-    crate::storage::write_atomic(path, &bytes)
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".nucleos-tmp");
+        let temp = path.with_file_name(name);
+        // A temporary left by a crash would make `create_new` fail for good.
+        let _ = std::fs::remove_file(&temp);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    }
+    #[cfg(not(unix))]
+    {
+        crate::storage::write_atomic(path, &bytes)
+    }
 }
 
 #[cfg(test)]
@@ -4974,7 +5004,7 @@ mod tests {
             classifier_governs_tools: false,
             messages: None,
             request_tx: None,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: Some("sonnet".to_owned()),
             effort: None,
             fallback_model: Vec::new(),
@@ -5151,7 +5181,7 @@ mod tests {
                     effort: None,
                 }]
             }),
-            ("ambient_mcp", |r| r.ambient_mcp = true),
+            ("mcp_servers", |r| r.mcp_servers = vec!["gh".into()]),
             ("tool_policy", |r| {
                 r.tool_policy = crate::execution::runner::ToolPolicy::McpOnly
             }),
@@ -7809,18 +7839,108 @@ mod tests {
         );
     }
 
-    /// The owner's opt-in reaches a turn only where ambient servers can be governed at all.
+    /// A registry server named `name`, enabled for a chat. The env value is a stand-in: no
+    /// assertion below prints it.
+    fn registry_server(name: &str) -> crate::chats::mcp_servers::McpServer {
+        crate::chats::mcp_servers::McpServer {
+            name: name.to_owned(),
+            command: "npx".to_owned(),
+            args: vec!["-y".to_owned(), format!("{name}-mcp")],
+            env: [("GH_TOKEN".to_owned(), "stand-in".to_owned())].into(),
+            imported_from: None,
+            created_at: "2026-10-28 00:00:00".to_owned(),
+        }
+    }
+
+    /// The registry reaches a turn only where extra servers can be governed at all.
     ///
     /// `McpOnly` is the unrooted, Telegram and relayed shape: its whole point is that nothing but
     /// the NucleOS server is reachable, so no toggle may widen it. `None` offers no tools to widen.
     #[test]
-    fn ambient_mcp_never_reaches_an_mcp_only_turn() {
+    fn registry_servers_never_reach_an_mcp_only_turn() {
         use crate::execution::runner::ToolPolicy;
 
-        assert!(ambient_mcp_for(ToolPolicy::Unrestricted, true));
-        assert!(!ambient_mcp_for(ToolPolicy::Unrestricted, false));
-        assert!(!ambient_mcp_for(ToolPolicy::McpOnly, true));
-        assert!(!ambient_mcp_for(ToolPolicy::McpOnly, false));
-        assert!(!ambient_mcp_for(ToolPolicy::None, true));
+        let answering = crate::chats::Answering {
+            mcp_servers: vec![registry_server("gh")],
+            ..Default::default()
+        };
+        let request = |policy| {
+            chat_run_request(
+                "hi".to_owned(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                crate::execution::runner::Permission::Default,
+                None,
+                "s-1".to_owned(),
+                std::env::temp_dir().join("registry-gate-unused.json"),
+                policy,
+                answering.clone(),
+                None,
+                "claude",
+                None,
+            )
+        };
+        assert_eq!(request(ToolPolicy::Unrestricted).mcp_servers, ["gh"]);
+        assert!(request(ToolPolicy::McpOnly).mcp_servers.is_empty());
+        assert!(request(ToolPolicy::None).mcp_servers.is_empty());
+
+        let listed = |policy| -> serde_json::Value {
+            let fingerprint = spawn_fingerprint(&answering, None, policy);
+            serde_json::from_str::<serde_json::Value>(&fingerprint).unwrap()["mcp_servers"].clone()
+        };
+        assert_eq!(listed(ToolPolicy::Unrestricted), serde_json::json!(["gh"]));
+        assert_eq!(listed(ToolPolicy::McpOnly), serde_json::json!([]));
+        assert_eq!(listed(ToolPolicy::None), serde_json::json!([]));
+    }
+
+    /// Enabling or disabling a server must retire a kept process, but only where the turn would
+    /// have seen the server in the first place.
+    #[test]
+    fn spawn_fingerprint_changes_with_the_enabled_list() {
+        use crate::execution::runner::ToolPolicy;
+
+        let without = crate::chats::Answering::default();
+        let with = crate::chats::Answering {
+            mcp_servers: vec![registry_server("gh")],
+            ..Default::default()
+        };
+        assert_ne!(
+            spawn_fingerprint(&without, None, ToolPolicy::Unrestricted),
+            spawn_fingerprint(&with, None, ToolPolicy::Unrestricted)
+        );
+        assert_eq!(
+            spawn_fingerprint(&without, None, ToolPolicy::McpOnly),
+            spawn_fingerprint(&with, None, ToolPolicy::McpOnly)
+        );
+    }
+
+    /// The per-turn file is where a Claude turn learns its registry servers, and it holds their
+    /// env values: it must list them next to `nucleos`, and on unix be readable by this user alone.
+    #[test]
+    fn the_turn_config_carries_the_enabled_servers() {
+        let path = mcp_config_path(&format!("registry-{}", crate::auth::generate_uuid_v4()));
+        let config = build_chat_mcp_config("nucleos-core", &[registry_server("gh")]);
+        write_mcp_config(&path, &config).unwrap();
+
+        let read: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let servers = read["mcpServers"].as_object().unwrap();
+        let mut names: Vec<&str> = servers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["gh", "nucleos"]);
+        assert_eq!(servers["gh"]["command"], "npx");
+        assert!(
+            servers["gh"]["env"].get("GH_TOKEN").is_some(),
+            "the env name must be there"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the config holds secrets: user-only");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

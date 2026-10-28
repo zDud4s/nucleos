@@ -6,6 +6,7 @@
 //! model or to a chat: the caller owns that, and `Outcome` says what it should do next.
 
 pub mod capabilities;
+pub mod compact_prompt;
 pub mod expand;
 pub mod help;
 pub mod model_pick;
@@ -48,6 +49,10 @@ pub enum CardKind {
     Dirs,
     /// The per-turn ceiling and the global budget.
     Budget,
+    /// The conversation's MCP servers: the fixed one and the registry's, each on or off.
+    Mcp,
+    /// What an MCP import copied, skipped, already had or could not read.
+    McpImport,
 }
 
 /// The shell controls a command can open instead of changing state itself.
@@ -78,6 +83,24 @@ pub enum SlashError {
     Unsupported { engine: ChatEngine, what: String },
     /// A workflow skill without what it runs on: 422 `workflow_unavailable`.
     WorkflowUnavailable { detail: String },
+    /// Nothing was said since the last `/clear`: 400 `nothing_to_compact`.
+    NothingToCompact,
+    /// `/mcp off nucleos`: the fixed server is always on: 400 `cannot_disable_nucleos`.
+    CannotDisableNucleos,
     /// Anything else: 500.
     Internal(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CardKind;
+
+    #[test]
+    fn card_kind_mcp_serializes_snake_case() {
+        assert_eq!(serde_json::to_value(CardKind::Mcp).unwrap(), "mcp");
+        assert_eq!(
+            serde_json::to_value(CardKind::McpImport).unwrap(),
+            "mcp_import"
+        );
+    }
 }

@@ -881,7 +881,13 @@ pub(super) async fn send_message_inner(
     let doctrine = doctrine_for(state, origin);
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().to_string();
-    let config = build_mcp_config(&exe);
+    let enabled = crate::chats::mcp_servers::enabled_for_chat(&state.pool, chat_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let config = build_chat_mcp_config(
+        &exe,
+        crate::chats::mcp_servers::active_for(tool_policy, &enabled),
+    );
     let mcp_path = mcp_config_path(chat_id);
     let written = {
         let path = mcp_path.clone();
@@ -1006,12 +1012,14 @@ pub(super) async fn send_message_inner(
             // not replayed on top of it. Only the text sent to the CLI changes; `runs.prompt` keeps
             // what the person typed.
             Some(prefixed) => prefixed,
-            None => match history_window(&state.pool, chat_id).await {
-                Ok((older, tail)) => {
+            // A done `/compact` floors the window and its handoff leads the summary.
+            None => match super::compaction::replay_window(&state.pool, chat_id).await {
+                Ok((handoff, older, tail)) => {
                     // What no longer fits verbatim is summarised rather than dropped (spec P6 (ii)).
                     // Only here, on the rotation of a CLI conversation: the local path replays on
                     // EVERY turn and must not pay a model call for each of them.
-                    let summary = rolled_up(state.runner.as_ref(), &older).await;
+                    let rolled = rolled_up(state.runner.as_ref(), &older).await;
+                    let summary = super::compaction::joined(handoff, rolled);
                     if !tail.is_empty() || summary.is_some() {
                         replayed_after(summary.as_deref(), &tail, &prompt)
                     } else {
@@ -1331,6 +1339,15 @@ pub async fn history_window(
     pool: &SqlitePool,
     chat_id: &str,
 ) -> sqlx::Result<(Vec<(String, String)>, Vec<(String, String)>)> {
+    history_window_after(pool, chat_id, 0).await
+}
+
+/// [`history_window`] with one more floor: only runs above `floor` (a done `/compact` run).
+pub async fn history_window_after(
+    pool: &SqlitePool,
+    chat_id: &str,
+    floor: i64,
+) -> sqlx::Result<(Vec<(String, String)>, Vec<(String, String)>)> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT prompt, stdout FROM runs
           WHERE chat_id = ?
@@ -1342,13 +1359,14 @@ pub async fn history_window(
                       (SELECT COALESCE(MAX(id), 0) FROM runs
                         WHERE chat_id = ? AND read_untrusted = 1),
                       COALESCE((SELECT cleared_after_run_id FROM chats
-                                 WHERE chat_id = ?), 0))
+                                 WHERE chat_id = ?), 0), ?)
           ORDER BY id DESC
           LIMIT ?",
     )
     .bind(chat_id)
     .bind(chat_id)
     .bind(chat_id)
+    .bind(floor)
     .bind(HISTORY_TURNS + ROLLED_UP_TURNS)
     .fetch_all(pool)
     .await?;

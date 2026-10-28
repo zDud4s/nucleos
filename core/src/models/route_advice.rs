@@ -1111,7 +1111,7 @@ mod tests {
             images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: Some("m".into()),
             effort: None,
             fallback_model: Vec::new(),

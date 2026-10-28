@@ -162,6 +162,33 @@ pub fn build_mcp_config(exe_path: &str) -> serde_json::Value {
     })
 }
 
+/// The throwaway MCP config a chat turn is launched with: `nucleos` plus the chat's active
+/// registry servers (spec §8.2), each as a stdio entry.
+///
+/// This is the only place a registry server's env VALUES are written. The file it goes into is
+/// user-only and removed at turn end; nothing else (args, logs, HTTP views) ever carries them.
+pub fn build_chat_mcp_config(
+    exe_path: &str,
+    servers: &[crate::chats::mcp_servers::McpServer],
+) -> serde_json::Value {
+    let mut config = build_mcp_config(exe_path);
+    let entries = config["mcpServers"]
+        .as_object_mut()
+        .expect("build_mcp_config returns an mcpServers object");
+    for server in servers {
+        entries.insert(
+            server.name.clone(),
+            serde_json::json!({
+                "type": "stdio",
+                "command": server.command,
+                "args": server.args,
+                "env": server.env,
+            }),
+        );
+    }
+    config
+}
+
 /// The throwaway MCP config a job node is launched with.
 pub fn build_job_node_mcp_config(exe_path: &str, job_id: i64) -> serde_json::Value {
     let args = vec![
@@ -423,5 +450,51 @@ impl Turns for RecordingTurns {
     ) -> Result<(), String> {
         self.record(chat_id, text, origin);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chats::mcp_servers::McpServer;
+
+    #[test]
+    fn build_chat_mcp_config_lists_nucleos_and_the_servers() {
+        let gh = McpServer {
+            name: "gh".to_string(),
+            command: "gh-mcp".to_string(),
+            args: vec!["serve".to_string()],
+            env: [("GH_TOKEN".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+            imported_from: None,
+            created_at: "2026-10-28T00:00:00Z".to_string(),
+        };
+
+        let config = build_chat_mcp_config("nucleos-core", &[gh]);
+
+        assert_eq!(
+            config["mcpServers"]["nucleos"],
+            build_mcp_config("nucleos-core")["mcpServers"]["nucleos"],
+            "the nucleos entry is the one every turn already gets"
+        );
+        assert_eq!(
+            config["mcpServers"]["gh"],
+            serde_json::json!({
+                "type": "stdio",
+                "command": "gh-mcp",
+                "args": ["serve"],
+                "env": {"GH_TOKEN": "value"},
+            })
+        );
+        assert_eq!(config["mcpServers"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn build_chat_mcp_config_without_servers_is_the_plain_turn_config() {
+        assert_eq!(
+            build_chat_mcp_config("nucleos-core", &[]),
+            build_mcp_config("nucleos-core")
+        );
     }
 }

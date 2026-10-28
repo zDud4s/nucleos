@@ -203,18 +203,128 @@ pub fn codex_mcp_overrides(
             "mcp_servers.{name}.args={}",
             serde_json::to_string(&args).expect("serializing strings cannot fail")
         ));
-        if !env_names.is_empty() {
-            overrides.push(format!(
-                "mcp_servers.{name}.env_vars={}",
-                serde_json::to_string(env_names).expect("serializing strings cannot fail")
-            ));
+        // A registry server brings its own `env` object (spec §8.2): Codex is told only its NAMES
+        // and reads the values from the child environment, where `codex_mcp_env` puts them. A
+        // server without one (nucleos) forwards the run's own environment, by name as well.
+        let own_env_names: Option<Vec<&String>> = server
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .map(|env| {
+                let mut names: Vec<&String> = env.keys().collect();
+                names.sort();
+                names
+            });
+        let listed = match own_env_names {
+            Some(names) if names.is_empty() => None,
+            Some(names) => {
+                Some(serde_json::to_string(&names).expect("serializing strings cannot fail"))
+            }
+            None if env_names.is_empty() => None,
+            None => {
+                Some(serde_json::to_string(env_names).expect("serializing strings cannot fail"))
+            }
+        };
+        if let Some(listed) = listed {
+            overrides.push(format!("mcp_servers.{name}.env_vars={listed}"));
         }
+        // Registry servers are pre-approved too, for the reason above: under approval `never` an
+        // unapproved server's every call would be declined. The registry is the owner's own list.
         overrides.push(format!(
             "mcp_servers.{name}.default_tools_approval_mode={}",
             serde_json::to_string("approve").expect("serializing a string cannot fail")
         ));
     }
     Ok(overrides)
+}
+
+/// Every `(name, value)` of every server's `env` object in an MCP config, sorted by name.
+///
+/// These are the values `codex_mcp_overrides` only names: they go into the child environment and
+/// nowhere else. A name already in `reserved` (the run's own environment) refuses the launch
+/// rather than letting a registry server shadow a daemon variable, and so does a name in
+/// `MCP_ENV_DENYLIST` (variables the Codex child itself depends on). Names compare
+/// case-insensitively on Windows, where `Path` and `PATH` are one variable. Errors carry names,
+/// never a value.
+pub fn codex_mcp_env(
+    config: &serde_json::Value,
+    reserved: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    codex_mcp_env_with(config, reserved, cfg!(windows))
+}
+
+/// Variables a registry server may never set in the Codex child's environment: the child's own
+/// process plumbing and credentials. Matched case-insensitively on every platform.
+const MCP_ENV_DENYLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "CODEX_HOME",
+    "OPENAI_API_KEY",
+    "SYSTEMROOT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "COMSPEC",
+];
+
+fn env_name_eq(a: &str, b: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// `codex_mcp_env` with the collision check's case rule made explicit, so both rules are testable
+/// on any platform.
+fn codex_mcp_env_with(
+    config: &serde_json::Value,
+    reserved: &[String],
+    case_insensitive: bool,
+) -> Result<Vec<(String, String)>, String> {
+    let Some(servers) = config
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut pairs = Vec::new();
+    for (server, entry) in servers {
+        let Some(env) = entry.get("env").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, value) in env {
+            if MCP_ENV_DENYLIST
+                .iter()
+                .any(|denied| env_name_eq(denied, name, true))
+            {
+                return Err(format!(
+                    "mcp_config server {server:?} env {name:?} collides with a variable the Codex child needs"
+                ));
+            }
+            if reserved
+                .iter()
+                .any(|taken| env_name_eq(taken, name, case_insensitive))
+            {
+                return Err(format!(
+                    "mcp_config server {server:?} env {name:?} collides with the daemon's environment"
+                ));
+            }
+            let value = value.as_str().ok_or_else(|| {
+                format!("mcp_config server {server:?} env {name:?} must be a string")
+            })?;
+            pairs.push((name.clone(), value.to_string()));
+        }
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(window) = pairs.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "mcp_config env {:?} is set by more than one server",
+            window[0].0
+        ));
+    }
+    Ok(pairs)
 }
 
 /// Reads the thread id from Codex's thread-started event.
@@ -627,7 +737,7 @@ impl CommandRunner for CodexCliRunner {
         // mutation", and that is precisely true of a launch that did not happen.
         // `codex_cli_args` honours MCP config, effort, and extra directories; partial messages
         // degrade because the reply arrives when the turn completes.
-        let mcp_overrides = match &request.mcp_config {
+        let (mcp_overrides, mcp_env) = match &request.mcp_config {
             Some(path) => {
                 let contents = std::fs::read(path).map_err(|error| {
                     std::io::Error::other(format!("codex exec cannot honour mcp_config: {error}"))
@@ -638,11 +748,14 @@ impl CommandRunner for CodexCliRunner {
                 let mut env_names: Vec<String> =
                     request.env.iter().map(|(name, _)| name.clone()).collect();
                 env_names.sort();
-                codex_mcp_overrides(&config, &env_names).map_err(|why| {
+                let refuse = |why: String| {
                     std::io::Error::other(format!("codex exec cannot honour mcp_config: {why}"))
-                })?
+                };
+                let overrides = codex_mcp_overrides(&config, &env_names).map_err(refuse)?;
+                let env = codex_mcp_env(&config, &env_names).map_err(refuse)?;
+                (overrides, env)
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
         struct StagedFiles(Vec<PathBuf>);
         impl Drop for StagedFiles {
@@ -686,6 +799,10 @@ impl CommandRunner for CodexCliRunner {
         let mut cmd = Command::new(&codex_bin);
         cmd.args(args);
         for (k, v) in &request.env {
+            cmd.env(k, v);
+        }
+        // The registry servers' env values: only here, in the child env, never in an argument.
+        for (k, v) in &mcp_env {
             cmd.env(k, v);
         }
         if let Some(dir) = &request.cwd {
@@ -929,7 +1046,7 @@ mod tests {
             images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: None,
             effort: None,
             fallback_model: Vec::new(),
@@ -967,5 +1084,142 @@ mod tests {
         );
         let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
         assert_eq!(args.last().unwrap(), "run the tests");
+    }
+
+    fn config_with_a_registry_server() -> serde_json::Value {
+        serde_json::json!({
+            "mcpServers": {
+                "nucleos": {"type": "stdio", "command": "nucleos-core", "args": ["--mcp-tools"]},
+                "gh": {
+                    "type": "stdio",
+                    "command": "gh-mcp",
+                    "args": ["serve"],
+                    "env": {"GH_TOKEN": "s3cret", "GH_HOST": "example"}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn codex_overrides_use_each_servers_own_env_names_never_values() {
+        let config = config_with_a_registry_server();
+        let request_env = vec!["NUCLEOS_RUN_ID".to_string()];
+        let overrides = codex_mcp_overrides(&config, &request_env).unwrap();
+        assert!(
+            overrides.contains(&r#"mcp_servers.gh.env_vars=["GH_HOST","GH_TOKEN"]"#.to_string()),
+            "the registry server lists its own env names"
+        );
+        assert!(
+            overrides.contains(&r#"mcp_servers.nucleos.env_vars=["NUCLEOS_RUN_ID"]"#.to_string()),
+            "nucleos keeps the request env names"
+        );
+        assert!(
+            overrides
+                .contains(&r#"mcp_servers.gh.default_tools_approval_mode="approve""#.to_string()),
+            "registry servers are pre-approved"
+        );
+        assert!(
+            overrides
+                .iter()
+                .all(|arg| !arg.contains("s3cret") && !arg.contains("example")),
+            "no override carries an env value"
+        );
+    }
+
+    #[test]
+    fn codex_overrides_omit_env_vars_for_a_server_with_an_empty_env() {
+        let config = serde_json::json!({
+            "mcpServers": {"bare": {"type": "stdio", "command": "bare", "env": {}}}
+        });
+        let overrides = codex_mcp_overrides(&config, &["NUCLEOS_RUN_ID".to_string()]).unwrap();
+        assert!(
+            overrides
+                .iter()
+                .all(|arg| !arg.starts_with("mcp_servers.bare.env_vars")),
+            "an empty env object lists no env names"
+        );
+    }
+
+    #[test]
+    fn codex_mcp_env_collects_values_and_refuses_a_collision() {
+        let config = config_with_a_registry_server();
+        let env = codex_mcp_env(&config, &["NUCLEOS_RUN_ID".to_string()]).unwrap();
+        assert_eq!(
+            env,
+            vec![
+                ("GH_HOST".to_string(), "example".to_string()),
+                ("GH_TOKEN".to_string(), "s3cret".to_string()),
+            ]
+        );
+
+        let error = codex_mcp_env(&config, &["GH_TOKEN".to_string()]).unwrap_err();
+        assert!(error.contains("GH_TOKEN"), "the error names the variable");
+        assert!(error.contains("gh"), "the error names the server");
+        assert!(
+            !error.contains("s3cret"),
+            "the error never carries the value"
+        );
+    }
+
+    #[test]
+    fn codex_mcp_env_refuses_a_denylisted_name_in_any_case() {
+        for name in [
+            "PATH",
+            "Path",
+            "codex_home",
+            "OPENAI_API_KEY",
+            "SystemRoot",
+            "ComSpec",
+        ] {
+            let config = serde_json::json!({
+                "mcpServers": {"gh": {"type": "stdio", "command": "gh", "env": {name: "s3cret"}}}
+            });
+            let error = codex_mcp_env(&config, &[]).unwrap_err();
+            assert!(
+                error.contains(name),
+                "{name}: the error names the variable: {error}"
+            );
+            assert!(
+                error.contains("gh"),
+                "{name}: the error names the server: {error}"
+            );
+            assert!(
+                !error.contains("s3cret"),
+                "{name}: the error never carries the value"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_mcp_env_collision_case_rule_follows_the_flag() {
+        let config = serde_json::json!({
+            "mcpServers": {"gh": {"type": "stdio", "command": "gh", "env": {"Gh_Token": "s3cret"}}}
+        });
+        let reserved = ["GH_TOKEN".to_string()];
+        let error = codex_mcp_env_with(&config, &reserved, true).unwrap_err();
+        assert!(error.contains("Gh_Token"), "{error}");
+        assert!(
+            !error.contains("s3cret"),
+            "the error never carries the value"
+        );
+        let env = codex_mcp_env_with(&config, &reserved, false).unwrap();
+        assert_eq!(env, vec![("Gh_Token".to_string(), "s3cret".to_string())]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_mcp_env_collision_is_case_insensitive_on_windows() {
+        let config = serde_json::json!({
+            "mcpServers": {"gh": {"type": "stdio", "command": "gh", "env": {"gh_token": "x"}}}
+        });
+        assert!(codex_mcp_env(&config, &["GH_TOKEN".to_string()]).is_err());
+    }
+
+    #[test]
+    fn codex_mcp_env_is_empty_for_the_nucleos_only_config() {
+        let config = serde_json::json!({
+            "mcpServers": {"nucleos": {"type": "stdio", "command": "nucleos-core", "args": []}}
+        });
+        assert!(codex_mcp_env(&config, &[]).unwrap().is_empty());
     }
 }

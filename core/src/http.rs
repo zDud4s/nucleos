@@ -24896,35 +24896,65 @@ mod tests {
         );
     }
 
-    /// Ambient MCP servers are offered only where the conversation has a project to govern them in.
-    ///
-    /// 400 and not a silent no-op: an unrooted conversation always runs MCP-only, so a stored "on"
-    /// would be a promise nothing keeps. The read side then reports what was stored.
+    /// `ambient_mcp` is gone (slash spec §8.1): a PATCH that still sends it is refused with 400
+    /// `ambient_mcp_removed`, with or without a project and for any value (`null` too), and nothing is
+    /// written. The project read no longer reports the field at all.
     #[tokio::test]
-    async fn ambient_mcp_is_only_offered_to_a_conversation_with_a_project() {
+    async fn patch_with_ambient_mcp_is_400_ambient_mcp_removed() {
+        async fn patch_body(
+            state: AppState,
+            chat_id: &str,
+            body: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/assistant/chats/{chat_id}"))
+                        .header("Authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
         let state = test_state().await;
         let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
             .unwrap();
-
-        assert_eq!(
-            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
-            StatusCode::BAD_REQUEST
-        );
-        assert!(
-            !crate::chats::ambient_mcp_of(&state.pool, &chat_id)
-                .await
-                .unwrap()
-        );
+        for body in [
+            r#"{"ambient_mcp":true}"#,
+            r#"{"ambient_mcp":false}"#,
+            r#"{"ambient_mcp":null}"#,
+        ] {
+            let (status, json) = patch_body(state.clone(), &chat_id, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "no cwd, body {body}");
+            assert_eq!(json["error"], "ambient_mcp_removed", "no cwd, body {body}");
+        }
 
         let root = tempfile::TempDir::new().unwrap();
         crate::chats::set_cwd(&state.pool, &chat_id, root.path().to_str().unwrap())
             .await
             .unwrap();
-        assert_eq!(
-            patch_chat_request(state.clone(), &chat_id, r#"{"ambient_mcp":true}"#).await,
-            StatusCode::NO_CONTENT
-        );
+        for body in [
+            r#"{"ambient_mcp":true}"#,
+            r#"{"ambient_mcp":false}"#,
+            r#"{"ambient_mcp":null}"#,
+        ] {
+            let (status, json) = patch_body(state.clone(), &chat_id, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "with cwd, body {body}");
+            assert_eq!(
+                json["error"], "ambient_mcp_removed",
+                "with cwd, body {body}"
+            );
+        }
 
         let response = project_request(state.clone(), &chat_id).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -24932,7 +24962,7 @@ mod tests {
             .await
             .unwrap();
         let project: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(project["ambient_mcp"], serde_json::json!(true));
+        assert!(project.get("ambient_mcp").is_none(), "{project}");
     }
 
     /// The distiller's model is a setting the owner changes from the shell, so both directions are

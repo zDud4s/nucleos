@@ -141,6 +141,14 @@ export interface AssistantTurnRow {
    */
   compacted: boolean;
   /**
+   * Whether this turn was a `/compact`: its answer is the handoff the next turns start from.
+   *
+   * Not `compacted`, which is the CLI summarising its own context mid-turn. This one is the
+   * person asking for it, and the daemon sets it on any run that has a compaction row, whatever
+   * became of it. Optional on the wire: a daemon older than `/compact` sends no such key.
+   */
+  compaction?: boolean;
+  /**
    * What the turn ran, oldest first. Empty on a turn that acted on nothing AND
    * on a turn from before the daemon recorded this — the daemon collapses the
    * two deliberately, because a client cannot act on the difference.
@@ -287,6 +295,8 @@ export interface Turn {
   window: number | null;
   /** See `AssistantTurnRow.compacted`. */
   compacted: boolean;
+  /** See `AssistantTurnRow.compaction`. */
+  compaction: boolean;
   /**
    * The conversation that handed this turn over, or null when the person whose
    * transcript this is typed it themselves.
@@ -373,6 +383,8 @@ export function turnFromRow(row: AssistantTurnRow): Turn {
     // because compaction is what this release added. So the absent value and the false one say the
     // same thing here, which is the only case where collapsing them is honest.
     compacted: row.compacted ?? false,
+    // False for the reason `compacted` is: a daemon older than `/compact` ran no compaction.
+    compaction: row.compaction ?? false,
     // Keyed off the ID and never off the title: the title is null on every conversation nobody has
     // named, so a check on it would read most relayed turns as ordinary ones. `?? null` is the
     // daemon-older-than-the-column case, same as `did` and `images` above.

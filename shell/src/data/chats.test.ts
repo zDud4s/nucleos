@@ -81,6 +81,7 @@ function pendingTurn(id: number, asked: string): Turn {
     contextFill: null,
     window: null,
     compacted: false,
+    compaction: false,
     did: [],
     relayedTo: [],
     relayedFrom: null,

@@ -505,7 +505,7 @@ pub(super) async fn spawn_agent(
             classifier_governs_tools: false,
             messages: None,
             request_tx: None,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model,
             effort,
             fallback_model: Vec::new(),

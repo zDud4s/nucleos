@@ -80,6 +80,7 @@ import type {
   Transcript,
 } from "../data/chats";
 import { CHAT_OPEN_HEADER } from "../data/chats";
+import type { McpCardData } from "../data/mcp";
 import { keys } from "../data/keys";
 import { POLL } from "../data/poll";
 import type { AssistantTurnRow, ToolCall } from "../lib/turns";
@@ -250,6 +251,11 @@ function chatsFetch(
      * distinction and says so.
      */
     projects?: Record<string, ChatProject>;
+    /**
+     * Each conversation's view of the MCP registry, by chat id. Mutated in place by a switch.
+     * Absent means an empty registry on an engine that takes servers.
+     */
+    mcp?: Record<string, McpCardData>;
     /** The daemon's project roster, which the project picker offers. */
     roster?: Array<Pick<ProjectSummary, "project_id" | "project_root">>;
     /** What each turn's tools answered, by turn id. The transcript never carries these. */
@@ -267,6 +273,29 @@ function chatsFetch(
     const chain = /^\/assistant\/chats\/([^/]+)\/turns\/(\d+)\/chain$/.exec(path);
     if (chain !== null) {
       return { chain: opts.chains?.[Number(chain[2])] ?? [] };
+    }
+    // The conversation's view of the MCP registry, and the switch of one server in it: the daemon
+    // answers the updated view, so the fixture is flipped in place and a copy handed back.
+    const mcpView = /^\/assistant\/chats\/([^/?]+)\/mcp$/.exec(path);
+    const mcpSwitch = /^\/assistant\/chats\/([^/?]+)\/mcp\/([^/?]+)$/.exec(path);
+    const mcpHit = mcpView ?? mcpSwitch;
+    if (mcpHit !== null) {
+      const chatId = decodeURIComponent(mcpHit[1]);
+      const view: McpCardData = opts.mcp?.[chatId] ?? {
+        engine: "claude",
+        supported: true,
+        engine_note: null,
+        policy: "unrestricted",
+        fixed: { name: "nucleos", active: true },
+        servers: [],
+        hint: null,
+      };
+      if (mcpSwitch !== null && (init?.method === "PUT" || init?.method === "DELETE")) {
+        const name = decodeURIComponent(mcpSwitch[2]);
+        const row = view.servers.find((server) => server.name === name);
+        if (row !== undefined) row.enabled = init.method === "PUT";
+      }
+      return { ...view, servers: view.servers.map((server) => ({ ...server })) };
     }
     const forward = /^\/assistant\/chats\/([^/]+)\/forward$/.exec(path);
     if (forward !== null && init?.method === "POST") {
@@ -1101,55 +1130,105 @@ describe("Chats - notices from NucleOS", () => {
     expect(within(transcript).queryByText(/said this while working/)).toBeNull();
     expect(within(transcript).queryByRole("button", { name: "Continue" })).toBeNull();
   });
+
+  it("slash c compaction notice is drawn as NucleOS", async () => {
+    const body = "Compacted: the next turn starts from the handoff (~120 tokens).";
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": twoTurns() }, {
+        notices: { "c-1": [nucleosNotice({ kind: "compaction", from_run_id: 2, body })] },
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    const said = await within(transcript).findByText(body);
+    const callout = said.closest(".chats-notice") as HTMLElement;
+    expect(within(callout).getByText("NucleOS")).toBeDefined();
+    expect(within(transcript).queryByRole("link")).toBeNull();
+    expect(within(transcript).queryByText(/said this while working/)).toBeNull();
+    expect(within(transcript).queryByRole("button", { name: "Continue" })).toBeNull();
+  });
+
+  it("slash c compaction turn shows the compaction label", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], {
+        "c-1": [
+          turnRow({ id: 1, asked: "primeira", answer: "uma", created_at: "2026-08-26T09:00:00Z" }),
+          turnRow({
+            id: 2,
+            asked: "/compact",
+            answer: "# Handoff — primeira",
+            compaction: true,
+            created_at: "2026-08-26T10:00:00Z",
+          }),
+        ],
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+
+    const transcript = await screen.findByRole("list", { name: "Transcript" });
+    await within(transcript).findByText("/compact");
+    const labels = within(transcript).getAllByText("compaction");
+    expect(labels).toHaveLength(1);
+    // On the `/compact` turn, not on the ordinary one before it.
+    expect(labels[0].closest("li")?.id).toBe("turn-2");
+  });
 });
 
-describe("Chats - ambient MCP servers", () => {
-  function projectFor(overrides: Partial<ChatProject> = {}): ChatProject {
+describe("Chats - MCP servers", () => {
+  function mcpView(): McpCardData {
     return {
-      cwd: "C:/Projects/demo",
-      tools: true,
-      session: null,
-      permission_mode: "auto",
-      ambient_mcp: false,
-      ...overrides,
+      engine: "claude",
+      supported: true,
+      engine_note: null,
+      policy: "unrestricted",
+      fixed: { name: "nucleos", active: true },
+      servers: [
+        {
+          name: "gh",
+          command: "gh-mcp",
+          env_names: ["GH_TOKEN"],
+          imported_from: "claude-user",
+          enabled: false,
+          active: false,
+          inactive_reason: null,
+          note: null,
+        },
+      ],
+      hint: null,
     };
   }
 
-  it("is off by default and turns on with one click", async () => {
+  it("mcp lists a checkbox per registry server in the settings menu, and one click sends PUT", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, {
-        projects: { "c-1": projectFor() },
-      }),
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, { mcp: { "c-1": mcpView() } }),
     );
 
     await renderChats("/chats/c-1");
     await openConversationSettings();
 
-    const box = await screen.findByRole("menuitemcheckbox", { name: /Ambient MCP servers/ });
+    expect(await screen.findByText("MCP servers")).toBeTruthy();
+    const box = await screen.findByRole("menuitemcheckbox", { name: /^gh/ });
     expect(box.getAttribute("aria-checked")).toBe("false");
     fireEvent.click(box);
 
-    await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", {
-        method: "PATCH",
-        body: JSON.stringify({ ambient_mcp: true }),
-      });
-    });
+    await waitFor(() => expect(callsTo("/assistant/chats/c-1/mcp/gh", "PUT")).toHaveLength(1));
   });
 
-  it("is not offered to a conversation without tools", async () => {
+  it("mcp offers no ambient switch any more", async () => {
     daemon.apiFetch.mockImplementation(
-      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, {
-        projects: { "c-1": projectFor({ tools: false }) },
-      }),
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }, { mcp: { "c-1": mcpView() } }),
     );
 
     await renderChats("/chats/c-1");
     await openConversationSettings();
 
     // The menu is open once its other entries are there; the absence only means something then.
-    await screen.findByRole("menuitem", { name: /standing instructions/i });
-    expect(screen.queryByRole("menuitemcheckbox", { name: /Ambient MCP servers/ })).toBeNull();
+    await screen.findByRole("menuitemcheckbox", { name: /^gh/ });
+    expect(screen.queryByRole("menuitemcheckbox", { name: /Ambient/ })).toBeNull();
+    expect(callsTo("/assistant/chats/c-1", "PATCH")).toEqual([]);
   });
 });
 
@@ -4843,6 +4922,59 @@ describe("slash commands routed to /command", () => {
     expect(screen.getByText(/2 turns? (with no cost|unmeasured)/i)).toBeTruthy();
   });
 
+  it("slash d mcp card renders the panel, and its checkbox switches the server", async () => {
+    const data: McpCardData = {
+      engine: "claude",
+      supported: true,
+      engine_note: null,
+      policy: "mcponly",
+      fixed: { name: "nucleos", active: true },
+      servers: [
+        {
+          name: "gh",
+          command: "gh-mcp",
+          env_names: [],
+          imported_from: null,
+          enabled: true,
+          active: false,
+          inactive_reason: "mode mcponly only allows NucleOS tools",
+          note: null,
+        },
+      ],
+      hint: null,
+    };
+    await sayCommand("/mcp", () => ({ kind: "card", card: { kind: "mcp", data } }), ["mcp"]);
+
+    const card = await screen.findByRole("region", { name: "Command" });
+    expect(within(card).getByText(/MCP servers \(claude, mode mcponly\)/)).toBeTruthy();
+    expect(within(card).getByText("mode mcponly only allows NucleOS tools")).toBeTruthy();
+    const box = within(card).getByRole("checkbox", { name: /gh/ });
+    fireEvent.click(box);
+    await waitFor(() => expect(callsTo("/assistant/chats/c-1/mcp/gh", "DELETE")).toHaveLength(1));
+  });
+
+  it("slash d mcp_import card lists what the import did", async () => {
+    await sayCommand(
+      "/mcp import",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "mcp_import",
+          data: {
+            imported: ["gh"],
+            skipped: [],
+            already_present: ["ctx"],
+            unread: [],
+          },
+        },
+      }),
+      ["mcp"],
+    );
+
+    expect(await screen.findByText("gh: imported")).toBeTruthy();
+    expect(screen.getByText("ctx: already existed")).toBeTruthy();
+  });
+
   it("slash b effort card lists levels", async () => {
     await sayCommand(
       "/effort",
@@ -4952,6 +5084,57 @@ describe("slash commands routed to /command", () => {
       { running: true },
     );
     expect(await screen.findByText(/\$0\.50/)).toBeTruthy();
+    expect(sentMessages()).toEqual([]);
+  });
+
+  /* ------------------------------------------------------- phase c: /compact -- */
+
+  it("slash c context card shows the compaction in force", async () => {
+    await sayCommand(
+      "/context",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "context",
+          data: {
+            engine: "local",
+            model: "qwen3",
+            used_tokens: null,
+            window_tokens: null,
+            percent: null,
+            turns: 3,
+            compaction: { run_id: 2, at: "2026-10-28 09:00:00" },
+          },
+        },
+      }),
+      ["context"],
+    );
+    expect(await screen.findByText("Compaction in force since 2026-10-28 09:00:00")).toBeTruthy();
+  });
+
+  it("slash c context card says nothing of a compaction when there is none", async () => {
+    await sayCommand(
+      "/context",
+      () => ({
+        kind: "card",
+        card: {
+          kind: "context",
+          data: { engine: "local", model: "qwen3", used_tokens: null, turns: 3, compaction: null },
+        },
+      }),
+      ["context"],
+    );
+    expect(await screen.findByText(/no measure on this engine/i)).toBeTruthy();
+    expect(screen.queryByText(/compaction in force/i)).toBeNull();
+  });
+
+  it("slash c /compact posts the command and does not send it as a message", async () => {
+    await sayCommand("/compact keep the parser notes", () => ({ kind: "prompt", turn_id: 7 }), ["compact"]);
+    expect(JSON.parse(String((posted()[0][1] as RequestInit).body))).toMatchObject({
+      text: "/compact keep the parser notes",
+    });
+    const box = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    await waitFor(() => expect(box.value).toBe(""));
     expect(sentMessages()).toEqual([]);
   });
 });

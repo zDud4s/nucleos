@@ -1,4 +1,6 @@
 import type { Command, CommandCard, CommandSource } from "../data/chats";
+import type { McpCardData, McpImportReport } from "../data/mcp";
+import { McpCardBody, McpImportBody } from "./McpPanel";
 
 /** Where a command came from, in the words the picker and the help card both use. */
 export function sourceLabel(source: CommandSource, kind?: Command["kind"]): string {
@@ -75,6 +77,8 @@ interface StateData {
   cache_creation_tokens?: number | null;
   live_session?: boolean;
   compacted?: boolean;
+  /** The `/compact` in force: the next turns start from its handoff. Null when there is none. */
+  compaction?: { run_id: number; at: string } | null;
   turns?: number;
   note?: string | null;
   // cost
@@ -137,6 +141,8 @@ function ContextBody({ data }: { data: StateData }) {
       {used !== null && detail.length > 0 && <p>{detail.join(" · ")}</p>}
       {typeof data.turns === "number" && <p>{data.turns === 1 ? "1 turn" : `${data.turns} turns`}</p>}
       {data.compacted === true && <p>Compacted</p>}
+      {/* Raw: no other date on this card is formatted, and the daemon's stamp is already legible. */}
+      {data.compaction != null && <p>Compaction in force since {data.compaction.at}</p>}
     </>
   );
 }
@@ -167,7 +173,16 @@ function CostBody({ data }: { data: StateData }) {
  * What a slash command answered with, drawn beside the transcript. Held in memory only: a card is
  * an answer to the person at the keyboard, not part of the conversation, so it is never replayed.
  */
-export function SlashCard({ card, onDismiss }: { card: CommandCard; onDismiss: () => void }) {
+export function SlashCard({
+  card,
+  chatId,
+  onDismiss,
+}: {
+  card: CommandCard;
+  /** The conversation the card answers for; the `mcp` card switches servers in it. */
+  chatId?: string;
+  onDismiss: () => void;
+}) {
   const data = (card.data ?? {}) as {
     groups?: HelpGroup[];
     entry?: HelpEntry;
@@ -237,6 +252,12 @@ export function SlashCard({ card, onDismiss }: { card: CommandCard; onDismiss: (
           )}
           {data.warning != null && data.warning !== "" && <p>{data.warning}</p>}
         </>
+      )}
+      {card.kind === "mcp" && chatId !== undefined && card.data != null && (
+        <McpCardBody chatId={chatId} data={card.data as McpCardData} />
+      )}
+      {card.kind === "mcp_import" && card.data != null && (
+        <McpImportBody data={card.data as McpImportReport} />
       )}
       <button type="button" className="chats-slash-dismiss" onClick={onDismiss}>
         Dismiss

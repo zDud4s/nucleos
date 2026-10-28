@@ -76,6 +76,9 @@ tokio = { version = "1.53.0", features = ["full"] }
 # Only for `ReaderStream`, which is what lets `GET /files/download` hand a file back without first
 # holding all of it in memory. Already in the lock file, as something else's dependency.
 tokio-util = { version = "0.7.19", features = ["io"] }
+# `chats/mcp_import.rs` only: reads `[mcp_servers.*]` from `~/.codex/config.toml`. Already in the
+# lock file (0.25, with its parser) as proc-macro-crate's dependency; parse only, no display.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors"] }
 tracing = "0.1.44"

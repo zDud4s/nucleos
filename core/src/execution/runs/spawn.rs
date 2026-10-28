@@ -574,7 +574,7 @@ pub(super) fn spawn_run(
                 messages: None,
                 request_tx: None,
                 // Autopilot runs pay for the ambient surface and call none of it.
-                ambient_mcp: false,
+                mcp_servers: Vec::new(),
                 // Cloned rather than moved: the request is built once per attempt.
                 model: model.clone(),
                 effort: effort.clone(),

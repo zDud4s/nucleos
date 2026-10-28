@@ -55,6 +55,7 @@ function turn(overrides: Partial<Turn> = {}): Turn {
     contextFill: null,
     window: 140000,
     compacted: false,
+    compaction: false,
     relayedFrom: null,
     unprompted: false,
     relayedTo: [],
@@ -172,6 +173,13 @@ describe("turnFromRow", () => {
   it("carries a genuinely empty settled turn as null, not as an empty string", () => {
     const empty = turnFromRow(row({ status: "cancelled", answer: null, error: null }));
     expect(empty.answer).toBeNull();
+  });
+
+  it("turnFromRow carries compaction and defaults it to false", () => {
+    expect(turnFromRow(row({ compaction: true })).compaction).toBe(true);
+    expect(turnFromRow(row({ compaction: false })).compaction).toBe(false);
+    // A daemon older than `/compact` sends no such key.
+    expect(turnFromRow(row()).compaction).toBe(false);
   });
 });
 
