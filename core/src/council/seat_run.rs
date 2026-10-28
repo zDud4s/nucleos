@@ -242,7 +242,7 @@ impl Driver {
             classifier_governs_tools: false,
             messages: None,
             request_tx: None,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: Some(seat.model_ref.clone()),
             effort: None,
             fallback_model: Vec::new(),

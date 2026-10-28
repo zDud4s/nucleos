@@ -335,13 +335,11 @@ pub struct RunRequest {
     /// run as a run that cost nothing. Only a runner whose `reports_model_request` is `true` ever
     /// fires it, so a caller arms one only after asking. A stream that ends first drops it unsent.
     pub request_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    /// Whether this run opts in to the operator's ambient MCP surface.
+    /// Names of the NucleOS registry servers `mcp_config` carries beside `nucleos`, sorted.
     ///
-    /// `false` everywhere today, and that is the point: the strict default closes the exfiltration
-    /// path a hostile mail body could otherwise use to reach a file-writing connector the daemon
-    /// never asked for. A run pays for every ambient server in re-sent tool definitions on every
-    /// turn, so the cost falls on whoever asks rather than on everyone who did not.
-    pub ambient_mcp: bool,
+    /// Read only to compare spawn shapes; the servers themselves travel in the config file. Empty
+    /// everywhere but a chat turn.
+    pub mcp_servers: Vec<String>,
     /// Per-run override of the runner's configured model. `None` keeps it.
     pub model: Option<String>,
     /// How hard this run asks the model to think, or `None` for the CLI's own default.

@@ -56,12 +56,8 @@ pub(super) async fn spawn_local_turn(
     // Read BEFORE this turn's own row is inserted, so the turn cannot appear in its own history.
     // An empty history on a database error, not a failure: a bot that answers without remembering
     // is worse than one that remembers, and better than one that refuses to answer.
-    let history = recent_exchanges(&state.pool, &slot.chat_id)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "could not read chat history; answering without it");
-            Vec::new()
-        });
+    // Floored at a done `/compact`, whose handoff then leads every prompt until the next one.
+    let (history, handoff) = super::compaction::local_history(&state.pool, &slot.chat_id).await;
 
     let session_id = crate::auth::generate_uuid_v4();
     let id = sqlx::query(
@@ -104,7 +100,7 @@ pub(super) async fn spawn_local_turn(
         tracing::warn!(%error, id, relay_id, "the relayed turn started but was not stamped onto its relay");
     }
 
-    let prompt = model_text;
+    let prompt = super::compaction::with_handoff(handoff.as_deref(), model_text);
 
     let pool = state.pool.clone();
     let run_timeout = state.run_timeout;
@@ -217,6 +213,7 @@ pub(super) async fn spawn_local_turn(
             }
         };
         crate::execution::runs::warn_on_terminal_write_err(&written, id, "completed");
+        super::compaction::settle(&pool, id).await;
     });
 
     Ok(id)
@@ -487,10 +484,9 @@ pub(super) fn chat_run_request(
         classifier_governs_tools: false,
         messages: None,
         request_tx: None,
-        // The owner opts in per conversation (decision 2026-10-05), and only a turn that
-        // is not `McpOnly` can use it: `McpOnly` pushes the strict flag unconditionally,
-        // so an unrooted, Telegram or withheld relayed turn never gets the ambient servers.
-        ambient_mcp: ambient_mcp_for(tool_policy, answering.ambient_mcp),
+        // Registry servers reach only an Unrestricted turn (spec §8.2): an unrooted, Telegram
+        // or withheld relayed turn is `McpOnly` and gets the NucleOS server alone.
+        mcp_servers: crate::chats::mcp_servers::active_names(tool_policy, &answering.mcp_servers),
         // What the conversation was pinned to, or `None` for the runner's configured model.
         //
         // This was `None` unconditionally, with a comment saying an orchestrator turn has no
@@ -566,7 +562,6 @@ pub(super) fn spawn_fingerprint(
     answering: &crate::chats::Answering,
     doctrine: Option<&str>,
     tool_policy: crate::execution::runner::ToolPolicy,
-    ambient_mcp: bool,
 ) -> String {
     serde_json::json!({
         "model": answering.model,
@@ -581,7 +576,7 @@ pub(super) fn spawn_fingerprint(
         "denied_tools": answering.denied_tools,
         "context_window": answering.context_window,
         "tool_policy": format!("{tool_policy:?}"),
-        "ambient_mcp": ambient_mcp,
+        "mcp_servers": crate::chats::mcp_servers::active_names(tool_policy, &answering.mcp_servers),
     })
     .to_string()
 }
@@ -838,7 +833,9 @@ async fn warm_chat(state: &crate::state::AppState, chat_id: &str) {
     // Its own file, not the one a turn writes: a turn starting meanwhile must not have its config
     // removed from under it.
     let mcp_path = mcp_config_path(&format!("{chat_id}.warm"));
-    if write_mcp_config(&mcp_path, &build_mcp_config(&exe.to_string_lossy())).is_err() {
+    let active = crate::chats::mcp_servers::active_for(tool_policy, &answering.mcp_servers);
+    let config = build_chat_mcp_config(&exe.to_string_lossy(), active);
+    if write_mcp_config(&mcp_path, &config).is_err() {
         return;
     }
     {
@@ -850,12 +847,7 @@ async fn warm_chat(state: &crate::state::AppState, chat_id: &str) {
         });
     }
 
-    let fingerprint = spawn_fingerprint(
-        &answering,
-        None,
-        tool_policy,
-        ambient_mcp_for(tool_policy, answering.ambient_mcp),
-    );
+    let fingerprint = spawn_fingerprint(&answering, None, tool_policy);
     let request = chat_run_request(
         String::new(),
         Vec::new(),
@@ -1123,9 +1115,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // A turn a kept process will serve never reads the briefing: the block travels as a
         // per-spawn system flag, which a kept process ignores. Decided HERE, after the eviction
         // above, so a conversation let go of is never taken for one the process will answer.
-        let ambient_mcp = ambient_mcp_for(tool_policy, answering.ambient_mcp);
-        let fingerprint =
-            spawn_fingerprint(&answering, doctrine.as_deref(), tool_policy, ambient_mcp);
+        let fingerprint = spawn_fingerprint(&answering, doctrine.as_deref(), tool_policy);
         let kept = may_live
             && kept_process_fits(
                 &turn.slot.chat_id,
@@ -1377,8 +1367,9 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     }
                     // Invisible root rotation. After the session block on purpose: the upsert above
                     // would otherwise recreate the session `rotate` just forgot. A completed turn
-                    // only; a cancelled one has not settled anything worth carrying forward.
-                    if status == "completed" {
+                    // only; a cancelled one has not settled anything worth carrying forward. Never
+                    // a compaction turn: its settle consumes the rotation (`consume_older`).
+                    if status == "completed" && !super::compaction::is_compaction(&pool, id).await {
                         // Deterministic unless `NUCLEOS_ROOT_ROTATE_LLM` is on; any failure of the
                         // model falls back to it inside the summarizer.
                         let one_shot = rotation::RunnerModel {
@@ -1476,6 +1467,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                 crate::execution::runs::warn_on_terminal_write_err(&timed_out, id, "timed_out");
             }
         }
+        // After the session upsert, so a done `/compact` forgets the session for good.
+        super::compaction::settle(&pool, id).await;
 
         // Dropped HERE rather than at the end of the block: dropping the guard releases the chat's
         // slot, and a slot armed by `drain_on_release` sends what waited from a task of its own, so

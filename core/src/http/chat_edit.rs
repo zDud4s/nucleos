@@ -585,11 +585,10 @@ pub(super) struct PatchChatRequest {
     /// The whole set every time, like `agents`, and for the same reason.
     #[serde(default, deserialize_with = "sent_even_if_null")]
     pub(super) denied_tools: Option<Option<Vec<String>>>,
-    /// Whether this conversation's turns may use the user's ambient MCP servers.
-    ///
-    /// Turning it on needs a project: a conversation with no directory is `McpOnly` and never
-    /// reaches those servers, so offering the switch there would promise something it cannot do.
-    pub(super) ambient_mcp: Option<bool>,
+    /// Removed (slash spec §8.1): kept only so a PATCH that still sends it is refused, never stored.
+    /// `Some(_)` whenever the key is present, `null` included.
+    #[serde(default, deserialize_with = "sent_even_if_null")]
+    pub(super) ambient_mcp: Option<Option<serde_json::Value>>,
 }
 
 /// What the two doors onto a conversation refuse with. Every path that had no body keeps none
@@ -604,9 +603,12 @@ pub(super) struct PatchChatRequest {
 /// check had no test asking for the body and would not widen a response without one. Opening a
 /// conversation on a model the machine cannot run is the FIRST place somebody meets this
 /// refusal, though, so it is the last place a bare status is any use.
+///
+/// `Coded` is a refusal a client must tell apart by machine, answered as `{"error", "detail"}`.
 pub(super) enum ChatRefusal {
     Status(StatusCode),
     WithDetail(StatusCode, String),
+    Coded(StatusCode, &'static str, String),
 }
 
 impl IntoResponse for ChatRefusal {
@@ -616,6 +618,11 @@ impl IntoResponse for ChatRefusal {
             ChatRefusal::WithDetail(status, detail) => {
                 (status, Json(serde_json::json!({ "detail": detail }))).into_response()
             }
+            ChatRefusal::Coded(status, code, detail) => (
+                status,
+                Json(serde_json::json!({ "error": code, "detail": detail })),
+            )
+                .into_response(),
         }
     }
 }
@@ -662,6 +669,16 @@ pub(super) async fn patch_chat(
         return Err(StatusCode::NOT_FOUND.into());
     }
 
+    // Refused before anything is written, whatever the value: a stored flag nothing reads would
+    // be a promise nothing keeps.
+    if body.ambient_mcp.is_some() {
+        return Err(ChatRefusal::Coded(
+            StatusCode::BAD_REQUEST,
+            "ambient_mcp_removed",
+            "ambient_mcp is gone: switch MCP servers per chat with /mcp or the MCP panel".into(),
+        ));
+    }
+
     // All three move something a turn in flight is already using, and nothing else records any of
     // them. `answered_by` is written when a turn's row is born, so changing the brain under a live
     // turn makes that column lie about who answered it; the chat's `cwd` is the ONLY record of where
@@ -674,8 +691,7 @@ pub(super) async fn patch_chat(
         || body.model.is_some()
         || body.effort.is_some()
         || body.cwd.is_some()
-        || body.permission_mode.is_some()
-        || body.ambient_mcp.is_some())
+        || body.permission_mode.is_some())
         && crate::assistant::is_busy(&chat_id)
     {
         return Err(StatusCode::CONFLICT.into());
@@ -782,20 +798,6 @@ pub(super) async fn patch_chat(
     {
         return Err(StatusCode::BAD_REQUEST.into());
     }
-    if let Some(true) = body.ambient_mcp {
-        // Only a conversation with a project can use the ambient servers; one without a
-        // directory is `McpOnly`, which drops them whatever is stored here. A directory this same
-        // request sets counts.
-        if body.cwd.is_none()
-            && crate::chats::cwd_of(&state.pool, &chat_id)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .is_none()
-        {
-            return Err(StatusCode::BAD_REQUEST.into());
-        }
-    }
-
     fn failed(step: &'static str) -> impl FnOnce(sqlx::Error) -> StatusCode {
         move |error| {
             tracing::warn!(%error, step, "editing a conversation failed");
@@ -899,12 +901,6 @@ pub(super) async fn patch_chat(
             .map_err(failed("changing what a conversation may do without asking"))?;
     }
 
-    if let Some(on) = body.ambient_mcp {
-        crate::chats::set_ambient_mcp(&mut *tx, &chat_id, on)
-            .await
-            .map_err(failed("changing a conversation's ambient MCP servers"))?;
-    }
-
     if let Some(title) = body.title.as_deref() {
         crate::chats::rename(&mut *tx, &chat_id, Some(title))
             .await
@@ -929,8 +925,8 @@ pub(super) async fn patch_chat(
         crate::hooks::reconsider_asks(&state, &chat_id, permission_mode).await;
     }
 
-    if respawns || body.ambient_mcp.is_some() {
-        // The next turn respawns (with or without `--strict-mcp-config` for `ambient_mcp`).
+    if respawns {
+        // The next turn respawns.
         crate::assistant::evict_live(&chat_id);
     }
 

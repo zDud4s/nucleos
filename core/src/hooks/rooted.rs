@@ -156,12 +156,16 @@ pub(super) async fn rooted_verdict(
     // rather than the one a living process was spawned for.
     let run_id = payload.run_id;
     if payload.tool_name.starts_with("mcp__") {
-        // An opted-in ambient tool falls through to the classifier, the read_untrusted barrier and
-        // the rung, exactly like a built-in tool. Anything under the `mcp__nucleos__` prefix keeps
-        // the strict NucleOS-only path.
-        let ambient = !payload.tool_name.starts_with("mcp__nucleos__")
-            && crate::chats::ambient_mcp_for_run(&state.pool, run_id).await;
-        if !ambient {
+        // A tool of a registry server enabled for this run's chat falls through to the classifier,
+        // the read_untrusted barrier and the rung, exactly like a built-in tool. Anything under the
+        // `mcp__nucleos__` prefix, and any server the chat has not enabled, keeps the strict
+        // NucleOS-only path.
+        let registry = !payload.tool_name.starts_with("mcp__nucleos__")
+            && crate::chats::mcp_servers::enabled_names_for_run(&state.pool, run_id)
+                .await
+                .iter()
+                .any(|name| crate::chats::mcp_servers::tool_belongs_to(&payload.tool_name, name));
+        if !registry {
             return Rung::Decided(assistant_decision(state, payload).await.0);
         }
     }

@@ -269,27 +269,11 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
                 .join(","),
         });
     }
-    match request.tool_policy {
-        // No tool denial of its own — the classifier governs what an autopilot run may call — but
-        // the ambient MCP servers are nobody's: each one is re-described in full on every turn, and
-        // nothing in the daemon's design calls them. The `--mcp-config` block above still runs, so
-        // a run carrying `request.mcp_config` keeps its nucleos server under the strict flag.
-        //
-        // Only this arm is opt-out-able. `McpOnly` and `None` keep their unconditional strict flag,
-        // where it is a safety property rather than an economy.
-        ToolPolicy::Unrestricted => {
-            if !request.ambient_mcp {
-                args.push("--strict-mcp-config".to_string());
-            }
-        }
-        // Both of the arms below drop every MCP server this user happens to have configured — the
-        // ambient surface a spawned run inherits otherwise includes file-writing connectors. Under
-        // the wildcard it is redundant and passed anyway, so a future narrowing of one is not a
-        // silent widening of the other.
-        ToolPolicy::McpOnly | ToolPolicy::None => {
-            args.push("--strict-mcp-config".to_string());
-        }
-    }
+    // Every policy runs strict: the MCP servers this user happens to have configured are nobody's
+    // here — the ambient surface includes file-writing connectors, and each server is re-described
+    // in full on every turn. A chat's extra servers come in through `--mcp-config` above, beside
+    // nucleos (spec §8.2), so the strict flag never costs a run a server it was meant to have.
+    args.push("--strict-mcp-config".to_string());
     // ONE `--disallowedTools`, holding everything anything wanted denied.
     //
     // The policy's denials and the run's own used to be unable to coexist, and the failure would

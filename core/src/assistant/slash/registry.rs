@@ -37,6 +37,12 @@ const BUILTINS: &[Builtin] = &[
         aliases: &[],
     },
     Builtin {
+        name: "compact",
+        description: "Summarise the conversation into a handoff the next turns start from",
+        hint: Some("[focus]"),
+        aliases: &[],
+    },
+    Builtin {
         name: "context",
         description: "Show what this conversation's context window holds",
         hint: None,
@@ -88,6 +94,12 @@ const BUILTINS: &[Builtin] = &[
         name: "budget",
         description: "Show or set the most one turn may spend",
         hint: Some("[usd|off]"),
+        aliases: &[],
+    },
+    Builtin {
+        name: "mcp",
+        description: "Show, switch or import this chat's MCP servers",
+        hint: Some("[on <name> | off <name> | import]"),
         aliases: &[],
     },
 ];
@@ -497,5 +509,31 @@ mod tests {
                 "/{name} does not resolve"
             );
         }
+    }
+
+    #[test]
+    fn slash_c_registry_lists_compact() {
+        let listed = listing(None, None);
+        let found = listed
+            .iter()
+            .find(|command| command.name == "compact")
+            .expect("/compact is not a built-in");
+        assert_eq!(found.source, Source::Builtin);
+        assert_eq!(found.hint.as_deref(), Some("[focus]"));
+        assert!(found.description.as_deref().is_some_and(|d| !d.is_empty()));
+        assert!(resolve(None, None, "compact").is_some());
+    }
+
+    #[test]
+    fn slash_d_registry_lists_mcp() {
+        let listed = listing(None, None);
+        let found = listed
+            .iter()
+            .find(|command| command.name == "mcp")
+            .expect("/mcp is not a built-in");
+        assert_eq!(found.source, Source::Builtin);
+        assert!(found.description.as_deref().is_some_and(|d| !d.is_empty()));
+        assert!(found.hint.as_deref().is_some_and(|h| !h.is_empty()));
+        assert!(resolve(None, None, "MCP").is_some());
     }
 }

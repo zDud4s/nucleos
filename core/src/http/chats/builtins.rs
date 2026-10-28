@@ -1,5 +1,5 @@
-//! The state-bearing slash built-ins: `/clear`, `/fresh`, `/context`, `/cost`, `/stop`, and the
-//! dispatch of the six configuration ones to `builtins_config`.
+//! The state-bearing slash built-ins: `/clear`, `/fresh`, `/context`, `/cost`, `/stop`, the
+//! dispatch of the six configuration ones to `builtins_config`, and of `/mcp` to `mcp`.
 //!
 //! They live beside the route and not in `assistant::slash` because they call into the HTTP layer's
 //! own state (the pool, the slots, the daemon's model config). `/help` stays in `command.rs`.
@@ -25,6 +25,7 @@ pub(super) fn handles(name: &str) -> bool {
             | "project"
             | "add-dir"
             | "budget"
+            | "mcp"
     )
 }
 
@@ -58,6 +59,7 @@ pub(super) async fn run(
         "model" | "effort" | "permissions" | "project" | "add-dir" | "budget" => {
             super::builtins_config::run(state, chat_id, parsed).await
         }
+        "mcp" => super::mcp::slash(state, chat_id, parsed).await,
         other => Err(SlashError::Internal(format!("no built-in named /{other}"))),
     }
 }
@@ -118,7 +120,11 @@ async fn fresh(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError> {
 /// `/stop`: interrupts the running turn. Nothing running is a notice, not an error.
 async fn stop(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError> {
     use crate::assistant::Stopped;
-    Ok(match crate::assistant::stop_chat(state, chat_id).await {
+    let stopped = crate::assistant::stop_chat(state, chat_id).await;
+    // A killed turn's task is aborted before it settles its compaction, if it was one; an
+    // interrupted one is still running and settles itself.
+    crate::assistant::compaction::settle_stale(&state.pool, chat_id).await;
+    Ok(match stopped {
         Some((_, Stopped::Interrupted)) => card(
             CardKind::Notice,
             json!({ "text": "Stopped the running turn.", "stopped": "interrupted" }),
@@ -174,6 +180,11 @@ async fn context(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError>
         .await
         .map_err(internal)?
         .is_some();
+    // The `/compact` handoff in force, on every engine: null when none or after a `/clear`.
+    let compaction = crate::chats::compactions::active(&state.pool, chat_id)
+        .await
+        .map_err(internal)?
+        .map(|active| json!({ "run_id": active.run_id, "at": active.created_at }));
 
     let mut data = json!({
         "engine": engine.as_str(),
@@ -188,6 +199,7 @@ async fn context(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError>
         "cache_creation_tokens": null,
         "live_session": live_session,
         "compacted": false,
+        "compaction": compaction,
         "turns": rows.len(),
     });
 

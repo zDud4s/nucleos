@@ -2113,6 +2113,20 @@
   font-style: italic;
 }
 
+/* The `/compact` turn's own label: a small tag above the question, in the mark's quiet colours,
+   because asking for a compaction is a deliberate, routine act and not a warning. */
+.chats-turn-label-compaction {
+  margin: 0;
+  align-self: center;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 /* ============================================================= composer == */
 
 /* Narrower than the conversation above it, and centred under it. Both were `.chats-detail`'s one
@@ -3434,6 +3448,43 @@
 
 .chats-slash-dismiss:hover,
 .chats-slash-suggestion:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+/* The `/mcp` card: the registry as this conversation sees it, one checkbox per server. */
+.chats-mcp-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.chats-mcp-panel p {
+  margin: 0;
+}
+
+.chats-mcp-panel li,
+.chats-mcp-import li {
+  padding: var(--space-1) var(--space-2);
+}
+
+.chats-mcp-panel code {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.chats-mcp-panel button {
+  align-self: flex-start;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.chats-mcp-panel button:hover:not(:disabled) {
   background: var(--surface);
   color: var(--text);
 }

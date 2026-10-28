@@ -16,12 +16,17 @@ pub(in crate::http) struct CommandIn {
 }
 
 /// A refusal: a status and an `{error, detail, ...}` body.
-type Refusal = (StatusCode, Json<Value>);
+pub(super) type Refusal = (StatusCode, Json<Value>);
 
 /// How many near names an unknown command suggests.
 const SUGGESTIONS: usize = 5;
 
-fn refuse(status: StatusCode, error: &str, detail: impl Into<String>, extra: Value) -> Refusal {
+pub(super) fn refuse(
+    status: StatusCode,
+    error: &str,
+    detail: impl Into<String>,
+    extra: Value,
+) -> Refusal {
     let mut body = json!({ "error": error, "detail": detail.into() });
     if let (Some(into), Value::Object(from)) = (body.as_object_mut(), extra) {
         into.extend(from);
@@ -29,7 +34,7 @@ fn refuse(status: StatusCode, error: &str, detail: impl Into<String>, extra: Val
     (status, Json(body))
 }
 
-fn internal() -> Refusal {
+pub(super) fn internal() -> Refusal {
     refuse(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
@@ -38,7 +43,7 @@ fn internal() -> Refusal {
     )
 }
 
-fn slash_refusal(error: SlashError) -> Refusal {
+pub(super) fn slash_refusal(error: SlashError) -> Refusal {
     match error {
         SlashError::Unknown { name, suggestions } => refuse(
             StatusCode::NOT_FOUND,
@@ -74,6 +79,18 @@ fn slash_refusal(error: SlashError) -> Refusal {
             StatusCode::UNPROCESSABLE_ENTITY,
             "workflow_unavailable",
             detail,
+            Value::Null,
+        ),
+        SlashError::NothingToCompact => refuse(
+            StatusCode::BAD_REQUEST,
+            "nothing_to_compact",
+            "nothing to compact since the last /clear",
+            Value::Null,
+        ),
+        SlashError::CannotDisableNucleos => refuse(
+            StatusCode::BAD_REQUEST,
+            "cannot_disable_nucleos",
+            "the nucleos server cannot be switched off",
             Value::Null,
         ),
         SlashError::Internal(detail) => {
@@ -164,7 +181,7 @@ async fn workflow_ready(state: &AppState, cwd: Option<&str>) -> Result<(), Slash
 
 /// Where personal and plugin commands are read from: the person's home.
 #[cfg(not(test))]
-fn home() -> Option<std::path::PathBuf> {
+pub(super) fn home() -> Option<std::path::PathBuf> {
     crate::commands::home()
 }
 
@@ -172,12 +189,12 @@ fn home() -> Option<std::path::PathBuf> {
 tokio::task_local! {
     /// Stands in for the person's home in a route test, so one can hold a personal command
     /// without writing to the real one.
-    static TEST_HOME: Option<std::path::PathBuf>;
+    pub(super) static TEST_HOME: Option<std::path::PathBuf>;
 }
 
 /// The test build's `home`: the scoped stand-in when a test set one, else the real home.
 #[cfg(test)]
-fn home() -> Option<std::path::PathBuf> {
+pub(super) fn home() -> Option<std::path::PathBuf> {
     TEST_HOME
         .try_with(Clone::clone)
         .unwrap_or_else(|_| crate::commands::home())
@@ -260,6 +277,11 @@ pub(in crate::http) async fn post_chat_command(
             .map_err(slash_refusal)?;
     }
 
+    // `/compact` is a turn of its own, never queued: busy is a 409.
+    if parsed.name.eq_ignore_ascii_case("compact") {
+        return super::compact::run(&state, &chat_id, &parsed, body.text.trim()).await;
+    }
+
     // The state-bearing built-ins are async and touch the chat; `help` stays in `run_command`.
     // Built-ins are not queued: they run while a turn is in flight, each deciding for itself
     // whether that is a conflict.
@@ -315,33 +337,29 @@ pub(in crate::http) async fn post_chat_command(
                 Ok(crate::assistant::Sent::Queued) => {
                     Ok(Json(json!({ "kind": "prompt", "queued": true })))
                 }
-                Err(msg) if msg == crate::assistant::TURN_IN_PROGRESS => {
-                    Err(slash_refusal(SlashError::Busy))
-                }
-                Err(msg) if msg == crate::assistant::NO_LOCAL_MODEL => Err(refuse(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no_local_model",
-                    "no local model is available",
-                    Value::Null,
-                )),
-                Err(msg) if msg == crate::assistant::NO_HOSTED_MODEL => Err(refuse(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no_hosted_model",
-                    "no hosted model is configured",
-                    Value::Null,
-                )),
-                Err(msg) if msg == crate::assistants::HOSTED_KEY_MISSING => Err(refuse(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no_openrouter_key",
-                    "the hosted model's key is not stored",
-                    Value::Null,
-                )),
-                Err(error) => {
-                    tracing::warn!(%error, "sending a slash command's prompt failed");
-                    Err(internal())
-                }
+                Err(msg) => Err(send_refusal(msg)),
             }
         }
+    }
+}
+
+/// The refusal for a turn that could not be sent: busy, no model, no key, or an internal error.
+pub(super) fn send_refusal(msg: String) -> Refusal {
+    if msg == crate::assistant::TURN_IN_PROGRESS {
+        return slash_refusal(SlashError::Busy);
+    }
+    let unavailable = |error: &str, detail: &str| {
+        refuse(StatusCode::SERVICE_UNAVAILABLE, error, detail, Value::Null)
+    };
+    if msg == crate::assistant::NO_LOCAL_MODEL {
+        unavailable("no_local_model", "no local model is available")
+    } else if msg == crate::assistant::NO_HOSTED_MODEL {
+        unavailable("no_hosted_model", "no hosted model is configured")
+    } else if msg == crate::assistants::HOSTED_KEY_MISSING {
+        unavailable("no_openrouter_key", "the hosted model's key is not stored")
+    } else {
+        tracing::warn!(error = %msg, "sending a slash command's prompt failed");
+        internal()
     }
 }
 
@@ -744,7 +762,7 @@ mod tests {
             images: Vec::new(),
             steerable: false,
             classifier_governs_tools: false,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: None,
             effort: None,
             fallback_model: Vec::new(),
@@ -1216,6 +1234,48 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(after, "running", "the turn was stopped");
+    }
+
+    #[tokio::test]
+    async fn command_b_stop_settles_the_killed_compaction() {
+        use crate::chats::compactions;
+        let state = state().await;
+        let chat = "b-stop-settles-the-killed-compaction";
+        seed_chat(&state, chat, "cloud", None).await;
+        let turn = seed_turn(&state, chat, "running", None, (0, 0)).await;
+        let version = "nucleos-compact v1";
+        compactions::insert_pending(&state.pool, chat, turn, version, "claude", None, None)
+            .await
+            .unwrap();
+        // Killed through its abort handle: the task never reaches its own settle.
+        let task = tokio::spawn(std::future::pending::<()>());
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(turn, task.abort_handle());
+
+        let (status, body) = command(&state, chat, "/stop").await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row: String =
+            sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
+                .bind(turn)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row, "failed",
+            "the stopped compaction does not stay pending"
+        );
+        let notices: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat_notices WHERE chat_id = ? AND kind = ?")
+                .bind(chat)
+                .bind(compactions::NOTICE_KIND)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(notices, 1, "the failed notice is posted");
     }
 
     #[tokio::test]

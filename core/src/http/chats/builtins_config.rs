@@ -80,6 +80,7 @@ async fn patch(
     let (status, detail) = match refusal {
         ChatRefusal::Status(status) => (status, None),
         ChatRefusal::WithDetail(status, detail) => (status, Some(detail)),
+        ChatRefusal::Coded(status, _, detail) => (status, Some(detail)),
     };
     Err(match status {
         StatusCode::CONFLICT => SlashError::Busy,

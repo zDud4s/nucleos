@@ -71,7 +71,7 @@ pub(super) struct SpawnShape {
     fallback_model: Vec<String>,
     max_budget_usd: Option<f64>,
     agents: Vec<crate::execution::runner::Subagent>,
-    ambient_mcp: bool,
+    mcp_servers: Vec<String>,
     mcp_config: Option<std::path::PathBuf>,
     allowed_mcp_tools: Option<Vec<String>>,
     classifier_governs_tools: bool,
@@ -91,7 +91,7 @@ impl SpawnShape {
             fallback_model: request.fallback_model.clone(),
             max_budget_usd: request.max_budget_usd,
             agents: request.agents.clone(),
-            ambient_mcp: request.ambient_mcp,
+            mcp_servers: request.mcp_servers.clone(),
             mcp_config: request.mcp_config.clone(),
             allowed_mcp_tools: request.allowed_mcp_tools.clone(),
             classifier_governs_tools: request.classifier_governs_tools,
@@ -123,7 +123,7 @@ impl SpawnShape {
             fallback_model: Vec::new(),
             max_budget_usd: None,
             agents: Vec::new(),
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             mcp_config: None,
             allowed_mcp_tools: None,
             classifier_governs_tools: false,
@@ -665,12 +665,6 @@ pub(super) fn make_room(
         excess -= 1;
     }
     evicted
-}
-
-/// Whether a turn runs with the user's ambient MCP servers: only when the conversation opted in
-/// and the turn is not restricted to NucleOS's own tools.
-pub fn ambient_mcp_for(policy: crate::execution::runner::ToolPolicy, opted_in: bool) -> bool {
-    opted_in && policy == crate::execution::runner::ToolPolicy::Unrestricted
 }
 
 /// Stops a conversation's process for good, if it has one.

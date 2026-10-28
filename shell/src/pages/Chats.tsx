@@ -53,6 +53,7 @@ import {
 } from "lucide-react";
 import { isApiRefusal } from "../data/client";
 import { SlashCard, sourceLabel } from "../chats/SlashCard";
+import { McpMenuItems } from "../chats/McpPanel";
 import {
   useArchiveChat,
   useChatCommand,
@@ -66,7 +67,6 @@ import {
   useIdeSessions,
   useSetChatProject,
   useSetPermissionMode,
-  useSetAmbientMcp,
   useWireChatTools,
   useSeedChatWorkflow,
   useWireIdeSessionTools,
@@ -1691,7 +1691,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
           <ChatCeiling chatId={chatId} />
           <ChatFallback chatId={chatId} />
           <ChatDenials chatId={chatId} />
-          <AmbientMcpToggle chatId={chatId} />
+          <McpMenuItems chatId={chatId} />
           <DropdownMenuSeparator />
           <DropdownMenuLabel>Context</DropdownMenuLabel>
           {/* The way back to a terminal, moved in here from the top of the transcript. It is
@@ -4477,7 +4477,10 @@ function DepartmentSaid({ notice }: { notice: ChatNotice }) {
 
 const CONTINUE_MESSAGE = "continue";
 
-/** Who is speaking on a notice: NucleOS itself for a restart or an untrusted mark, else a department. */
+/**
+ * Who is speaking on a notice: NucleOS itself for a restart, an untrusted mark or a compaction's
+ * outcome, else a department.
+ */
 function NoticeBlock({
   notice,
   chatId,
@@ -4489,6 +4492,7 @@ function NoticeBlock({
 }) {
   if (notice.kind === "restart") return <RestartNotice notice={notice} chatId={chatId} latest={latest} />;
   if (notice.kind === "untrusted") return <NucleosSaid notice={notice} />;
+  if (notice.kind === "compaction") return <NucleosSaid notice={notice} />;
   return <DepartmentSaid notice={notice} />;
 }
 
@@ -4533,28 +4537,6 @@ function RestartNotice({
   );
 }
 
-/** The per-conversation switch for the user's own MCP servers; only a conversation with tools has one. */
-function AmbientMcpToggle({ chatId }: { chatId: string }) {
-  const project = useChatProject(chatId);
-  const set = useSetAmbientMcp(chatId);
-  if (project.data?.tools !== true) return null;
-  return (
-    /* A row like every other setting here — the name, its value at the end — rather than a
-       checkbox item, whose indent for the tick put this one name out of line with the rest. */
-    <DropdownMenuCheckboxItem
-      className="chats-meta-toggle"
-      checked={project.data.ambient_mcp === true}
-      disabled={set.isPending}
-      title="your own MCP servers, e.g. context7; off by default"
-      onSelect={(event) => event.preventDefault()}
-      onCheckedChange={(on) => set.mutate(on === true)}
-    >
-      Ambient MCP servers
-      <span className="chats-tool-why">{project.data.ambient_mcp === true ? "on" : "off"}</span>
-    </DropdownMenuCheckboxItem>
-  );
-}
-
 /**
  * Memoised: the transcript polls every 1.5–3 s and holds up to a hundred turns a page, each one
  * parsing its answer's markdown when it renders. A settled turn is the same object from one poll to
@@ -4594,6 +4576,9 @@ const TurnBlock = memo(function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
+      {/* A `/compact` the person asked for: its answer is the handoff the next turns start from,
+          so the turn says what it was rather than reading as an ordinary exchange. */}
+      {turn.compaction && <p className="chats-turn-label chats-turn-label-compaction">compaction</p>}
       {/* A spontaneous turn (a background task ended) has no owner message: its prompt is the
           daemon's own note, so no user bubble and no "you" label is drawn, only a small marker. */}
       {turn.unprompted ? (
@@ -6048,6 +6033,7 @@ ${was}`));
         <SlashCard
           key={id}
           card={card}
+          chatId={chatId}
           onDismiss={() => setCards((was) => was.filter((entry) => entry.id !== id))}
         />
       ))}

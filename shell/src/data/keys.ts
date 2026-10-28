@@ -488,6 +488,10 @@ export const keys = {
     /** The commands the front door offers, before a conversation exists to scope them. */
     frontCommands: (query: string) => ["chats", "front-commands", query] as const,
     project: (chatId: string) => ["chats", "project", chatId] as const,
+    /** `GET /assistant/chats/{id}/mcp` — the registry servers as this conversation sees them. */
+    mcp: (chatId: string) => ["chats", "mcp", chatId] as const,
+    /** The prefix of every `mcp(chatId)`: an import changes the list every conversation reads. */
+    mcpAll: ["chats", "mcp"] as const,
     diff: (chatId: string) => ["chats", "diff", chatId] as const,
     /** `GET /assistant/chats/{id}/tasks` — the work a conversation's turns launched. */
     tasks: (chatId: string) => ["chats", "tasks", chatId] as const,
@@ -520,6 +524,11 @@ export const keys = {
 
   council: {
     all: ["council"] as const,
+  },
+
+  /** The MCP server registry, apart from any one conversation. */
+  mcp: {
+    servers: ["mcp", "servers"] as const,
   },
 
   agents: {

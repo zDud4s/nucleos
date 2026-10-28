@@ -523,7 +523,7 @@ mod tests {
             images: Vec::new(),
             steerable: true,
             classifier_governs_tools: false,
-            ambient_mcp: false,
+            mcp_servers: Vec::new(),
             model: model.map(str::to_owned),
             effort: None,
             fallback_model: Vec::new(),

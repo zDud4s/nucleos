@@ -500,7 +500,7 @@ pub async fn ask_once_with_model(
         request_tx: None,
         // The strict default. A spec is a document, and a document being read is not a reason to
         // open a connector to it.
-        ambient_mcp: false,
+        mcp_servers: Vec::new(),
         // `None` keeps whatever the runner was built with, and that is the point of this signature:
         // the owner chose a brain by choosing which runner arrives here, not by naming a model
         // string that only one of the two would honour.

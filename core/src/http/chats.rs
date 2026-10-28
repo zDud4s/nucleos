@@ -5,6 +5,8 @@ use super::*;
 mod builtins;
 mod builtins_config;
 mod command;
+mod compact;
+mod mcp;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -72,6 +74,8 @@ pub(super) fn routes() -> Router<AppState> {
             post(post_fresh_context),
         )
         .route("/assistant/chats/{chat_id}/clear", post(post_clear_context))
+        // The MCP panel and the registry behind it (slash spec §8.3); see `mcp.rs`.
+        .merge(mcp::routes())
 }
 
 /// One exchange in a chat, as it is read back.
@@ -138,6 +142,8 @@ pub(super) struct AssistantTurn {
     /// to draw moved from `session_id` to here, and it says a milder and truer thing: the older
     /// exchanges were summarised at this point, not forgotten at this point.
     pub(super) compacted: bool,
+    /// Whether this turn was a `/compact` turn (it has a `chat_compactions` row, any status).
+    pub(super) compaction: bool,
     /// The conversation that handed this turn its words, or null for the ordinary case — somebody
     /// typed them here.
     ///
@@ -472,9 +478,6 @@ pub(super) struct ChatProjectOut {
     /// `.claude/` is not committed — so a conversation pointed at one still cannot open a file, and
     /// a window that reported only the directory would be telling the truth and misleading at once.
     pub(super) tools: bool,
-    /// Whether this conversation's turns use the user's ambient MCP servers. Off until somebody
-    /// opts in.
-    pub(super) ambient_mcp: bool,
     /// Whether `cwd` is a linked worktree of a project that pins a workflow which was never
     /// materialized into it — the case "Set up workflow" answers.
     pub(super) workflow_missing: bool,
@@ -504,9 +507,6 @@ pub(super) async fn read_chat_project(
     let permission_mode = crate::chats::permission_mode_of(&state.pool, &chat_id)
         .await
         .unwrap_or(crate::chats::PermissionMode::Auto);
-    let ambient_mcp = crate::chats::ambient_mcp_of(&state.pool, &chat_id)
-        .await
-        .unwrap_or(false);
 
     let Some(cwd) = opened_in else {
         return Ok(Json(ChatProjectOut {
@@ -514,7 +514,6 @@ pub(super) async fn read_chat_project(
             session,
             permission_mode,
             tools: false,
-            ambient_mcp,
             workflow_missing: false,
         }));
     };
@@ -552,7 +551,6 @@ pub(super) async fn read_chat_project(
         session,
         permission_mode,
         tools,
-        ambient_mcp,
         workflow_missing,
     }))
 }
@@ -826,6 +824,7 @@ pub(super) async fn get_assistant_chat(
                 r.cost_usd, r.answered_by, r.session_id, r.created_at, r.completed_at,
                 r.model, r.cache_ttl, r.context_fill,
                 r.tools_used, r.thought, r.thought_tokens, r.prompt_images, r.compacted,
+                EXISTS(SELECT 1 FROM chat_compactions cc WHERE cc.run_id = r.id) AS compaction,
                 rel.from_chat_id AS relayed_from_chat_id,
                 src.title        AS relayed_from_title,
                 r.origin

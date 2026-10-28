@@ -205,8 +205,6 @@ export interface ChatProject {
    * materialized into it. Optional: an older daemon omits it, and that reads as false.
    */
   workflow_missing?: boolean;
-  /** Whether this rooted conversation's turns keep the user's own MCP servers. Absent reads as false. */
-  ambient_mcp?: boolean;
 }
 
 /**
@@ -390,7 +388,7 @@ export interface ChatNotice {
   body: string;
   created_at: string;
   /** Who is speaking. Absent means a department, which is what every notice was before this. */
-  kind?: "department" | "restart" | "untrusted";
+  kind?: "department" | "restart" | "untrusted" | "compaction";
 }
 
 /**
@@ -477,6 +475,8 @@ export interface CommandCard {
     | "effort"
     | "dirs"
     | "budget"
+    | "mcp"
+    | "mcp_import"
     | (string & {});
   data: unknown;
 }
@@ -1456,6 +1456,8 @@ function optimisticTurn(id: number, text: string): Turn {
         // Nothing has run, so nothing has been summarised: that is a fact about a turn that ended,
         // and this one has not started.
         compacted: false,
+        // A `/compact` goes through the command route, never this optimistic row.
+        compaction: false,
         // Nothing has been run yet, and this turn has not even reached the CLI. The empty list is
         // the truth about it, not a placeholder — the live view replaces it as calls happen.
         did: [],
@@ -1858,23 +1860,6 @@ export function useSetPermissionMode(chatId: string) {
         queryClient.setQueryData<ChatProject>(keys.chats.project(chatId), context.previous);
       }
     },
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
-  });
-}
-
-/** Turn the user's own MCP servers on or off for this conversation's next turns. */
-export function useSetAmbientMcp(chatId: string) {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (on: boolean) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ ambient_mcp: on }),
-      }),
-    retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });

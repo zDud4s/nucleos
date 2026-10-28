@@ -571,6 +571,21 @@ pub async fn take_pending(
         .map(|(_, prefix, tainted)| Pending { prefix, tainted }))
 }
 
+/// A done `/compact` at `run_id` supersedes every undelivered rotation fired at or before it: they
+/// are marked delivered to it and never prefix a turn. A rotation fired later still wins.
+pub async fn consume_older(pool: &SqlitePool, chat_id: &str, run_id: i64) -> sqlx::Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE root_rotations SET delivered_run_id = ?
+          WHERE chat_id = ? AND delivered_run_id IS NULL AND from_run_id <= ?",
+    )
+    .bind(run_id)
+    .bind(chat_id)
+    .bind(run_id)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// The prefix, a separator line, then the new message.
 pub fn with_prefix(prefix: &str, prompt: &str) -> String {
     format!("{prefix}\n\n---\nThe new message follows.\n\n{prompt}")
@@ -733,6 +748,39 @@ mod tests {
         let prompt = model.seen.lock().unwrap()[0].clone();
         assert!(prompt.contains("new-q") && prompt.contains("PRIOR-PREFIX"));
         assert!(!prompt.contains("old-q"));
+    }
+
+    #[tokio::test]
+    async fn consume_older_marks_only_rotations_at_or_before_the_run() {
+        let pool = pool().await;
+        for (chat, from) in [("c-co", 5), ("c-co", 7), ("c-co", 9), ("c-other", 3)] {
+            sqlx::query(
+                "INSERT INTO root_rotations (chat_id, root_id, from_run_id, prefix, tainted, created_at)
+                 VALUES (?, 'r', ?, ?, 0, '2026-10-28T10:00:00+00:00')",
+            )
+            .bind(chat)
+            .bind(from)
+            .bind(format!("P{from}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(consume_older(&pool, "c-co", 7).await.unwrap(), 2);
+        let delivered: Vec<(i64, Option<i64>)> = sqlx::query_as(
+            "SELECT from_run_id, delivered_run_id FROM root_rotations ORDER BY from_run_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            delivered,
+            vec![(3, None), (5, Some(7)), (7, Some(7)), (9, None)]
+        );
+        let next = take_pending(&pool, "c-co", 10)
+            .await
+            .unwrap()
+            .expect("the newer one");
+        assert_eq!(next.prefix, "P9");
     }
 
     #[test]
