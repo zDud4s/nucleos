@@ -4594,15 +4594,19 @@ const TurnBlock = memo(function TurnBlock({
       {marks.map((mark, index) => (
         <MarkNote key={index} mark={mark} />
       ))}
-      <WhoAsked
-        relayedFrom={turn.relayedFrom}
-        unprompted={turn.unprompted}
-        chatId={chatId}
-        turnId={turn.id}
-      />
+      {/* A spontaneous turn (a background task ended) has no owner message: its prompt is the
+          daemon's own note, so no user bubble and no "you" label is drawn, only a small marker. */}
+      {turn.unprompted ? (
+        <p className="chats-mark chats-mark-restart" role="status">
+          {taskMarkerText(turn.asked)}
+        </p>
+      ) : (
+        <WhoAsked relayedFrom={turn.relayedFrom} chatId={chatId} turnId={turn.id} />
+      )}
       {/* Verbatim, and not through `Rich`: their half is not markdown and is not read as any.
           Somebody who types two asterisks meant two asterisks, and a message redrawn as bold is a
           message they did not send. */}
+      {!turn.unprompted && (
       <AskedBubble text={turn.asked}>
         {/* Editing, in the only sense this app can honestly offer.
             A turn is a billed run that already happened, and its answer is in the record; there is
@@ -4625,6 +4629,7 @@ const TurnBlock = memo(function TurnBlock({
             same. Moving the question to the right made it obvious. */}
         <TurnPictures paths={turn.images} />
       </AskedBubble>
+      )}
       {/* What was said INTO the turn while it worked ("Send now"): the person's own words, drawn
           the way the question is, under the turn they were folded into. */}
       {(turn.saidNow ?? []).map((said, i) => (
@@ -4642,7 +4647,11 @@ const TurnBlock = memo(function TurnBlock({
       {!live && turn.answer !== null && <AnswerBlock text={turn.answer} />}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">
-          no answer recorded
+          {/* `answer` already falls back to the row's error, so null here on a failed turn means
+              nothing at all was recorded about why. */}
+          {turn.status === "failed"
+            ? "Turn failed with no reason recorded"
+            : "no answer recorded"}
         </p>
       )}
       {!live && <RelaySentNote sent={turn.relayedTo} />}
@@ -5227,6 +5236,39 @@ function ToolAnswer({ call, loading }: { call: ToolCall; loading: boolean }) {
 }
 
 /**
+ * The marker drawn for a turn the assistant started on its own.
+ *
+ * Its stored prompt is either a placeholder or the daemon's notification text, e.g.
+ * `[background task abc123 completed]: Background command "x" (exit code 0)`. Neither is the
+ * owner's, so the notification is parsed into a plain sentence and anything else gets a neutral one.
+ */
+function taskMarkerText(prompt: string): string {
+  const status = (word: string) => (word.toLowerCase() === "completed" ? "finished" : word.toLowerCase());
+  const parts: string[] = [];
+  // Batched notices arrive joined with a newline; each line is one notice.
+  for (const raw of prompt.split("\n")) {
+    const line = raw.trim();
+    const task = /^\[background task \S+ (completed|finished|failed|killed)\](?::\s*(.*))?$/i.exec(line);
+    if (task !== null) {
+      let description = (task[2] ?? "").trim();
+      let exit: string | null = null;
+      const code = /\s*\(exit code (-?\d+)\)\s*$/i.exec(description);
+      if (code !== null) {
+        exit = code[1];
+        description = description.slice(0, code.index).trim();
+      }
+      const lead = `background task ${status(task[1])}`;
+      const detail = [description, exit === null ? "" : `exit ${exit}`].filter((s) => s !== "").join(", ");
+      parts.push(detail === "" ? lead : `${lead}: ${detail}`);
+      continue;
+    }
+    const agent = /^\[subagent (.+?) (completed|finished|failed)\]/i.exec(line);
+    if (agent !== null) parts.push(`subagent ${agent[1]} ${status(agent[2])}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : "continued after a background task";
+}
+
+/**
  * Who put the words at the top of this turn there.
  *
  * "you" is the ordinary answer and was the only one until conversations could hand messages to each
@@ -5241,19 +5283,13 @@ function ToolAnswer({ call, loading }: { call: ToolCall; loading: boolean }) {
  */
 function WhoAsked({
   relayedFrom,
-  unprompted,
   chatId,
   turnId,
 }: {
   relayedFrom: RelayedFrom | null;
-  unprompted: boolean;
   chatId: string;
   turnId: number;
 }) {
-  // The words under this label are the daemon's note that a background task ended, not anything a
-  // person typed, so the label says who really started the turn.
-  if (unprompted)
-    return <p className="chats-turn-who chats-turn-who-relayed">the assistant continued on its own</p>;
   if (relayedFrom === null)
     return <p className="chats-turn-who chats-turn-who-you">you</p>;
   return (

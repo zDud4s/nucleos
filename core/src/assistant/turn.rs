@@ -209,7 +209,7 @@ pub(super) async fn spawn_local_turn(
                 sqlx::query(
                     "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
-                .bind(error.to_string())
+                .bind(failure_text(&error.to_string(), None))
                 .bind(&completed_at)
                 .bind(id)
                 .execute(&pool)
@@ -1211,6 +1211,13 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         request.request_tx =
             crate::execution::runs::watch_model_request(&pool, id, runner.as_ref()).await;
 
+        // Dropped with this future, so the follower never outlives the turn (cancel included).
+        let _task_follower = follow_task_events(
+            pool.clone(),
+            turn.slot.chat_id.clone(),
+            id,
+            std::sync::Arc::clone(&transcript),
+        );
         let result = serve_turn_briefed(
             &runner,
             request,
@@ -1429,7 +1436,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     )
                     .bind(status)
                     .bind(o.exit_code)
-                    .bind(&o.stderr)
+                    // Never empty: a failed turn with no stderr would show the owner no reason.
+                    .bind(failure_text(&o.stderr, Some(o.exit_code)))
                     .bind(&o.session_id)
                     .bind(o.cost_usd)
                     .bind(o.input_tokens)
@@ -1450,7 +1458,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                 let failed = sqlx::query(
                     "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                 )
-                .bind(e.to_string())
+                .bind(failure_text(&e.to_string(), None))
                 .bind(&completed_at)
                 .bind(id)
                 .execute(&pool)
@@ -1488,6 +1496,72 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // left waiting for the next person's turn.
         watch_between_turns(&after, &drained_chat);
     });
+}
+
+/// The error a failed turn records. Never empty: the owner sees a failed turn, so it has to say
+/// why. The CLI's stderr (its tail, when long) if it wrote any, else a line naming the exit code.
+pub(super) fn failure_text(stderr: &str, exit_code: Option<i32>) -> String {
+    const TAIL_CHARS: usize = 2000;
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return match exit_code {
+            Some(code) => format!("turn failed with no error output (exit {code})"),
+            None => "turn failed with no error output".to_string(),
+        };
+    }
+    let count = stderr.chars().count();
+    if count <= TAIL_CHARS {
+        return stderr.to_string();
+    }
+    let tail: String = stderr.chars().skip(count - TAIL_CHARS).collect();
+    format!("...{tail}")
+}
+
+/// How often the live task follower looks at the transcript.
+const TASK_FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Stops the task follower when the turn's future ends or is dropped (a `/cancel` aborts it).
+struct StopOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Applies `task_*` lines to the chat's task rows while the turn is still streaming, reading the
+/// transcript the runner mirrors. Before this a notification that arrived mid-turn only landed at
+/// `record_turn` at the turn's end, so AgentMap showed a finished subagent as working.
+fn follow_task_events(
+    pool: SqlitePool,
+    chat_id: String,
+    run_id: i64,
+    transcript: std::sync::Arc<std::sync::Mutex<String>>,
+) -> StopOnDrop {
+    StopOnDrop(tokio::spawn(async move {
+        let mut applied = 0usize;
+        loop {
+            tokio::time::sleep(TASK_FOLLOW_EVERY).await;
+            // Copied out only when a task event arrived, so a quiet stream costs one scan of its
+            // new lines and not a clone of the whole transcript.
+            let snapshot = {
+                let Ok(stream) = transcript.lock() else {
+                    return;
+                };
+                let (end, has_task_event) = crate::chats::tasks::scan_new_lines(&stream, applied);
+                if has_task_event {
+                    Some(stream[..end].to_string())
+                } else {
+                    applied = end;
+                    None
+                }
+            };
+            if let Some(stream) = snapshot {
+                crate::chats::tasks::apply_live(&pool, &chat_id, run_id, &stream, &mut applied)
+                    .await;
+            }
+        }
+    }))
 }
 
 /// How a turn that came back from the CLI is recorded: its status and what it answered.
@@ -1550,6 +1624,46 @@ mod tests {
             progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
             run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
         }
+    }
+
+    /// A failed turn always carries a reason: the CLI's stderr when it wrote some, else a line
+    /// naming the exit code.
+    #[test]
+    fn a_failed_turn_never_records_an_empty_error() {
+        assert_eq!(
+            failure_text("", Some(137)),
+            "turn failed with no error output (exit 137)"
+        );
+        assert_eq!(
+            failure_text("  \n", Some(1)),
+            "turn failed with no error output (exit 1)"
+        );
+        assert_eq!(failure_text("", None), "turn failed with no error output");
+        assert_eq!(failure_text("boom\n", Some(1)), "boom");
+        let long = format!("{}END", "x".repeat(5000));
+        let kept = failure_text(&long, Some(1));
+        assert!(kept.ends_with("END") && kept.len() < 2100, "{}", kept.len());
+    }
+
+    /// A cancelled turn keeps the words it had said, never the raw stream-json (hook lines and all).
+    #[test]
+    fn a_cancelled_turn_stores_text_not_the_raw_stream() {
+        let stream = concat!(
+            r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:resume"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+        );
+        assert_eq!(settled_reply(stream), Some(("cancelled", None)));
+
+        let said = format!(
+            "{}\n{stream}",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"half an answer"}]}}"#
+        );
+        let (status, reply) = settled_reply(&said).expect("a cancelled turn settles");
+        assert_eq!(status, "cancelled");
+        assert_eq!(reply.as_deref(), Some("half an answer"));
     }
 
     /// A linked browser agent's turn that completes hands its answer to its mother, as a relay the

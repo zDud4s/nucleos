@@ -36,13 +36,18 @@ pub async fn resolve_worktree(
 ) -> Result<(PathBuf, String), VerifyError> {
     let (root, run_project) = match caller {
         Caller::Run(id) => {
-            let row: Option<(Option<String>, Option<String>)> =
-                sqlx::query_as("SELECT project_id, cwd FROM runs WHERE id = ?")
+            let row: Option<(Option<String>, Option<String>, Option<String>)> =
+                sqlx::query_as("SELECT project_id, cwd, chat_id FROM runs WHERE id = ?")
                     .bind(id)
                     .fetch_optional(pool)
                     .await
                     .map_err(internal)?;
-            let Some((project_id, Some(cwd))) = row else {
+            let (project_id, cwd, chat_id) = row.unwrap_or_default();
+            let Some(cwd) = cwd else {
+                // A chat turn never stamps `runs.cwd`; its project is the one its chat is rooted in.
+                if let Some(chat_id) = chat_id {
+                    return chat_turn_worktree(pool, id, &chat_id, asked, deadline).await;
+                }
                 return Err(VerifyError::Forbidden(format!(
                     "run {id} has no working directory to verify"
                 )));
@@ -93,7 +98,65 @@ pub async fn resolve_worktree(
             (root, None)
         }
     };
+    confirm_registered(pool, root, run_project, deadline).await
+}
 
+/// A chat turn verifies in the project its chat is rooted in (`chats.cwd`, which `chats` has no
+/// project column to replace). With no worktree asked for it is that root's own worktree; an asked
+/// one must be the project root or another registered worktree of the same project.
+async fn chat_turn_worktree(
+    pool: &SqlitePool,
+    run_id: i64,
+    chat_id: &str,
+    asked: Option<&str>,
+    deadline: Instant,
+) -> Result<(PathBuf, String), VerifyError> {
+    let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM chats WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(internal)?
+        .flatten();
+    let Some(cwd) = cwd else {
+        return Err(VerifyError::Forbidden(format!(
+            "run {run_id} is a turn of a chat with no project directory, so there is no worktree to verify"
+        )));
+    };
+    let chat_root = git_exec::toplevel(Path::new(&cwd), deadline)
+        .await
+        .map_err(|error| {
+            VerifyError::Unprocessable(format!("{cwd} is not a git worktree: {error}"))
+        })?;
+    let chat_project = vcs::project_for_worktree(pool, &chat_root, deadline)
+        .await
+        .map_err(VerifyError::NotFound)?;
+    let root = match asked {
+        None => chat_root,
+        Some(asked) => {
+            if !Path::new(asked).is_absolute() {
+                return Err(VerifyError::BadRequest(format!(
+                    "worktree must be an absolute path, not {asked}"
+                )));
+            }
+            git_exec::toplevel(Path::new(asked), deadline)
+                .await
+                .map_err(|error| {
+                    VerifyError::Unprocessable(format!("{asked} is not a git worktree: {error}"))
+                })?
+        }
+    };
+    // The shared tail refuses a worktree of another project and one git does not list.
+    confirm_registered(pool, root, Some(chat_project), deadline).await
+}
+
+/// The registered-worktree-of-a-known-project check every caller passes: `root` must belong to a
+/// rostered project (the run's own, when it has one) and be listed by that project's git.
+async fn confirm_registered(
+    pool: &SqlitePool,
+    root: PathBuf,
+    run_project: Option<String>,
+    deadline: Instant,
+) -> Result<(PathBuf, String), VerifyError> {
     let project_id = vcs::project_for_worktree(pool, &root, deadline)
         .await
         .map_err(VerifyError::NotFound)?;

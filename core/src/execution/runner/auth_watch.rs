@@ -1,10 +1,13 @@
 //! Which credential the Claude CLI is spending, said to the owner when it changes.
 //!
-//! The CLI picks its own credential: the subscription it is logged in with, and an API key only
-//! when there is no login. Measured 2026-10-19 on CLI 2.1.296: a key in the process environment,
-//! in the user settings' `env` block, or in `--settings` did not displace a live login. The four
-//! conflict resolutions of that morning failed with "Invalid API key" because the login was GONE,
-//! and the CLI fell through to a stale key nobody knew it was holding.
+//! The CLI picks its own credential. Measured 2026-10-19 on CLI 2.1.296, a key in the process
+//! environment did not displace a live login; the four conflict resolutions of that morning failed
+//! with "Invalid API key" because the login was GONE and the CLI fell through to a stale key.
+//! CORRECTED 2026-10-28: a key in the user settings' `env` block DOES displace a live login — with
+//! `ANTHROPIC_API_KEY` there, `claude auth status` (logged in, max) reported
+//! `apiKeySource=ANTHROPIC_API_KEY` and chat turns failed "Invalid API key". The CLI injects that
+//! block itself, so the spawn cannot strip it from the child env ([`inherited_key_to_strip`] only
+//! covers the daemon's own environment); [`settings_env_sets_api_key`] lets the watch say so.
 //!
 //! The daemon does not change that order — the owner's rule is the CLI's rule, subscription first —
 //! and it does not force a key when the subscription hits its limit either: the only switch that
@@ -100,6 +103,60 @@ pub fn api_key_source(init: &serde_json::Value) -> Option<&str> {
     init.get("apiKeySource").and_then(|source| source.as_str())
 }
 
+/// Whether the spawn should remove `ANTHROPIC_API_KEY` from the child's environment: only when a
+/// subscription login is present and the request did not set the key explicitly.
+pub fn inherited_key_to_strip(has_login: bool, request_sets_key: bool) -> bool {
+    has_login && !request_sets_key
+}
+
+/// Whether a `~/.claude/settings.json` text carries `ANTHROPIC_API_KEY` in its `env` block. The CLI
+/// applies that block itself, so the daemon cannot strip it; it can only report it.
+pub fn settings_env_sets_api_key(settings: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(settings)
+        .ok()
+        .and_then(|v| v.get("env")?.get("ANTHROPIC_API_KEY").cloned())
+        .is_some_and(|key| key.as_str().is_none_or(|s| !s.is_empty()))
+}
+
+/// Whether the CLI has a subscription login on disk (`~/.claude/.credentials.json`). Where the
+/// login lives in a keychain (macOS) this reads false and the spawn leaves the env alone.
+pub fn has_subscription_login() -> bool {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .is_some_and(|home| {
+            std::path::Path::new(&home)
+                .join(".claude")
+                .join(".credentials.json")
+                .is_file()
+        })
+}
+
+/// The user settings' text, when readable; for [`settings_env_sets_api_key`].
+pub fn read_user_settings() -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    std::fs::read_to_string(std::path::Path::new(&home).join(".claude").join("settings.json")).ok()
+}
+
+/// Appends the settings hint to a key-auth summary when the key comes from the environment
+/// (`apiKeySource` is `ANTHROPIC_API_KEY`) and the user settings' `env` block sets it.
+pub fn with_settings_hint(
+    summary: String,
+    kind: &str,
+    signal: &AuthSignal,
+    settings_sets_key: bool,
+) -> String {
+    let from_env_key =
+        matches!(signal, AuthSignal::Source(source) if source == "ANTHROPIC_API_KEY");
+    if kind == ON_API_KEY_KIND && from_env_key && settings_sets_key {
+        format!(
+            "{summary} ANTHROPIC_API_KEY is set in ~/.claude/settings.json env and displaces \
+             your login; remove it."
+        )
+    } else {
+        summary
+    }
+}
+
 static SINK: OnceLock<UnboundedSender<AuthSignal>> = OnceLock::new();
 
 /// Starts the watch: from now on every signal a Claude run reports is weighed, and a change is
@@ -113,11 +170,15 @@ pub fn watch_claude_auth(pool: SqlitePool) {
     tokio::spawn(async move {
         let mut watch = AuthWatch::default();
         while let Some(signal) = rx.recv().await {
-            if let Some((kind, summary)) = watch.on(&signal)
-                && let Err(error) =
+            if let Some((kind, summary)) = watch.on(&signal) {
+                let settings_sets_key = read_user_settings()
+                    .is_some_and(|text| settings_env_sets_api_key(&text));
+                let summary = with_settings_hint(summary, kind, &signal, settings_sets_key);
+                if let Err(error) =
                     crate::feed::append(&pool, None, kind, &summary, None, None).await
-            {
-                tracing::warn!(%error, kind, "auth watch could not write the feed");
+                {
+                    tracing::warn!(%error, kind, "auth watch could not write the feed");
+                }
             }
         }
     });
@@ -136,6 +197,44 @@ mod tests {
 
     fn source(s: &str) -> AuthSignal {
         AuthSignal::Source(s.to_string())
+    }
+
+    #[test]
+    fn key_is_stripped_only_with_a_login_and_no_explicit_key() {
+        assert!(inherited_key_to_strip(true, false));
+        assert!(!inherited_key_to_strip(false, false));
+        assert!(!inherited_key_to_strip(true, true));
+    }
+
+    #[test]
+    fn settings_env_key_is_detected() {
+        assert!(settings_env_sets_api_key(
+            r#"{"env":{"ANTHROPIC_API_KEY":"sk-x"}}"#
+        ));
+        assert!(!settings_env_sets_api_key(r#"{"env":{"OTHER":"1"}}"#));
+        assert!(!settings_env_sets_api_key(r#"{"env":{"ANTHROPIC_API_KEY":""}}"#));
+        assert!(!settings_env_sets_api_key("not json"));
+    }
+
+    #[test]
+    fn settings_hint_only_for_an_env_key_set_in_settings() {
+        let signal = source("ANTHROPIC_API_KEY");
+        let base = "base.".to_string();
+        let hinted = with_settings_hint(base.clone(), ON_API_KEY_KIND, &signal, true);
+        assert!(hinted.starts_with("base."), "{hinted}");
+        assert!(hinted.contains("~/.claude/settings.json"), "{hinted}");
+        assert_eq!(
+            with_settings_hint(base.clone(), ON_API_KEY_KIND, &signal, false),
+            base
+        );
+        assert_eq!(
+            with_settings_hint(base.clone(), ON_API_KEY_KIND, &source("apiKeyHelper"), true),
+            base
+        );
+        assert_eq!(
+            with_settings_hint(base.clone(), ON_SUBSCRIPTION_KIND, &signal, true),
+            base
+        );
     }
 
     #[test]

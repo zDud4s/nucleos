@@ -49,11 +49,13 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
         // taking the process ends this reader.
         let mut recorded = 0_usize;
         let mut tick = BETWEEN_TURNS_TICK;
+        // When the first notice of the current batch was held back (see [`hold_wake`]).
+        let mut held_since: Option<std::time::Instant> = None;
         loop {
             tokio::time::sleep(tick).await;
             // No lock is held across an await: the guard lives only in this block. An entry that is
             // gone (a turn took it) or owned by a newer reader ends this one.
-            let (begun, task_lines, has_set_aside, grew) = {
+            let (begun, task_lines, has_set_aside, grew, notice_lines) = {
                 let mut kept = relock(&LIVE_CHATS);
                 match kept.get_mut(&chat_id) {
                     Some(live) if live.watcher == token => {
@@ -76,21 +78,42 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
                             .collect();
                         let grew = live.carried.len() != recorded;
                         recorded = live.carried.len();
+                        let notice_lines = if begun {
+                            notice_task_lines(&live.carried)
+                        } else {
+                            Vec::new()
+                        };
                         (
                             begun,
                             fresh,
                             relock(&SET_ASIDE).contains_key(&chat_id),
                             grew,
+                            notice_lines,
                         )
                     }
                     _ => return,
                 }
             };
-            tick = next_between_turns_tick(tick, begun || grew || has_set_aside);
             // A task that ends between turns is recorded now, not when a later turn reads the line.
             for line in &task_lines {
                 crate::chats::tasks::apply_line(&state.pool, &chat_id, line).await;
             }
+            // Batching: a notification that leaves sibling tasks still running does not wake a turn
+            // of its own; the notices stay in `carried` and the last one to settle wakes them all.
+            // The CLI often delivers a finish only as a `user` notice, which `apply_line` ignores:
+            // settle the rows those notices name, or the task that just ended counts as its own sibling.
+            for line in &notice_lines {
+                crate::chats::tasks::apply_line(&state.pool, &chat_id, line).await;
+            }
+            let held = if begun && !notice_lines.is_empty() {
+                let since = *held_since.get_or_insert_with(std::time::Instant::now);
+                let others = running_tasks(&state.pool, &chat_id).await;
+                hold_wake(others, since.elapsed())
+            } else {
+                held_since = None;
+                false
+            };
+            tick = next_between_turns_tick(tick, (begun && !held) || grew || has_set_aside);
             // An answer a person's message interrupted was set aside whole by `LiveChat::turn`. The
             // turn that set it aside records it before letting go of the slot; whatever still waits
             // (that turn was cancelled first) is recorded here, as the turn of its own that it was.
@@ -100,7 +123,7 @@ pub(super) fn watch_between_turns(state: &crate::state::AppState, chat_id: &str)
                 record_set_aside(&state, &chat_id).await;
                 drop(slot);
             }
-            if !begun {
+            if !begun || held {
                 continue;
             }
             // A person's turn owns the slot, and its `gather` reads `carried` first.
@@ -465,6 +488,48 @@ pub(super) async fn close_spontaneous(
     crate::execution::runs::warn_on_terminal_write_err(&written, id, status);
 }
 
+/// The longest a task notification is held back waiting for its sibling tasks to settle. A stuck
+/// task therefore delays the chat's wake-up by this much at most, never starves it.
+pub(super) const MAX_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A task row still `running` after this long is taken for stale (its process was lost without the
+/// row closing) and no longer holds a wake-up back.
+const STALE_TASK: chrono::Duration = chrono::Duration::hours(2);
+
+/// PURE: whether a wake-up carrying task notifications waits for more. It waits while other tasks
+/// of the chat are still running, so one turn answers the whole batch instead of one turn per
+/// completion saying "still waiting for N agents", and never longer than [`MAX_BATCH_WAIT`].
+pub(super) fn hold_wake(other_running: usize, waited: std::time::Duration) -> bool {
+    other_running > 0 && waited < MAX_BATCH_WAIT
+}
+
+/// How many tasks the chat launched are still `running` and not stale. A read that fails counts as
+/// none, so a broken database never holds a wake-up back.
+async fn running_tasks(pool: &SqlitePool, chat_id: &str) -> usize {
+    let started: Vec<String> = sqlx::query_scalar(
+        "SELECT started_at FROM chat_tasks WHERE chat_id = ? AND status = 'running'",
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let cutoff = chrono::Utc::now() - STALE_TASK;
+    started
+        .iter()
+        .filter(|at| {
+            chrono::DateTime::parse_from_rfc3339(at)
+                .map_or(true, |at| at.with_timezone(&chrono::Utc) > cutoff)
+        })
+        .count()
+}
+
+/// The window fill a stream ended at, read the way a person's turn reads it.
+fn context_fill_of(stdout: &str) -> Option<i64> {
+    stdout.lines().fold(None, |fill, line| {
+        crate::execution::runner::context_fill_from_line(line, fill)
+    })
+}
+
 /// Writes a spontaneous turn's answer the way a person's turn writes its own, without sharing the
 /// block: the numbers are the turn's, taken off the outcome the splitter built for it.
 pub(super) async fn record_spontaneous_answer(
@@ -492,7 +557,7 @@ pub(super) async fn record_spontaneous_answer(
     // The rows must exist before the turn stops being `running`, or a live task's next call finds no authority.
     crate::chats::tasks::record_turn(pool, chat_id, id, &o.stdout).await;
     let completed = sqlx::query(
-        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, compacted = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
+        "UPDATE runs SET status = 'completed', exit_code = ?, stdout = ?, session_id = COALESCE(?, session_id), cost_usd = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, num_turns = ?, tools_used = ?, thought = ?, thought_tokens = ?, context_fill = ?, compacted = ?, model = COALESCE(?, model), completed_at = ? WHERE id = ? AND status = 'running'",
     )
     .bind(o.exit_code)
     .bind(&reply)
@@ -506,6 +571,7 @@ pub(super) async fn record_spontaneous_answer(
     .bind(&tools_used)
     .bind(&thought)
     .bind(stream.thought_tokens)
+    .bind(context_fill_of(&o.stdout))
     .bind(o.compacted)
     .bind(&model)
     .bind(completed_at)
@@ -815,5 +881,83 @@ mod tests {
                 .is_some_and(|out| out.contains("second on its own")),
             "{recorded:?}"
         );
+    }
+
+    /// A notification that leaves siblings running waits for them, up to the safety valve.
+    #[test]
+    fn a_wake_waits_for_sibling_tasks_but_never_past_the_valve() {
+        assert!(!hold_wake(0, Duration::ZERO), "the last task wakes at once");
+        assert!(hold_wake(2, Duration::from_secs(5)));
+        assert!(hold_wake(1, MAX_BATCH_WAIT - Duration::from_secs(1)));
+        assert!(
+            !hold_wake(1, MAX_BATCH_WAIT),
+            "a stuck task must not starve the chat"
+        );
+    }
+
+    async fn running_row(pool: &SqlitePool, chat: &str, task: &str) {
+        sqlx::query(
+            "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, task_id, kind, status, started_at)
+             VALUES (?, 0, ?, ?, 'bash', 'running', ?)",
+        )
+        .bind(chat)
+        .bind(format!("toolu_{task}"))
+        .bind(task)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("insert task row");
+    }
+
+    fn user_notice(task: &str) -> std::collections::VecDeque<TurnEvent> {
+        let line = serde_json::json!({"type": "user", "message": {"content": format!(
+            "<task-notification>
+<task-id>{task}</task-id>
+<status>completed</status>
+</task-notification>")}})
+        .to_string();
+        std::iter::once(TurnEvent::Line(line)).collect()
+    }
+
+    /// A lone `user`-line notice settles its own row, so nothing holds the wake; with a sibling
+    /// still running the wake is held.
+    #[tokio::test]
+    async fn a_user_line_notice_settles_its_task_before_siblings_are_counted() {
+        let state = test_state().await;
+        let (lone, pair) = ("notice-lone-chat", "notice-pair-chat");
+        running_row(&state.pool, lone, "t1").await;
+        running_row(&state.pool, pair, "t1").await;
+        running_row(&state.pool, pair, "t2").await;
+        for chat in [lone, pair] {
+            for line in notice_task_lines(&user_notice("t1")) {
+                crate::chats::tasks::apply_line(&state.pool, chat, &line).await;
+            }
+        }
+        let held = |n| hold_wake(n, Duration::ZERO);
+        assert!(!held(running_tasks(&state.pool, lone).await));
+        assert!(held(running_tasks(&state.pool, pair).await));
+    }
+
+    /// A spontaneous answer records how full the window got, as a person's turn does.
+    #[tokio::test]
+    async fn a_spontaneous_answer_records_its_context_fill() {
+        let state = test_state().await;
+        let chat = "spontaneous-fill-chat";
+        let (id, _) = open_task_run(&state, chat, "p", &None, Some(("auto", Vec::new())), None)
+            .await
+            .expect("the run row was not written");
+        let stdout = [
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":90},"content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"hi"}"#,
+        ]
+        .join("\n");
+        let o = gathered(TurnOutcome::default(), stdout, "s-1".to_owned());
+        record_spontaneous_answer(&state.pool, id, chat, &o, "2026-10-28T00:00:00Z").await;
+        let fill: Option<i64> = sqlx::query_scalar("SELECT context_fill FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(fill, Some(100));
     }
 }
