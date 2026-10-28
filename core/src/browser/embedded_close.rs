@@ -102,7 +102,10 @@ mod tests {
         .expect("insert");
     }
 
-    async fn state_of(pool: &sqlx::SqlitePool, sidecar_id: &str) -> (Option<String>, Option<String>) {
+    async fn state_of(
+        pool: &sqlx::SqlitePool,
+        sidecar_id: &str,
+    ) -> (Option<String>, Option<String>) {
         sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT closed_at, closed_reason FROM browser_sessions WHERE sidecar_id = ?",
         )
