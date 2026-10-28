@@ -777,8 +777,10 @@ pub async fn confirm_measured_tree(
     submitted: String,
 ) {
     let started = Instant::now();
+    // Read without classifying: this detached wait must not start a master proof, nor settle a
+    // classification before the reader that can start one (the asker's own wait) gets to it.
     let ticket = loop {
-        match read_ticket(&pool, id).await {
+        match read_ticket_with(&pool, None, id, false).await {
             Ok(Some((ticket, _))) if ticket.done => break ticket,
             Ok(Some(_)) => {}
             Ok(None) => return,
@@ -3681,7 +3683,8 @@ tests:
         let incident = live_master_red(&f.pool).await.expect("incident");
         assert_eq!(
             (a.verdict.as_deref(), b.verdict.as_deref()),
-            (Some("inherited"), Some("inherited"))
+            (Some("inherited"), Some("inherited")),
+            "tickets: {a:?} / {b:?}"
         );
         assert_eq!(
             (a.inherited_task_ids, b.inherited_task_ids),
