@@ -284,6 +284,34 @@ class Prompt(CliCase):
         self.assertIn("node.md", self.refused(*base, "--branch", "core", "--kind", "review"))
 
 
+class Containment(unittest.TestCase):
+    """`tree.contained` and `tree.normalize_paths` against the daemon's `check_containment`."""
+
+    DIR = ".claude/worktrees/slash-cd"
+
+    def test_literal_owned_path_is_a_file_or_a_directory(self):
+        owned = [self.DIR]
+        for inside in [self.DIR, f"{self.DIR}/core/src/x.rs", f"{self.DIR}/**", f"{self.DIR}/core/*.rs"]:
+            self.assertTrue(tree.contained(inside, owned), inside)
+        for outside in [f"{self.DIR}-evil", f"{self.DIR}-evil/x.rs", f"{self.DIR}*", ".claude/worktrees",
+                        "other/x.rs"]:
+            self.assertFalse(tree.contained(outside, owned), outside)
+
+    def test_trailing_slash_and_backslashes(self):
+        owned = [f"{self.DIR}/"]
+        self.assertTrue(tree.contained(f"{self.DIR}/x.rs", owned))
+        self.assertTrue(tree.contained(f"{self.DIR}/**", owned))
+        self.assertFalse(tree.contained(f"{self.DIR}-evil/**", owned))
+        [child] = tree.normalize_paths([".claude\\worktrees\\slash-cd\\x.rs"])
+        self.assertTrue(tree.contained(child, tree.normalize_paths([".claude\\worktrees\\slash-cd"])))
+
+    def test_normalize_paths_refuses_dotdot_and_absolute(self):
+        for bad in ["a/../b", "..\\x", "/etc/x", "C:/x"]:
+            with self.assertRaises(tree.TreeError, msg=bad):
+                tree.normalize_paths([bad])
+        self.assertEqual(tree.normalize_paths(["./a/b"]), ["a/b"])
+
+
 class Status(CliCase):
     NOW = "2026-10-21T12:00:00+00:00"
 

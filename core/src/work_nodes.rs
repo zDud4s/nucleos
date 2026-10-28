@@ -351,10 +351,20 @@ fn segments_match(pattern: &[&str], text: &[&str]) -> bool {
     }
 }
 
+/// Whether `child` is `dir` itself or lies under it, at a segment boundary.
+fn under_dir(child: &str, dir: &str) -> bool {
+    child == dir
+        || child
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// **Pure.** Whether every file the `child` glob can name is also named by the `parent` glob. Both
 /// arguments must already be `normalise_glob` output. Conservative: when unsure, `false`.
 ///
-/// - parent without wildcards: the child must be equal to it;
+/// - parent without wildcards: a file or a directory. The child is the parent itself or starts
+///   with `<parent>/` (a segment boundary, so `core/srcx` is not inside `core/src`), and may carry
+///   wildcards after that; the same rule as `<prefix>/**` below;
 /// - parent `<prefix>/**` with a wildcard-free prefix: the child is the prefix itself, or starts
 ///   with `<prefix>/` (a segment boundary, so `core/srcx` is not inside `core/src/**`), and may
 ///   carry wildcards after that;
@@ -363,15 +373,12 @@ fn segments_match(pattern: &[&str], text: &[&str]) -> bool {
 ///   `{` contains nothing, because those forms are not understood here.
 pub fn path_contained(child: &str, parent: &str) -> bool {
     if !has_wildcard(parent) {
-        return child == parent;
+        return under_dir(child, parent);
     }
     if let Some(prefix) = parent.strip_suffix("/**")
         && !has_wildcard(prefix)
     {
-        return child == prefix
-            || child
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/'));
+        return under_dir(child, prefix);
     }
     if has_wildcard(child) || parent.contains(['[', '{']) {
         return false;
@@ -1064,6 +1071,8 @@ mod tests {
         assert!(globs_overlap("**", "core/b/x.rs"));
         assert!(globs_overlap("./src/**", "src\\lib.rs"));
         assert!(!globs_overlap("src/a.rs", "src/b.rs"));
+        assert!(globs_overlap("a/b", "a/b/x.rs"));
+        assert!(globs_overlap("a/b", "a/b/**"));
         let a = vec!["x/**".to_owned(), "y/**".to_owned()];
         let b = vec!["z/**".to_owned(), "y/q.rs".to_owned()];
         assert_eq!(
@@ -1103,12 +1112,33 @@ mod tests {
     }
 
     #[test]
-    fn path_contained_literal_parent_needs_equality() {
+    fn path_contained_literal_parent_is_a_file_or_a_directory() {
+        let dir = ".claude/worktrees/slash-cd";
         assert!(path_contained("core/src/a.rs", "core/src/a.rs"));
+        // A literal parent may be a directory, so a sub-path is inside it.
+        assert!(path_contained("core/src/a.rs/x", "core/src/a.rs"));
+        for inside in [
+            ".claude/worktrees/slash-cd/core/src/x.rs",
+            ".claude/worktrees/slash-cd/**",
+            ".claude/worktrees/slash-cd/core/*.rs",
+            ".claude/worktrees/slash-cd/a/**/b?.rs",
+        ] {
+            assert!(path_contained(inside, dir), "{inside:?}");
+        }
+
         assert!(!path_contained("core/src/b.rs", "core/src/a.rs"));
         // A wildcard child is wider than a literal parent.
         assert!(!path_contained("core/src/*.rs", "core/src/a.rs"));
-        assert!(!path_contained("core/src/a.rs/x", "core/src/a.rs"));
+        for outside in [
+            ".claude/worktrees/slash-cd-evil",
+            ".claude/worktrees/slash-cd-evil/x.rs",
+            ".claude/worktrees/slash-cd*",
+            ".claude/worktrees/slash-c",
+            ".claude/worktrees",
+            "other/x.rs",
+        ] {
+            assert!(!path_contained(outside, dir), "{outside:?}");
+        }
     }
 
     #[test]
@@ -1350,6 +1380,49 @@ mod tests {
     }
 
     #[test]
+    fn check_containment_literal_parent_takes_sub_paths() {
+        for owned in [
+            ".claude/worktrees/slash-cd",
+            ".claude/worktrees/slash-cd/",
+            ".claude\\worktrees\\slash-cd",
+        ] {
+            let parent = owning("orchestrator", &[owned]);
+            for inside in [
+                ".claude/worktrees/slash-cd",
+                ".claude/worktrees/slash-cd/core/src/x.rs",
+                ".claude/worktrees/slash-cd/**",
+                ".claude\\worktrees\\slash-cd\\core\\src\\x.rs",
+                "./.claude/worktrees/slash-cd/shell/**",
+            ] {
+                let accepted = check_containment(&parent, &strings(&[inside]));
+                assert!(accepted.is_ok(), "{owned:?} / {inside:?}: {accepted:?}");
+            }
+            for outside in [
+                ".claude/worktrees/slash-cd-evil/x.rs",
+                ".claude/worktrees/slash-cd*",
+                "core/src/x.rs",
+            ] {
+                let refused = check_containment(&parent, &strings(&[outside]));
+                assert!(
+                    matches!(refused, Err(NodeError::Conflict(_))),
+                    "{owned:?} / {outside:?}: {refused:?}"
+                );
+            }
+            for bad in [
+                ".claude/worktrees/slash-cd/../other/x.rs",
+                "/.claude/worktrees/slash-cd/x",
+                "C:/x",
+            ] {
+                let refused = check_containment(&parent, &strings(&[bad]));
+                assert!(
+                    matches!(refused, Err(NodeError::Invalid(_))),
+                    "{owned:?} / {bad:?}: {refused:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn check_containment_other_wildcard_parent() {
         let parent = owning("orchestrator", &["src/*.rs"]);
         assert!(check_containment(&parent, &strings(&["src/lib.rs"])).is_ok());
@@ -1406,6 +1479,48 @@ mod tests {
             ("reviewer", vec![]),
         ] {
             let args = child_args(&orch.id, "leaf", title, &paths);
+            open(&pool, None, &limits, &args)
+                .await
+                .unwrap_or_else(|e| panic!("{title}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn open_accepts_sub_paths_of_a_literal_parent_path() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let root = open(&pool, None, &limits, &root_args()).await.unwrap();
+        let orch = child_args(
+            &root.id,
+            "orchestrator",
+            "Slash",
+            &[".claude/worktrees/slash-cd"],
+        );
+        let orch = open(&pool, None, &limits, &orch).await.unwrap();
+
+        // No running siblings yet, so every refusal here is the containment one.
+        for outside in [".claude/worktrees/slash-cd-evil/x.rs", "other/x.rs"] {
+            let args = child_args(&orch.id, "leaf", "stray", &[outside]);
+            let refused = open(&pool, None, &limits, &args).await;
+            assert!(
+                matches!(refused, Err(NodeError::Conflict(_))),
+                "{outside}: {refused:?}"
+            );
+        }
+        let args = child_args(
+            &orch.id,
+            "leaf",
+            "dotdot",
+            &[".claude/worktrees/slash-cd/../x"],
+        );
+        let refused = open(&pool, None, &limits, &args).await;
+        assert!(matches!(refused, Err(NodeError::Invalid(_))), "{refused:?}");
+
+        for (title, path) in [
+            ("leaf-file", ".claude/worktrees/slash-cd/core/src/x.rs"),
+            ("leaf-dir", ".claude/worktrees/slash-cd/shell/**"),
+        ] {
+            let args = child_args(&orch.id, "leaf", title, &[path]);
             open(&pool, None, &limits, &args)
                 .await
                 .unwrap_or_else(|e| panic!("{title}: {e}"));
