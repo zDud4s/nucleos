@@ -191,6 +191,12 @@ impl CommandRunner for ClaudeCliRunner {
         if let Some((name, value)) = background_off {
             cmd.env(name, value);
         }
+        if super::auth_watch::inherited_key_to_strip(
+            super::auth_watch::has_subscription_login(),
+            request.env.iter().any(|(k, _)| k.as_str() == "ANTHROPIC_API_KEY"),
+        ) {
+            cmd.env_remove("ANTHROPIC_API_KEY");
+        }
         for (k, v) in &request.env {
             cmd.env(k, v);
         }

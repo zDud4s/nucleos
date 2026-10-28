@@ -53,7 +53,7 @@ fn cut(text: &str) -> String {
 }
 
 /// PURE: the task a call launched, or `None` for a call that launches none (or carries no id).
-fn launched(call: &crate::execution::runner::ToolCall) -> Option<Launch> {
+fn launched(call: &crate::execution::runner::ToolCall, live: bool) -> Option<Launch> {
     let tool_use_id = call.id.clone()?;
     let spawns = matches!(call.name.as_str(), "Task" | "Agent");
     if !spawns && !call.background {
@@ -77,6 +77,9 @@ fn launched(call: &crate::execution::runner::ToolCall) -> Option<Launch> {
         } else {
             "completed"
         }
+    } else if live {
+        // Partial stream: the foreground subagent may still be answering.
+        "running"
     } else {
         // A foreground subagent whose turn ended before it answered ended with that turn.
         "stopped"
@@ -170,9 +173,21 @@ fn task_update(line: &str) -> Option<TaskUpdate> {
 /// Records every task a turn launched, then every task event in its stream. Best effort: a
 /// failed write is logged and never fails the turn.
 pub async fn record_turn(pool: &SqlitePool, chat_id: &str, run_id: i64, stdout: &str) {
+    record_turn_inner(pool, chat_id, run_id, stdout, false).await;
+}
+
+/// `live` marks a pass over a PARTIAL stream: a foreground launch without its answer is still in
+/// flight there, so it stays `running` instead of being closed as `stopped`.
+async fn record_turn_inner(
+    pool: &SqlitePool,
+    chat_id: &str,
+    run_id: i64,
+    stdout: &str,
+    live: bool,
+) {
     let now = chrono::Utc::now().to_rfc3339();
     let calls = crate::execution::runner::live_from_stream(stdout).did;
-    for launch in calls.iter().filter_map(launched) {
+    for launch in calls.iter().filter_map(|call| launched(call, live)) {
         // A row already closed keeps its end: the upsert only rewrites a `running` row.
         let written = sqlx::query(
             "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, task_id, kind,
@@ -240,6 +255,48 @@ pub async fn apply_line(pool: &SqlitePool, chat_id: &str, line: &str) {
     .await;
     if let Err(error) = written {
         tracing::warn!(chat_id = %chat_id, %error, "could not record a chat task's event");
+    }
+}
+
+/// Looks at the complete lines of `stream` past byte offset `applied` and answers where those lines
+/// end plus whether any of them is a task event (`task_started` / `task_updated` /
+/// `task_notification`). A trailing partial line is left for the next call, and an offset that is
+/// not usable (past the end, or not on a char boundary) restarts from the beginning.
+pub fn scan_new_lines(stream: &str, applied: usize) -> (usize, bool) {
+    let from = if stream.is_char_boundary(applied) {
+        applied
+    } else {
+        0
+    };
+    let fresh = &stream[from..];
+    let Some(last_newline) = fresh.rfind('\n') else {
+        return (from, false);
+    };
+    let complete = &fresh[..=last_newline];
+    (
+        from + complete.len(),
+        complete.lines().any(|line| task_update(line).is_some()),
+    )
+}
+
+/// Applies the task events that a LIVE stream has gained since byte offset `*applied`, so a task
+/// that ends mid-turn stops reading `running` now instead of at the turn's end. `stream` is the
+/// text so far (a snapshot of the turn's transcript); `*applied` is advanced past what was looked
+/// at. When new complete lines hold a task event the whole complete prefix goes through
+/// [`record_turn`], which is what creates the row of a launch the event refers to; the upsert and
+/// [`apply_line`] only move rows out of `running`, so the turn's own end-of-turn `record_turn`
+/// over the full stdout repeats this harmlessly.
+pub async fn apply_live(
+    pool: &SqlitePool,
+    chat_id: &str,
+    run_id: i64,
+    stream: &str,
+    applied: &mut usize,
+) {
+    let (end, has_task_event) = scan_new_lines(stream, *applied);
+    *applied = end;
+    if has_task_event {
+        record_turn_inner(pool, chat_id, run_id, &stream[..end], true).await;
     }
 }
 
@@ -328,6 +385,54 @@ mod tests {
 
     const BG_UPDATED: &str = r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"completed","end_time":1791021626000}}"#;
     const BG_NOTIFIED: &str = r#"{"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"toolu_bg","status":"completed","summary":"(exit code 0)","usage":{"total_tokens":321}}"#;
+
+    /// A notification that arrives while the turn is still streaming closes its row at once, and
+    /// the same stream applied again at the turn's end changes nothing.
+    #[tokio::test]
+    async fn a_notification_mid_turn_is_applied_live_and_idempotently() {
+        let pool = test_pool().await;
+        let launched = format!("{LAUNCHES}\n");
+        let mut applied = 0usize;
+
+        apply_live(&pool, "chat-1", 7, &launched, &mut applied).await;
+        assert_eq!(row(&pool, "toolu_bg").await.status, "running");
+        assert_eq!(applied, launched.len());
+
+        // The line is still half written: nothing is applied and nothing is skipped.
+        let partial = format!("{launched}{}", &BG_NOTIFIED[..20]);
+        apply_live(&pool, "chat-1", 7, &partial, &mut applied).await;
+        assert_eq!(applied, launched.len());
+
+        let streamed = format!("{launched}{BG_NOTIFIED}\n");
+        apply_live(&pool, "chat-1", 7, &streamed, &mut applied).await;
+        let bash = row(&pool, "toolu_bg").await;
+        assert_eq!(bash.status, "completed");
+        assert_eq!(bash.total_tokens, Some(321));
+
+        record_turn(&pool, "chat-1", 7, &streamed).await;
+        let again = row(&pool, "toolu_bg").await;
+        assert_eq!(again.status, "completed");
+        assert_eq!(again.finished_at, bash.finished_at);
+        assert_eq!(for_chat(&pool, "chat-1").await.unwrap().len(), 3);
+    }
+
+    /// A foreground subagent still in flight when a task event arrives stays `running`; the full
+    /// stream then closes it with its real status.
+    #[tokio::test]
+    async fn a_live_pass_leaves_an_unanswered_foreground_task_running() {
+        let pool = test_pool().await;
+        let call = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"toolu_fg","name":"Task","input":{"description":"d","prompt":"p","subagent_type":"Explore"}}]}}"#;
+        let answer = r#"{"type":"user","parent_tool_use_id":null,"timestamp":"2026-10-06T10:00:05.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_fg","content":"done"}]},"tool_use_result":{"status":"completed","totalTokens":9}}"#;
+        let partial = format!("{call}\n{BG_UPDATED}\n");
+        let mut applied = 0usize;
+
+        apply_live(&pool, "chat-1", 7, &partial, &mut applied).await;
+        assert_eq!(row(&pool, "toolu_fg").await.status, "running");
+
+        let full = format!("{partial}{answer}\n");
+        record_turn(&pool, "chat-1", 7, &full).await;
+        assert_eq!(row(&pool, "toolu_fg").await.status, "completed");
+    }
 
     #[tokio::test]
     async fn a_launch_in_a_turn_is_a_running_row() {
