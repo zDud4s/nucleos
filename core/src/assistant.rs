@@ -7889,7 +7889,14 @@ mod tests {
             let fingerprint = spawn_fingerprint(&answering, None, policy);
             serde_json::from_str::<serde_json::Value>(&fingerprint).unwrap()["mcp_servers"].clone()
         };
-        assert_eq!(listed(ToolPolicy::Unrestricted), serde_json::json!(["gh"]));
+        // Each entry is `name:<definition hash>`, so a redefined server respawns the session.
+        let unrestricted = listed(ToolPolicy::Unrestricted);
+        let entries = unrestricted.as_array().expect("an array of servers");
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].as_str().unwrap().starts_with("gh:"),
+            "{entries:?}"
+        );
         assert_eq!(listed(ToolPolicy::McpOnly), serde_json::json!([]));
         assert_eq!(listed(ToolPolicy::None), serde_json::json!([]));
     }
@@ -7913,6 +7920,48 @@ mod tests {
             spawn_fingerprint(&without, None, ToolPolicy::McpOnly),
             spawn_fingerprint(&with, None, ToolPolicy::McpOnly)
         );
+    }
+
+    /// A server re-imported under the same name with a new command, args or env value must respawn
+    /// a kept process; the same definition must not. The env value is a secret: it never shows.
+    #[test]
+    fn spawn_fingerprint_changes_when_a_server_definition_changes() {
+        use crate::execution::runner::ToolPolicy;
+
+        let print = |server: crate::chats::mcp_servers::McpServer| {
+            let answering = crate::chats::Answering {
+                mcp_servers: vec![server],
+                ..Default::default()
+            };
+            spawn_fingerprint(&answering, None, ToolPolicy::Unrestricted)
+        };
+        let base = print(registry_server("gh"));
+        assert_eq!(
+            base,
+            print(registry_server("gh")),
+            "same definition, same print"
+        );
+
+        let mut command = registry_server("gh");
+        command.command = "node".to_owned();
+        assert_ne!(base, print(command), "a new command must respawn");
+
+        let mut args = registry_server("gh");
+        args.args.push("--verbose".to_owned());
+        assert_ne!(base, print(args), "new args must respawn");
+
+        let mut env = registry_server("gh");
+        env.env
+            .insert("GH_TOKEN".to_owned(), "rotated-secret-value".to_owned());
+        let rotated = print(env);
+        assert_ne!(base, rotated, "a new env value must respawn");
+
+        assert!(!base.contains("stand-in"), "an env value leaked: {base}");
+        assert!(
+            !rotated.contains("rotated-secret-value"),
+            "an env value leaked: {rotated}"
+        );
+        assert!(base.contains("gh"), "the server name stays readable");
     }
 
     /// The per-turn file is where a Claude turn learns its registry servers, and it holds their

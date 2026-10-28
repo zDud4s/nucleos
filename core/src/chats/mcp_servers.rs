@@ -322,6 +322,45 @@ pub fn active_names(policy: ToolPolicy, enabled: &[McpServer]) -> Vec<String> {
         .collect()
 }
 
+/// `name:digest` for each of `active_for(policy, enabled)`, in the order given: what a spawn
+/// fingerprint holds, so re-importing a server under the same name with a new command, args or env
+/// still respawns a kept process.
+///
+/// SHA-256 (already a dependency) rather than std's `DefaultHasher`: the env VALUES are secrets and
+/// must never appear in the fingerprint, so a cryptographic digest is the honest choice, and it is
+/// stable across Rust versions besides. Every field is length-prefixed so no two definitions can
+/// feed the hasher the same bytes; `env` is a BTreeMap, so it iterates in key order.
+pub fn active_fingerprints(policy: ToolPolicy, enabled: &[McpServer]) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    fn field(hasher: &mut Sha256, bytes: &str) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes.as_bytes());
+    }
+    active_for(policy, enabled)
+        .iter()
+        .map(|s| {
+            let mut hasher = Sha256::new();
+            field(&mut hasher, &s.name);
+            field(&mut hasher, &s.command);
+            hasher.update((s.args.len() as u64).to_le_bytes());
+            for arg in &s.args {
+                field(&mut hasher, arg);
+            }
+            hasher.update((s.env.len() as u64).to_le_bytes());
+            for (key, value) in &s.env {
+                field(&mut hasher, key);
+                field(&mut hasher, value);
+            }
+            let digest: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("{}:{digest}", s.name)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

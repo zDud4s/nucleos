@@ -148,8 +148,18 @@ pub(super) async fn summary(
         .ok_or_else(|| internal("the conversation is gone"))
 }
 
-/// One assistant turn as `/context` reads it.
-type TurnRow = (String, Option<String>, i64, i64, i64, i64, Option<i64>, i64);
+/// One assistant turn as `/context` reads it; the run id is last.
+type TurnRow = (
+    String,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    i64,
+    i64,
+);
 
 /// `/context`: what the window holds, measured off the newest finished turn.
 async fn context(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError> {
@@ -166,7 +176,7 @@ async fn context(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError>
         "SELECT status, session_id,
                 COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
                 COALESCE(cache_read_tokens, 0), COALESCE(cache_creation_tokens, 0),
-                context_fill, compacted
+                context_fill, compacted, id
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant' AND id > COALESCE(?, -1)
           ORDER BY id",
@@ -181,10 +191,16 @@ async fn context(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError>
         .map_err(internal)?
         .is_some();
     // The `/compact` handoff in force, on every engine: null when none or after a `/clear`.
-    let compaction = crate::chats::compactions::active(&state.pool, chat_id)
+    let active = crate::chats::compactions::active(&state.pool, chat_id)
         .await
-        .map_err(internal)?
-        .map(|active| json!({ "run_id": active.run_id, "at": active.created_at }));
+        .map_err(internal)?;
+    // The turns the window holds start after the later of the two floors: the `/clear` (already
+    // applied by the query) and the compaction turn in force, whose handoff replaced everything
+    // before it. `active` only ever returns a compaction above the clear floor.
+    let turn_floor = active.as_ref().map_or(-1, |active| active.run_id);
+    let turns = rows.iter().filter(|row| row.8 > turn_floor).count();
+    let compaction =
+        active.map(|active| json!({ "run_id": active.run_id, "at": active.created_at }));
 
     let mut data = json!({
         "engine": engine.as_str(),
@@ -200,7 +216,7 @@ async fn context(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError>
         "live_session": live_session,
         "compacted": false,
         "compaction": compaction,
-        "turns": rows.len(),
+        "turns": turns,
     });
 
     use crate::assistant::slash::capabilities::ChatEngine;
@@ -250,4 +266,126 @@ async fn cost(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError> {
             "turn_budget_usd": chat.turn_budget_usd,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::http::build_router;
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    async fn context_turns(state: &AppState, chat: &str) -> Value {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/assistant/chats/{chat}/command"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({ "text": "/context" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["card"]["data"]["turns"].clone()
+    }
+
+    async fn seed_chat(state: &AppState, chat: &str) {
+        sqlx::query(
+            "INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', '2026-10-28T10:00:00Z')",
+        )
+        .bind(chat)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// `n` finished turns of `chat`; returns the id of the last one.
+    async fn seed_turns(state: &AppState, chat: &str, n: usize) -> i64 {
+        let mut last = 0;
+        for _ in 0..n {
+            last = sqlx::query_scalar(
+                "INSERT INTO runs (prompt, status, mode, chat_id, stdout, created_at)
+                 VALUES ('asked', 'completed', 'assistant', ?, 'answered',
+                         '2026-10-28T10:00:00+00:00')
+                 RETURNING id",
+            )
+            .bind(chat)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        }
+        last
+    }
+
+    /// A settled (`done`) compaction whose turn is `run_id`.
+    async fn seed_compaction(state: &AppState, chat: &str, run_id: i64) {
+        crate::chats::compactions::insert_pending(
+            &state.pool,
+            chat,
+            run_id,
+            "v1",
+            "claude",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE chat_compactions SET status = 'done', summary = 'HANDOFF' WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn set_clear_floor(state: &AppState, chat: &str, run_id: i64) {
+        sqlx::query("UPDATE chats SET cleared_after_run_id = ? WHERE chat_id = ?")
+            .bind(run_id)
+            .bind(chat)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// clear, 3 turns, a compaction turn, 2 turns: the window holds the 2 after the compaction.
+    #[tokio::test]
+    async fn context_counts_turns_from_the_compaction_in_force() {
+        let state = crate::http::tests::test_state().await;
+        let chat = "b-context-turns-after-compact";
+        seed_chat(&state, chat).await;
+        let cleared = seed_turns(&state, chat, 2).await;
+        set_clear_floor(&state, chat, cleared).await;
+        seed_turns(&state, chat, 3).await;
+        assert_eq!(context_turns(&state, chat).await, json!(3));
+
+        let compaction = seed_turns(&state, chat, 1).await;
+        seed_compaction(&state, chat, compaction).await;
+        seed_turns(&state, chat, 2).await;
+        assert_eq!(context_turns(&state, chat).await, json!(2));
+    }
+
+    /// A compaction from before the `/clear` is not in force, so the clear floor alone counts.
+    #[tokio::test]
+    async fn context_ignores_a_compaction_older_than_the_clear() {
+        let state = crate::http::tests::test_state().await;
+        let chat = "b-context-turns-old-compact";
+        seed_chat(&state, chat).await;
+        let compaction = seed_turns(&state, chat, 1).await;
+        seed_compaction(&state, chat, compaction).await;
+        let cleared = seed_turns(&state, chat, 2).await;
+        set_clear_floor(&state, chat, cleared).await;
+        seed_turns(&state, chat, 4).await;
+        assert_eq!(context_turns(&state, chat).await, json!(4));
+    }
 }
