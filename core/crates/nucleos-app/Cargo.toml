@@ -45,6 +45,11 @@ tracing = "0.1.44"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
+# `fleet/claude_code/session.rs` only: `kill(pid, 0)` to ask whether a session process is alive. The
+# same crate and version as `nucleos-core`'s, so nothing new is built.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 nucleos-core = { path = "../..", features = ["testkit"] }
 tempfile = "3.27.0"

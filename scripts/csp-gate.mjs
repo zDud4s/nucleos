@@ -240,7 +240,8 @@ ownUntilExit(chromium, profile);
 
 async function debuggerUrl() {
   const portFile = join(profile, "DevToolsActivePort");
-  for (let attempt = 0; attempt < 120; attempt++) {
+  // 90 s: a cold Chromium on a hosted Windows runner has taken longer than 30 s to write the file.
+  for (let attempt = 0; attempt < 360; attempt++) {
     if (existsSync(portFile)) {
       try {
         /*
