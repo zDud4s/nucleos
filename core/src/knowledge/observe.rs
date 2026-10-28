@@ -65,17 +65,17 @@ pub async fn sweep_observations(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE knowledge_id IN ({stale})"
         )))
-            .bind(&cutoff)
-            .execute(&mut *tx)
-            .await?;
+        .bind(&cutoff)
+        .execute(&mut *tx)
+        .await?;
     }
     let removed = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM knowledge WHERE id IN ({stale})"
     )))
-        .bind(&cutoff)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    .bind(&cutoff)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     tx.commit().await?;
     Ok(removed)
 }
@@ -210,9 +210,27 @@ mod tests {
     async fn the_sweep_deletes_observations_over_sixty_days_old_through_all_four_tables() {
         let pool = crate::testdb::fresh_pool().await;
         let now = Utc::now();
-        let old = observation_aged(&pool, "alpha:chat:1", "observed", now - chrono::Duration::days(61)).await;
-        let fresh = observation_aged(&pool, "alpha:chat:1", "observed", now - chrono::Duration::days(59)).await;
-        let archived = observation_aged(&pool, "alpha:chat:2", "archived", now - chrono::Duration::days(70)).await;
+        let old = observation_aged(
+            &pool,
+            "alpha:chat:1",
+            "observed",
+            now - chrono::Duration::days(61),
+        )
+        .await;
+        let fresh = observation_aged(
+            &pool,
+            "alpha:chat:1",
+            "observed",
+            now - chrono::Duration::days(59),
+        )
+        .await;
+        let archived = observation_aged(
+            &pool,
+            "alpha:chat:2",
+            "archived",
+            now - chrono::Duration::days(70),
+        )
+        .await;
         let lesson = project_row_aged(&pool, "alpha", now - chrono::Duration::days(100)).await;
         for id in [old, archived] {
             vector_and_failure(&pool, id).await;
