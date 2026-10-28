@@ -1346,7 +1346,9 @@ def claims_exchange_cases():
         good = answer == ok and len(seen) == 1 and seen[0][0].endswith("/tasks/session")
         good = good and seen[0][1] == {"session_id": "s1", "cwd": "/work/repo", "want_incidents": False}
         cases.append(("a tool call registers the session with (session_id, cwd)", "" if good else f"{answer!r} {seen!r}"))
-        cases.append(("the registration waits 2 seconds at most", "" if seen and seen[0][2] == 2 else f"timeout {seen[0][2]!r}"))
+        # The request gets what is left of the 2 s budget after reading the token: a hair under 2 on a
+        # clock finer than the token read, exactly 2 on one coarser than it.
+        cases.append(("the registration waits 2 seconds at most", "" if seen and 1.5 < seen[0][2] <= 2 else f"timeout {seen[0][2]!r}"))
 
         answer, seen = _exchange(tmp, payload, [ok], now=1005.0)
         cases.append(("a second call within 20 s sends nothing", "" if answer is None and not seen else f"{seen!r}"))
