@@ -262,29 +262,6 @@ fn cut_chat_answer(seen: &str) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-#[cfg(test)]
-mod cut_chat_answer_tests {
-    use super::cut_chat_answer;
-
-    #[test]
-    fn a_stream_of_only_hook_lines_leaves_no_answer() {
-        let seen = concat!(
-            "{\"type\":\"system\",\"subtype\":\"hook_started\",\"hook_name\":\"SessionStart:resume\"}\n",
-            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}\n",
-        );
-        assert_eq!(cut_chat_answer(seen), None);
-    }
-
-    #[test]
-    fn a_stream_with_assistant_text_answers_with_that_text() {
-        let seen = concat!(
-            "{\"type\":\"system\",\"subtype\":\"hook_started\"}\n",
-            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Half an answer\"}]}}\n",
-        );
-        assert_eq!(cut_chat_answer(seen).as_deref(), Some("Half an answer"));
-    }
-}
-
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
 /// and records `status`. Removing the entry from the handle map is the atomic arbiter when several
 /// termination reasons race (user cancel, timeout, or Chunk 3's §8.4 approval-pause): whoever removes
@@ -865,5 +842,28 @@ mod terminal_write_ratchet {
             offenders.is_empty(),
             "terminal writes discarded with `let _ =`; use storage::settle_write: {offenders:#?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cut_chat_answer_tests {
+    use super::cut_chat_answer;
+
+    #[test]
+    fn a_stream_of_only_hook_lines_leaves_no_answer() {
+        let seen = concat!(
+            "{\"type\":\"system\",\"subtype\":\"hook_started\",\"hook_name\":\"SessionStart:resume\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}\n",
+        );
+        assert_eq!(cut_chat_answer(seen), None);
+    }
+
+    #[test]
+    fn a_stream_with_assistant_text_answers_with_that_text() {
+        let seen = concat!(
+            "{\"type\":\"system\",\"subtype\":\"hook_started\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Half an answer\"}]}}\n",
+        );
+        assert_eq!(cut_chat_answer(seen).as_deref(), Some("Half an answer"));
     }
 }

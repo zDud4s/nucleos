@@ -2,7 +2,7 @@ import { useState } from "react";
 import { DAEMON_NAME } from "../copy";
 import { ApiRefusal } from "../data/client";
 import { useMergeTheme, useRenameTheme } from "../data/themes";
-import { Button, ErrorNote } from "../ui";
+import { Button, ErrorNote, Select } from "../ui";
 import "./ThemesProposed.css";
 
 /** A refused rename in the owner's words; anything else means the daemon did not answer. */
@@ -107,7 +107,7 @@ export function ThemeEdit({ id, name, others }: { id: number; name: string; othe
       )}
       {mode === "merge" && (
         <>
-          <select
+          <Select
             aria-label={`Merge theme ${id} into`}
             value={target ?? ""}
             onChange={(e) => setInto(Number(e.target.value))}
@@ -117,7 +117,7 @@ export function ThemeEdit({ id, name, others }: { id: number; name: string; othe
                 {t.name} #{t.id}
               </option>
             ))}
-          </select>
+          </Select>
           <Button
             variant="quiet"
             aria-label={`Confirm merging theme ${id}`}
