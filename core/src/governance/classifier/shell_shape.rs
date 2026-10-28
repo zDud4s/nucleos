@@ -361,22 +361,142 @@ pub(super) fn checks_formatting_without_writing(command: &str) -> bool {
 /// Splitting on raw whitespace still breaks a quoted string with spaces into several words, which
 /// over-matches (`rg "a -exec b"` is refused) — the cheap side, and what the raw split did already.
 pub(super) fn flag_words(command: &str) -> Vec<String> {
-    command.split_whitespace().map(dequoted).collect()
+    // Bash deletes a backslash-newline pair outside quotes and inside double quotes, so
+    // `"-\<newline>exec"` is the single word `-exec`. Splitting on whitespace first would have cut
+    // it into `-` and `exec`, neither a flag. Joining first also joins inside single quotes, where
+    // bash keeps the pair; that only over-matches, the cheap side.
+    //
+    // Every classify path lowercases the line first (`normalize_command`), so bash's `\U0000002d`
+    // (eight hex digits) arrives as `\u0000002d`, indistinguishable from the four-digit `\u`.
+    // Case is lost, so a `\u` is read BOTH ways and each word either reading produces is emitted;
+    // the guards only refuse, so the extra word costs at most a redundant refusal. This join is
+    // not reached on the classify path (`normalize_command` already turned the newline into a
+    // space); it is kept for callers that hand over a raw line.
+    let joined = command.replace("\\\r\n", "").replace("\\\n", "");
+    let mut words = Vec::new();
+    for word in joined.split_whitespace() {
+        let narrow = dequoted(word, 4);
+        let wide = dequoted(word, 8);
+        if narrow != wide {
+            words.push(wide);
+        }
+        words.push(narrow);
+    }
+    words
 }
 
 /// PURE: one word without its quotes and with each backslash escape replaced by the character it
 /// escapes.
-fn dequoted(word: &str) -> String {
+///
+/// Bash's `$'...'` (ANSI-C) and `$"..."` (locale) quoting are read too. Without that, `$'-exec'`
+/// dequoted to `$-exec`, which no flag list contains, while bash hands `find` a plain `-exec`; the
+/// escapes inside `$'...'` (`\x2d`, `\055` and `-` are all `-`) spell the same flag without
+/// ever writing it.
+///
+/// The word ends at its first NUL: the kernel cuts every argv entry there and bash cuts a `$'...'`
+/// string there, so `$'-delete\0'`, `$'-exec\x00'`, `$'-exec\c@'` and `$'-exec\u0000'` reach the
+/// program as the bare flag. Left in, the NUL made the exact-match guards miss.
+/// The command reader treats `$'` as an ordinary quote, so nothing upstream refuses the form and
+/// this is the only place it is seen. Every caller only refuses, so decoding too much costs a
+/// redundant refusal and decoding too little is the bug.
+///
+/// `u_digits` is how many hex digits a lowercase `\u` reads (4 in bash, 8 for a `\U` whose case was
+/// lost); an uppercase `\U` always reads 8.
+fn dequoted(word: &str, u_digits: usize) -> String {
     let mut out = String::with_capacity(word.len());
-    let mut chars = word.chars();
+    let mut chars = word.chars().peekable();
     while let Some(character) = chars.next() {
         match character {
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                decode_ansi_c_body(&mut chars, &mut out, u_digits);
+            }
+            // The leading `$` of a locale string is not part of the word.
+            '$' if chars.peek() == Some(&'"') => {}
             '\'' | '"' => {}
             '\\' => out.extend(chars.next()),
             _ => out.push(character),
         }
     }
+    if let Some(nul) = out.find('\0') {
+        out.truncate(nul);
+    }
     out
+}
+
+/// PURE: the text of a `$'...'` string up to its closing quote, escapes decoded the way bash does,
+/// appended to `out`. An escape bash would leave alone is kept literally, backslash included.
+fn decode_ansi_c_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+    u_digits: usize,
+) {
+    // Reads up to `max` digits of `radix` and returns their value, or `None` when there are none.
+    fn number(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        radix: u32,
+        max: usize,
+    ) -> Option<u32> {
+        let mut value: Option<u32> = None;
+        for _ in 0..max {
+            let Some(digit) = chars.peek().and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            chars.next();
+            value = Some(value.unwrap_or(0).saturating_mul(radix).saturating_add(digit));
+        }
+        value
+    }
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' => return,
+            '\\' => {
+                let Some(escape) = chars.next() else {
+                    out.push('\\');
+                    return;
+                };
+                let decoded = match escape {
+                    'a' => Some('\u{7}'),
+                    'b' => Some('\u{8}'),
+                    'e' | 'E' => Some('\u{1b}'),
+                    'f' => Some('\u{c}'),
+                    'n' => Some('\n'),
+                    'r' => Some('\r'),
+                    't' => Some('\t'),
+                    'v' => Some('\u{b}'),
+                    '\\' | '\'' | '"' | '?' => Some(escape),
+                    'x' => number(chars, 16, 2).map(|v| char::from_u32(v).unwrap_or('\u{fffd}')),
+                    'u' => number(chars, 16, u_digits).map(|v| char::from_u32(v).unwrap_or('\u{fffd}')),
+                    'U' => number(chars, 16, 8).map(|v| char::from_u32(v).unwrap_or('\u{fffd}')),
+                    '0'..='7' => {
+                        // The first digit is already consumed; up to two more follow, so the
+                        // value is `first` followed by those digits in base 8. Bash keeps the
+                        // low byte of an overlong one.
+                        let mut value = escape.to_digit(8).unwrap_or(0);
+                        for _ in 0..2 {
+                            let Some(digit) = chars.peek().and_then(|c| c.to_digit(8)) else {
+                                break;
+                            };
+                            chars.next();
+                            value = value * 8 + digit;
+                        }
+                        char::from_u32(value & 0xff)
+                    }
+                    'c' => chars.next().map(|c| ((c as u32) & 0x1f) as u8 as char),
+                    _ => None,
+                };
+                match decoded {
+                    Some(c) => out.push(c),
+                    // `\x` with no digits, an unknown escape: bash keeps both characters.
+                    None => {
+                        out.push('\\');
+                        out.push(escape);
+                    }
+                }
+            }
+            _ => out.push(character),
+        }
+    }
 }
 
 /// The guards a command has to clear before ANY list may say yes to it, separated from the lists

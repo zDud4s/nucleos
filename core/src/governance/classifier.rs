@@ -4844,6 +4844,29 @@ mod tests {
             "go build '-o' ../x.exe ./cmd",
             "sort \"-o\" ../x file.txt",
             "tail \"-f\" daemon.log",
+            // Bash's ANSI-C (`$'...'`) and locale (`$"..."`) quoting: the program still receives a
+            // plain flag, and the escapes spell it without writing it.
+            "find . $'-exec' rm {} +",
+            "find . $\"-exec\" rm {} +",
+            "find . $'\\x2dexec' cat {} +",
+            "find . $'\\055exec' cat {} +",
+            "find . $'\\u002dexec' cat {} +",
+            "rg $'--pre=./x.sh' pattern",
+            "git log $'--output=../x'",
+            "go build $'-o' ../x.exe",
+            "tail $'-f' daemon.log",
+            // The kernel and bash cut the word at the first NUL, however it was spelled.
+            "find . $'-exec\\0' rm {} +",
+            "find . $'-exec\\x00' rm {} +",
+            "find . $'-exec\\c@' rm {} +",
+            "find . $'-exec\\u0000' rm {} +",
+            // `\U` (eight digits) arrives lowercased as `\u0000002d`, which must not be read only
+            // as the four-digit `\u0000` (NUL) followed by `002d`.
+            "find . $'\\U0000002d'exec rm {} +",
+            "rg $'\\U0000002d'-pre=./x.sh pattern",
+            // Backslash-newline join: unreachable through `classify` (the newline is already a
+            // space by then), so this case only documents the intent of `flag_words`.
+            "find . \"-\\\nexec\" rm {} +",
         ] {
             let classification = classify("Bash", &json!({"command": command}), None);
             assert_ne!(
@@ -4861,11 +4884,43 @@ mod tests {
     /// recursive delete `rm -rf` is, and gets the same `deny`.
     #[test]
     fn a_quoted_delete_on_find_is_denied_like_the_bare_one() {
-        for command in ["find . \"-delete\"", "find . '-delete'", "find . -de\\lete"] {
+        for command in [
+            "find . \"-delete\"",
+            "find . '-delete'",
+            "find . -de\\lete",
+            "find . $'-delete'",
+            "find . $'\\x2ddelete'",
+            "find . $'-delete\\0'",
+            "find . $'\\U0000002d'delete",
+        ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
                 "deny",
                 "destructive",
+            );
+        }
+    }
+
+    /// An apostrophe the shell reads as a literal (`\'`, or `$'\''`) does not open a quote, so a
+    /// `>` after it is a real redirect. The command reader once masked everything up to the next
+    /// apostrophe, hid the `>` and let a write outside the project through as `read-local`.
+    #[test]
+    fn a_redirect_after_an_escaped_apostrophe_is_not_read_local() {
+        for command in [
+            "echo x \\' > ../../outside/leak.txt \\'",
+            "echo x $'\\'' > ../../outside/leak.txt $'\\''",
+            "cat README.md \\' > ../../outside/leak.txt \\'",
+            "cat README.md $'\\'' > ../../outside/leak.txt $'\\''",
+            "echo x$$'\\' > ../../outside/leak.txt \\' '\\'",
+        ] {
+            let classification = classify("Bash", &json!({"command": command}), None);
+            assert_ne!(
+                classification.action_class, "read-local",
+                "{command} must not read as read-local"
+            );
+            assert_ne!(
+                classification.decision.decision, "allow",
+                "{command} must not be allowed"
             );
         }
     }
