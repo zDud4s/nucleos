@@ -671,6 +671,8 @@ const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
 /// refuses these and anything unlisted alike; the list exists so that choice is always explicit.
 /// `home` was Admin-only before remote access existed; devices stay out until the owner allows it.
 /// `tasks` is the claim board agent sessions coordinate through; a device takes no part in it.
+/// Only the guard test reads it, since the gate itself is an allow-list.
+#[cfg_attr(not(test), allow(dead_code))]
 const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "admission",
     "agents",

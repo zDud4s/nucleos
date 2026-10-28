@@ -108,6 +108,11 @@ def normalize_paths(paths: list[str]) -> list[str]:
         text = text[2:] if text.startswith("./") else text
         if not text:
             raise TreeError("an empty path is not a path")
+        # Mirror the daemon's `normalise_glob`, which refuses these as Invalid.
+        if text.startswith("/") or text[1:2] == ":":
+            raise TreeError(f"path {path!r} must be relative to the project root")
+        if ".." in text.split("/"):
+            raise TreeError(f"path {path!r} may not contain a '..' segment")
         cleaned.append(text)
     return cleaned
 
@@ -353,8 +358,10 @@ def report_block(sections, kind: str, max_lines: int, handoff: str) -> list[str]
 
 def contained(path: str, owned: list[str]) -> bool:
     """Whether a child's path lies inside the branch's paths (the daemon's L1 containment rule, not
-    overlap). A literal path must be matched by an owned glob; a wildcard path (`core/src/x/**`) by an
-    owned `/**` glob whose literal prefix is a prefix of the child's, or by an owned directory."""
+    overlap). A literal path must be matched by an owned glob (a literal owned path is a file or a
+    directory); a wildcard path (`core/src/x/**`) by an owned `/**` glob whose literal prefix is a
+    prefix of the child's, or by an owned literal directory the child's literal prefix lies under
+    (`<dir>/...`, segment boundary)."""
     if not any(c in path for c in "*?[{"):
         return any(ts.path_matches(path, glob) for glob in owned)
     prefix = ts.literal_prefix(path)
@@ -362,8 +369,10 @@ def contained(path: str, owned: list[str]) -> bool:
         if any(c in glob for c in "*?[{"):
             if glob.endswith("/**") and prefix.startswith(ts.literal_prefix(glob)):
                 return True
-        elif ts.path_matches(prefix.rstrip("/"), glob):
-            return True
+        else:
+            base = ts.literal_prefix(glob).rstrip("/")  # glob has no wildcard: the whole glob
+            if prefix.startswith(base + "/"):
+                return True
     return False
 
 
