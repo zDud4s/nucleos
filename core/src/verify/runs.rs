@@ -28,6 +28,8 @@ pub const REQUESTED_BY_POSTGATE: &str = "postgate";
 pub const REQUESTED_BY_FLAKE_CHECK: &str = "flake-check";
 /// One probe of the post-merge gate's bisection (`verify::Caller::Bisect`).
 pub const REQUESTED_BY_BISECT: &str = "bisect";
+/// One unit of a master proof (`verify::Caller::Probe`).
+pub const REQUESTED_BY_PROBE: &str = "probe";
 
 pub const STATUS_PASSED: &str = "passed";
 pub const STATUS_FAILED: &str = "failed";
@@ -252,6 +254,8 @@ pub struct State {
     pub duration_ms: Option<i64>,
     pub output_tail: Option<String>,
     pub interruptions: i64,
+    /// The test ids the runner printed for a failed unit (`verify::failures::extract`), if any.
+    pub failed_tests: Option<crate::verify::failures::Failures>,
 }
 
 /// Queues a request, or joins an equal one that is still queued or running.
@@ -450,23 +454,46 @@ pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
     // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `State`;
     // a named struct would repeat the column order in two places.
     #[allow(clippy::type_complexity)]
-    let row: Option<(i64, String, Option<i64>, Option<i64>, Option<String>, i64)> = sqlx::query_as(
-        "SELECT id, status, exit_code, duration_ms, output_tail, interruptions \
-             FROM verify_runs WHERE id = ?",
+    let row: Option<(
+        i64,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        i64,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, status, exit_code, duration_ms, output_tail, interruptions, failed_tests              FROM verify_runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(id, status, exit_code, duration_ms, output_tail, interruptions)| State {
+        |(id, status, exit_code, duration_ms, output_tail, interruptions, failed_tests)| State {
             id,
             status,
             exit_code,
             duration_ms,
             output_tail,
             interruptions,
+            failed_tests: failed_tests.and_then(|json| serde_json::from_str(&json).ok()),
         },
     ))
+}
+
+/// Records the test ids a failed unit printed. Called before `finish` makes the row terminal.
+pub async fn set_failed_tests(
+    pool: &SqlitePool,
+    id: i64,
+    failures: &crate::verify::failures::Failures,
+) -> sqlx::Result<()> {
+    let json = serde_json::to_string(failures).unwrap_or_else(|_| "{}".to_owned());
+    sqlx::query("UPDATE verify_runs SET failed_tests = ? WHERE id = ?")
+        .bind(json)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// At daemon start, rows still `running` were cut off by the restart: they go back to the queue,

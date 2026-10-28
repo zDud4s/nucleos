@@ -390,14 +390,16 @@ impl Executor {
         }
     }
 
-    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate requested; empty for any other unit.
+    /// `NUCLEOS_GATE_BASE` for a unit the post-merge gate or the daemon's probe requested; empty
+    /// for any other unit.
     ///
     /// The gate runs in a worktree at the target's tip, where `gate-diff.sh` defaults its base to
-    /// the merge base with `master` — `HEAD` itself — and so gates nothing. Computed here, from
-    /// the stored state, rather than when the unit is queued: crash recovery and bisect probes run
-    /// units the tick that queued them never saw.
+    /// the merge base with `master` — `HEAD` itself — and so gates nothing. A probe runs at the
+    /// master head, the very same situation, so a `gate_command` proof would gate nothing too.
+    /// Computed here, from the stored state, rather than when the unit is queued: crash recovery
+    /// and bisect probes run units the tick that queued them never saw.
     async fn gate_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
-        let (verify_runs::REQUESTED_BY_POSTGATE, Some(project)) =
+        let (verify_runs::REQUESTED_BY_POSTGATE | verify_runs::REQUESTED_BY_PROBE, Some(project)) =
             (claimed.requested_by.as_str(), claimed.project_id.as_deref())
         else {
             return Vec::new();
@@ -448,6 +450,16 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     .await;
     let (status, exit_code) = status_of(&outcome);
     let tail = tail_of(&outcome);
+    // The full output is still in `outcome.tail` here; `finish` keeps only 4000 characters of it. The
+    // ids are written BEFORE `finish` makes the row terminal: a reader that sees `failed` must already
+    // find them, or it would classify the unit as "no ids".
+    if status == verify_runs::STATUS_FAILED
+        && let Some(failures) = crate::verify::failures::extract(&outcome.tail)
+        && let Err(error) =
+            verify_runs::set_failed_tests(&executor.pool, claimed.id, &failures).await
+    {
+        tracing::warn!(%error, id = claimed.id, "verify executor: cannot record the failed test ids");
+    }
     let duration_ms = i64::try_from(outcome.duration.as_millis()).unwrap_or(i64::MAX);
     if let Err(error) = verify_runs::finish(
         &executor.pool,
@@ -675,6 +687,40 @@ mod tests {
         let state = wait_terminal(&ex, submitted.id).await;
         assert_eq!(state.status, verify_runs::STATUS_FAILED);
         assert!(matches!(state.exit_code, Some(code) if code != 0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_unit_stores_the_test_ids_the_runner_printed() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        // `sh` is the portable shell the neighbouring tests of this module (runs.rs) use.
+        let script = "printf 'test a::boom ... FAILED\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\\n'; exit 1";
+        let argv = ["sh", "-c", script];
+        let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+
+        let state = wait_terminal(&ex, submitted.id).await;
+
+        assert_eq!(state.status, verify_runs::STATUS_FAILED);
+        let failures = state.failed_tests.expect("ids stored");
+        assert!(failures.tests.contains("a::boom"), "{failures:?}");
+    }
+
+    #[tokio::test]
+    async fn a_passed_unit_and_a_failed_one_without_ids_store_none() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let ex = executor(2, root.path()).await;
+        for argv in [
+            ["git", "--version"],
+            ["git", "definitely-not-a-git-subcommand"],
+        ] {
+            let submitted = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+            assert_eq!(ex.start_ready().await, 1);
+            let state = wait_terminal(&ex, submitted.id).await;
+            assert_eq!(state.failed_tests, None, "{argv:?}");
+        }
     }
 
     #[test]
@@ -1094,6 +1140,19 @@ mod tests {
         let ex = executor(4, root.path()).await;
         store_postgate(&ex.pool, Some(&shas[1]), None).await;
         let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_POSTGATE);
+        let env = ex.gate_env(&claimed).await;
+        assert_eq!(gate_base(&env), Some(shas[1].as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_probe_unit_diffs_from_the_last_green_like_the_postgate() {
+        let (repo, shas) = history();
+        let root = tempfile::tempdir().unwrap();
+        let ex = executor(4, root.path()).await;
+        store_postgate(&ex.pool, Some(&shas[1]), None).await;
+        // A probe of `gate_command` runs at the master head, where gate-diff.sh would default its
+        // base to HEAD itself and gate nothing.
+        let claimed = claimed_in(repo.path(), verify_runs::REQUESTED_BY_PROBE);
         let env = ex.gate_env(&claimed).await;
         assert_eq!(gate_base(&env), Some(shas[1].as_str()));
     }

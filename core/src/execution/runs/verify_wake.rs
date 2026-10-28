@@ -225,9 +225,12 @@ async fn refuse(state: &AppState, run_id: i64, ticket_id: i64, reason: &str) -> 
     Ok(())
 }
 
-// The initializer IS `const`; clippy 1.97 still reports it inside the macro.
+/// A module only to carry the `allow`: an attribute on a macro call is ignored.
 #[cfg(test)]
-#[allow(clippy::missing_const_for_thread_local)]
+#[allow(
+    clippy::missing_const_for_thread_local,
+    reason = "the initializer is already `const { .. }`; clippy 1.97 still reports it inside the macro"
+)]
 mod deferred_in_this_test {
     thread_local! {
         /// How many times the deferred work ran on this thread: a `#[tokio::test]` runs on one.
@@ -592,6 +595,7 @@ mod tests {
                 running: Vec::new(),
             },
             units: Vec::new(),
+            inherited_task_ids: Vec::new(),
         }
     }
 

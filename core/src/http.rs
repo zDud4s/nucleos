@@ -56,6 +56,7 @@ mod proposals;
 mod relay;
 mod repo;
 mod run_queue;
+mod tasks;
 mod team;
 mod themes;
 mod workflows;
@@ -139,6 +140,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(map_flows::routes())
         .merge(map_states::routes())
         .merge(nodes::routes())
+        .merge(tasks::routes())
         .merge(projects::routes())
         .merge(proposals::routes())
         .merge(relay::routes())
@@ -632,6 +634,7 @@ mod tests {
             Json(LandBody {
                 cwd: worktree.to_string_lossy().into_owned(),
                 target: None,
+                override_claimed: false,
             }),
         )
         .await
@@ -661,6 +664,7 @@ mod tests {
             Json(LandBody {
                 cwd: repo.to_string_lossy().into_owned(),
                 target: None,
+                override_claimed: false,
             }),
         )
         .await
@@ -722,6 +726,7 @@ mod tests {
             Json(LandBody {
                 cwd: worktree.to_string_lossy().into_owned(),
                 target: Some("release".to_owned()),
+                override_claimed: false,
             }),
         )
         .await
@@ -749,6 +754,7 @@ mod tests {
             Json(LandBody {
                 cwd: worktree.to_string_lossy().into_owned(),
                 target: Some("nope".to_owned()),
+                override_claimed: false,
             }),
         )
         .await
@@ -810,6 +816,7 @@ mod tests {
             Json(LandBody {
                 cwd: worktree.to_string_lossy().into_owned(),
                 target: Some(String::new()),
+                override_claimed: false,
             }),
         )
         .await
@@ -835,6 +842,79 @@ mod tests {
     fn a_land_body_without_a_target_still_deserializes() {
         let body: LandBody = serde_json::from_str(r#"{"cwd":"C:\\somewhere"}"#).unwrap();
         assert_eq!(body.target, None);
+        assert!(!body.override_claimed, "an absent override is false");
+    }
+
+    #[tokio::test]
+    async fn landing_a_claimed_path_is_a_conflict_unless_the_owner_overrides() {
+        let (state, _db) = file_test_state().await;
+        let container =
+            crate::execution::git_exec::testkit::space_free_tempdir("http-land-claims-");
+        let repo = container.path().join("repo");
+        crate::execution::git_exec::testkit::initialize_repo(&repo);
+        // The same shape as the test above: the main checkout stands on `trunk`, the declared
+        // integration branch, and `feature` is checked out in its own worktree with a real commit.
+        assert!(git_in(&repo, &["checkout", "-q", "-b", "trunk"]));
+        assert!(git_in(&repo, &["branch", "feature"]));
+        let worktree = container.path().join("wt");
+        assert!(git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "feature"
+            ]
+        ));
+        std::fs::write(worktree.join("feature.txt"), "from the branch\n").unwrap();
+        assert!(git_in(&worktree, &["add", "-A"]));
+        assert!(git_in(&worktree, &["commit", "-m", "feature"]));
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
+             VALUES ('alpha', 'active', ?, 'trunk')",
+        )
+        .bind(repo.to_string_lossy().into_owned())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        // A session elsewhere holds a task that guards feature.txt.
+        let new = crate::task_claims::NewTask {
+            key: crate::task_claims::keys::normalize("file:feature.txt", &repo).unwrap(),
+            kind: crate::task_claims::TaskKind::Declared,
+            title: "t".to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: vec!["feature.txt".to_owned()],
+            hint_paths: vec![],
+        };
+        let other = crate::task_claims::Holder {
+            kind: crate::task_claims::HolderKind::Session,
+            id: "s1".to_owned(),
+            worktree: "C:/elsewhere".to_owned(),
+        };
+        crate::task_claims::store::claim(&state.pool, "alpha", new, &other, chrono::Utc::now())
+            .await
+            .unwrap();
+        let body = |override_claimed| LandBody {
+            cwd: worktree.to_string_lossy().into_owned(),
+            target: None,
+            override_claimed,
+        };
+
+        let refused = land_worktree(State(state.clone()), Json(body(false)))
+            .await
+            .expect_err("guarded");
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+        assert!(refused.1.contains("file:feature.txt"), "{}", refused.1);
+        assert!(
+            !refused.1.to_uppercase().contains("NUCLEOS_ALLOW"),
+            "the refusal never advertises the override"
+        );
+
+        let landed = land_worktree(State(state.clone()), Json(body(true)))
+            .await
+            .expect("the owner's override");
+        assert_eq!(landed.0.status, "queued");
     }
 
     fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {

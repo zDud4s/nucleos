@@ -93,6 +93,7 @@ pub mod source_scan;
 pub mod speed;
 pub mod state;
 pub use nucleos_base::storage;
+pub mod task_claims;
 pub mod team;
 pub use nucleos_base::team_notes;
 pub mod test_select;

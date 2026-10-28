@@ -74,7 +74,8 @@ pub async fn resolve_worktree(
         | Caller::Job(_)
         | Caller::Postgate
         | Caller::FlakeCheck
-        | Caller::Bisect => {
+        | Caller::Bisect
+        | Caller::Probe => {
             let Some(asked) = asked else {
                 return Err(VerifyError::BadRequest("worktree is required".to_owned()));
             };

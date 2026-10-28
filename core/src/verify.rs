@@ -10,14 +10,17 @@
 pub mod batch;
 pub mod bisect;
 pub mod exec;
+pub mod failures;
 pub mod fingerprint;
 pub mod flaky;
 pub mod guard;
 pub mod ide_box;
+pub mod inherit;
 pub mod observe;
 pub mod plan;
 pub mod postgate;
 pub mod postgate_worker;
+pub mod probe;
 pub mod provision;
 pub mod render;
 pub mod runs;
@@ -113,6 +116,10 @@ pub struct VerifyArgs {
     /// this task run" is a GROUP BY. Absent for the daemon's own gates.
     #[serde(default)]
     pub task_id: Option<String>,
+    /// The daemon's probe only (`Caller::Probe`): run exactly these map groups, whole, instead of
+    /// selecting them from a diff. Anyone else naming it is refused before a row exists.
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
 }
 
 /// The body of `POST /verify/status`.
@@ -144,6 +151,8 @@ pub enum Caller {
     FlakeCheck,
     /// One probe of the post-merge gate's bisection. `from_scope` never produces it.
     Bisect,
+    /// The daemon's proof of a red group at the master head. `from_scope` never produces it.
+    Probe,
 }
 
 impl Caller {
@@ -163,7 +172,7 @@ impl Caller {
             Caller::Merge(_) => PRIORITY_AUTONOMOUS,
             Caller::Owner => PRIORITY_INTERACTIVE,
             Caller::Run(_) | Caller::Job(_) => PRIORITY_AUTONOMOUS,
-            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
+            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect | Caller::Probe => {
                 verify_runs::PRIORITY_POSTGATE
             }
         }
@@ -177,6 +186,7 @@ impl Caller {
             Caller::Run(id) => format!("run:{id}"),
             Caller::Job(id) => format!("job:{id}"),
             Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => "postgate".to_owned(),
+            Caller::Probe => "probe".to_owned(),
         }
     }
 
@@ -187,7 +197,18 @@ impl Caller {
             Caller::Postgate => verify_runs::REQUESTED_BY_POSTGATE.to_owned(),
             Caller::FlakeCheck => verify_runs::REQUESTED_BY_FLAKE_CHECK.to_owned(),
             Caller::Bisect => verify_runs::REQUESTED_BY_BISECT.to_owned(),
+            // Named on purpose: `Executor::gate_env` treats a probe like the post-merge gate.
+            Caller::Probe => verify_runs::REQUESTED_BY_PROBE.to_owned(),
             _ => scope.to_owned(),
+        }
+    }
+
+    /// A proof unit is cut off well before its lease (`PROBE_LEASE_SECONDS`) lapses; every other
+    /// caller keeps the executor's configured timeout (0 = "derive it").
+    pub fn unit_timeout_ms(self) -> i64 {
+        match self {
+            Caller::Probe => i64::try_from(probe::UNIT_TIMEOUT.as_millis()).unwrap_or(i64::MAX),
+            _ => 0,
         }
     }
 }
@@ -202,7 +223,8 @@ pub fn may_read(caller: Caller, row_caller: &str) -> bool {
         | Caller::Job(_)
         | Caller::Postgate
         | Caller::FlakeCheck
-        | Caller::Bisect => row_caller == caller.label(),
+        | Caller::Bisect
+        | Caller::Probe => row_caller == caller.label(),
     }
 }
 
@@ -337,6 +359,12 @@ async fn submit_checked(
     args: &VerifyArgs,
 ) -> Result<(i64, bool), VerifyError> {
     let pool = &executor.pool;
+    // Naming groups is the daemon's probe alone: refused before any row or git read.
+    if args.groups.is_some() && caller != Caller::Probe {
+        return Err(VerifyError::BadRequest(
+            "groups is for the daemon's probe".into(),
+        ));
+    }
     // The same bound the workflow ledger holds a task id to, so a task that verifies can be joined
     // to the records it filed.
     if args
@@ -419,8 +447,10 @@ async fn submit_checked(
     }
 
     let own_files = args.scope == ScopeArg::Own && args.files.is_some();
-    let needs_base =
-        args.scope != ScopeArg::Full && matches!(map, MapState::Valid(_)) && !own_files;
+    let needs_base = caller != Caller::Probe
+        && args.scope != ScopeArg::Full
+        && matches!(map, MapState::Valid(_))
+        && !own_files;
     let base = if needs_base {
         let project_root = inspect::project_root(pool, &project_id)
             .await
@@ -471,20 +501,23 @@ async fn submit_checked(
 
     // `true` until a project can declare that it gates after landing (there is no
     // `gate_after_land` yet); the planner already knows how to refuse `full` once there is.
-    let plan = verify_plan::plan(
-        &map,
-        args.kind,
-        args.scope,
-        &changed,
-        &fillable,
-        rules.gate_command.as_deref(),
-        true,
-        // Filters narrow only a session's own iteration run. A scope run (the daemon's item and
-        // merge gates, the evidence a green run leaves for a tip) and any daemon caller measure
-        // the whole group.
-        args.scope == ScopeArg::Own && matches!(caller, Caller::Owner | Caller::Run(_)),
-    )
-    .map_err(|error| match error {
+    let planned = match (caller, args.groups.as_deref()) {
+        (Caller::Probe, Some(groups)) => verify_plan::plan_groups(&map, args.kind, groups),
+        _ => verify_plan::plan(
+            &map,
+            args.kind,
+            args.scope,
+            &changed,
+            &fillable,
+            rules.gate_command.as_deref(),
+            true,
+            // Filters narrow only a session's own iteration run. A scope run (the daemon's item
+            // and merge gates, the evidence a green run leaves for a tip) and any daemon caller
+            // measure the whole group.
+            args.scope == ScopeArg::Own && matches!(caller, Caller::Owner | Caller::Run(_)),
+        ),
+    };
+    let plan = planned.map_err(|error| match error {
         PlanError::InvalidMap(errors) => VerifyError::Unprocessable(format!(
             "nucleos.tests.yaml is invalid: {}",
             errors.join("; ")
@@ -590,6 +623,12 @@ async fn submit_checked(
                 unit.cacheable = false;
             }
         }
+        if caller == Caller::Probe {
+            // A proof neither feeds the cache (`settle` is spawned for any cacheable unit, whatever
+            // the priority) nor joins an equal unit of another tree: it runs in its own tree, now.
+            unit.fingerprint = None;
+            unit.cacheable = false;
+        }
 
         // The post-gate never reads the cache: it is the check that a cache could be wrong.
         if unit.cacheable
@@ -650,7 +689,7 @@ async fn submit_checked(
                 priority,
                 // Zero lets the executor derive both from the argv and its own config.
                 weight: 0,
-                timeout_ms: 0,
+                timeout_ms: caller.unit_timeout_ms(),
             })
             .await;
         let submitted = match submitted {
@@ -884,6 +923,17 @@ async fn settle(
 
 /// A ticket as it stands now, with the caller label that may read it.
 pub async fn read_ticket(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<(Ticket, String)>> {
+    read_ticket_with(pool, installed().as_ref(), id, true).await
+}
+
+/// `classify`: whether this read may tell an inherited red from the session's own (and so start a
+/// master proof). Land evidence and access checks read with `false`: they must have no side effects.
+pub async fn read_ticket_with(
+    pool: &SqlitePool,
+    executor: Option<&Arc<Executor>>,
+    id: i64,
+    classify: bool,
+) -> sqlx::Result<Option<(Ticket, String)>> {
     let Some(request) = verify_store::get_request(pool, id).await? else {
         return Ok(None);
     };
@@ -901,6 +951,9 @@ pub async fn read_ticket(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<(Tic
     }
     let mut ticket = verify_plan::assemble(&request, &live);
     annotate_red_target(pool, &mut ticket).await;
+    if classify {
+        inherit::apply(pool, executor, &request, &mut ticket, chrono::Utc::now()).await;
+    }
     Ok(Some((ticket, request.caller)))
 }
 
@@ -930,7 +983,7 @@ pub async fn covering_request(
         if !bases.contains(&base.as_str()) {
             continue;
         }
-        let Some((ticket, _)) = read_ticket(pool, id).await? else {
+        let Some((ticket, _)) = read_ticket_with(pool, None, id, false).await? else {
             continue;
         };
         if ticket.done && ticket.verdict.as_deref() == Some("passed") {
@@ -977,9 +1030,20 @@ pub async fn wait_ticket(
     id: i64,
     deadline: Duration,
 ) -> sqlx::Result<Option<(Ticket, String)>> {
+    wait_ticket_with(pool, installed().as_ref(), id, deadline, true).await
+}
+
+/// `wait_ticket` with the executor and the classification switch spelled out.
+pub async fn wait_ticket_with(
+    pool: &SqlitePool,
+    executor: Option<&Arc<Executor>>,
+    id: i64,
+    deadline: Duration,
+    classify: bool,
+) -> sqlx::Result<Option<(Ticket, String)>> {
     let started = Instant::now();
     loop {
-        let Some((ticket, caller)) = read_ticket(pool, id).await? else {
+        let Some((ticket, caller)) = read_ticket_with(pool, executor, id, classify).await? else {
             return Ok(None);
         };
         if ticket.done || started.elapsed() >= deadline {
@@ -1079,7 +1143,7 @@ pub async fn post_verify_status(
     // 404 rather than 403 for another run's ticket, so a run cannot learn which ids exist.
     let not_found = || (StatusCode::NOT_FOUND, format!("no ticket {}", args.ticket));
     // Access is checked before waiting, so a refused caller is not held for the whole wait first.
-    match read_ticket(&state.pool, args.ticket)
+    match read_ticket_with(&state.pool, None, args.ticket, false)
         .await
         .map_err(database_error)?
     {
@@ -1125,8 +1189,9 @@ mod tests {
     use crate::verify::plan::NO_MAP_OWN_NOTE;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-    /// Long enough for a `git --version` unit on a loaded machine, short enough to bound a test.
-    const WAIT: Duration = Duration::from_secs(20);
+    /// Long enough for a `git --version` unit, or a master proof (a fresh probe worktree plus its
+    /// units), on a loaded machine; short enough to bound a test. Only a failing test waits it out.
+    const WAIT: Duration = Duration::from_secs(60);
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -1279,6 +1344,7 @@ tests:
             wait: true,
             cover: false,
             task_id: None,
+            groups: None,
         }
     }
 
@@ -1497,6 +1563,11 @@ tests:
             run_id: None,
             cached_from: None,
             already_failing: None,
+            failed_tests: None,
+            failed_files: Vec::new(),
+            inherited: None,
+            pending: None,
+            not_inherited: None,
         }
     }
 
@@ -1519,6 +1590,7 @@ tests:
                 running: Vec::new(),
             },
             units,
+            inherited_task_ids: Vec::new(),
         }
     }
 
@@ -2905,5 +2977,1095 @@ tests:
             .unwrap();
 
         assert!(evidence.is_none(), "{evidence:?}");
+    }
+
+    // ---- task claims: a red that belongs to the master incident (chunk 4 Task 4) ----------------
+
+    use crate::task_claims::TaskKey;
+
+    /// A group named `group` that runs `script` through `sh -c`; the fixture's other group passes. The
+    /// script sits in a YAML block scalar, which takes `: ` and quotes verbatim (a plain scalar would not).
+    fn scripted_map(group: &str, script: &str) -> String {
+        let (red_paths, ok_name, ok_paths) = if group == "core" {
+            ("core/", "py", "py/")
+        } else {
+            ("py/", "core", "core/")
+        };
+        format!(
+            "version: 1\ntests:\n  groups:\n    {group}:\n      paths: [{red_paths}]\n      check: git --version\n      command: |-\n        sh -c \"{script}\"\n    {ok_name}:\n      paths: [{ok_paths}]\n      check: git --version\n      command: git --version\n"
+        )
+    }
+
+    /// What libtest prints for `ids` failing, then exit 1.
+    fn failing_script(ids: &[&str]) -> String {
+        let lines: String = ids
+            .iter()
+            .map(|id| format!("test {id} ... FAILED\\n"))
+            .collect();
+        format!(
+            "printf 'running {n} tests\\n{lines}\\ntest result: FAILED. 0 passed; {n} failed; 0 ignored\\n'; exit 1",
+            n = ids.len()
+        )
+    }
+
+    fn red_map(group: &str, ids: &[&str]) -> String {
+        scripted_map(group, &failing_script(ids))
+    }
+
+    /// `own_core` asks for `Kind::Check`, which runs the group's passing `check`; this runs its `command`.
+    fn own_core_test(f: &Fixture) -> VerifyArgs {
+        args(
+            Kind::Test,
+            ScopeArg::Own,
+            f.repo.path(),
+            Some(&["core/a.rs"]),
+            None,
+        )
+    }
+
+    /// `finished`, but through `wait_ticket_with`: `installed()` is a global `OnceLock` the tests do not fill.
+    async fn finished_with(f: &Fixture, id: i64) -> (Ticket, String) {
+        let (ticket, caller) = wait_ticket_with(&f.pool, Some(&f.ex), id, WAIT, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ticket.done,
+            "ticket {id} did not finish in time: {ticket:?}"
+        );
+        (ticket, caller)
+    }
+
+    /// A live `master-red`, written straight into the table the way the postgate leaves it.
+    struct SeedIncident<'a> {
+        status: &'a str,
+        holder: Option<(&'a str, &'a str)>,
+        red_tests: &'a [&'a str],
+        red_groups: &'a [&'a str],
+        since: Option<&'a str>,
+        checked: Option<&'a str>,
+    }
+
+    impl Default for SeedIncident<'_> {
+        fn default() -> Self {
+            Self {
+                status: "open",
+                holder: None,
+                red_tests: &[],
+                red_groups: &[],
+                since: None,
+                checked: None,
+            }
+        }
+    }
+
+    async fn seed_incident(pool: &SqlitePool, seed: SeedIncident<'_>) -> i64 {
+        let detail = serde_json::json!({
+            "red_tests": seed.red_tests,
+            "red_groups": seed.red_groups,
+            "red_since_sha": seed.since,
+            "red_sha": seed.checked,
+        });
+        let lease = seed.holder.map(|_| {
+            crate::execution::wave::stamp(chrono::Utc::now() + chrono::Duration::hours(1))
+        });
+        sqlx::query(
+            "INSERT INTO task_claims (project_id, task_key, kind, title, detail, guard_paths, hint_paths, status, \
+             holder_kind, holder_id, holder_worktree, lease_until, checked_sha, created_at) \
+             VALUES ('alpha', ?, 'incident', 'master red', ?, '[]', '[]', ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(TaskKey::master_red().as_str())
+        .bind(detail.to_string())
+        .bind(seed.status)
+        .bind(seed.holder.map(|h| h.0))
+        .bind(seed.holder.map(|h| h.1))
+        .bind(seed.holder.map(|h| format!("/wt/{}", h.1)))
+        .bind(lease)
+        .bind(seed.checked)
+        .bind(crate::execution::wave::stamp(chrono::Utc::now()))
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn stored_inherited_ids(pool: &SqlitePool, id: i64) -> String {
+        sqlx::query_scalar("SELECT inherited_task_ids FROM verify_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn red_tests_contained_in_the_incident_make_the_ticket_inherited_and_not_green() {
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom", "a::bang"],
+                red_groups: &["gate_command"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core_test(&f))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("inherited"), "{ticket:?}");
+        assert_eq!(
+            ticket.units[0].status, "failed",
+            "the unit itself stays failed"
+        );
+        assert_eq!(
+            ticket.units[0].failed_tests.as_deref(),
+            Some(&["a::boom".to_owned()][..])
+        );
+        let note = ticket.units[0]
+            .inherited
+            .as_deref()
+            .expect("the unit says why");
+        assert!(
+            note.contains(&format!("#{incident}")) && note.contains("do not fix"),
+            "{note}"
+        );
+        assert_eq!(ticket.inherited_task_ids, [incident]);
+        assert_eq!(
+            stored_inherited_ids(&f.pool, id).await,
+            format!("[{incident}]")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_group_failing_other_tests_stays_failed_and_unlisted() {
+        let f = fixture(Some(&red_map("core", &["a::boom", "a::mine"])), None, true).await;
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core_test(&f))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert!(ticket.inherited_task_ids.is_empty() && ticket.units[0].inherited.is_none());
+        assert_eq!(stored_inherited_ids(&f.pool, id).await, "[]");
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_does_not_contain_red_since_sha_is_the_tasks_failure() {
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        // A sha git has never heard of cannot be an ancestor of anything.
+        let unknown = "0".repeat(40);
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                red_groups: &["core"],
+                since: Some(&unknown),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core_test(&f))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        let note = ticket.units[0]
+            .not_inherited
+            .as_deref()
+            .expect("the unit says why");
+        assert!(note.contains("rebase"), "{note}");
+        assert!(ticket.inherited_task_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_group_without_test_ids_is_inherited_at_group_level_when_untouched_listed_and_fresh()
+    {
+        let f = fixture(Some(&scripted_map("core", "exit 1")), None, true).await;
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // The root is clean against its own base, so the session changed nothing: `core` is suspect.
+        let id = submit(&f.ex, Caller::Owner, &own_core_test(&f))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("inherited"), "{ticket:?}");
+        assert!(ticket.units[0].failed_tests.is_none());
+        assert!(
+            ticket.units[0]
+                .inherited
+                .as_deref()
+                .unwrap()
+                .contains("no test ids")
+        );
+        assert_eq!(ticket.inherited_task_ids, [incident]);
+    }
+
+    #[tokio::test]
+    async fn a_group_without_test_ids_is_the_tasks_failure_when_the_incident_lists_other_groups() {
+        let f = fixture(Some(&scripted_map("core", "exit 1")), None, true).await;
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_groups: &["py"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core_test(&f))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert!(ticket.inherited_task_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_final_classification_is_read_back_as_stored() {
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+        let id = submit(&f.ex, Caller::Owner, &own_core_test(&f))
+            .await
+            .unwrap();
+        let (first, _) = finished_with(&f, id).await;
+        assert_eq!(first.verdict.as_deref(), Some("inherited"));
+
+        // The incident closing later does not rewrite what this ticket was told; no git, no probe.
+        sqlx::query("DELETE FROM task_claims WHERE id = ?")
+            .bind(incident)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (again, _) = finished_with(&f, id).await;
+
+        assert_eq!(again.verdict.as_deref(), Some("inherited"));
+        assert_eq!(again.inherited_task_ids, [incident]);
+    }
+
+    #[tokio::test]
+    async fn daemon_callers_are_never_classified() {
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let id = submit(&f.ex, Caller::Job(1), &own_core_test(&f))
+            .await
+            .unwrap();
+        let (ticket, caller) = finished_with(&f, id).await;
+
+        assert_eq!(caller, "job:1");
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert!(ticket.inherited_task_ids.is_empty() && ticket.units[0].inherited.is_none());
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT classification FROM verify_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None, "nothing was written for a daemon caller");
+    }
+
+    #[test]
+    fn scope_outcome_never_reads_an_inherited_verdict_as_a_pass() {
+        use crate::gate::GateOutcome;
+        let inherited = ticket(
+            true,
+            Some("inherited"),
+            vec![unit(Some("py"), "failed", Some(1), Some("boom"))],
+        );
+        match scope_outcome(&inherited) {
+            ScopeVerdict::Measured(GateOutcome::Errored { reason }) => {
+                assert!(reason.contains("inherited"), "{reason}")
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
+    }
+
+    // ---- task claims: case 2, suspect groups and the single proof (chunk 4 Task 5) -----------------
+
+    use crate::task_claims::Status as ClaimStatus;
+    use crate::task_claims::store as claims;
+
+    #[test]
+    fn the_probe_caller_runs_at_postgate_priority_is_labelled_probe_and_no_key_can_claim_it() {
+        assert_eq!(Caller::Probe.priority(), verify_runs::PRIORITY_POSTGATE);
+        assert_eq!(Caller::Probe.label(), "probe");
+        assert_eq!(
+            Caller::Probe.requested_by("own"),
+            verify_runs::REQUESTED_BY_PROBE
+        );
+        assert!(may_read(Caller::Probe, "probe") && !may_read(Caller::Probe, "owner"));
+        assert!(
+            may_read(Caller::Owner, "probe"),
+            "the owner reads every ticket"
+        );
+        assert_ne!(Caller::from_scope(&Scope::Control), Some(Caller::Probe));
+        assert!(Caller::Probe.unit_timeout_ms() > 0);
+        assert_eq!(
+            Caller::Owner.unit_timeout_ms(),
+            0,
+            "everyone else keeps the configured timeout"
+        );
+    }
+
+    /// `Caller::Probe` runs the named groups whole, never feeds nor reads the cache, never joins another
+    /// run, and cannot be asked for by anyone else.
+    #[tokio::test]
+    async fn a_probe_request_runs_its_groups_whole_and_is_refused_to_anyone_else() {
+        let f = fixture(Some(&plain_map()), None, true).await;
+        let mut request = args(Kind::Test, ScopeArg::Own, f.repo.path(), None, None);
+        request.groups = Some(vec!["core".to_owned()]);
+
+        // Anyone but the daemon's probe is refused before a row exists.
+        let refused = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+        assert!(matches!(refused, VerifyError::BadRequest(_)), "{refused:?}");
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+
+        let id = submit(&f.ex, Caller::Probe, &request).await.unwrap();
+        let (ticket, caller) = finished(&f.pool, id).await;
+        assert_eq!(caller, "probe");
+        assert_eq!(groups(&ticket), [Some("core".to_owned())]);
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+        let_settle_decide().await; // `settle` would have written by now if a candidate had been queued
+        assert_eq!(
+            cache_rows(&f.pool).await,
+            0,
+            "a probe never feeds the green cache"
+        );
+        let (timeout_ms, requested_by): (i64, String) = sqlx::query_as(
+            "SELECT timeout_ms, requested_by FROM verify_runs WHERE origin = 'verify' AND origin_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(timeout_ms, Caller::Probe.unit_timeout_ms());
+        assert_eq!(requested_by, verify_runs::REQUESTED_BY_PROBE);
+    }
+
+    // ---- case 2 end to end (spec section 5: "Verify") ------------------------------------------------
+
+    /// Probe worktrees go under a space-free temp root, as the postgate worktree tests do; the env override
+    /// is process-wide, hence the lock. Field order is drop order: env first, lock last.
+    struct ProbeRoot {
+        _env: crate::execution::git_exec::tests::WorktreeRootEnv,
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn probe_root() -> ProbeRoot {
+        let lock = crate::execution::worktree::test_env_lock();
+        let dir = crate::execution::git_exec::tests::space_free_tempdir("nucleos-probe-");
+        let env = crate::execution::git_exec::tests::WorktreeRootEnv::set(dir.path());
+        ProbeRoot {
+            _env: env,
+            _dir: dir,
+            _lock: lock,
+        }
+    }
+
+    /// A probe root that cannot hold a worktree: the override names a regular file.
+    fn blocked_probe_root() -> ProbeRoot {
+        let lock = crate::execution::worktree::test_env_lock();
+        let dir = crate::execution::git_exec::tests::space_free_tempdir("nucleos-probe-");
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "x").unwrap();
+        let env = crate::execution::git_exec::tests::WorktreeRootEnv::set(&file);
+        ProbeRoot {
+            _env: env,
+            _dir: dir,
+            _lock: lock,
+        }
+    }
+
+    /// A linked worktree `name` of `f.repo`, branched from `main` (so it contains c1 and c2), that commits
+    /// a change to `core/a.rs` only. The session "touched" `core` and never `py`.
+    fn side_touching_core(f: &Fixture, holder: &Path, name: &str, content: &str) -> PathBuf {
+        let side = holder.join(name);
+        git_in(
+            f.repo.path(),
+            &["worktree", "add", "-q", "-b", name, &path_arg(&side)],
+        );
+        std::fs::write(side.join("core/a.rs"), content).unwrap();
+        git_in(&side, &["commit", "-q", "-am", "core change"]);
+        side
+    }
+
+    /// A scope request that also claims `py/b.py`, so `py` runs although the session never touched it.
+    /// The diff-aware selection (diff only) does not pick `py`: that is what makes it suspect.
+    fn scope_with_py(side: &Path) -> VerifyArgs {
+        args(Kind::Test, ScopeArg::Scope, side, Some(&["py/b.py"]), None)
+    }
+
+    async fn probe_requests(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM verify_requests WHERE caller = 'probe'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn live_master_red(pool: &SqlitePool) -> Option<crate::task_claims::TaskRow> {
+        claims::live_by_key(pool, "alpha", &TaskKey::master_red(), chrono::Utc::now())
+            .await
+            .unwrap()
+    }
+
+    /// Master gains `flag.txt`, which the sessions branched before it lack.
+    fn master_gains_flag(f: &Fixture) -> String {
+        std::fs::write(f.repo.path().join("flag.txt"), "x\n").unwrap();
+        git_in(f.repo.path(), &["add", "flag.txt"]);
+        git_in(f.repo.path(), &["commit", "-q", "-m", "three"]);
+        git_in(f.repo.path(), &["rev-parse", "HEAD"])
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_suspect_group_without_an_incident_is_proven_on_master_and_the_incident_opens() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("inherited"), "{ticket:?}");
+        let incident = live_master_red(&f.pool)
+            .await
+            .expect("the proof opened the incident");
+        assert_eq!(incident.status, ClaimStatus::Open);
+        assert_eq!(incident.detail["red_tests"], serde_json::json!(["a::boom"]));
+        assert_eq!(incident.detail["red_groups"], serde_json::json!(["py"]));
+        assert_eq!(incident.detail["red_sha"], serde_json::json!(f.c2));
+        assert_eq!(incident.detail["red_since_sha"], serde_json::json!(f.c2));
+        assert_eq!(incident.checked_sha.as_deref(), Some(f.c2.as_str()));
+        assert_eq!(ticket.inherited_task_ids, [incident.id]);
+        assert_eq!(probe_requests(&f.pool).await, 1);
+        let py = ticket
+            .units
+            .iter()
+            .find(|u| u.group.as_deref() == Some("py"))
+            .unwrap();
+        assert!(py.inherited.is_some() && py.pending.is_none(), "{py:?}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_suspect_group_that_passes_on_master_is_the_tasks_failure_and_one_pass_serves_the_next_ticket()
+     {
+        let _root = probe_root();
+        let f = fixture(
+            Some(&scripted_map("py", "test -f flag.txt || exit 1")),
+            None,
+            true,
+        )
+        .await;
+        let holder = tempfile::tempdir().unwrap();
+        let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
+        let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
+        master_gains_flag(&f); // py passes on master; the sessions branched before the flag
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&one))
+            .await
+            .unwrap();
+        let (first, _) = finished_with(&f, id).await;
+        assert_eq!(first.verdict.as_deref(), Some("failed"), "{first:?}");
+        let py = first
+            .units
+            .iter()
+            .find(|u| u.group.as_deref() == Some("py"))
+            .unwrap();
+        assert!(
+            py.not_inherited
+                .as_deref()
+                .unwrap()
+                .contains("passes on master"),
+            "{py:?}"
+        );
+        assert!(
+            live_master_red(&f.pool).await.is_none(),
+            "the probing row is gone"
+        );
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
+        assert_eq!(probe_requests(&f.pool).await, 1);
+
+        // A second session with the same suspect group, right after: the pass is remembered per master
+        // head, so no second proof starts.
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&two))
+            .await
+            .unwrap();
+        let (second, _) = finished_with(&f, id).await;
+        assert_eq!(second.verdict.as_deref(), Some("failed"), "{second:?}");
+        assert_eq!(probe_requests(&f.pool).await, 1, "one proof per master sha");
+        // And a re-read of the first ticket is stable.
+        let (again, _) = finished_with(&f, first.ticket).await;
+        assert_eq!(again.verdict.as_deref(), Some("failed"));
+        assert_eq!(probe_requests(&f.pool).await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn two_tickets_with_suspect_groups_share_one_probe() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
+        let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
+        let first = submit(&f.ex, Caller::Owner, &scope_with_py(&one))
+            .await
+            .unwrap();
+        let second = submit(&f.ex, Caller::Owner, &scope_with_py(&two))
+            .await
+            .unwrap();
+
+        // Both are read at once: one gets `Started`, the other finds the `probing` row and waits.
+        let ((a, _), (b, _)) = tokio::join!(finished_with(&f, first), finished_with(&f, second));
+
+        let incident = live_master_red(&f.pool).await.expect("incident");
+        assert_eq!(
+            (a.verdict.as_deref(), b.verdict.as_deref()),
+            (Some("inherited"), Some("inherited"))
+        );
+        assert_eq!(
+            (a.inherited_task_ids, b.inherited_task_ids),
+            (vec![incident.id], vec![incident.id])
+        );
+        assert_eq!(probe_requests(&f.pool).await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_probing_row_with_an_expired_lease_is_taken_over_and_proven_again() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        // A verify that crashed two hours ago left its `probing` row behind.
+        let stale = match claims::begin_probe(
+            &f.pool,
+            "alpha",
+            "999",
+            "/gone",
+            chrono::Utc::now() - chrono::Duration::hours(2),
+        )
+        .await
+        .unwrap()
+        {
+            crate::task_claims::ProbeStart::Started(row) => row,
+            other => panic!("{other:?}"),
+        };
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("inherited"), "{ticket:?}");
+        let incident = live_master_red(&f.pool).await.expect("incident");
+        assert_eq!(
+            incident.id, stale.id,
+            "the lapsed row was taken over, not duplicated"
+        );
+        assert_eq!(incident.status, ClaimStatus::Open);
+        assert_eq!(probe_requests(&f.pool).await, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_probe_that_cannot_run_is_the_tasks_failure_and_is_not_repeated() {
+        let _root = blocked_probe_root(); // the proof tree cannot be created
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+        let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
+        // A master head no other test has: the aborted proof is remembered in process memory per
+        // project and head, and every fixture is project `alpha`.
+        master_gains_flag(&f);
+
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        let py = ticket
+            .units
+            .iter()
+            .find(|u| u.group.as_deref() == Some("py"))
+            .unwrap();
+        assert!(
+            py.not_inherited
+                .as_deref()
+                .unwrap()
+                .contains("did not finish"),
+            "{py:?}"
+        );
+        assert!(
+            live_master_red(&f.pool).await.is_none(),
+            "an aborted proof leaves no probing row"
+        );
+        assert_eq!(
+            probe_requests(&f.pool).await,
+            0,
+            "nothing was ever submitted"
+        );
+        let (again, _) = finished_with(&f, id).await;
+        assert_eq!(again.verdict.as_deref(), Some("failed"));
+        assert_eq!(
+            count(&f.pool, "task_claims").await,
+            0,
+            "and a second read starts no second probe"
+        );
+
+        // Another session with the same suspect group on the same master head: the aborted proof is
+        // remembered, so no proof starts for this ticket (it would stop the same way).
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&two))
+            .await
+            .unwrap();
+        let (second, _) = finished_with(&f, id).await;
+        assert_eq!(second.verdict.as_deref(), Some("failed"), "{second:?}");
+        let py = second
+            .units
+            .iter()
+            .find(|u| u.group.as_deref() == Some("py"))
+            .unwrap();
+        assert!(
+            py.not_inherited
+                .as_deref()
+                .unwrap()
+                .contains("did not finish"),
+            "{py:?}"
+        );
+        let outcome: Option<String> =
+            sqlx::query_scalar("SELECT probe_outcome FROM verify_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(outcome, None, "no proof ran for the second ticket");
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_land_evidence_read_never_starts_a_probe() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+        let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side))
+            .await
+            .unwrap();
+
+        // `covering_request` and the access check read like this: no classification, no side effects.
+        let (ticket, _) = wait_ticket_with(&f.pool, Some(&f.ex), id, WAIT, false)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(ticket.done);
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert!(ticket.inherited_task_ids.is_empty());
+        assert_eq!(count(&f.pool, "task_claims").await, 0);
+        assert_eq!(probe_requests(&f.pool).await, 0);
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT classification FROM verify_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    /// `group` fails with `ids` unless `flag.txt` exists in the tree it runs in. A subshell and not a
+    /// `{ ...; }` group: the tests map rejects any command word holding both braces as a marker.
+    fn red_unless_flag(ids: &[&str]) -> String {
+        format!("test -f flag.txt || ( {} )", failing_script(ids))
+    }
+
+    fn own_core_in(side: &Path) -> VerifyArgs {
+        args(Kind::Test, ScopeArg::Own, side, Some(&["core/a.rs"]), None)
+    }
+
+    async fn claim_row(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT status, checked_sha, close_note FROM task_claims WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_incident_checked_at_an_old_sha_is_reproved_and_closes_when_green() {
+        let _root = probe_root();
+        let f = fixture(
+            Some(&scripted_map("core", &red_unless_flag(&["a::boom"]))),
+            None,
+            true,
+        )
+        .await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+        let head = master_gains_flag(&f); // core is green on master now; the session still fails it
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                status: "claimed",
+                holder: Some(("session", "s9")),
+                red_tests: &["a::boom"],
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c1), // old: master moved on to `head`
+            },
+        )
+        .await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core_in(&side))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        // The re-proof ran core on master, found it green and closed the incident ...
+        let (status, _, note) = claim_row(&f.pool, incident).await;
+        assert_eq!(status, "done");
+        assert!(
+            note.unwrap().contains(&head),
+            "the close note names the proving sha"
+        );
+        assert!(live_master_red(&f.pool).await.is_none());
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT holder_id FROM task_claim_events WHERE task_id = ? AND event = 'done'",
+        )
+        .bind(incident)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            owner.as_deref(),
+            Some("s9"),
+            "the event keeps the previous owner"
+        );
+        assert_eq!(probe_requests(&f.pool).await, 1);
+        // ... and the unit, with no incident left, follows case 2 like any verify: core is the session's
+        // own group (it touched core/a.rs), so the red is its own.
+        assert_eq!(ticket.verdict.as_deref(), Some("failed"), "{ticket:?}");
+        assert!(ticket.inherited_task_ids.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_incident_still_red_at_head_gets_its_checked_sha_updated_and_the_unit_is_inherited()
+    {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                status: "claimed",
+                holder: Some(("session", "s9")),
+                red_tests: &["a::boom"],
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c1),
+            },
+        )
+        .await;
+
+        let id = submit(&f.ex, Caller::Owner, &own_core_in(&side))
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        let (status, checked, _) = claim_row(&f.pool, incident).await;
+        assert_eq!(
+            (status.as_str(), checked.as_deref()),
+            ("claimed", Some(f.c2.as_str()))
+        );
+        let holder_id: Option<String> =
+            sqlx::query_scalar("SELECT holder_id FROM task_claims WHERE id = ?")
+                .bind(incident)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(holder_id.as_deref(), Some("s9"), "status and owner stay");
+        assert_eq!(ticket.verdict.as_deref(), Some("inherited"), "{ticket:?}");
+        assert_eq!(ticket.inherited_task_ids, [incident]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn two_concurrent_reads_start_one_reprobe() {
+        let _root = probe_root();
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
+        let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let first = submit(&f.ex, Caller::Owner, &own_core_in(&one))
+            .await
+            .unwrap();
+        let second = submit(&f.ex, Caller::Owner, &own_core_in(&two))
+            .await
+            .unwrap();
+
+        let ((a, _), (b, _)) = tokio::join!(finished_with(&f, first), finished_with(&f, second));
+
+        assert_eq!(
+            (a.verdict.as_deref(), b.verdict.as_deref()),
+            (Some("inherited"), Some("inherited"))
+        );
+        assert_eq!(
+            probe_requests(&f.pool).await,
+            1,
+            "single flight by probe_lease_until"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stale_incident_whose_reproof_cannot_run_still_serves_units_with_ids_once_the_flight_lapses()
+     {
+        let _root = blocked_probe_root();
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let holder = tempfile::tempdir().unwrap();
+        let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let id = submit(&f.ex, Caller::Owner, &own_core_in(&side))
+            .await
+            .unwrap();
+
+        // The re-proof is launched, cannot create its tree, and records nothing: the lease stays.
+        let (waiting, _) = wait_ticket_with(&f.pool, Some(&f.ex), id, Duration::from_secs(3), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!waiting.done, "{waiting:?}");
+        assert!(waiting.units.iter().any(|u| {
+            u.pending
+                .as_deref()
+                .is_some_and(|p| p.starts_with("reprobe #"))
+        }));
+        let draft: serde_json::Value = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>(
+                "SELECT classification FROM verify_requests WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(draft["done"], false);
+        assert_eq!(
+            draft["reprobes"], 1,
+            "the ticket remembers it already tried"
+        );
+        assert!(draft["suspects"].is_null() || draft["suspects"].is_object());
+
+        // The flight lapses; the ticket does not start a second one and reads the incident as it stands.
+        sqlx::query("UPDATE task_claims SET probe_lease_until = ? WHERE id = ?")
+            .bind(crate::execution::wave::stamp(
+                chrono::Utc::now() - chrono::Duration::hours(1),
+            ))
+            .bind(incident)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let (ticket, _) = finished_with(&f, id).await;
+
+        assert_eq!(
+            ticket.verdict.as_deref(),
+            Some("inherited"),
+            "ids do not need a fresh incident: {ticket:?}"
+        );
+        assert_eq!(probe_requests(&f.pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_live_incident_or_with_a_fresh_one_runs_nothing() {
+        let f = fixture(Some(&plain_map()), None, false).await;
+        let none = crate::verify::inherit::refresh_master_red(
+            &f.pool,
+            &f.ex,
+            "alpha",
+            Duration::ZERO,
+            chrono::Utc::now(),
+        )
+        .await;
+        assert_eq!(none, crate::verify::inherit::Refresh::NoIncident);
+
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+        let fresh = crate::verify::inherit::refresh_master_red(
+            &f.pool,
+            &f.ex,
+            "alpha",
+            Duration::ZERO,
+            chrono::Utc::now(),
+        )
+        .await;
+        assert_eq!(fresh, crate::verify::inherit::Refresh::Fresh);
+        assert_eq!(probe_requests(&f.pool).await, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_closes_an_incident_that_is_green_at_head() {
+        let _root = probe_root();
+        let f = fixture(Some(&plain_map()), None, true).await; // core passes on master
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c1),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let refresh = crate::verify::inherit::refresh_master_red(
+            &f.pool,
+            &f.ex,
+            "alpha",
+            WAIT,
+            chrono::Utc::now(),
+        )
+        .await;
+
+        assert_eq!(
+            refresh,
+            crate::verify::inherit::Refresh::Closed { sha: f.c2.clone() }
+        );
+        assert_eq!(claim_row(&f.pool, incident).await.0, "done");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_reports_still_red_and_in_flight() {
+        let _root = probe_root();
+        // `core` fails on master, slowly enough for a zero wait to see the proof still running.
+        let slow = format!("sleep 3; {}", failing_script(&["a::boom"]));
+        let f = fixture(Some(&scripted_map("core", &slow)), None, true).await;
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                red_groups: &["core"],
+                since: Some(&f.c1),
+                checked: Some(&f.c1),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let in_flight = crate::verify::inherit::refresh_master_red(
+            &f.pool,
+            &f.ex,
+            "alpha",
+            Duration::ZERO,
+            chrono::Utc::now(),
+        )
+        .await;
+        assert_eq!(in_flight, crate::verify::inherit::Refresh::InFlight);
+
+        // A second look while the first proof still runs joins its flight instead of starting another.
+        let still_red = crate::verify::inherit::refresh_master_red(
+            &f.pool,
+            &f.ex,
+            "alpha",
+            WAIT,
+            chrono::Utc::now(),
+        )
+        .await;
+        assert_eq!(still_red, crate::verify::inherit::Refresh::StillRed);
+        assert_eq!(
+            claim_row(&f.pool, incident).await.1.as_deref(),
+            Some(f.c2.as_str())
+        );
+        assert_eq!(probe_requests(&f.pool).await, 1);
     }
 }

@@ -29,6 +29,15 @@ pub fn render_units(ticket: &Value) -> String {
         if let Some(already) = unit["already_failing"].as_str() {
             out.push_str(&format!(" (already failing on the target: {already})"));
         }
+        if let Some(text) = unit["inherited"].as_str() {
+            out.push_str(&format!(" (inherited: {text})"));
+        }
+        if let Some(text) = unit["not_inherited"].as_str() {
+            out.push_str(&format!(" (not yours? {text})"));
+        }
+        if let Some(text) = unit["pending"].as_str() {
+            out.push_str(&format!(" (pending: {text})"));
+        }
         out.push('\n');
         if matches!(status, "failed" | "errored")
             && let Some(tail) = unit["output_tail"].as_str()

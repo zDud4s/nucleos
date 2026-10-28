@@ -4,8 +4,9 @@
 Registered under seven events (`autopilot.rs`'s `wire_classifier_hook`), told apart by the
 payload's own `hook_event_name` rather than by anything the invocation says, because the same
 command is wired to all seven. `Stop`, `SubagentStop`, `UserPromptSubmit` and `SessionStart` (stdout JSON such as
-`hookSpecificOutput.additionalContext` is printed verbatim) only forward to the
-hooks a pinned workflow bundle declares (`bundle_hooks`), and fail open; the three tool events
+`hookSpecificOutput.additionalContext` is printed verbatim) forward to the
+hooks a pinned workflow bundle declares (`bundle_hooks`), and fail open; the last two also
+carry the claims context of the session (`claims_context`); the three tool events
 are what follows:
 
 A run (NUCLEOS_RUN_ID present) gets the full safety gate on `PreToolUse`: allows emit the
@@ -15,11 +16,16 @@ for the daemon's admission to run (`admit_heavy`), the one leg here that fails o
 
 An interactive session gets one narrow question instead: is this a git operation the
 VCS queue performs? If so it is queued and this call is refused; otherwise this hook
-says nothing at all. **It can refuse but it can never approve** — that asymmetry is what
+says nothing at all. **It can refuse but it can never approve, with one exception**:
+a call to one of the four `mcp__nucleos__task_*` tools is allowed, only to stamp the session id
+into its input (see `interactive_session`); every other tool, MCP server or near-miss name gets
+no decision at all. That asymmetry is what
 makes it safe to speak here, where the old version had to stay silent. Registered
 repo-wide, an allow would auto-approve a person's own tools; a refusal grants nothing.
 This branch may also add context (`additionalContext`) telling the agent that a vcs request
-it was refused for has settled, once per request; that carries no permission decision either,
+it was refused for has settled, once per request; so does the claims context (`claims_exchange`:
+a rate-limited, fail-open registration of the session with the daemon, 2 s in total with token
+discovery included, and the notices it answers); that carries no permission decision either,
 and it is silent on every error.
 
 That silence was a real hole rather than a conservative default. The queue exists to
@@ -31,7 +37,8 @@ merged, with no hook, no proposal and no row.
 never block anything: by the time either fires the tool has already run (or already failed), so
 a refusal here would be a barrier with nothing left to stop — an expensive warning, not a
 protection. `report_outcome` is therefore silent on every failure of its own: an unreachable
-daemon, a missing token, a payload it cannot use. Never `deny()`, never `approve()`.
+daemon, a missing token, a payload it cannot use. Never `deny()`, never `approve()`. They also
+carry the claims notices, as context only.
 
 All malformed-input, configuration, and daemon errors still fail closed ON THE PreToolUse PATH —
 the one path where failing open would matter.
@@ -59,6 +66,23 @@ PENDING_DIR_ENV = "NUCLEOS_VCS_PENDING_DIR"
 PENDING_TTL_SECONDS = 30 * 60
 PENDING_RECHECK_SECONDS = 15
 SESSION_ID_SHAPE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+# Task claims (spec 2026-10-22). An interactive session tells the daemon it is alive so that the
+# claims it holds stay alive, and hears back what happened to them. A run never does this: it is a
+# holder by its own id, which the daemon reads off its key.
+CLAIMS_DIR_ENV = "NUCLEOS_CLAIMS_DIR"
+# Switched off by ANY non-empty value ("1", "0" and "off" alike); only unset or empty leaves it on.
+CLAIMS_OFF_ENV = "NUCLEOS_CLAIMS_OFF"
+# Never more than this IN TOTAL: token discovery (at most 1 s) and the HTTP call share it. The
+# registration is its OWN request, apart from the git path (30 s, fails closed). A claim must never
+# be able to slow a tool call or stop one.
+CLAIMS_TIMEOUT_SECONDS = 2
+# The token costs a git call and a process spawn when it is not in the environment, and this hook
+# runs before and after every tool call. The lease is 30 minutes, so one registration every 20
+# seconds keeps it far from lapsing and a tool call longer than that is caught by its PostToolUse.
+CLAIMS_INTERVAL_SECONDS = 20
+CLAIMS_ERROR_BACKOFF_SECONDS = 60
+CLAIMS_UNREGISTERED_BACKOFF_SECONDS = 300
 
 # A deliberately over-broad local filter, and it must never be the authority. Its only job is
 # to keep the fast path free: this hook runs in front of every tool call in every editor
@@ -119,6 +143,42 @@ def governed_git_verb(command: str) -> str:
     return ""
 
 
+# The project owner's override of the task-claims land gate (`nucleos-core --land` reads it). It is
+# for a person at their own terminal, like NUCLEOS_ALLOW_DIRECT_GIT, but unlike that one an agent
+# must not reach it at all: a claimed task is only closed by its owner or by green.
+CLAIMED_LAND_OVERRIDE = "nucleos_allow_claimed_land"
+
+
+# The forms that SET a variable, on text already stripped and lower-cased: `NAME=`, `NAME =`,
+# `env:NAME` (also `$env:NAME` and `Set-Item env:NAME`), `export NAME`, `env NAME`, `set NAME`,
+# `-e NAME`. A bare mention (`rg NAME`, `git commit -m "... NAME ..."`, a doc) is not one.
+_CLAIMED_LAND_SETTING = re.compile(
+    r"(?<![a-z0-9_])(?:(?:env:|export\s+|env\s+|set\s+|-e\s+)" + CLAIMED_LAND_OVERRIDE
+    + r"|" + CLAIMED_LAND_OVERRIDE + r"\s*=)"
+)
+
+
+def claimed_land_override(payload: dict) -> bool:
+    """Whether this tool call SETS the owner's land override, however it is spelled.
+
+    A speed bump, not the guard: a shell has endless ways to build a name (`n=NUCLEOS_ALLOW_CLAIMED;
+    export ${n}_LAND=1`) that no text filter catches. The real refusal lives in `nucleos-core
+    --land`, which is what honours or ignores the variable. This only stops the plain attempts.
+
+    Over-broad like `governed_git_verb` on spelling: quotes, backslashes, backticks and `+ $ { }`
+    are dropped before looking and the match ignores case, so `NUCLEOS_ALLOW_"CLAIMED_LAND"=1` and
+    `$env:nucleos_allow_claimed_land` are both caught. Narrow on form: only a setting is refused
+    (see `_CLAIMED_LAND_SETTING`), so searching for the name or writing it in a message is not.
+    """
+    if payload.get("tool_name") not in ("Bash", "PowerShell"):
+        return False
+    command = (payload.get("tool_input") or {}).get("command")
+    if not isinstance(command, str):
+        return False
+    stripped = re.sub(r"[\\`'\"+${}]", "", command).lower()
+    return _CLAIMED_LAND_SETTING.search(stripped) is not None
+
+
 def _verb_in_command(command: str) -> str:
     """One reading of `governed_git_verb`: separators, then quote-aware and plain tokens."""
     normalized = command
@@ -169,7 +229,7 @@ def _verb_in(tokens) -> str:
     return ""
 
 
-def approve(reason: str = "autopilot: allowed", updated_input=None) -> None:
+def approve(reason: str = "autopilot: allowed", updated_input=None, context=None) -> None:
     """Allows the tool call, optionally rewriting its input.
 
     A rewrite (`updatedInput`) rides only on an allow, and a malformed one (anything but
@@ -182,6 +242,8 @@ def approve(reason: str = "autopilot: allowed", updated_input=None) -> None:
     }
     if isinstance(updated_input, dict):
         output["updatedInput"] = updated_input
+    if isinstance(context, str) and context:
+        output["additionalContext"] = context
     print(json.dumps({"hookSpecificOutput": output}))
     sys.exit(0)
 
@@ -330,20 +392,32 @@ def control_token(cwd: str) -> str:
     )
 
 
-def read_control_token(cwd: str, git_timeout=10, print_timeout=20):
+def read_control_token(cwd: str, git_timeout=10, print_timeout=20, total_timeout=None):
     """`(token, why)`: the token or None, and why none (`"repo"` or `"token"`).
 
     Raises nothing and never denies, so a caller that must stay silent (the follow-up that
     reports a settled request) can use it; `control_token` turns the failure into its denials.
+    `total_timeout`, when given, is one budget for git and every `--print-token` together; each
+    call gets the smaller of its own timeout and what is left of it.
     """
     from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
     if from_env:
         return from_env, None
 
+    deadline = None if total_timeout is None else time.monotonic() + total_timeout
+
+    def left(own):
+        if deadline is None:
+            return own
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("token discovery", total_timeout)
+        return min(own, remaining)
+
     try:
         common = subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            capture_output=True, text=True, timeout=git_timeout,
+            capture_output=True, text=True, timeout=left(git_timeout),
         )
         if common.returncode != 0:
             return None, "repo"
@@ -353,7 +427,7 @@ def read_control_token(cwd: str, git_timeout=10, print_timeout=20):
             if os.path.exists(binary):
                 printed = subprocess.run(
                     [binary, "--print-token"], capture_output=True, text=True,
-                    timeout=print_timeout,
+                    timeout=left(print_timeout),
                 )
                 if printed.returncode == 0 and printed.stdout.strip():
                     return printed.stdout.strip(), None
@@ -536,11 +610,162 @@ def settled_notice(payload, token=None):
         return ""
 
 
-def tell(text: str) -> None:
+def claims_off():
+    return bool(os.environ.get(CLAIMS_OFF_ENV))
+
+
+def claims_state_path(session_id):
+    """Where this session's claims state is kept, or None for an unsafe id."""
+    try:
+        if not isinstance(session_id, str) or not SESSION_ID_SHAPE.fullmatch(session_id):
+            return None
+        base = os.environ.get(CLAIMS_DIR_ENV) or os.path.join(
+            tempfile.gettempdir(), "nucleos-claims"
+        )
+        return os.path.join(base, f"{session_id}.json")
+    except Exception:
+        return None
+
+
+def _claims_state(path):
+    """The state file as a dict; `{}` when it is missing or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_claims_state(path, state):
+    """Writes the state through a temp file; silent on every error. Never holds the token."""
+    try:
+        # Like `_store_pending`: the directory does not exist the first time.
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _number(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return 0
+
+
+def claims_exchange(payload, want_incidents=False, force=False, now=None):
+    """Registers this session with the daemon; returns the daemon's answer or None. Silent on every error.
+
+    None means "nothing to say": switched off, a governed run, an id or cwd it cannot use, the rate
+    limit, a daemon that is down (retried after a minute), or a project that is not registered
+    (answered, but asked again only after five). Nothing here can raise, deny or approve.
+
+    One total budget of CLAIMS_TIMEOUT_SECONDS covers token discovery (at most 1 s of it) and the
+    HTTP call. `force` skips the rate limit, but not the error backoff: only a previous exchange
+    that succeeded lets it through, so a dead daemon is not retried on every forced call.
+    """
+    try:
+        if claims_off() or os.environ.get("NUCLEOS_RUN_ID") is not None:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        session_id = payload.get("session_id")
+        cwd = payload.get("cwd")
+        path = claims_state_path(session_id)
+        if path is None or not isinstance(cwd, str) or not cwd.strip():
+            return None
+        now = time.time() if now is None else now
+        state = _claims_state(path)
+        if now < _number(state.get("next")) and not (force and state.get("ok") is True):
+            return None
+
+        started = time.monotonic()
+        token, _why = read_control_token(cwd, 1, 1, total_timeout=1)
+        if not token:
+            state["next"] = now + CLAIMS_ERROR_BACKOFF_SECONDS
+            state["ok"] = False
+            _save_claims_state(path, state)
+            return None
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        request = urllib.request.Request(
+            f"{daemon_url}/tasks/session",
+            data=json.dumps(
+                {"session_id": session_id, "cwd": cwd, "want_incidents": bool(want_incidents)}
+            ).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            remaining = max(0.2, CLAIMS_TIMEOUT_SECONDS - (time.monotonic() - started))
+            with urllib.request.urlopen(request, timeout=remaining) as response:
+                answer = json.loads(response.read())
+        except Exception:
+            answer = None
+        if not isinstance(answer, dict):
+            state["next"] = now + CLAIMS_ERROR_BACKOFF_SECONDS
+            state["ok"] = False
+            _save_claims_state(path, state)
+            return None
+        state["ok"] = True
+        if answer.get("registered") is not True:
+            state["next"] = now + CLAIMS_UNREGISTERED_BACKOFF_SECONDS
+        else:
+            state["next"] = now + CLAIMS_INTERVAL_SECONDS
+        _save_claims_state(path, state)
+        return answer
+    except Exception:
+        return None
+
+
+# Equals mcp_tools::TASK_TOOL_NAMES behind the server prefix; a test compares the two.
+TASK_TOOLS = tuple(f"mcp__nucleos__task_{name}" for name in ("list", "claim", "release", "done"))
+INCIDENTS_HEADER = (
+    "Live incidents in this project. Before fixing anything outside your own task, claim it with "
+    "mcp__nucleos__task_claim, and if you do not win, leave it:\n"
+)
+
+
+def claims_context(payload, want_incidents=False, force=False, always_list=False):
+    """The text this session should read before its next step, or "". Silent on every error.
+
+    Notices (a claim lost, an incident closed) come from the daemon already worded. Incidents are
+    listed only when asked, and only when the list changed since this session last saw it (or
+    `always_list`, after a compaction dropped it from the context).
+    """
+    try:
+        answer = claims_exchange(payload, want_incidents=want_incidents, force=force)
+        if not isinstance(answer, dict) or answer.get("registered") is not True:
+            return ""
+        notices = answer.get("notices")
+        parts = [n for n in (notices if isinstance(notices, list) else []) if isinstance(n, str) and n.strip()]
+        if want_incidents:
+            raw = answer.get("incidents")
+            incidents = [i for i in (raw if isinstance(raw, list) else []) if isinstance(i, str) and i.strip()]
+            digest = "\n".join(incidents)
+            path = claims_state_path(payload.get("session_id"))
+            state = _claims_state(path) if path else {}
+            if incidents and (always_list or digest != state.get("incidents")):
+                parts.append(INCIDENTS_HEADER + "\n".join(f"- {line}" for line in incidents))
+            if path and state.get("incidents") != digest:
+                # Also stored when the list went empty, so that the same list coming back is news.
+                state["incidents"] = digest
+                _save_claims_state(path, state)
+        return "\n\n".join(parts)
+    except Exception:
+        return ""
+
+
+def tell(text: str, event: str = "PreToolUse") -> None:
     """Adds context to the next turn. Carries no permission decision, so it grants nothing."""
     print(
         json.dumps(
-            {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
+            {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
         )
     )
     sys.exit(0)
@@ -769,10 +994,34 @@ def verify_hint(payload: dict, now=None) -> str:
 
 
 def interactive_session(payload: dict) -> None:
-    """A session a person opened. Refuses queue operations; may add context, never approves.
+    """A session a person opened. Refuses queue operations; may add context. The one thing it ever
+    approves is a call to one of the four `mcp__nucleos__task_*` tools, to stamp the session id.
 
     The non-git branch may also add the verify hint (context only, never a decision).
     """
+    tool = payload.get("tool_name")
+    session_id = payload.get("session_id")
+    tool_input = payload.get("tool_input")
+    stamping = (
+        tool in TASK_TOOLS
+        and isinstance(session_id, str)
+        and SESSION_ID_SHAPE.fullmatch(session_id) is not None
+        and isinstance(tool_input, dict)
+    )
+    # A task tool forces the registration: the daemon only believes a session id it has seen.
+    claims = claims_context(payload, force=stamping)
+    if stamping:
+        # The ONE approval this hook ever gives, and the reason it is safe to give: the four task
+        # tools only write claim rows in the daemon's own table (idempotent, no effect outside it).
+        # The owner accepted this on 2026-10-22. The stamp overwrites whatever the model put in
+        # `session_id`, so a session cannot speak for another. The residual trust is the server
+        # NAME: `mcp__nucleos__` is whatever this session registered as `nucleos`, the same trust
+        # `is_job_node_tool` places in it on the daemon side.
+        approve(
+            "claims: task tools only write claim rows",
+            {**tool_input, "session_id": session_id},
+            claims or None,
+        )
     command = (payload.get("tool_input") or {}).get("command")
     if (
         payload.get("tool_name") not in ("Bash", "PowerShell")
@@ -781,7 +1030,7 @@ def interactive_session(payload: dict) -> None:
     ):
         notice = settled_notice(payload)
         hint = verify_hint(payload)
-        text = "\n\n".join(t for t in (notice, hint) if t)
+        text = "\n\n".join(t for t in (claims, notice, hint) if t)
         if text:
             tell(text)
         no_opinion()
@@ -823,7 +1072,7 @@ def interactive_session(payload: dict) -> None:
         and not isinstance(request_id, bool)
     ):
         remember_pending(payload.get("session_id"), request_id)
-    notice = settled_notice(payload, token)
+    notice = "\n\n".join(t for t in (claims, settled_notice(payload, token)) if t)
     if decision.get("decision") == "allow":
         # Never re-emitted as an approval. The daemon means "not mine to govern", and the
         # session's ordinary permissions decide from here.
@@ -861,41 +1110,67 @@ def merged_stdout(outputs):
     return "\n\n".join(out.strip() for out in outputs)
 
 
-def bundle_hooks(payload: dict) -> None:
+def with_context(outputs, event, extra):
+    """`outputs` (bundle hook stdout) with `extra` added as context, still ONE document.
+
+    A bundle that printed a JSON object keeps it, and `extra` goes into its
+    `hookSpecificOutput.additionalContext` (Claude Code reads stdout as one document, so a second
+    object beside it would parse as neither). Otherwise `extra` is one more plain-text paragraph.
+    """
+    if not extra:
+        return outputs
+    for index, out in enumerate(outputs):
+        try:
+            parsed = json.loads(out)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            special = parsed.get("hookSpecificOutput")
+            if not isinstance(special, dict):
+                special = parsed["hookSpecificOutput"] = {}
+            special.setdefault("hookEventName", event)
+            current = special.get("additionalContext")
+            special["additionalContext"] = f"{current}\n\n{extra}" if current else extra
+            return outputs[:index] + [json.dumps(parsed)] + outputs[index + 1:]
+    return outputs + [extra]
+
+
+def bundle_hooks(payload: dict, extra: str = "") -> None:
     """Runs the hooks the project's pinned workflow bundles declare for this session event.
 
     The daemon runs them, from its library, and hands back what each did; this reproduces Claude
     Code's own reading of a hook. The first one that exited 2 blocks: its stderr is printed and
     this exits 2. Otherwise the stdout of those that printed something is printed (`merged_stdout`)
-    and this exits 0.
+    and this exits 0. `extra` (the claims text of `main`) rides in that same document, and is
+    printed even when there is no bundle, token or daemon behind the call.
 
     **Fails open, every way.** No token, no daemon, an error, an answer it cannot read, no project,
-    no pins: exit 0 with nothing printed. These events are not a tool call this daemon governs;
-    they are a workflow's own guards, and a guard that cannot be reached must not leave a session
-    that can never stop, or a prompt that can never be sent.
+    no pins: exit 0 with nothing printed (but `extra`). These events are not a tool call this
+    daemon governs; they are a workflow's own guards, and a guard that cannot be reached must not
+    leave a session that can never stop, or a prompt that can never be sent.
     """
+    results = []
     try:
         cwd = payload.get("cwd") or os.getcwd()
         token, _why = read_control_token(cwd, 2, 3)
-        if not token:
-            no_opinion()
-        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
-        request = urllib.request.Request(
-            f"{daemon_url}/hooks/bundle",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=BUNDLE_HOOKS_TIMEOUT) as response:
-            answer = json.loads(response.read())
-        results = answer.get("results") if isinstance(answer, dict) else None
-        if not isinstance(results, list):
-            no_opinion()
+        if token:
+            daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+            request = urllib.request.Request(
+                f"{daemon_url}/hooks/bundle",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=BUNDLE_HOOKS_TIMEOUT) as response:
+                answer = json.loads(response.read())
+            found = answer.get("results") if isinstance(answer, dict) else None
+            if isinstance(found, list):
+                results = found
     except Exception:
-        no_opinion()
+        results = []
 
     outputs = []
     for result in results:
@@ -907,6 +1182,7 @@ def bundle_hooks(payload: dict) -> None:
         out = result.get("stdout")
         if isinstance(out, str) and out.strip():
             outputs.append(out)
+    outputs = with_context(outputs, payload.get("hook_event_name"), extra)
     if outputs:
         print(merged_stdout(outputs))
     sys.exit(0)
@@ -931,12 +1207,32 @@ def main() -> None:
     event = payload.get("hook_event_name") if payload is not None else None
     if event in ("PostToolUse", "PostToolUseFailure"):
         report_outcome(payload)
+        if os.environ.get("NUCLEOS_RUN_ID") is None:
+            text = claims_context(payload)
+            if text:
+                tell(text, event)
         return
 
     # Before the run branch, which would otherwise send a `Stop` to the tool gate: these events
     # carry no tool call, and they fail open whoever's session fired them.
     if event in SESSION_EVENTS:
-        bundle_hooks(payload)
+        extra = ""
+        if event in ("UserPromptSubmit", "SessionStart") and os.environ.get("NUCLEOS_RUN_ID") is None:
+            # Forced: a prompt is rare next to tool calls, and a list that is a minute stale is not
+            # worth the rate limit. `always_list` after a compaction, which drops the context.
+            extra = claims_context(
+                payload, want_incidents=True, force=True, always_list=(event == "SessionStart"),
+            )
+        bundle_hooks(payload, extra)
+
+    # Refused for a person's session and for a governed run alike, before either is asked
+    # anything: the override belongs to the project's owner, not to an agent.
+    if payload is not None and claimed_land_override(payload):
+        deny(
+            "this variable is for the project's owner at their own terminal, not for an agent. "
+            "A branch that touches a claimed task waits for the task to close; task_list shows "
+            "who holds it."
+        )
 
     run_id_raw = os.environ.get("NUCLEOS_RUN_ID")
     if run_id_raw is None:
