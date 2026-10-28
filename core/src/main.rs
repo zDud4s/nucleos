@@ -1034,10 +1034,11 @@ async fn main() {
         &verify_config.admission,
     ));
     let admission_enabled = verify_config.admission.enabled;
-    let verify_executor = verify::exec::Executor::new(
+    let verify_executor = verify::exec::Executor::with_warm_home(
         state.pool.clone(),
         verify_config,
         machine_config_root.clone(),
+        machine_config_root.as_deref().map(nucleos_core::warm::home),
     );
     verify::install(verify_executor.clone());
     // A graph node that names an `agent:` launches as that catalogue agent (agent spec section 13).

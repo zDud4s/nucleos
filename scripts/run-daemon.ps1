@@ -241,6 +241,11 @@ Remove-Item Env:NUCLEOS_SIDECAR_DIR -ErrorAction SilentlyContinue
 # Started from a Claude Code session, the daemon would inherit its id and hand it to every gate it
 # runs, and heavy.py would file the daemon's gates under that session.
 Remove-Item Env:CLAUDE_CODE_SESSION_ID -ErrorAction SilentlyContinue
+# Verification build output goes to the dev home, not ~/.nucleos: a profile path with a space in it
+# breaks the windows-gnu linker (warm::HOME_ENV). An explicit value is kept.
+if ([string]::IsNullOrEmpty($env:NUCLEOS_WARM_HOME)) {
+    $env:NUCLEOS_WARM_HOME = if ($env:NUCLEOS_DEV_HOME) { $env:NUCLEOS_DEV_HOME } else { Join-Path "$env:SystemDrive\" 'nucleos-dev' }
+}
 Push-Location $RepoRoot
 & (Join-Path $RunDir 'nucleos-core.exe') @DaemonArgs
 $code = $LASTEXITCODE

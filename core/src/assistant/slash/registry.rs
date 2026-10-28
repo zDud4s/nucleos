@@ -17,12 +17,80 @@ struct Builtin {
 }
 
 /// Every built-in. A phase that adds a command adds one entry here and a branch in its runner.
-const BUILTINS: &[Builtin] = &[Builtin {
-    name: "help",
-    description: "List the commands this conversation can run, or describe one",
-    hint: Some("[command]"),
-    aliases: &["commands"],
-}];
+const BUILTINS: &[Builtin] = &[
+    Builtin {
+        name: "help",
+        description: "List the commands this conversation can run, or describe one",
+        hint: Some("[command]"),
+        aliases: &["commands"],
+    },
+    Builtin {
+        name: "clear",
+        description: "Forget everything said so far; the next turn starts clean",
+        hint: None,
+        aliases: &[],
+    },
+    Builtin {
+        name: "fresh",
+        description: "Start the next turn on a fresh context, keeping a short replay",
+        hint: None,
+        aliases: &[],
+    },
+    Builtin {
+        name: "context",
+        description: "Show what this conversation's context window holds",
+        hint: None,
+        aliases: &[],
+    },
+    Builtin {
+        name: "cost",
+        description: "Show what this conversation has cost",
+        hint: None,
+        aliases: &[],
+    },
+    Builtin {
+        name: "stop",
+        description: "Stop the turn that is running",
+        hint: None,
+        aliases: &[],
+    },
+    Builtin {
+        name: "model",
+        description: "Show the model menu, or switch to a model",
+        hint: Some("[model|default]"),
+        aliases: &[],
+    },
+    Builtin {
+        name: "effort",
+        description: "Show or set how hard the model thinks",
+        hint: Some("[level|default]"),
+        aliases: &[],
+    },
+    Builtin {
+        name: "permissions",
+        description: "Show the permission menu, set a mode, or deny or allow a tool",
+        hint: Some("[mode | deny <tool> | allow <tool>]"),
+        aliases: &[],
+    },
+    Builtin {
+        name: "project",
+        description: "Show the project picker, or move the conversation to a directory",
+        hint: Some("[path]"),
+        aliases: &[],
+    },
+    Builtin {
+        name: "add-dir",
+        description: "Show or change the extra directories the tools may reach",
+        hint: Some("[path | remove <path>]"),
+        aliases: &[],
+    },
+    Builtin {
+        name: "budget",
+        description: "Show or set the most one turn may spend",
+        hint: Some("[usd|off]"),
+        aliases: &[],
+    },
+];
 
 /// Skills that belong to the NucleOS workflow bundle, which the daemon materializes. Expanding one
 /// is checked against what the workflow needs (a project, tools, the bundle on disk).
@@ -396,5 +464,38 @@ mod tests {
 
         let found = resolve(Some(cwd.path()), Some(home.path()), "orchestrate").unwrap();
         assert_eq!((found.source, found.kind), (Source::Project, Kind::Skill));
+    }
+
+    #[test]
+    fn slash_b_registry_lists_every_phase_b_builtin() {
+        let listed = listing(None, None);
+        for name in [
+            "help",
+            "clear",
+            "fresh",
+            "context",
+            "cost",
+            "stop",
+            "model",
+            "effort",
+            "permissions",
+            "project",
+            "add-dir",
+            "budget",
+        ] {
+            let found = listed
+                .iter()
+                .find(|command| command.name == name)
+                .unwrap_or_else(|| panic!("/{name} is not a built-in"));
+            assert_eq!(found.source, Source::Builtin, "/{name}");
+            assert!(
+                found.description.as_deref().is_some_and(|d| !d.is_empty()),
+                "/{name} has no description"
+            );
+            assert!(
+                resolve(None, None, name).is_some(),
+                "/{name} does not resolve"
+            );
+        }
     }
 }

@@ -109,6 +109,8 @@ pub struct Executor {
     pub pool: SqlitePool,
     pub config: VerifyConfig,
     pub machine_root: Option<PathBuf>,
+    /// Where warm state lives (`warm::home`): the machine root unless the daemon moved it.
+    warm_home: Option<PathBuf>,
     pub wake: Arc<Notify>,
     in_flight: Mutex<InFlight>,
     /// A warm sweep is running; the next tick skips rather than overlap it.
@@ -163,10 +165,23 @@ impl Drop for Reservation {
 
 impl Executor {
     pub fn new(pool: SqlitePool, config: VerifyConfig, machine_root: Option<PathBuf>) -> Arc<Self> {
+        let warm_home = machine_root.clone();
+        Self::with_warm_home(pool, config, machine_root, warm_home)
+    }
+
+    /// `new` with warm state kept under `warm_home` rather than the machine root; `main` passes
+    /// `warm::home`, so `NUCLEOS_WARM_HOME` moves it. Tests keep `new`, whatever the env says.
+    pub fn with_warm_home(
+        pool: SqlitePool,
+        config: VerifyConfig,
+        machine_root: Option<PathBuf>,
+        warm_home: Option<PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool,
             config,
             machine_root,
+            warm_home,
             wake: Arc::new(Notify::new()),
             in_flight: Mutex::new(InFlight::default()),
             sweeping: AtomicBool::new(false),
@@ -338,7 +353,7 @@ impl Executor {
     /// The env a unit's warm state contributes. Empty when there is no machine root, no project,
     /// no valid map or no `warm:`; a `prepare` error is logged and the unit runs without it.
     async fn warm_env(&self, claimed: &Claimed) -> Vec<(String, String)> {
-        let (Some(root), Some(project)) = (self.machine_root.clone(), claimed.project_id.clone())
+        let (Some(root), Some(project)) = (self.warm_home.clone(), claimed.project_id.clone())
         else {
             return Vec::new();
         };
@@ -412,7 +427,7 @@ impl Executor {
 
 /// Runs one claimed unit to its terminal row. The reservation is released when it drops.
 async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Reservation) {
-    if let (Some(root), Some(project)) = (&executor.machine_root, &claimed.project_id) {
+    if let (Some(root), Some(project)) = (&executor.warm_home, &claimed.project_id) {
         // Lexical, no filesystem access; an invalid project id has no warm state to hold.
         if let Ok(dir) = warm::worktree_dir(root, project, Path::new(&claimed.worktree)) {
             reservation.hold_dir(dir).await;
@@ -465,10 +480,11 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     drop(reservation);
 }
 
-/// The caps the sweep enforces: the machine's, and each project's from its `autopilot.yaml`.
-fn sweep_caps(root: &Path, config: &VerifyConfig) -> warm::Caps {
+/// The caps the sweep enforces: the machine's, and each project's from its `autopilot.yaml`. The
+/// projects are read under `warm_home`, their caps under `machine_root`.
+fn sweep_caps(warm_home: &Path, machine_root: &Path, config: &VerifyConfig) -> warm::Caps {
     let mut project_bytes = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(root.join("warm")) {
+    if let Ok(entries) = std::fs::read_dir(warm_home.join("warm")) {
         for entry in entries.flatten() {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
@@ -476,7 +492,7 @@ fn sweep_caps(root: &Path, config: &VerifyConfig) -> warm::Caps {
             let Some(project) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let cap = crate::config::load_schedule_rules(Some(root), &project)
+            let cap = crate::config::load_schedule_rules(Some(machine_root), &project)
                 .ok()
                 .and_then(|rules| rules.verify_disk_cap_gb)
                 .unwrap_or(DEFAULT_PROJECT_DISK_CAP_GB);
@@ -512,15 +528,17 @@ impl Drop for Sweeping {
 
 /// One warm-state sweep, off the async threads. `_running` is released when it ends.
 async fn sweep_once(executor: Arc<Executor>, _running: Sweeping) {
-    let Some(root) = executor.machine_root.clone() else {
+    let (Some(home), Some(machine_root)) =
+        (executor.warm_home.clone(), executor.machine_root.clone())
+    else {
         return;
     };
     let config = executor.config.clone();
     let guard = Arc::clone(&executor);
     let result = tokio::task::spawn_blocking(move || {
-        let caps = sweep_caps(&root, &config);
+        let caps = sweep_caps(&home, &machine_root, &config);
         warm::sweep(
-            &root,
+            &home,
             &caps,
             &|dir| guard.try_reserve_removal(dir),
             &|dir| guard.release_removal(dir),
@@ -1003,6 +1021,53 @@ mod tests {
             .expect("NUCLEOS_PROBE_DIR is in the env");
         assert_eq!(value, expected);
         assert!(expected.is_dir());
+    }
+
+    /// A moved warm home takes the warm dirs; the machine root keeps none of them.
+    #[tokio::test]
+    async fn warm_env_lives_under_the_warm_home_when_one_is_given() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let map = concat!(
+            "version: 1\n",
+            "tests:\n",
+            "  groups:\n",
+            "    core:\n",
+            "      paths: [core/]\n",
+            "      command: cargo test -p nucleos-core\n",
+            "  warm:\n",
+            "    NUCLEOS_PROBE_DIR:\n",
+            "      dir: probe\n",
+        );
+        std::fs::write(wt.path().join(tests_map::MAP_FILE), map).unwrap();
+        let ex = Executor::with_warm_home(
+            test_pool().await,
+            VerifyConfig::default(),
+            Some(root.path().to_path_buf()),
+            Some(home.path().to_path_buf()),
+        );
+        let claimed = Claimed {
+            id: 0,
+            project_id: Some("proj".to_owned()),
+            worktree: wt.path().to_string_lossy().into_owned(),
+            requested_by: "agent".to_owned(),
+            argv: strings(&["git", "--version"]),
+            weight: 1,
+            timeout_ms: 1000,
+        };
+        let env = ex.warm_env(&claimed).await;
+        let expected = warm::worktree_dir(home.path(), "proj", wt.path())
+            .unwrap()
+            .join("probe");
+        let value = env
+            .iter()
+            .find(|(var, _)| var == "NUCLEOS_PROBE_DIR")
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("NUCLEOS_PROBE_DIR is in the env");
+        assert_eq!(value, expected);
+        assert!(expected.is_dir());
+        assert!(!root.path().join("warm").exists());
     }
 
     /// Runs git in `dir`, asserts it succeeded, and returns its trimmed stdout.

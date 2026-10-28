@@ -468,15 +468,27 @@ export interface Command {
 
 /** A card the daemon answers a slash command with. */
 export interface CommandCard {
-  kind: "help" | "help_entry" | (string & {});
+  kind:
+    | "help"
+    | "help_entry"
+    | "notice"
+    | "context"
+    | "cost"
+    | "effort"
+    | "dirs"
+    | "budget"
+    | (string & {});
   data: unknown;
 }
+
+/** The shell control a slash command asks the window to open. */
+export type CommandControl = "model_menu" | "permission_menu" | "project_picker";
 
 /** What `POST /assistant/chats/{id}/command` answers with on a 200. */
 export type CommandResult =
   | { kind: "card"; card: CommandCard }
   | { kind: "prompt"; turn_id?: number; queued?: boolean }
-  | { kind: "open"; control: string };
+  | { kind: "open"; control: CommandControl | (string & {}) };
 
 /** The body of a refused slash command (`ApiRefusal.body`). */
 export interface CommandRefusal {

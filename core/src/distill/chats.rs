@@ -27,7 +27,10 @@ pub const MAX_OBS_PER_ROW: usize = 8;
 pub const MAX_OBS_PER_CHAT_DAY: i64 = 10;
 
 pub fn chat_scope_id(project: &str, chat_key: i64) -> String {
-    format!("{}:chat:{chat_key}", if project.is_empty() { "-" } else { project })
+    format!(
+        "{}:chat:{chat_key}",
+        if project.is_empty() { "-" } else { project }
+    )
 }
 
 /// `<project|->:chat:<digits>`; `rsplit_once` because a project id may itself contain ':'.
@@ -43,7 +46,10 @@ pub fn parse_chat_scope(scope_id: &str) -> Option<(&str, i64)> {
 pub fn local_day_start<Tz: chrono::TimeZone>(
     now: chrono::DateTime<Tz>,
 ) -> chrono::DateTime<chrono::Utc> {
-    let midnight = now.date_naive().and_hms_opt(0, 0, 0).expect("midnight exists");
+    let midnight = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight exists");
     now.timezone()
         .from_local_datetime(&midnight)
         .earliest()
@@ -63,7 +69,11 @@ pub struct Turn {
 /// last turn that read untrusted text, the owner's `/clear`, the previous batch of this chat and
 /// (P8) the history cut, unless the owner seeded this chat. It is `history_window`'s floor
 /// (`send.rs`) plus relays out: a relayed turn is not something the owner wrote.
-pub(super) async fn window(pool: &SqlitePool, chat_id: &str, up_to: i64) -> sqlx::Result<Vec<Turn>> {
+pub(super) async fn window(
+    pool: &SqlitePool,
+    chat_id: &str,
+    up_to: i64,
+) -> sqlx::Result<Vec<Turn>> {
     let rows: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT id, prompt, stdout FROM runs
           WHERE chat_id = ?1 AND mode = 'assistant' AND status = 'completed'
@@ -231,7 +241,13 @@ pub async fn sweep(
 
 /// A rotation closes a conversation: queue what it said, idle or not, from one exchange up.
 pub async fn enqueue_rotated(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
-    enqueue_rotated_at(pool, chat_id, Utc::now(), local_day_start(chrono::Local::now())).await
+    enqueue_rotated_at(
+        pool,
+        chat_id,
+        Utc::now(),
+        local_day_start(chrono::Local::now()),
+    )
+    .await
 }
 
 pub(crate) async fn enqueue_rotated_at(
@@ -401,7 +417,19 @@ pub(super) async fn process(
     };
     let vectors = embed_items(embedder, &items).await;
     let model = embedder.map(|e| e.model());
-    match write(pool, row, chat_id, &turns, &built.runs, &items, &vectors, model, now).await {
+    match write(
+        pool,
+        row,
+        chat_id,
+        &turns,
+        &built.runs,
+        &items,
+        &vectors,
+        model,
+        now,
+    )
+    .await
+    {
         Ok((observations, candidates, dropped)) => tracing::info!(
             "distillation: chat row {}: {} parsed, {observations} observations, {candidates} candidates, {dropped} dropped",
             row.id,
@@ -431,7 +459,10 @@ async fn write(
         .await?;
     // The evidence names the chat by its numeric key (never the UUID), then the runs read.
     let mut evidence_list = vec![serde_json::json!({"t": "chat", "id": key})];
-    evidence_list.extend(runs.iter().map(|r| serde_json::json!({"t": "run", "id": r})));
+    evidence_list.extend(
+        runs.iter()
+            .map(|r| serde_json::json!({"t": "run", "id": r})),
+    );
     let evidence = serde_json::Value::Array(evidence_list).to_string();
     let reasoning = "distilled from a conversation (chat_exchanges)".to_string();
     let sources: Vec<&str> = turns.iter().map(|t| t.asked.as_str()).collect();
@@ -568,7 +599,16 @@ mod tests {
         let chat = chat_with(&pool).await;
         let mut ids = Vec::new();
         for i in 0..45 {
-            ids.push(turn(&pool, &chat, None, &format!("q{i}{}", "x".repeat(2_000)), "a").await);
+            ids.push(
+                turn(
+                    &pool,
+                    &chat,
+                    None,
+                    &format!("q{i}{}", "x".repeat(2_000)),
+                    "a",
+                )
+                .await,
+            );
         }
         let got = window(&pool, &chat, ids[39]).await.unwrap();
         assert_eq!(
@@ -587,21 +627,34 @@ mod tests {
             ids.push(turn(&pool, &chat, None, "q", "a").await);
         }
         async fn first(pool: &SqlitePool, chat: &str, last: i64) -> i64 {
-            window(pool, chat, last).await.unwrap().first().unwrap().run_id
+            window(pool, chat, last)
+                .await
+                .unwrap()
+                .first()
+                .unwrap()
+                .run_id
         }
         sqlx::query("UPDATE runs SET read_untrusted = 1 WHERE id = ?")
             .bind(ids[2])
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(first(&pool, &chat, ids[11]).await, ids[3], "the last tainted turn is the floor");
+        assert_eq!(
+            first(&pool, &chat, ids[11]).await,
+            ids[3],
+            "the last tainted turn is the floor"
+        );
         sqlx::query("UPDATE chats SET cleared_after_run_id = ? WHERE chat_id = ?")
             .bind(ids[5])
             .bind(&chat)
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(first(&pool, &chat, ids[11]).await, ids[6], "a clear is a floor too");
+        assert_eq!(
+            first(&pool, &chat, ids[11]).await,
+            ids[6],
+            "a clear is a floor too"
+        );
         sqlx::query(
             "INSERT INTO distill_queue (cause, project_id, run_id, chat_id, status, attempts, created_at)
              VALUES ('chat_exchanges', '', ?, ?, 'done', 0, '2026-10-02T00:00:00Z')",
@@ -611,7 +664,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(first(&pool, &chat, ids[11]).await, ids[9], "the previous batch is the watermark");
+        assert_eq!(
+            first(&pool, &chat, ids[11]).await,
+            ids[9],
+            "the previous batch is the watermark"
+        );
     }
 
     #[tokio::test]
@@ -652,7 +709,10 @@ mod tests {
             "the cut hides turns up to ids[3]"
         );
         assert!(seed(&pool, &chat).await.unwrap());
-        assert!(!seed(&pool, &chat).await.unwrap(), "seeding twice writes nothing");
+        assert!(
+            !seed(&pool, &chat).await.unwrap(),
+            "seeding twice writes nothing"
+        );
         assert_eq!(
             first(window(&pool, &chat, ids[5]).await.unwrap()),
             ids[0],
@@ -699,10 +759,24 @@ mod tests {
         for _ in 0..3 {
             turn(&pool, &chat, Some("alpha"), "q", "a").await;
         }
-        assert!(!enqueue(&pool, &chat, MIN_EXCHANGES, now(), day()).await.unwrap(), "three are not enough");
+        assert!(
+            !enqueue(&pool, &chat, MIN_EXCHANGES, now(), day())
+                .await
+                .unwrap(),
+            "three are not enough"
+        );
         let last = turn(&pool, &chat, Some("alpha"), "q", "a").await;
-        assert!(enqueue(&pool, &chat, MIN_EXCHANGES, now(), day()).await.unwrap());
-        assert!(!enqueue(&pool, &chat, MIN_EXCHANGES, now(), day()).await.unwrap(), "the watermark moved");
+        assert!(
+            enqueue(&pool, &chat, MIN_EXCHANGES, now(), day())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !enqueue(&pool, &chat, MIN_EXCHANGES, now(), day())
+                .await
+                .unwrap(),
+            "the watermark moved"
+        );
         assert_eq!(rows(&pool).await, vec![(chat, "alpha".into(), Some(last))]);
     }
 
@@ -731,7 +805,9 @@ mod tests {
         sweep(&pool, now(), day()).await.unwrap();
         assert_eq!(rows(&pool).await.len() as i64, MAX_CHAT_ROWS_PER_DAY);
         let tomorrow = chrono::Duration::days(1);
-        sweep(&pool, now() + tomorrow, day() + tomorrow).await.unwrap();
+        sweep(&pool, now() + tomorrow, day() + tomorrow)
+            .await
+            .unwrap();
         assert_eq!(rows(&pool).await.len() as i64, MAX_CHAT_ROWS_PER_DAY + 2);
     }
 
@@ -746,8 +822,16 @@ mod tests {
         for _ in 0..4 {
             turn(&pool, &unstamped, None, "q", "a").await;
         }
-        assert!(enqueue(&pool, &mixed, MIN_EXCHANGES, now(), day()).await.unwrap());
-        assert!(enqueue(&pool, &unstamped, MIN_EXCHANGES, now(), day()).await.unwrap());
+        assert!(
+            enqueue(&pool, &mixed, MIN_EXCHANGES, now(), day())
+                .await
+                .unwrap()
+        );
+        assert!(
+            enqueue(&pool, &unstamped, MIN_EXCHANGES, now(), day())
+                .await
+                .unwrap()
+        );
         let projects: Vec<String> = rows(&pool).await.into_iter().map(|r| r.1).collect();
         assert_eq!(projects, vec![String::new(), String::new()]);
     }
@@ -767,8 +851,17 @@ mod tests {
             .await
             .unwrap();
         sweep(&pool, now(), day()).await.unwrap();
-        assert!(rows(&pool).await.is_empty(), "the chat spoke ten minutes ago");
-        sweep(&pool, now() + chrono::Duration::minutes(IDLE_MINUTES), day()).await.unwrap();
+        assert!(
+            rows(&pool).await.is_empty(),
+            "the chat spoke ten minutes ago"
+        );
+        sweep(
+            &pool,
+            now() + chrono::Duration::minutes(IDLE_MINUTES),
+            day(),
+        )
+        .await
+        .unwrap();
         assert_eq!(rows(&pool).await.len(), 1);
     }
 
@@ -783,7 +876,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert!(enqueue_rotated_at(&pool, &chat, now(), day()).await.unwrap());
+        assert!(
+            enqueue_rotated_at(&pool, &chat, now(), day())
+                .await
+                .unwrap()
+        );
         assert_eq!(rows(&pool).await, vec![(chat, String::new(), Some(only))]);
     }
 
@@ -796,7 +893,11 @@ mod tests {
         }
         sources::set(&pool, CHAT_KEY, false).await.unwrap();
         sweep(&pool, now(), day()).await.unwrap();
-        assert!(!enqueue_rotated_at(&pool, &chat, now(), day()).await.unwrap());
+        assert!(
+            !enqueue_rotated_at(&pool, &chat, now(), day())
+                .await
+                .unwrap()
+        );
         assert!(rows(&pool).await.is_empty());
     }
 
@@ -810,7 +911,10 @@ mod tests {
         }
         set_floor(&pool, last).await;
         sweep(&pool, now(), day()).await.unwrap();
-        assert!(rows(&pool).await.is_empty(), "history is not ingested by itself");
+        assert!(
+            rows(&pool).await.is_empty(),
+            "history is not ingested by itself"
+        );
         assert!(seed(&pool, &chat).await.unwrap());
         sweep(&pool, now(), day()).await.unwrap();
         assert_eq!(rows(&pool).await.len(), 1, "an ingested chat is swept");
@@ -827,9 +931,13 @@ mod tests {
             assert!(seed(&pool, &c).await.unwrap());
         }
         // The seeds were written "today" by the real clock; the ceiling day is the real one too.
-        sweep(&pool, Utc::now() + chrono::Duration::days(1), local_day_start(chrono::Local::now()))
-            .await
-            .unwrap();
+        sweep(
+            &pool,
+            Utc::now() + chrono::Duration::days(1),
+            local_day_start(chrono::Local::now()),
+        )
+        .await
+        .unwrap();
         assert_eq!(rows(&pool).await.len() as i64, MAX_CHAT_ROWS_PER_DAY);
     }
 
@@ -846,8 +954,18 @@ mod tests {
         chat_in(&pool, "alpha").await;
         chat_in(&pool, "alpha").await;
         chat_in(&pool, "bravo").await;
-        assert_eq!(ingest(&pool, Selection::Project("alpha".into())).await.unwrap(), (2, 0));
-        assert_eq!(ingest(&pool, Selection::Project("alpha".into())).await.unwrap(), (0, 2));
+        assert_eq!(
+            ingest(&pool, Selection::Project("alpha".into()))
+                .await
+                .unwrap(),
+            (2, 0)
+        );
+        assert_eq!(
+            ingest(&pool, Selection::Project("alpha".into()))
+                .await
+                .unwrap(),
+            (0, 2)
+        );
         let seeds: Vec<(i64, String, Option<String>)> = sqlx::query_as(
             "SELECT run_id, status, error FROM distill_queue WHERE cause = 'chat_exchanges'",
         )
@@ -857,7 +975,10 @@ mod tests {
         assert_eq!(seeds.len(), 2);
         for (run_id, status, error) in seeds {
             assert!(run_id <= 0, "a seed is no watermark");
-            assert_eq!((status.as_str(), error.as_deref()), ("done", Some("ingest")));
+            assert_eq!(
+                (status.as_str(), error.as_deref()),
+                ("done", Some("ingest"))
+            );
         }
     }
 
@@ -875,7 +996,9 @@ mod tests {
     async fn ingest_of_an_unknown_uuid_is_skipped_not_seeded() {
         let pool = crate::testdb::fresh_pool().await;
         assert_eq!(
-            ingest(&pool, Selection::Chats(vec!["no-such".into()])).await.unwrap(),
+            ingest(&pool, Selection::Chats(vec!["no-such".into()]))
+                .await
+                .unwrap(),
             (0, 1)
         );
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM distill_queue")

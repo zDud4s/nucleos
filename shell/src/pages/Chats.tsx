@@ -1761,6 +1761,7 @@ function Project({
       {cwd === null && (
         <NoProject chatId={chatId} picking={picking} onPicking={onPicking} onRooted={onRooted} />
       )}
+      {cwd !== null && <ChangeProject chatId={chatId} picking={picking} onPicking={onPicking} />}
       {cwd !== null && workflow_missing === true && (
         <WorkflowMissing chatId={chatId} cwd={cwd} tools={tools} />
       )}
@@ -1771,6 +1772,35 @@ function Project({
           `ChatMeta`. What is left in this block is the two states that need SAYING, which
           is what it was always for. */}
     </>
+  );
+}
+
+/**
+ * The project picker over a conversation that already has a directory: opened by `/project`, and
+ * closed once a project is chosen. `NoProject` owns the same dialog for the unrooted case.
+ */
+function ChangeProject({
+  chatId,
+  picking,
+  onPicking,
+}: {
+  chatId: string;
+  picking: boolean;
+  onPicking: (open: boolean) => void;
+}) {
+  const point = useSetChatProject(chatId);
+  return (
+    <ProjectPicker
+      open={picking}
+      onOpenChange={onPicking}
+      pending={point.isPending}
+      holding={false}
+      onChoose={(cwd) => {
+        if (point.isPending) return;
+        point.mutate(cwd, { onSuccess: () => onPicking(false) });
+      }}
+      refusal={point.isError ? <ProjectRefusal error={point.error} /> : undefined}
+    />
   );
 }
 
@@ -1860,6 +1890,8 @@ function PermissionPicker({
   tools,
   barred,
   disabled,
+  open,
+  onOpenChange,
 }: {
   mode: PermissionMode;
   onPick: (mode: PermissionMode) => void;
@@ -1868,12 +1900,15 @@ function PermissionPicker({
   /** What to say on the rungs `tools` puts out of reach. */
   barred: string;
   disabled: boolean;
+  /** Controlled open state, for a slash command that opens the menu; omitted, the menu is its own. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const shown =
     PERMISSION_RUNGS.find((rung) => rung.mode === mode)?.label ?? "Auto";
 
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={onOpenChange}>
       <DropdownMenuTrigger
         className="chats-tool chats-tool-mode"
         /* Only the exceptions carry a mode: "the exceptions dominate, the normal disappears". The
@@ -1928,7 +1963,15 @@ function PermissionPicker({
  * state on the way into `POST /assistant/chats` rather than a PATCH. Same control, two lifetimes,
  * and the split is what stops the front door growing a fake `chatId` to satisfy a hook.
  */
-function PermissionMenu({ chatId }: { chatId: string }) {
+function PermissionMenu({
+  chatId,
+  open,
+  onOpenChange,
+}: {
+  chatId: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
   const project = useChatProject(chatId);
   const set = useSetPermissionMode(chatId);
   /* Two different absences, and only one of them is actionable — which is why `cwd` travels beside
@@ -1952,6 +1995,8 @@ function PermissionMenu({ chatId }: { chatId: string }) {
       tools={project.data?.tools ?? false}
       barred={barred}
       disabled={false}
+      open={open}
+      onOpenChange={onOpenChange}
     />
   );
 }
@@ -2513,12 +2558,17 @@ function ModelMenu({
   disabled = false,
   children,
   chatId,
+  open,
+  onOpenChange,
 }: {
   model: string | null;
   onPick: (model: string | null) => void;
   disabled?: boolean;
   children?: React.ReactNode;
   chatId?: string;
+  /** Controlled open state, for a slash command that opens the menu; omitted, the menu is its own. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const catalogue = useAssistantModels(chatId);
   // The agent-CLI section is drawn from the daemon's discovered, grouped list when it has one.
@@ -2573,10 +2623,12 @@ function ModelMenu({
 
   return (
     <DropdownMenu
+      open={open}
       /* Closing is what disarms. A menu you walked away from is one you closed, which is why this
          needs none of `ConfirmButton`'s timer — see the comment on `armed` above. */
-      onOpenChange={(open) => {
-        if (!open) setArmed(null);
+      onOpenChange={(next) => {
+        if (!next) setArmed(null);
+        onOpenChange?.(next);
       }}
     >
       <DropdownMenuTrigger
@@ -2836,10 +2888,14 @@ function ChatModelControls({
   chatId,
   model,
   effort,
+  modelOpen,
+  onModelOpenChange,
 }: {
   chatId: string;
   model: string | null;
   effort: string | null;
+  modelOpen?: boolean;
+  onModelOpenChange?: (open: boolean) => void;
 }) {
   const patch = usePatchChat();
   return (
@@ -2848,6 +2904,8 @@ function ChatModelControls({
         model={model}
         disabled={false}
         chatId={chatId}
+        open={modelOpen}
+        onOpenChange={onModelOpenChange}
         onPick={(picked) => patch.mutate({ chatId, model: picked })}
       >
         {patch.isError && <ModelRefusal error={patch.error} />}
@@ -5594,6 +5652,8 @@ function Composer({
   const [cards, setCards] = useState<{ id: number; card: CommandCard }[]>([]);
   // A command the daemon refused: its sentence and the names it suggests. Cleared by the next edit.
   const [slashError, setSlashError] = useState<CommandRefusal | null>(null);
+  // Which of the composer's own menus a slash command asked to open (`/model`, `/permissions`).
+  const [openMenu, setOpenMenu] = useState<"model_menu" | "permission_menu" | null>(null);
   // Set when a refused held command is put back in the box together with its refusal: that one
   // change of the text is the window's, not an edit, and must not clear what it is shown with.
   const keepSlashError = useRef(false);
@@ -5768,6 +5828,17 @@ function Composer({
         if (result.kind === "card") {
           const card = result.card;
           setCards((was) => [...was, { id: (was[was.length - 1]?.id ?? 0) + 1, card }]);
+        }
+        if (result.kind === "open") {
+          // The window's own control does the rest; the picker is the page's, the menus are here.
+          const control = result.control;
+          if (control === "model_menu") {
+            setOpenMenu("model_menu");
+          } else if (control === "permission_menu") {
+            setOpenMenu("permission_menu");
+          } else if (control === "project_picker") {
+            onNeedsProject?.();
+          }
         }
         if (typed) {
           setText("");
@@ -6061,6 +6132,8 @@ ${was}`));
                 chatId={chatId}
                 model={chat.model}
                 effort={chat.effort}
+                modelOpen={openMenu === "model_menu"}
+                onModelOpenChange={(next) => setOpenMenu(next ? "model_menu" : null)}
               />
             )}
             {chips}
@@ -6078,7 +6151,11 @@ ${was}`));
             )}
             {/* Last before send, because it is the answer most likely to be changed in the moment
                 of sending — "actually, plan this one" — and the hand is already on that corner. */}
-            <PermissionMenu chatId={chatId} />
+            <PermissionMenu
+              chatId={chatId}
+              open={openMenu === "permission_menu"}
+              onOpenChange={(next) => setOpenMenu(next ? "permission_menu" : null)}
+            />
             {steerable && text.trim() !== "" && (
               <Button
                 type="button"

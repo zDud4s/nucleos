@@ -229,16 +229,16 @@ async fn refuse(state: &AppState, run_id: i64, ticket_id: i64, reason: &str) -> 
 #[cfg(test)]
 #[allow(
     clippy::missing_const_for_thread_local,
-    reason = "the initializer is already `const { .. }`; the lint misfires on this expansion"
+    reason = "the initializer is already `const { .. }`; clippy 1.97 still reports it inside the macro"
 )]
-mod deferred_count {
+mod deferred_in_this_test {
     thread_local! {
         /// How many times the deferred work ran on this thread: a `#[tokio::test]` runs on one.
         pub(super) static DEFERRED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 }
 #[cfg(test)]
-use deferred_count::DEFERRED;
+use deferred_in_this_test::DEFERRED;
 
 /// What the terminal arm skipped while a wake was open: the briefing sweep, the token-efficiency
 /// observation and the judge's look at a failed gate.

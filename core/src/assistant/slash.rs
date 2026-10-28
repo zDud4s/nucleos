@@ -5,12 +5,14 @@
 //! expanded into the prompt every engine receives (`expand`). Nothing in this module talks to a
 //! model or to a chat: the caller owns that, and `Outcome` says what it should do next.
 
+pub mod capabilities;
 pub mod expand;
 pub mod help;
+pub mod model_pick;
 pub mod parse;
 pub mod registry;
 
-use crate::agents::capabilities::Engine;
+use capabilities::ChatEngine;
 
 /// What running a slash command asks of the caller.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +36,18 @@ pub enum CardKind {
     Help,
     /// One command in full.
     HelpEntry,
+    /// A short confirmation or statement.
+    Notice,
+    /// What the conversation's context holds.
+    Context,
+    /// What the conversation has cost.
+    Cost,
+    /// The effort in force and the levels the model takes.
+    Effort,
+    /// The project directory and the extra directories.
+    Dirs,
+    /// The per-turn ceiling and the global budget.
+    Budget,
 }
 
 /// The shell controls a command can open instead of changing state itself.
@@ -61,7 +75,7 @@ pub enum SlashError {
     /// The command needs a project the chat does not have: 409 `needs_project`.
     NeedsProject,
     /// This engine cannot do what the command asks: 422 `unsupported_engine`.
-    Unsupported { engine: Engine, what: String },
+    Unsupported { engine: ChatEngine, what: String },
     /// A workflow skill without what it runs on: 422 `workflow_unavailable`.
     WorkflowUnavailable { detail: String },
     /// Anything else: 500.

@@ -227,7 +227,10 @@ pub(super) async fn synthesise_theme(
             .into_response();
     };
     let asked = route.extractor(state.runner.as_ref(), &state.web.http);
-    if themes::synthesise(&state.pool, asked, id, now).await.is_err() {
+    if themes::synthesise(&state.pool, asked, id, now)
+        .await
+        .is_err()
+    {
         return StatusCode::BAD_GATEWAY.into_response();
     }
     match sqlx::query_scalar::<_, Option<String>>("SELECT synthesis FROM themes WHERE id = ?")
@@ -358,7 +361,11 @@ mod tests {
             Some("{}"),
         )
         .await;
-        assert_eq!(s, StatusCode::CONFLICT, "accepted -> accepted is not in the table");
+        assert_eq!(
+            s,
+            StatusCode::CONFLICT,
+            "accepted -> accepted is not in the table"
+        );
         let (s, _) = call(state, "POST", "/themes/999/refuse", Some("{}")).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
@@ -430,8 +437,16 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(body["synthesis"], "A fresh synthesis.");
         let (_, detail) = call(state.clone(), "GET", &format!("/themes/{proposed}"), None).await;
-        assert!(detail["synthesis"].is_null(), "only an accepted theme shows it");
+        assert!(
+            detail["synthesis"].is_null(),
+            "only an accepted theme shows it"
+        );
         let (_, list) = call(state, "GET", "/themes", None).await;
-        assert!(list.as_array().unwrap().iter().all(|t| t.get("synthesis").is_none()));
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t.get("synthesis").is_none())
+        );
     }
 }
