@@ -2946,6 +2946,10 @@ mod tests {
                 "node_tree",
                 "node_update",
                 "record",
+                "task_claim",
+                "task_done",
+                "task_list",
+                "task_release",
                 "verify",
                 "verify_status"
             ]
