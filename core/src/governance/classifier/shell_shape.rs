@@ -214,12 +214,25 @@ pub(super) fn is_powershell_delete_switch(token: &str) -> bool {
 /// The program is read from the RAW word and only its arguments are dequoted (`flag_words`), so
 /// `find . "-delete"` is the delete it is while a commit message opening on `"rm -rf` does not
 /// newly start one.
+///
+/// The raw words are split from the line with its backslash-newlines joined, the line `flag_words`
+/// splits, so each raw word yields at least one word there and `index + 1` never runs past it
+/// (extra readings only shift `rest` earlier, which over-matches). The slice is still taken with
+/// `get`, so a mismatch costs a missed match rather than a panic.
 pub(super) fn has_destructive_flags(command: &str) -> bool {
-    let raw: Vec<_> = command.split_whitespace().collect();
+    // A literal NUL is where the kernel ends an argument, while `dequoted` drops it: read the line
+    // cut there as well, so `find . -delete<NUL>x` is still the `-delete` it is to `find`.
+    if let Some((before, _)) = command.split_once('\0')
+        && has_destructive_flags(before)
+    {
+        return true;
+    }
+    let joined = command.replace("\\\r\n", "").replace("\\\n", "");
+    let raw: Vec<_> = joined.split_whitespace().collect();
     let words = flag_words(command);
     let tokens: Vec<&str> = words.iter().map(String::as_str).collect();
     raw.iter().enumerate().any(|(index, token)| {
-        let rest = &tokens[index + 1..];
+        let rest = tokens.get(index + 1..).unwrap_or(&[]);
         match program_name(token) {
             "rm" => rm_deletes_recursively_and_forcibly(rest),
             // Under PowerShell `rd`, `rmdir`, `del`, `erase` and `ri` are all aliases of
@@ -361,22 +374,345 @@ pub(super) fn checks_formatting_without_writing(command: &str) -> bool {
 /// Splitting on raw whitespace still breaks a quoted string with spaces into several words, which
 /// over-matches (`rg "a -exec b"` is refused) — the cheap side, and what the raw split did already.
 pub(super) fn flag_words(command: &str) -> Vec<String> {
-    command.split_whitespace().map(dequoted).collect()
+    // Bash deletes a backslash-newline pair outside quotes and inside double quotes, so
+    // `"-\<newline>exec"` is the single word `-exec`. Splitting on whitespace first would have cut
+    // it into `-` and `exec`, neither a flag. Joining first also joins inside single quotes, where
+    // bash keeps the pair; that only over-matches, the cheap side.
+    //
+    // Every classify path lowercases the line first (`normalize_command`), so bash's `\U0000002d`
+    // (eight hex digits) arrives as `\u0000002d`, indistinguishable from the four-digit `\u`.
+    // Case is lost, so each ambiguous `\u` (see `dequoted_readings`) is read BOTH ways, chosen per
+    // escape rather than per word, and every distinct word the choices produce is emitted: one word
+    // can mix `-` and a lowercased `\U00000065`. The guards only refuse, so an extra word
+    // costs at most a redundant refusal. A word with too many ambiguous escapes to enumerate keeps
+    // the all-narrow and all-wide readings here; the allow side never decodes such a word, since
+    // `has_ansi_c_or_locale_quote` refuses every `$'` line outright. This join is not reached on the classify path (`normalize_command` already
+    // turned the newline into a space); it is kept for callers that hand over a raw line.
+    //
+    // A `$'...'` string may hold whitespace (`$'\0 x'-delete` is the one word `-delete` to bash),
+    // which the raw split cuts across words. Each such word is ALSO read joined with the raw words
+    // after it, up to the one that closes the string, so the guards see the word bash builds as
+    // well as the pieces; `has_ansi_c_or_locale_quote` refuses the line outright for the allow side.
+    // The join is per word, as `dequoted` reads it (a `$'` inside plain quotes counts too); every
+    // extra reading it adds can only refuse more.
+    let mut words = Vec::new();
+    for piece in reading_pieces(command) {
+        push_readings(&piece, &mut words);
+    }
+    words
+}
+
+/// The most raw words one `$'...'` span is joined across (see `reading_pieces`). Past it the span
+/// is cut: the join exists for the deny side, and a cut span only costs that side a missed reading,
+/// while the allow side refuses every `$'` line anyway (`has_ansi_c_or_locale_quote`). Without a
+/// cap, `ls` followed by thousands of `'$'` words re-opens a span at every word and each one runs
+/// to the end of the line, quadratic in readings emitted.
+const MAX_ANSI_C_SPAN_WORDS: usize = 64;
+
+/// PURE: the pieces `flag_words` reads, in order: every raw whitespace-separated word of the line
+/// with its backslash-newlines joined, each one that leaves a `$'...'` string open followed by the
+/// span of raw words joined up to the one that closes it (at most `MAX_ANSI_C_SPAN_WORDS`).
+///
+/// The open state is tracked incrementally (`AnsiCLexer`), so a span costs its own length once
+/// rather than a re-lex from its start for every word appended.
+fn reading_pieces(command: &str) -> Vec<String> {
+    let joined = command.replace("\\\r\n", "").replace("\\\n", "");
+    let raw: Vec<&str> = joined.split_whitespace().collect();
+    let mut pieces = Vec::new();
+    for (index, word) in raw.iter().enumerate() {
+        pieces.push((*word).to_string());
+        let mut lexer = AnsiCLexer::default();
+        lexer.feed(word);
+        if lexer.is_open() {
+            let mut span = (*word).to_string();
+            for next in raw[index + 1..].iter().take(MAX_ANSI_C_SPAN_WORDS - 1) {
+                span.push(' ');
+                span.push_str(next);
+                lexer.feed(" ");
+                lexer.feed(next);
+                if !lexer.is_open() {
+                    break;
+                }
+            }
+            pieces.push(span);
+        }
+    }
+    pieces
+}
+
+/// Where a left-to-right lex of a word stands with respect to `$'...'` strings, lexed exactly the
+/// way `dequoted` and `decode_ansi_c_body` lex it, so text can be fed piece by piece and the open
+/// state read after each one. Escape arguments that are digits (`\x`, `\u`, `\U`, octal) are plain
+/// characters here: no digit is a quote, a backslash or whitespace, so they never move a closing
+/// quote. A NUL ends a string's text but not its lexing, so it changes nothing here either.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum AnsiCLexer {
+    /// Outside any `$'...'` string.
+    #[default]
+    Outside,
+    /// Outside, just after a `$` (a `'` next opens a string).
+    OutsideDollar,
+    /// Outside, just after a `\`, which takes the next character.
+    OutsideEscape,
+    /// Inside a string's body.
+    Body,
+    /// Inside, just after a `\`.
+    BodyEscape,
+    /// Inside, just after `\c`, which takes the next character whatever it is (`\c'` does not
+    /// close, `\c\` is one escape).
+    BodyControl,
+}
+
+impl AnsiCLexer {
+    fn feed(&mut self, text: &str) {
+        for character in text.chars() {
+            self.step(character);
+        }
+    }
+
+    fn step(&mut self, character: char) {
+        *self = match (*self, character) {
+            (Self::OutsideDollar, '\'') => Self::Body,
+            (Self::Outside | Self::OutsideDollar, '$') => Self::OutsideDollar,
+            (Self::Outside | Self::OutsideDollar, '\\') => Self::OutsideEscape,
+            (Self::Outside | Self::OutsideDollar | Self::OutsideEscape, _) => Self::Outside,
+            (Self::Body, '\'') => Self::Outside,
+            (Self::Body, '\\') => Self::BodyEscape,
+            (Self::BodyEscape, 'c') => Self::BodyControl,
+            (Self::Body | Self::BodyEscape | Self::BodyControl, _) => Self::Body,
+        };
+    }
+
+    /// Whether the text fed so far leaves a `$'...'` string unclosed.
+    fn is_open(self) -> bool {
+        matches!(self, Self::Body | Self::BodyEscape | Self::BodyControl)
+    }
+}
+
+/// Appends every reading of one word to `words` (see `flag_words`).
+fn push_readings(word: &str, words: &mut Vec<String>) {
+    match dequoted_readings(word) {
+        Some(readings) => words.extend(readings),
+        // Over the cap only the all-wide and all-narrow readings are emitted, so a mix of the two
+        // (a flag spelled by a narrow `\u` beside a wide one) is missed here. That gap is the deny
+        // side's alone: the allow side refuses the line whole (`has_ansi_c_or_locale_quote`), so such a
+        // line reaches the judge rather than read-local.
+        None => {
+            let mut seen = 0;
+            let wide = dequoted(word, &|_| true, &mut seen);
+            let narrow = dequoted(word, &|_| false, &mut seen);
+            if narrow != wide {
+                words.push(wide);
+            }
+            words.push(narrow);
+        }
+    }
+}
+
+/// PURE: whether the raw text of `command` holds `$'` or `$"` anywhere, inside other quotes or not.
+///
+/// The allow side does not decode ANSI-C (`$'...'`) or locale (`$"..."`) quoting at all: such a
+/// line is never read-local and goes to the judge. Three review rounds each found another way the
+/// decoder and bash disagreed on the allow side (a `$'...'` string split by whitespace, a case-lost
+/// `\u` read two ways, `cargo 'fmt$' --check` and `cargo "$"fmt --check` decoded to `fmt` while
+/// bash runs `cargo-fmt$`), and refusing more is the safe side of that trade. It also refuses
+/// `rg 'foo$' x` and `rg "x$" y`, where bash reads the `$` literally; those cost a judge call. The
+/// deny side (`has_destructive_flags` and the guards beside it) still decodes both forms through
+/// `flag_words`, where every extra reading only refuses.
+pub(super) fn has_ansi_c_or_locale_quote(command: &str) -> bool {
+    command.contains("$'") || command.contains("$\"")
+}
+
+/// The most ambiguous `\u` escapes one word may hold and still have every reading of it emitted:
+/// six escapes is 64 readings. A word over the cap keeps only its all-wide and
+/// all-narrow readings (`push_readings`); the allow side never decodes it
+/// (`has_ansi_c_or_locale_quote`).
+const MAX_AMBIGUOUS_U_ESCAPES: usize = 6;
+
+/// PURE: every distinct way `word` can reach the program, one per choice of four or eight digits
+/// for each ambiguous lowercase `\u` escape inside `$'...'` (one followed by more than four hex
+/// digits, where the two readings differ). An unambiguous word has exactly one reading. `None`
+/// when the word holds more than `MAX_AMBIGUOUS_U_ESCAPES` of them.
+///
+/// The all-wide pass counts the escapes: a wide reading only decodes to NUL (which ends the
+/// `$'...'` string and hides the escapes after it) when the narrow one does too, so no pass can
+/// see more ambiguous escapes than it. Any pass that does anyway is treated as over the cap.
+fn dequoted_readings(word: &str) -> Option<Vec<String>> {
+    let mut seen = 0;
+    let widest = dequoted(word, &|_| true, &mut seen);
+    if seen > MAX_AMBIGUOUS_U_ESCAPES {
+        return None;
+    }
+    let mut readings = vec![widest];
+    // Widest first and all-narrow last, the order the per-word reading used to emit.
+    for mask in (0u32..(1u32 << seen)).rev() {
+        let mut count = 0;
+        let wide = |index: usize| index < 32 && (mask >> index) & 1 == 1;
+        let reading = dequoted(word, &wide, &mut count);
+        if count > seen {
+            return None;
+        }
+        if !readings.contains(&reading) {
+            readings.push(reading);
+        }
+    }
+    Some(readings)
 }
 
 /// PURE: one word without its quotes and with each backslash escape replaced by the character it
 /// escapes.
-fn dequoted(word: &str) -> String {
+///
+/// Bash's `$'...'` (ANSI-C) and `$"..."` (locale) quoting are read too. Without that, `$'-exec'`
+/// dequoted to `$-exec`, which no flag list contains, while bash hands `find` a plain `-exec`; the
+/// escapes inside `$'...'` (`\x2d`, `\055` and `-` are all `-`) spell the same flag without
+/// ever writing it.
+///
+/// An escape that decodes to NUL ends the `$'...'` STRING, not the word: bash stops decoding the
+/// string there and keeps whatever follows its closing quote, so `$'-delete\0'`, `$'-exec\x00'`,
+/// `$'-exec\c@'` and `$'-exec\u0000'` reach the program as the bare flag, and `$'\0'-delete` and
+/// `$'\x00'-exec` as `-delete` and `-exec`. Cutting the whole word at the NUL (the earlier
+/// reading) turned those last two into an empty word the guards never matched. A literal NUL
+/// character is dropped, as bash drops NUL bytes from its input.
+/// The command reader treats `$'` as an ordinary quote, so nothing upstream refuses the form and
+/// this is the only place it is seen. Every caller only refuses, so decoding too much costs a
+/// redundant refusal and decoding too little is the bug.
+///
+/// `wide(index)` says whether the `index`-th ambiguous lowercase `\u` of the word (counted from 0,
+/// see `dequoted_readings`) reads eight hex digits (a `\U` whose case was lost) instead of bash's
+/// four; `ambiguous` is advanced once per such escape seen. An uppercase `\U` always reads 8.
+fn dequoted(word: &str, wide: &dyn Fn(usize) -> bool, ambiguous: &mut usize) -> String {
     let mut out = String::with_capacity(word.len());
-    let mut chars = word.chars();
+    let mut chars = word.chars().peekable();
     while let Some(character) = chars.next() {
         match character {
-            '\'' | '"' => {}
-            '\\' => out.extend(chars.next()),
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                decode_ansi_c_body(&mut chars, &mut out, wide, ambiguous);
+            }
+            // The leading `$` of a locale string is not part of the word.
+            '$' if chars.peek() == Some(&'"') => {}
+            '\'' | '"' | '\0' => {}
+            '\\' => out.extend(chars.next().filter(|&c| c != '\0')),
             _ => out.push(character),
         }
     }
     out
+}
+
+/// PURE: the text of a `$'...'` string up to its closing quote, escapes decoded the way bash does,
+/// appended to `out`. An escape bash would leave alone is kept literally, backslash included. An
+/// escape that decodes to NUL ends the decoded text: the rest of the string, up to its closing
+/// quote, is still lexed by this same decoder and its text discarded, so escapes pair up exactly
+/// as they do before the NUL (`\c\` is one escape, and the `\'` after it does not close).
+///
+/// Returns whether the closing quote was reached; `false` means the string ran off the end of the
+/// text it was handed.
+fn decode_ansi_c_body(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    out: &mut String,
+    wide: &dyn Fn(usize) -> bool,
+    ambiguous: &mut usize,
+) -> bool {
+    // Reads up to `max` digits of `radix` and returns their value, or `None` when there are none.
+    fn number(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        radix: u32,
+        max: usize,
+    ) -> Option<u32> {
+        let mut value: Option<u32> = None;
+        for _ in 0..max {
+            let Some(digit) = chars.peek().and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            chars.next();
+            value = Some(
+                value
+                    .unwrap_or(0)
+                    .saturating_mul(radix)
+                    .saturating_add(digit),
+            );
+        }
+        value
+    }
+    // Set once an escape decodes to NUL: the rest of the string is still lexed by this loop, so
+    // escapes pair up exactly as before the NUL, but nothing more reaches `out`. Its `\u` escapes
+    // are not counted either: they decode to nothing, so the readings `dequoted_readings`
+    // enumerates need not choose for them. A flag rather than a recursive call, which overflowed
+    // the stack on a `$'...'` holding tens of thousands of `\0` escapes.
+    let mut drop_output = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' => return true,
+            '\\' => {
+                let Some(escape) = chars.next() else {
+                    if !drop_output {
+                        out.push('\\');
+                    }
+                    return false;
+                };
+                let decoded = match escape {
+                    'a' => Some('\u{7}'),
+                    'b' => Some('\u{8}'),
+                    'e' | 'E' => Some('\u{1b}'),
+                    'f' => Some('\u{c}'),
+                    'n' => Some('\n'),
+                    'r' => Some('\r'),
+                    't' => Some('\t'),
+                    'v' => Some('\u{b}'),
+                    '\\' | '\'' | '"' | '?' => Some(escape),
+                    'x' => number(chars, 16, 2).map(|v| char::from_u32(v).unwrap_or('\u{fffd}')),
+                    'u' => {
+                        // Ambiguous only when a fifth hex digit follows: with four or fewer both
+                        // readings consume the same digits.
+                        let hex = chars.clone().take_while(char::is_ascii_hexdigit);
+                        let digits = if !drop_output && hex.take(5).count() == 5 {
+                            let index = *ambiguous;
+                            *ambiguous += 1;
+                            if wide(index) { 8 } else { 4 }
+                        } else {
+                            4
+                        };
+                        number(chars, 16, digits).map(|v| char::from_u32(v).unwrap_or('\u{fffd}'))
+                    }
+                    'U' => number(chars, 16, 8).map(|v| char::from_u32(v).unwrap_or('\u{fffd}')),
+                    '0'..='7' => {
+                        // The first digit is already consumed; up to two more follow, so the
+                        // value is `first` followed by those digits in base 8. Bash keeps the
+                        // low byte of an overlong one.
+                        let mut value = escape.to_digit(8).unwrap_or(0);
+                        for _ in 0..2 {
+                            let Some(digit) = chars.peek().and_then(|c| c.to_digit(8)) else {
+                                break;
+                            };
+                            chars.next();
+                            value = value * 8 + digit;
+                        }
+                        char::from_u32(value & 0xff)
+                    }
+                    'c' => chars.next().map(|c| ((c as u32) & 0x1f) as u8 as char),
+                    _ => None,
+                };
+                if drop_output {
+                    continue;
+                }
+                match decoded {
+                    // A NUL ends the string's text; the word goes on after the closing quote.
+                    Some('\0') => drop_output = true,
+                    Some(c) => out.push(c),
+                    // `\x` with no digits, an unknown escape: bash keeps both characters.
+                    None => {
+                        out.push('\\');
+                        out.push(escape);
+                    }
+                }
+            }
+            // A literal NUL byte is dropped, as bash drops it from its input.
+            '\0' => {}
+            _ if drop_output => {}
+            _ => out.push(character),
+        }
+    }
+    false
 }
 
 /// The guards a command has to clear before ANY list may say yes to it, separated from the lists
@@ -407,7 +743,13 @@ fn dequoted(word: &str) -> String {
 /// them. Migration `0128` puts it in one line: "Do lado `deny` não há nada a validar — uma recusa a
 /// mais nunca deixou correr nada."
 pub fn shell_form_is_readable(command: &str) -> bool {
-    !has_shell_control(command)
+    // First, before every flag guard and positional consumer below and in `is_safe_command`.
+    !has_ansi_c_or_locale_quote(command)
+        // A literal NUL is refused outright: where it cuts the line depends on who reads it (the
+        // kernel ends an argument there, `dequoted` drops it), and `find . -delete<NUL>x` read the
+        // second way hid the `-delete`. No honest command carries one.
+        && !command.contains('\0')
+        && !has_shell_control(command)
         && !flag_words(command).iter().any(|token| token == "--fix")
         && !writes_an_output_file(command)
         && !forces_external_diff_or_textconv(command)

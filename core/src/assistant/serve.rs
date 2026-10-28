@@ -566,38 +566,233 @@ pub(super) fn track_background(line: &str, running: &mut HashSet<String>) {
 pub(super) fn spontaneous_prompt(
     carried: &std::collections::VecDeque<crate::execution::runner::TurnEvent>,
 ) -> String {
-    let notices: Vec<String> = carried
-        .iter()
-        .filter_map(|event| {
-            let crate::execution::runner::TurnEvent::Line(line) = event else {
-                return None;
-            };
-            let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-            if value.get("type").and_then(serde_json::Value::as_str) != Some("system")
-                || value.get("subtype").and_then(serde_json::Value::as_str)
-                    != Some("task_notification")
-            {
-                return None;
-            }
-            let id = value
-                .get("task_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let status = value
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("ended");
-            Some(
-                match value.get("summary").and_then(serde_json::Value::as_str) {
-                    Some(summary) => format!("[background task {id} {status}]: {summary}"),
-                    None => format!("[background task {id} {status}]"),
-                },
-            )
-        })
-        .collect();
+    let notices = spontaneous_notices(carried);
     if notices.is_empty() {
         "[the assistant continued on its own]".to_owned()
     } else {
         notices.join("\n")
+    }
+}
+
+/// The text between `<name>` and `</name>`, if the body has that tag.
+fn xml_tag<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&format!("</{name}>"))? + start;
+    Some(body[start..end].trim())
+}
+
+/// Every piece of text a stream line carries: `message.content` as a string or as text blocks, or a
+/// top-level `content` string.
+fn line_text(value: &serde_json::Value) -> String {
+    let content = value
+        .pointer("/message/content")
+        .or_else(|| value.get("content"));
+    match content {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// One notification in the text format the shell parses (`taskMarkerText` in `Chats.tsx`):
+/// `[background task <id> completed|failed|killed]: <description> (exit code N)` or
+/// `[subagent <name> completed|failed]`. PURE.
+///
+/// The CLI words the summary itself (`Background command "x" completed (exit code 2)`,
+/// `Agent "name" completed`), so the status word it repeats is dropped from the description.
+fn format_notice(task_id: &str, status: &str, summary: Option<&str>) -> String {
+    let status = match status {
+        "stopped" | "killed" => "killed",
+        "failed" | "error" => "failed",
+        _ => "completed",
+    };
+    let Some(summary) = summary.map(str::trim).filter(|summary| !summary.is_empty()) else {
+        return format!("[background task {task_id} {status}]");
+    };
+    if let Some(rest) = summary.strip_prefix("Agent \"")
+        && let Some((name, _)) = rest.split_once('"')
+    {
+        let word = if status == "completed" {
+            "completed"
+        } else {
+            "failed"
+        };
+        return format!("[subagent {name} {word}]");
+    }
+    let (body, exit) = match summary.rfind("(exit code ") {
+        Some(at) if summary.ends_with(')') => (summary[..at].trim_end(), Some(&summary[at..])),
+        _ => (summary, None),
+    };
+    let body = [" completed", " failed", " was stopped", " killed"]
+        .iter()
+        .find_map(|word| body.strip_suffix(word))
+        .unwrap_or(body);
+    match exit {
+        Some(exit) => format!("[background task {task_id} {status}]: {body} {exit}"),
+        None => format!("[background task {task_id} {status}]: {body}"),
+    }
+}
+
+/// The task notifications a process said while no turn held it, one formatted line per task, oldest
+/// first.
+///
+/// The CLI hands a finished task to the model as a `user` line (the stream's echo of its queue)
+/// whose text is a `<task-notification>` block, and only sometimes also as a `system` /
+/// `task_notification` event; both are read, and a task named twice is listed once.
+pub(super) fn spontaneous_notices(
+    carried: &std::collections::VecDeque<crate::execution::runner::TurnEvent>,
+) -> Vec<String> {
+    notice_records(carried)
+        .into_iter()
+        .map(|(id, status, summary)| format_notice(&id, &status, summary.as_deref()))
+        .collect()
+}
+
+/// The carried notices as `system` / `task_notification` stream lines, so `apply_line` can settle
+/// the task rows a `user`-line notice names (it reads only `system` lines). PURE.
+pub(super) fn notice_task_lines(
+    carried: &std::collections::VecDeque<crate::execution::runner::TurnEvent>,
+) -> Vec<String> {
+    notice_records(carried)
+        .into_iter()
+        .filter(|(id, _, _)| id != "?")
+        .map(|(id, status, _)| {
+            serde_json::json!({"type": "system", "subtype": "task_notification",
+                "task_id": id, "status": status})
+            .to_string()
+        })
+        .collect()
+}
+
+/// `(task id, raw status, summary)` of each distinct notice, oldest first.
+fn notice_records(
+    carried: &std::collections::VecDeque<crate::execution::runner::TurnEvent>,
+) -> Vec<(String, String, Option<String>)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut notices = Vec::new();
+    for event in carried {
+        let crate::execution::runner::TurnEvent::Line(line) = event else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let kind = value.get("type").and_then(serde_json::Value::as_str);
+        let (id, status, summary) = if kind == Some("system")
+            && value.get("subtype").and_then(serde_json::Value::as_str) == Some("task_notification")
+        {
+            (
+                value
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?")
+                    .to_owned(),
+                value
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("completed")
+                    .to_owned(),
+                value
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            )
+        } else if matches!(kind, Some("user" | "queue-operation")) {
+            let text = line_text(&value);
+            if !text.contains("<task-notification>") {
+                continue;
+            }
+            (
+                xml_tag(&text, "task-id").unwrap_or("?").to_owned(),
+                xml_tag(&text, "status").unwrap_or("completed").to_owned(),
+                xml_tag(&text, "summary").map(str::to_owned),
+            )
+        } else {
+            continue;
+        };
+        if seen.insert(id.clone()) {
+            notices.push((id, status, summary));
+        }
+    }
+    notices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::runner::TurnEvent;
+
+    fn carried_of(lines: &[&str]) -> std::collections::VecDeque<TurnEvent> {
+        lines
+            .iter()
+            .map(|line| TurnEvent::Line((*line).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_user_line_notification_becomes_the_text_the_shell_parses() {
+        let body = "<task-notification>\n<task-id>bV2</task-id>\n<tool-use-id>toolu_b</tool-use-id>\n\
+                    <status>completed</status>\n<summary>Background command \"cargo build\" completed (exit code 2)</summary>\n</task-notification>";
+        let line =
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": body}})
+                .to_string();
+        assert_eq!(
+            spontaneous_prompt(&carried_of(&[&line])),
+            "[background task bV2 completed]: Background command \"cargo build\" (exit code 2)"
+        );
+    }
+
+    #[test]
+    fn several_notifications_join_with_newlines_and_a_task_named_twice_counts_once() {
+        let block = |id: &str, status: &str, summary: &str| {
+            serde_json::json!({"type": "user", "message": {"content": [{"type": "text",
+                "text": format!("<task-notification>\n<task-id>{id}</task-id>\n<status>{status}</status>\n<summary>{summary}</summary>\n</task-notification>")}]}})
+            .to_string()
+        };
+        let agent = block("a1", "completed", "Agent \"reviewer\" completed");
+        let failed = block(
+            "b2",
+            "failed",
+            "Background command \"make\" failed (exit code 3)",
+        );
+        let again = r#"{"type":"system","subtype":"task_notification","task_id":"b2","status":"failed","summary":"x"}"#;
+        assert_eq!(
+            spontaneous_prompt(&carried_of(&[&agent, &failed, again])),
+            "[subagent reviewer completed]\n[background task b2 failed]: Background command \"make\" (exit code 3)"
+        );
+    }
+
+    #[test]
+    fn notice_task_lines_name_each_task_once_as_system_lines() {
+        let user = serde_json::json!({"type": "user", "message": {"content":
+            "<task-notification>
+<task-id>bV2</task-id>
+<status>failed</status>
+</task-notification>"}})
+        .to_string();
+        let lines = notice_task_lines(&carried_of(&[&user, &user]));
+        assert_eq!(lines.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["subtype"], "task_notification");
+        assert_eq!(v["task_id"], "bV2");
+        assert_eq!(v["status"], "failed");
+    }
+
+    #[test]
+    fn a_system_notification_still_reads_and_nothing_still_falls_back() {
+        let system = r#"{"type":"system","subtype":"task_notification","task_id":"t9","status":"stopped","summary":"Background command \"sleep\" was stopped"}"#;
+        assert_eq!(
+            spontaneous_prompt(&carried_of(&[system])),
+            "[background task t9 killed]: Background command \"sleep\""
+        );
+        assert_eq!(
+            spontaneous_prompt(&carried_of(&[r#"{"type":"assistant","message":{}}"#])),
+            "[the assistant continued on its own]"
+        );
     }
 }

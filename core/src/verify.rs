@@ -2395,6 +2395,111 @@ tests:
         .last_insert_rowid()
     }
 
+    /// A chat rooted in `cwd` and one assistant turn of it carrying `origin`; returns the turn's id.
+    async fn insert_chat_turn(pool: &SqlitePool, cwd: Option<&str>, origin: &str) -> i64 {
+        let chat = format!("chat-{origin}");
+        sqlx::query(
+            "INSERT OR IGNORE INTO chats (chat_id, brain, created_at, cwd) VALUES (?, 'cloud', ?, ?)",
+        )
+        .bind(&chat)
+        .bind("2026-10-06T00:00:00Z")
+        .bind(cwd)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, created_at) \
+             VALUES ('x', 'running', 'assistant', ?, ?, '2026-10-06T00:00:00Z')",
+        )
+        .bind(&chat)
+        .bind(origin)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn a_chat_turn_verifies_the_worktree_of_its_chats_project() {
+        let f = fixture(Some(&plain_map()), None, false).await;
+        let root = path_arg(f.repo.path());
+
+        // A person's turn and a task-origin (spontaneous) turn resolve alike, without a run cwd.
+        for origin in ["shell", "task"] {
+            let turn = insert_chat_turn(&f.pool, Some(&root), origin).await;
+            let (_, project) = resolve_worktree(&f.pool, Caller::Run(turn), None, deadline())
+                .await
+                .unwrap();
+            assert_eq!(project, "alpha", "{origin}");
+            let (_, project) =
+                resolve_worktree(&f.pool, Caller::Run(turn), Some(&root), deadline())
+                    .await
+                    .unwrap();
+            assert_eq!(project, "alpha", "{origin}");
+        }
+
+        // Another registered worktree of the same project may be asked for.
+        let parent = tempfile::tempdir().unwrap();
+        let side = parent.path().join("side");
+        git_in(
+            f.repo.path(),
+            &["worktree", "add", "-q", "-b", "side", &path_arg(&side)],
+        );
+        let turn = insert_chat_turn(&f.pool, Some(&root), "shell").await;
+        let (_, project) = resolve_worktree(
+            &f.pool,
+            Caller::Run(turn),
+            Some(&path_arg(&side)),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(project, "alpha");
+    }
+
+    #[tokio::test]
+    async fn a_chat_turn_is_refused_a_foreign_worktree_or_a_chat_without_a_project() {
+        let f = fixture(Some(&plain_map()), None, false).await;
+        let root = path_arg(f.repo.path());
+        let turn = insert_chat_turn(&f.pool, Some(&root), "shell").await;
+
+        // A second, rostered project: its worktree is not alpha's.
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::write(foreign.path().join("b.txt"), "b\n").unwrap();
+        git_in(foreign.path(), &["init", "-q", "-b", "main"]);
+        git_in(foreign.path(), &["add", "-A"]);
+        git_in(foreign.path(), &["commit", "-q", "-m", "one"]);
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('beta', 'active', ?)",
+        )
+        .bind(path_arg(foreign.path()))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let error = resolve_worktree(
+            &f.pool,
+            Caller::Run(turn),
+            Some(&path_arg(foreign.path())),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, VerifyError::Forbidden(_)), "{error:?}");
+
+        // A relative path is never resolved against the daemon's directory.
+        let error = resolve_worktree(&f.pool, Caller::Run(turn), Some("relative"), deadline())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VerifyError::BadRequest(_)), "{error:?}");
+
+        // A chat rooted nowhere has no project to verify in.
+        let unrooted = insert_chat_turn(&f.pool, None, "task").await;
+        let error = resolve_worktree(&f.pool, Caller::Run(unrooted), None, deadline())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VerifyError::Forbidden(_)), "{error:?}");
+    }
+
     #[tokio::test]
     async fn a_run_caller_is_held_to_its_own_worktree() {
         let f = fixture(Some(&plain_map()), None, false).await;

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"nucleosbrowser/browser"
+	"nucleosbrowser/cdp/cdptest"
 )
 
 func TestAttachEmbeddedWaitsForTheTabToBeListed(t *testing.T) {
@@ -36,6 +37,42 @@ func TestAttachEmbeddedStopsWaitingWhenCancelled(t *testing.T) {
 	}
 	if time.Since(started) > time.Second {
 		t.Errorf("waited %v after the context ended", time.Since(started))
+	}
+}
+
+// The caller going away during the last call Adopt makes (Target.getTargetInfo, whose error is
+// ignored) leaves Adopt succeeding on a cancelled ctx: the session must not stay registered.
+func TestAttachEmbeddedCancelledAfterAdoptionLeavesNoSession(t *testing.T) {
+	view := newWebview(t)
+	view.addPage("T1", "n1")
+	pool, _ := preparedPool(t) // max_sessions 4
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	view.cdp.Handle("Target.getTargetInfo", func(cdptest.Call) (any, error) {
+		cancel()
+		return map[string]any{"targetInfo": map[string]any{
+			"targetId": "T1", "url": "https://example.org/landed", "title": "Example",
+		}}, nil
+	})
+
+	_, err := pool.AttachEmbedded(ctx, attachRequest(view, "n1"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	pool.mu.Lock()
+	live := len(pool.sessions)
+	pool.mu.Unlock()
+	if live != 0 {
+		t.Fatalf("sessions = %d, want 0: an attach nobody is waiting for must not hold a slot", live)
+	}
+
+	// The slot is free again: a fresh attach on another tab succeeds.
+	view.cdp.Handle("Target.getTargetInfo", func(cdptest.Call) (any, error) {
+		return map[string]any{"targetInfo": map[string]any{"targetId": "T2", "url": "https://example.org/"}}, nil
+	})
+	view.addPage("T2", "n2")
+	if _, err := pool.AttachEmbedded(context.Background(), attachRequest(view, "n2")); err != nil {
+		t.Fatalf("attach after the cancelled one: %v", err)
 	}
 }
 

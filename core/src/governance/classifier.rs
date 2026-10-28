@@ -1166,6 +1166,11 @@ fn is_verify_client_call(command: &str, raw: &str) -> bool {
     fn digits(text: &str) -> bool {
         !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
     }
+    // The words below are decoded by `flag_words`, and the allow side never trusts a decoded
+    // `$'...'` or `$"..."` word: refused here too, not only by the caller's shape guard.
+    if has_ansi_c_or_locale_quote(command) || has_ansi_c_or_locale_quote(raw) {
+        return false;
+    }
     let Some((program, arguments)) = split_program(command) else {
         return false;
     };
@@ -4844,6 +4849,48 @@ mod tests {
             "go build '-o' ../x.exe ./cmd",
             "sort \"-o\" ../x file.txt",
             "tail \"-f\" daemon.log",
+            // Bash's ANSI-C (`$'...'`) and locale (`$"..."`) quoting: the program still receives a
+            // plain flag, and the escapes spell it without writing it.
+            "find . $'-exec' rm {} +",
+            "find . $\"-exec\" rm {} +",
+            "find . $'\\x2dexec' cat {} +",
+            "find . $'\\055exec' cat {} +",
+            "find . $'\\u002dexec' cat {} +",
+            "rg $'--pre=./x.sh' pattern",
+            "git log $'--output=../x'",
+            "go build $'-o' ../x.exe",
+            "tail $'-f' daemon.log",
+            // The kernel and bash cut the word at the first NUL, however it was spelled.
+            "find . $'-exec\\0' rm {} +",
+            "find . $'-exec\\x00' rm {} +",
+            "find . $'-exec\\c@' rm {} +",
+            "find . $'-exec\\u0000' rm {} +",
+            // `\U` (eight digits) arrives lowercased as `\u0000002d`, which must not be read only
+            // as the four-digit `\u0000` (NUL) followed by `002d`.
+            "find . $'\\U0000002d'exec rm {} +",
+            "rg $'\\U0000002d'-pre=./x.sh pattern",
+            "find . $'-\\U00000065xec' rm {} +",
+            // The four-or-eight choice is made per escape: one word can mix a real four-digit
+            // `\u` with a lowercased eight-digit `\U`, and neither all-narrow nor all-wide reading
+            // of it spells the flag.
+            "find . $'\\u002de\\U00000078ec' rm {} +",
+            // A NUL ends the `$'...'` string, not the word: what follows the quote is still part
+            // of the argument.
+            "find . $'\\x00'-exec rm {} +",
+            "find . $'\\0'-exec rm {} +",
+            // A `$'...'` string holding whitespace is one word to bash but several to a raw split;
+            // after the NUL the piece behind the quote used to read as `x-exec`. Refused.
+            "find . $'\\0 x'-exec rm {} +",
+            "find . $'\\c@ zz'-ok rm {} +",
+            "go build -o $'x '/../../evil ./cmd",
+            // After a NUL the rest of the string lexes like before it: `\c` takes the `\`, so the
+            // `\'` after it is an escaped quote and the string closes just before `-exec`.
+            "find . $'\\0\\c\\\\'zz'-exec rm {} +",
+            // Too many case-lost `\u` escapes in one word to enumerate every reading: refused.
+            "ls $'\\u00000061\\u00000061\\u00000061\\u00000061\\u00000061\\u00000061\\u00000061'",
+            // Backslash-newline join: unreachable through `classify` (the newline is already a
+            // space by then), so this case only documents the intent of `flag_words`.
+            "find . \"-\\\nexec\" rm {} +",
         ] {
             let classification = classify("Bash", &json!({"command": command}), None);
             assert_ne!(
@@ -4861,11 +4908,167 @@ mod tests {
     /// recursive delete `rm -rf` is, and gets the same `deny`.
     #[test]
     fn a_quoted_delete_on_find_is_denied_like_the_bare_one() {
-        for command in ["find . \"-delete\"", "find . '-delete'", "find . -de\\lete"] {
+        for command in [
+            "find . \"-delete\"",
+            "find . '-delete'",
+            "find . -de\\lete",
+            "find . $'-delete'",
+            "find . $'\\x2ddelete'",
+            "find . $'-delete\\0'",
+            "find . $'\\U0000002d'delete",
+            "find . $'\\U0000002ddelete'",
+            "find . $'\\u002dd\\U00000065lete'",
+            "find . $'\\0'-delete",
+            "find . $'\\x00'-delete",
+            // The string holds a space, so the raw split cuts it; the joined reading is `-delete`.
+            "find . $'\\0 x'-delete",
+        ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
                 "deny",
                 "destructive",
+            );
+        }
+    }
+
+    /// A raw word with more than one reading is never read-local: the positional consumers take one
+    /// word at one index, and the first reading there is the widest, not the one bash runs. Bash
+    /// reads `\u0000` (four digits) as a NUL, so this is `cargo t` (a test run), not `cargo fmt`.
+    #[test]
+    fn a_word_with_several_readings_is_not_read_local() {
+        for command in [
+            "cargo $'\\u00000066m't -- --check",
+            "cargo $'\\U00000066m't -- --check",
+        ] {
+            let classification = classify("Bash", &json!({"command": command}), None);
+            assert_ne!(
+                classification.action_class, "read-local",
+                "{command} must not read as read-local"
+            );
+        }
+    }
+
+    /// The text after a NUL inside `$'...'` is lexed in a loop, not by recursion: one recursive
+    /// call per `\0` overflowed the stack and aborted the daemon on a long enough string.
+    #[test]
+    fn a_long_run_of_nul_escapes_does_not_overflow_the_stack() {
+        let command = format!("find . $'{}'-delete", "\\0".repeat(100_000));
+        let classification = classify("Bash", &json!({"command": command}), None);
+        assert_ne!(classification.action_class, "read-local");
+        assert_eq!(classification.decision.decision, "deny");
+    }
+
+    /// `'$'` re-opens an ANSI-C span at every word as `flag_words` lexes it, and each span used to
+    /// be re-lexed from its start for every word appended. The span join is incremental and capped,
+    /// so this classifies in normal unit-test time.
+    #[test]
+    fn many_reopened_ansi_c_spans_classify_quickly() {
+        let command = format!("ls {}", "'$' ".repeat(2000));
+        let classification = classify("Bash", &json!({"command": command}), None);
+        assert!(!classification.action_class.is_empty());
+    }
+
+    /// Tens of thousands of `$'...'` strings in one word classify, and never as read-local: the
+    /// allow side refuses the line on its first `$'` rather than re-counting the tail of the line
+    /// once per string, which was quadratic.
+    #[test]
+    fn many_ansi_c_strings_in_one_word_classify() {
+        let command = format!("ls {}", "$'a'".repeat(25_000));
+        let classification = classify("Bash", &json!({"command": command}), None);
+        assert!(!classification.action_class.is_empty());
+        assert_ne!(classification.action_class, "read-local");
+    }
+
+    /// The allow side does not decode ANSI-C (`$'...'`) or locale (`$"..."`) quoting: any line
+    /// holding `$'` or `$"`, inside other quotes or not, closed or not, is never read-local. Bash
+    /// runs `cargo 'fmt$' --check` and `cargo "$"fmt --check` as the external `cargo-fmt$`, which
+    /// the decoder used to read as `fmt`.
+    #[test]
+    fn an_ansi_c_or_locale_quote_is_never_read_local() {
+        for command in [
+            "cargo 'fmt$' --check",
+            "cargo \"$\"fmt --check",
+            "cargo $'fmt' --check",
+            "cargo $\"fmt\" --check",
+            "find . $'-delete",
+            "nucleos-core $'--verify'",
+            "nucleos-core --verify-ticket $'12'",
+        ] {
+            let classification = classify("Bash", &json!({"command": command}), None);
+            assert_ne!(
+                classification.action_class, "read-local",
+                "{command} must not read as read-local"
+            );
+            assert_ne!(
+                classification.decision.decision, "allow",
+                "{command} must not be allowed"
+            );
+        }
+        // Keep-green: the plain spelling still reads.
+        assert_eq!(
+            classify("Bash", &json!({"command": "cargo fmt --check"}), None).action_class,
+            "read-local"
+        );
+        assert!(!is_verify_client_call(
+            "nucleos-core --verify-ticket $'12'",
+            "nucleos-core --verify-ticket $'12'"
+        ));
+        assert!(is_verify_client_call(
+            "nucleos-core --verify-ticket 12",
+            "nucleos-core --verify-ticket 12"
+        ));
+    }
+
+    /// A literal NUL is refused outright on the allow side, and the deny side reads the line cut at
+    /// it as well, as the kernel ends the argument there.
+    #[test]
+    fn a_literal_nul_is_never_read_local() {
+        let command = "find . -delete\0x";
+        let classification = classify("Bash", &json!({"command": command}), None);
+        assert_ne!(classification.action_class, "read-local");
+        assert_ne!(classification.decision.decision, "allow");
+        assert!(super::shell_shape::has_destructive_flags(command));
+        assert!(!super::shell_shape::shell_form_is_readable("ls\0"));
+    }
+
+    /// The raw words `has_destructive_flags` indexes are split from the line with its
+    /// backslash-newlines joined, the line `flag_words` reads, so a pair inside a word neither
+    /// panics on a slice past the end nor hides the flag it splits.
+    #[test]
+    fn a_backslash_newline_inside_a_flag_is_still_destructive() {
+        for command in [
+            "find . -\\\ndelete",
+            "find . -\\\r\ndelete",
+            "find \\\n. \\\n-delete",
+        ] {
+            assert!(
+                super::shell_shape::has_destructive_flags(command),
+                "{command:?} must read as destructive"
+            );
+        }
+        assert!(!super::shell_shape::has_destructive_flags("ls \\\n\\\n"));
+    }
+
+    /// An apostrophe the shell reads as a literal (`\'`, or `$'\''`) does not open a quote, so a
+    /// `>` after it is a real redirect. The command reader once masked everything up to the next
+    /// apostrophe, hid the `>` and let a write outside the project through as `read-local`.
+    #[test]
+    fn a_redirect_after_an_escaped_apostrophe_is_not_read_local() {
+        for command in [
+            "echo x \\' > ../../outside/leak.txt \\'",
+            "echo x $'\\'' > ../../outside/leak.txt $'\\''",
+            "cat README.md \\' > ../../outside/leak.txt \\'",
+            "cat README.md $'\\'' > ../../outside/leak.txt $'\\''",
+            "echo x$$'\\' > ../../outside/leak.txt \\' '\\'",
+        ] {
+            let classification = classify("Bash", &json!({"command": command}), None);
+            assert_ne!(
+                classification.action_class, "read-local",
+                "{command} must not read as read-local"
+            );
+            assert_ne!(
+                classification.decision.decision, "allow",
+                "{command} must not be allowed"
             );
         }
     }

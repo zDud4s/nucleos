@@ -67,10 +67,11 @@ function useWindowInFront(): boolean {
  * It reads the lists the badge and the drawer already keep alive — no request of its own — and
  * leaves every decision to `toastsFor`. The policy is the one Telegram obeys.
  *
- * The toast's click does not reach the page on every platform, so the destination of the last
- * toast is kept and the window goes there when it next comes to the front.
+ * The notification plugin reports a click only on mobile, so on desktop the destination of the
+ * last toast is offered as an in-app "Open <title>" button when the window comes back. Coming
+ * back to the front never navigates by itself; only a click on that button does.
  *
- * It renders nothing, and it lives in the AppShell for the reason `AttentionHeartbeat` does: it
+ * It renders only that button, and it lives in the AppShell for the reason `AttentionHeartbeat` does: it
  * is a fact about the window, not about a page.
  */
 export function DesktopNotifier({ send = sendDesktopToast }: { send?: (toast: Toast) => unknown }) {
@@ -84,7 +85,9 @@ export function DesktopNotifier({ send = sendDesktopToast }: { send?: (toast: To
   const policy = useNotifyPolicy();
 
   const seen = useRef(EMPTY_SEEN);
-  const outstanding = useRef<{ to: string; at: number } | null>(null);
+  const [outstanding, setOutstanding] = useState<{ to: string; title: string; at: number } | null>(
+    null,
+  );
 
   useEffect(() => {
     const out = toastsFor({
@@ -102,15 +105,28 @@ export function DesktopNotifier({ send = sendDesktopToast }: { send?: (toast: To
 
     for (const toast of out.toasts) void Promise.resolve(send(toast)).catch(() => {});
     const last = out.toasts[out.toasts.length - 1];
-    if (last) outstanding.current = { to: last.to, at: Date.now() };
+    if (last) setOutstanding({ to: last.to, title: last.title, at: Date.now() });
   }, [front, enabled, policy.data, policy.isPending, proposals.data, feed.data, chats.data, send]);
 
+  // A stale prompt expires: it is dropped on the window's next return after ACT_ON_MS.
   useEffect(() => {
-    if (!front || outstanding.current === null) return;
-    const { to, at } = outstanding.current;
-    outstanding.current = null;
-    if (Date.now() - at <= ACT_ON_MS) void navigate({ to });
-  }, [front, navigate]);
+    if (front && outstanding !== null && Date.now() - outstanding.at > ACT_ON_MS) setOutstanding(null);
+  }, [front, outstanding]);
 
-  return null;
+  if (!front || outstanding === null || Date.now() - outstanding.at > ACT_ON_MS) return null;
+  const { to, title } = outstanding;
+  return (
+    <div role="status" className="fixed bottom-4 right-4 z-50">
+      <button
+        type="button"
+        className="rounded-md border px-3 py-2 shadow"
+        onClick={() => {
+          setOutstanding(null);
+          void navigate({ to });
+        }}
+      >
+        Open {title}
+      </button>
+    </div>
+  );
 }

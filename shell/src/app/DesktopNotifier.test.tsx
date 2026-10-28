@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -97,7 +97,7 @@ describe("the desktop notifier", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it("opens where the last toast pointed when the window comes back to the front", async () => {
+  it("offers the last toast's page on return but navigates only when it is clicked", async () => {
     const send = vi.fn();
     const view = await mounted(send);
 
@@ -109,7 +109,13 @@ describe("the desktop notifier", () => {
     expect(view.router.state.location.pathname).toBe("/");
 
     setFront(true);
+    const open = await screen.findByRole("button", { name: /^Open Waiting/ });
+    await act(async () => {});
+    expect(view.router.state.location.pathname).toBe("/");
+
+    fireEvent.click(open);
     await waitFor(() => expect(view.router.state.location.pathname).toBe("/waiting"));
+    expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
   });
 
   it("does not take the owner anywhere when the window returns with no toast outstanding", async () => {
@@ -121,5 +127,6 @@ describe("the desktop notifier", () => {
     await act(async () => {});
 
     expect(view.router.state.location.pathname).toBe("/");
+    expect(screen.queryByRole("button", { name: /^Open / })).toBeNull();
   });
 });
