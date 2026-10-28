@@ -148,10 +148,17 @@ async fn devtime(
     // Re-read per request, so a price refresh (or a hand edit of the file) needs no restart
     // (spec §4.4).
     let models = crate::config::models_config_now();
-    let mut overview =
-        crate::analytics::devtime::devtime_overview(&state.pool, &models, scope, window, now)
-            .await
-            .map_err(|error| failed(error, "devtime analytics"))?;
+    let (rules, _) = devtime_rules(state);
+    let mut overview = crate::analytics::devtime::devtime_overview(
+        &state.pool,
+        &models,
+        &rules,
+        scope,
+        window,
+        now,
+    )
+    .await
+    .map_err(|error| failed(error, "devtime analytics"))?;
     // A model with no price may be one the vendors listed since the last refresh: this starts one
     // in the background (when allowed) and the next view reads its prices.
     crate::price_refresh::note_unpriced(

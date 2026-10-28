@@ -38,7 +38,10 @@ import type { Onboarding } from "../data/onboarding";
 import type { ProjectReadings } from "../data/project-readings";
 import type { AnalyticsDays, AnalyticsReport, QuotaHistory } from "../data/analytics";
 import type { Dist, PipelineReport } from "../data/analytics-pipeline";
-import type { DevtimeDay, DevtimeFindings, DevtimeOverview, RuleView, Verdict as DevtimeVerdict } from "../data/devtime";
+import type {
+  DevtimeAgents, DevtimeDay, DevtimeFindings, DevtimeOverview, DevtimeToolFailures, DevtimeTurnClasses, DevtimeUnexplained,
+  RuleView, Verdict as DevtimeVerdict,
+} from "../data/devtime";
 import type { BudgetView, ProjectSummary, Proposal } from "../data/system";
 
 /**
@@ -952,6 +955,91 @@ export function devtimeOverview(overrides: Partial<DevtimeOverview> = {}): Devti
     tokens: { by_model: [], cache_hit_ratio: null, cost_usd: null, cost_low: null, cost_high: null,
               cost_estimated: true, prices_as_of: null,
               unpriced_models: [], dropped_prices: [], price_refresh: null, previous: { cost_usd: null, cache_hit_ratio: null } },
+    ...overrides,
+  };
+}
+
+/**
+ * A metric-7 block (spec follow-up A): 40 attempts, 4 failures (3 non-zero exits, 1 edit not found),
+ * one interrupted, one unresolved. `devtimeOverview()` never adds it; pass it as `tool_failures`.
+ */
+export function devtimeToolFailures(overrides: Partial<DevtimeToolFailures> = {}): DevtimeToolFailures {
+  return {
+    attempts: 40, failures: 4, failure_rate: 0.1, interrupted: 1, unresolved: 1,
+    by_error_class: [
+      { error_class: "exit_nonzero", failures: 3 },
+      { error_class: "edit_not_found", failures: 1 },
+    ],
+    by_tool: [
+      { tool_name: "Bash", cmd_program: "cargo test", attempts: 20, failures: 3, failure_rate: 0.15, top_error_class: "exit_nonzero" },
+      { tool_name: "Edit", cmd_program: null, attempts: 20, failures: 1, failure_rate: 0.05, top_error_class: "edit_not_found" },
+    ],
+    ...overrides,
+  };
+}
+
+/**
+ * A metric-9 per-class block (spec follow-up B), the plan contract's numbers: c0 (no calls) 12 turns,
+ * c1 (1–5 calls) 30 turns with 2 slow ones, c3 (21+ calls) 15 turns. `devtimeOverview()` never adds it.
+ */
+export function devtimeTurnClasses(overrides: Partial<DevtimeTurnClasses> = {}): DevtimeTurnClasses {
+  return {
+    turns: 57,
+    classes: [
+      { turn_class: "c0", min_calls: 0, max_calls: 0, turns: 12, calls: 0, active_ms: 540_000, explained_ms: 0,
+        explained_ratio: 0, median_active_ms: 30_000, ms_per_call: null, unexplained_turns: 0 },
+      { turn_class: "c1", min_calls: 1, max_calls: 5, turns: 30, calls: 96, active_ms: 5_400_000, explained_ms: 600_000,
+        explained_ratio: 0.1111, median_active_ms: 150_000, ms_per_call: 56_250, unexplained_turns: 2 },
+      { turn_class: "c3", min_calls: 21, max_calls: null, turns: 15, calls: 480, active_ms: 9_000_000, explained_ms: 0,
+        explained_ratio: 0, median_active_ms: 540_000, ms_per_call: 18_750, unexplained_turns: 1 },
+    ],
+    ...overrides,
+  };
+}
+
+/**
+ * A metric-9 slow-turn block, consistent with `devtimeTurnClasses()`: 3 listed turns (one c3, two c1),
+ * all in project `nucleos`, summing to `active_ms`. No session id, no worktree (spec analytics-devtime
+ * §8). `devtimeOverview()` never adds it; pass it as `unexplained`.
+ */
+export function devtimeUnexplained(overrides: Partial<DevtimeUnexplained> = {}): DevtimeUnexplained {
+  return {
+    turns: 3, active_ms: 2_700_000,
+    criteria: { median_multiple: 3, min_turn_ms: 300_000, max_explained_fraction: 0.2, min_class_turns: 10,
+                medians_from: "2026-09-17" },
+    items: [
+      { project_id: "nucleos", day: "2026-10-16", started_at: "2026-10-16T09:12:03.000Z", turn_class: "c3",
+        calls: 40, active_ms: 1_800_000, explained_ms: 0, class_median_ms: 540_000 },
+      { project_id: "nucleos", day: "2026-10-14", started_at: "2026-10-14T15:40:00.000Z", turn_class: "c1",
+        calls: 4, active_ms: 450_000, explained_ms: 60_000, class_median_ms: 150_000 },
+      { project_id: "nucleos", day: "2026-10-12", started_at: "2026-10-12T11:05:30.000Z", turn_class: "c1",
+        calls: 2, active_ms: 450_000, explained_ms: 0, class_median_ms: 150_000 },
+    ],
+    ...overrides,
+  };
+}
+
+/**
+ * A metric-10 block (spec follow-up C), the plan contract's numbers: 42 agent runs, 4 failed, 2 interrupted;
+ * `wf-executor` (implementer, 10 of 14 checks passed) and `Explore` (no role, never checked). No session,
+ * agent id, worktree or prompt (spec analytics-devtime §8). `devtimeOverview()` never adds it; pass it as `agents`.
+ */
+export function devtimeAgents(overrides: Partial<DevtimeAgents> = {}): DevtimeAgents {
+  return {
+    attempts: 42, ms: 9_000_000,
+    outcome: { ok: 36, failed: 4, interrupted: 2, other: 0 },
+    verified: { passed: 10, failed: 4, not_measured: 20, unruled: 8 },
+    failure_rate: 4 / 42, pass_rate: 10 / 14,
+    by_type: [
+      { agent_type: "wf-executor", role: "implementer", attempts: 20, ms: 6_000_000, median_ms: 240_000,
+        outcome: { ok: 17, failed: 2, interrupted: 1, other: 0 },
+        verified: { passed: 10, failed: 4, not_measured: 3, unruled: 3 },
+        failure_rate: 0.1, pass_rate: 10 / 14 },
+      { agent_type: "Explore", role: null, attempts: 22, ms: 3_000_000, median_ms: 90_000,
+        outcome: { ok: 19, failed: 2, interrupted: 1, other: 0 },
+        verified: { passed: 0, failed: 0, not_measured: 17, unruled: 5 },
+        failure_rate: 2 / 22, pass_rate: null },
+    ],
     ...overrides,
   };
 }

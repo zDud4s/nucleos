@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { ApiRefusal } from "./client";
 import { devtimeFindingsPath, devtimeMarkPath, devtimePath } from "./devtime";
-import { daemonFetch, daemonState, devtimeFindings, devtimeOverview, project } from "../test/harness";
+import {
+  daemonFetch, daemonState, devtimeAgents, devtimeFindings, devtimeOverview, devtimeToolFailures, devtimeTurnClasses,
+  devtimeUnexplained, project,
+} from "../test/harness";
 
 describe("devtime paths", () => {
   it("puts a project's routes under the project and global ones under /analytics", () => {
@@ -29,6 +32,38 @@ describe("the fake daemon's devtime routes", () => {
     expect(body.days_series[body.days_series.length - 1]?.partial).toBe(true);
     expect(body.days_series.every((day) => day.cost_usd === null)).toBe(true); // null, never 0
     expect(body.tokens.cost_estimated).toBe(true);
+  });
+
+  it("leaves `tool_failures` out by default and passes a set block through", async () => {
+    const report = devtimeOverview();
+    expect("tool_failures" in report).toBe(false); // absent, not null: an older daemon sends no key
+    const block = devtimeToolFailures();
+    const answer = daemonFetch(daemonState({ devtime: devtimeOverview({ tool_failures: block }) }));
+    const body = (await answer("/analytics/devtime?days=30")) as ReturnType<typeof devtimeOverview>;
+    expect(body.tool_failures).toEqual(block);
+  });
+
+  it("leaves `turn_classes` and `unexplained` out by default and passes set blocks through", async () => {
+    const report = devtimeOverview();
+    expect("turn_classes" in report).toBe(false); // absent, not null: an older daemon sends no key
+    expect("unexplained" in report).toBe(false);
+    const classes = devtimeTurnClasses();
+    const slow = devtimeUnexplained();
+    const answer = daemonFetch(daemonState({ devtime: devtimeOverview({ turn_classes: classes, unexplained: slow }) }));
+    const body = (await answer("/analytics/devtime?days=30")) as ReturnType<typeof devtimeOverview>;
+    expect(body.turn_classes).toEqual(classes);
+    expect(body.unexplained).toEqual(slow);
+    expect(JSON.stringify(body.unexplained)).not.toContain("session_id");
+  });
+
+  it("leaves `agents` out by default and passes a set block through", async () => {
+    const report = devtimeOverview();
+    expect("agents" in report).toBe(false); // absent, not null: an older daemon sends no key
+    const block = devtimeAgents();
+    const answer = daemonFetch(daemonState({ devtime: devtimeOverview({ agents: block }) }));
+    const body = (await answer("/analytics/devtime?days=30")) as ReturnType<typeof devtimeOverview>;
+    expect(body.agents).toEqual(block);
+    expect(JSON.stringify(body.agents)).not.toContain("session_id");
   });
 
   it("404s a project the roster does not have and scopes a known one", async () => {

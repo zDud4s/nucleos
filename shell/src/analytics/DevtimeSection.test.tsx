@@ -5,7 +5,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({ ...(await original<typeof import("../data/client")>()), ...daemon }));
 
-import { daemonFetch, daemonState, devtimeFindings, devtimeOverview, project, renderWithRouter, type DaemonState } from "../test/harness";
+import { daemonFetch, daemonState, devtimeAgents, devtimeFindings, devtimeOverview, devtimeToolFailures, devtimeTurnClasses, devtimeUnexplained, project, renderWithRouter, type DaemonState } from "../test/harness";
 import { DevtimeSection } from "./DevtimeSection";
 
 const MIN = 60_000;
@@ -114,6 +114,40 @@ describe("DevtimeSection", () => {
     const panel = screen.getByRole("region", { name: "Waste per day" });
     expect(within(panel).getByText("No rule")).toBeTruthy();
     expect(within(panel).getByText("spec_gap")).toBeTruthy();
+  });
+
+  it("shows tool failures under the metric panel only when the daemon sends them", async () => {
+    const state = busy();
+    state.devtime.tool_failures = devtimeToolFailures();
+    const { unmount } = await mount(state);
+    expect(await screen.findByRole("region", { name: "Tool failures" })).toBeTruthy();
+    unmount();
+    await mount(busy()); // an older daemon: the key is absent
+    await screen.findByRole("region", { name: "Active time per day" });
+    expect(screen.queryByRole("region", { name: "Tool failures" })).toBeNull();
+  });
+
+  it("shows turn efficiency under the metric panel only when the daemon sends it", async () => {
+    const state = busy();
+    state.devtime.turn_classes = devtimeTurnClasses();
+    state.devtime.unexplained = devtimeUnexplained();
+    const { unmount } = await mount(state);
+    expect(await screen.findByRole("region", { name: "Turn efficiency" })).toBeTruthy();
+    unmount();
+    await mount(busy()); // an older daemon: the keys are absent
+    await screen.findByRole("region", { name: "Active time per day" });
+    expect(screen.queryByRole("region", { name: "Turn efficiency" })).toBeNull();
+  });
+
+  it("shows agent effectiveness only when the daemon sends it", async () => {
+    const state = busy();
+    state.devtime.agents = devtimeAgents();
+    const { unmount } = await mount(state);
+    expect(await screen.findByRole("region", { name: "Agent effectiveness" })).toBeTruthy();
+    unmount();
+    await mount(busy()); // an older daemon: the key is absent
+    await screen.findByRole("region", { name: "Active time per day" });
+    expect(screen.queryByRole("region", { name: "Agent effectiveness" })).toBeNull();
   });
 
   it("offers a price refresh button instead of a developer command", async () => {

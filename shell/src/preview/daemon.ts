@@ -575,6 +575,154 @@ export function previewDevtime(projectId: string | null, rawDays: string | null)
       price_refresh: { at: new Date(NOW - 3 * HOUR).toISOString().replace(/\.\d{3}Z$/, "Z"), ok: true, prices_as_of: "2026-08-20", problems: [] },
       previous: { cost_usd: cents(tokenCost * 0.9), cache_hit_ratio: 0.92 },
     },
+    tool_failures: previewToolFailures(days),
+    turn_classes: previewTurnClasses(days, projectId),
+    unexplained: previewUnexplained(days, projectId),
+    agents: previewAgents(days),
+  };
+}
+
+/**
+ * Metric 9 (devtime follow-up B): per-call-class efficiency, scaled by the window. Each class's
+ * `unexplained_turns` counts that class's items in `previewUnexplained`, so the two blocks agree.
+ */
+function previewTurnClasses(days: number, projectId: string | null): NonNullable<DevtimeOverview["turn_classes"]> {
+  const scale = (value: number) => Math.max(0, Math.round(value * days / 30));
+  const slowItems = previewUnexplained(days, projectId).items;
+  const rows: [string, number | null, number | null, number, number, number, number, number][] = [
+    // token, min, max, turns, calls per turn, median ms, mean ms, explained share
+    ["c0", 0, 0, scale(70), 0, 25_000, 32_000, 0],
+    ["c1", 1, 5, scale(160), 3, 140_000, 175_000, 0.08],
+    ["c2", 6, 20, scale(90), 11, 360_000, 420_000, 0.15],
+    ["c3", 21, null, scale(35), 34, 900_000, 1_080_000, 0.05],
+  ];
+  const classes = rows.map(([turn_class, min_calls, max_calls, turns, perTurn, median, mean, share]) => {
+    const slow = slowItems.filter((item) => item.turn_class === turn_class).length;
+    const calls = turns * perTurn;
+    const active_ms = turns * mean;
+    const explained_ms = Math.round(active_ms * share);
+    return {
+      turn_class, min_calls, max_calls, turns, calls, active_ms, explained_ms,
+      explained_ratio: active_ms === 0 ? null : Math.round((explained_ms / active_ms) * 10_000) / 10_000,
+      median_active_ms: median,
+      ms_per_call: calls === 0 ? null : Math.round(active_ms / calls),
+      unexplained_turns: slow,
+    };
+  });
+  return { turns: classes.reduce((sum, row) => sum + row.turns, 0), classes };
+}
+
+/**
+ * Metric 9: the slow turns no rule explains, within the window. A project view keeps the `nucleos`
+ * seeds under its own id. Projects only, never a session id, a worktree, a prompt or a path (spec
+ * analytics-devtime §8).
+ */
+function previewUnexplained(days: number, projectId: string | null): NonNullable<DevtimeOverview["unexplained"]> {
+  const at = (daysAgo: number, hour: number) => {
+    const day = new Date(NOW - daysAgo * 24 * HOUR);
+    day.setUTCHours(hour, 17, 4, 0);
+    return day.toISOString();
+  };
+  const seeds: [string, number, number, string, number, number, number, number][] = [
+    // project, days ago, hour, class, calls, active ms, explained ms, class median ms
+    ["nucleos", 1, 10, "c3", 48, 3_600_000, 120_000, 900_000],
+    ["site", 2, 15, "c2", 14, 1_500_000, 0, 360_000],
+    ["nucleos", 4, 9, "c1", 4, 720_000, 60_000, 140_000],
+    ["nucleos", 6, 14, "c2", 9, 1_260_000, 90_000, 360_000],
+    ["site", 11, 11, "c1", 2, 540_000, 0, 140_000],
+    ["nucleos", 19, 16, "c1", 5, 480_000, 0, 140_000],
+    ["nucleos", 25, 13, "c3", 30, 2_900_000, 0, 900_000],
+  ];
+  const items = seeds
+    .filter(([project, daysAgo]) => daysAgo < days && (projectId === null || project === "nucleos"))
+    .map(([project, daysAgo, hour, turn_class, calls, active_ms, explained_ms, class_median_ms]) => {
+      const started_at = at(daysAgo, hour);
+      return { project_id: projectId ?? project, day: started_at.slice(0, 10), started_at, turn_class, calls, active_ms, explained_ms, class_median_ms };
+    })
+    .sort((a, b) => b.active_ms - a.active_ms);
+  const mediansFrom = new Date(NOW - Math.max(days, 30) * 24 * HOUR).toISOString().slice(0, 10);
+  return {
+    turns: items.length,
+    active_ms: items.reduce((sum, item) => sum + item.active_ms, 0),
+    criteria: { median_multiple: 3, min_turn_ms: 300_000, max_explained_fraction: 0.2, min_class_turns: 10, medians_from: mediansFrom },
+    items,
+  };
+}
+
+/**
+ * Metric 7 (devtime follow-up A), scaled by the window: programs only, never a path, an argument, a
+ * worktree or a session (spec analytics-devtime §8).
+ */
+function previewToolFailures(days: number): NonNullable<DevtimeOverview["tool_failures"]> {
+  const scale = (value: number) => Math.max(0, Math.round(value * days / 30));
+  const rate = (failures: number, attempts: number) => (attempts === 0 ? null : Math.round((failures / attempts) * 10_000) / 10_000);
+  const rows: [string, string | null, number, number, string | null][] = [
+    ["Bash", "cargo test", scale(180), scale(22), "exit_nonzero"],
+    ["Edit", null, scale(240), scale(9), "edit_not_found"],
+    ["Bash", "git", scale(130), scale(4), "hook_block"],
+    ["Bash", "npm", scale(60), scale(5), "exit_nonzero"],
+    ["Bash", "cargo build", scale(40), scale(3), "exit_75"],
+    ["Read", null, scale(310), scale(2), "tool_error"],
+    ["__other__", null, scale(45), 0, null],
+  ];
+  const by_tool = rows.map(([tool_name, cmd_program, attempts, failures, top]) => ({
+    tool_name, cmd_program, attempts, failures, failure_rate: rate(failures, attempts),
+    top_error_class: failures > 0 ? top : null,
+  }));
+  const attempts = by_tool.reduce((sum, row) => sum + row.attempts, 0);
+  const failures = by_tool.reduce((sum, row) => sum + row.failures, 0);
+  const classes = new Map<string, number>();
+  for (const row of by_tool) {
+    if (row.top_error_class !== null) classes.set(row.top_error_class, (classes.get(row.top_error_class) ?? 0) + row.failures);
+  }
+  const by_error_class = [...classes.entries()]
+    .map(([error_class, count]) => ({ error_class, failures: count }))
+    .sort((a, b) => b.failures - a.failures || a.error_class.localeCompare(b.error_class));
+  return {
+    attempts, failures, failure_rate: rate(failures, attempts),
+    interrupted: scale(7), unresolved: scale(2), by_error_class, by_tool,
+  };
+}
+
+/**
+ * Metric 10 (devtime follow-up C), scaled by the window: agent types, roles and counts only, never a
+ * session, an agent id, a worktree, a prompt or a path (spec analytics-devtime §8). Totals are the rows'
+ * sums; a rate with no denominator is `null`.
+ */
+function previewAgents(days: number): NonNullable<DevtimeOverview["agents"]> {
+  const scale = (value: number) => Math.max(0, Math.round(value * days / 30));
+  const rate = (part: number, whole: number) => (whole === 0 ? null : Math.round((part / whole) * 10_000) / 10_000);
+  // [type, role, ok, failed, interrupted, passed, checkFailed, unruled, median_ms]
+  const rows: [string, "implementer" | "reviewer" | null, number, number, number, number, number, number, number][] = [
+    ["wf-executor", "implementer", scale(34), scale(4), scale(2), scale(24), scale(8), scale(3), 240_000],
+    ["Explore", null, scale(48), scale(3), scale(1), 0, 0, scale(6), 90_000],
+    ["code-reviewer", "reviewer", scale(12), scale(1), 0, 0, 0, scale(2), 150_000],
+    ["general-purpose", "implementer", scale(9), scale(2), scale(1), scale(5), scale(3), scale(1), 360_000],
+  ];
+  const by_type = rows.map(([agent_type, role, ok, failed, interrupted, passed, checkFailed, unruled, median]) => {
+    const attempts = ok + failed + interrupted;
+    const checked = Math.min(passed + checkFailed, Math.max(0, attempts - unruled));
+    const pass = Math.min(passed, checked);
+    const verified = { passed: pass, failed: checked - pass, not_measured: Math.max(0, attempts - checked - unruled),
+                       unruled: Math.min(unruled, attempts) };
+    return {
+      agent_type, role, attempts, ms: attempts * median, median_ms: attempts === 0 ? null : median,
+      outcome: { ok, failed, interrupted, other: 0 }, verified,
+      failure_rate: rate(failed, attempts), pass_rate: rate(verified.passed, verified.passed + verified.failed),
+    };
+  });
+  // The daemon's order: most attempts first, ties by agent_type in byte (not locale) order.
+  by_type.sort((a, b) => b.attempts - a.attempts || (a.agent_type < b.agent_type ? -1 : a.agent_type > b.agent_type ? 1 : 0));
+  const sum = (pick: (row: (typeof by_type)[number]) => number) => by_type.reduce((total, row) => total + pick(row), 0);
+  const outcome = { ok: sum((r) => r.outcome.ok), failed: sum((r) => r.outcome.failed),
+                    interrupted: sum((r) => r.outcome.interrupted), other: 0 };
+  const verified = { passed: sum((r) => r.verified.passed), failed: sum((r) => r.verified.failed),
+                     not_measured: sum((r) => r.verified.not_measured), unruled: sum((r) => r.verified.unruled) };
+  const attempts = sum((r) => r.attempts);
+  return {
+    attempts, ms: sum((r) => r.ms), outcome, verified,
+    failure_rate: rate(outcome.failed, attempts), pass_rate: rate(verified.passed, verified.passed + verified.failed),
+    by_type,
   };
 }
 

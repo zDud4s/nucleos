@@ -18,9 +18,18 @@ use crate::config::{DevtimeRulesConfig, ModelPrice, ModelsConfig, ThresholdsSour
 use crate::devtime::precision::{self, MarkError, RulePrecision};
 use crate::devtime::rules::RULES;
 use crate::devtime::store::{
-    self as store, FindingCursor, FindingOrder, IngestStatus, MessageDayRow, SessionCounts,
-    SpanDayRow, TurnDayRow,
+    self as store, AttemptFailureRow, FindingCursor, FindingOrder, IngestStatus, MessageDayRow,
+    SessionCounts, SpanDayRow, TurnDayRow,
 };
+
+mod tool_failures;
+pub use tool_failures::{ErrorClassFailures, ToolFailureRow, ToolFailures};
+mod turn_efficiency;
+pub use turn_efficiency::{
+    TurnClassRow, TurnClasses, Unexplained, UnexplainedCriteria, UnexplainedItem,
+};
+mod agent_effectiveness;
+pub use agent_effectiveness::{AgentOutcomes, AgentTypeRow, AgentVerification, Agents};
 
 /// The span kinds that are active time on the `main` lane (spec §6.3).
 pub const ACTIVE_KINDS: [&str; 5] = [
@@ -199,6 +208,14 @@ pub struct DevtimeOverview {
     pub waste_by_rule: Vec<RuleWaste>,
     pub waste_by_lever: Vec<LeverWaste>,
     pub tokens: DevtimeTokens,
+    /// Metric 7, follow-up A: present since it landed (spec §3: follow-ups add keys).
+    pub tool_failures: ToolFailures,
+    /// Metric 9, follow-up B: present since it landed (spec §3: follow-ups add keys).
+    pub turn_classes: TurnClasses,
+    /// Metric 9, follow-up B: present since it landed (spec §3: follow-ups add keys).
+    pub unexplained: Unexplained,
+    /// Metric 10, follow-up C: present since it landed (spec §3: follow-ups add keys).
+    pub agents: Agents,
 }
 
 /* ---------------------------------------------------------------- reads -- */
@@ -214,11 +231,18 @@ pub(crate) struct Reads {
     pub sessions: SessionCounts,
     pub findings_by_rule: Vec<(String, i64)>,
     pub ingest: Option<IngestStatus>,
+    /// Tool attempts of the current window only (metric 7 has no previous-window delta).
+    pub attempts: Vec<AttemptFailureRow>,
+    /// Turn stats of the current window plus metric 9's wider medians basis.
+    pub turn_stats: turn_efficiency::TurnReads,
+    /// Agent attempts of the current window only, with the roles to label them.
+    pub agents: agent_effectiveness::AgentReads,
 }
 
 pub async fn devtime_overview(
     pool: &SqlitePool,
     models: &ModelsConfig,
+    rules: &DevtimeRulesConfig,
     scope: Scope<'_>,
     window: Window,
     now: DateTime<Utc>,
@@ -246,6 +270,9 @@ pub async fn devtime_overview(
         sessions: store::session_counts(pool, project, &current, &until).await?,
         findings_by_rule: store::finding_rule_counts(pool, project, &current, &until).await?,
         ingest: store::read_ingest_status(pool).await?,
+        attempts: store::attempt_failure_rows(pool, project, &current, &until).await?,
+        turn_stats: turn_efficiency::read(pool, rules, project, window, now).await?,
+        agents: agent_effectiveness::read(pool, rules, project, &current, &until).await?,
     };
     Ok(assemble(&reads, models, scope, window, now))
 }
@@ -353,6 +380,10 @@ pub(crate) fn assemble(
         waste_by_rule: waste_by_rule(window, &reads.spans, &reads.findings_by_rule),
         waste_by_lever: waste_by_lever(window, &reads.spans),
         tokens,
+        tool_failures: tool_failures::block(&reads.attempts),
+        turn_classes: turn_efficiency::classes(&reads.turn_stats),
+        unexplained: turn_efficiency::unexplained(&reads.turn_stats),
+        agents: agent_effectiveness::block(&reads.agents),
     }
 }
 
@@ -938,6 +969,7 @@ mod tests {
         devtime_overview(
             pool,
             models,
+            &DevtimeRulesConfig::default(),
             scope,
             Window::new(days, now()).unwrap(),
             now(),

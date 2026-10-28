@@ -106,6 +106,57 @@ export interface DevtimeOverview {
   waste_by_rule: RuleWaste[];
   waste_by_lever: LeverWaste[];
   tokens: DevtimeTokens;
+  /** Metric 7 (follow-up A). Absent from a daemon older than it: the contract adds keys, never changes them. */
+  tool_failures?: DevtimeToolFailures;
+  /** Metric 9 (follow-up B). Absent from a daemon older than it: the contract adds keys, never changes them. */
+  turn_classes?: DevtimeTurnClasses;
+  /** Metric 9 (follow-up B): slow turns no rule explains. Absent from an older daemon. */
+  unexplained?: DevtimeUnexplained;
+  /** Metric 10 (follow-up C). Absent from a daemon older than it: the contract adds keys, never changes them. */
+  agents?: DevtimeAgents;
+}
+
+export interface ErrorClassFailures { error_class: string; failures: number }
+export interface ToolFailureRow {
+  tool_name: string; cmd_program: string | null;
+  attempts: number; failures: number; failure_rate: number | null; top_error_class: string | null;
+}
+export interface DevtimeToolFailures {
+  attempts: number; failures: number; failure_rate: number | null;
+  interrupted: number; unresolved: number;
+  by_error_class: ErrorClassFailures[]; by_tool: ToolFailureRow[];
+}
+
+export interface TurnClassRow {
+  turn_class: string; min_calls: number | null; max_calls: number | null;
+  turns: number; calls: number; active_ms: number; explained_ms: number;
+  explained_ratio: number | null; median_active_ms: number; ms_per_call: number | null;
+  unexplained_turns: number;
+}
+export interface DevtimeTurnClasses { turns: number; classes: TurnClassRow[] }
+export interface UnexplainedCriteria {
+  median_multiple: number; min_turn_ms: number; max_explained_fraction: number;
+  min_class_turns: number; medians_from: string;
+}
+export interface UnexplainedItem {
+  project_id: string; day: string; started_at: string; turn_class: string;
+  calls: number; active_ms: number; explained_ms: number; class_median_ms: number;
+}
+export interface DevtimeUnexplained { turns: number; active_ms: number; criteria: UnexplainedCriteria; items: UnexplainedItem[] }
+
+export interface AgentOutcomes { ok: number; failed: number; interrupted: number; other: number }
+export interface AgentVerification { passed: number; failed: number; not_measured: number; unruled: number }
+export interface AgentTypeRow {
+  agent_type: string; role: string | null;
+  attempts: number; ms: number; median_ms: number | null;
+  outcome: AgentOutcomes; verified: AgentVerification;
+  failure_rate: number | null; pass_rate: number | null;
+}
+export interface DevtimeAgents {
+  attempts: number; ms: number;
+  outcome: AgentOutcomes; verified: AgentVerification;
+  failure_rate: number | null; pass_rate: number | null;
+  by_type: AgentTypeRow[];
 }
 
 export interface RuleView {
