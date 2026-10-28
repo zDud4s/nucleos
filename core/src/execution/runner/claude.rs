@@ -193,7 +193,10 @@ impl CommandRunner for ClaudeCliRunner {
         }
         if super::auth_watch::inherited_key_to_strip(
             super::auth_watch::has_subscription_login(),
-            request.env.iter().any(|(k, _)| k.as_str() == "ANTHROPIC_API_KEY"),
+            request
+                .env
+                .iter()
+                .any(|(k, _)| k.as_str() == "ANTHROPIC_API_KEY"),
         ) {
             cmd.env_remove("ANTHROPIC_API_KEY");
         }

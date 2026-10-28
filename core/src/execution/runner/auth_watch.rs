@@ -134,7 +134,12 @@ pub fn has_subscription_login() -> bool {
 /// The user settings' text, when readable; for [`settings_env_sets_api_key`].
 pub fn read_user_settings() -> Option<String> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    std::fs::read_to_string(std::path::Path::new(&home).join(".claude").join("settings.json")).ok()
+    std::fs::read_to_string(
+        std::path::Path::new(&home)
+            .join(".claude")
+            .join("settings.json"),
+    )
+    .ok()
 }
 
 /// Appends the settings hint to a key-auth summary when the key comes from the environment
@@ -171,8 +176,8 @@ pub fn watch_claude_auth(pool: SqlitePool) {
         let mut watch = AuthWatch::default();
         while let Some(signal) = rx.recv().await {
             if let Some((kind, summary)) = watch.on(&signal) {
-                let settings_sets_key = read_user_settings()
-                    .is_some_and(|text| settings_env_sets_api_key(&text));
+                let settings_sets_key =
+                    read_user_settings().is_some_and(|text| settings_env_sets_api_key(&text));
                 let summary = with_settings_hint(summary, kind, &signal, settings_sets_key);
                 if let Err(error) =
                     crate::feed::append(&pool, None, kind, &summary, None, None).await
@@ -212,7 +217,9 @@ mod tests {
             r#"{"env":{"ANTHROPIC_API_KEY":"sk-x"}}"#
         ));
         assert!(!settings_env_sets_api_key(r#"{"env":{"OTHER":"1"}}"#));
-        assert!(!settings_env_sets_api_key(r#"{"env":{"ANTHROPIC_API_KEY":""}}"#));
+        assert!(!settings_env_sets_api_key(
+            r#"{"env":{"ANTHROPIC_API_KEY":""}}"#
+        ));
         assert!(!settings_env_sets_api_key("not json"));
     }
 

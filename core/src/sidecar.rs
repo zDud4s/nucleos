@@ -20,6 +20,7 @@ pub const EMAIL: &str = "email";
 pub const WEB: &str = "web";
 pub const BROWSER: &str = "browser";
 pub const QUOTA: &str = "quota";
+pub const REMOTE: &str = "remote";
 
 /// The two values [`SidecarState::state`] takes, written once because it is serialized to the shell.
 const RUNNING: &str = "running";
@@ -343,12 +344,70 @@ fn arm_lifeline(cmd: &mut Command) {
     cmd.env(LIFELINE_VAR, "1");
 }
 
+/// The only variables of the daemon's own environment the remote sidecar may inherit (finding M2).
+///
+/// It faces the tailnet, so it must not carry the daemon's provider keys. The Go gateway reads only
+/// the `remote_env` variables (see `sidecars/remote/config`) and calls no `UserHomeDir` or
+/// `UserCacheDir`, so this is just what a Go binary needs to start and talk to loopback: `PATH`;
+/// `SYSTEMROOT`/`WINDIR` (Windows winsock and the system crypto RNG fail without them);
+/// `TEMP`/`TMP`/`TMPDIR` (`os.TempDir`); `HOME` (unix). Names compare case-insensitively because
+/// Windows environment names are.
+const REMOTE_INHERITED: &[&str] = &[
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HOME",
+];
+
+/// PURE: the complete environment a sidecar is spawned with, given the daemon's own (`parent`).
+///
+/// An isolated sidecar gets only the allow-listed parent variables, then `env`, then the lifeline
+/// variable; any other sidecar keeps the inherited environment, so this returns `None` for the
+/// parent part and the caller leaves it alone. Returned as `(clear, vars)`: when `clear` is true the
+/// caller must `env_clear()` first and set `vars`; otherwise it sets `vars` on top of the inherited
+/// environment. `vars` always ends with the lifeline, so nothing later can displace it.
+fn spawn_env(
+    isolated: bool,
+    parent: &[(String, String)],
+    env: &[(String, String)],
+) -> (bool, Vec<(String, String)>) {
+    let mut vars: Vec<(String, String)> = Vec::new();
+    if isolated {
+        vars.extend(
+            parent
+                .iter()
+                .filter(|(k, _)| REMOTE_INHERITED.iter().any(|a| a.eq_ignore_ascii_case(k)))
+                .cloned(),
+        );
+    }
+    vars.extend(env.iter().cloned());
+    vars.push((LIFELINE_VAR.to_string(), "1".to_string()));
+    (isolated, vars)
+}
+
 pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, String)>) {
     let mut delay = RESTART_BASE;
     let mut attempts: u32 = 0;
+    let isolated = name == REMOTE;
     loop {
         let mut cmd = Command::new(&binary_path);
-        for (k, v) in &env {
+        let parent: Vec<(String, String)> = if isolated {
+            std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (clear, vars) = spawn_env(isolated, &parent, &env);
+        if clear {
+            // The remote sidecar faces the network: it starts from nothing, not from the daemon's
+            // environment (provider keys and all).
+            cmd.env_clear();
+        }
+        for (k, v) in &vars {
             cmd.env(k, v);
         }
         // A sidecar's environment holds the daemon token, and for email the IMAP password too.
@@ -475,6 +534,39 @@ pub const BROWSER_ADDR: &str = "127.0.0.1:8795";
 /// this process answers with how much of the owner's usage limit is gone, which is nobody else's
 /// business, and it reaches the vendor holding the owner's own token (design D2).
 pub const QUOTA_ADDR: &str = "127.0.0.1:8796";
+
+/// Where the remote gateway answers; `tailscale serve` forwards to it. 8797 follows the quota
+/// sidecar (8796). The Go side refuses to bind anything that is not loopback: the only way in from
+/// off-machine is the tunnel, never a listener of its own.
+pub const REMOTE_ADDR: &str = "127.0.0.1:8797";
+
+/// The remote gateway's environment.
+///
+/// `remote_key` is the minted `Service::Remote` key and NOTHING ELSE: the control token is never a
+/// parameter here, so it cannot reach a process that faces the network. `dist_dir` is resolved by
+/// the caller (config value or `<dir of daemon exe>/dist-remote`). `REMOTE_COOKIE_MAX_AGE_SECONDS`
+/// and `REMOTE_MAX_BODY_BYTES` are left to the gateway's defaults (30 d, 64 MiB).
+pub fn remote_env(
+    daemon_url: &str,
+    remote_key: &str,
+    config: &crate::remote::RemoteConfig,
+    dist_dir: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("NUCLEOS_DAEMON_URL".to_string(), daemon_url.to_string()),
+        ("NUCLEOS_DAEMON_TOKEN".to_string(), remote_key.to_string()),
+        ("REMOTE_ADDR".to_string(), REMOTE_ADDR.to_string()),
+        (
+            "REMOTE_PUBLIC_ORIGIN".to_string(),
+            config.public_origin.clone(),
+        ),
+        ("REMOTE_DIST_DIR".to_string(), dist_dir.to_string()),
+        (
+            "REMOTE_STREAM_MAX_SECONDS".to_string(),
+            config.stream_max_seconds.to_string(),
+        ),
+    ]
+}
 
 /// The quota sidecar's environment (spec §1.4, design D2).
 ///
@@ -726,6 +818,109 @@ async fn wait_out(name: &str, delay: Duration) -> Duration {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn remote_config() -> crate::remote::RemoteConfig {
+        crate::remote::RemoteConfig {
+            enabled: true,
+            public_origin: "https://box.tail1234.ts.net".to_string(),
+            dist_dir: None,
+            stream_max_seconds: 120,
+        }
+    }
+
+    fn env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn remote_env_names_the_contract_and_binds_loopback() {
+        let env = remote_env(
+            "http://127.0.0.1:8791",
+            "remote.key",
+            &remote_config(),
+            "C:/app/dist-remote",
+        );
+        let mut names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "NUCLEOS_DAEMON_TOKEN",
+                "NUCLEOS_DAEMON_URL",
+                "REMOTE_ADDR",
+                "REMOTE_DIST_DIR",
+                "REMOTE_PUBLIC_ORIGIN",
+                "REMOTE_STREAM_MAX_SECONDS",
+            ]
+        );
+        assert_eq!(env_value(&env, "REMOTE_ADDR"), Some("127.0.0.1:8797"));
+        assert!(REMOTE_ADDR.starts_with("127.0.0.1:"));
+        assert_eq!(
+            env_value(&env, "REMOTE_PUBLIC_ORIGIN"),
+            Some("https://box.tail1234.ts.net")
+        );
+        assert_eq!(
+            env_value(&env, "REMOTE_DIST_DIR"),
+            Some("C:/app/dist-remote")
+        );
+        assert_eq!(env_value(&env, "REMOTE_STREAM_MAX_SECONDS"), Some("120"));
+        assert_eq!(
+            env_value(&env, "NUCLEOS_DAEMON_URL"),
+            Some("http://127.0.0.1:8791")
+        );
+    }
+
+    fn parent_env() -> Vec<(String, String)> {
+        [
+            ("ANTHROPIC_API_KEY", "sk-ant-secret"),
+            ("OPENAI_API_KEY", "sk-openai-secret"),
+            ("PATH", "/usr/bin"),
+            ("SystemRoot", "C:\\Windows"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn remote_spawn_env_excludes_provider_keys() {
+        let env = remote_env("http://127.0.0.1:8791", "remote.key", &remote_config(), "d");
+        let (clear, vars) = spawn_env(true, &parent_env(), &env);
+        assert!(clear);
+        assert_eq!(env_value(&vars, "ANTHROPIC_API_KEY"), None);
+        assert_eq!(env_value(&vars, "OPENAI_API_KEY"), None);
+    }
+
+    #[test]
+    fn remote_spawn_env_keeps_path_lifeline_and_remote_env() {
+        let env = remote_env("http://127.0.0.1:8791", "remote.key", &remote_config(), "d");
+        let (_, vars) = spawn_env(true, &parent_env(), &env);
+        assert_eq!(env_value(&vars, "PATH"), Some("/usr/bin"));
+        assert_eq!(env_value(&vars, "SystemRoot"), Some("C:\\Windows"));
+        assert_eq!(env_value(&vars, "NUCLEOS_DAEMON_TOKEN"), Some("remote.key"));
+        assert_eq!(env_value(&vars, "REMOTE_ADDR"), Some(REMOTE_ADDR));
+        // Last, so nothing the caller passed can displace it.
+        assert_eq!(vars.last().map(|(k, _)| k.as_str()), Some(LIFELINE_VAR));
+    }
+
+    #[test]
+    fn other_sidecars_keep_the_inherited_environment() {
+        let env = vec![("A".to_string(), "b".to_string())];
+        let (clear, vars) = spawn_env(false, &parent_env(), &env);
+        assert!(!clear);
+        assert_eq!(env_value(&vars, "A"), Some("b"));
+        assert_eq!(env_value(&vars, LIFELINE_VAR), Some("1"));
+    }
+
+    #[test]
+    fn remote_env_never_carries_the_control_token() {
+        let control = "nos_control_SECRET";
+        let env = remote_env("http://127.0.0.1:8791", "remote.key", &remote_config(), "d");
+        assert_eq!(env_value(&env, "NUCLEOS_DAEMON_TOKEN"), Some("remote.key"));
+        assert!(env.iter().all(|(_, value)| !value.contains(control)));
+    }
 
     /// A sidecar that starts and dies immediately, over and over, must cost less each time.
     ///

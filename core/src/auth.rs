@@ -593,6 +593,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
         Scope::Service(Service::Email) => listed(EMAIL_ROUTES),
         Scope::Service(Service::Council) => listed(COUNCIL_ROUTES),
         Scope::Service(Service::Channel(_)) => listed(CHANNEL_ROUTES),
+        Scope::Service(Service::Remote) => listed(REMOTE_GATEWAY_ROUTES),
         Scope::TeamRun(_) => listed(TEAM_ROUTES),
         Scope::ApiToken(ApiTokenLevel::ReadOnly) => listed(READ_ONLY_ROUTES),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
@@ -618,6 +619,149 @@ fn route_is_listed_as(
     routes
         .iter()
         .any(|(allowed, pattern)| allowed == method && path_matches(pattern, path, target))
+}
+
+/// The header the remote gateway forwards a browser's session secret in. Never logged.
+pub const DEVICE_SESSION_HEADER: &str = "x-nucleos-device-session";
+
+/// What the gateway's key reaches on its own, with no device session: the pairing exchange, which
+/// is the one call made before a browser has a session.
+const REMOTE_GATEWAY_ROUTES: &[(Method, &str)] = &[(Method::POST, "/remote/pair")];
+
+/// Open to every paired device whatever its level: reading itself and logging out.
+const REMOTE_SELF_ROUTES: &[(Method, &str)] = &[
+    (Method::GET, "/remote/session"),
+    (Method::POST, "/remote/logout"),
+];
+
+/// The ONLY first path segments a remote device may reach. Derived from what the phone UI calls:
+/// the read tables' families (status, health, projects, runs, ...) plus the run-launching ones
+/// (`jobs`, `presets`), and the VCS queue (`vcs`, owner's call 2026-10-28). Everything else is refused to every level, Admin included; a new route
+/// family is therefore closed to devices until someone adds it here on purpose.
+///
+/// Within an allowed segment the device is still graded as the API token of its level, so a
+/// read-only device never reaches a write even under `projects`.
+const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
+    "status",
+    "health",
+    "concurrency",
+    "autopilot",
+    "projects",
+    "runs",
+    "jobs",
+    "presets",
+    "fleet",
+    "feed",
+    "analytics",
+    "route",
+    "proposals",
+    "scoreboard",
+    "shadow-decisions",
+    "vcs",
+];
+
+/// First path segments known to be refused to every remote device, written out so the
+/// classification is total: the guard test fails on a route prefix in neither this list nor
+/// [`REMOTE_ALLOWED_SEGMENTS`]. Each is owner-only or host-local by nature: the shutdown/update
+/// handshake (`daemon`, `system`), machine settings and secrets (`config`), backups, credential
+/// minting (`api-tokens`), sidecar control (`sidecars`), messaging identity pairing (`channels`),
+/// the whole remote owner surface including `/remote/pair` (`remote`), live browser pixels
+/// (`browser`), host files (`files`), tool loadout and hook management (`loadout`, `hooks`), and the
+/// integrations/assistant/team surfaces a phone has no business with. `remote_device_permits`
+/// refuses these and anything unlisted alike; the list exists so that choice is always explicit.
+/// `home` was Admin-only before remote access existed; devices stay out until the owner allows it.
+const REMOTE_DENIED_SEGMENTS: &[&str] = &[
+    "admission",
+    "agents",
+    "api-tokens",
+    "assistant",
+    "backup",
+    "backups",
+    "browser",
+    "calendar",
+    "capture-digests",
+    "capture-requests",
+    "channels",
+    "chats",
+    "config",
+    "contacts",
+    "context",
+    "context-refs",
+    "council",
+    "daemon",
+    "distill",
+    "email",
+    "files",
+    "github",
+    "home",
+    "hooks",
+    "judge-resolutions",
+    "judge-verdicts",
+    "knowledge",
+    "loadout",
+    "models",
+    "nodes",
+    "notifications",
+    "owner-notes",
+    "pii",
+    "pricing",
+    "quota",
+    "remote",
+    "sidecars",
+    "system",
+    "team-actions",
+    "team-files",
+    "team-notes",
+    "team-pressure",
+    "team-recruits",
+    "team-reports",
+    "team-runs",
+    "team-triggers",
+    "teams",
+    "themes",
+    "v1",
+    "verify",
+    "voice",
+    "waiting",
+    "web",
+    "webhooks",
+    "workflow",
+    "workflows",
+    "worktrees",
+];
+
+/// What a request carried by a paired remote device may reach. Matched against the route template.
+///
+/// 1. [`REMOTE_SELF_ROUTES`] are open to every level.
+/// 2. A route whose first segment is not in [`REMOTE_ALLOWED_SEGMENTS`] is refused, whatever the
+///    level (allow-list; [`REMOTE_DENIED_SEGMENTS`] documents the known-refused ones).
+/// 3. Otherwise the device is graded as the API token of the same level (`grants`): read-only gets
+///    `READ_ONLY_ROUTES`, run-creating adds `RUN_CREATING_ROUTES`, admin gets everything under the
+///    allowed segments. Routes in no table (Control/Admin-only) are unreachable to read-only and
+///    run-creating devices automatically.
+pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str) -> bool {
+    if REMOTE_SELF_ROUTES
+        .iter()
+        .any(|(allowed, pattern)| allowed == method && *pattern == route)
+    {
+        return true;
+    }
+    let first = route
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if !REMOTE_ALLOWED_SEGMENTS.contains(&first) {
+        return false;
+    }
+    grants(&Scope::ApiToken(level), method, route, Target::Route)
+}
+
+/// Request extension set when the caller is a paired remote device: which one. Handlers that need
+/// to know (logout) read this instead of trusting a body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteDevice {
+    pub id: i64,
 }
 
 fn is_param(segment: &str) -> bool {
@@ -988,6 +1132,9 @@ pub enum Service {
     /// A messaging channel's adapter, by its manifest id (`registry::by_id`). Its key opens only
     /// `CHANNEL_ROUTES` under its own `/channels/<id>/`.
     Channel(&'static str),
+    /// The remote-access gateway sidecar. On its own it opens only `REMOTE_GATEWAY_ROUTES`; paired
+    /// with a valid `X-Nucleos-Device-Session` header the middleware swaps in the device's level.
+    Remote,
 }
 
 impl Service {
@@ -998,6 +1145,7 @@ impl Service {
             Service::Email => "email",
             Service::Council => "council",
             Service::Channel(id) => id,
+            Service::Remote => "remote",
         }
     }
 
@@ -1005,6 +1153,7 @@ impl Service {
         match name {
             "email" => Some(Service::Email),
             "council" => Some(Service::Council),
+            "remote" => Some(Service::Remote),
             other => crate::channels::registry::by_id(other).map(|m| Service::Channel(m.id)),
         }
     }
@@ -1197,9 +1346,36 @@ pub async fn require_token(
         .ok_or(StatusCode::UNAUTHORIZED)?
         .to_owned();
 
-    let scope = resolve(&state, &presented)
+    let mut scope = resolve(&state, &presented)
         .await
         .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    // The remote gateway's device-session branch. The header is read ONLY for the gateway's own
+    // key: for every other credential it is ignored, so it can neither downgrade the control token
+    // nor upgrade anything. The row is re-read on every request, so a revocation applies on the very
+    // next one. Every refusal is the same 401 body, and the header value is never logged.
+    let mut device: Option<RemoteDevice> = None;
+    if scope == Scope::Service(Service::Remote)
+        && let Some(presented_session) = req.headers().get(DEVICE_SESSION_HEADER)
+    {
+        let session_invalid = || {
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({ "refusal": "session_invalid" })),
+            )
+                .into_response()
+        };
+        let Some(secret) = presented_session.to_str().ok() else {
+            return Ok(session_invalid());
+        };
+        match crate::remote::authenticate(&state.pool, secret, chrono::Utc::now()).await {
+            Ok(found) => {
+                scope = Scope::ApiToken(found.level);
+                device = Some(RemoteDevice { id: found.id });
+            }
+            Err(_) => return Ok(session_invalid()),
+        }
+    }
 
     // 403 rather than 401: the caller authenticated, it is simply not allowed here. Warned rather
     // than silently refused, because a run reaching for a control route is the exact signature of
@@ -1207,16 +1383,28 @@ pub async fn require_token(
     // Graded against the route the router chose, not the path the client typed: see
     // `permits_route` for the over-grant the raw path allowed. A request that matched no route has
     // no template and falls back to its path — it is headed for a 404 either way.
-    let mut allowed = match req.extensions().get::<MatchedPath>() {
-        Some(matched) => permits_route(&scope, req.method(), matched.as_str()),
-        None => permits(&scope, req.method(), req.uri().path()),
+    let mut allowed = match (req.extensions().get::<MatchedPath>(), &device) {
+        // A paired device is graded by its own function: the deny list sits in front of `grants`.
+        (Some(matched), Some(_)) => match &scope {
+            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), matched.as_str()),
+            _ => false,
+        },
+        (None, Some(_)) => match &scope {
+            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), req.uri().path()),
+            _ => false,
+        },
+        (Some(matched), None) => permits_route(&scope, req.method(), matched.as_str()),
+        (None, None) => permits(&scope, req.method(), req.uri().path()),
     };
     let route = req
         .extensions()
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_owned());
     // The loadout door: only for a matched route, and only when the fixed tables said no.
-    if !allowed && let Some(matched) = route.as_deref() {
+    if !allowed
+        && device.is_none()
+        && let Some(matched) = route.as_deref()
+    {
         allowed = loadout_admits(&state.pool, &scope, req.method(), matched, req.headers()).await;
     }
     // The chat-browser door: a chat turn's run key on the session routes, for its own sessions.
@@ -1249,7 +1437,9 @@ pub async fn require_token(
         }
     }
     // The browser-agents door: a chat turn's conversation key may start a linked browser agent.
+    // A paired device never uses it: the door is for a chat turn's own key, not a browser session.
     if !allowed
+        && device.is_none()
         && req.method() == Method::POST
         && route.as_deref() == Some(CHAT_BROWSER_AGENT_ROUTE)
         && chat_browser_agent_admits(&state.pool, &presented, &scope).await
@@ -1290,6 +1480,9 @@ pub async fn require_token(
 
     // Handlers that care WHICH run is calling read this rather than believing the request body;
     // `hooks::pretooluse_decision` is the one that does.
+    if let Some(device) = device {
+        req.extensions_mut().insert(device);
+    }
     req.extensions_mut().insert(scope);
     Ok(next.run(req).await)
 }
@@ -1482,6 +1675,21 @@ mod tests {
             .route("/browser/embedded/requests/{id}/ack", post(|| async {}))
             .route("/browser/embedded/sessions/{id}/closed", post(|| async {}))
             .route("/browser/embedded/sessions/{id}/owner", post(|| async {}))
+            // The remote owner surface and its device-facing routes, plus the owner-only families
+            // the deny list names, so the refusals below are refusals of routes that exist.
+            .route("/remote/pair", post(|| async {}))
+            .route("/remote/session", get(|| async {}))
+            .route("/remote/logout", post(|| async {}))
+            .route("/remote/pairing-codes", post(|| async {}))
+            .route("/remote/devices", get(|| async {}))
+            .route("/remote/devices/{id}", axum::routing::delete(|| async {}))
+            .route("/daemon/shutdown", post(|| async {}))
+            .route("/system/shutdown", post(|| async {}))
+            .route("/config/secrets", get(|| async {}))
+            .route("/config/secrets/{key}", axum::routing::delete(|| async {}))
+            .route("/sidecars/{name}/restart", post(|| async {}))
+            .route("/channels/{channel}/pairing", post(|| async {}))
+            .route("/browser/sessions/{id}/live", get(|| async {}))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_token,
@@ -1582,6 +1790,606 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    /// One request with an optional device-session header; returns the status and the body text.
+    async fn send_with_session(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        bearer: &str,
+        session: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {bearer}"));
+        if let Some(session) = session {
+            request = request.header(DEVICE_SESSION_HEADER, session);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Pairs a device of `level` through the real domain module, at `now`.
+    async fn pair_device(
+        state: &AppState,
+        level: ApiTokenLevel,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::remote::Paired {
+        let created = crate::remote::create_pairing_code(&state.pool, level, "test phone", now)
+            .await
+            .unwrap();
+        match crate::remote::exchange(&state.pool, &created.code, now).await {
+            Ok(paired) => paired,
+            Err(_) => panic!("the pairing exchange of a fresh code must succeed"),
+        }
+    }
+
+    const ALL_LEVELS: [ApiTokenLevel; 3] = [
+        ApiTokenLevel::ReadOnly,
+        ApiTokenLevel::RunCreating,
+        ApiTokenLevel::Admin,
+    ];
+
+    #[tokio::test]
+    async fn remote_key_alone_reaches_only_the_pairing_exchange() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let app = protected_router(state);
+
+        assert_eq!(
+            status_of(&app, "POST", "/remote/pair", &key).await,
+            StatusCode::OK
+        );
+        for (method, uri) in [
+            ("GET", "/status"),
+            ("GET", "/runs"),
+            ("POST", "/runs"),
+            ("GET", "/secret"),
+            ("GET", "/remote/session"),
+            ("POST", "/remote/logout"),
+            ("GET", "/remote/devices"),
+            ("POST", "/remote/pairing-codes"),
+        ] {
+            assert_eq!(
+                status_of(&app, method, uri, &key).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_session_resolves_to_the_device_level() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let read_only = pair_device(&state, ApiTokenLevel::ReadOnly, now).await;
+        let run_creating = pair_device(&state, ApiTokenLevel::RunCreating, now).await;
+        let admin = pair_device(&state, ApiTokenLevel::Admin, now).await;
+        let app = protected_router(state);
+
+        let code = |method: &'static str, uri: &'static str, session: &str| {
+            let app = app.clone();
+            let key = key.clone();
+            let session = session.to_owned();
+            async move {
+                send_with_session(&app, method, uri, &key, Some(&session))
+                    .await
+                    .0
+            }
+        };
+
+        assert_eq!(
+            code("GET", "/status", &read_only.session).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            code("POST", "/runs", &read_only.session).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            code("GET", "/secret", &read_only.session).await,
+            StatusCode::FORBIDDEN
+        );
+
+        assert_eq!(
+            code("GET", "/status", &run_creating.session).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            code("POST", "/runs", &run_creating.session).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            code("GET", "/secret", &run_creating.session).await,
+            StatusCode::FORBIDDEN
+        );
+
+        assert_eq!(code("POST", "/runs", &admin.session).await, StatusCode::OK);
+        // An admin-only route inside an allowed segment: Admin reaches it, the lower levels do not.
+        assert_eq!(
+            code("POST", "/proposals/1/approve", &admin.session).await,
+            StatusCode::OK
+        );
+        for session in [&read_only.session, &run_creating.session] {
+            assert_eq!(
+                code("POST", "/proposals/1/approve", session).await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Outside the allow-list even Admin is refused: `/secret` is in no allowed segment.
+        assert_eq!(
+            code("GET", "/secret", &admin.session).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_revocation_applies_on_the_next_request() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let device = pair_device(&state, ApiTokenLevel::Admin, now).await;
+        let pool = state.pool.clone();
+        let app = protected_router(state);
+
+        let (before, _) =
+            send_with_session(&app, "GET", "/status", &key, Some(&device.session)).await;
+        assert_eq!(before, StatusCode::OK);
+
+        assert!(
+            crate::remote::revoke_device(&pool, device.device_id, now)
+                .await
+                .unwrap()
+        );
+
+        let (after, body) =
+            send_with_session(&app, "GET", "/status", &key, Some(&device.session)).await;
+        assert_eq!(after, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("session_invalid"));
+    }
+
+    #[tokio::test]
+    async fn remote_expired_or_unknown_session_is_401_session_invalid() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        // Paired 31 days ago: past the 30-day absolute lifetime by the time the request is made.
+        let long_ago = chrono::Utc::now() - chrono::Duration::days(31);
+        let expired = pair_device(&state, ApiTokenLevel::Admin, long_ago).await;
+        let app = protected_router(state);
+
+        for session in [expired.session.as_str(), "nos_device_unknown", "", "x y"] {
+            let (status, body) =
+                send_with_session(&app, "GET", "/status", &key, Some(session)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "session {session:?}");
+            assert_eq!(body, r#"{"refusal":"session_invalid"}"#);
+        }
+        // The refusal comes before any route logic, so even the pairing route is shut.
+        let (status, _) = send_with_session(
+            &app,
+            "POST",
+            "/remote/pair",
+            &key,
+            Some("nos_device_unknown"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Owner and control-only routes: one per denied first segment, plus the whole remote owner
+    /// surface and the token surface.
+    const REMOTE_OWNER_ONLY: &[(&str, &str)] = &[
+        ("POST", "/daemon/shutdown"),
+        ("POST", "/system/shutdown"),
+        ("POST", "/system/storage/compact"),
+        ("GET", "/api-tokens"),
+        ("POST", "/api-tokens"),
+        ("DELETE", "/api-tokens/some-token"),
+        ("GET", "/config/secrets"),
+        ("DELETE", "/config/secrets/some-key"),
+        ("POST", "/backup"),
+        ("GET", "/backups"),
+        ("POST", "/backups/some-backup/restore"),
+        ("POST", "/sidecars/web/restart"),
+        ("POST", "/channels/telegram/pairing"),
+        ("GET", "/browser/sessions/1/live"),
+        ("POST", "/browser/open"),
+        ("POST", "/remote/pair"),
+        ("POST", "/remote/pairing-codes"),
+        ("GET", "/remote/devices"),
+        ("DELETE", "/remote/devices/1"),
+    ];
+
+    #[tokio::test]
+    async fn remote_owner_and_control_only_routes_are_refused_to_every_level() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let mut sessions = Vec::new();
+        for level in ALL_LEVELS {
+            sessions.push((level, pair_device(&state, level, now).await.session));
+        }
+        let app = protected_router(state);
+
+        for (level, session) in &sessions {
+            for (method, uri) in REMOTE_OWNER_ONLY {
+                let (status, _) = send_with_session(&app, method, uri, &key, Some(session)).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{level:?} device must not reach {method} {uri}"
+                );
+            }
+        }
+
+        // The same on the pure function, with route templates, so a route the test router does not
+        // mount is still covered. And the list itself is pinned: shrinking it is a decision.
+        for level in ALL_LEVELS {
+            for (method, route) in [
+                ("POST", "/daemon/shutdown"),
+                ("POST", "/system/shutdown"),
+                ("GET", "/config/secrets"),
+                ("DELETE", "/config/secrets/{key}"),
+                ("DELETE", "/api-tokens/{name}"),
+                ("POST", "/backups/{name}/restore"),
+                ("POST", "/sidecars/{name}/restart"),
+                ("POST", "/channels/{channel}/pairing"),
+                ("GET", "/browser/sessions/{id}/live"),
+                ("POST", "/remote/pair"),
+                ("DELETE", "/remote/devices/{id}"),
+            ] {
+                assert!(
+                    !remote_device_permits(
+                        level,
+                        &Method::from_bytes(method.as_bytes()).unwrap(),
+                        route
+                    ),
+                    "{level:?} {method} {route}"
+                );
+            }
+        }
+        assert_eq!(
+            REMOTE_ALLOWED_SEGMENTS,
+            [
+                "status",
+                "health",
+                "concurrency",
+                "autopilot",
+                "projects",
+                "runs",
+                "jobs",
+                "presets",
+                "fleet",
+                "feed",
+                "analytics",
+                "route",
+                "proposals",
+                "scoreboard",
+                "shadow-decisions",
+                "vcs",
+            ]
+        );
+    }
+
+    /// `vcs` is open to devices (owner's call 2026-10-28) but still graded by level: a read-only
+    /// phone lists and reads queue requests, never waits on one, submits one or approves one.
+    #[test]
+    fn remote_device_reaches_the_vcs_queue_graded_by_level() {
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/vcs/requests"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/vcs/requests/{id}"
+        ));
+        for (method, route) in [
+            (Method::GET, "/vcs/requests/{id}/wait"),
+            (Method::POST, "/vcs/requests"),
+            (Method::POST, "/vcs/requests/{id}/approve"),
+            (Method::POST, "/vcs/requests/{id}/refuse"),
+        ] {
+            assert!(
+                !remote_device_permits(ApiTokenLevel::ReadOnly, &method, route),
+                "ReadOnly {method} {route}"
+            );
+        }
+        assert!(remote_device_permits(
+            ApiTokenLevel::Admin,
+            &Method::POST,
+            "/vcs/requests/{id}/approve"
+        ));
+    }
+
+    /// An Admin device is no longer graded by a deny-list: `loadout`, `hooks` and `files` were open
+    /// to it and are now refused, as is any route family nobody listed.
+    #[test]
+    fn remote_admin_device_is_refused_loadout_hooks_files_and_unlisted_families() {
+        for level in ALL_LEVELS {
+            for (method, route) in [
+                (Method::GET, "/loadout/tools"),
+                (Method::POST, "/loadout/tools/{id}/approve"),
+                (Method::GET, "/hooks"),
+                (Method::POST, "/hooks/{id}"),
+                (Method::GET, "/files"),
+                (Method::GET, "/files/download"),
+                (Method::GET, "/brand-new-family/x"),
+                (Method::GET, "/"),
+            ] {
+                assert!(
+                    !remote_device_permits(level, &method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_device_reaches_an_allow_listed_route_at_the_right_level() {
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/status"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/runs/{id}"
+        ));
+        assert!(!remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::POST,
+            "/runs"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::RunCreating,
+            &Method::POST,
+            "/runs"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::Admin,
+            &Method::POST,
+            "/proposals/{id}/approve"
+        ));
+        assert!(!remote_device_permits(
+            ApiTokenLevel::RunCreating,
+            &Method::POST,
+            "/proposals/{id}/approve"
+        ));
+    }
+
+    /// `GET /email/queue` is granted to read-only API tokens, but `email` is outside the device
+    /// allow-list, so a read-only device is refused it.
+    #[test]
+    fn read_only_device_is_refused_a_read_only_token_route_outside_the_allow_list() {
+        assert!(route_is_listed(
+            READ_ONLY_ROUTES,
+            &Method::GET,
+            "/email/queue"
+        ));
+        assert!(!remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/email/queue"
+        ));
+    }
+
+    /// Local callers are unchanged: the control token (no device session) and an Admin API token
+    /// still reach the routes a device is refused.
+    #[tokio::test]
+    async fn local_callers_still_reach_routes_denied_to_devices() {
+        let state = test_state("expected-token").await;
+        let admin = stored_api_token(&state, "boss", ApiTokenLevel::Admin).await;
+        let app = protected_router(state);
+
+        for (method, uri) in [("GET", "/secret"), ("POST", "/daemon/shutdown")] {
+            for bearer in ["expected-token", admin.as_str()] {
+                assert_eq!(
+                    status_of(&app, method, uri, bearer).await,
+                    StatusCode::OK,
+                    "{method} {uri}"
+                );
+            }
+        }
+        for level in ALL_LEVELS {
+            assert!(!remote_device_permits(level, &Method::GET, "/secret"));
+        }
+    }
+
+    /// Every first segment the daemon registers is classified for devices: in
+    /// [`REMOTE_ALLOWED_SEGMENTS`] or [`REMOTE_DENIED_SEGMENTS`]. Axum cannot enumerate a built
+    /// router, so this scans the sources under `core/src` for `.route(` followed by a `"/..."`
+    /// literal (production code only: each file is cut at its first `#[cfg(test)]`), at test time
+    /// so a new file is covered without touching this test. A new route family fails here until it
+    /// is put in one list on purpose.
+    #[test]
+    fn every_route_prefix_is_classified_for_remote_devices() {
+        fn walk(dir: &std::path::Path, found: &mut std::collections::BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.extension().is_none_or(|e| e != "rs") || name.contains("conformance") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                // Cut at the test module, not at a bare `#[cfg(test)]` attribute: a file may carry
+                // `#[cfg(test)] use ...;` far above its routes.
+                let cut = source
+                    .match_indices("#[cfg(test)]")
+                    .find(|(at, attr)| source[at + attr.len()..].trim_start().starts_with("mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                let production = &source[..cut];
+                for part in production.split(".route(").skip(1) {
+                    let Some(literal) = part.trim_start().strip_prefix("\"/") else {
+                        continue;
+                    };
+                    let segment: String = literal
+                        .chars()
+                        .take_while(|c| !matches!(c, '/' | '"' | '{'))
+                        .collect();
+                    if !segment.is_empty() {
+                        found.insert(segment);
+                    }
+                }
+            }
+        }
+
+        let mut found = std::collections::BTreeSet::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(
+            found.len() > 20 && found.contains("projects") && found.contains("loadout"),
+            "the route scan found too little: {found:?}"
+        );
+        let unclassified: Vec<&String> = found
+            .iter()
+            .filter(|segment| {
+                !REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str())
+                    && !REMOTE_DENIED_SEGMENTS.contains(&segment.as_str())
+            })
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "route prefixes in neither REMOTE_ALLOWED_SEGMENTS nor REMOTE_DENIED_SEGMENTS: {unclassified:?}"
+        );
+        for segment in REMOTE_ALLOWED_SEGMENTS {
+            assert!(
+                !REMOTE_DENIED_SEGMENTS.contains(segment),
+                "{segment} is in both lists"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_self_routes_are_open_to_every_level_and_nothing_else_under_remote() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let mut devices = Vec::new();
+        for level in ALL_LEVELS {
+            devices.push((level, pair_device(&state, level, now).await.session));
+        }
+        let app = protected_router(state);
+
+        for (level, session) in &devices {
+            for (method, uri) in [("GET", "/remote/session"), ("POST", "/remote/logout")] {
+                let (status, _) = send_with_session(&app, method, uri, &key, Some(session)).await;
+                assert_eq!(status, StatusCode::OK, "{level:?} {method} {uri}");
+            }
+        }
+
+        for level in ALL_LEVELS {
+            assert!(remote_device_permits(
+                level,
+                &Method::GET,
+                "/remote/session"
+            ));
+            assert!(remote_device_permits(
+                level,
+                &Method::POST,
+                "/remote/logout"
+            ));
+            // Right path, wrong method, and every sibling under /remote: all refused.
+            assert!(!remote_device_permits(
+                level,
+                &Method::POST,
+                "/remote/session"
+            ));
+            assert!(!remote_device_permits(
+                level,
+                &Method::GET,
+                "/remote/logout"
+            ));
+            for (method, route) in [
+                (Method::POST, "/remote/pair"),
+                (Method::GET, "/remote/devices"),
+                (Method::DELETE, "/remote/devices/{id}"),
+                (Method::POST, "/remote/pairing-codes"),
+                (Method::GET, "/remote/anything-new"),
+            ] {
+                assert!(
+                    !remote_device_permits(level, &method, route),
+                    "{level:?} {route}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_session_header_does_not_change_the_control_token() {
+        let state = test_state("expected-token").await;
+        let now = chrono::Utc::now();
+        let read_only = pair_device(&state, ApiTokenLevel::ReadOnly, now).await;
+        let app = protected_router(state);
+
+        // Neither a garbage header nor a valid read-only session downgrades the control token.
+        for session in ["nos_device_unknown", read_only.session.as_str()] {
+            for (method, uri) in [("GET", "/secret"), ("POST", "/daemon/shutdown")] {
+                let (status, _) =
+                    send_with_session(&app, method, uri, "expected-token", Some(session)).await;
+                assert_eq!(status, StatusCode::OK, "{method} {uri}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_key_dies_when_disarmed() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let device = pair_device(&state, ApiTokenLevel::Admin, now).await;
+        let pool = state.pool.clone();
+        let app = protected_router(state);
+
+        assert!(crate::remote::is_armed(&pool).await.unwrap());
+        assert_eq!(
+            status_of(&app, "POST", "/remote/pair", &key).await,
+            StatusCode::OK
+        );
+
+        crate::remote::disarm(&pool).await.unwrap();
+
+        assert!(!crate::remote::is_armed(&pool).await.unwrap());
+        assert_eq!(
+            status_of(&app, "POST", "/remote/pair", &key).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // A still-valid device session is worthless without the gateway's key.
+        let (status, _) =
+            send_with_session(&app, "GET", "/status", &key, Some(&device.session)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     async fn post_status_with_run_header(
@@ -4864,6 +5672,33 @@ mod tests {
             StatusCode::OK,
             "the control token still reaches it"
         );
+    }
+
+    /// A device-authenticated request never uses the browser-agents door, whatever its level.
+    #[tokio::test]
+    async fn a_paired_device_is_refused_the_browser_agents_door() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let mut sessions = Vec::new();
+        for level in ALL_LEVELS {
+            sessions.push(pair_device(&state, level, now).await.session);
+        }
+        let app = browser_agents_door_router(state);
+
+        for session in &sessions {
+            let (status, _) = send_with_session(
+                &app,
+                "POST",
+                "/assistant/browser-agents",
+                &key,
+                Some(session),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
     }
 
     /// The door needs a chat turn that is running now. Once the turn ends its key authenticates
