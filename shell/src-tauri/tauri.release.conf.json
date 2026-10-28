@@ -7,6 +7,7 @@
       "binaries/echo-sidecar",
       "binaries/email-sidecar",
       "binaries/quota-sidecar",
+      "binaries/remote-sidecar",
       "binaries/telegram-sidecar",
       "binaries/web-sidecar"
     ],

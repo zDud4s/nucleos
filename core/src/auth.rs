@@ -670,6 +670,7 @@ const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
 /// integrations/assistant/team surfaces a phone has no business with. `remote_device_permits`
 /// refuses these and anything unlisted alike; the list exists so that choice is always explicit.
 /// `home` was Admin-only before remote access existed; devices stay out until the owner allows it.
+/// `tasks` is the claim board agent sessions coordinate through; a device takes no part in it.
 const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "admission",
     "agents",
@@ -709,6 +710,7 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "remote",
     "sidecars",
     "system",
+    "tasks",
     "team-actions",
     "team-files",
     "team-notes",
