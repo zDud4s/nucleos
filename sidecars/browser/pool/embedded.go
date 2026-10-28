@@ -233,6 +233,17 @@ func (p *Pool) AttachEmbedded(ctx context.Context, req browser.AttachRequest) (b
 	p.sessions[outer] = placed{holder: holder, inner: session.ID}
 	p.mu.Unlock()
 
+	// Adopt can succeed on a cancelled ctx (the readiness wait swallows the cancellation). The caller
+	// (core, past its attach bound) is then gone and nobody learns this id, so the session would hold a
+	// slot until the project is forgotten. Core already answered the shell Failed for this nonce, so the
+	// shell owns the tab; closing through the normal path frees the slot and the bookkeeping.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		closing, cancel := context.WithTimeout(context.Background(), embeddedHTTPTimeout)
+		defer cancel()
+		_ = p.Close(closing, outer)
+		return browser.Session{}, ctxErr
+	}
+
 	session.ID = outer
 	return session, nil
 }
