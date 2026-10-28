@@ -624,7 +624,7 @@ const REMOTE_SELF_ROUTES: &[(Method, &str)] = &[
 
 /// The ONLY first path segments a remote device may reach. Derived from what the phone UI calls:
 /// the read tables' families (status, health, projects, runs, ...) plus the run-launching ones
-/// (`jobs`, `presets`). Everything else is refused to every level, Admin included; a new route
+/// (`jobs`, `presets`), and the VCS queue (`vcs`, owner's call 2026-10-28). Everything else is refused to every level, Admin included; a new route
 /// family is therefore closed to devices until someone adds it here on purpose.
 ///
 /// Within an allowed segment the device is still graded as the API token of its level, so a
@@ -645,6 +645,7 @@ const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
     "proposals",
     "scoreboard",
     "shadow-decisions",
+    "vcs",
 ];
 
 /// First path segments known to be refused to every remote device, written out so the
@@ -707,7 +708,6 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "teams",
     "themes",
     "v1",
-    "vcs",
     "verify",
     "voice",
     "waiting",
@@ -2074,8 +2074,41 @@ mod tests {
                 "proposals",
                 "scoreboard",
                 "shadow-decisions",
+                "vcs",
             ]
         );
+    }
+
+    /// `vcs` is open to devices (owner's call 2026-10-28) but still graded by level: a read-only
+    /// phone lists and reads queue requests, never waits on one, submits one or approves one.
+    #[test]
+    fn remote_device_reaches_the_vcs_queue_graded_by_level() {
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/vcs/requests"
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::ReadOnly,
+            &Method::GET,
+            "/vcs/requests/{id}"
+        ));
+        for (method, route) in [
+            (Method::GET, "/vcs/requests/{id}/wait"),
+            (Method::POST, "/vcs/requests"),
+            (Method::POST, "/vcs/requests/{id}/approve"),
+            (Method::POST, "/vcs/requests/{id}/refuse"),
+        ] {
+            assert!(
+                !remote_device_permits(ApiTokenLevel::ReadOnly, &method, route),
+                "ReadOnly {method} {route}"
+            );
+        }
+        assert!(remote_device_permits(
+            ApiTokenLevel::Admin,
+            &Method::POST,
+            "/vcs/requests/{id}/approve"
+        ));
     }
 
     /// An Admin device is no longer graded by a deny-list: `loadout`, `hooks` and `files` were open
