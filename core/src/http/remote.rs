@@ -63,9 +63,7 @@ async fn post_pair(State(state): State<AppState>, Json(body): Json<PairBody>) ->
         Err(crate::remote::ExchangeError::Invalid) => {
             refusal(StatusCode::UNAUTHORIZED, "invalid_code").into_response()
         }
-        Err(crate::remote::ExchangeError::Storage(error)) => {
-            storage_failure(error).into_response()
-        }
+        Err(crate::remote::ExchangeError::Storage(error)) => storage_failure(error).into_response(),
     }
 }
 
@@ -384,11 +382,23 @@ mod tests {
         assert_eq!(rows[0]["id"], id);
         assert_eq!(rows[0]["name"], "test phone");
         assert_eq!(rows[0]["access_level"], "admin");
-        let mut keys: Vec<&str> = rows[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut keys: Vec<&str> = rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
         keys.sort();
         assert_eq!(
             keys,
-            ["access_level", "created_at", "id", "last_seen_at", "name", "revoked_at"]
+            [
+                "access_level",
+                "created_at",
+                "id",
+                "last_seen_at",
+                "name",
+                "revoked_at"
+            ]
         );
         assert!(!text.contains(&session));
         assert!(!text.contains(&crate::remote::hash_secret(&session)));
@@ -413,12 +423,19 @@ mod tests {
         // Idempotent for a device that is already revoked.
         let (status, _) = send(&app, "DELETE", &uri, CONTROL, None, None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _) = send(&app, "DELETE", "/remote/devices/987654", CONTROL, None, None).await;
+        let (status, _) = send(
+            &app,
+            "DELETE",
+            "/remote/devices/987654",
+            CONTROL,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // The very next request of the revoked device is refused.
-        let (status, text) =
-            send(&app, "GET", "/remote/session", &key, Some(&session), None).await;
+        let (status, text) = send(&app, "GET", "/remote/session", &key, Some(&session), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(json(&text)["refusal"], "session_invalid");
     }
@@ -458,8 +475,7 @@ mod tests {
         assert!(paired["expires_at"].is_string());
 
         // The secret works as a session, and the same code does not pair twice.
-        let (status, text) =
-            send(&app, "GET", "/remote/session", &key, Some(&session), None).await;
+        let (status, text) = send(&app, "GET", "/remote/session", &key, Some(&session), None).await;
         assert_eq!(status, StatusCode::OK, "{text}");
         assert_eq!(json(&text)["name"], "Laptop");
         assert!(!text.contains(&session));

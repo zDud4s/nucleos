@@ -866,7 +866,10 @@ mod tests {
             Some("C:/app/dist-remote")
         );
         assert_eq!(env_value(&env, "REMOTE_STREAM_MAX_SECONDS"), Some("120"));
-        assert_eq!(env_value(&env, "NUCLEOS_DAEMON_URL"), Some("http://127.0.0.1:8791"));
+        assert_eq!(
+            env_value(&env, "NUCLEOS_DAEMON_URL"),
+            Some("http://127.0.0.1:8791")
+        );
     }
 
     fn parent_env() -> Vec<(String, String)> {

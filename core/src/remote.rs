@@ -260,14 +260,7 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-type DeviceRow = (
-    i64,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-);
+type DeviceRow = (i64, String, String, String, Option<String>, Option<String>);
 
 /// Looks a session secret up and checks it is revoked, expired or idle for none of the reasons.
 /// Touches `last_seen_at` at most once per [`LAST_SEEN_GRANULARITY`].
@@ -460,7 +453,11 @@ impl RemoteConfig {
         }
         // The gateway compares the browser's Origin with this string byte for byte, so it must be
         // written as the browser serializes it: no userinfo, no default `:443`, lowercase host.
-        let written = self.public_origin.trim().trim_end_matches('/').to_ascii_lowercase();
+        let written = self
+            .public_origin
+            .trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
         if written != origin.origin().ascii_serialization() {
             return Err(format!(
                 "public_origin must be written as {}",
@@ -560,9 +557,11 @@ mod tests {
         let fresh = create_pairing_code(&pool, ApiTokenLevel::Admin, "ok", t0())
             .await
             .unwrap();
-        assert!(exchange(&pool, &fresh.code, t0() + Duration::seconds(299))
-            .await
-            .is_ok());
+        assert!(
+            exchange(&pool, &fresh.code, t0() + Duration::seconds(299))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
