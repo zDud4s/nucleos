@@ -193,25 +193,135 @@ pub fn segments(command: &str, shell: Shell) -> Vec<&str> {
 /// `None` for an unterminated quote, and the caller must read it as "refuse". Everything after an
 /// unclosed `"` would otherwise mask as quoted, which turns the one line whose extent nobody can
 /// prove into the one line with no metacharacters in it.
+///
+/// **Two readings, and a character is masked only when both agree.** The quote toggle below is the
+/// original reading and it is wrong for POSIX in two places: outside quotes `\'` is a literal
+/// apostrophe (it opens nothing), and inside ANSI-C `$'...'` a `\'` does not close the string. On
+/// `echo x \' > ../../outside/leak.txt \'` it saw a quoted `>` that bash executes, and the guards
+/// that read this mask called the line read-local. The POSIX reading (`posix_mask_flags`) fixes
+/// both. But this function takes no shell and PowerShell lines reach it too, where a backslash is an
+/// ordinary character and `'` really does open a string. Taking the intersection can only REVEAL
+/// more metacharacters than either reading alone, never hide more, so neither shell loses a
+/// redirect to the other's rules. When either reading calls the quotes unterminated the answer is
+/// `None` (refuse): letting the POSIX reading decide alone would trust a lexer that can be wrong
+/// about where a quote opens (`echo x$$'\' > f \' '\'`), the very line this must not hide.
 pub fn without_quoted_text(command: &str) -> Option<String> {
-    let mut masked = String::with_capacity(command.len());
+    let chars: Vec<char> = command.chars().collect();
+    let posix = posix_mask_flags(&chars)?;
+    let old = toggle_mask_flags(&chars)?;
+    let flags: Vec<bool> = posix.iter().zip(old).map(|(p, o)| *p && o).collect();
+    Some(
+        chars
+            .iter()
+            .zip(flags)
+            .map(|(c, masked)| if masked { 'x' } else { *c })
+            .collect(),
+    )
+}
+
+/// The original reading: every `'` and `"` toggles its own kind of quote, no escapes. One flag per
+/// character, `true` = masked (quote characters included). `None` for an open quote.
+fn toggle_mask_flags(chars: &[char]) -> Option<Vec<bool>> {
+    let mut flags = Vec::with_capacity(chars.len());
     let mut single = false;
     let mut double = false;
-    for c in command.chars() {
+    for &c in chars {
         match c {
             '\'' if !double => {
                 single = !single;
-                masked.push('x');
+                flags.push(true);
             }
             '"' if !single => {
                 double = !double;
-                masked.push('x');
+                flags.push(true);
             }
-            _ if single || double => masked.push('x'),
-            _ => masked.push(c),
+            _ => flags.push(single || double),
         }
     }
-    (!single && !double).then_some(masked)
+    (!single && !double).then_some(flags)
+}
+
+/// The POSIX reading. Outside quotes a `\` takes the next character literally, so `\'` and `\"`
+/// open nothing. `$'` opens an ANSI-C span in which `\` escapes the next character (`\'` stays
+/// inside) and a bare `'` closes. Single quotes have no escapes; double quotes keep the toggle (the
+/// `escapes_masked` pre-pass owns their backslashes). `None` for an open quote.
+fn posix_mask_flags(chars: &[char]) -> Option<Vec<bool>> {
+    #[derive(PartialEq)]
+    enum State {
+        Plain,
+        Single,
+        Double,
+        Ansi,
+    }
+    let mut flags = Vec::with_capacity(chars.len());
+    let mut state = State::Plain;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match state {
+            State::Plain => match c {
+                '\\' => {
+                    // The pair is live text; the escaped character neither toggles nor hides.
+                    flags.push(false);
+                    if i + 1 < chars.len() {
+                        flags.push(false);
+                        i += 1;
+                    }
+                }
+                '$' if chars.get(i + 1) == Some(&'$') => {
+                    // `$$` (the pid) is lexed before `$'`, so in `$$'` the quote is a plain
+                    // single quote, not an ANSI-C opener. Consume both so the second `$` is
+                    // never taken as the start of `$'`. It is the only two-char `$` token whose
+                    // second character is `$`: `$#`, `$?`, `$-`, `$!`, `$_` and `$0`-`$9` leave
+                    // a following `'` as a plain quote already, since their `$` is not
+                    // followed by `'`.
+                    flags.push(false);
+                    flags.push(false);
+                    i += 1;
+                }
+                '$' if chars.get(i + 1) == Some(&'\'') => {
+                    flags.push(false);
+                    flags.push(true);
+                    state = State::Ansi;
+                    i += 1;
+                }
+                '\'' => {
+                    flags.push(true);
+                    state = State::Single;
+                }
+                '"' => {
+                    flags.push(true);
+                    state = State::Double;
+                }
+                _ => flags.push(false),
+            },
+            State::Single => {
+                flags.push(true);
+                if c == '\'' {
+                    state = State::Plain;
+                }
+            }
+            State::Double => {
+                flags.push(true);
+                if c == '"' {
+                    state = State::Plain;
+                }
+            }
+            State::Ansi => {
+                flags.push(true);
+                if c == '\\' {
+                    if i + 1 < chars.len() {
+                        flags.push(true);
+                        i += 1;
+                    }
+                } else if c == '\'' {
+                    state = State::Plain;
+                }
+            }
+        }
+        i += 1;
+    }
+    (state == State::Plain).then_some(flags)
 }
 
 /// Blanks the character a POSIX backslash escapes inside double quotes, keeping the backslash.
@@ -917,6 +1027,51 @@ mod tests {
         assert!(without_quoted_text("echo 'unclosed ; whoami").is_none());
         // A quote closed by the OTHER kind is still open.
         assert!(without_quoted_text(r#"echo "a' "#).is_none());
+    }
+
+    /// A backslash-escaped apostrophe outside quotes, and `\'` inside `$'...'`, open or close
+    /// nothing in bash, so the `>`/`;`/`|` after them is live. Each fails on the old toggle reading
+    /// (it masked the span between the two apostrophes, or went unterminated -> `None`).
+    #[test]
+    fn an_escaped_apostrophe_does_not_hide_a_live_metacharacter() {
+        for (line, meta) in [
+            (r"echo x \' > f \'", '>'),
+            (r"echo x $'\'' > f $'\''", '>'),
+            (r"echo $'a\'b' > f", '>'),
+            (r"echo \' ; rm x \'", ';'),
+            (r"echo \' | rm x \'", '|'),
+        ] {
+            // Refused (None) or visible are both safe; a masked metacharacter is not. The toggle
+            // reading refuses `$'a\'b'` (odd apostrophes), which sends the line to the judge.
+            if let Some(masked) = without_quoted_text(line) {
+                assert!(
+                    masked.contains(meta),
+                    "{meta} was hidden in {line}: {masked}"
+                );
+            }
+        }
+    }
+
+    /// Keep-green: real quotes still hide what they hold, including ANSI-C.
+    #[test]
+    fn real_quotes_still_mask_their_metacharacters() {
+        for line in [r"echo '>'", r#"echo "a > b""#, r"echo $'a > b'"] {
+            let masked = without_quoted_text(line).unwrap();
+            assert!(!masked.contains('>'), "{line} leaked: {masked}");
+            assert_eq!(masked.chars().count(), line.chars().count());
+        }
+        // The toggle reading leaves this quote open, so the line is refused, not half-masked.
+        assert_eq!(without_quoted_text(r"echo $'a\'>b'"), None);
+    }
+
+    /// `$$` is lexed before `$'`, so the quote after it is plain and the `>` is live. Refused
+    /// (None) or visible are both safe; a masked `>` is not.
+    #[test]
+    fn pid_dollar_does_not_open_an_ansi_span() {
+        let line = r"echo x$$'\' > ../../outside/leak.txt \' '\'";
+        if let Some(masked) = without_quoted_text(line) {
+            assert!(masked.contains('>'), "live > hidden in {line}: {masked}");
+        }
     }
 
     /// 2026-10-11, the owner's `grep` parked in a chat. The `\"` inside the pattern is an escaped
