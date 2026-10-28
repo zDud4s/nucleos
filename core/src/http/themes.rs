@@ -147,7 +147,7 @@ pub(super) async fn get_theme(
                 "kind": kind,
                 "id": member_id,
                 "origin": origin,
-                "excluded": excluded != 0,
+                "excluded": *excluded != 0,
                 "label": target.label,
                 "missing": target.missing || MemberKind::parse(kind).is_none(),
             })

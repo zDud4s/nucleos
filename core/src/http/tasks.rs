@@ -303,10 +303,11 @@ pub(super) struct CloseBody {
     note: Option<String>,
 }
 
+/// A listing asks for no session: a `session_id` the hook sends anyway is an unknown field, which serde
+/// skips.
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ListBody {
     worktree: Option<String>,
-    session_id: Option<String>,
 }
 
 type Now = chrono::DateTime<chrono::Utc>;

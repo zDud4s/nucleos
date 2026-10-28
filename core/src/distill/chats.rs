@@ -886,18 +886,19 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fixtures {
+/// `testkit` too: the daemon binary compiles `http.rs` into its own tests and reaches these through the lib.
+#[cfg(any(test, feature = "testkit"))]
+pub mod fixtures {
     use sqlx::SqlitePool;
 
-    pub(crate) async fn chat_with(pool: &SqlitePool) -> String {
+    pub async fn chat_with(pool: &SqlitePool) -> String {
         crate::chats::create(pool, crate::chats::Brain::Local, None)
             .await
             .unwrap()
     }
 
     /// The chat's numeric key: its oldest run (spec 4.1, `chat_key`).
-    pub(crate) async fn chat_key(pool: &SqlitePool, chat: &str) -> i64 {
+    pub async fn chat_key(pool: &SqlitePool, chat: &str) -> i64 {
         sqlx::query_scalar("SELECT MIN(id) FROM runs WHERE chat_id = ?")
             .bind(chat)
             .fetch_one(pool)
@@ -906,7 +907,7 @@ pub(crate) mod fixtures {
     }
 
     /// One completed assistant turn of `chat`; returns the run id.
-    pub(crate) async fn turn(
+    pub async fn turn(
         pool: &SqlitePool,
         chat: &str,
         project: Option<&str>,
@@ -928,7 +929,7 @@ pub(crate) mod fixtures {
     }
 
     /// Moves the P8 history cut to `run_id`.
-    pub(crate) async fn set_floor(pool: &SqlitePool, run_id: i64) {
+    pub async fn set_floor(pool: &SqlitePool, run_id: i64) {
         sqlx::query(
             "INSERT INTO schema_meta (key, value) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -941,7 +942,7 @@ pub(crate) mod fixtures {
     }
 
     /// An `observed` observation created `days` days ago; returns its id.
-    pub(crate) async fn stale_observation(pool: &SqlitePool, days: i64) -> i64 {
+    pub async fn stale_observation(pool: &SqlitePool, days: i64) -> i64 {
         let at = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         sqlx::query(
             "INSERT INTO knowledge

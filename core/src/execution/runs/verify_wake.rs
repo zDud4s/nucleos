@@ -225,11 +225,20 @@ async fn refuse(state: &AppState, run_id: i64, ticket_id: i64, reason: &str) -> 
     Ok(())
 }
 
+/// A module only to carry the `allow`: an attribute on a macro call is ignored.
 #[cfg(test)]
-thread_local! {
-    /// How many times the deferred work ran on this thread: a `#[tokio::test]` runs on one.
-    static DEFERRED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+#[allow(
+    clippy::missing_const_for_thread_local,
+    reason = "the initializer is already `const { .. }`; the lint misfires on this expansion"
+)]
+mod deferred_count {
+    thread_local! {
+        /// How many times the deferred work ran on this thread: a `#[tokio::test]` runs on one.
+        pub(super) static DEFERRED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
 }
+#[cfg(test)]
+use deferred_count::DEFERRED;
 
 /// What the terminal arm skipped while a wake was open: the briefing sweep, the token-efficiency
 /// observation and the judge's look at a failed gate.
@@ -586,6 +595,7 @@ mod tests {
                 running: Vec::new(),
             },
             units: Vec::new(),
+            inherited_task_ids: Vec::new(),
         }
     }
 
