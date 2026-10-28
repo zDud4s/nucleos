@@ -209,7 +209,7 @@ pub const TASK_TOOL_NAMES: [&str; 4] = ["task_list", "task_claim", "task_release
 /// `ReadsOwn`; none `Acts`, none `ReadsUntrusted`, and this box serves no untrusted read, so the taint
 /// rule has nothing to guard. The daemon enforces depth, sibling and `owned_paths` limits itself.
 /// Accepted residual: node ids are not fenced to the worktree; they are the owner's own bookkeeping
-/// rows and run nothing.
+/// rows and run nothing. The task tools ride with `verify` here as in every box (`TASK_TOOL_NAMES`).
 pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "node_active",
     "node_close",
@@ -217,6 +217,10 @@ pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "node_tree",
     "node_update",
     "record",
+    "task_claim",
+    "task_done",
+    "task_list",
+    "task_release",
     "verify",
     "verify_status",
 ];
