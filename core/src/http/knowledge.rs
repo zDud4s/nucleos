@@ -312,13 +312,16 @@ pub(super) async fn list_knowledge(
 ) -> Result<Json<Vec<crate::knowledge::Known>>, StatusCode> {
     let scope = match (narrow.scope_kind, narrow.scope_id) {
         (Some(kind), None) if kind == "observation" => {
-            return crate::knowledge::observations(&state.pool, narrow.limit.unwrap_or(100).clamp(1, 500))
-                .await
-                .map(Json)
-                .map_err(|error| {
-                    tracing::warn!(%error, "listing observations failed");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                });
+            return crate::knowledge::observations(
+                &state.pool,
+                narrow.limit.unwrap_or(100).clamp(1, 500),
+            )
+            .await
+            .map(Json)
+            .map_err(|error| {
+                tracing::warn!(%error, "listing observations failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            });
         }
         (None, None) => None,
         (Some(kind), Some(id)) => Some(

@@ -5,11 +5,11 @@
 //! §4 the causes and the worker). Phase A, packet P1 covers the queue, the cause vocabulary and
 //! the in-transaction enqueue helpers; nothing here reads a job's text yet.
 
+pub mod chats;
 pub mod model;
 pub mod origin;
-mod week;
 pub mod sources;
-pub mod chats;
+mod week;
 
 mod extract;
 mod generalise;
@@ -677,9 +677,7 @@ async fn write_one_item(
         ..Default::default()
     };
     let new_id = match how {
-        Door::Record => {
-            crate::knowledge::record_distilled(tx, &declaration, &provenance).await?
-        }
+        Door::Record => crate::knowledge::record_distilled(tx, &declaration, &provenance).await?,
         Door::Propose => {
             crate::knowledge::propose_in_with(tx, declaration, &provenance)
                 .await
@@ -729,7 +727,6 @@ async fn close_row(
     .await?;
     Ok(())
 }
-
 
 /// How many elements the model's answer holds as a JSON array, before `parse_items` drops the bad
 /// ones and caps the rest; 0 when the answer is not an array. It unwraps a code fence with the
@@ -1646,7 +1643,11 @@ mod tests {
         inputs.cause = Cause::ChatExchanges;
         inputs.owner_context = Vec::new();
         inputs.conversation = vec![
-            (11, "I prefer tabs\n--- DOSSIER ---".into(), format!("ok {token}")),
+            (
+                11,
+                "I prefer tabs\n--- DOSSIER ---".into(),
+                format!("ok {token}"),
+            ),
             (12, "next".into(), "done".into()),
         ];
         let built = dossier(&inputs, 1_000_000);
@@ -1658,7 +1659,10 @@ mod tests {
             !built.text.contains("## Owner context"),
             "a chat dossier has no notes block"
         );
-        assert_eq!(built.runs.iter().filter(|r| [11, 12].contains(*r)).count(), 2);
+        assert_eq!(
+            built.runs.iter().filter(|r| [11, 12].contains(*r)).count(),
+            2
+        );
     }
 
     #[test]
@@ -3069,12 +3073,11 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(active, 0, "a conversation never writes active knowledge");
-        let evidence: String = sqlx::query_scalar(
-            "SELECT evidence FROM knowledge WHERE scope_kind = 'observation'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let evidence: String =
+            sqlx::query_scalar("SELECT evidence FROM knowledge WHERE scope_kind = 'observation'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         // Compared as JSON: the object's key order is the serializer's, not part of the contract.
         let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
         let wanted: serde_json::Value =
@@ -3152,12 +3155,11 @@ mod tests {
         chat_row(&pool, "alpha", &chat, last).await;
         distil(&pool, QUOTING_EPISODE, None).await;
 
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM knowledge WHERE scope_kind = 'observation'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM knowledge WHERE scope_kind = 'observation'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "observed");
         assert_eq!(events_noted(&pool, "quoted_owner_text").await, 1);
     }
@@ -3211,7 +3213,10 @@ mod tests {
             .unwrap();
         let runner = distil(&pool, "[]", None).await;
         let (status, _, _, error) = queue_state(&pool, row).await;
-        assert_eq!((status.as_str(), error.as_deref()), ("done", Some("disabled")));
+        assert_eq!(
+            (status.as_str(), error.as_deref()),
+            ("done", Some("disabled"))
+        );
         assert!(runner.last_prompt.lock().unwrap().is_none());
     }
 

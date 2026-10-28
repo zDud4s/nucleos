@@ -221,7 +221,13 @@ async fn three_near_identical_candidates_in_three_projects_make_one_machine_prop
         Outcome::Done
     );
 
-    type Row = (String, Option<String>, String, Option<String>, Option<String>);
+    type Row = (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    );
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT scope_kind, scope_id, status, evidence, about FROM knowledge WHERE distill_cause = 'generalised'",
     )
@@ -724,7 +730,10 @@ fn evidence_carries_note_ids_without_text_and_stays_within_20_entries() {
 #[test]
 fn the_note_text_is_scrubbed_and_sits_under_do_not_quote() {
     let group = group_of(&[Subject::Job(1)]);
-    let with = dossier(&group, &["call me at sk-ABCDEF1234567890XYZabcd".to_owned()]);
+    let with = dossier(
+        &group,
+        &["call me at sk-ABCDEF1234567890XYZabcd".to_owned()],
+    );
     assert!(with.contains("do not quote"));
     assert!(!with.contains("sk-ABCDEF1234567890XYZabcd"));
     assert!(!dossier(&group, &[]).contains("OWNER CONTEXT"));

@@ -834,7 +834,9 @@ pub(super) async fn post_ingest_chats(
         (None, None) => Selection::All,
     };
     match ingest(&state.pool, selection).await {
-        Ok((seeded, skipped)) => Ok(Json(serde_json::json!({ "seeded": seeded, "skipped": skipped }))),
+        Ok((seeded, skipped)) => Ok(Json(
+            serde_json::json!({ "seeded": seeded, "skipped": skipped }),
+        )),
         Err(error) => {
             tracing::warn!(%error, "ingesting past chats failed");
             Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))

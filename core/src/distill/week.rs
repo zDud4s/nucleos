@@ -719,7 +719,10 @@ mod tests {
 
     #[test]
     fn a_retried_row_reads_the_window_of_its_own_week_not_of_now() {
-        let anchor = week_anchor(Some(202643), Utc.with_ymd_and_hms(2026, 12, 1, 12, 0, 0).unwrap());
+        let anchor = week_anchor(
+            Some(202643),
+            Utc.with_ymd_and_hms(2026, 12, 1, 12, 0, 0).unwrap(),
+        );
         assert_eq!(
             anchor.with_timezone(&Local).date_naive(),
             NaiveDate::from_ymd_opt(2026, 10, 22).unwrap()
