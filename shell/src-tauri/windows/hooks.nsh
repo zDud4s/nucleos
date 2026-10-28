@@ -11,6 +11,8 @@
   Pop $0
   nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM quota-sidecar.exe'
   Pop $0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM remote-sidecar.exe'
+  Pop $0
   nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM telegram-sidecar.exe'
   Pop $0
   nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM web-sidecar.exe'
