@@ -5,7 +5,8 @@
 //! has to ask the sidecar to `close` it too: the daemon closing it (`browser_close`, a policy
 //! close), the shell reporting the tab gone (`POST .../sessions/{id}/closed`), and an attach whose
 //! result nobody received. Every call is best effort: the sidecar may have restarted and forgotten
-//! the session already, and that must never keep a row open or fail a close.
+//! the session already, and that must never keep a row open or fail a close. A shell registration
+//! that lapses also ends its embedded sessions: their rows are closed with `shell-lapsed`.
 
 use sqlx::SqlitePool;
 
@@ -14,6 +15,29 @@ use crate::browser_client::{BrowserClient, BrowserError};
 
 /// The reason a row carries when the shell reports its tab closed (by the person or by a crash).
 pub const TAB_CLOSED: &str = "tab-closed";
+
+/// The reason a row carries when its shell registration lapsed.
+pub const SHELL_LAPSED: &str = "shell-lapsed";
+
+/// A registration lapsed: the sidecar is told to forget the project, and the still-open rows of
+/// its embedded sessions are closed here with reason `shell-lapsed`. Best effort per row.
+pub(super) async fn close_lapsed_rows(pool: &SqlitePool, sessions: &[String]) {
+    let now = chrono::Utc::now().to_rfc3339();
+    for session_id in sessions {
+        let result = sqlx::query(
+            "UPDATE browser_sessions SET closed_at = ?, closed_reason = ? \
+             WHERE sidecar_id = ? AND closed_at IS NULL",
+        )
+        .bind(&now)
+        .bind(SHELL_LAPSED)
+        .bind(session_id)
+        .execute(pool)
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%error, session_id, "could not close the row of a lapsed embedded session");
+        }
+    }
+}
 
 /// Best effort: frees the sidecar's slot for `sidecar_id`. A session it no longer knows is fine.
 pub(super) async fn release_sidecar_slot(client: &BrowserClient, sidecar_id: &str) {
@@ -60,7 +84,49 @@ pub(super) async fn tab_closed(pool: &SqlitePool, runtime: &BrowserRuntime, sess
 
 #[cfg(test)]
 mod tests {
+    use super::close_lapsed_rows;
     use crate::browser_client::Session;
+    use crate::storage::TempDb;
+
+    async fn insert_open_row(pool: &sqlx::SqlitePool, sidecar_id: &str) {
+        sqlx::query(
+            "INSERT INTO browser_sessions \
+               (sidecar_id, project_id, profile_kind, profile_id, requested_url, final_url, \
+                rule, mode, opened_at, closed_at) \
+             VALUES (?, 'acme', 'project', 'acme', 'https://a.example.net/', '', \
+                'rule', 'agent', '2026-01-01T00:00:00Z', NULL)",
+        )
+        .bind(sidecar_id)
+        .execute(pool)
+        .await
+        .expect("insert");
+    }
+
+    async fn state_of(pool: &sqlx::SqlitePool, sidecar_id: &str) -> (Option<String>, Option<String>) {
+        sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT closed_at, closed_reason FROM browser_sessions WHERE sidecar_id = ?",
+        )
+        .bind(sidecar_id)
+        .fetch_one(pool)
+        .await
+        .expect("row")
+    }
+
+    #[tokio::test]
+    async fn lapsed_sessions_have_their_open_rows_closed() {
+        let db = TempDb::new().await;
+        insert_open_row(&db.pool, "s1").await;
+        insert_open_row(&db.pool, "s2").await;
+        close_lapsed_rows(&db.pool, &["s1".to_string()]).await;
+        let (closed_at, reason) = state_of(&db.pool, "s1").await;
+        assert!(closed_at.is_some());
+        assert_eq!(reason.as_deref(), Some("shell-lapsed"));
+        assert_eq!(state_of(&db.pool, "s2").await, (None, None));
+        // A second call must not touch the already closed row.
+        close_lapsed_rows(&db.pool, &["s1".to_string()]).await;
+        assert_eq!(state_of(&db.pool, "s1").await, (closed_at, reason));
+        db.close().await;
+    }
 
     fn session(id: &str) -> Session {
         Session {
