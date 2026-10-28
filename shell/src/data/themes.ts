@@ -12,6 +12,8 @@ import type { GraphTheme } from "../brain/graph-types";
  * | one, with members    | `GET /themes/{id}`             |
  * | accept (optional name)| `POST /themes/{id}/accept`    |
  * | refuse               | `POST /themes/{id}/refuse`     |
+ * | rename               | `POST /themes/{id}/rename`     |
+ * | merge into another   | `POST /themes/{id}/merge`      |
  * | force a synthesis    | `POST /themes/{id}/synthesise` |
  *
  * The list never carries the synthesis; the detail shows it only for an accepted theme.
@@ -126,6 +128,28 @@ export function useRefuseTheme() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
+    }),
+  );
+}
+
+/** Renames a theme: 422 for an empty or over-long name, 404 for an unknown id. The route answers a bare 200. */
+export function useRenameTheme() {
+  return useThemeMutation(({ id, name }: { id: number; name: string }) =>
+    apiText(`/themes/${id}/rename`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+  );
+}
+
+/** Merges theme `id` into the live theme `into`; `id` becomes `merged`. Settling refetches the list and every detail. */
+export function useMergeTheme() {
+  return useThemeMutation(({ id, into }: { id: number; into: number }) =>
+    apiText(`/themes/${id}/merge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ into }),
     }),
   );
 }

@@ -226,10 +226,14 @@ pub(super) async fn record_the_cut_stream(pool: &sqlx::SqlitePool, id: i64, seen
         return;
     }
     let usage = crate::execution::runner::usage_without_a_result(seen);
+    let answer = cut_chat_answer(seen);
+    // A chat turn's `stdout` is its answer (the chat reads it as such), so it gets the extracted
+    // assistant text, or NULL when there is none; every other run keeps the raw stream.
     let written = sqlx::query(
-        "UPDATE runs SET stdout = ?, num_turns = ?, input_tokens = ?, cache_read_tokens = ?, \
+        "UPDATE runs SET stdout = CASE WHEN chat_id IS NOT NULL THEN ? ELSE ? END, num_turns = ?, input_tokens = ?, cache_read_tokens = ?, \
          cache_creation_tokens = ?, context_peak = ?, tools_used = ? WHERE id = ? AND stdout IS NULL",
     )
+    .bind(answer)
     .bind(seen)
     .bind(usage.num_turns)
     .bind(usage.input_tokens)
@@ -248,6 +252,36 @@ pub(super) async fn record_the_cut_stream(pool: &sqlx::SqlitePool, id: i64, seen
             %error,
             "could not record the stream of a run cut off before its result"
         ),
+    }
+}
+
+/// The answer a cut chat turn leaves in `runs.stdout`: the assistant text its stream showed, NULL
+/// when blank (a stream of only `hook_started` / `system` lines). Never the raw stream-json.
+fn cut_chat_answer(seen: &str) -> Option<String> {
+    let text = crate::execution::runner::live_from_stream(seen).text;
+    (!text.trim().is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod cut_chat_answer_tests {
+    use super::cut_chat_answer;
+
+    #[test]
+    fn a_stream_of_only_hook_lines_leaves_no_answer() {
+        let seen = concat!(
+            "{\"type\":\"system\",\"subtype\":\"hook_started\",\"hook_name\":\"SessionStart:resume\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}\n",
+        );
+        assert_eq!(cut_chat_answer(seen), None);
+    }
+
+    #[test]
+    fn a_stream_with_assistant_text_answers_with_that_text() {
+        let seen = concat!(
+            "{\"type\":\"system\",\"subtype\":\"hook_started\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Half an answer\"}]}}\n",
+        );
+        assert_eq!(cut_chat_answer(seen).as_deref(), Some("Half an answer"));
     }
 }
 

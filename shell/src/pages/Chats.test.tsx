@@ -7353,3 +7353,93 @@ describe("Chats - a live answer and a pending change", () => {
     });
   });
 });
+
+/* ------------------------------------------- spontaneous and failed turns -- */
+
+describe("Chats - turns the owner did not write", () => {
+  async function openWith(rows: AssistantTurnRow[]) {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": rows }),
+    );
+    await renderChats("/chats/c-1");
+    return screen.findByRole("list", { name: "Transcript" });
+  }
+
+  it("draws a task notification as a marker, never as the owner's bubble", async () => {
+    const transcript = await openWith([
+      turnRow({
+        id: 1,
+        origin: "task",
+        asked: '[background task brzfhch8k completed]: Background command "cargo build" (exit code 0)',
+        answer: "build is done",
+      }),
+    ]);
+    expect(await within(transcript).findByText("build is done")).toBeDefined();
+    expect(
+      within(transcript).getByText('background task finished: Background command "cargo build", exit 0'),
+    ).toBeDefined();
+    expect(within(transcript).queryByText("you")).toBeNull();
+    expect(within(transcript).queryByText(/brzfhch8k/)).toBeNull();
+    expect(within(transcript).queryByText("the assistant continued on its own")).toBeNull();
+  });
+
+  it("draws one sentence for batched notices", async () => {
+    const transcript = await openWith([
+      turnRow({
+        id: 1,
+        origin: "task",
+        asked: "[background task a1 completed]: Build (exit code 0)\n[subagent reviewer completed]",
+        answer: "both done",
+      }),
+    ]);
+    expect(await within(transcript).findByText("both done")).toBeDefined();
+    expect(
+      within(transcript).getByText("background task finished: Build, exit 0; subagent reviewer finished"),
+    ).toBeDefined();
+  });
+
+  it("draws a notice that carries no summary", async () => {
+    const transcript = await openWith([
+      turnRow({ id: 1, origin: "task", asked: "[background task x9 completed]", answer: "ok" }),
+    ]);
+    expect(await within(transcript).findByText("ok")).toBeDefined();
+    expect(within(transcript).getByText("background task finished")).toBeDefined();
+  });
+
+  it("keeps the failed status of a subagent", async () => {
+    const transcript = await openWith([
+      turnRow({ id: 1, origin: "task", asked: "[subagent reviewer failed]", answer: "ok" }),
+    ]);
+    expect(await within(transcript).findByText("ok")).toBeDefined();
+    expect(within(transcript).getByText("subagent reviewer failed")).toBeDefined();
+  });
+
+  it("draws a neutral marker for the placeholder prompt", async () => {
+    const transcript = await openWith([
+      turnRow({
+        id: 1,
+        origin: "task",
+        asked: "[the assistant continued on its own]",
+        answer: "carrying on",
+      }),
+    ]);
+    expect(await within(transcript).findByText("carrying on")).toBeDefined();
+    expect(within(transcript).getByText("continued after a background task")).toBeDefined();
+    expect(within(transcript).queryByText("[the assistant continued on its own]")).toBeNull();
+    expect(within(transcript).queryByText("you")).toBeNull();
+  });
+
+  it("shows the error of a failed turn", async () => {
+    const transcript = await openWith([
+      turnRow({ id: 1, status: "failed", answer: null, error: "claude exited with 1" }),
+    ]);
+    expect(await within(transcript).findByText("claude exited with 1")).toBeDefined();
+  });
+
+  it("falls back to a sentence when a failed turn recorded no error", async () => {
+    const transcript = await openWith([
+      turnRow({ id: 1, status: "failed", answer: null, error: null }),
+    ]);
+    expect(await within(transcript).findByText("Turn failed with no reason recorded")).toBeDefined();
+  });
+});

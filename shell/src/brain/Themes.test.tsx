@@ -50,6 +50,75 @@ describe("ThemesProposed", () => {
     await waitFor(() => expect(daemon.apiText).toHaveBeenCalledWith("/themes/3/refuse", expect.objectContaining({ method: "POST" })));
   });
 
+  it("renames a theme: Save is disabled for an empty or unchanged name and posts {name}", async () => {
+    daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
+    daemon.apiText.mockResolvedValue("");
+    renderWithQuery(<ThemesProposed />);
+    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    const input = screen.getByRole("textbox", { name: "New name for theme 3" }) as HTMLInputElement;
+    const save = screen.getByRole("button", { name: "Save name of theme 3" }) as HTMLButtonElement;
+    expect(input.value).toBe("Theme 3");
+    expect(save.disabled).toBe(true);
+    fireEvent.change(input, { target: { value: "   " } });
+    expect(save.disabled).toBe(true);
+    fireEvent.change(input, { target: { value: " Sleep " } });
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    await waitFor(() =>
+      expect(daemon.apiText).toHaveBeenCalledWith(
+        "/themes/3/rename",
+        expect.objectContaining({ method: "POST", body: JSON.stringify({ name: "Sleep" }) }),
+      ),
+    );
+  });
+
+  it("shows the specific message when the daemon refuses a rename", async () => {
+    daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
+    daemon.apiText.mockRejectedValue(new ApiRefusal(422, "bad_name", ""));
+    renderWithQuery(<ThemesProposed />);
+    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "New name for theme 3" }), { target: { value: "Sleep" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save name of theme 3" }));
+    expect(await screen.findByText(/it must be 1 to 80 characters/)).toBeTruthy();
+  });
+
+  it("says the daemon is not responding when a rename fails without an answer", async () => {
+    daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
+    daemon.apiText.mockRejectedValue(new TypeError("network down"));
+    renderWithQuery(<ThemesProposed />);
+    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "New name for theme 3" }), { target: { value: "Sleep" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save name of theme 3" }));
+    expect(await screen.findByText(/is not responding: the name was not changed/)).toBeTruthy();
+    expect(screen.queryByText(/it must be 1 to 80 characters/)).toBeNull();
+  });
+
+  it("cancels a rename on Escape without posting", async () => {
+    daemon.apiFetch.mockResolvedValue([row(3, "proposed")]);
+    renderWithQuery(<ThemesProposed />);
+    fireEvent.click(await screen.findByRole("button", { name: "Rename theme 3" }));
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "New name for theme 3" }), { key: "Escape" });
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(daemon.apiText).not.toHaveBeenCalled();
+  });
+
+  it("merges into another theme: the select excludes the theme itself and posts {into}", async () => {
+    daemon.apiFetch.mockResolvedValue([row(3, "proposed"), row(4, "proposed")]);
+    daemon.apiText.mockResolvedValue("");
+    renderWithQuery(<ThemesProposed />);
+    fireEvent.click(await screen.findByRole("button", { name: "Merge theme 3" }));
+    const select = screen.getByRole("combobox", { name: "Merge theme 3 into" }) as HTMLSelectElement;
+    const values = Array.from(select.options).map((o) => o.value);
+    expect(values).toEqual(["4"]);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm merging theme 3" }));
+    await waitFor(() =>
+      expect(daemon.apiText).toHaveBeenCalledWith(
+        "/themes/3/merge",
+        expect.objectContaining({ method: "POST", body: JSON.stringify({ into: 4 }) }),
+      ),
+    );
+  });
+
   it("renders nothing when there are no proposed themes", async () => {
     daemon.apiFetch.mockResolvedValue([]);
     const { container } = renderWithQuery(<ThemesProposed />);

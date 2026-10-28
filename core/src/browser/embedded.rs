@@ -163,6 +163,13 @@ struct Shared {
     sweep_every: Duration,
 }
 
+/// A registration that lapsed, with the embedded sessions it held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lapsed {
+    pub project: String,
+    pub sessions: Vec<String>,
+}
+
 /// What an ack came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckOutcome {
@@ -298,6 +305,15 @@ impl Registry {
     /// Drops registrations whose shell stopped polling, with the requests queued for them, and
     /// returns their projects so the caller can tell the sidecar to forget them.
     pub fn expire(&self) -> Vec<String> {
+        self.expire_lapsed()
+            .into_iter()
+            .map(|lapsed| lapsed.project)
+            .collect()
+    }
+
+    /// Like `expire`, and also reports the embedded session ids each lapsed project held, so the
+    /// caller can close their rows.
+    pub fn expire_lapsed(&self) -> Vec<Lapsed> {
         let now = self.now();
         let ttl = self.shared.registration_ttl;
         let mut inner = self.lock();
@@ -307,20 +323,28 @@ impl Registry {
             .filter(|(_, reg)| now.saturating_duration_since(reg.last_poll) >= ttl)
             .map(|(project, _)| project.clone())
             .collect();
-        for project in &dead {
-            inner.registrations.remove(project);
-            inner.forget_sessions_of(project);
+        let mut lapsed = Vec::with_capacity(dead.len());
+        for project in dead {
+            inner.registrations.remove(&project);
+            let sessions: Vec<String> = inner
+                .sessions
+                .iter()
+                .filter(|(_, owner)| owner.as_str() == project)
+                .map(|(id, _)| id.clone())
+                .collect();
+            inner.forget_sessions_of(&project);
             // Dropping an open's waiter wakes it with an error, which sends it to the headless path.
             inner
                 .requests
-                .retain(|request| &request.wire.project != project);
+                .retain(|request| request.wire.project != project);
+            lapsed.push(Lapsed { project, sessions });
         }
-        dead
+        lapsed
     }
 
     /// Starts the watchdog that forgets silent registrations, unless one is already running. It
     /// stops by itself when no registration is left, and the next `register` starts it again.
-    pub fn start_watchdog(&self, client: BrowserClient) {
+    pub fn start_watchdog(&self, client: BrowserClient, pool: sqlx::SqlitePool) {
         {
             let mut inner = self.lock();
             if inner.watching || inner.registrations.is_empty() {
@@ -332,11 +356,13 @@ impl Registry {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(registry.shared.sweep_every).await;
-                for project in registry.expire() {
+                for lapsed in registry.expire_lapsed() {
+                    let project = &lapsed.project;
                     tracing::info!(%project, "embedded browser registration lapsed, forgetting it");
-                    if let Err(error) = client.embedded_forget(&project).await {
+                    if let Err(error) = client.embedded_forget(project).await {
                         tracing::warn!(%project, %error, "the sidecar did not forget an embedded project");
                     }
+                    super::embedded_close::close_lapsed_rows(&pool, &lapsed.sessions).await;
                 }
                 // Decided under the same lock that `start_watchdog` takes, so a registration landing
                 // now either keeps this loop alive or finds the flag cleared and starts a new one.
@@ -761,7 +787,7 @@ pub async fn post_register(
     state
         .browser
         .embedded
-        .start_watchdog(state.browser.client.clone());
+        .start_watchdog(state.browser.client.clone(), state.pool.clone());
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -861,6 +887,27 @@ mod tests {
         assert!(!registry.has_live("p"));
         assert_eq!(registry.expire(), vec!["p".to_string()]);
         assert!(registry.expire().is_empty(), "forgotten once");
+    }
+
+    #[test]
+    fn expire_lapsed_reports_the_sessions_of_the_lapsed_project() {
+        let (registry, clock) = registry(OPEN_WAIT);
+        registry.register("p", "http://127.0.0.1:1");
+        registry.register("q", "http://127.0.0.1:2");
+        registry.adopt_for_test("s1", "p");
+        registry.adopt_for_test("s2", "q");
+        advance(&clock, 20);
+        registry.register("q", "http://127.0.0.1:2");
+        advance(&clock, 11);
+        assert_eq!(
+            registry.expire_lapsed(),
+            vec![Lapsed {
+                project: "p".to_string(),
+                sessions: vec!["s1".to_string()],
+            }]
+        );
+        assert!(!registry.is_embedded("s1"));
+        assert!(registry.is_embedded("s2"));
     }
 
     #[test]
