@@ -1,4 +1,7 @@
 import type { ReactNode } from "react";
+import { isApiRefusal } from "../data/client";
+import { isRemote } from "../remote/host";
+import { UnavailableRemotely } from "../remote/UnavailableRemotely";
 import { ErrorNote } from "./ErrorNote";
 import { Skeleton } from "./Skeleton";
 import { StaleNote } from "./StaleNote";
@@ -52,6 +55,10 @@ export function QueryState<T>({ query, label, empty, isEmpty, lines, children }:
 
   if (data === undefined) {
     if (query.isError) {
+      // A route family the gateway keeps from remote devices: say so, rather than "could not load".
+      if (isRemote() && isApiRefusal(query.error) && query.error.status === 403) {
+        return <UnavailableRemotely feature="This page" />;
+      }
       return (
         <ErrorNote onRetry={() => void query.refetch()}>
           Could not load {label}: {causeOf(query.error)}

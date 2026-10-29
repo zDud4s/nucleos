@@ -6,6 +6,8 @@
 package serve
 
 import (
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -18,6 +20,48 @@ const HeaderTimeout = 10 * time.Second
 
 // IdleTimeout closes keep-alive connections a client leaves idle.
 const IdleTimeout = 120 * time.Second
+
+// BodyReadTimeout bounds how long a client may take to deliver a request body to /auth/* and /api/*.
+// The auth bodies are a few hundred bytes and the API bodies are capped (MaxBodyBytes), so 30s is
+// generous for a phone on a bad link yet stops a slow-loris trickle. It covers the request body only:
+// a response (an SSE stream) is not bound by it.
+const BodyReadTimeout = 30 * time.Second
+
+// deadlineBody is a request body whose read deadline is lifted once it has been read to the end.
+type deadlineBody struct {
+	io.ReadCloser
+	rc *http.ResponseController
+}
+
+func (b *deadlineBody) lift() { _ = b.rc.SetReadDeadline(time.Time{}) }
+
+func (b *deadlineBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	// Only a complete body lifts the deadline: after a failed read the deadline must stay, or the
+	// server's drain of the unread rest would wait on the slow client again.
+	if err == io.EOF {
+		b.lift()
+	}
+	return n, err
+}
+
+// boundBodyRead makes the request body arrive within d. A request without a body is left alone: the
+// connection's background read (which watches for a client hang-up while a stream is served) would
+// otherwise trip on the deadline and cancel a long-lived response. A transport that cannot set a
+// deadline (ErrNotSupported) is tolerated: the header and idle timeouts still apply.
+func boundBodyRead(w http.ResponseWriter, r *http.Request, d time.Duration) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return
+	}
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(d)); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			log.Printf("serve: cannot bound request body read: %v", err)
+		}
+		return
+	}
+	r.Body = &deadlineBody{ReadCloser: r.Body, rc: rc}
+}
 
 // Handlers are the three parts of the public surface.
 type Handlers struct {

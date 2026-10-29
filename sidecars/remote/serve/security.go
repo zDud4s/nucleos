@@ -116,9 +116,16 @@ func writeJSONError(w http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
 }
 
+// guardBodyTimeout bounds the request body of every guarded request, set before any refusal: a
+// refused request's unread body is drained by net/http after the handler returns, and without a
+// deadline a client trickling it would hold the connection open on the one path anyone can reach.
+// A variable only so tests can shorten it.
+var guardBodyTimeout = BodyReadTimeout
+
 // guard runs checkRequest in front of next.
 func guard(p Policy, strict bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		boundBodyRead(w, r, guardBodyTimeout)
 		if ref := checkRequest(r, p, strict); ref != nil {
 			writeJSONError(w, ref.status, ref.code)
 			return

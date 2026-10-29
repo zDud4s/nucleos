@@ -77,6 +77,7 @@ import {
   Th,
   Meter,
 } from "../ui";
+import { RemoteDevices } from "../system/RemoteDevices";
 import { MachineSettings } from "./MachineSettings";
 import { ChannelsView } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
@@ -1352,6 +1353,7 @@ function TokensView() {
   return (
     <>
       <TokensPanel />
+      <RemoteDevices />
       <ConfigIndex />
     </>
   );

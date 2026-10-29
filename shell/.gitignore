@@ -34,3 +34,5 @@ dist-lab
 .env
 .env.*
 !.env.example
+# The remote gateway bundle, for the same reason.
+dist-remote
