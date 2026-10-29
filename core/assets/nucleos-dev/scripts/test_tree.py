@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
 import shutil
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -101,6 +103,35 @@ class Registry(CliCase):
         resources(verbs)
         record(verbs)
         self.assertEqual((sorted(verbs), sorted(verbs.parsers)), (["record"], ["budget"]))
+
+    def test_optional_modules_are_loaded_and_registered(self):
+        # A fake `tree_doctor` injected in sys.modules: main() must import it and call register(verbs).
+        fake = types.ModuleType("tree_doctor")
+        fake.register = lambda verbs: verbs.__setitem__(
+            "doctor", (lambda p: None, lambda args: {"verb": "doctor"}))
+        with mock.patch.dict(sys.modules, {"tree_doctor": fake}):
+            self.assertEqual(self.ok("doctor"), {"verb": "doctor"})
+
+    def test_absent_optional_modules_are_skipped(self):
+        # `None` in sys.modules makes the import raise ModuleNotFoundError: main() must carry on.
+        absent = {"tree_doctor": None, "tree_plan": None, "tree_pending": None}
+        with mock.patch.dict(sys.modules, absent):
+            self.init()
+            code, out = self.cli("status")
+            self.assertEqual(code, 0, out)
+
+    def test_each_optional_module_gets_register_called_once(self):
+        calls = []
+        fakes = {}
+        for name in ("tree_doctor", "tree_plan", "tree_pending"):
+            mod = types.ModuleType(name)
+            mod.register = lambda verbs, name=name: calls.append(name)
+            fakes[name] = mod
+        with mock.patch.dict(sys.modules, fakes):
+            self.init()
+            calls.clear()  # init() ran main() once already; assert on a single invocation
+            self.ok("status")
+        self.assertEqual(sorted(calls),["tree_doctor", "tree_pending", "tree_plan"])
 
     def test_a_refusal_prints_the_error_and_exits_two(self):
         code, out = self.cli("init", "../x", "--feature-branch", "f", "--goal", "g")
@@ -192,6 +223,33 @@ class BranchAdd(CliCase):
         self.edit(lambda m: m.update(state="parked"))
         self.assertIn("parked", self.refused("branch", "add", "z", "--paths", "z/**", "--layer", "l"))
         self.assertNotIn("z", ts.load_manifest("root-1")["branches"])
+
+
+class PromptGoalFile(CliCase):
+    BASE = ["n1", "--branch", "b", "--kind", "leaf"]
+
+    def parse(self, *extra):
+        parser = argparse.ArgumentParser(prog="prompt")
+        tree.configure_prompt(parser)
+        return parser.parse_args([*self.BASE, *extra])
+
+    def test_goal_file_is_accepted_instead_of_goal(self):
+        args = self.parse("--goal-file", "goal.txt")
+        self.assertEqual(args.goal_file, "goal.txt")
+        self.assertIsNone(args.goal)
+
+    def test_goal_and_goal_file_are_mutually_exclusive(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.parse("--goal", "x", "--goal-file", "goal.txt")
+
+    def test_goal_alone_still_parses(self):
+        self.assertEqual(self.parse("--goal", "x").goal, "x")
+
+    def test_goal_file_is_read_as_utf8(self):
+        goal = self.root / "goal.txt"
+        goal.write_bytes("Ship o núcleo — ação".encode("utf-8"))
+        args = self.parse("--goal-file", str(goal))
+        self.assertEqual(tree.read_goal(args), "Ship o núcleo — ação")
 
 
 class Prompt(CliCase):
@@ -296,6 +354,13 @@ class Containment(unittest.TestCase):
         for outside in [f"{self.DIR}-evil", f"{self.DIR}-evil/x.rs", f"{self.DIR}*", ".claude/worktrees",
                         "other/x.rs"]:
             self.assertFalse(tree.contained(outside, owned), outside)
+
+    def test_a_path_equal_to_an_owned_glob_is_contained_before_expansion(self):
+        # Equal after normalization (backslashes, leading ./) to an owned wildcard glob: True as is.
+        for glob in ["core/*.rs", "core/src/{a,b}.rs", "core/[ab].rs", "core/src/x?.rs"]:
+            self.assertTrue(tree.contained(glob, [glob]), glob)
+        self.assertTrue(tree.contained(tree.normalize_paths(["./core\\*.rs"])[0], ["core/*.rs"]))
+        self.assertFalse(tree.contained("core/*.py", ["core/*.rs"]))
 
     def test_trailing_slash_and_backslashes(self):
         owned = [f"{self.DIR}/"]

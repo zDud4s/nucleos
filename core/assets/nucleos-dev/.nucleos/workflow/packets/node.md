@@ -35,7 +35,7 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
 - Run no build or test tool (compilers, package managers, test runners): list the exact commands in the handoff for the root to run.
 - Write state through `mcp__nucleos__node_update` on every status change, decision and context peak.
 - Dispatch only your own direct children (kind `orchestrator` or `leaf`); never another node's phases.
-- Close through `mcp__nucleos__node_close` with a summary of at most 1500 characters and the path of the full handoff, written first from `packets/handoff.md`.
+- Close through `mcp__nucleos__node_close` (a top-of-branch orchestrator excepted: it returns its report and stays `running` until merge) with a summary of at most 1500 characters and the path of the full handoff, written first from `packets/handoff.md`.
 - An orchestrator never implements and never rotates its own context: at the ceiling it closes `handoff` and the parent relaunches a fresh node from the daemon tree.
 
 ## Rules by role
@@ -57,7 +57,7 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
 - Edit no file: you have no Edit tool, and an orchestrator that changes code is refused.
 - Open children with `node_open`; their `owned_paths` must be disjoint and contained in yours.
 - Split only into independent pieces. A piece that needs a new interface between siblings, or a path outside yours, is a `contract_request`, not a split.
-- Close yourself `done` when every child is closed.
+- The top-of-branch orchestrator (the one the root launched) does not close itself: when every child is closed it returns its report and its node stays `running` until the branch is merged. A sub-orchestrator inside the branch closes itself `done` when every child is closed.
 
 ### review
 - Read only: change nothing, not even a comment.
@@ -76,3 +76,14 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
 
 ### message
 - You have no Write tool: return the report as your final message; the root records it.
+
+### template
+<!-- A fillable model report, copied into the generated prompt. Fill every field; the section headings after the header are the `## ` headings of `packets/handoff.md`, in that order. -->
+Node ID: <your node id>
+Root ID: <the root id>
+Status: done
+Role: {role}
+Outcome: done
+Contract used: none
+Change Outcome if it is not done: split, contract_request, blocked or failed. Status must follow it (done or split -> done, contract_request or blocked -> blocked, failed -> failed). Contract used is the ids from contract.md, or none.
+Then the sections of `packets/handoff.md`: Summary, What was done, Decisions, Files touched, Commands for the root, Open items / next step, Contract request, Blocked reason. At most {max_lines} lines; write it to {handoff}.

@@ -18,6 +18,7 @@ wave_engine.py. It never calls the MCP: when a node must be opened, updated or c
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 import subprocess
@@ -77,11 +78,21 @@ def build_parser(verbs: Verbs) -> argparse.ArgumentParser:
     return parser
 
 
+OPTIONAL_MODULES = ("tree_doctor", "tree_plan", "tree_pending")
+
+
 def main(argv: list[str] | None = None) -> int:
     verbs = core_verbs()
     tree_resources.register(verbs)
     tree_record.register(verbs)
-    args = build_parser(verbs).parse_args(argv)
+    # Optional modules of later chunks: each one that exists registers its verbs, the rest are skipped.
+    for name in OPTIONAL_MODULES:
+        try:
+            module = importlib.import_module(name)
+        except ModuleNotFoundError:
+            continue
+        module.register(verbs)
+    args =build_parser(verbs).parse_args(argv)
     try:
         answer = args.func(args)
     except (TreeError, nucleos_paths.ProjectNotFound, OSError) as error:
@@ -277,7 +288,9 @@ def configure_prompt(p) -> None:
     p.add_argument("node_id", help="the id node_open returned for this node")
     p.add_argument("--branch", required=True)
     p.add_argument("--kind", required=True, choices=["leaf", "orchestrator", "review"])
-    p.add_argument("--goal", required=True)
+    goal = p.add_mutually_exclusive_group(required=True)
+    goal.add_argument("--goal", default=None)
+    goal.add_argument("--goal-file", default=None, help="read the goal from this file (UTF-8)")
     p.add_argument("--paths", nargs="*", default=[], help="owned globs (leaf and orchestrator)")
     p.add_argument("--pointers", nargs="*", default=[], help="`<path>:<start>-<end> - why`, one per argument")
     p.add_argument("--sections", nargs="*", default=[], help="contract ids to read, e.g. A3 E2")
@@ -285,6 +298,16 @@ def configure_prompt(p) -> None:
     p.add_argument("--parent", default=None, help="parent node id (default: the root)")
     p.add_argument("--depth", type=int, default=1)
     p.add_argument("--task-id", default="none")
+
+
+def read_goal(args) -> str:
+    """The goal text: `--goal` as given, or the UTF-8 content of `--goal-file`."""
+    if getattr(args, "goal_file", None):
+        try:
+            return Path(args.goal_file).read_text(encoding="utf-8")
+        except (OSError, ValueError) as error:
+            raise TreeError(f"--goal-file {args.goal_file}: {error}") from error
+    return args.goal or ""
 
 
 def fill_fields(template: str, values: dict) -> str:
@@ -361,7 +384,9 @@ def contained(path: str, owned: list[str]) -> bool:
     overlap). A literal path must be matched by an owned glob (a literal owned path is a file or a
     directory); a wildcard path (`core/src/x/**`) by an owned `/**` glob whose literal prefix is a
     prefix of the child's, or by an owned literal directory the child's literal prefix lies under
-    (`<dir>/...`, segment boundary)."""
+    (`<dir>/...`, segment boundary). A path equal to an owned glob is contained as is."""
+    if path in owned:
+        return True
     if not any(c in path for c in "*?[{"):
         return any(ts.path_matches(path, glob) for glob in owned)
     prefix = ts.literal_prefix(path)
@@ -384,6 +409,7 @@ def run_prompt(args) -> dict:
     tree_id, manifest = open_manifest(args)
     branch = ts.get_branch(manifest, args.branch)
     kind = args.kind
+    goal = read_goal(args)
     paths = normalize_paths(args.paths)
     if kind != "review":
         if not paths:
@@ -404,7 +430,7 @@ def run_prompt(args) -> dict:
     values = {
         "Node ID": node_id, "Root ID": tree_id, "Parent ID": args.parent or tree_id, "Task ID": args.task_id,
         "Kind": "orchestrator" if kind == "orchestrator" else "leaf",
-        "Title": args.title or args.goal[:60], "Owned paths": ", ".join(paths) or "none (read-only)",
+        "Title": args.title or goal[:60], "Owned paths": ", ".join(paths) or "none (read-only)",
         "Budget tokens": limits["orchestrator_budget" if kind == "orchestrator" else "leaf_budget"],
         "Current depth": args.depth, "Max depth": limits["max_depth"], "Max width": limits["max_width"],
         "Leaf budget": limits["leaf_budget"], "Orchestrator budget": limits["orchestrator_budget"],
@@ -416,7 +442,7 @@ def run_prompt(args) -> dict:
         if title in ("Rules by role", "Report format"):
             continue
         if title == "Goal":
-            body = [args.goal, ""]
+            body = [goal, ""]
         elif title == "Pointers":
             body = [*(args.pointers or ["none"]), ""]
         lines += [f"## {title}", *body]
