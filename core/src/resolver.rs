@@ -1632,6 +1632,25 @@ mod tests {
         );
     }
 
+    /// The classifier holds every compound form of shell, not just `&&`: a `;` between two commands
+    /// is as compound as a chain, and a prompt that names only some forms invites the others.
+    #[test]
+    fn the_prompt_forbids_every_form_of_shell_chaining() {
+        let prompt = resolution_prompt("feat/x", "master", None);
+
+        for (form, what) in [
+            ("`;`", "a semicolon between commands"),
+            ("`&&`", "an && chain"),
+            ("pipe", "a pipe"),
+            ("$(", "command substitution"),
+        ] {
+            assert!(
+                prompt.contains(form),
+                "the prompt must name {what} as forbidden ({form}), or the agent will reach for it"
+            );
+        }
+    }
+
     /// The agent resolves, commits and stops: handing the commit to the queue is the daemon's job.
     /// `nucleos-core --land` is held by the classifier on every call and the binary is not on the
     /// agent's PATH anyway, so a prompt that asks for it produces improvisation instead of a landing.
