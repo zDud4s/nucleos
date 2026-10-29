@@ -47,12 +47,14 @@ import json, os, pathlib, sys, time
 
 argv = sys.argv[1:]
 sub = argv[0] if argv else ""
-td = os.environ.get("CARGO_TARGET_DIR")
+env_td = os.environ.get("CARGO_TARGET_DIR")
+flag_td = next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--target-dir"), None)
+td = flag_td or env_td
 tag = os.environ.get("FAKE_TAG", "")
 log = os.environ.get("FAKE_LOG")
 if log:
     rec = {"t": time.time_ns(), "pid": os.getpid(), "tag": tag, "argv": argv, "td": td,
-           "cwd": os.getcwd()}
+           "env_td": env_td, "flag_td": flag_td, "cwd": os.getcwd()}
     probe = os.environ.get("FAKE_PROBE")
     if probe:
         rec["probe"] = os.path.exists(probe)
@@ -71,7 +73,7 @@ if sub == "clean":
 out = os.environ.get("FAKE_OUT")
 if out:
     pathlib.Path(out).write_text(json.dumps({
-        "td": td,
+        "td": td, "env_td": env_td, "flag_td": flag_td,
         "btd": os.environ.get("CARGO_BUILD_TARGET_DIR"),
         "argv": argv,
     }))
@@ -301,12 +303,28 @@ class TargetDirTests(unittest.TestCase):
         flagged = self.tmp / "flagged"
         _, seen, row = self.run_broker(
             ["test", "-p", "nucleos-core", "--target-dir", str(flagged)])
-        self.assertIsNone(seen.get("td"), f"CARGO_TARGET_DIR must not be injected: {seen}")
-        self.assertIn("--target-dir", seen.get("argv", []), seen)
+        self.assertIsNone(seen.get("env_td"), f"CARGO_TARGET_DIR must not be injected: {seen}")
+        self.assertEqual(seen.get("argv", []).count("--target-dir"), 1, seen)
+        self.assertEqual(real(seen.get("flag_td") or ""), real(flagged), seen)
         self.assertEqual(real(row.get("target_dir") or ""), real(flagged), row)
         self.assertFalse((self.td_root / ".cargo-target-feat-x-y").exists())
         self.assertEqual(sorted(p.name for p in self.td_root.glob(".cargo-target-pool-*")), [],
                          "an explicit target dir leases no pool dir")
+
+    # 2b
+    def test_direct_cargo_gets_the_slot_as_a_flag(self) -> None:
+        # sccache keys on every CARGO_* env var rustc inherits: the slot as CARGO_TARGET_DIR
+        # made each pool slot a separate cache (2026-10-29). A direct cargo call gets the flag.
+        _, seen, row = self.run_broker()
+        self.assertIsNone(seen.get("env_td"), f"the slot leaked as CARGO_TARGET_DIR: {seen}")
+        self.assertEqual(seen.get("argv", [])[:3], ["test", "--target-dir", seen.get("flag_td")],
+                         seen)
+        self.assert_pool(seen)
+        self.assertEqual(real(row.get("target_dir") or ""), real(seen["flag_td"]), row)
+        # Under `cargo nextest` the flag goes after nextest's own subcommand.
+        _, seen, _ = self.run_broker(["nextest", "run", "-p", "nucleos-core"])
+        self.assertIsNone(seen.get("env_td"), seen)
+        self.assertEqual(seen.get("argv", [])[:3], ["nextest", "run", "--target-dir"], seen)
 
     # 3
     def test_disabled_by_env(self) -> None:

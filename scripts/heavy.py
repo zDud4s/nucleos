@@ -1529,6 +1529,43 @@ def _flag_values(args: list[str], *names: str) -> list[str]:
     return vals
 
 
+# Subcommands that take `--target-dir` (cargo's own, and nextest's under `cargo nextest`).
+_TD_SUBCOMMANDS = {"build", "b", "check", "c", "test", "t", "clippy", "doc", "d", "bench",
+                   "run", "r", "rustc", "rustdoc", "clean", "fix"}
+_TD_NEXTEST = {"run", "r", "list", "archive"}
+
+
+def with_target_dir(argv: list[str], td: str) -> list[str] | None:
+    """argv with `--target-dir <td>` right after its subcommand, or None when argv is not a
+    direct cargo call whose subcommand takes one (the caller then falls back to the env var).
+
+    WHY a flag and not CARGO_TARGET_DIR: cargo passes its environment on to rustc, and sccache
+    hashes every CARGO_* variable into its key, so the same dependency built into two pool slots
+    under the env var is two misses. The flag reaches no rustc env, so the slots share hits
+    (measured 2026-10-29: env var, a fresh dir each time, 0 hits; the flag, 100 %)."""
+    if not _is_cargo(argv):
+        return None
+    i = 1
+    if i < len(argv) and argv[i].startswith("+"):
+        i += 1
+    want = _TD_SUBCOMMANDS
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            return None
+        if a.startswith("-"):
+            i += 2 if (a in _VALUE_FLAGS or a == "-C") else 1
+            continue
+        if want is _TD_SUBCOMMANDS and a == "nextest":
+            want = _TD_NEXTEST
+            i += 1
+            continue
+        if a not in want:
+            return None
+        return [*argv[:i + 1], "--target-dir", td, *argv[i + 1:]]
+    return None
+
+
 def _fp_argv(argv: list[str]) -> list[str]:
     """The argv part of the fingerprint: the subcommand, flags and their values, without a
     positional test filter or anything after `--`."""
@@ -2582,8 +2619,13 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                 inject = None
         if fp is not None and cand is not None and lease is None:
             fp = None  # computed for a slot this run did not get: never record it
+        run_argv = argv
         if inject and env is not None:
-            env["CARGO_TARGET_DIR"] = inject
+            # A direct cargo call gets the slot as a flag (see `with_target_dir`); a wrapper's
+            # inner cargo can only be reached through the env var.
+            run_argv = with_target_dir(argv, inject) or argv
+            if run_argv is argv:
+                env["CARGO_TARGET_DIR"] = inject
         eff_td = None
         if kind in ("cargo", "auto") and _is_cargo(argv):
             eff_td = (inject or os.environ.get("CARGO_TARGET_DIR")
@@ -2657,7 +2699,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                 # The compile is over: the held weight falls to 1 while the tests run.
                 if drop_token_weight(directory, ctime):
                     drop_at.append(time.time() - t_run)
-        code, stats = run_child(argv, env, job, low=warm,
+        code, stats = run_child(run_argv, env, job, low=warm,
                                 progress=directory / "progress" / str(os.getpid()),
                                 yield_check=yield_check, on_test_phase=on_test_phase)
     except OSError as exc:
