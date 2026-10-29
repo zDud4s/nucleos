@@ -662,7 +662,7 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
          - Never assign PATH, RUSTUP_HOME or CARGO_HOME, and do not go looking for tools. `cargo` and \
          `git` are already on PATH; an assignment to one of those variables is held for a person to \
          approve, and a resolution that stops there is one nobody gets the benefit of.\n\
-         - Run ONE shell command at a time. No `&&` chains, no pipes, no `$(...)` — the classifier \
+         - Run ONE shell command at a time. No `&&` chains, no `;` between commands, no pipes, no `$(...)` — the classifier \
          holds compound shell for a person to approve, and a resolution that stops to be approved \
          for a `git log` is one nobody gets the benefit of. This costs you a few extra calls and \
          saves the whole run.\n\
