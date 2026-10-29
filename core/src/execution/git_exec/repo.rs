@@ -555,6 +555,20 @@ pub async fn canonical(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("could not canonicalise {}: {error}", path.display()))
 }
 
+/// `path` without the `\\?\` that `canonical` puts in front of a drive path on Windows.
+///
+/// For a root that is stored and later handed to git, which is the opposite of `canonical`'s key:
+/// `git worktree add` under `\\?\C:\…` dies on "could not create leading directories of
+/// '//?/C:/…'", so a project registered in that spelling could never merge through the queue. Only
+/// a drive path is stripped — `\\?\UNC\…` and anything else verbatim mean something without the
+/// prefix that they do not mean with it, and are returned as they came.
+pub fn without_verbatim_prefix(path: &Path) -> std::path::PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => std::path::PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// The object id `rev` names, or the outcome to record when git will not resolve it.
 ///
 /// Reads `stdout` rather than `output_tail`: the tail is a diagnostic and may carry a truncation
