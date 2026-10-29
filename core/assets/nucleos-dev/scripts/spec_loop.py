@@ -240,7 +240,9 @@ def start(argv: list[str]) -> int:
 
 def _payload() -> dict:
     try:
-        data = json.loads(sys.stdin.read() or "{}")
+        # Bytes, decoded as UTF-8: on Windows sys.stdin uses the ANSI code page (cp1252), which
+        # turns "Verificação" into "VerificaÃ§Ã£o" and fails the accented report headings.
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
     except (OSError, UnicodeError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
