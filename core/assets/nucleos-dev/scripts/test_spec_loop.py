@@ -162,6 +162,16 @@ class SpecLoop(unittest.TestCase):
                            input="not json", capture_output=True, text=True)
         self.assertEqual((r.returncode, r.stdout), (0, ""))
 
+    def test_hook_cli_reads_the_accented_report_as_utf8(self):
+        # Claude Code writes the payload as UTF-8; Windows' default stdin code page is not.
+        self.write("- [x] a\n")
+        payload = {"session_id": "s1", "cwd": str(self.root), "last_assistant_message": REPORT}
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        r = subprocess.run([sys.executable, str(HERE / "spec_loop.py"), "--stop-hook"],
+                           input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                           capture_output=True, env=env)
+        self.assertEqual((r.returncode, r.stdout), (0, b""), r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
