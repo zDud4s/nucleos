@@ -3309,6 +3309,21 @@ gate_command: git --version
         );
     }
 
+    /// A root stored for git loses the verbatim prefix of a drive path and nothing else: `\\?\UNC\…`
+    /// would name a different thing without it, and a path that never had one is left as it came.
+    #[test]
+    fn only_a_verbatim_drive_path_loses_its_prefix() {
+        let strip = |text: &str| {
+            without_verbatim_prefix(std::path::Path::new(text))
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(strip(r"\\?\C:\Projects\nucleos"), r"C:\Projects\nucleos");
+        assert_eq!(strip(r"\\?\UNC\server\share"), r"\\?\UNC\server\share");
+        assert_eq!(strip(r"C:\Projects\nucleos"), r"C:\Projects\nucleos");
+        assert_eq!(strip("/home/me/nucleos"), "/home/me/nucleos");
+    }
+
     /// The budget is for the whole operation, and a spent one must refuse before spawning git — the
     /// same guarantee `remaining` gives the merge path, for the same reason: `tokio`'s `Command::output`
     /// spawns the child eagerly, so a spent budget would launch git only to kill it.

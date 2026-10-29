@@ -868,12 +868,15 @@ pub(super) async fn get_project_detect(
         return Err(refusal(StatusCode::BAD_REQUEST, "not_absolute"));
     }
 
-    let root = tokio::fs::canonicalize(&root)
+    let canonical = tokio::fs::canonicalize(&root)
         .await
         .map_err(|_| refusal(StatusCode::NOT_FOUND, "no_such_folder"))?;
-    if !root.is_dir() {
+    if !canonical.is_dir() {
         return Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "not_a_folder"));
     }
+    // The `root` handed back is the one the shell registers, so it is the plain spelling git can
+    // use; `canonical` stays for the comparison with the roots already kept, which it canonicalises.
+    let root = crate::execution::git_exec::without_verbatim_prefix(&canonical);
 
     let looking = root.clone();
     let mut found = tokio::task::spawn_blocking(move || crate::detect::inspect_folder(&looking))
@@ -892,7 +895,7 @@ pub(super) async fn get_project_detect(
 
     // The one thing here that cannot be seen from the folder. Adding a project twice under two
     // names is the mistake this prevents, and neither name would look wrong on its own.
-    found.taken_by = already_registered(&state, &root).await;
+    found.taken_by = already_registered(&state, &canonical).await;
     Ok(Json(found))
 }
 

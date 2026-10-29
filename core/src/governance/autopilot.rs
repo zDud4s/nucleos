@@ -178,7 +178,13 @@ pub async fn set_project_mode(
     }
 
     let persisted_root = match mode {
-        Mode::Shadow | Mode::Active => project_root.map(|root| root.to_string_lossy().into_owned()),
+        // Stored in the spelling git can use: the shell registers the folder `GET /projects/detect`
+        // canonicalised, and the queue hands this root to `git worktree add`.
+        Mode::Shadow | Mode::Active => project_root.map(|root| {
+            crate::execution::git_exec::without_verbatim_prefix(root)
+                .to_string_lossy()
+                .into_owned()
+        }),
         Mode::Off => None,
     };
 
@@ -2892,6 +2898,38 @@ pub mod tests {
         assert_eq!(
             project_mode(&pool, "project-b").await.unwrap(),
             Mode::Shadow
+        );
+    }
+
+    /// The shell registers the folder `GET /projects/detect` handed back, and on Windows a
+    /// canonicalised path starts `\\?\` — a root git cannot make the integration worktree under.
+    /// What the roster keeps is the plain spelling, whichever one arrived.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_verbatim_root_is_recorded_plain() {
+        let pool = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        write_nucleos_hook(&root);
+        onboard(&root, "project-a");
+        let verbatim = fs::canonicalize(root.path()).unwrap();
+        assert!(verbatim.to_string_lossy().starts_with(r"\\?\"));
+
+        set_project_mode(
+            &pool,
+            Some(&home(&root)),
+            "project-a",
+            Mode::Shadow,
+            Some(&verbatim),
+        )
+        .await
+        .unwrap();
+
+        let recorded = root_of(&pool, "project-a").await.unwrap().unwrap();
+        assert!(!recorded.starts_with(r"\\?\"), "{recorded}");
+        assert_eq!(
+            fs::canonicalize(&recorded).unwrap(),
+            verbatim,
+            "the plain root still names the same folder"
         );
     }
 
