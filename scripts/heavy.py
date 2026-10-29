@@ -11,7 +11,8 @@ scheme and appends one telemetry line per run.
 Admission is a machine token queue: every request has a weight (heavy_classify) and a
 priority; the head of the queue (priority, then arrival) is admitted by the admission mode
 (`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than capacity() jobs are held and
-the live probe shows room (free RAM, idle cores, a settle window since the last admission),
+the live probe shows room (free RAM, idle cores, and a settle window since the last admission
+when that room is close to the floors),
 or nothing is held; an unreadable probe falls back to `static`, the held weights plus its own
 fitting the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4; setting it forces `static`);
 `shadow` decides as static and only logs the cost model's opinion. Underneath it sits the

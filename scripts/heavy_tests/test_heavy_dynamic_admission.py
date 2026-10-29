@@ -194,10 +194,12 @@ class Broker(unittest.TestCase):
     def test_settle_window_delays_second_admission(self) -> None:
         # A broker's own start-up takes up to ~1 s under load, so the window must be wide
         # enough that "b is still waiting at 2 s" cannot be explained by start-up alone.
-        a = self.broker("a", "check", settle="4")
+        # 6 GB of 32 free is above the floor but short of the settle waiver's 25%.
+        tight = probe_json(avail_mb=6000)
+        a = self.broker("a", "check", probe=tight, settle="4")
         self.assert_started("a")
         t_a = time.time()
-        b = self.broker("b", "check", settle="4")
+        b = self.broker("b", "check", probe=tight, settle="4")
         time.sleep(2.0)
         self.assertFalse(self.started("b"), "b admitted inside the settle window")
         self.assert_started("b")
@@ -302,7 +304,8 @@ class Pure(unittest.TestCase):
     def load(self):
         keys = ("NUCLEOS_HEAVY_CAPACITY", "NUCLEOS_HEAVY_ADMISSION",
                 "NUCLEOS_HEAVY_MIN_AVAIL_MB", "NUCLEOS_HEAVY_MIN_IDLE_CORES",
-                "NUCLEOS_HEAVY_SETTLE_S", "NUCLEOS_HEAVY_FAKE_PROBE")
+                "NUCLEOS_HEAVY_SETTLE_S", "NUCLEOS_HEAVY_FAKE_PROBE",
+                "NUCLEOS_HEAVY_SETTLE_FREE_PCT")
         patcher = mock.patch.dict(os.environ, {}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -341,6 +344,21 @@ class Pure(unittest.TestCase):
         self.assertFalse(ok)
         ok, _ = c.dynamic_fit(1, self.probe(None), 0.0, 4, True)
         self.assertFalse(ok)
+        # Plenty free (20 of 32 GB, 10 of 12 cores idle): the settle window is waived.
+        ok, _ = c.dynamic_fit(1, self.probe(2), 0.0, 4, True)
+        self.assertTrue(ok)
+        # Under 25% free on either axis: the window applies again.
+        ok, _ = c.dynamic_fit(1, self.probe(2, avail=6000), 0.0, 4, True)
+        self.assertFalse(ok)
+        ok, _ = c.dynamic_fit(1, self.probe(10), 0.0, 4, True)
+        self.assertFalse(ok)
+        ok, _ = c.dynamic_fit(1, self.probe(10), 20.0, 4, True)
+        self.assertTrue(ok)
+        # The percentage is configurable: at 70%, 20 of 32 GB free is not enough.
+        os.environ["NUCLEOS_HEAVY_SETTLE_FREE_PCT"] = "70"
+        ok, _ = c.dynamic_fit(1, self.probe(2), 0.0, 4, True)
+        self.assertFalse(ok)
+        del os.environ["NUCLEOS_HEAVY_SETTLE_FREE_PCT"]
         # Nothing held: alone, whatever the probe says.
         ok, adm = c.dynamic_fit(0, self.probe(11.9, avail=10), 0.0, 4, False)
         self.assertTrue(ok)

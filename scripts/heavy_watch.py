@@ -199,6 +199,7 @@ def dynamic_state(held: list, cap: int) -> dict | None:
     min_avail = hc._env_pos("NUCLEOS_HEAVY_MIN_AVAIL_MB", 1536.0)
     min_idle = hc._env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0)
     settle = hc._env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0)
+    settle_on = hc.settle_needed(avail, idle, p)
     short = []
     if held:
         if len(held) >= cap:
@@ -207,10 +208,10 @@ def dynamic_state(held: list, cap: int) -> dict | None:
             short.append(f"RAM {avail / 1024:.1f} < {min_avail / 1024:.1f} GB")
         if idle is not None and idle < min_idle:
             short.append(f"idle {idle:.1f} < {min_idle:.1f} cores")
-        if since < settle:
+        if since < settle and settle_on:
             short.append(f"settle {since:.0f}s < {settle:.0f}s")
     return {"avail_mb": avail, "idle": idle, "since": since, "min_avail_mb": min_avail,
-            "min_idle": min_idle, "settle": settle, "short": short}
+            "min_idle": min_idle, "settle": settle, "settle_on": settle_on, "short": short}
 
 
 def dynamic_line(dyn: dict) -> str:
@@ -223,8 +224,9 @@ def dynamic_line(dyn: dict) -> str:
                    dyn["avail_mb"] >= dyn["min_avail_mb"])
             + "  " + (part(f"idle {idle:.1f}/{dyn['min_idle']:.1f} cores", idle >= dyn["min_idle"])
                       if idle is not None else f"{DIM}idle ?{RESET}")
-            + "  " + part("settle " + ("-" if since == float("inf") else f"{since:.0f}s")
-                          + f"/{dyn['settle']:.0f}s", since >= dyn["settle"]))
+            + "  " + (part("settle " + ("-" if since == float("inf") else f"{since:.0f}s")
+                           + f"/{dyn['settle']:.0f}s", since >= dyn["settle"])
+                      if dyn.get("settle_on", True) else f"{DIM}settle waived{RESET}"))
 
 
 def queue_reason(pos: int, rec: dict, used: int, cap: int, dyn: dict | None = None) -> str:

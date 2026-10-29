@@ -606,8 +606,8 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
 
     Nothing held: admitted ("alone"). Unreadable probe: the static weight-sum decision stands
     ("static_fallback"). Otherwise held COUNT must be under `ceiling` and the probe must show
-    room: free RAM, idle cores (skipped when busy_cores is unknown) and a settle window since
-    the last admission."""
+    room: free RAM, idle cores (skipped when busy_cores is unknown) and, only when that room is
+    close to the floors, a settle window since the last admission (see settle_needed)."""
     avail = None
     idle = None
     usable = isinstance(p, dict)
@@ -638,8 +638,23 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
         return False, adm("room")
     ok = (avail >= _env_pos("NUCLEOS_HEAVY_MIN_AVAIL_MB", 1536.0)
           and (idle is None or idle >= _env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0))
-          and since_admit_s >= _env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0))
+          and (not settle_needed(avail, idle, p)
+               or since_admit_s >= _env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0)))
     return ok, adm("room")
+
+
+def settle_needed(avail_mb: float, idle_cores: float | None, p: dict | None) -> bool:
+    """Whether the settle window applies. It exists because a job admitted a moment ago has not
+    ramped up yet, so the probe still shows the room it is about to take; that only matters
+    when the room is close to the floors. With plenty free -- at least NUCLEOS_HEAVY_SETTLE_FREE_PCT
+    (default 25) percent of both the machine's RAM and its logical cores -- the window is
+    waived; an unknown total, core count or idle count keeps it."""
+    p = p if isinstance(p, dict) else {}
+    total, logical = p.get("total_mb"), p.get("logical")
+    if idle_cores is None or not _num(total) or not _num(logical) or total <= 0 or logical <= 0:
+        return True
+    frac = _env_pos("NUCLEOS_HEAVY_SETTLE_FREE_PCT", 25.0) / 100.0
+    return avail_mb < frac * float(total) or idle_cores < frac * float(logical)
 
 
 def budget(p: dict) -> tuple[float, float, float]:
