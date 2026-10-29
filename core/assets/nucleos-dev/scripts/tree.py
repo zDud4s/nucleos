@@ -233,7 +233,9 @@ def branch_bind(args) -> dict:
     node_id = ts.check_id(args.node_id, "node id")
     if branch.get("node_id"):
         raise TreeError(f"branch {args.name!r} is already bound to node {branch['node_id']}")
-    if branch["state"] != "open":
+    # a docs branch has nothing to open (no worktree), so it binds straight from queued
+    allowed = ("open", "queued") if branch.get("layer") == "docs" else ("open",)
+    if branch["state"] not in allowed:
         raise TreeError(f"branch {args.name!r} is {branch['state']}: bind its node after `open` (state open)")
     for other in manifest["branches"].values():
         if other.get("node_id") == node_id:

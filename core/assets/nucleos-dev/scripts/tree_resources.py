@@ -119,6 +119,8 @@ def _norm(path):
 
 
 def _cost(cfg, m, layer):
+    if layer == "docs":  # a docs branch has no worktree and no target dir: it costs no disk
+        return 0.0
     measured = (m.get("costs_gb") or {}).get(layer)
     return float(measured) if measured is not None else float(cfg.get("seed_gb_per_layer", 8))
 
@@ -150,7 +152,9 @@ def compute_budget(cfg, m, project_root, free_gb):
     floor = float(cfg.get("floor_gb", 15))
     cap = int(cfg.get("max_live_branches", 4))
     branches = m.get("branches", {})
-    live = [b for b in branches.values() if b.get("state") in OPEN_STATES]
+    # docs branches take neither a slot nor disk, so the budget does not see them
+    live = [b for b in branches.values()
+            if b.get("state") in OPEN_STATES and b.get("layer") != "docs"]
 
     growth = 0.0
     for b in live:
@@ -178,7 +182,7 @@ def compute_budget(cfg, m, project_root, free_gb):
         room = cap - len(live)
         remaining = slack
         for name, b in branches.items():
-            if b.get("state") != "queued":
+            if b.get("state") != "queued" or b.get("layer") == "docs":
                 continue
             if not _ready(m, b):
                 reasons.append(f"{name}: waiting for base {b.get('base')} to be merged")
@@ -328,7 +332,12 @@ def _workflow_sync(worktree):
     if not core:
         return "skipped: no staged nucleos-core in the dev home run dir"
     rc, out = run([core, "--workflow-sync", str(worktree)], str(worktree))
-    return "ok" if rc == 0 else f"failed: {out or 'rc ' + str(rc)}; re-run it once the daemon is up"
+    if rc == 0:
+        return "ok"
+    if '"refusal"' in (out or "") and "no_project" in out:
+        return (f"failed: no_project (the daemon has no project registered for this tree); "
+                f"register the project, then re-run: {core} --workflow-sync {worktree}")
+    return f"failed: {out or 'rc ' + str(rc)}; re-run it once the daemon is up"
 
 
 def run_open(args):
@@ -341,6 +350,19 @@ def run_open(args):
         raise TreeError(f"branch {name!r} is {b.get('state')}, only a queued branch can be opened")
 
     root = m["project_root"]
+    if b.get("layer") == "docs":
+        # docs work happens in the feature checkout: no worktree, links, sync or target dir,
+        # and no disk-floor check since nothing is allocated
+        b.update(state="open", git_branch=None, worktree=None, target_dir=None)
+        save_manifest(tid, m)
+        return {
+            "branch": name, "worktree": None, "git_branch": None,
+            "env": {}, "skipped_links": [], "workflow_sync": "skipped: docs branch",
+            "orchestrator_piece": {
+                "branch": name, "layer": "docs", "paths": b.get("paths", []),
+                "worktree": None, "git_branch": None, "target_dir": None,
+            },
+        }
     free = _free(cfg, root)
     budget = compute_budget(cfg, m, root, free)
     _sample(m, free, "budget")

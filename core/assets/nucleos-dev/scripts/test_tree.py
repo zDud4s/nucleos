@@ -219,6 +219,13 @@ class BranchAdd(CliCase):
         self.assertIn("finished", self.refused("branch", "add", "z", "--paths", "z/**", "--layer", "l",
                                                "--tree", "root-1"))
 
+    def test_a_docs_branch_needs_no_base(self):
+        # F1-DOCS: the docs layer is queued with no --base and stays unbased.
+        out = self.branch("notes", "docs/notes/**", layer="docs")
+        self.assertEqual((out["state"], out["base"]), ("queued", None))
+        stored = ts.load_manifest("root-1")["branches"]["notes"]
+        self.assertEqual((stored["layer"], stored["base"]), ("docs", None))
+
     def test_no_branch_is_added_while_the_tree_is_parked(self):
         self.edit(lambda m: m.update(state="parked"))
         self.assertIn("parked", self.refused("branch", "add", "z", "--paths", "z/**", "--layer", "l"))
@@ -491,6 +498,15 @@ class BranchLifecycle(CliCase):
         self.branch("ui", "ui/**", layer="shell")
         self.set_branch("ui", state="open")
         self.assertIn("n-core", self.refused("branch", "bind", "ui", "--node-id", "n-core"))
+
+    def test_a_docs_branch_binds_straight_from_queued(self):
+        # F1-DOCS: a docs branch has no `open` step (no worktree), so bind accepts `queued`.
+        self.branch("notes", "docs/notes/**", layer="docs")
+        out = self.ok("branch", "bind", "notes", "--node-id", "n-notes")
+        self.assertEqual((out["state"], out["node_id"]), ("building", "n-notes"))
+        self.assertEqual(self.branch_state("notes")["state"], "building")
+        # a non-docs queued branch is still refused
+        self.assertIn("open", self.refused("branch", "bind", "core", "--node-id", "n-core"))
 
     def test_dropping_a_branch_without_a_node_frees_its_paths(self):
         out = self.ok("branch", "drop", "core", "--reason", "scope cut")
