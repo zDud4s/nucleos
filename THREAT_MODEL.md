@@ -207,6 +207,28 @@ A council is the first trigger that fans ONE owner sentence into up to nine mode
 
 Open items for this pillar: gaps 11 and 12.
 
+## Remote access
+
+Remote access (`~/.nucleos/remote.yaml`, off until `enabled: true`) lets the owner use the shell from another device's browser over their Tailscale tailnet. Operating steps are in `docs/remote-access.md`; this section is the fence. The daemon and all processing stay on the host; the other device renders an interface.
+
+**Assets.** What a stolen or abused session can reach: the agents (runs, chats, councils), the project files and knowledge the owner's shell reaches, and the mail and calendar tools. What it must never reach: the control token, API tokens, machine config and secrets, backups, the daemon's shutdown and update handshake, sidecar control, and remote management itself.
+
+**The tailnet is reachability, not authentication.** Anyone on the tailnet, or a compromised tailnet device, can open the page. The `Tailscale-*` identity headers are never trusted: the gateway strips them, along with inbound `Authorization`, `Cookie`, `X-Forwarded-*` and `X-Nucleos-*`, and nothing downstream reads them. Access is decided by a pairing code and the device session it buys. Funnel must stay off; a public hostname would turn the next two paragraphs into the only defence.
+
+**The gateway's key reaches only pairing.** `sidecars/remote` runs supervised, only while remote is enabled, with a cleared environment, bound to `127.0.0.1:8797`. It holds the `remote` service key, and `REMOTE_GATEWAY_ROUTES` in `core/src/auth.rs` gives that key `POST /remote/pair` and nothing else. Every other call carries the browser's own session, which the daemon authenticates; a compromised gateway can proxy but cannot act as the owner. Pairing codes are `XXXXX-XXXXX`, valid 5 minutes, single use, burned by 5 wrong guesses, stored as sha256. Sessions last 30 days absolute and 14 days idle, and only hashes are stored.
+
+**Cookie and cross-site requests.** The session cookie is `__Host-nucleos_session`: HttpOnly, Secure, SameSite=Strict, Path `/`, no Domain. Every `/api/*` and `/auth/*` request must also pass: `Origin` equal to `public_origin` on unsafe methods, `Host` equal to it (421 otherwise), `Sec-Fetch-Site` not `cross-site`, and the `X-Nucleos-Csrf: 1` header. The page ships a strict CSP with a per-request style nonce.
+
+**Access levels.** A device is read-only, run-creating or admin, graded as the API token of that level inside `REMOTE_ALLOWED_SEGMENTS`. `REMOTE_ADMIN_SEGMENTS` (chats under `assistant`, files, knowledge, teams, mail, calendar and the like) are reachable only by an admin device. **Owner decision 2026-10-29: an admin device is the owner working from another machine.** **Residual:** a stolen admin session works the agents and the files like the owner until it is revoked. What bounds it: revocation in Settings, the 14-day idle and 30-day absolute expiry, and the hard-deny set, which holds for every level: `daemon`, `system`, `config`, `backup`/`backups`, `api-tokens`, `sidecars`, `channels`, `remote` and `browser`, plus `POST /assistant/browser-agents`, which would start a browser on the host, and the email sidecar's ingestion routes (`POST /email/incoming`, `GET /email/cursor`), which would let a device inject forged inbound mail (`REMOTE_DEVICE_REFUSED_ROUTES`). **Accepted:** a chat turn an admin device starts is an ordinary agent run, so its own key may still drive a host browser session through the chat-browser door, and the device reads the result in the transcript, exactly as the owner would at the host. The `browser` deny keeps the device off the live pixels and the browser controls, not the agent off its tools. Secrets, tokens, backups, shutdown and remote management therefore stay host-only. A device cannot mint a longer-lived credential or another device.
+
+**New route families are closed by default.** `remote_device_permits` is an allow-list on the first path segment; an unlisted family is refused. A guard test fails on a route prefix in none of the allowed, admin and denied lists, so adding an endpoint family forces a decision.
+
+**Revocation reaches open streams.** The gateway cuts any response of unknown length (SSE) at `stream_max_seconds` (default 120, 10 to 900), so a revoked device loses an open stream within that bound. Request bodies must arrive within a 30 s read deadline (`BodyReadTimeout`), which bounds a slow client holding a connection; it is set before any refusal, so a refused request's unread body cannot hold the connection during net/http's drain either.
+
+**Code burning from inside the tailnet.** Pairing is rate-limited to 10 per minute, and 5 wrong guesses burn a code. A hostile tailnet device can therefore burn the owner's pending code by guessing, which costs the owner a new code and nothing more. It cannot learn the code at the guess rate allowed.
+
+**Deferred.** Passkeys (a device-bound credential in place of a typed code) are not built; until they are, the typed code and the session cookie are the whole proof.
+
 ## Known gaps
 
 Numbers are stable — code comments cite them (`core/src/integrations/email.rs` cites 6, `core/src/execution/runner.rs` cites 7). A closed gap keeps its number and says so.

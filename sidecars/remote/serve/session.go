@@ -43,7 +43,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // sessionCookie builds the cookie of the contract. maxAge < 0 clears it.
-func sessionCookie(cfg config.Config, value string, maxAge int) *http.Cookie {
+func sessionCookie(value string, maxAge int) *http.Cookie {
 	return &http.Cookie{
 		Name:     CookieName,
 		Value:    value,
@@ -56,7 +56,7 @@ func sessionCookie(cfg config.Config, value string, maxAge int) *http.Cookie {
 }
 
 // clearedCookie expires the session cookie in the browser.
-func clearedCookie(cfg config.Config) *http.Cookie { return sessionCookie(cfg, "", -1) }
+func clearedCookie() *http.Cookie { return sessionCookie("", -1) }
 
 // validSecret reports whether a session secret is safe to place in a header and a cookie.
 func validSecret(s string) bool {
@@ -185,17 +185,19 @@ type deviceInfo struct {
 
 // authHandler serves /auth/*.
 type authHandler struct {
-	cfg config.Config
-	d   *daemonClient
-	lim *limiter
+	cfg         config.Config
+	d           *daemonClient
+	lim         *limiter
+	bodyTimeout time.Duration
 }
 
 // NewAuth builds the /auth/* handler.
 func NewAuth(cfg config.Config) http.Handler {
-	return &authHandler{cfg: cfg, d: newDaemonClient(cfg), lim: newLimiter(pairLimit, pairWindow)}
+	return &authHandler{cfg: cfg, d: newDaemonClient(cfg), lim: newLimiter(pairLimit, pairWindow), bodyTimeout: BodyReadTimeout}
 }
 
 func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	boundBodyRead(w, r, a.bodyTimeout)
 	switch r.URL.Path {
 	case "/auth/pair":
 		a.pair(w, r)
@@ -209,7 +211,7 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *authHandler) sessionLost(w http.ResponseWriter) {
-	http.SetCookie(w, clearedCookie(a.cfg))
+	http.SetCookie(w, clearedCookie())
 	writeJSONError(w, http.StatusUnauthorized, refusalSessionInvalid)
 }
 
@@ -253,7 +255,7 @@ func (a *authHandler) pair(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// The secret travels only in this header; the body below is rebuilt field by field.
-		http.SetCookie(w, sessionCookie(a.cfg, out.Session, a.cfg.CookieMaxAge))
+		http.SetCookie(w, sessionCookie(out.Session, a.cfg.CookieMaxAge))
 		writeJSON(w, http.StatusOK, out.deviceInfo)
 	case http.StatusUnauthorized:
 		if refusalOf(data) == refusalInvalidCode {
@@ -310,6 +312,6 @@ func (a *authHandler) logout(w http.ResponseWriter, r *http.Request) {
 		// be revoked here can still be revoked from the desktop.
 		_, _, _ = a.d.call(r.Context(), http.MethodPost, "/remote/logout", nil, secret)
 	}
-	http.SetCookie(w, clearedCookie(a.cfg))
+	http.SetCookie(w, clearedCookie())
 	w.WriteHeader(http.StatusNoContent)
 }

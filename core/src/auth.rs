@@ -636,8 +636,9 @@ const REMOTE_SELF_ROUTES: &[(Method, &str)] = &[
 
 /// The ONLY first path segments a remote device may reach. Derived from what the phone UI calls:
 /// the read tables' families (status, health, projects, runs, ...) plus the run-launching ones
-/// (`jobs`, `presets`), and the VCS queue (`vcs`, owner's call 2026-10-28). Everything else is refused to every level, Admin included; a new route
-/// family is therefore closed to devices until someone adds it here on purpose.
+/// (`jobs`, `presets`), and the VCS queue (`vcs`, owner's call 2026-10-28). Everything else is refused to read-only and run-creating devices; an
+/// Admin device additionally reaches [`REMOTE_ADMIN_SEGMENTS`]. A new route family is therefore
+/// closed to devices until someone adds it to one of the lists on purpose.
 ///
 /// Within an allowed segment the device is still graded as the API token of its level, so a
 /// read-only device never reaches a write even under `projects`.
@@ -660,89 +661,114 @@ const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
     "vcs",
 ];
 
-/// First path segments known to be refused to every remote device, written out so the
-/// classification is total: the guard test fails on a route prefix in neither this list nor
-/// [`REMOTE_ALLOWED_SEGMENTS`]. Each is owner-only or host-local by nature: the shutdown/update
-/// handshake (`daemon`, `system`), machine settings and secrets (`config`), backups, credential
-/// minting (`api-tokens`), sidecar control (`sidecars`), messaging identity pairing (`channels`),
-/// the whole remote owner surface including `/remote/pair` (`remote`), live browser pixels
-/// (`browser`), host files (`files`), tool loadout and hook management (`loadout`, `hooks`), and the
-/// integrations/assistant/team surfaces a phone has no business with. `remote_device_permits`
-/// refuses these and anything unlisted alike; the list exists so that choice is always explicit.
-/// `home` was Admin-only before remote access existed; devices stay out until the owner allows it.
-/// `tasks` is the claim board agent sessions coordinate through; a device takes no part in it.
-/// Only the guard test reads it, since the gate itself is an allow-list.
-#[cfg_attr(not(test), allow(dead_code))]
-const REMOTE_DENIED_SEGMENTS: &[&str] = &[
-    "admission",
+/// First path segments reachable ONLY by an Admin-level device (owner decision 2026-10-29: an
+/// admin device is the owner working from another machine, with everything still running on the
+/// host). These are the families the desktop shell calls to do its work (chats under `assistant`,
+/// files, knowledge, teams, mail, calendar, voice, ...). Read-only and run-creating devices never
+/// reach them. An admin device is still graded by `grants(&Scope::ApiToken(Admin), ..)`. An explicit
+/// list, so a new route family stays closed to devices until someone adds it here on purpose.
+const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "agents",
-    "api-tokens",
     "assistant",
-    "backup",
-    "backups",
-    "browser",
     "calendar",
-    "capture-digests",
     "capture-requests",
-    "channels",
-    "chats",
-    "config",
     "contacts",
-    "context",
     "context-refs",
     "council",
-    "daemon",
     "distill",
     "email",
     "files",
     "github",
     "home",
-    "hooks",
     "judge-resolutions",
     "judge-verdicts",
     "knowledge",
     "loadout",
-    "models",
-    "nodes",
     "notifications",
     "owner-notes",
     "pii",
-    "pricing",
     "quota",
+    "team-actions",
+    "team-runs",
+    "team-triggers",
+    "teams",
+    "themes",
+    "voice",
+    "waiting",
+    "web",
+    "workflows",
+    "worktrees",
+];
+
+/// First path segments refused to every remote device whatever its level (the hard-deny set, plus
+/// families the shell never calls), written out so the classification is total: the guard test
+/// fails on a route prefix in none of [`REMOTE_ALLOWED_SEGMENTS`], [`REMOTE_ADMIN_SEGMENTS`] and
+/// this list. The hard-deny set is host-only by nature: the shutdown/update handshake (`daemon`,
+/// `system`), machine settings and secrets (`config`), backups (`backup`, `backups`), credential
+/// minting (`api-tokens`), sidecar control (`sidecars`), messaging identity pairing (`channels`),
+/// the whole remote owner surface including `/remote/pair` (`remote`) and live browser pixels
+/// (`browser`). The rest are families the desktop shell never calls over the API (`chats` is only a
+/// shell page route; the chat API is `assistant`). `tasks` is the claim board agent sessions
+/// coordinate through; a device takes no part in it. `remote_device_permits` refuses these and
+/// anything unlisted alike; the list exists so that choice is always explicit. Only the guard test
+/// reads it, since the gate itself is an allow-list.
+#[cfg_attr(not(test), allow(dead_code))]
+const REMOTE_DENIED_SEGMENTS: &[&str] = &[
+    "admission",
+    "api-tokens",
+    "backup",
+    "backups",
+    "browser",
+    "capture-digests",
+    "channels",
+    "chats",
+    "config",
+    "context",
+    "daemon",
+    "hooks",
+    "models",
+    "nodes",
+    "pricing",
     "remote",
     "sidecars",
     "system",
     "tasks",
-    "team-actions",
     "team-files",
     "team-notes",
     "team-pressure",
     "team-recruits",
     "team-reports",
-    "team-runs",
-    "team-triggers",
-    "teams",
-    "themes",
     "v1",
     "verify",
-    "voice",
-    "waiting",
-    "web",
     "webhooks",
     "workflow",
-    "workflows",
-    "worktrees",
+];
+
+/// Routes inside admin segments that no device reaches, whatever its level. `POST
+/// /assistant/browser-agents` starts a browser on the host, the host-only surface the `browser`
+/// deny covers (listing linked browser conversations, `GET`, stays open). `/email/incoming` and
+/// `/email/cursor` are the email sidecar's ingestion surface, not a working surface: a device
+/// reaching them could inject forged inbound mail into triage.
+const REMOTE_DEVICE_REFUSED_ROUTES: &[(Method, &str)] = &[
+    (Method::POST, CHAT_BROWSER_AGENT_ROUTE),
+    (Method::POST, "/email/incoming"),
+    (Method::GET, "/email/cursor"),
 ];
 
 /// What a request carried by a paired remote device may reach. Matched against the route template.
 ///
 /// 1. [`REMOTE_SELF_ROUTES`] are open to every level.
-/// 2. A route whose first segment is not in [`REMOTE_ALLOWED_SEGMENTS`] is refused, whatever the
-///    level (allow-list; [`REMOTE_DENIED_SEGMENTS`] documents the known-refused ones).
-/// 3. Otherwise the device is graded as the API token of the same level (`grants`): read-only gets
-///    `READ_ONLY_ROUTES`, run-creating adds `RUN_CREATING_ROUTES`, admin gets everything under the
-///    allowed segments. Routes in no table (Control/Admin-only) are unreachable to read-only and
-///    run-creating devices automatically.
+/// 2. A first segment in [`REMOTE_ALLOWED_SEGMENTS`] is graded as the API token of the same level
+///    (`grants`): read-only gets `READ_ONLY_ROUTES`, run-creating adds `RUN_CREATING_ROUTES`,
+///    admin gets everything under the segment.
+/// 3. A first segment in [`REMOTE_ADMIN_SEGMENTS`] is reachable only by an Admin device, graded as
+///    the Admin token (owner decision 2026-10-29: the owner working from another machine).
+/// 4. Anything else is refused, whatever the level: the hard-deny set in
+///    [`REMOTE_DENIED_SEGMENTS`] (shutdown/update, machine settings and secrets, backups,
+///    credential minting, sidecar control, messaging identity pairing, the remote owner surface,
+///    host-only live browser pixels) and any unlisted family.
+///
+/// A few routes inside admin segments stay refused: see [`REMOTE_DEVICE_REFUSED_ROUTES`].
 pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str) -> bool {
     if REMOTE_SELF_ROUTES
         .iter()
@@ -750,15 +776,29 @@ pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str)
     {
         return true;
     }
+    if REMOTE_DEVICE_REFUSED_ROUTES
+        .iter()
+        .any(|(refused, pattern)| refused == method && *pattern == route)
+    {
+        return false;
+    }
     let first = route
         .trim_start_matches('/')
         .split('/')
         .next()
         .unwrap_or("");
-    if !REMOTE_ALLOWED_SEGMENTS.contains(&first) {
-        return false;
+    if REMOTE_ALLOWED_SEGMENTS.contains(&first) {
+        return grants(&Scope::ApiToken(level), method, route, Target::Route);
     }
-    grants(&Scope::ApiToken(level), method, route, Target::Route)
+    if level == ApiTokenLevel::Admin && REMOTE_ADMIN_SEGMENTS.contains(&first) {
+        return grants(
+            &Scope::ApiToken(ApiTokenLevel::Admin),
+            method,
+            route,
+            Target::Route,
+        );
+    }
+    false
 }
 
 /// Request extension set when the caller is a paired remote device: which one. Handlers that need
@@ -2127,20 +2167,159 @@ mod tests {
         ));
     }
 
-    /// An Admin device is no longer graded by a deny-list: `loadout`, `hooks` and `files` were open
-    /// to it and are now refused, as is any route family nobody listed.
+    /// An Admin device is graded by explicit lists, not a deny-list: `hooks` and any route family
+    /// nobody listed are refused to every level. (`loadout` and `files` moved to
+    /// [`REMOTE_ADMIN_SEGMENTS`] on 2026-10-29, so they are refused only below Admin; see
+    /// `remote_non_admin_devices_do_not_reach_admin_segments`.)
     #[test]
-    fn remote_admin_device_is_refused_loadout_hooks_files_and_unlisted_families() {
+    fn remote_admin_device_is_refused_hooks_and_unlisted_families() {
         for level in ALL_LEVELS {
+            for (method, route) in [
+                (Method::GET, "/hooks"),
+                (Method::POST, "/hooks/{id}"),
+                (Method::GET, "/brand-new-family/x"),
+                (Method::GET, "/"),
+            ] {
+                assert!(
+                    !remote_device_permits(level, &method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+        }
+    }
+
+    /// Real route templates of working surfaces an Admin device reaches (owner decision
+    /// 2026-10-29): chat API (`assistant`), files, knowledge.
+    const REMOTE_ADMIN_WORKING_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/assistant/chats"),
+        ("POST", "/assistant/chats"),
+        ("GET", "/assistant/chats/{chat_id}"),
+        ("POST", "/assistant/chats/{chat_id}/relay"),
+        ("GET", "/files"),
+        ("GET", "/files/download"),
+        ("POST", "/files/folder"),
+        ("POST", "/files/upload"),
+        ("GET", "/knowledge"),
+        ("POST", "/knowledge/recall"),
+        ("POST", "/knowledge/{id}/revert"),
+        ("GET", "/team-runs"),
+    ];
+
+    #[test]
+    fn remote_admin_device_reaches_working_surfaces_but_not_the_hard_deny_set() {
+        for (method, route) in REMOTE_ADMIN_WORKING_ROUTES {
+            assert!(
+                remote_device_permits(
+                    ApiTokenLevel::Admin,
+                    &Method::from_bytes(method.as_bytes()).unwrap(),
+                    route
+                ),
+                "Admin {method} {route}"
+            );
+        }
+        for (method, route) in [
+            ("POST", "/daemon/shutdown"),
+            ("POST", "/daemon/update"),
+            ("POST", "/system/shutdown"),
+            ("POST", "/system/storage/compact"),
+            ("GET", "/config/secrets"),
+            ("DELETE", "/config/secrets/{key}"),
+            ("GET", "/api-tokens"),
+            ("POST", "/api-tokens"),
+            ("DELETE", "/api-tokens/{name}"),
+            ("GET", "/remote/devices"),
+            ("DELETE", "/remote/devices/{id}"),
+            ("POST", "/remote/pairing-codes"),
+            ("POST", "/remote/pair"),
+            ("POST", "/sidecars/{name}/restart"),
+            ("POST", "/channels/{channel}/pairing"),
+            ("GET", "/browser/sessions/{id}/live"),
+            ("POST", "/browser/open"),
+            ("POST", "/backup"),
+            ("GET", "/backups"),
+            ("POST", "/backups/{name}/restore"),
+            ("POST", "/assistant/browser-agents"),
+            ("POST", "/email/incoming"),
+            ("GET", "/email/cursor"),
+        ] {
+            assert!(
+                !remote_device_permits(
+                    ApiTokenLevel::Admin,
+                    &Method::from_bytes(method.as_bytes()).unwrap(),
+                    route
+                ),
+                "Admin {method} {route}"
+            );
+        }
+    }
+
+    /// Each refusal inside an admin segment names a route the daemon really registers and is
+    /// refused at every level: a renamed handler must not leave a refusal pointing at nothing while
+    /// the new path falls through to the admin grant.
+    #[test]
+    fn remote_refused_routes_are_registered_and_refused_at_every_level() {
+        fn collect(dir: &std::path::Path, routes: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(&path, routes);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let cut = source
+                    .match_indices("#[cfg(test)]")
+                    .find(|(at, attr)| source[at + attr.len()..].trim_start().starts_with("mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                for part in source[..cut].split(".route(").skip(1) {
+                    if let Some(literal) = part.trim_start().strip_prefix('"') {
+                        routes.push(literal.chars().take_while(|c| *c != '"').collect());
+                    }
+                }
+            }
+        }
+
+        let mut registered = Vec::new();
+        collect(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/http"),
+            &mut registered,
+        );
+        for (method, route) in REMOTE_DEVICE_REFUSED_ROUTES {
+            assert!(
+                registered.iter().any(|r| r == route),
+                "{method} {route} is refused to devices but no handler registers it"
+            );
+            for level in [
+                ApiTokenLevel::ReadOnly,
+                ApiTokenLevel::RunCreating,
+                ApiTokenLevel::Admin,
+            ] {
+                assert!(
+                    !remote_device_permits(level, method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_non_admin_devices_do_not_reach_admin_segments() {
+        for level in [ApiTokenLevel::ReadOnly, ApiTokenLevel::RunCreating] {
+            for (method, route) in REMOTE_ADMIN_WORKING_ROUTES {
+                assert!(
+                    !remote_device_permits(
+                        level,
+                        &Method::from_bytes(method.as_bytes()).unwrap(),
+                        route
+                    ),
+                    "{level:?} {method} {route}"
+                );
+            }
             for (method, route) in [
                 (Method::GET, "/loadout/tools"),
                 (Method::POST, "/loadout/tools/{id}/approve"),
-                (Method::GET, "/hooks"),
-                (Method::POST, "/hooks/{id}"),
-                (Method::GET, "/files"),
-                (Method::GET, "/files/download"),
-                (Method::GET, "/brand-new-family/x"),
-                (Method::GET, "/"),
             ] {
                 assert!(
                     !remote_device_permits(level, &method, route),
@@ -2277,17 +2456,62 @@ mod tests {
             .iter()
             .filter(|segment| {
                 !REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str())
+                    && !REMOTE_ADMIN_SEGMENTS.contains(&segment.as_str())
                     && !REMOTE_DENIED_SEGMENTS.contains(&segment.as_str())
             })
             .collect();
         assert!(
             unclassified.is_empty(),
-            "route prefixes in neither REMOTE_ALLOWED_SEGMENTS nor REMOTE_DENIED_SEGMENTS: {unclassified:?}"
+            "route prefixes in none of REMOTE_ALLOWED_SEGMENTS, REMOTE_ADMIN_SEGMENTS, REMOTE_DENIED_SEGMENTS: {unclassified:?}"
         );
+        for segment in found.iter() {
+            let hits = [
+                REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str()),
+                REMOTE_ADMIN_SEGMENTS.contains(&segment.as_str()),
+                REMOTE_DENIED_SEGMENTS.contains(&segment.as_str()),
+            ]
+            .iter()
+            .filter(|hit| **hit)
+            .count();
+            assert_eq!(hits, 1, "{segment} must be in exactly one list");
+        }
+    }
+
+    /// The three lists are pairwise disjoint, and the hard-deny set (owner decision 2026-10-29)
+    /// never leaks into the allowed or admin lists.
+    #[test]
+    fn remote_segment_lists_are_disjoint_and_the_hard_deny_set_stays_denied() {
         for segment in REMOTE_ALLOWED_SEGMENTS {
             assert!(
                 !REMOTE_DENIED_SEGMENTS.contains(segment),
-                "{segment} is in both lists"
+                "{segment} is in allowed and denied"
+            );
+            assert!(
+                !REMOTE_ADMIN_SEGMENTS.contains(segment),
+                "{segment} is in allowed and admin"
+            );
+        }
+        for segment in REMOTE_ADMIN_SEGMENTS {
+            assert!(
+                !REMOTE_DENIED_SEGMENTS.contains(segment),
+                "{segment} is in admin and denied"
+            );
+        }
+        for segment in [
+            "daemon",
+            "system",
+            "config",
+            "backup",
+            "backups",
+            "api-tokens",
+            "sidecars",
+            "channels",
+            "remote",
+            "browser",
+        ] {
+            assert!(
+                REMOTE_DENIED_SEGMENTS.contains(&segment),
+                "{segment} must stay hard-denied"
             );
         }
     }

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/brand/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NucleOS</title>
+
+    <!--
+      The nonce channel, as in index.html, with the gateway standing in for Tauri: it replaces the
+      literal __CSP_NONCE__ with a fresh value on every request and sends the same value in
+      `style-src 'nonce-…'`. `src/lib/style-nonce.ts` reads it from here. Do not remove or fill it.
+    -->
+    <style nonce="__CSP_NONCE__"></style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/remote/main.tsx"></script>
+  </body>
+</html>

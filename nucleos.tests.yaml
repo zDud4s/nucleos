@@ -17,6 +17,11 @@ tests:
           expr: 'test(/^channels::/)'
         - paths: [core/src/execution/job/**]
           expr: 'test(/^execution::job::/)'
+        # Remote access: the config/pairing module and its owner/device routes. The Go gateway
+        # (sidecars/remote/) and the remote shell (shell/src/remote/) are already covered by the
+        # sidecars and shell groups' path prefixes.
+        - paths: [core/src/remote.rs, core/src/http/remote.rs]
+          expr: 'test(/^remote::/) | test(/^http::remote::/)'
     sidecars:
       paths: [sidecars/, scripts/build-sidecars.sh]
       command: bash scripts/gates.sh sidecars

@@ -1,5 +1,7 @@
 import type { ApiRefusal } from "../data/client";
 import { DAEMON_NAME } from "../copy";
+import { isRemote } from "../remote/host";
+import { UnavailableRemotely } from "../remote/UnavailableRemotely";
 
 /**
  * Sentences for the refusals every page can meet.
@@ -64,6 +66,9 @@ export interface RefusalNoteProps {
  * step at which this renders "request failed".
  */
 export function RefusalNote({ refusal, sentences }: RefusalNoteProps) {
+  // A route family the gateway keeps from remote devices: an explicit state, not a bare refusal.
+  if (isRemote() && refusal.status === 403) return <UnavailableRemotely feature="This page" />;
+
   const named = sentences?.[refusal.code] ?? SENTENCES[refusal.code];
   const detail = refusal.detail.trim();
   // The daemon repeats the code as the detail when the code is all it sent;

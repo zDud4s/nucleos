@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
+import { isRemote } from "../remote/host";
 import { startBrowserBridge, useBrowserStore } from "../data/browser-store";
 
 /**
@@ -19,7 +20,8 @@ export function BrowserBridge() {
   const { focusIntent } = useBrowserStore();
   const handled = useRef<number | null>(null);
 
-  useEffect(() => startBrowserBridge(), []);
+  // The native browser exists only on the host; remotely its 1 s poll would just collect refusals.
+  useEffect(() => (isRemote() ? undefined : startBrowserBridge()), []);
 
   useEffect(() => {
     if (focusIntent === null) return;

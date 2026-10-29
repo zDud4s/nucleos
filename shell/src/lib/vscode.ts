@@ -1,4 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { isRemote } from "../remote/host";
 
 /**
  * The door to the editor.
@@ -84,5 +85,7 @@ export function vscodeUrl(absolutePath: string, line: number | null): string {
  * different sentences, and neither of them is a stack trace.
  */
 export function openInVscode(absolutePath: string, line: number | null): Promise<void> {
+  // VS Code runs on the host machine, not beside a browser tab: inert remotely.
+  if (isRemote()) return Promise.resolve();
   return openUrl(vscodeUrl(absolutePath, line));
 }

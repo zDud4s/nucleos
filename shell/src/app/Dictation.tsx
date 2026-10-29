@@ -8,6 +8,7 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { isRemote } from "../remote/host";
 import {
   finishCapture,
   startCapture,
@@ -217,7 +218,8 @@ export function DictationProvider({ children }: { children: ReactNode }) {
   }
 
   async function press(memo: boolean) {
-    if (pending) return;
+    // No microphone chord or paste host behind a browser tab: the buttons are inert there.
+    if (pending || isRemote()) return;
     setPending(true);
     try {
       const result = await invoke<"recording" | "transcribing" | "busy">(

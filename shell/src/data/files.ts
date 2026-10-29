@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { localDataDir } from "@tauri-apps/api/path";
 import { openPath } from "@tauri-apps/plugin-opener";
+import { isRemote } from "../remote/host";
 import { apiBlob, apiFetch, apiText } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
@@ -436,6 +437,8 @@ export function runsOnOpen(name: string): boolean {
 export async function openFile(relative: string): Promise<void> {
   // The page asks `runsOnOpen` first and says why; this is the floor under it.
   if (runsOnOpen(relative)) throw new Error("a program is never run from the files folder");
+  // The files live on the host's disk; the caller prints this after "Could not open it".
+  if (isRemote()) throw new Error("opening a file on disk is only available on the host machine");
   await openPath(await diskPath(relative));
 }
 

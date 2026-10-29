@@ -2,6 +2,8 @@ import { Navigate, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useBrowserHealth, useBrowserSessions } from "../data/browser";
 import { useFocusNonce } from "../data/browser-store";
+import { isRemote } from "../remote/host";
+import { UnavailableRemotely } from "../remote/UnavailableRemotely";
 import { Count, StateBadge } from "../ui";
 import { AgentPanel } from "./AgentPanel";
 import { Browser } from "./Browser";
@@ -93,6 +95,9 @@ export function WebTabs() {
       </button>
     </div>
   );
+
+  // The embedded browser is a native webview on the host: nothing to mount beside a browser tab.
+  if (isRemote()) return <UnavailableRemotely feature="The browser" />;
 
   return (
     <div className="web-split">

@@ -220,6 +220,25 @@ if (Test-Path -LiteralPath $srcDir) {
     }
 }
 
+# The remote shell build: the gateway serves <dir of daemon exe>\dist-remote unless remote.yaml
+# names a dist_dir (core/src/main.rs). Mirrored, not merged, so a stale hashed asset never lingers.
+# Built separately (`npm --prefix shell run build:remote`) so a daemon restart costs no vite build.
+$distSrc = Join-Path $RepoRoot 'shell\dist-remote'
+$distDst = Join-Path $RunDir 'dist-remote'
+$staged = 0
+if (Test-Path -LiteralPath (Join-Path $distSrc 'index.html')) {
+    if (Test-Path -LiteralPath $distDst) { Remove-Item -LiteralPath $distDst -Recurse -Force }
+    Copy-Item -LiteralPath $distSrc -Destination $distDst -Recurse -Force
+    $staged = 1
+}
+else {
+    $remoteYaml = Join-Path $env:USERPROFILE '.nucleos\remote.yaml'
+    if ((Test-Path -LiteralPath $remoteYaml) -and (Select-String -LiteralPath $remoteYaml -Pattern '^\s*enabled:\s*true\b' -Quiet)) {
+        [Console]::Error.WriteLine("run-daemon: WARNING: remote.yaml enables remote access but $distSrc has no index.html; " +
+            "run 'npm --prefix shell run build:remote' or the gateway answers 404 at /")
+    }
+}
+
 $head = ''
 try {
     $prev = $ErrorActionPreference
@@ -232,7 +251,7 @@ catch { $head = '' }
 $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $note = @("repo: $RepoRoot", "commit: $head", "source: $out", "built: $stamp")
 Set-Content -LiteralPath (Join-Path $RunDir 'built-from.txt') -Value $note -Encoding ASCII
-$count = 1 + $sidecars.Count + 1
+$count = 1 + $sidecars.Count + 1 + $staged
 Write-Output "staged $count files into $RunDir"
 if ($NoStart) { exit 0 }
 

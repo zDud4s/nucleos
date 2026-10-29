@@ -34,8 +34,9 @@ func newTransport() *http.Transport {
 // apiHandler serves /api/*: it authenticates nothing itself, it carries the cookie to the daemon,
 // which decides on every request.
 type apiHandler struct {
-	cfg config.Config
-	rp  *httputil.ReverseProxy
+	cfg         config.Config
+	rp          *httputil.ReverseProxy
+	bodyTimeout time.Duration
 }
 
 // NewAPI builds the /api/* reverse proxy.
@@ -44,7 +45,7 @@ func NewAPI(cfg config.Config) (http.Handler, error) {
 	if err != nil || target.Host == "" {
 		return nil, fmt.Errorf("daemon URL: not a valid URL")
 	}
-	h := &apiHandler{cfg: cfg}
+	h := &apiHandler{cfg: cfg, bodyTimeout: BodyReadTimeout}
 	h.rp = &httputil.ReverseProxy{
 		Rewrite:        func(pr *httputil.ProxyRequest) { h.rewrite(pr, target) },
 		ModifyResponse: h.modifyResponse,
@@ -57,6 +58,9 @@ func NewAPI(cfg config.Config) (http.Handler, error) {
 }
 
 func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Bounded before the early refusals below: their unread body is drained after the handler
+	// returns, and that drain must not wait on a slow client either.
+	boundBodyRead(w, r, h.bodyTimeout)
 	p := r.URL.Path
 	// The daemon refuses /remote/* to a device anyway; the owner surface is not even forwarded.
 	if p == "/api/remote" || strings.HasPrefix(p, "/api/remote/") {
@@ -117,10 +121,10 @@ func (h *apiHandler) modifyResponse(resp *http.Response) error {
 	if resp.StatusCode == http.StatusUnauthorized {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxDaemonAnswer))
 		if refusalOf(body) == refusalSessionInvalid {
-			synthesize(resp, http.StatusUnauthorized, refusalSessionInvalid, h.cfg, true)
+			synthesize(resp, http.StatusUnauthorized, refusalSessionInvalid, true)
 		} else {
 			// The daemon refused the gateway's own key: not something the browser can fix.
-			synthesize(resp, http.StatusBadGateway, "gateway_credential_rejected", h.cfg, false)
+			synthesize(resp, http.StatusBadGateway, "gateway_credential_rejected", false)
 		}
 		return nil
 	}
@@ -143,7 +147,7 @@ func (h *apiHandler) errorHandler(w http.ResponseWriter, _ *http.Request, err er
 
 // synthesize replaces an upstream response with a gateway-authored JSON error. Nothing of the
 // upstream headers survives.
-func synthesize(resp *http.Response, status int, code string, cfg config.Config, clear bool) {
+func synthesize(resp *http.Response, status int, code string, clear bool) {
 	_ = resp.Body.Close()
 	body, _ := json.Marshal(map[string]string{"error": code})
 	body = append(body, '\n')
@@ -154,7 +158,7 @@ func synthesize(resp *http.Response, status int, code string, cfg config.Config,
 		"Content-Length": {strconv.Itoa(len(body))},
 	}
 	if clear {
-		resp.Header.Add("Set-Cookie", clearedCookie(cfg).String())
+		resp.Header.Add("Set-Cookie", clearedCookie().String())
 	}
 	resp.ContentLength = int64(len(body))
 	resp.TransferEncoding = nil
