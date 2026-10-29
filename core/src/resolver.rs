@@ -662,7 +662,7 @@ fn resolution_prompt(source: &str, target: &str, output_tail: Option<&str>) -> S
          - Never assign PATH, RUSTUP_HOME or CARGO_HOME, and do not go looking for tools. `cargo` and \
          `git` are already on PATH; an assignment to one of those variables is held for a person to \
          approve, and a resolution that stops there is one nobody gets the benefit of.\n\
-         - Run ONE shell command at a time. No `&&` chains, no pipes, no `$(...)` — the classifier \
+         - Run ONE shell command at a time. No `&&` chains, no `;` between commands, no pipes, no `$(...)` — the classifier \
          holds compound shell for a person to approve, and a resolution that stops to be approved \
          for a `git log` is one nobody gets the benefit of. This costs you a few extra calls and \
          saves the whole run.\n\
@@ -1630,6 +1630,25 @@ mod tests {
             prompt.contains("CONFLICT (content): seed.txt"),
             "git's own account of the conflict is the one thing here nobody has to guess at"
         );
+    }
+
+    /// The classifier holds every compound form of shell, not just `&&`: a `;` between two commands
+    /// is as compound as a chain, and a prompt that names only some forms invites the others.
+    #[test]
+    fn the_prompt_forbids_every_form_of_shell_chaining() {
+        let prompt = resolution_prompt("feat/x", "master", None);
+
+        for (form, what) in [
+            ("`;`", "a semicolon between commands"),
+            ("`&&`", "an && chain"),
+            ("pipe", "a pipe"),
+            ("$(", "command substitution"),
+        ] {
+            assert!(
+                prompt.contains(form),
+                "the prompt must name {what} as forbidden ({form}), or the agent will reach for it"
+            );
+        }
     }
 
     /// The agent resolves, commits and stops: handing the commit to the queue is the daemon's job.
