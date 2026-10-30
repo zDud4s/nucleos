@@ -353,6 +353,10 @@ const RESTRAINT_EVIDENCE_CLASSES: &[&str] = &[
     // that hazard. Fail-closed, therefore correct, and therefore worth a paragraph rather than a
     // surprise.
     "destructive-outside",
+    // The NucleOS database: a compiled hard deny, no approval path. Every one of its decisions is a
+    // refusal, so it is restraint evidence by construction. Like `destructive-outside` above, a new
+    // class starts its own `READINESS_MIN_REVIEWED` count from zero: fail-closed, and intended.
+    "nucleos-data",
     "self-governing-file",
     "outside-workspace",
     "executes-on-next-command",

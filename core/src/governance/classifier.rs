@@ -27,7 +27,7 @@ pub use self::paths::*;
 pub use self::shell_shape::*;
 use self::write_guards::*;
 
-pub const CLASSIFIER_VERSION: u32 = 23;
+pub const CLASSIFIER_VERSION: u32 = 24;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -605,6 +605,22 @@ pub fn classify(
         );
     }
 
+    // The NucleOS database and the files that replace it at start-up. Compiled, so it sits beside
+    // `outside-workspace` and above `project-denied`: nothing a project writes may lower it and no
+    // prompt below may reach it. It is not subsumed by the containment deny above - a home- or
+    // variable-rooted spelling is glued onto the workspace by `normalize_path` and so lies "inside"
+    // it, the hole `names_machine_settings` documents.
+    if WRITE_TOOLS.contains(&tool_name) && writes_nucleos_data(tool_input, cwd) {
+        return classification("deny", NUCLEOS_DATA_CLASS, NUCLEOS_DATA_REASON);
+    }
+
+    // The same database, for the tools that READ: a governed run's hook matches every tool, so
+    // without this they fall to the `READ_LOCAL_TOOLS` allow below. See `reads_nucleos_data`.
+    if matches!(tool_name, "Read" | "Grep" | "Glob") && reads_nucleos_data(tool_name, tool_input, cwd)
+    {
+        return classification("deny", NUCLEOS_DATA_CLASS, NUCLEOS_DATA_REASON);
+    }
+
     // A project's own refusal about WHERE this tool may write, in the position that mirrors the
     // shell path's `project-denied` exactly: below the compiled refusal, which keeps its own
     // narrower `outside-workspace` class, and above every `pending_approval` beneath it. A refusal
@@ -859,6 +875,22 @@ fn classify_shell_command(
             "destructive",
             "destructive deletion commands are denied",
         );
+    }
+
+    // The NucleOS database, its `-wal`/`-shm`, `backups/` and the restore markers, in any spelling
+    // of the data directory. Below the two compiled destructive refusals (so `rm -f <db>` keeps
+    // `destructive-outside`), above everything else - the project's own deny, every approval pattern
+    // and every `allow`, `cat` included. It scans the whole line by word, so where in the line the
+    // path appears does not matter. See `names_nucleos_data_in`.
+    if texts.iter().any(|text| line_names_nucleos_data(text)) {
+        return classification("deny", NUCLEOS_DATA_CLASS, NUCLEOS_DATA_REASON);
+    }
+
+    // The daemon's own settings command line (`nucleos-core --settings-reset|--settings-rollback`)
+    // opens the database by itself and never spells a path, so the check above cannot see it. Same
+    // class: an agent that may run it may rewrite the configuration.
+    if texts.iter().any(|text| line_runs_settings_cli(text)) {
+        return classification("deny", NUCLEOS_DATA_CLASS, NUCLEOS_SETTINGS_CLI_REASON);
     }
 
     // A project's refusal outranks an approval PROMPT, and this is the position that makes that
