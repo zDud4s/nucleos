@@ -47,7 +47,7 @@
 use sqlx::SqlitePool;
 
 use crate::config::DevtimeActionsConfig;
-use crate::devtime::precision::RulePrecision;
+use crate::devtime::precision::{RulePrecision, action_eligible, wilson_lower};
 
 /// Which pair the report is for, and "now" for its windows.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,8 +103,191 @@ pub async fn action_promotion_report(
     precision: &RulePrecision,
     scope: &PromotionScope<'_>,
 ) -> sqlx::Result<PromotionReport> {
-    let _ = (pool, cfg, precision, scope);
-    todo!("3.3 GREEN: action_promotion_report")
+    let rows = crate::devtime::store::decisions_for(
+        pool,
+        scope.action,
+        scope.rule_id,
+        "shadow",
+        &[scope.action_version],
+    )
+    .await?;
+    let in_scope: Vec<_> = rows
+        .iter()
+        .filter(|r| r.rule_version == scope.rule_version)
+        .filter(|r| scope.project_id.is_none_or(|p| r.project_id == p))
+        .collect();
+
+    let suppressed = in_scope.iter().filter(|r| r.decision == "suppress").count();
+    let suppress_rate = (!in_scope.is_empty()).then(|| suppressed as f64 / in_scope.len() as f64);
+
+    let counted: Vec<_> = in_scope
+        .iter()
+        .filter(|r| r.decision == "fire" && r.outcome_state == "resolved")
+        .collect();
+
+    // The human verdict prevails over the automatic outcome.
+    let effective = |r: &crate::devtime::store::ShadowRow| match r.human_verdict.as_deref() {
+        Some("useful") => Some(true),
+        Some("noise") => Some(false),
+        _ => match r.outcome.as_deref() {
+            Some("hit") => Some(true),
+            Some("miss") => Some(false),
+            _ => None,
+        },
+    };
+    let ignored = counted
+        .iter()
+        .filter(|r| r.human_verdict.is_none() && r.outcome.as_deref() == Some("ignored"))
+        .count() as i64;
+
+    let sample: Vec<_> = counted
+        .iter()
+        .filter_map(|r| effective(r).map(|hit| (**r, hit)))
+        .collect();
+    let n_resolved = sample.len() as i64;
+    let sessions: std::collections::HashSet<&str> = sample
+        .iter()
+        .map(|(r, _)| r.session_id.as_deref().unwrap_or(r.subject_key.as_str()))
+        .collect();
+    let n_sessions = sessions.len() as i64;
+    let earliest = sample
+        .iter()
+        .filter_map(|(r, _)| chrono::DateTime::parse_from_rfc3339(&r.decided_at).ok())
+        .map(|t| t.timestamp_millis())
+        .min();
+    let days_covered = earliest.map_or(0, |e| (scope.now_ms - e).div_euclid(DAY_MS));
+    let sample_ok = n_resolved >= i64::from(cfg.effect_min_resolved)
+        && n_sessions >= i64::from(cfg.effect_min_sessions)
+        && days_covered >= i64::from(cfg.effect_min_days);
+
+    let hits: Vec<_> = sample
+        .iter()
+        .filter(|(_, hit)| *hit)
+        .map(|(r, _)| *r)
+        .collect();
+    let hit_rate = (n_resolved > 0).then(|| hits.len() as f64 / n_resolved as f64);
+    let mut costs: Vec<i64> = hits
+        .iter()
+        .map(|r| r.outcome_cost_ms.unwrap_or(0))
+        .collect();
+    costs.sort_unstable();
+    let mean_hit_cost_ms =
+        (!costs.is_empty()).then(|| costs.iter().sum::<i64>() as f64 / costs.len() as f64);
+    let median_hit_cost_ms = match costs.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(costs[n / 2] as f64),
+        n => Some((costs[n / 2 - 1] + costs[n / 2]) as f64 / 2.0),
+    };
+    let hit_rate_min = match scope.action {
+        "inject" => cfg.shadow_hit_rate_min.inject,
+        _ => cfg.shadow_hit_rate_min.propose,
+    };
+    let shadow_approved = hit_rate.is_some_and(|h| h >= hit_rate_min)
+        && mean_hit_cost_ms.is_some_and(|m| m >= cfg.min_mean_hit_cost_ms as f64);
+
+    // Avoidable fraction per window, kept as (cost, active) integers so the +10% test is exact.
+    let window_ms = i64::from(cfg.effect_min_days) * DAY_MS;
+    let now = avoidable_window(pool, scope, scope.now_ms - window_ms, scope.now_ms).await?;
+    let prev = avoidable_window(
+        pool,
+        scope,
+        scope.now_ms - 2 * window_ms,
+        scope.now_ms - window_ms,
+    )
+    .await?;
+    let fraction = |w: Option<(i64, i64)>| w.map(|(cost, active)| cost as f64 / active as f64);
+    let regression_ok = match (prev, now) {
+        (Some((prev_cost, prev_active)), Some((now_cost, now_active))) if prev_cost > 0 => {
+            // now/now_active <= prev/prev_active * 1.10, cross-multiplied.
+            i128::from(now_cost) * i128::from(prev_active) * 10
+                <= i128::from(prev_cost) * i128::from(now_active) * 11
+        }
+        _ => true,
+    };
+
+    let useful = counted
+        .iter()
+        .filter(|r| r.human_verdict.as_deref() == Some("useful"))
+        .count() as i64;
+    let noise = counted
+        .iter()
+        .filter(|r| r.human_verdict.as_deref() == Some("noise"))
+        .count() as i64;
+    let human_marks = useful + noise;
+    let human_rate = (human_marks > 0).then(|| useful as f64 / human_marks as f64);
+    let human_ok = human_marks >= i64::from(cfg.human_min_marks)
+        && human_rate.is_some_and(|h| h >= hit_rate_min);
+
+    let action_eligible = action_eligible(precision, cfg);
+    let ready = action_eligible && sample_ok && shadow_approved && regression_ok && human_ok;
+    Ok(PromotionReport {
+        action_eligible,
+        wilson_lower: wilson_lower(
+            precision.n_cases - precision.n_not_rework,
+            precision.n_cases,
+        ),
+        n_resolved,
+        n_sessions,
+        days_covered,
+        sample_ok,
+        hit_rate,
+        mean_hit_cost_ms,
+        shadow_approved,
+        avoidable_now: fraction(now),
+        avoidable_prev: fraction(prev),
+        regression_ok,
+        human_marks,
+        human_rate,
+        human_ok,
+        ready,
+        median_hit_cost_ms,
+        suppress_rate,
+        ignored,
+    })
+}
+
+const DAY_MS: i64 = 86_400_000;
+
+/// `(rule cost, active time)` of the window `(after_ms, until_ms]` by `started_at`; `None` when the
+/// window has no active time.
+async fn avoidable_window(
+    pool: &SqlitePool,
+    scope: &PromotionScope<'_>,
+    after_ms: i64,
+    until_ms: i64,
+) -> sqlx::Result<Option<(i64, i64)>> {
+    let stamp = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap_or_default()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    };
+    let (after, until) = (stamp(after_ms), stamp(until_ms));
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(active_ms), 0) FROM devtime_turn_stats \
+         WHERE started_at > ?1 AND started_at <= ?2 AND (?3 IS NULL OR project_id = ?3)",
+    )
+    .bind(&after)
+    .bind(&until)
+    .bind(scope.project_id)
+    .fetch_one(pool)
+    .await?;
+    if active <= 0 {
+        return Ok(None);
+    }
+    let cost: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(cost_ms), 0) FROM devtime_findings \
+         WHERE rule_id = ?4 AND rule_version = ?5 AND scope <> 'cross' \
+         AND started_at > ?1 AND started_at <= ?2 AND (?3 IS NULL OR project_id = ?3)",
+    )
+    .bind(&after)
+    .bind(&until)
+    .bind(scope.project_id)
+    .bind(scope.rule_id)
+    .bind(scope.rule_version)
+    .fetch_one(pool)
+    .await?;
+    Ok(Some((cost, active)))
 }
 
 #[cfg(test)]
@@ -627,7 +810,10 @@ mod tests {
         .await;
         let r = report(&pool, &good_precision()).await;
         assert_eq!(r.human_marks, 4);
-        assert!(close(r.human_rate, 1.0), "a perfect rate does not make up for few marks");
+        assert!(
+            close(r.human_rate, 1.0),
+            "a perfect rate does not make up for few marks"
+        );
         assert!(!r.human_ok);
         assert!(r.action_eligible && r.sample_ok && r.shadow_approved && r.regression_ok);
         assert!(!r.ready);
@@ -697,7 +883,10 @@ mod tests {
         }
         let r = report(&pool, &good_precision()).await;
         assert!(close(r.hit_rate, 22.0 / 30.0));
-        assert!(r.shadow_approved, "the cost of a useful-marked miss counts as 0 in the mean");
+        assert!(
+            r.shadow_approved,
+            "the cost of a useful-marked miss counts as 0 in the mean"
+        );
         assert!(close(r.mean_hit_cost_ms, 16.0 * 60_000.0 / 22.0));
         assert_eq!(r.human_marks, 6);
         assert!(r.human_ok);
@@ -741,7 +930,10 @@ mod tests {
         }
         let r = report(&pool, &good_precision()).await;
         assert!(close(r.suppress_rate, 10.0 / 40.0));
-        assert_eq!(r.n_resolved, 30, "suppressed rows are not part of the sample");
+        assert_eq!(
+            r.n_resolved, 30,
+            "suppressed rows are not part of the sample"
+        );
         assert!(r.ready, "the suppress rate never gates ready");
     }
 

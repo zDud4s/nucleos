@@ -494,6 +494,7 @@ the contract, not a snapshot.
 | `devtime/actions/inject.rs` | Fixtures for the `inject` decision (D3 search bursts, D6 long foreground commands); the function itself is `decide_inject` in the parent. Tests only. |
 | `devtime/actions/outcome.rs` | Closes due `pending` `inject` rows in `devtime_shadow` to `hit`, `miss` or `void` from the session's findings and attempt marks (`close_inject_outcomes`). |
 | `devtime/actions/propose.rs` | The pure `propose` decision (`decide_propose`) for cross-session findings F1 and F2, with its `CrossCandidate` and `ProposeState` inputs. |
+| `devtime/actions/report.rs` | The shadow-to-live promotion report of one `(action, rule)` pair (`action_promotion_report`): the five criteria with their counts, rates and ms figures, and a `ready` signal; read-only, the owner promotes. |
 | `devtime/store/shadow.rs` | The SQL of `devtime_shadow` (what each action decided, why, and the human's outcome) and `devtime_action_state` (per-action, per-rule mode), plus their closed vocabularies. No message text. |
 | `devtime/unexplained.rs` | PURE per-turn active/explained time and the listing of slow turns no rule explains. |
 | `devtime/rules/fixture.rs` | Tests only: compact session-script DSL that builds devtime rows, spans and rule facts. |
