@@ -705,7 +705,7 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
 /// families the shell never calls), written out so the classification is total: the guard test
 /// fails on a route prefix in none of [`REMOTE_ALLOWED_SEGMENTS`], [`REMOTE_ADMIN_SEGMENTS`] and
 /// this list. The hard-deny set is host-only by nature: the shutdown/update handshake (`daemon`,
-/// `system`), machine settings and secrets (`config`), backups (`backup`, `backups`), credential
+/// `system`), machine settings and secrets (`config`, and `settings`, which replaced it as the home of the machine and `channels/*` documents), backups (`backup`, `backups`), credential
 /// minting (`api-tokens`), sidecar control (`sidecars`), messaging identity pairing (`channels`),
 /// the whole remote owner surface including `/remote/pair` (`remote`) and live browser pixels
 /// (`browser`). The rest are families the desktop shell never calls over the API (`chats` is only a
@@ -731,6 +731,7 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "nodes",
     "pricing",
     "remote",
+    "settings",
     "sidecars",
     "system",
     "tasks",
