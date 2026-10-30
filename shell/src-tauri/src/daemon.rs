@@ -142,7 +142,11 @@ mod tests {
 
     #[test]
     fn install_kind_other_locations_are_other() {
-        for p in ["/opt/nucleos/nucleos-shell", "C:/apps/nucleos/shell.exe", "/usrx/bin/nucleos-shell"] {
+        for p in [
+            "/opt/nucleos/nucleos-shell",
+            "C:/apps/nucleos/shell.exe",
+            "/usrx/bin/nucleos-shell",
+        ] {
             assert_eq!(
                 super::install_kind_of(Path::new(p), false),
                 InstallKind::Other,
