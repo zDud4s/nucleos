@@ -196,10 +196,14 @@ pub(super) async fn spawn_local_turn(
                     .execute(&pool)
                     .await
                 } else {
+                    // These engines report no usage we read, so the window is estimated.
+                    let fill =
+                        super::compaction::local_fill_estimate(&history, &prompt, &turn.answer);
                     sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(&turn.answer)
+                    .bind(fill)
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
@@ -963,6 +967,9 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // What a linked browser agent's completed turn answered, handed to its parent once the slot
         // below is free. Failed, cancelled and timed-out turns leave it `None`: they deliver nothing.
         let mut linked_reply: Option<String> = None;
+        // The fill of a turn that completed, for the automatic-compaction trigger once the slot is
+        // free; `None` on every other outcome.
+        let mut auto_fill: Option<i64> = None;
         match result {
             // A turn's product is the `result` event, and a CLI that exited without one answered
             // nothing. That is a failed turn, not a completed one — and emphatically not a turn
@@ -1005,9 +1012,14 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     // Cache-read tokens count as context because they occupy the window exactly as
                     // fresh input does. A resumed conversation is nearly all cache: reading only
                     // `input_tokens` would report a session at 96k as sitting at 9k.
-                    let context_fill = o.stdout.lines().fold(None, |fill, line| {
+                    let claude_fill = o.stdout.lines().fold(None, |fill, line| {
                         crate::execution::runner::context_fill_from_line(line, fill)
                     });
+                    // Codex has no `assistant` usage events; its figure comes from `turn.completed`.
+                    // Only the Claude figure feeds `rotation::rotate` until the auto-compact wiring
+                    // lands, so a Codex chat does not start rotating before the flag exists.
+                    let context_fill = claude_fill
+                        .or_else(|| crate::execution::runner::codex_context_fill(&o.stdout));
                     // Taken off the outcome and not re-derived from the transcript beside it: on the
                     // multi-turn path the transcript belongs to a PROCESS that may have served several
                     // answers, and this is a fact about ONE of them. `RunOutcome` is where the
@@ -1085,6 +1097,9 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     // would otherwise recreate the session `rotate` just forgot. A completed turn
                     // only; a cancelled one has not settled anything worth carrying forward. Never
                     // a compaction turn: its settle consumes the rotation (`consume_older`).
+                    if status == "completed" {
+                        auto_fill = context_fill;
+                    }
                     if status == "completed" && !super::compaction::is_compaction(&pool, id).await {
                         // Deterministic unless `NUCLEOS_ROOT_ROTATE_LLM` is on; any failure of the
                         // model falls back to it inside the summarizer.
@@ -1100,7 +1115,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                             &summarizer,
                             &turn.slot.chat_id,
                             id,
-                            context_fill,
+                            claude_fill,
                         )
                         .await
                         {
@@ -1196,6 +1211,15 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // cannot set another aside before this one is written.
         record_set_aside(&after, &drained_chat).await;
         drop(turn);
+        // Automatic compaction runs in a task of its own, for the reason given above: the
+        // compaction turn must not start inside this one's registered task.
+        // An unknown fill never fires, so a turn without one needs no task.
+        if auto_fill.is_some() {
+            let (state, chat) = (after.clone(), drained_chat.clone());
+            tokio::spawn(async move {
+                super::compaction::maybe_auto_compact(&state, &chat, id, auto_fill).await;
+            });
+        }
         // A linked child's answer travels to its parent now that this chat's slot is free. An
         // unlinked chat costs one read inside `deliver_reply`.
         if let Some(reply) = linked_reply {
