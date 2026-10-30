@@ -1401,3 +1401,27 @@ utility_model: \"\"
         assert_eq!(parsed.utility_model, None);
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::settings::{Scope, Settings, Snapshot, testing};
+
+    /// Only `embedding_model` is changed: no other test reads it through `models_config_now`, and the guard serialises
+    /// installers but not readers, so a field a concurrent test reads would make this a race.
+    #[test]
+    fn models_config_now_answers_the_installed_document() {
+        let mut stored = ModelsConfig::default();
+        stored.embedding_model = "test-embed-from-the-snapshot".to_string();
+        let snapshot = Snapshot::default().with_document(&Scope::Machine, stored.clone());
+        let _installed = testing::install(Settings::from_snapshot(snapshot));
+
+        assert_eq!(models_config_now(), stored);
+    }
+
+    #[test]
+    fn with_nothing_stored_it_answers_the_defaults() {
+        let _installed = testing::install(Settings::new());
+        assert_eq!(models_config_now(), ModelsConfig::default());
+    }
+}

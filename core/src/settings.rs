@@ -10,6 +10,7 @@ use sqlx::SqlitePool;
 
 mod checks;
 pub mod decode;
+pub mod import;
 pub mod registry;
 pub mod scope;
 pub mod snapshot;

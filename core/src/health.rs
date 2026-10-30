@@ -443,22 +443,13 @@ enum RouterPlan {
     Ask { url: String, timeout: Duration },
 }
 
-/// PURE: `router.yaml`'s text (`None` for an absent file) as a plan. The grammar and the loopback
-/// fence are `route_advice::parse_config`'s, not restated here, and the error text is dropped:
-/// this readout carries a closed vocabulary and no text.
-fn router_plan(text: Option<&str>) -> RouterPlan {
-    let Some(text) = text else {
-        return RouterPlan::Off;
-    };
-    match crate::models::route_advice::parse_config(text) {
-        Err(_) => RouterPlan::Refused,
-        Ok(config) if config.is_off() => RouterPlan::Off,
-        Ok(config) => RouterPlan::Ask {
-            url: config.url,
-            // Inside the readout's own half-second budget, whatever the file allows a run.
-            timeout: Duration::from_millis(config.timeout_ms).min(PROBE_TIMEOUT),
-        },
-    }
+/// PURE: the stored router document (`None` for an absent one) as a plan.
+///
+/// RED stub: the real body converts with `RouterDoc::to_config` (the loopback fence) and answers
+/// `Refused` / `Off` / `Ask`; until then every document is read as "off".
+fn router_plan(doc: Option<&crate::models::route_doc::RouterDoc>) -> RouterPlan {
+    let _ = doc;
+    RouterPlan::Off
 }
 
 /// The summary `devtime`'s ingestion loop writes after every cycle and this readout reads back.
@@ -713,20 +704,13 @@ fn router_row(plan: &RouterPlan, reachable: bool) -> SubsystemReadout {
     }
 }
 
-/// Reads `~/.nucleos/router.yaml` as the settings door does, then asks the router for its tiers.
+/// Reads the stored `router` document, then asks the router for its tiers.
 /// Task text never travels: `targets` is a GET with no body.
 async fn router_probe() -> SubsystemReadout {
-    // Only the file's text is cached; whether the router answers is asked live every poll.
-    let text = tokio::task::spawn_blocking(|| {
-        cached_lookup(&ROUTER_TEXT_LOOKUP, LOOKUP_CACHE_TTL, || {
-            let path = crate::machine_config::root()?.join(crate::machine_config::ROUTER_FILE);
-            std::fs::read_to_string(path).ok()
-        })
-    })
-    .await
-    .ok()
-    .flatten();
-    router_answer(router_plan(text.as_deref())).await
+    let doc = crate::settings::get_opt::<crate::models::route_doc::RouterDoc>(
+        &crate::settings::Scope::Machine,
+    );
+    router_answer(router_plan(doc.as_deref())).await
 }
 
 /// The probe's one question, for a plan already made: does the router answer `targets`?
@@ -739,6 +723,16 @@ async fn router_answer(plan: RouterPlan) -> SubsystemReadout {
         _ => false,
     };
     router_row(&plan, reachable)
+}
+
+/// PURE: the settings row, from the snapshot the daemon is reading.
+///
+/// RED stub: the real body is `down` + `NotConfigured` with `counts` keyed by document name when
+/// `snapshot.unreadable()` is non-empty, and `ok` otherwise. Not wired into `collect_readout` yet.
+#[cfg_attr(not(test), allow(dead_code))]
+fn settings_row(snapshot: &crate::settings::Snapshot) -> SubsystemReadout {
+    let _ = snapshot;
+    todo!("settings health row")
 }
 
 /// PURE: the row, from whether the interpreter resolved and whether any rostered project wires
@@ -1136,7 +1130,6 @@ fn cached_lookup<T: Clone>(slot: &LookupSlot<T>, ttl: Duration, lookup: impl FnO
 
 static CLI_BINARY_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
 static HOOK_INTERPRETER_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
-static ROUTER_TEXT_LOOKUP: LookupSlot<Option<String>> = Mutex::new(None);
 static DAEMON_TOKEN_LOOKUP: LookupSlot<ExecVerdict> = Mutex::new(None);
 
 /// Keyed by the program itself, not by the row: the verdict is a fact about a specific binary, so
@@ -1378,6 +1371,7 @@ fn classify_error<E>(_error: E) -> FailureCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::route_doc::RouterDoc;
 
     fn breached_readout() -> HealthReadout {
         HealthReadout {
@@ -1395,37 +1389,40 @@ mod tests {
         crate::testdb::fresh_pool().await
     }
 
+    /// A router document the way the importer would store `yaml`: through the legacy parser and `RouterDoc`.
+    fn router_doc(yaml: &str) -> RouterDoc {
+        RouterDoc::from_config(
+            &crate::models::route_advice::parse_config(yaml).expect("the fixture is valid"),
+        )
+    }
+
+    /// A document `to_config` refuses: a router that is not on this machine.
+    fn router_doc_off_this_machine() -> RouterDoc {
+        RouterDoc {
+            mode: "shadow".to_string(),
+            url: "http://example.com:1".to_string(),
+            timeout_ms: 1000,
+            runners: Vec::new(),
+            models: std::collections::BTreeMap::new(),
+            surfaces: std::collections::BTreeMap::new(),
+        }
+    }
+
     #[test]
-    fn the_router_row_follows_the_file_and_then_the_router() {
+    fn the_router_row_follows_the_document_and_then_the_router() {
         assert_eq!(router_plan(None), RouterPlan::Off);
         assert_eq!(
-            router_plan(Some(
-                "mode: off
-"
-            )),
+            router_plan(Some(&router_doc("mode: off
+"))),
             RouterPlan::Off
         );
         assert_eq!(
-            router_plan(Some(
-                "mode: shadow
-: [
-"
-            )),
+            router_plan(Some(&router_doc_off_this_machine())),
             RouterPlan::Refused
         );
-        assert_eq!(
-            router_plan(Some(
-                "mode: shadow
-url: http://example.com:1
-"
-            )),
-            RouterPlan::Refused
-        );
-        let ask = router_plan(Some(
-            "mode: shadow
+        let ask = router_plan(Some(&router_doc("mode: shadow
 url: http://127.0.0.1:9
-",
-        ));
+")));
         assert!(matches!(ask, RouterPlan::Ask { .. }));
 
         let off = router_row(&RouterPlan::Off, false);
@@ -1467,17 +1464,84 @@ connection: close
             }
         });
         let ask = |port: u16| {
-            router_plan(Some(&format!(
+            router_plan(Some(&router_doc(&format!(
                 "mode: shadow
 url: http://127.0.0.1:{port}
 "
-            )))
+            ))))
         };
         assert_eq!(router_answer(ask(port)).await.status, HealthState::Ok);
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead = free.local_addr().unwrap().port();
         drop(free);
         assert_eq!(router_answer(ask(dead)).await.status, HealthState::Degraded);
+    }
+
+    #[tokio::test]
+    async fn the_router_probe_with_nothing_stored_is_disabled() {
+        use crate::settings::{Settings, testing};
+        let _installed = testing::install(Settings::new());
+        assert_eq!(
+            router_probe().await.status,
+            HealthState::Disabled,
+            "nothing stored is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_router_probe_with_a_document_the_fence_refuses_is_down() {
+        use crate::settings::{Scope, Settings, Snapshot, testing};
+        let snapshot =
+            Snapshot::default().with_document(&Scope::Machine, router_doc_off_this_machine());
+        let _installed = testing::install(Settings::from_snapshot(snapshot));
+        assert_eq!(
+            router_probe().await.status,
+            HealthState::Down,
+            "a document the fence refuses is red"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_sound_snapshot_is_a_green_settings_row() {
+        let row = settings_row(&crate::settings::Snapshot::default());
+        assert_eq!((row.name, row.status), ("settings", HealthState::Ok));
+        assert!(row.reason.is_none() && row.counts.is_none());
+    }
+
+    /// A stored document that no longer fits its type falls back to the defaults. The row says so: red, and naming
+    /// WHICH document by its static name, because the readout carries no text.
+    #[tokio::test]
+    async fn an_unreadable_document_is_a_red_row_naming_it() {
+        let pool = migrated_pool().await;
+        for (scope, name) in [
+            ("machine", "email"),
+            ("project:p1", "autopilot"),
+            ("project:p2", "autopilot"),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (scope, name, body_json, version, updated_at, updated_by)                  VALUES (?, ?, '{\"enabled\": \"not a bool\"}', 1, '2026-10-11T00:00:00.000Z', 'test')",
+            )
+            .bind(scope)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let snapshot = crate::settings::load_all(&pool).await.unwrap();
+        assert!(
+            !snapshot.unreadable().is_empty(),
+            "the fixture must be unreadable"
+        );
+
+        let row = settings_row(&snapshot);
+
+        assert_eq!(row.status, HealthState::Down);
+        assert_eq!(row.reason, Some(FailureCategory::NotConfigured));
+        let counts = row
+            .counts
+            .expect("the unreadable documents are counted by name");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert_eq!(counts.get("autopilot"), Some(&2), "one per scope");
     }
 
     #[test]

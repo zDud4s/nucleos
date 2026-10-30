@@ -400,3 +400,46 @@ pub fn parse_council_config(
     }
     Ok(config.validated())
 }
+
+/// The stored council as startup may run it: `None` when there is none, or when it names a `kind: local` seat and
+/// no local model answered the probe.
+///
+/// RED stub: the real body checks `CouncilConfig::faults(&stored, local_available)`.
+pub fn runnable_council(
+    stored: Option<std::sync::Arc<CouncilConfig>>,
+    local_available: bool,
+) -> Option<CouncilConfig> {
+    let _ = (stored, local_available);
+    todo!("runnable_council")
+}
+
+#[cfg(test)]
+mod runnable_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    const MIXED: &str = "chairman: { kind: cloud, ref: claude-opus-4-8 }
+                         members:
+                           - { kind: cloud, ref: claude-opus-4-8 }
+                           - { kind: local, ref: qwen3.5:4b }
+";
+
+    #[test]
+    fn a_stored_roster_naming_a_local_seat_runs_only_with_a_local_model() {
+        let stored = Arc::new(parse_council_config(MIXED, true).unwrap());
+
+        assert!(runnable_council(Some(stored.clone()), false).is_none());
+        assert_eq!(
+            runnable_council(Some(stored), true)
+                .expect("the same roster once a model is up")
+                .members
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn no_stored_roster_is_no_council() {
+        assert!(runnable_council(None, true).is_none());
+    }
+}
