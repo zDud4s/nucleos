@@ -21218,7 +21218,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["project_id"], serde_json::Value::Null);
         assert_eq!(entries[0]["summary"], "global summary");
-        assert_eq!(parsed, serde_json::to_value(legacy_entries).unwrap());
+        // The wire shape is the legacy entry plus an explicit `origin` (F4); these rows have no run.
+        let mut expected = serde_json::to_value(legacy_entries).unwrap();
+        for row in expected.as_array_mut().unwrap() {
+            row["origin"] = serde_json::Value::Null;
+        }
+        assert_eq!(parsed, expected);
     }
 
     fn preset_body(name: &str, prompt: &str, mode: &str) -> Body {
@@ -21548,6 +21553,7 @@ mod tests {
                 "created_at",
                 "id",
                 "kind",
+                "origin",
                 "project_id",
                 "run_id",
                 "subject",
