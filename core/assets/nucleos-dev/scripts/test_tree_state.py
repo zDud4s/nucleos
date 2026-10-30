@@ -14,13 +14,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import yaml
-
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 BUNDLE = HERE.parent
 WORKFLOW = BUNDLE / ".nucleos" / "workflow"
 
+import tree_yaml as yaml  # noqa: E402  (the vendored reader tree_state.py uses)
 import tree_state as ts  # noqa: E402
 
 

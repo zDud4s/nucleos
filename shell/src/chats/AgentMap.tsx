@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { useLiveTurnSnapshot, useChatTasks, useStopTask, useTurnTools, type ChatTask } from "../data/chats";
+import { useChatProject, useLiveTurnSnapshot, useChatTasks, useStopTask, useTurnTools, type ChatTask } from "../data/chats";
 import { turnIsLive, type ToolCall, type Turn } from "../lib/turns";
 import { displayName } from "../lib/modelName";
 import { plural } from "../lib/plural";
@@ -13,6 +13,34 @@ import { cacheState, leftText } from "./cache";
 /** A Task or Agent call is a subagent; nothing else spawns a child conversation. */
 export function isSubagent(call: ToolCall): boolean {
   return call.name === "Task" || call.name === "Agent";
+}
+
+export const PARALLEL_HINT =
+  "Parallel subagents may each ask for permission and a question left unanswered is refused after 45s. For autonomous development use auto with a judge, or bypass.";
+
+/** Modes in which a tool call can raise a permission question. */
+const ASKING_MODES: string[] = ["manual", "accept_edits", "auto"];
+
+/**
+ * The hint to show when two or more top-level subagents are still open on a live turn under a mode
+ * that asks. Works off `turns` alone so it appears before the task poll answers. `mode` is a plain
+ * string so a project that has not loaded yet (undefined) simply yields no hint.
+ */
+export function parallelHint(turns: Turn[] | undefined, mode: string | undefined): string | null {
+  if (mode === undefined || !ASKING_MODES.includes(mode)) return null;
+  const last = turns?.[turns.length - 1];
+  if (last === undefined || !turnIsLive(last.status)) return null;
+  const open = last.did.filter((c) => isSubagent(c) && c.parent == null && c.finished_at === undefined);
+  return open.length >= 2 ? PARALLEL_HINT : null;
+}
+
+export function ParallelHint({ chatId, turns }: { chatId: string; turns: Turn[] | undefined }) {
+  const text = parallelHint(turns, useChatProject(chatId).data?.permission_mode);
+  return text === null ? null : (
+    <p className="chats-hint" role="note">
+      {text}
+    </p>
+  );
 }
 
 export interface AgentCard {

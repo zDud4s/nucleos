@@ -227,6 +227,10 @@ pub(super) async fn create_job(
 
     match outcome {
         crate::execution::job::JobStart::Started(job_id) => {
+            // Known gap (F4 / CR5): `x-nucleos-origin` is NOT applied here. `start` only inserts
+            // the job; its runs (`runs.job_id`) are created later by the job tick, so no run exists
+            // to tag yet. Carrying the label needs a new design (e.g. a `jobs.origin` column that
+            // the tick copies onto each run it creates), so job runs stay origin NULL for now.
             Ok((StatusCode::CREATED, Json(CreateJobResponse { job_id })))
         }
         // Still a 409, and still not a 500: no room is a state the asker can act on by waiting. The

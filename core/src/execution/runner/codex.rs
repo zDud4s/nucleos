@@ -721,6 +721,28 @@ impl CommandRunner for CodexCliRunner {
     }
 }
 
+/// Context occupied at the end of a `codex exec` turn, for `runs.context_fill`.
+///
+/// `input_tokens` of the LAST `turn.completed` approximates the window at the end of the turn.
+/// `cached_input_tokens` is a subset of it in Codex's usage object, so it is not added (unlike the
+/// Claude stream, where `cache_read_input_tokens` is reported apart from `input_tokens`).
+/// `None` when no `turn.completed` carries an `input_tokens` figure: unknown is not zero.
+pub fn codex_context_fill(stdout: &str) -> Option<i64> {
+    stdout.lines().fold(None, |fill, line| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return fill;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("turn.completed") {
+            return fill;
+        }
+        value
+            .get("usage")
+            .and_then(|usage| usage.get("input_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .or(fill)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,5 +860,52 @@ mod tests {
         );
         let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
         assert_eq!(args.last().unwrap(), "run the tests");
+    }
+
+    const CODEX_TRANSCRIPT: &str = concat!(
+        r#"{"type":"thread.started","thread_id":"t-1"}"#,
+        "
+",
+        r#"{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#,
+        "
+",
+        r#"{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24704,"output_tokens":122}}"#,
+        "
+",
+    );
+
+    #[test]
+    fn codex_context_fill_is_the_input_tokens_of_the_last_turn_completed() {
+        // `cached_input_tokens` is a subset of `input_tokens`, so it is not added.
+        assert_eq!(codex_context_fill(CODEX_TRANSCRIPT), Some(24763));
+    }
+
+    #[test]
+    fn codex_context_fill_takes_the_last_of_several_turn_completed_events() {
+        let two = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":10000}}"#,
+            "
+",
+            r#"{"type":"turn.completed","usage":{"input_tokens":30000}}"#,
+            "
+",
+        );
+        assert_eq!(codex_context_fill(two), Some(30000));
+    }
+
+    #[test]
+    fn codex_context_fill_is_none_without_a_usage_object_or_input_tokens() {
+        assert_eq!(codex_context_fill(r#"{"type":"turn.completed"}"#), None);
+        assert_eq!(
+            codex_context_fill(r#"{"type":"turn.completed","usage":{"output_tokens":5}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_context_fill_is_none_for_plain_text_and_claude_streams() {
+        assert_eq!(codex_context_fill("just text"), None);
+        let claude = r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":7}}}"#;
+        assert_eq!(codex_context_fill(claude), None);
     }
 }

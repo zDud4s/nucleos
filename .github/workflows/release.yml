@@ -32,7 +32,7 @@ jobs:
           - os: macos-latest
             bundles: --bundles app,dmg
           - os: ubuntu-22.04
-            bundles: --bundles appimage,deb
+            bundles: --bundles appimage,deb,rpm
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
 
       - name: Linux system libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libssl-dev pkg-config patchelf
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libssl-dev pkg-config patchelf rpm
 
       # Read from rust-toolchain.toml and passed as an argument, so the version lives in one place.
       # Windows runners default to the MSVC host; this repository's Windows builds use GNU (see

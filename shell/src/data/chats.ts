@@ -326,6 +326,11 @@ export type Exchange = [string, string];
  * this" and is false.
  */
 export interface Transcript {
+  /**
+   * Set once the chat's current session has called a tool that reads third-party text. A
+   * non-blocking notice; absent from an older daemon.
+   */
+  untrusted_first_call?: { tool: string } | null;
   handed: Exchange[];
   turns: Turn[];
   /**
@@ -780,6 +785,7 @@ export function useSetChatGroup() {
 
 /** The transcript route's answer. */
 interface TranscriptRead {
+  untrusted_first_call?: { tool: string } | null;
   handed: Exchange[];
   turns: AssistantTurnRow[];
   queued: Waiting[];
@@ -876,6 +882,7 @@ export function useChatTranscript(chatId: string | null) {
       // column answers with turns and no `handed`, and a conversation that will not draw over a
       // missing field is a worse answer than one that draws without the note.
       return {
+        untrusted_first_call: read.untrusted_first_call ?? null,
         handed: read.handed ?? [],
         queued: read.queued ?? [],
         asks: read.asks ?? [],
@@ -1492,6 +1499,7 @@ function writeTurns(
     const turns = change(current?.turns ?? []);
     if (current === undefined && turns.length === 0) return undefined;
     return {
+      untrusted_first_call: current?.untrusted_first_call ?? null,
       handed: current?.handed ?? [],
       queued: current?.queued ?? [],
       asks: current?.asks ?? [],

@@ -2711,6 +2711,70 @@ mod tests {
         .last_insert_rowid()
     }
 
+    /// A chat of its own with one running assistant turn, for the untrusted-notice tests. The
+    /// notice map is process-wide like `ASKS`, so every test gets a fresh chat id.
+    async fn chat_with_turn(state: &AppState) -> (String, i64) {
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let run_id = turn_of(state, &chat_id).await;
+        (chat_id, run_id)
+    }
+
+    /// The first `ReadsUntrusted` MCP call of a chat's session registers a non-blocking notice
+    /// naming the tool; the hook's decision is whatever it was before.
+    #[tokio::test]
+    async fn first_untrusted_call_of_a_chat_registers_the_notice_with_the_tool_name() {
+        let state = test_state().await;
+        let (chat_id, run_id) = chat_with_turn(&state).await;
+        let app = test_router(state.clone());
+        assert_eq!(untrusted_first_call_for(&chat_id), None);
+
+        let verdict = orchestrator_tool(&app, run_id, "get_email", serde_json::json!({})).await;
+        assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
+        assert_eq!(
+            untrusted_first_call_for(&chat_id).as_deref(),
+            Some("get_email")
+        );
+    }
+
+    /// A second untrusted call in the same session does not raise the notice again (the tool
+    /// recorded stays the first one) and the decision is the same as without the notice.
+    #[tokio::test]
+    async fn second_untrusted_call_keeps_the_first_notice_and_the_same_decision() {
+        let state = test_state().await;
+        let (chat_id, run_id) = chat_with_turn(&state).await;
+        let app = test_router(state.clone());
+
+        let first = orchestrator_tool(&app, run_id, "get_email", serde_json::json!({})).await;
+        let second =
+            orchestrator_tool(&app, run_id, "get_email_queue", serde_json::json!({})).await;
+        assert_eq!(first.decision, "allow", "{}", first.reason);
+        assert_eq!(second.decision, first.decision, "{}", second.reason);
+        assert_eq!(second.reason, first.reason);
+        assert_eq!(
+            untrusted_first_call_for(&chat_id).as_deref(),
+            Some("get_email"),
+            "the second untrusted call must not replace or re-raise the notice"
+        );
+    }
+
+    /// A tool that is not `ReadsUntrusted` registers nothing.
+    #[tokio::test]
+    async fn a_tool_that_does_not_read_untrusted_registers_no_notice() {
+        let state = test_state().await;
+        let (chat_id, run_id) = chat_with_turn(&state).await;
+        let app = test_router(state.clone());
+        assert_eq!(
+            crate::mcp_tools::tool_effect("get_budget"),
+            crate::mcp_tools::ToolEffect::ReadsOwn
+        );
+
+        let verdict = orchestrator_tool(&app, run_id, "get_budget", serde_json::json!({})).await;
+        assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
+        assert_eq!(untrusted_first_call_for(&chat_id), None);
+    }
+
     /// `run_id` comes from the request body, so it is a claim the caller makes about itself. Every
     /// branch in this handler reads `mode` from that id, so a run able to name another run's id
     /// picks which rules it is judged by — a `shadow` run could ask under a `worktree` run's id and

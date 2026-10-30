@@ -266,6 +266,7 @@ fn channel_path_admits(scope: &Scope, path: &str) -> bool {
 /// table either.
 const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/status"),
+    (Method::GET, "/routes/search"),
     (Method::GET, "/health/readout"),
     (Method::GET, "/backups"),
     (Method::GET, "/autopilot/state"),
