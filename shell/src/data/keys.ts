@@ -729,4 +729,12 @@ export const keys = {
     identities: (channel: string) => ["channels", channel, "identities"] as const,
     pairing: (channel: string) => ["channels", channel, "pairing"] as const,
   },
+
+  /** Settings documents kept in the núcleo's database — `GET /settings…`. */
+  settings: {
+    all: ["settings"] as const,
+    index: (scope?: string) => ["settings", "index", scope ?? "all"] as const,
+    doc: (scope: string, name: string) => ["settings", "doc", scope, name] as const,
+    history: (scope: string, name: string) => ["settings", "history", scope, name] as const,
+  },
 } as const;

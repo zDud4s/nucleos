@@ -14,6 +14,7 @@ import { createAppQueryClient } from "../app/queryClient";
 import { createAppRouter } from "../router";
 import { PaletteProvider } from "../ui";
 import { ApiRefusal } from "../data/client";
+import { isSettingsPath, settingsDouble, type SettingsDouble } from "./settings-double";
 import type { Concurrency, HeldSlot, ProjectConcurrency } from "../data/fleet";
 import type { ClassTally } from "../data/autopilot";
 import type { Changed, Worktree } from "../data/project-code";
@@ -224,6 +225,8 @@ export interface DaemonState {
    * the claim a daemon staring at a broken pins file cannot make.
    */
   pinsError: string | null;
+  /** The in-memory `/settings` server — see `settings-double.ts`. */
+  settings: SettingsDouble;
   /**
    * One workflow's graph, or `null` for a bundle with no sequence in it.
    *
@@ -434,6 +437,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
     consentRefused: 0,
     workflowRefusal: null,
     pinsError: null,
+    settings: settingsDouble([]),
     graph: null,
     overlays: [],
     detected: null,
@@ -1165,6 +1169,7 @@ export function shellRule(overrides: Partial<ShellRule> = {}): ShellRule {
  */
 export function daemonFetch(state: DaemonState): (path: string, init?: RequestInit) => Promise<unknown> {
   return async (path, init) => {
+    if (isSettingsPath(path)) return state.settings.handle(path, init);
     /*
       The declaration routes, all ten, in one block at the very top.
 

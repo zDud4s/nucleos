@@ -165,10 +165,10 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
       return new ApiRefusal(res.status, body.refusal, detail, body);
     }
     const prose = [body.error, body.message, body.reason].find((v) => typeof v === "string" && v !== "");
-    if (typeof prose === "string") return new ApiRefusal(res.status, fallback, prose);
+    if (typeof prose === "string") return new ApiRefusal(res.status, fallback, prose, body);
   }
 
-  return new ApiRefusal(res.status, fallback, trimmed);
+  return new ApiRefusal(res.status, fallback, trimmed, parsed);
 }
 
 /**
