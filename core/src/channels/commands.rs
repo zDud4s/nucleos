@@ -6,8 +6,12 @@
 //! `capture_target` finds nothing, so `execute` and `answer_capture` are unreachable until A2.
 
 use super::strings::{self, Text};
-use super::{contract, ingest, media, outbox};
+use super::{access, contract, ingest, media, outbox};
 use crate::state::AppState;
+use crate::tree_job::decisions::{self, Decision, DecisionError};
+
+/// The one channel whose owner may answer a tree decision (D7): e-mail and Fleet do not approve.
+const DECISION_CHANNEL: &str = "telegram";
 
 /// What a message asks for. Port of `shortcuts.Intent` plus the channel-only commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +39,12 @@ pub enum Intent {
     /// `approve N` / `reject N`, and the degraded form of buttons.
     Approve(i64),
     Reject(i64),
+    /// An answer to a tree decision. `decision` is the one `/decide <id> <text>` named, and is
+    /// `None` for a plain text (`pending_answer`), which `execute` weighs before applying it.
+    DecisionAnswer {
+        decision: Option<String>,
+        text: String,
+    },
     /// A command heard in a voice note: said back, never run.
     Refused(String),
     /// Not a command: goes to the turn.
@@ -89,6 +99,19 @@ pub fn route(text: &str) -> Intent {
             },
             // A malformed `/cap` is answered with the usage, like a malformed `/kill`.
             _ => Intent::Help,
+        };
+    }
+    if let Some(rest) = word_argument(trimmed, "/decide") {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let id = parts.next().unwrap_or("");
+        let body = parts.next().map(str::trim).unwrap_or("");
+        // A malformed `/decide` is answered with the usage, like a malformed `/cap`.
+        if id.is_empty() || body.is_empty() {
+            return Intent::Help;
+        }
+        return Intent::DecisionAnswer {
+            decision: Some(id.to_string()),
+            text: body.to_string(),
         };
     }
     if let Some(intent) = approval(&lowered) {
@@ -226,6 +249,12 @@ pub async fn execute(
             decision_reply(decided, Text::Rejected { id })
         }
         Intent::Cap { job, text } => run_capture(at, state, job, &text).await,
+        Intent::DecisionAnswer { decision, text } => {
+            match run_decision_answer(state, at, decision, &text).await? {
+                Some(reply) => reply,
+                None => return Ok(()),
+            }
+        }
         Intent::Chat(_) => {
             // A plain message goes to the turn in `ingest`, never through `execute`.
             tracing::error!("a plain message reached commands::execute");
@@ -265,6 +294,130 @@ async fn run_note(state: &AppState, at: &ingest::Inbound<'_>, text: &str) -> Str
             strings::render(&Text::NoteFailed)
         }
     }
+}
+
+/// How a plain text reads as the answer to a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerClass {
+    /// A bare yes or no, with the text as sent (trimmed).
+    Clear(String),
+    Ambiguous,
+}
+
+/// Only a bare yes or no is clear, whatever its case and with a closing `.` or `!`. Anything longer
+/// may qualify the answer, so it is asked about rather than applied.
+pub fn classify_answer(text: &str) -> AnswerClass {
+    const CLEAR: [&str; 8] = [
+        "sim", "yes", "ok", "aprovo", "não", "nao", "no", "rejeito",
+    ];
+    let sent = text.trim();
+    let bare = sent.trim_end_matches(['.', '!']).to_lowercase();
+    if CLEAR.contains(&bare.as_str()) {
+        AnswerClass::Clear(sent.to_string())
+    } else {
+        AnswerClass::Ambiguous
+    }
+}
+
+/// The intent of a typed text that `route` leaves as chat while a decision waits for its owner, and
+/// `None` when it stays chat. Whether the text is clear is for `execute` to weigh.
+pub async fn pending_answer(
+    state: &AppState,
+    at: &ingest::Inbound<'_>,
+    text: &str,
+) -> sqlx::Result<Option<Intent>> {
+    if at.channel != DECISION_CHANNEL || !matches!(route(text), Intent::Chat(_)) {
+        return Ok(None);
+    }
+    if open_decisions(state).await?.is_empty() {
+        return Ok(None);
+    }
+    if let access::Verdict::Drop(_) =
+        access::admit(state, at.channel, at.conversation, at.sender).await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(Intent::DecisionAnswer {
+        decision: None,
+        text: text.to_string(),
+    }))
+}
+
+/// `open` can only fail on the database, which is all `sqlx::Result` has room for.
+async fn open_decisions(state: &AppState) -> sqlx::Result<Vec<Decision>> {
+    decisions::open(&state.pool).await.map_err(|error| match error {
+        DecisionError::Db(error) => error,
+        other => sqlx::Error::Protocol(other.to_string()),
+    })
+}
+
+/// The reply to an answer to a decision, or `None` for a sender `admit` refuses, who gets no reply
+/// at all. It re-checks the sender itself: this is the door that resumes a branch.
+async fn run_decision_answer(
+    state: &AppState,
+    at: &ingest::Inbound<'_>,
+    decision: Option<String>,
+    text: &str,
+) -> sqlx::Result<Option<String>> {
+    if let access::Verdict::Drop(_) =
+        access::admit(state, at.channel, at.conversation, at.sender).await?
+    {
+        return Ok(None);
+    }
+    if at.channel != DECISION_CHANNEL {
+        return Ok(Some(strings::render(&Text::DecisionWrongChannel)));
+    }
+    let reply = match decision {
+        // Naming the decision is what makes the text unambiguous, whatever it says.
+        Some(id) => apply_decision(state, at, &id, text).await?,
+        None => {
+            let open = open_decisions(state).await?;
+            match (classify_answer(text), open.as_slice()) {
+                (_, []) => strings::render(&Text::NoOpenDecision),
+                (AnswerClass::Clear(clear), [only]) => {
+                    apply_decision(state, at, &only.id, &clear).await?
+                }
+                (_, waiting) => strings::render(&Text::DecisionConfirm {
+                    open: waiting
+                        .iter()
+                        .map(|decision| (decision.id.clone(), decision.question.clone()))
+                        .collect(),
+                }),
+            }
+        }
+    };
+    Ok(Some(reply))
+}
+
+/// Answers decision `id` with this channel as the origin, and says what happened. A database failure
+/// goes up, so that the event stays `processing` and its redelivery runs again.
+async fn apply_decision(
+    state: &AppState,
+    at: &ingest::Inbound<'_>,
+    id: &str,
+    text: &str,
+) -> sqlx::Result<String> {
+    let said = match decisions::answer(&state.pool, id, text, at.channel).await {
+        Ok(decided) => Text::DecisionApplied {
+            question: decided.question,
+            answer: text.to_string(),
+        },
+        Err(DecisionError::NotFound(_)) => Text::DecisionUnknown { id: id.to_string() },
+        Err(DecisionError::AlreadyDecided(_)) => Text::AlreadyHandled,
+        Err(DecisionError::Db(error)) => return Err(error),
+        Err(error) => {
+            tracing::warn!(
+                channel = at.channel,
+                decision = id,
+                %error,
+                "a decision did not take its answer"
+            );
+            Text::NotSent {
+                refusal: format!("decision {id} could not take the answer ({error})"),
+            }
+        }
+    };
+    Ok(strings::render(&said))
 }
 
 /// The reply to an approve or reject: `done` when it went through, "already handled" when somebody

@@ -451,7 +451,16 @@ async fn on_message(
         commands::route(&input.text)
     };
     match intent {
-        Intent::Chat(_) => {}
+        Intent::Chat(_) => {
+            // Only typed text can answer a decision. While one is open the owner's free text goes
+            // to it and not to the turn: at worst it earns a confirmation question naming `/decide`.
+            if !input.transcribed
+                && !input.non_text
+                && let Some(answer) = commands::pending_answer(state, &inbound, &input.text).await?
+            {
+                return commands::execute(state, &inbound, answer).await;
+            }
+        }
         // Handled before `admit` for typed text; a transcript never yields it.
         Intent::Pair(_) => return Ok(()),
         other => return commands::execute(state, &inbound, other).await,

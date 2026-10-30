@@ -1,5 +1,301 @@
 //! Decisions a tree job asks its owner for: parking a branch on a question, and resuming it from
 //! the answer. Each one is a row of `decisions` (migration 0263).
+//!
+//! `answer` only moves state: relaunching the node of a resumed branch is not done here.
+//!
+//! `park` writes its own `work_tree_parked` line. `announce_close` in `http/nodes.rs` writes one
+//! for every node that closes `blocked`, so a caller of `park` must not also close that branch's
+//! node as `blocked`: the feed would say it twice.
+
+use std::fmt;
+
+use chrono::{SecondsFormat, Utc};
+use rand::RngExt;
+use serde_json::{Value, json};
+use sqlx::{SqliteConnection, SqlitePool};
+
+use super::engine::{self, apply_transition};
+use super::model::{Branch, Manifest};
+use super::store::{self, StoreError};
+
+pub const STATUS_OPEN: &str = "open";
+pub const STATUS_ANSWERED: &str = "answered";
+/// The `origin` of a row until somebody answers it, when the answering channel takes over.
+pub const ORIGIN_AGENT: &str = "agent";
+
+const PARKED: &str = "parked";
+const FEED_KIND: &str = "work_tree_parked";
+
+/// One row of `decisions`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+pub struct Decision {
+    pub id: String,
+    pub tree_id: Option<String>,
+    pub node_id: Option<String>,
+    pub question: String,
+    pub answer: Option<String>,
+    pub origin: Option<String>,
+    /// RFC 3339 text: the time of the question until there is an answer, then of the answer.
+    pub at: String,
+    pub status: String,
+}
+
+#[derive(Debug)]
+pub enum DecisionError {
+    /// No row has this decision id.
+    NotFound(String),
+    /// The decision has its answer, which stays.
+    AlreadyDecided(String),
+    /// The tree or node given to `park` has no branch to park.
+    NoBranch(String),
+    Engine(engine::EngineError),
+    Store(StoreError),
+    Db(sqlx::Error),
+}
+
+impl fmt::Display for DecisionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecisionError::NotFound(id) => write!(f, "decision {id} not found"),
+            DecisionError::AlreadyDecided(id) => write!(f, "decision {id} is already answered"),
+            DecisionError::NoBranch(reason) => write!(f, "no branch to park: {reason}"),
+            DecisionError::Engine(error) => write!(f, "{error}"),
+            DecisionError::Store(error) => write!(f, "{error}"),
+            DecisionError::Db(error) => write!(f, "database error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DecisionError {}
+
+impl From<engine::EngineError> for DecisionError {
+    fn from(error: engine::EngineError) -> Self {
+        DecisionError::Engine(error)
+    }
+}
+
+impl From<StoreError> for DecisionError {
+    fn from(error: StoreError) -> Self {
+        DecisionError::Store(error)
+    }
+}
+
+impl From<sqlx::Error> for DecisionError {
+    fn from(error: sqlx::Error) -> Self {
+        DecisionError::Db(error)
+    }
+}
+
+macro_rules! select_decisions {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, tree_id, node_id, question, answer, origin, at, status FROM decisions ",
+            $tail
+        )
+    };
+}
+
+/// Whole seconds and `+00:00`, the form the manifest's own times take.
+fn now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false)
+}
+
+/// Short and without whitespace, because the owner types it after `/decide`.
+fn new_id() -> String {
+    format!("d-{:08x}", rand::rng().random::<u32>())
+}
+
+fn branch_of_node<'a>(manifest: &'a mut Manifest, node_id: &str) -> Option<&'a mut Branch> {
+    manifest
+        .branches
+        .values_mut()
+        .find(|branch| branch.node_id.as_deref() == Some(node_id))
+}
+
+/// `store::update` takes the pool, and these writes share a transaction with the decision's row.
+/// `state` is left out: neither `park` nor `answer` changes the job's own state.
+async fn write_manifest(
+    conn: &mut SqliteConnection,
+    tree_id: &str,
+    manifest: &str,
+    updated_at: &str,
+) -> Result<(), DecisionError> {
+    let updated = sqlx::query("UPDATE tree_jobs SET manifest = ?, updated_at = ? WHERE id = ?")
+        .bind(manifest)
+        .bind(updated_at)
+        .bind(tree_id)
+        .execute(conn)
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::NotFound(tree_id.to_owned()).into());
+    }
+    Ok(())
+}
+
+/// Parks the branch behind `node_id` on `question`: the open decision, the branch's move to
+/// `parked` and the feed line land together or not at all, and a refusal writes nothing.
+pub async fn park(
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    question: &str,
+) -> Result<Decision, DecisionError> {
+    let Some(mut job) = store::load(pool, tree_id).await? else {
+        return Err(DecisionError::NoBranch(format!(
+            "tree job {tree_id} not found"
+        )));
+    };
+    let Some(branch) = branch_of_node(&mut job.manifest, node_id) else {
+        return Err(DecisionError::NoBranch(format!(
+            "node {node_id} tops no branch of tree job {tree_id}"
+        )));
+    };
+    let prev_state = branch.state.clone();
+    apply_transition(branch, PARKED)?;
+    let decision = Decision {
+        id: new_id(),
+        tree_id: Some(tree_id.to_owned()),
+        node_id: Some(node_id.to_owned()),
+        question: question.to_owned(),
+        answer: None,
+        origin: Some(ORIGIN_AGENT.to_owned()),
+        at: now(),
+        status: STATUS_OPEN.to_owned(),
+    };
+    branch.park = Some(json!({ "prev_state": prev_state, "decision_id": decision.id }));
+    // The tail is the wording of `work_nodes::feed_line`, whose `blocked` lines this one joins.
+    let line = format!(
+        "{}: blocked — branch {}, decision {} — precisa de: {question}",
+        job.goal, branch.name, decision.id
+    );
+    let manifest = serde_json::to_string(&job.manifest).map_err(StoreError::from)?;
+
+    // Nothing below may ask the pool for a connection while `tx` holds one.
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&decision.id)
+    .bind(&decision.tree_id)
+    .bind(&decision.node_id)
+    .bind(&decision.question)
+    .bind(&decision.answer)
+    .bind(&decision.origin)
+    .bind(&decision.at)
+    .bind(&decision.status)
+    .execute(&mut *tx)
+    .await?;
+    write_manifest(&mut tx, tree_id, &manifest, &decision.at).await?;
+    crate::feed::append_on(&mut tx, job.project_id.as_deref(), FEED_KIND, &line, None, None)
+        .await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
+/// Records the answer and, when the branch still waits on this very decision, puts it back in the
+/// state it parked from. The first answer stays: a second one is refused and changes nothing.
+///
+/// A decision whose tree, branch or park record has moved on is still answered, and only its row
+/// changes: otherwise it would stay open for good, with nothing left that could close it.
+pub async fn answer(
+    pool: &SqlitePool,
+    decision_id: &str,
+    text: &str,
+    origin: &str,
+) -> Result<Decision, DecisionError> {
+    let found: Option<Decision> = sqlx::query_as(select_decisions!("WHERE id = ?"))
+        .bind(decision_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(mut decision) = found else {
+        return Err(DecisionError::NotFound(decision_id.to_owned()));
+    };
+    if decision.status != STATUS_OPEN {
+        return Err(DecisionError::AlreadyDecided(decision_id.to_owned()));
+    }
+    let resumed = resumed_manifest(pool, &decision).await?;
+    let at = now();
+
+    // Nothing below may ask the pool for a connection while `tx` holds one.
+    let mut tx = pool.begin().await?;
+    let claimed = sqlx::query(
+        "UPDATE decisions SET answer = ?, origin = ?, at = ?, status = ?
+         WHERE id = ? AND status = ?",
+    )
+    .bind(text)
+    .bind(origin)
+    .bind(&at)
+    .bind(STATUS_ANSWERED)
+    .bind(decision_id)
+    .bind(STATUS_OPEN)
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        // Somebody answered between the read and this write.
+        return Err(DecisionError::AlreadyDecided(decision_id.to_owned()));
+    }
+    if let (Some(tree_id), Some(manifest)) = (decision.tree_id.as_deref(), resumed.as_deref()) {
+        write_manifest(&mut tx, tree_id, manifest, &at).await?;
+    }
+    tx.commit().await?;
+
+    decision.answer = Some(text.to_owned());
+    decision.origin = Some(origin.to_owned());
+    decision.at = at;
+    decision.status = STATUS_ANSWERED.to_owned();
+    Ok(decision)
+}
+
+/// The manifest to write once `decision` is answered, or `None` when no branch waits on it.
+async fn resumed_manifest(
+    pool: &SqlitePool,
+    decision: &Decision,
+) -> Result<Option<String>, DecisionError> {
+    let (Some(tree_id), Some(node_id)) = (decision.tree_id.as_deref(), decision.node_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(mut job) = store::load(pool, tree_id).await? else {
+        return Ok(None);
+    };
+    let Some(branch) = branch_of_node(&mut job.manifest, node_id) else {
+        return Ok(None);
+    };
+    let Some(record) = branch.park.as_ref().filter(|_| branch.state == PARKED) else {
+        return Ok(None);
+    };
+    if record.get("decision_id").and_then(Value::as_str) != Some(decision.id.as_str()) {
+        return Ok(None);
+    }
+    // A record without a `prev_state` names no state to go back to, which the engine refuses.
+    let prev_state = record
+        .get("prev_state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    apply_transition(branch, &prev_state)?;
+    branch.park = None;
+    let manifest = serde_json::to_string(&job.manifest).map_err(StoreError::from)?;
+    Ok(Some(manifest))
+}
+
+/// Every decision, open or answered, oldest first.
+pub async fn list(pool: &SqlitePool) -> Result<Vec<Decision>, DecisionError> {
+    let rows: Vec<Decision> = sqlx::query_as(select_decisions!("ORDER BY at, id"))
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// The decisions still waiting for an answer, oldest first.
+pub async fn open(pool: &SqlitePool) -> Result<Vec<Decision>, DecisionError> {
+    let rows: Vec<Decision> = sqlx::query_as(select_decisions!("WHERE status = ? ORDER BY at, id"))
+        .bind(STATUS_OPEN)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
 
 #[cfg(test)]
 mod tests {
