@@ -277,51 +277,67 @@ export interface ShadowQuery { action?: ActionName; rule?: string; cursor?: stri
 
 export const DEVTIME_ACTIONS_PATH = "/analytics/devtime/actions";
 
+/** Parameters in the order the core documents them: limit, action, rule, cursor; unset ones are left out. */
 export function devtimeShadowPath(query: ShadowQuery): string {
-  void query;
-  return "";
+  const params = new URLSearchParams({ limit: String(SHADOW_PAGE) });
+  if (query.action !== undefined) params.set("action", query.action);
+  if (query.rule !== undefined) params.set("rule", query.rule);
+  if (query.cursor !== undefined) params.set("cursor", query.cursor);
+  return `${DEVTIME_ACTIONS_PATH}/shadow?${params.toString()}`;
 }
 
 export function devtimeShadowVerdictPath(id: number): string {
-  void id;
-  return "";
+  return `${DEVTIME_ACTIONS_PATH}/shadow/${id}/verdict`;
 }
 
 export function devtimeActionPromotePath(action: ActionName, rule: string): string {
-  void action;
-  void rule;
-  return "";
+  return `${DEVTIME_ACTIONS_PATH}/${action}/${encodeURIComponent(rule)}/promote`;
 }
 
-// The hooks below are RED stubs: idle queries and mutations that do nothing.
-
+/** Every configured `(action, rule)` pair with its mode and promotion report. */
 export function useDevtimeActions() {
   return useQuery({
     queryKey: keys.analytics.devtimeActions(),
     queryFn: () => apiFetch<ActionPairs>(DEVTIME_ACTIONS_PATH),
-    enabled: false,
   });
 }
 
+/** One page of shadow decisions; `enabled` lets a caller hold the read back. */
 export function useDevtimeShadow(query: ShadowQuery, enabled = true) {
   return useQuery({
     queryKey: keys.analytics.devtimeShadow(query.action ?? "", query.rule ?? "", query.cursor ?? ""),
     queryFn: () => apiFetch<ShadowPage>(devtimeShadowPath(query)),
-    enabled: false && enabled,
+    enabled,
   });
+}
+
+/** Re-read every shadow page and the pairs: a mark or a promotion moves both (the report counts marks). */
+function useRefreshActions() {
+  const queryClient = useQueryClient();
+  return () => {
+    void queryClient.invalidateQueries({ queryKey: ["analytics", "devtime-shadow"] });
+    void queryClient.invalidateQueries({ queryKey: keys.analytics.devtimeActions() });
+  };
 }
 
 export function useMarkShadow() {
+  const refresh = useRefreshActions();
   return useMutation({
-    mutationFn: async (_vars: { id: number; verdict: ShadowMark }) => undefined as unknown as ShadowItem,
+    mutationFn: ({ id, verdict }: { id: number; verdict: ShadowMark }) =>
+      apiFetch<ShadowItem>(devtimeShadowVerdictPath(id), { method: "POST", body: JSON.stringify({ verdict }) }),
     retry: false,
+    onSuccess: refresh,
   });
 }
 
+/** A refusal (`not_ready`, 409) rejects the mutation and invalidates nothing: nothing was written. */
 export function usePromoteAction() {
+  const refresh = useRefreshActions();
   return useMutation({
-    mutationFn: async (_vars: { action: ActionName; rule: string }) => undefined as unknown as ActionPair,
+    mutationFn: ({ action, rule }: { action: ActionName; rule: string }) =>
+      apiFetch<ActionPair>(devtimeActionPromotePath(action, rule), { method: "POST" }),
     retry: false,
+    onSuccess: refresh,
   });
 }
 
