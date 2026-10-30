@@ -70,8 +70,18 @@ fn is_registered(exe_path: &Path) -> bool {
         .map(|unit| char::from_u32(u32::from(*unit)).unwrap_or('\u{fffd}'))
         .collect();
 
-    xml.to_lowercase()
-        .contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase())
+    xml_matches_task(&xml, exe_path)
+}
+
+/// Whether a queried task XML launches `exe_path` AND carries the settings this build registers.
+/// A task from an older build (default 72h limit, no restart-on-failure) names the same exe, so the
+/// exe alone would keep it forever; requiring `PT0S` and `<Count>99</Count>` makes it re-register.
+#[cfg(any(windows, test))]
+fn xml_matches_task(xml: &str, exe_path: &Path) -> bool {
+    let lower = xml.to_lowercase();
+    lower.contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase())
+        && lower.contains("pt0s")
+        && lower.contains("<count>99</count>")
 }
 
 #[cfg(windows)]
@@ -473,8 +483,9 @@ mod tests {
         assert!(xml.contains(r"<WorkingDirectory>C:\Projects\nucleos</WorkingDirectory>"));
     }
 
-    /// The daemon is a long-lived process: the task must never be killed by the default 72h limit,
-    /// must not show a window, and must keep restarting after a crash (every minute, 99 times).
+    /// The daemon is a long-lived process: the task must never be killed by the default 72h limit
+    /// and must keep restarting after a crash (every minute, 99 times). `<Hidden>true</Hidden>` hides
+    /// the task in the Task Scheduler UI; it does not hide a console window.
     #[test]
     fn task_xml_has_no_time_limit_is_hidden_and_restarts_up_to_99_times() {
         let xml = task_xml(Path::new(
@@ -485,6 +496,16 @@ mod tests {
         assert!(xml.contains(
             "<RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>99</Count>\n    </RestartOnFailure>"
         ));
+    }
+
+    #[test]
+    fn an_old_task_without_the_current_settings_is_not_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let current = task_xml(exe);
+        assert!(xml_matches_task(&current, exe));
+        let old = r"<Task><Exec><Command>C:\x\nucleos-core.exe</Command></Exec></Task>";
+        assert!(!xml_matches_task(old, exe));
+        assert!(!xml_matches_task(&current, Path::new(r"C:\other\nucleos-core.exe")));
     }
 
     #[cfg(unix)]

@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 DEFAULT_DAEMON_URL = "http://127.0.0.1:8791"
-CORE = "nucleos-core"
+CORE = "nucleos-core"  # display name in repair hints; the real binary comes from find_core()
 
 
 def _line(text):
@@ -53,13 +53,17 @@ def _check_yaml(import_module):
     return _check("tree_yaml", True)
 
 
-def _check_mcp(run_command, token):
+def _check_mcp(run_command, token, find_core):
     tok = token()
     if not tok:
         return _check("mcp_tools", False, "no daemon token available",
                       f"set NUCLEOS_DAEMON_TOKEN or run `{CORE} --print-token`")
+    core = find_core()
+    if not core:
+        return _check("mcp_tools", False, f"{CORE} binary not found in the dev home run dir",
+                      "stage the daemon with scripts/run-daemon.ps1")
     try:
-        code, out, err = run_command([CORE, "--mcp-tools"], {"NUCLEOS_DAEMON_TOKEN": tok})
+        code, out, err = run_command([core, "--mcp-tools"], {"NUCLEOS_DAEMON_TOKEN": tok})
     except Exception as exc:  # noqa: BLE001
         return _check("mcp_tools", False, f"cannot run {CORE} --mcp-tools: {exc}",
                       "stage the daemon with scripts/run-daemon.ps1")
@@ -100,12 +104,12 @@ def _check_registry(registry, project):
 
 
 def run_checks(root, *, load_project, dir_exists, import_module, run_command, token, http_get,
-               registry, daemon_url=DEFAULT_DAEMON_URL):
+               registry, daemon_url=DEFAULT_DAEMON_URL, find_core=lambda: "nucleos-core"):
     project_check, project = _check_project(root, load_project, dir_exists)
     checks = [
         project_check,
         _check_yaml(import_module),
-        _check_mcp(run_command, token),
+        _check_mcp(run_command, token, find_core),
         _check_health(http_get, token, daemon_url),
         _check_registry(registry, project),
     ]
@@ -118,12 +122,31 @@ def _daemon_url():
     return os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
 
 
+def _real_find_core():
+    import tree_resources
+
+    return tree_resources.find_core()
+
+
 def _real_token():
+    """Env, then the project's own control-token reader (as rehydrate), then the staged binary."""
     tok = os.environ.get("NUCLEOS_DAEMON_TOKEN")
     if tok:
         return tok
     try:
-        proc = subprocess.run([CORE, "--print-token"], capture_output=True, text=True, timeout=20)
+        import rehydrate
+
+        tok = rehydrate.find_token(os.getcwd())
+    except Exception:  # noqa: BLE001 - a missing helper just means the next fallback
+        tok = None
+    if tok:
+        return tok
+    core = _real_find_core()
+    if not core:
+        return None
+    try:
+        proc = subprocess.run([core, "--print-token"], capture_output=True, text=True, timeout=20,
+                              stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     out = proc.stdout.strip()
@@ -133,7 +156,7 @@ def _real_token():
 def _real_run_command(argv, env):
     try:
         proc = subprocess.run(argv, env={**os.environ, **env}, capture_output=True, text=True,
-                              timeout=30)
+                              timeout=30, stdin=subprocess.DEVNULL)  # EOF: the stdio server exits
     except subprocess.TimeoutExpired:
         return 1, "", "timed out after 30s"
     return proc.returncode, proc.stdout, proc.stderr
@@ -177,6 +200,7 @@ def run(args):
         token=_real_token,
         http_get=_real_http_get,
         registry=_real_registry,
+        find_core=_real_find_core,
         daemon_url=_daemon_url(),
     )
 

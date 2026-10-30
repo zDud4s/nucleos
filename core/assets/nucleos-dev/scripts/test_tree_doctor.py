@@ -97,6 +97,28 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse(check["ok"])
         self.assertNotIn("\n", check["cause"])
 
+    def test_mcp_tools_uses_found_core_path(self):
+        calls = []
+        tree_doctor.run_checks(
+            Path("/r"),
+            **make_deps(run_command=lambda a, e: calls.append(a) or (0, "", ""),
+                        find_core=lambda: "/dev/run/nucleos-core"),
+        )
+        self.assertEqual(calls[0][0], "/dev/run/nucleos-core")
+
+    def test_mcp_tools_core_not_found(self):
+        report = tree_doctor.run_checks(Path("/r"), **make_deps(find_core=lambda: None))
+        self.assertFalse(by_name(report)["mcp_tools"]["ok"])
+
+    def test_real_run_command_closes_stdin(self):
+        import subprocess
+        from unittest import mock
+
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            tree_doctor._real_run_command(["x"], {})
+        self.assertIs(run.call_args.kwargs.get("stdin"), subprocess.DEVNULL)
+
     def test_missing_token(self):
         report = tree_doctor.run_checks(Path("/r"), **make_deps(token=lambda: None))
         self.assertFalse(by_name(report)["mcp_tools"]["ok"])

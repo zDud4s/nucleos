@@ -53,6 +53,8 @@ def _entries(tree_id: str) -> list[tuple]:
 
 def run_add(args) -> dict:
     tree_id = ts.resolve_tree_id(args)
+    ts.check_id(args.tool, "tool")
+    ts.check_id(args.node, "node")
     entries = _entries(tree_id)
     for data, _path in entries:
         if data.get("node") == args.node and data.get("transition") == args.transition:
