@@ -175,15 +175,29 @@ pub async fn base_rates(
 
 /// Lower bound of the 95% Wilson interval (z = 1.96) for `right` out of `n`; 0.0 when `n <= 0`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn wilson_lower(_right: i64, _n: i64) -> f64 {
-    0.0
+pub fn wilson_lower(right: i64, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let right = right.clamp(0, n) as f64;
+    let n = n as f64;
+    let z = 1.96_f64;
+    let z2 = z * z;
+    let p = right / n;
+    let centre = p + z2 / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    ((centre - margin) / (1.0 + z2 / n)).clamp(0.0, 1.0)
 }
 
 /// A rule may drive an action only when it is eligible and the Wilson lower bound of its
 /// precision reaches `wilson_floor`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn action_eligible(_p: &RulePrecision, _wilson_floor: f64) -> bool {
-    false
+pub fn action_eligible(p: &RulePrecision, wilson_floor: f64) -> bool {
+    if !p.eligible || p.level != Level::Base {
+        return false;
+    }
+    let right = (p.n_cases - p.n_not_rework).max(0);
+    wilson_lower(right, p.n_cases) >= wilson_floor
 }
 
 #[cfg(test)]
