@@ -29,6 +29,8 @@ export const keys = {
   status: ["status"] as const,
   /** The release feed's answer: an update to offer, or null. */
   update: ["update"] as const,
+  /** How this build was installed (AppImage, system package, other). */
+  installKind: ["install-kind"] as const,
 
   /**
    * How much work fits and what is inside it — `GET /concurrency`.

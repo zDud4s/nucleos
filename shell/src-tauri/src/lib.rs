@@ -270,6 +270,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_daemon_token,
             daemon::updates_enabled,
+            daemon::install_kind,
             dictation::voice_hotkey,
             dictation::voice_phase,
             dictation::voice_paste,

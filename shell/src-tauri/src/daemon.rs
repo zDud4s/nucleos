@@ -77,16 +77,33 @@ pub fn updates_enabled() -> bool {
 }
 
 /// How this shell was installed, which decides whether it may update itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum InstallKind {
     AppImage,
     SystemPackage,
     Other,
 }
 
-/// Classifies the install. STUB (RED): always `Other`.
-pub fn install_kind_of(_exe: &Path, _appimage_env: bool) -> InstallKind {
-    InstallKind::Other
+/// Classifies the install from the executable path and whether `APPIMAGE` is set. An AppImage
+/// mounts itself under a temp dir, but the variable wins regardless of where the exe sits.
+/// Under `/usr/bin` or `/usr/lib` the package manager owns the files, so the shell must not
+/// replace them itself.
+pub fn install_kind_of(exe: &Path, appimage_env: bool) -> InstallKind {
+    if appimage_env {
+        InstallKind::AppImage
+    } else if exe.starts_with("/usr/bin") || exe.starts_with("/usr/lib") {
+        InstallKind::SystemPackage
+    } else {
+        InstallKind::Other
+    }
+}
+
+/// How this shell was installed: an AppImage, a .deb/.rpm system package, or something else.
+#[tauri::command]
+pub fn install_kind() -> InstallKind {
+    let exe = std::env::current_exe().unwrap_or_default();
+    install_kind_of(&exe, std::env::var_os("APPIMAGE").is_some())
 }
 
 #[cfg(test)]

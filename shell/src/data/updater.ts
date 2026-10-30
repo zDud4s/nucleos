@@ -21,19 +21,23 @@ export async function updatesEnabled(): Promise<boolean> {
 
 export type InstallKind = "app-image" | "system-package" | "other";
 
-/** How this build was installed. STUB (RED). */
+/** How this build was installed; `other` outside the desktop host. */
 export async function installKind(): Promise<InstallKind> {
-  throw new Error("not implemented");
+  if (!isTauri()) return "other";
+  return invoke<InstallKind>("install_kind");
 }
 
-/** Hook over installKind(). STUB (RED). */
-export function useInstallKind(): { data: InstallKind | undefined } {
-  return { data: undefined };
+export function useInstallKind() {
+  return useQuery({ queryKey: keys.installKind, queryFn: installKind, retry: false });
 }
 
-/** The offered update, or null when there is none or updates are disabled here. */
+/**
+ * The offered update, or null when there is none, updates are disabled here, or this is a
+ * .deb/.rpm install that its package manager updates.
+ */
 export async function findUpdate(): Promise<Update | null> {
   if (!(await updatesEnabled())) return null;
+  if ((await installKind()) === "system-package") return null;
   return check();
 }
 
