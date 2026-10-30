@@ -49,6 +49,18 @@ pub struct ClassTally {
     pub reviewed: i64,
     pub agree: i64,
     pub disagree: i64,
+    /// Disagreements where the human was stricter than the classifier (rejected an `allow`).
+    pub stricter: i64,
+    /// Disagreements where the human was looser (approved a `deny` or `pending_approval`).
+    pub looser: i64,
+    /// Decisions still waiting for a human verdict.
+    pub unreviewed: i64,
+    /// Oldest `created_at` among the unreviewed decisions, `None` when nothing is waiting.
+    pub oldest_unreviewed_at: Option<String>,
+    /// Reviewed decisions split by what the classifier decided.
+    pub reviewed_allow: i64,
+    pub reviewed_pend: i64,
+    pub reviewed_deny: i64,
 }
 
 /// How much of one stored text a `shadow_decisions` row keeps: each string inside `tool_input`, and
@@ -306,7 +318,36 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
              SUM(CASE
                  WHEN shadow_decisions.human_verdict IS NOT NULL AND ({AGREE_CASE}) = 0 THEN 1
                  ELSE 0
-             END) AS disagree
+             END) AS disagree,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict = 'reject'
+                      AND shadow_decisions.decision = 'allow' THEN 1
+                 ELSE 0
+             END) AS stricter,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict = 'approve'
+                      AND shadow_decisions.decision IN ('deny', 'pending_approval') THEN 1
+                 ELSE 0
+             END) AS looser,
+             SUM(CASE WHEN shadow_decisions.human_verdict IS NULL THEN 1 ELSE 0 END) AS unreviewed,
+             MIN(CASE
+                 WHEN shadow_decisions.human_verdict IS NULL THEN shadow_decisions.created_at
+             END) AS oldest_unreviewed_at,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'allow' THEN 1
+                 ELSE 0
+             END) AS reviewed_allow,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'pending_approval' THEN 1
+                 ELSE 0
+             END) AS reviewed_pend,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'deny' THEN 1
+                 ELSE 0
+             END) AS reviewed_deny
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.project_id = ?
@@ -857,6 +898,13 @@ mod tests {
                     reviewed: 0,
                     agree: 0,
                     disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
                 },
                 ClassTally {
                     mode: "real".to_owned(),
@@ -868,6 +916,13 @@ mod tests {
                     reviewed: 0,
                     agree: 0,
                     disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 2,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
                 },
             ]
         );
@@ -912,6 +967,13 @@ mod tests {
                     reviewed: 0,
                     agree: 0,
                     disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
                 },
                 ClassTally {
                     mode: "shadow".to_owned(),
@@ -923,6 +985,13 @@ mod tests {
                     reviewed: 0,
                     agree: 0,
                     disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
                 },
                 ClassTally {
                     mode: "worktree".to_owned(),
@@ -934,6 +1003,13 @@ mod tests {
                     reviewed: 0,
                     agree: 0,
                     disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
                 },
                 ClassTally {
                     mode: "worktree".to_owned(),
@@ -945,6 +1021,13 @@ mod tests {
                     reviewed: 0,
                     agree: 0,
                     disagree: 0,
+                    stricter: 0,
+                    looser: 0,
+                    unreviewed: 1,
+                    oldest_unreviewed_at: Some("2026-07-18T00:00:00Z".to_owned()),
+                    reviewed_allow: 0,
+                    reviewed_pend: 0,
+                    reviewed_deny: 0,
                 },
             ]
         );
@@ -971,6 +1054,166 @@ mod tests {
         assert_eq!(tallies[0].reviewed, 3);
         assert_eq!(tallies[0].agree, 2);
         assert_eq!(tallies[0].disagree, 1);
+    }
+
+    async fn set_created_at(pool: &sqlx::SqlitePool, id: i64, created_at: &str) {
+        sqlx::query("UPDATE shadow_decisions SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoreboard_stricter_plus_looser_equals_disagree() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("reject")).await;
+        insert_shadow(&pool, run_id, "governance", "deny", Some("approve")).await;
+        insert_shadow(
+            &pool,
+            run_id,
+            "governance",
+            "pending_approval",
+            Some("approve"),
+        )
+        .await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("approve")).await;
+        insert_shadow(&pool, run_id, "governance", "deny", Some("reject")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(tallies[0].disagree, 3);
+        assert_eq!(tallies[0].stricter, 1, "reject of an allow is stricter");
+        assert_eq!(tallies[0].looser, 2, "approve of a deny/pend is looser");
+        assert_eq!(tallies[0].stricter + tallies[0].looser, tallies[0].disagree);
+    }
+
+    #[tokio::test]
+    async fn scoreboard_reports_unreviewed_oldest_and_reviewed_by_decision() {
+        let pool = test_pool().await;
+        let run_id = insert_run(&pool, "project-a").await;
+        let newer = insert_shadow(&pool, run_id, "governance", "pending_approval", None).await;
+        let older = insert_shadow(&pool, run_id, "governance", "allow", None).await;
+        set_created_at(&pool, newer, "2026-07-20T00:00:00Z").await;
+        set_created_at(&pool, older, "2026-07-10T00:00:00Z").await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("approve")).await;
+        insert_shadow(&pool, run_id, "governance", "allow", Some("reject")).await;
+        insert_shadow(
+            &pool,
+            run_id,
+            "governance",
+            "pending_approval",
+            Some("approve"),
+        )
+        .await;
+        insert_shadow(&pool, run_id, "governance", "deny", Some("reject")).await;
+        insert_shadow(&pool, run_id, "read-local", "allow", Some("approve")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        let gov = tallies
+            .iter()
+            .find(|t| t.action_class == "governance")
+            .unwrap();
+        assert_eq!(gov.unreviewed, 2);
+        assert_eq!(
+            gov.oldest_unreviewed_at.as_deref(),
+            Some("2026-07-10T00:00:00Z")
+        );
+        assert_eq!(gov.reviewed_allow, 2);
+        assert_eq!(gov.reviewed_pend, 1);
+        assert_eq!(gov.reviewed_deny, 1);
+        let other = tallies
+            .iter()
+            .find(|t| t.action_class == "read-local")
+            .unwrap();
+        assert_eq!(other.unreviewed, 0);
+        assert_eq!(other.oldest_unreviewed_at, None);
+    }
+
+    #[tokio::test]
+    async fn a_mixed_class_can_be_ready_with_no_withheld_decision_reviewed() {
+        let pool = test_pool().await;
+        let run_id = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run_id, "governance", "allow", Some("approve")).await;
+        }
+        for _ in 0..3 {
+            insert_shadow(&pool, run_id, "governance", "pending_approval", None).await;
+        }
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+        let t = &tallies[0];
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        let (ready, total, _withheld) = readiness.get("project-a").copied().unwrap();
+
+        assert!(
+            class_ready(t.reviewed, t.agree),
+            "the gate changed: a mixed class should be ready on its allows alone; re-read the spec"
+        );
+        assert_eq!((ready, total), (1, 1));
+        assert_eq!(t.reviewed_pend, 0, "no withheld decision was reviewed");
+        assert!(t.would_pend > 0);
+    }
+
+    #[tokio::test]
+    async fn scoreboard_keeps_worktree_in_its_own_row_for_the_new_fields() {
+        let pool = test_pool().await;
+        let shadow_run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        let worktree_run = insert_run_with_mode(&pool, "project-a", "worktree").await;
+        let pending = insert_shadow(&pool, shadow_run, "governance", "allow", None).await;
+        set_created_at(&pool, pending, "2026-07-10T00:00:00Z").await;
+        insert_shadow(&pool, worktree_run, "governance", "allow", Some("reject")).await;
+        insert_shadow(&pool, worktree_run, "governance", "deny", Some("approve")).await;
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        assert_eq!(tallies.len(), 2);
+        let (s, w) = (&tallies[0], &tallies[1]);
+        assert_eq!((s.mode.as_str(), w.mode.as_str()), ("shadow", "worktree"));
+        assert_eq!(s.unreviewed, 1);
+        assert_eq!(
+            s.oldest_unreviewed_at.as_deref(),
+            Some("2026-07-10T00:00:00Z")
+        );
+        assert_eq!((s.stricter, s.looser, s.reviewed_allow), (0, 0, 0));
+        assert_eq!(w.unreviewed, 0);
+        assert_eq!(w.oldest_unreviewed_at, None);
+        assert_eq!((w.stricter, w.looser), (1, 1));
+        assert_eq!(
+            (w.reviewed_allow, w.reviewed_pend, w.reviewed_deny),
+            (1, 0, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoreboard_new_fields_do_not_change_existing_counts_or_the_95_percent_edge() {
+        let pool = test_pool().await;
+        let run_id = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for i in 0..20 {
+            let a = if i < 1 { "reject" } else { "approve" };
+            let b = if i < 2 { "reject" } else { "approve" };
+            insert_shadow(&pool, run_id, "edge-a", "allow", Some(a)).await;
+            insert_shadow(&pool, run_id, "edge-b", "allow", Some(b)).await;
+        }
+
+        let tallies = scoreboard(&pool, "project-a").await.unwrap();
+
+        let (a, b) = (&tallies[0], &tallies[1]);
+        assert_eq!(
+            (a.total, a.would_allow, a.would_pend, a.would_deny),
+            (20, 20, 0, 0)
+        );
+        assert_eq!((a.reviewed, a.agree, a.disagree), (20, 19, 1));
+        assert_eq!((b.reviewed, b.agree, b.disagree), (20, 18, 2));
+        assert!(class_ready(20, 19));
+        assert!(!class_ready(20, 18));
+        assert!(class_ready(a.reviewed, a.agree));
+        assert!(!class_ready(b.reviewed, b.agree));
+        let readiness = shadow_readiness(&pool).await.unwrap();
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 2, 0)));
     }
 
     #[tokio::test]
