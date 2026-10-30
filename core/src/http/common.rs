@@ -173,8 +173,8 @@ pub(super) fn machine_config_root(
 /// none.
 ///
 /// Two refusals, and they are different facts: `no_machine_root` is this machine having no home
-/// directory — the same name `/config/machine` refuses with — and `bad_project_id` is an id that
-/// cannot name a directory without meaning another one (`project::state::valid_id`).
+/// directory, and `bad_project_id` is an id that cannot name a directory without meaning another
+/// one (`project::state::valid_id`).
 pub(super) fn project_state_dir(
     state: &AppState,
     id: &str,

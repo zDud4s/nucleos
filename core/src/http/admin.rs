@@ -11,11 +11,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/system/shutdown", post(post_system_shutdown))
         .route("/sidecars/{name}/restart", post(post_sidecar_restart))
         .route("/config/email", get(get_email_config))
-        .route(
-            "/config/machine",
-            get(get_machine_config).post(post_machine_config),
-        )
-        // In no `auth.rs` table on purpose: Control and Admin only, like `/config/machine`.
+        // In no `auth.rs` table on purpose: Control and Admin only, like `/settings`.
         .route(
             "/config/distiller",
             get(crate::distill::model::get_distiller_config)
@@ -43,7 +39,7 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route("/backup", post(post_backup))
         .route("/backups", get(get_backups))
-        // In no `auth.rs` table on purpose, like `/config/machine`: it names the data directory's
+        // In no `auth.rs` table on purpose, like `/settings`: it names the data directory's
         // layout and sizes, which a read-only key has no use for.
         .route("/system/storage", get(get_system_storage))
         // Same reasoning, and the same default: it rewrites the database file on the next start.
@@ -417,195 +413,6 @@ pub(super) struct EmailConfigView {
     pub(super) retain_bodies_days: u8,
     /// Why local triage is unavailable when a local model was configured but could not be trusted.
     pub(super) local_triage_disabled: Option<String>,
-}
-
-/// This machine's settings: the fence, and what is currently inside it.
-///
-/// The whole table every time, including rows whose file does not exist, because "this pillar has
-/// never been configured" is the answer the page most needs and an absent row cannot give it. That
-/// is the same reason `GET /projects/{id}/ownership` serves claims rather than files.
-///
-/// `display` is the spelling a person is shown (`~/.nucleos/voice.yaml`) and `resolved` the file the
-/// daemon actually opens. The second used to matter more than it does: when these files were
-/// relative to the working directory, twenty worktrees meant twenty candidate files, and the
-/// absolute path was the only thing that said which one the page was editing. It is still served,
-/// because "which file is this" deserves an answer that is not an abbreviation.
-///
-/// No secret is in any of these files by construction — every one of them lives in the OS
-/// credential store instead, and each config type's doc says so where the temptation was closest.
-/// So the contents go over the wire as they are.
-pub(super) async fn get_machine_config(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let root = machine_config_root(&state)?;
-    let read_root = root.clone();
-    let startup = state.startup_config.clone();
-    let rows = tokio::task::spawn_blocking(move || {
-        crate::machine_config::SETTINGS
-            .iter()
-            .map(|setting| {
-                let target = read_root.join(setting.path);
-                let read = std::fs::read_to_string(&target);
-                // Judged from the read that is served, so the verdict and the text beside it can
-                // never be about two different versions of the file.
-                let check = crate::machine_config::check_read(setting, &read);
-                // What the daemon started on, if it recorded anything for this file; a state that
-                // recorded nothing means "nothing was wrong".
-                let at_startup = startup.iter().find(|entry| entry.path == setting.path);
-                let contents = read.ok();
-                serde_json::json!({
-                    "path": setting.path,
-                    "display": crate::machine_config::display_path(setting.path),
-                    "area": setting.area,
-                    "what": setting.what,
-                    "takes_effect": setting.takes_effect,
-                    "exists": contents.is_some(),
-                    "valid": check.valid,
-                    "problem": check.problem,
-                    "at_startup": {
-                        "valid": at_startup.is_none_or(|entry| entry.valid),
-                        "problem": at_startup.and_then(|entry| entry.problem.clone()),
-                    },
-                    "contents": contents,
-                    "resolved": target.display().to_string(),
-                })
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
-
-    Ok(Json(serde_json::json!({
-        "root": root.display().to_string(),
-        "root_display": crate::machine_config::ROOT_DISPLAY,
-        "settings": rows,
-    })))
-}
-
-/// Creates the directory a settings row lives in under `root`, if it has one beyond `root` itself.
-///
-/// `setting_path` is the table's own string (`Setting::path`), never the caller's `body.path`, so
-/// the directories made are only ever ones a row names.
-pub(super) fn create_setting_dirs(
-    root: &std::path::Path,
-    setting_path: &str,
-) -> std::io::Result<()> {
-    match root.join(setting_path).parent() {
-        Some(parent) => std::fs::create_dir_all(parent),
-        None => Ok(()),
-    }
-}
-
-#[cfg(test)]
-mod channels_write_tests;
-
-/// Writes one of this machine's settings files, having first made it prove it parses.
-///
-/// Deliberately the same shape as [`post_project_write`] — same refusal names, same validate-then-
-/// write order, same atomic rename — because it is the same act against a different root, and two
-/// write routes that disagreed about what `invalid` means would be two contracts for one page.
-///
-/// **Admin, by appearing in no table in `auth.rs`.** `permits` is default-deny, which is what
-/// protects a route nobody thought about; this one was thought about, and the answer is the same.
-/// It matters more here than for a project's rules file: `~/.nucleos/github.yaml` names what a run may do
-/// on GitHub without asking, and `~/.nucleos/nucleos-models.yaml` names the models every route is built
-/// from. The control token reaches this, and `assistant.rs` hands that token to an MCP-only
-/// assistant turn — which is precisely why the kill switch is consulted below.
-///
-/// The global kill switch only. There is no project-scoped one to ask about: this file is not any
-/// project's, which is the whole reason it has its own registry.
-pub(super) async fn post_machine_config(
-    State(state): State<AppState>,
-    Json(body): Json<WriteRequest>,
-) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
-    // about is not a stop anybody may assume is off.
-    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
-        .await
-        .unwrap_or(true)
-    {
-        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
-    }
-
-    let Some(setting) = crate::machine_config::setting_for(&body.path) else {
-        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
-    };
-
-    let root = machine_config_root(&state)?;
-    // The root may not exist yet — it is created by the first file anybody writes into it — and
-    // `safe_write_target` canonicalises the root before it will answer. Created only once the path
-    // is known to be a row, so a refused path still leaves nothing behind.
-    std::fs::create_dir_all(&root).map_err(|error| {
-        tracing::warn!(%error, "could not create this machine's settings directory");
-        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-    })?;
-    // A row may sit in a subdirectory (`channels/telegram.yaml`), and `safe_write_target` answers
-    // only for a parent that exists. Made from the table's string, before the target is resolved.
-    create_setting_dirs(&root, setting.path).map_err(|error| {
-        tracing::warn!(%error, "could not create the directory of a machine settings file");
-        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-    })?;
-    // `setting.path` and not `body.path`: the caller's spelling has been matched against the table
-    // and has done its job. Joining the table's own string is what makes a path that normalises to
-    // a row unable to reach a file the row does not name.
-    let target = inspect::safe_write_target(&root, setting.path)
-        .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
-
-    if let Err(detail) = (setting.validate)(&body.contents) {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
-        ));
-    }
-
-    // The models file has a second writer in this process, the price refresh, and the two share
-    // one lock (see `crate::config::MODELS_FILE_WRITE`): without it the refresh could splice the
-    // text this write replaced and put it back, and both would race for the one temporary
-    // `write_atomically` stages beside the file. Held until the write has landed.
-    let models_file_write = if setting.path == crate::config::MODELS_CONFIG_FILE {
-        Some(crate::config::MODELS_FILE_WRITE.lock().await)
-    } else {
-        None
-    };
-    let contents = body.contents;
-    tokio::task::spawn_blocking(move || {
-        crate::project::state::write_atomically(&target, &contents)
-    })
-    .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-    .map_err(|error| {
-        tracing::warn!(%error, path = %setting.path, "writing a machine settings file failed");
-        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-    })?;
-    drop(models_file_write);
-
-    // A channel's yaml is held in memory (`ChannelsRuntime::configs`); re-read so the edit applies
-    // to the next turn rather than at the next restart.
-    if setting.path.starts_with("channels/") {
-        state.channels.reload(&root);
-    }
-
-    // `None` for the project, because there is not one — this is the machine's own line. After the
-    // write and loudly on failure, for the reason `post_project_write` gives: a feed line about a
-    // write that then failed claims something that did not happen.
-    if let Err(error) = feed::append(
-        &state.pool,
-        None,
-        "config_written",
-        &format!(
-            "{} written from the app",
-            crate::machine_config::display_path(setting.path)
-        ),
-        None,
-        // A machine setting or a credential: nothing a run, a job or a council owns.
-        None,
-    )
-    .await
-    {
-        tracing::error!(%error, path = %setting.path, "the settings file was written but the feed line was lost");
-    }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The credentials this machine holds, by whether they are set — never by what they are.

@@ -673,7 +673,7 @@ pub(super) async fn get_project_onboarding(
 /// refuse to allow; here it is allowed because a project being brought in has no folder on record
 /// yet, and naming one is what `GET /projects/detect` already lets this same key do.
 ///
-/// **Kill-switch checked first, like `POST /write` and `POST /config/machine`.** Onboarding writes
+/// **Kill-switch checked first, like `POST /write` and `PUT /settings/{scope}/{name}`.** Onboarding writes
 /// `gate_command` into the project's `autopilot` settings document and installs an executable classifier hook —
 /// the same shape of governance write those two routes already refuse the stop for — so a stop
 /// engaged here must refuse before either lands. The shell's new-project wizard used to lean on

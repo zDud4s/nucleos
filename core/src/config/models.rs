@@ -919,19 +919,17 @@ pub const MODELS_CONFIG_FILE: &str = "nucleos-models.yaml";
 /// [`crate::machine_config::ROOT_DISPLAY`].
 pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
 
-/// Held by every in-process writer of [`MODELS_CONFIG_FILE`]: the price refresh
-/// ([`crate::price_refresh::refresh_file`], around its re-read, splice and write) and the System
-/// page's write door (`http/admin.rs::post_machine_config`, around its write).
+/// Held by every in-process writer of [`MODELS_CONFIG_FILE`]. Since `POST /config/machine` went
+/// that is one: the price refresh ([`crate::price_refresh::refresh_file`], around its re-read,
+/// splice and write).
 ///
-/// Two reasons. The refresh rewrites the file from a fresh read, and the lock makes "fresh" hold
-/// until its write lands, so a settings write cannot slip in between and be overwritten by a splice
-/// of the text it replaced. And both go through [`crate::project::state::write_atomically`], which
-/// stages the text in the same `nucleos-models.yaml.nucleos-tmp` beside the target; two writes at
-/// once would collide on that temporary. It cannot order the daemon against an edit by hand or
-/// another process, which is why the refresh re-reads only after its fetch, keeping that window as
-/// short as a read and a write.
+/// The refresh rewrites the file from a fresh read, and the lock makes "fresh" hold until its write
+/// lands. [`crate::project::state::write_atomically`] stages the text in the same
+/// `nucleos-models.yaml.nucleos-tmp` beside the target, so two writes at once would collide on that
+/// temporary. It cannot order the daemon against an edit by hand or another process, which is why
+/// the refresh re-reads only after its fetch, keeping that window as short as a read and a write.
 ///
-/// A tokio mutex because the write door holds it across the `await` of its blocking write.
+/// A tokio mutex because a holder keeps it across the `await` of its blocking write.
 pub static MODELS_FILE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// One model's published prices. A `None` field is a price the script could not read: tokens of that

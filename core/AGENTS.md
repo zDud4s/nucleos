@@ -164,7 +164,7 @@ the contract, not a snapshot.
 | `http/proposals.rs` | Proposals and the waiting queue (`/proposals/*`, `/waiting/*`). |
 | `http/relay.rs` | Notifications, PII, voice, web and browser seats (`/notifications/*`, `/pii`, `/voice/*`, `/web/*`, `/browser/*`). |
 | `http/remote.rs` | Remote access (`/remote/pair`, `/remote/session`, `/remote/logout`, `/remote/pairing-codes`, `/remote/devices*`): thin over `remote.rs`; who reaches which route is decided in `auth::require_token`. |
-| `http/repo.rs` | Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…). |
+| `http/repo.rs` | Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…). **Debt, leaves in Task 8.9:** `POST /projects/{id}/write` and `GET /projects/{id}/owned` stay until the shell's `OwnedFiles` goes. `POST /write` answers 403 `not_ours` for `autopilot.yaml`/`workflows.yaml` and 403 `another_author` for a workflow-claimed file, and `GET /owned` has nothing in `State`, so neither does useful work now. |
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
 | `http/settings.rs` | Settings documents over HTTP (`/settings*`): index, read, history, PUT with optimistic versioning, rollback. |
 | `http/tasks.rs` | The HTTP face of `task_claims`: `/tasks/*` per worktree (tools and runs), `/projects/{id}/tasks*` for the owner only (hooks and the shell). A project off the roster is "claims unavailable", never a server error. |
@@ -397,7 +397,14 @@ the contract, not a snapshot.
 | `settings/store.rs` | The transactional store behind the handle: load, put, update, rollback, delete and history, one transaction per write. |
 | `settings/import.rs` | The one-time YAML -> database import, run once per start on the PRIMARY instance, after `settings::init` and before any reader. Each file that has no document yet goes through the SAME `parse_*` function its old loader used (so the grammar, the router's loopback fence and the council's roster rules are one rule set), is stored as version 1 by `import` (`put` with `expected = Some(0)`, so a lost race is silent), and is renamed `<file>.imported` — never deleted, never read again. A document that exists is never overwritten and its file is not even read; a file that does not parse stays, a `config_migrated` feed line says why, and that document starts on its defaults, retried every start. Never carries a body in a feed line. |
 | `route_index/mod.rs` | The route index: every HTTP route the daemon serves, searchable by `GET /routes/search`. Holds `RouteEntry` and `Body`, and re-exports the table, the hot operations and the search. |
-| `route_index/generated.rs` | The generated route table (`ROUTES`) and `schema_of`; written by `scripts/route_index_gate.py --write`, never by hand. Carries a file-size baseline line because it is data, not logic. |
+| `route_index/generated.rs` | The generated route table (`ROUTES`, the parts below joined in order at compile time) and `schema_of`; written by `scripts/route_index_gate.py --write`, never by hand. |
+| `route_index/generated/a.rs` | Generated: the route entries whose path starts with `a`. |
+| `route_index/generated/b_c.rs` | Generated: the route entries whose path starts with `b` or `c`. |
+| `route_index/generated/d_h.rs` | Generated: the route entries whose path starts with `d` to `h`. |
+| `route_index/generated/j_o.rs` | Generated: the route entries whose path starts with `j` to `o`. |
+| `route_index/generated/p.rs` | Generated: the route entries whose path starts with `p`. |
+| `route_index/generated/q_s.rs` | Generated: the route entries whose path starts with `q` to `s`. |
+| `route_index/generated/t_z.rs` | Generated: the route entries whose path starts with `t` to `z`. |
 | `route_index/hot.rs` | The six operations the supervisor prompt names verbatim (`HotOp`, `hot_ops`, `render_prompt_block`). |
 | `route_index/search.rs` | Pure search over the route table: lowercase token AND-match, path hits ranked above purpose hits, filtered by token level. |
 | `route_index/tests.rs` | Tests of the route index: the table, the hot pairs, the search and the `/routes/search` handler. |

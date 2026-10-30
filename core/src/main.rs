@@ -719,25 +719,8 @@ async fn main() {
         .with_agent_clis(Arc::new(claude_runner()), models_config.codex_model.clone()),
     );
 
-    // What every settings file looked like when the loaders above read it. A loader answers a file
-    // it cannot parse with defaults and a warning, so the owner learns of it from the settings page
-    // (this, set against the file as it is now) and from one feed line each, not from a log.
-    let startup_config = Arc::new(
-        machine_config_root
-            .as_deref()
-            .map(machine_config::check_all)
-            .unwrap_or_default(),
-    );
-    for check in startup_config.iter().filter(|check| !check.valid) {
-        tracing::warn!(
-            file = %machine_config::display_path(check.path),
-            "this settings file does not parse; the daemon started on its defaults for it"
-        );
-    }
-    machine_config::report_unreadable(&pool, &startup_config).await;
-
     let state = AppState {
-        startup_config,
+        startup_config: (),
         token: Token(token_value),
         pool,
         runner: primary_runner,
@@ -751,8 +734,8 @@ async fn main() {
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),
         secrets: std::sync::Arc::new(secrets::OsCredentialStore),
-        // The root every file above was read from, so the settings page writes the same files the
-        // daemon reads. `None` was already warned about where it was resolved.
+        // The root every file above was read from, so a project's state directory hangs off the
+        // same home the daemon reads. `None` was already warned about where it was resolved.
         machine_config_root: machine_config_root.clone(),
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
