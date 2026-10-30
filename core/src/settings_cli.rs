@@ -61,8 +61,15 @@ pub enum Invocation {
     NotSettings,
     /// A flag is present and the rest does not parse. `run` turns it into exit 2.
     Usage(String),
-    Reset { scope: Scope, name: String },
-    Rollback { scope: Scope, name: String, version: i64 },
+    Reset {
+        scope: Scope,
+        name: String,
+    },
+    Rollback {
+        scope: Scope,
+        name: String,
+        version: i64,
+    },
 }
 
 /// What a call produced, for `main` to print and exit with.
@@ -75,11 +82,19 @@ pub struct Outcome {
 
 impl Outcome {
     fn done(stdout: String) -> Self {
-        Self { code: EXIT_OK, stdout, stderr: String::new() }
+        Self {
+            code: EXIT_OK,
+            stdout,
+            stderr: String::new(),
+        }
     }
 
     fn refused(code: i32, stderr: String) -> Self {
-        Self { code, stdout: String::new(), stderr }
+        Self {
+            code,
+            stdout: String::new(),
+            stderr,
+        }
     }
 }
 
@@ -103,10 +118,15 @@ pub fn invocation(args: &[String]) -> Invocation {
         return Invocation::NotSettings;
     };
     if flags.len() > 1 {
-        return Invocation::Usage("give one of --settings-reset and --settings-rollback, not both".into());
+        return Invocation::Usage(
+            "give one of --settings-reset and --settings-rollback, not both".into(),
+        );
     }
     if at > 0 {
-        return Invocation::Usage(format!("`{}` may not come before {}", operands[0], operands[at]));
+        return Invocation::Usage(format!(
+            "`{}` may not come before {}",
+            operands[0], operands[at]
+        ));
     }
     let rest = &operands[1..];
     match (operands[0].as_str(), rest) {
@@ -114,12 +134,22 @@ pub fn invocation(args: &[String]) -> Invocation {
             Ok((scope, name)) => Invocation::Reset { scope, name },
             Err(reason) => Invocation::Usage(reason),
         },
-        (ROLLBACK_FLAG, [target, version]) => match (parse_target(target), parse_version(version)) {
-            (Ok((scope, name)), Ok(version)) => Invocation::Rollback { scope, name, version },
-            (Err(reason), _) | (_, Err(reason)) => Invocation::Usage(reason),
-        },
-        (RESET_FLAG, _) => Invocation::Usage("--settings-reset takes exactly one <scope>/<name>".into()),
-        _ => Invocation::Usage("--settings-rollback takes exactly <scope>/<name> and a version".into()),
+        (ROLLBACK_FLAG, [target, version]) => {
+            match (parse_target(target), parse_version(version)) {
+                (Ok((scope, name)), Ok(version)) => Invocation::Rollback {
+                    scope,
+                    name,
+                    version,
+                },
+                (Err(reason), _) | (_, Err(reason)) => Invocation::Usage(reason),
+            }
+        }
+        (RESET_FLAG, _) => {
+            Invocation::Usage("--settings-reset takes exactly one <scope>/<name>".into())
+        }
+        _ => Invocation::Usage(
+            "--settings-rollback takes exactly <scope>/<name> and a version".into(),
+        ),
     }
 }
 
@@ -127,19 +157,25 @@ pub fn invocation(args: &[String]) -> Invocation {
 /// LAST `/`: document names never contain one, a project id might.
 fn parse_target(text: &str) -> Result<(Scope, String), String> {
     let (scope_text, name) = text.rsplit_once('/').ok_or_else(|| {
-        format!("`{text}` is not <scope>/<name>; write e.g. machine/verify or project:<id>/autopilot")
+        format!(
+            "`{text}` is not <scope>/<name>; write e.g. machine/verify or project:<id>/autopilot"
+        )
     })?;
     if name.is_empty() {
         return Err(format!("`{text}` names no document after the last `/`"));
     }
-    let scope = scope_text.parse::<Scope>().map_err(|error| error.to_string())?;
+    let scope = scope_text
+        .parse::<Scope>()
+        .map_err(|error| error.to_string())?;
     Ok((scope, name.to_owned()))
 }
 
 fn parse_version(text: &str) -> Result<i64, String> {
     match text.parse::<i64>() {
         Ok(version) if version >= 1 => Ok(version),
-        _ => Err(format!("`{text}` is not a version number; versions start at 1")),
+        _ => Err(format!(
+            "`{text}` is not a version number; versions start at 1"
+        )),
     }
 }
 
@@ -155,7 +191,11 @@ pub async fn daemon_answers_on(port: u16, wait: Duration) -> bool {
 pub async fn run(data_dir: &Path, port: u16, call: Invocation) -> Outcome {
     let (scope, name, to_version) = match call {
         Invocation::Reset { scope, name } => (scope, name, None),
-        Invocation::Rollback { scope, name, version } => (scope, name, Some(version)),
+        Invocation::Rollback {
+            scope,
+            name,
+            version,
+        } => (scope, name, Some(version)),
         Invocation::Usage(reason) => {
             return Outcome::refused(EXIT_USAGE, format!("settings: {reason}\n\n{USAGE}\n"));
         }
@@ -226,7 +266,11 @@ async fn apply(
     handle.load(pool).await?;
     match to_version {
         None => handle.delete(pool, scope, name, WRITTEN_BY, None).await,
-        Some(version) => handle.rollback(pool, scope, name, version, WRITTEN_BY).await,
+        Some(version) => {
+            handle
+                .rollback(pool, scope, name, version, WRITTEN_BY)
+                .await
+        }
     }
 }
 
@@ -269,11 +313,20 @@ mod tests {
     /// A data directory whose database holds `verify` at version 2 (capacity 2, then capacity 3).
     async fn seeded_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        let pool = crate::storage::open(&data_dir::db_path(dir.path())).await.expect("open");
+        let pool = crate::storage::open(&data_dir::db_path(dir.path()))
+            .await
+            .expect("open");
         let handle = Settings::new();
         for capacity in [2, 3] {
             handle
-                .put(&pool, &Scope::Machine, "verify", &json!({ "capacity": capacity }), "owner", None)
+                .put(
+                    &pool,
+                    &Scope::Machine,
+                    "verify",
+                    &json!({ "capacity": capacity }),
+                    "owner",
+                    None,
+                )
                 .await
                 .expect("seed");
         }
@@ -284,24 +337,36 @@ mod tests {
     /// What the database holds for `machine/verify`, read after the CLI has closed its own pool:
     /// the current row (version, capacity) if any, and the history, newest first.
     async fn stored(dir: &Path) -> (Option<(i64, i64)>, Vec<HistoryRow>) {
-        let pool = crate::storage::open(&data_dir::db_path(dir)).await.expect("open");
+        let pool = crate::storage::open(&data_dir::db_path(dir))
+            .await
+            .expect("open");
         let snapshot = settings::load_all(&pool).await.expect("load");
-        let current = snapshot
-            .entry(&Scope::Machine, "verify")
-            .map(|entry| (entry.version, entry.body()["capacity"].as_i64().expect("capacity")));
-        let history = settings::history(&pool, &Scope::Machine, "verify").await.expect("history");
+        let current = snapshot.entry(&Scope::Machine, "verify").map(|entry| {
+            (
+                entry.version,
+                entry.body()["capacity"].as_i64().expect("capacity"),
+            )
+        });
+        let history = settings::history(&pool, &Scope::Machine, "verify")
+            .await
+            .expect("history");
         pool.close().await;
         (current, history)
     }
 
     /// A port nothing listens on: bound to get a free number, then released.
     async fn free_port() -> u16 {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
         listener.local_addr().expect("addr").port()
     }
 
     fn reset_machine_verify() -> Invocation {
-        Invocation::Reset { scope: Scope::Machine, name: "verify".into() }
+        Invocation::Reset {
+            scope: Scope::Machine,
+            name: "verify".into(),
+        }
     }
 
     #[test]
@@ -311,7 +376,11 @@ mod tests {
             reset_machine_verify()
         );
         assert_eq!(
-            invocation(&argv(&["--settings-rollback", "project:BACMAT/autopilot", "4"])),
+            invocation(&argv(&[
+                "--settings-rollback",
+                "project:BACMAT/autopilot",
+                "4"
+            ])),
             Invocation::Rollback {
                 scope: Scope::project("BACMAT"),
                 name: "autopilot".into(),
@@ -324,7 +393,10 @@ mod tests {
     fn a_command_line_without_the_flags_is_not_a_settings_call() {
         assert_eq!(invocation(&argv(&[])), Invocation::NotSettings);
         assert_eq!(invocation(&argv(&["--land", "x"])), Invocation::NotSettings);
-        assert_eq!(invocation(&argv(&["--print-token"])), Invocation::NotSettings);
+        assert_eq!(
+            invocation(&argv(&["--print-token"])),
+            Invocation::NotSettings
+        );
     }
 
     #[test]
@@ -333,15 +405,42 @@ mod tests {
         assert!(usage(&["--settings-reset"]), "no target");
         assert!(usage(&["--settings-reset", "verify"]), "no scope");
         assert!(usage(&["--settings-reset", "machine/"]), "no name");
-        assert!(usage(&["--settings-reset", "nowhere/verify"]), "not a scope");
-        assert!(usage(&["--settings-reset", "project:/verify"]), "an empty project id");
-        assert!(usage(&["--settings-reset", "machine/verify", "extra"]), "a reset takes no version");
-        assert!(usage(&["--settings-rollback", "machine/verify"]), "a rollback needs a version");
-        assert!(usage(&["--settings-rollback", "machine/verify", "0"]), "versions start at 1");
-        assert!(usage(&["--settings-rollback", "machine/verify", "-3"]), "versions are positive");
-        assert!(usage(&["--settings-rollback", "machine/verify", "two"]), "versions are numbers");
-        assert!(usage(&["--settings-rollback", "machine/verify", "1", "2"]), "too many operands");
-        assert!(usage(&["--land", "--settings-reset", "machine/verify"]), "nothing may precede the flag");
+        assert!(
+            usage(&["--settings-reset", "nowhere/verify"]),
+            "not a scope"
+        );
+        assert!(
+            usage(&["--settings-reset", "project:/verify"]),
+            "an empty project id"
+        );
+        assert!(
+            usage(&["--settings-reset", "machine/verify", "extra"]),
+            "a reset takes no version"
+        );
+        assert!(
+            usage(&["--settings-rollback", "machine/verify"]),
+            "a rollback needs a version"
+        );
+        assert!(
+            usage(&["--settings-rollback", "machine/verify", "0"]),
+            "versions start at 1"
+        );
+        assert!(
+            usage(&["--settings-rollback", "machine/verify", "-3"]),
+            "versions are positive"
+        );
+        assert!(
+            usage(&["--settings-rollback", "machine/verify", "two"]),
+            "versions are numbers"
+        );
+        assert!(
+            usage(&["--settings-rollback", "machine/verify", "1", "2"]),
+            "too many operands"
+        );
+        assert!(
+            usage(&["--land", "--settings-reset", "machine/verify"]),
+            "nothing may precede the flag"
+        );
         assert!(
             usage(&["--settings-reset", "machine/verify", "--settings-rollback"]),
             "one flag at a time"
@@ -354,7 +453,11 @@ mod tests {
     fn the_guard_predicate_and_the_parser_agree() {
         for flag in [RESET_FLAG, ROLLBACK_FLAG] {
             assert!(is_settings_flag(flag));
-            assert_ne!(invocation(&argv(&[flag])), Invocation::NotSettings, "{flag} must be caught");
+            assert_ne!(
+                invocation(&argv(&[flag])),
+                Invocation::NotSettings,
+                "{flag} must be caught"
+            );
         }
         assert!(!is_settings_flag("--land"));
         assert!(!is_settings_flag("--settings"));
@@ -373,10 +476,17 @@ mod tests {
         let dir = seeded_dir().await;
         let outcome = run(dir.path(), free_port().await, reset_machine_verify()).await;
         assert_eq!(outcome.code, EXIT_OK, "stderr: {}", outcome.stderr);
-        assert!(outcome.stdout.contains("machine/verify"), "stdout: {}", outcome.stdout);
+        assert!(
+            outcome.stdout.contains("machine/verify"),
+            "stdout: {}",
+            outcome.stdout
+        );
 
         let (current, history) = stored(dir.path()).await;
-        assert_eq!(current, None, "the document is absent, so the defaults apply");
+        assert_eq!(
+            current, None,
+            "the document is absent, so the defaults apply"
+        );
         assert_eq!(history.len(), 3, "the two writes plus the deletion");
         assert_eq!(history[0].version, 3);
         assert!(history[0].deleted());
@@ -386,12 +496,20 @@ mod tests {
     #[tokio::test]
     async fn a_rollback_writes_the_old_body_as_a_new_version() {
         let dir = seeded_dir().await;
-        let call = Invocation::Rollback { scope: Scope::Machine, name: "verify".into(), version: 1 };
+        let call = Invocation::Rollback {
+            scope: Scope::Machine,
+            name: "verify".into(),
+            version: 1,
+        };
         let outcome = run(dir.path(), free_port().await, call).await;
         assert_eq!(outcome.code, EXIT_OK, "stderr: {}", outcome.stderr);
 
         let (current, history) = stored(dir.path()).await;
-        assert_eq!(current, Some((3, 2)), "version 3 now holds version 1's capacity");
+        assert_eq!(
+            current,
+            Some((3, 2)),
+            "version 3 now holds version 1's capacity"
+        );
         assert_eq!(history.len(), 3);
         assert_eq!(history[0].body_json, history[2].body_json);
         assert_eq!(history[0].written_by, WRITTEN_BY);
@@ -400,21 +518,37 @@ mod tests {
     #[tokio::test]
     async fn a_live_daemon_makes_both_commands_refuse_and_touch_nothing() {
         let dir = seeded_dir().await;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        assert!(daemon_answers_on(port, PROBE_WAIT).await, "the probe sees a listener");
+        assert!(
+            daemon_answers_on(port, PROBE_WAIT).await,
+            "the probe sees a listener"
+        );
 
         let reset = run(dir.path(), port, reset_machine_verify()).await;
         assert_eq!(reset.code, EXIT_DAEMON_LIVE);
-        assert!(reset.stderr.contains(&port.to_string()), "it names the port: {}", reset.stderr);
-        let call = Invocation::Rollback { scope: Scope::Machine, name: "verify".into(), version: 1 };
+        assert!(
+            reset.stderr.contains(&port.to_string()),
+            "it names the port: {}",
+            reset.stderr
+        );
+        let call = Invocation::Rollback {
+            scope: Scope::Machine,
+            name: "verify".into(),
+            version: 1,
+        };
         assert_eq!(run(dir.path(), port, call).await.code, EXIT_DAEMON_LIVE);
 
         let (current, history) = stored(dir.path()).await;
         assert_eq!(current, Some((2, 3)), "unchanged");
         assert_eq!(history.len(), 2, "no row was written");
         drop(listener);
-        assert!(!daemon_answers_on(port, PROBE_WAIT).await, "a released port is not a daemon");
+        assert!(
+            !daemon_answers_on(port, PROBE_WAIT).await,
+            "a released port is not a daemon"
+        );
     }
 
     #[tokio::test]
@@ -422,28 +556,59 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let outcome = run(dir.path(), free_port().await, reset_machine_verify()).await;
         assert_eq!(outcome.code, EXIT_NO_DATABASE);
-        assert!(outcome.stderr.contains(&dir.path().display().to_string()), "{}", outcome.stderr);
-        assert!(!data_dir::db_path(dir.path()).exists(), "storage::open would have created it");
+        assert!(
+            outcome.stderr.contains(&dir.path().display().to_string()),
+            "{}",
+            outcome.stderr
+        );
+        assert!(
+            !data_dir::db_path(dir.path()).exists(),
+            "storage::open would have created it"
+        );
     }
 
     #[tokio::test]
     async fn the_store_refusing_a_target_is_an_error_exit() {
         let dir = seeded_dir().await;
         let port = free_port().await;
-        let unknown = Invocation::Reset { scope: Scope::Machine, name: "nope".into() };
+        let unknown = Invocation::Reset {
+            scope: Scope::Machine,
+            name: "nope".into(),
+        };
         let outcome = run(dir.path(), port, unknown).await;
         assert_eq!(outcome.code, EXIT_FAILED);
-        assert!(outcome.stderr.contains("`nope` is not a settings document"), "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("`nope` is not a settings document"),
+            "{}",
+            outcome.stderr
+        );
 
-        let wrong_scope = Invocation::Reset { scope: Scope::project("p1"), name: "verify".into() };
+        let wrong_scope = Invocation::Reset {
+            scope: Scope::project("p1"),
+            name: "verify".into(),
+        };
         let outcome = run(dir.path(), port, wrong_scope).await;
         assert_eq!(outcome.code, EXIT_FAILED);
-        assert!(outcome.stderr.contains("cannot be written at scope `project:p1`"), "{}", outcome.stderr);
+        assert!(
+            outcome
+                .stderr
+                .contains("cannot be written at scope `project:p1`"),
+            "{}",
+            outcome.stderr
+        );
 
-        let missing = Invocation::Rollback { scope: Scope::Machine, name: "verify".into(), version: 9 };
+        let missing = Invocation::Rollback {
+            scope: Scope::Machine,
+            name: "verify".into(),
+            version: 9,
+        };
         let outcome = run(dir.path(), port, missing).await;
         assert_eq!(outcome.code, EXIT_FAILED);
-        assert!(outcome.stderr.contains("no version 9"), "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no version 9"),
+            "{}",
+            outcome.stderr
+        );
 
         let (current, history) = stored(dir.path()).await;
         assert_eq!(current, Some((2, 3)));
@@ -454,10 +619,21 @@ mod tests {
     async fn resetting_a_document_that_is_not_stored_says_the_defaults_already_apply() {
         let dir = seeded_dir().await;
         let port = free_port().await;
-        assert_eq!(run(dir.path(), port, reset_machine_verify()).await.code, EXIT_OK);
+        assert_eq!(
+            run(dir.path(), port, reset_machine_verify()).await.code,
+            EXIT_OK
+        );
         let again = run(dir.path(), port, reset_machine_verify()).await;
         assert_eq!(again.code, EXIT_FAILED);
-        assert!(again.stderr.contains("defaults already apply"), "{}", again.stderr);
-        assert_eq!(stored(dir.path()).await.1.len(), 3, "the second reset wrote nothing");
+        assert!(
+            again.stderr.contains("defaults already apply"),
+            "{}",
+            again.stderr
+        );
+        assert_eq!(
+            stored(dir.path()).await.1.len(),
+            3,
+            "the second reset wrote nothing"
+        );
     }
 }

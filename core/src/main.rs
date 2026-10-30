@@ -52,8 +52,8 @@ async fn main() {
         std::process::exit(code);
     }
 
-    let default_dir = data_dir::default_data_dir()
-        .expect("could not resolve local app data directory");
+    let default_dir =
+        data_dir::default_data_dir().expect("could not resolve local app data directory");
 
     // Whether this process is the machine's daemon or a second one somebody is testing with, and
     // where its database and logs go. Resolved HERE, before the first thing that acts on either,

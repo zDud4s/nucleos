@@ -53,15 +53,24 @@ mod tests {
     #[test]
     fn an_empty_data_dir_override_is_not_an_override() {
         let default = Path::new("default-dir");
-        assert_eq!(data_dir_from(Some("elsewhere"), default), PathBuf::from("elsewhere"));
-        assert_eq!(data_dir_from(Some(""), default), PathBuf::from("default-dir"));
+        assert_eq!(
+            data_dir_from(Some("elsewhere"), default),
+            PathBuf::from("elsewhere")
+        );
+        assert_eq!(
+            data_dir_from(Some(""), default),
+            PathBuf::from("default-dir")
+        );
         assert_eq!(data_dir_from(None, default), PathBuf::from("default-dir"));
     }
 
     #[test]
     fn the_database_is_a_file_directly_under_the_data_dir() {
         assert_eq!(DB_FILE, "nucleos.db");
-        assert_eq!(db_path(Path::new("some-dir")), Path::new("some-dir").join("nucleos.db"));
+        assert_eq!(
+            db_path(Path::new("some-dir")),
+            Path::new("some-dir").join("nucleos.db")
+        );
     }
 
     /// Startup and the CLI must resolve the platform default from the SAME `ProjectDirs` triple.
