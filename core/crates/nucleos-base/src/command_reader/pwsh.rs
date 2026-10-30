@@ -14,6 +14,8 @@ mod scanner_tests_common;
 #[cfg(test)]
 mod scanner_tests_s1;
 #[cfg(test)]
+mod scanner_tests_s10;
+#[cfg(test)]
 mod scanner_tests_s2;
 #[cfg(test)]
 mod scanner_tests_s3;

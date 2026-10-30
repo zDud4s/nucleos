@@ -117,7 +117,14 @@ impl Scanner {
         loop {
             match self.peek() {
                 None => return Err("unterminated string".to_string()),
-                Some('`') => self.backtick_escape()?,
+                Some('`') => {
+                    // pwsh: a backtick-escaped quote inside a string nested in a `$( )` of another
+                    // double-quoted string does not escape it ("missing terminator"): refused.
+                    if self.dq_sub > 0 && matches!(self.peek_at(1), Some(d) if is_dq(d)) {
+                        return Err("escaped quote in a string sub-expression".to_string());
+                    }
+                    self.backtick_escape()?
+                }
                 Some(c) if is_dq(c) => {
                     // pwsh rejects (or reads differently) an empty or doubled-quote string inside the
                     // `$( )` of another double-quoted string: refused, never modelled.
