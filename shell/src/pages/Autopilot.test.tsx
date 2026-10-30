@@ -1016,7 +1016,90 @@ describe("Autopilot - the scoreboard reports review quality", () => {
 
     await renderCockpit();
 
-    expect(await screen.findByText(/3 withheld decisions, none reviewed/)).toBeDefined();
+    expect(
+      await screen.findByText("vcs-local: 3 withheld decisions, none reviewed: this blocks promotion until one is"),
+    ).toBeDefined();
+  });
+
+  it("the unreviewed-withheld note does not claim to block promotion on enforced decisions", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          mode: "worktree",
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("vcs-local: 3 withheld decisions, none reviewed")).toBeDefined();
+    expect(screen.queryByText(/blocks promotion/)).toBeNull();
+  });
+
+  it("a shadow class with withheld decisions and none reviewed does not say ready", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    const row = within(table).getByRole("rowheader", { name: "vcs-local" }).closest("tr")!;
+    expect(within(row).queryByText("ready", { selector: ".ap-agree-verdict" })).toBeNull();
+    expect(within(row).getByText("withheld not reviewed", { selector: ".ap-agree-verdict" })).toBeDefined();
+  });
+
+  it("the unreviewed-withheld note keeps its facts but not the promotion claim when the project is active", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "active" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("vcs-local: 3 withheld decisions, none reviewed")).toBeDefined();
+    expect(screen.queryByText(/blocks promotion/)).toBeNull();
   });
 
   it("the unreviewed-withheld note is absent when a pending one was reviewed or nothing was withheld", async () => {

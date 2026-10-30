@@ -366,7 +366,9 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
 
 /// The shadow-exit bar (spec §8.2/§8.8, `.ai/decisions.md` 2026-07-27): an action class earns
 /// promotion once enough of its shadow decisions have been reviewed AND the classifier agreed with
-/// the human on nearly all of them.
+/// the human on nearly all of them. A class that withheld decisions (`would_pend > 0`) is not ready
+/// until at least one of them was reviewed (`reviewed_pend > 0`): agreement on its allows alone says
+/// nothing about the cases that mattered.
 ///
 /// **This is the single source of truth for the rule.** The shell reads the computed
 /// `classes_ready`/`promotable` off the daemon rather than recomputing them, so the button the user
@@ -430,6 +432,10 @@ pub fn promotable(classes_ready: i64, classes_total: i64, withheld_classes_ready
 /// different decisions for it. Review and agreement counts therefore cover the whole class. A class
 /// counts as withheld only when every recorded decision is `pending_approval` or `deny`; any
 /// `allow` makes the conservative result "not withheld" so mixed evidence cannot unlock promotion.
+///
+/// A class is ready only if it clears `class_ready` AND, when it has any `pending_approval`
+/// decision, at least one of those was reviewed. Otherwise its agreement is measured on the other
+/// decisions alone, which says nothing about whether the classifier was right to hold back.
 pub async fn shadow_readiness(
     pool: &SqlitePool,
 ) -> sqlx::Result<std::collections::HashMap<String, (i64, i64, i64)>> {
@@ -443,7 +449,13 @@ pub async fn shadow_readiness(
              END) AS withheld,
              {REVIEWED_DISTINCT} AS reviewed,
              {AGREE_DISTINCT} AS agree,
-             COUNT(DISTINCT shadow_decisions.policy_digest) AS policies
+             COUNT(DISTINCT shadow_decisions.policy_digest) AS policies,
+             SUM(CASE WHEN shadow_decisions.decision = 'pending_approval' THEN 1 ELSE 0 END) AS would_pend,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'pending_approval' THEN 1
+                 ELSE 0
+             END) AS reviewed_pend
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.mode = 'shadow'
@@ -451,13 +463,26 @@ pub async fn shadow_readiness(
     );
 
     // Same `AssertSqlSafe` reasoning as `scoreboard`: the only interpolation is `AGREE_CASE`.
-    let rows: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    // One row per (project, action class): project_id, action_class, then the six counters in the
+    // order the SELECT lists them.
+    type ReadinessRow = (String, String, i64, i64, i64, i64, i64, i64);
+    let rows: Vec<ReadinessRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .fetch_all(pool)
         .await?;
 
     let mut readiness: std::collections::HashMap<String, (i64, i64, i64)> =
         std::collections::HashMap::new();
-    for (project_id, action_class, withheld, reviewed, agree, policies) in rows {
+    for (
+        project_id,
+        action_class,
+        withheld,
+        reviewed,
+        agree,
+        policies,
+        would_pend,
+        reviewed_pend,
+    ) in rows
+    {
         // A count and NOT a `GROUP BY`, and the tempting change is the wrong one. This function's
         // contract above is that each action class contributes exactly one row, "even when
         // historical classifier versions recorded different decisions for it" — grouping by digest
@@ -480,7 +505,10 @@ pub async fn shadow_readiness(
         }
         let entry = readiness.entry(project_id).or_insert((0, 0, 0));
         entry.1 += 1;
-        if class_ready(reviewed, agree) {
+        // Here and not inside `class_ready`, which the judge also reads and which knows nothing of
+        // decisions. `deny` is left out of this check on purpose.
+        let withheld_unchecked = would_pend > 0 && reviewed_pend == 0;
+        if class_ready(reviewed, agree) && !withheld_unchecked {
             entry.0 += 1;
             if withheld != 0 && RESTRAINT_EVIDENCE_CLASSES.contains(&action_class.as_str()) {
                 entry.2 += 1;
@@ -1134,7 +1162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mixed_class_can_be_ready_with_no_withheld_decision_reviewed() {
+    async fn a_mixed_class_is_not_ready_with_no_withheld_decision_reviewed() {
         let pool = test_pool().await;
         let run_id = insert_run_with_mode(&pool, "project-a", "shadow").await;
         for _ in 0..10 {
@@ -1151,9 +1179,13 @@ mod tests {
 
         assert!(
             class_ready(t.reviewed, t.agree),
-            "the gate changed: a mixed class should be ready on its allows alone; re-read the spec"
+            "the allows alone must clear the bar, or this test no longer isolates the withheld rule"
         );
-        assert_eq!((ready, total), (1, 1));
+        assert_eq!(
+            (ready, total),
+            (0, 1),
+            "agreement on allows alone must not make a class with unreviewed withholds ready"
+        );
         assert_eq!(t.reviewed_pend, 0, "no withheld decision was reviewed");
         assert!(t.would_pend > 0);
     }
@@ -1550,6 +1582,52 @@ mod tests {
         // The only ready class is an `allow` one, so nothing withheld has been validated yet.
         assert_eq!(readiness.get("project-a").copied(), Some((1, 2, 0)));
         assert!(!promotable(1, 2, 0));
+    }
+
+    /// A class with withheld (`pending_approval`) decisions but none of them reviewed is not ready:
+    /// the allow-side evidence says nothing about whether the withholds were right.
+    #[tokio::test]
+    async fn class_with_unreviewed_pending_approval_is_not_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        insert_shadow(&pool, run, "read-local", "pending_approval", None).await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        assert_eq!(readiness.get("project-a").copied(), Some((0, 1, 0)));
+    }
+
+    /// Symmetric guard: one reviewed, agreeing `pending_approval` decision keeps the class ready.
+    #[tokio::test]
+    async fn class_with_reviewed_pending_approval_stays_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+        insert_shadow(&pool, run, "read-local", "pending_approval", Some("reject")).await;
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        // Mixed allow + pending evidence is never "withheld", so the third number stays 0.
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 1, 0)));
+    }
+
+    /// Symmetric guard: a class with no `pending_approval` decisions at all is unaffected.
+    #[tokio::test]
+    async fn class_with_only_allow_decisions_stays_ready() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+        for _ in 0..10 {
+            insert_shadow(&pool, run, "read-local", "allow", Some("approve")).await;
+        }
+
+        let readiness = shadow_readiness(&pool).await.unwrap();
+
+        assert_eq!(readiness.get("project-a").copied(), Some((1, 1, 0)));
     }
 
     /// The promotion bar exists to say the classifier has been checked against enough real
