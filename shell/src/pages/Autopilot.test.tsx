@@ -1016,7 +1016,36 @@ describe("Autopilot - the scoreboard reports review quality", () => {
 
     await renderCockpit();
 
-    expect(await screen.findByText(/3 withheld decisions, none reviewed/)).toBeDefined();
+    expect(
+      await screen.findByText("vcs-local: 3 withheld decisions, none reviewed: this blocks promotion until one is"),
+    ).toBeDefined();
+  });
+
+  it("the unreviewed-withheld note does not claim to block promotion on enforced decisions", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          mode: "worktree",
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("vcs-local: 3 withheld decisions, none reviewed")).toBeDefined();
+    expect(screen.queryByText(/blocks promotion/)).toBeNull();
   });
 
   it("the unreviewed-withheld note is absent when a pending one was reviewed or nothing was withheld", async () => {

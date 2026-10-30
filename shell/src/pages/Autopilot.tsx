@@ -1628,7 +1628,10 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
       </p>
       {unreviewedWithheld.map((row) => (
         <p key={`${row.mode}:${row.action_class}`} className="ap-note">
-          {`${row.action_class}: ${row.would_pend} withheld decisions, none reviewed`}
+          {/* Only shadow rows count toward the bar: the same table also lists enforced decisions. */}
+          {`${row.action_class}: ${row.would_pend} withheld decisions, none reviewed${
+            row.mode === SHADOW_EVIDENCE_MODE ? ": this blocks promotion until one is" : ""
+          }`}
         </p>
       ))}
     </>
