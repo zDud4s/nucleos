@@ -5244,7 +5244,10 @@ mod tests {
     /// daemon no longer reads or migrates anything from `.ai/`, so a write there decides nothing (a
     /// loosening on names nothing reads), and guards a project's ejected workflow copies under
     /// `.nucleos/workflows/` the way `.claude/skills/` is guarded, since those are what every new
-    /// worktree is given (a tightening).
+    /// worktree is given (a tightening). 24 (settings in the database, 2026-10-11) adds the
+    /// `nucleos-data` hard deny: an agent's shell line, write or `Read`/`Grep`/`Glob` that reaches
+    /// the daemon's data directory or its SQLite database, and an agent running
+    /// `--settings-reset`/`--settings-rollback` — a tightening only.
     /// The
     /// version is stamped onto every `shadow_decisions` row, so it is the only thing that tells two
     /// differently-classified decisions apart after the fact — leaving it at 2 would have made the
@@ -5259,7 +5262,7 @@ mod tests {
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 23);
+        assert_eq!(CLASSIFIER_VERSION, 24);
     }
 
     /// `(decision, action_class)` of a Bash line, with the cwd every test in this group uses.
@@ -5657,31 +5660,41 @@ mod tests {
         }
     }
 
-    /// Every settings file is guarded by name under `.nucleos/`, however it is rooted — and the old
-    /// `.ai/<file>` copies are not: the daemon no longer reads or migrates them, so a write there
-    /// decides nothing and stays an ordinary write.
+    /// Every document in the registry is guarded by name wherever its file lives now - a machine
+    /// document under `.nucleos/`, a project document in its state directory - and so is the
+    /// `.yaml.imported` the importer leaves behind. The old `.ai/<file>` copies are not: the daemon
+    /// no longer reads or migrates them, so a write there decides nothing and stays an ordinary
+    /// write. Iterating `settings::documents()` is what makes a new document fail here until the
+    /// classifier covers it, instead of being forgotten.
     #[test]
-    fn every_settings_file_under_dot_nucleos_asks_and_its_old_ai_copy_does_not() {
+    fn every_registered_document_asks_for_approval_wherever_it_has_lived() {
         let cwd = Some(Path::new(r"C:\work\repo"));
-        for setting in crate::machine_config::SETTINGS {
-            assert_classification(
-                classify(
-                    "Write",
-                    &json!({ "file_path": format!(".nucleos/{}", setting.path) }),
-                    cwd,
-                ),
-                "pending_approval",
-                "self-governing-file",
-            );
-            assert_classification(
-                classify(
-                    "Write",
-                    &json!({ "file_path": format!(".ai/{}", setting.path) }),
-                    cwd,
-                ),
-                "allow",
-                "read-local",
-            );
+        let documents = crate::settings::documents();
+        assert!(!documents.is_empty());
+        for document in documents {
+            let origin = document.origin_file;
+            assert!(origin.ends_with(".yaml"), "{}: {origin}", document.name);
+            let guarded = match document.kind {
+                crate::settings::Kind::Machine => format!(".nucleos/{origin}"),
+                crate::settings::Kind::Project => format!("~/.nucleos/projects/alpha/{origin}"),
+            };
+            let imported = format!("{guarded}{IMPORTED_SUFFIX}");
+            for path in [guarded, imported] {
+                for tool in ["Edit", "Write"] {
+                    assert_classification(
+                        classify(tool, &json!({ "file_path": path }), cwd),
+                        "pending_approval",
+                        "self-governing-file",
+                    );
+                }
+            }
+            for path in [format!(".ai/{origin}"), format!(".ai/{origin}{IMPORTED_SUFFIX}")] {
+                assert_classification(
+                    classify("Write", &json!({ "file_path": path }), cwd),
+                    "allow",
+                    "read-local",
+                );
+            }
         }
     }
 
@@ -5739,6 +5752,492 @@ mod tests {
             .decision,
             "allow"
         );
+    }
+
+    /// The directories the daemon of a hypothetical machine uses: the default (a Windows user whose
+    /// profile has a space-free name) and a second daemon started with `NUCLEOS_DATA_DIR`.
+    fn data_dirs() -> Vec<std::path::PathBuf> {
+        vec![
+            std::path::PathBuf::from(r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data"),
+            std::path::PathBuf::from("D:/scratch/second-daemon"),
+        ]
+    }
+
+    /// Spec section 11: every spelling of the data directory, every file in it that replaces the
+    /// database at start-up, and each of the spec's sibling names.
+    #[test]
+    fn nucleos_data_is_named_by_every_spelling_of_the_data_dir() {
+        let dirs = data_dirs();
+        for path in [
+            // The resolved path, literally, and each sibling.
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.db",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.db-wal",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.db-shm",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\backups",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\backups\nucleos-20261011-101500.db",
+            // The names backup.rs really builds (`with_extension` replaces `.db`) ...
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.pending-restore",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.pending-restore-safety",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.restore-new",
+            // ... and the bare spellings the spec uses.
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\.pending-restore",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\.pending-restore-safety",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\.restore-new",
+            // Case, slashes, `..`, and the extended-length prefix.
+            r"C:\USERS\ANA\APPDATA\LOCAL\NUCLEOS\NUCLEOS\DATA\NUCLEOS.DB",
+            "c:/users/ana/appdata/local/nucleos/nucleos/data/nucleos.db",
+            r"C:\work\repo\..\..\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.db",
+            r"~/AppData/Local/nucleos/NucleOS/other/../data/nucleos.db",
+            r"\\?\C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.db",
+            // Windows, rooted by an environment variable or by the home directory.
+            r"%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db",
+            "%localappdata%/nucleos/NucleOS/data/nucleos.db",
+            r"$env:LOCALAPPDATA\nucleos\NucleOS\data\nucleos.db",
+            r"${env:LOCALAPPDATA}\nucleos\NucleOS\data\backups",
+            "$LOCALAPPDATA/nucleos/NucleOS/data/nucleos.db-wal",
+            "~/AppData/Local/nucleos/NucleOS/data/nucleos.db",
+            "$HOME/AppData/Local/nucleos/NucleOS/data/nucleos.db",
+            "${HOME}/AppData/Local/nucleos/NucleOS/data/nucleos.db",
+            r"%USERPROFILE%\AppData\Local\nucleos\NucleOS\data\nucleos.db",
+            // Another user's profile, and the tail a `Join-Path` leaves in one word.
+            r"C:\Users\Bob\AppData\Local\nucleos\NucleOS\data\nucleos.db",
+            r"nucleos\NucleOS\data\nucleos.db",
+            // Linux.
+            "~/.local/share/nucleos/nucleos.db",
+            "$HOME/.local/share/nucleos/backups/nucleos-1.db",
+            "/home/ana/.local/share/nucleos/nucleos.db-shm",
+            "$XDG_DATA_HOME/nucleos/nucleos.db",
+            "${XDG_DATA_HOME}/nucleos/nucleos.db",
+            // macOS, plain and shell-escaped.
+            "~/Library/Application Support/dev.nucleos.NucleOS/nucleos.db",
+            "/Users/ana/Library/Application Support/dev.nucleos.NucleOS/nucleos.db-wal",
+            r"~/Library/Application\ Support/dev.nucleos.NucleOS/nucleos.db",
+            // The one-segment root: what is left of the escaped form once a shell has split it
+            // after `Application\`.
+            "Support/dev.nucleos.NucleOS/nucleos.db",
+            "dev.nucleos.NucleOS/nucleos.db-wal",
+            "dev.nucleos.NucleOS/backups",
+            // The override, anchored: exact case or not.
+            r"D:\scratch\second-daemon\nucleos.db",
+            "d:/SCRATCH/second-daemon/backups/x.db",
+            // A SQLite URI.
+            "file:C:/Users/Ana/AppData/Local/nucleos/NucleOS/data/nucleos.db?mode=ro",
+            "file:///C:/Users/Ana/AppData/Local/nucleos/NucleOS/data/nucleos.db",
+        ] {
+            assert!(names_nucleos_data_in(path, &dirs), "{path}");
+        }
+    }
+
+    /// Spec section 11: not by basename alone, not another database, not the rest of the directory.
+    #[test]
+    fn nucleos_data_is_not_named_by_a_basename_or_by_another_directory() {
+        let dirs = data_dirs();
+        for path in [
+            "nucleos.db",
+            "core/testdata/nucleos.db",
+            "/tmp/xyz/nucleos.db",
+            r"C:\work\repo\nucleos.db-wal",
+            r"C:\Users\Ana\AppData\Local\Temp\.tmpAbC123\nucleos.db",
+            // Another database in the same neighbourhood.
+            r"C:\Users\Ana\AppData\Local\other\app.db",
+            "~/.local/share/other-app/nucleos.db",
+            "~/.local/share/nucleos-old/nucleos.db",
+            // The data directory's other contents and the directory itself.
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\logs\core.log",
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data",
+            "~/.local/share/nucleos",
+            // The one-segment macOS root needs a sibling too.
+            "dev.nucleos.NucleOS",
+            "dev.nucleos.NucleOS/logs/core.log",
+            "dev.nucleos.other/nucleos.db",
+            "dev.nucleos/nucleos.db",
+            // Next to it, not in it.
+            r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\config\nucleos.db",
+            // The override as a prefix of a longer name, and the override itself.
+            r"D:\scratch\second-daemon-2\nucleos.db",
+            r"D:\scratch\second-daemon",
+            // The machine's settings are `names_machine_settings`' business, not this rule's.
+            "~/.nucleos/github.yaml",
+            "C:/Projects/nucleos/core/src/main.rs",
+        ] {
+            assert!(!names_nucleos_data_in(path, &dirs), "{path}");
+        }
+        // No directory known at all: only the static spellings can match.
+        assert!(!names_nucleos_data_in("D:/scratch/second-daemon/nucleos.db", &[]));
+        assert!(names_nucleos_data_in("~/.local/share/nucleos/nucleos.db", &[]));
+    }
+
+    /// The scan is per WORD of the whole line, so glue, quoting and position do not matter.
+    #[test]
+    fn nucleos_data_is_found_in_a_shell_line_wherever_it_sits() {
+        let dirs = data_dirs();
+        for command in [
+            r#"sqlite3 "%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db" ".tables""#,
+            r"cp $env:LOCALAPPDATA\nucleos\NucleOS\data\nucleos.db .",
+            "echo x > ~/.local/share/nucleos/nucleos.db",
+            "echo x >~/.local/share/nucleos/nucleos.db",
+            "cat 2>/dev/null ~/.local/share/nucleos/nucleos.db",
+            "sqlite3 --readonly --db=$LOCALAPPDATA/nucleos/NucleOS/data/nucleos.db",
+            "ls && cat ~/.local/share/nucleos/backups/a.db",
+            "ls; cp ~/.local/share/nucleos/nucleos.db-wal /tmp/w",
+            "cat $(echo ok)/../x ; cp ~/.local/share/nucleos/nucleos.db .",
+            r#"cp "~/Library/Application Support/dev.nucleos.NucleOS/nucleos.db" ."#,
+            // Shell-escaped: `shell_words` splits it into `.../Application\` and
+            // `Support/dev.nucleos.NucleOS/nucleos.db`.
+            r"cp ~/Library/Application\ Support/dev.nucleos.NucleOS/nucleos.db .",
+            r"sqlite3 /Users/ana/Library/Application\ Support/dev.nucleos.NucleOS/nucleos.db .tables",
+            r"ls; cat ~/Library/Application\ Support/dev.nucleos.NucleOS/backups/a.db",
+            r#"sqlite3 "file:C:/Users/Ana/AppData/Local/nucleos/NucleOS/data/nucleos.db?mode=ro" .tables"#,
+            r"Copy-Item (Join-Path $env:LOCALAPPDATA 'nucleos\NucleOS\data\nucleos.db') .",
+            r"Set-Content D:\scratch\second-daemon\nucleos.pending-restore x",
+        ] {
+            assert!(line_names_nucleos_data_in(command, &dirs), "{command}");
+        }
+        for command in [
+            "grep nucleos.db core/src/main.rs",
+            "git log --stat -- nucleos.db",
+            "sqlite3 other.db .tables",
+            r"sqlite3 C:\Users\Ana\AppData\Local\Other\app.db .tables",
+            "rm -f /tmp/tmp123/nucleos.db",
+            "cargo test -p nucleos-core --lib nucleos_data",
+            "ls ~/.local/share",
+            "ls ~/.local/share/nucleos",
+            "cat ~/.nucleos/github.yaml",
+            r"ls ~/Library/Application\ Support/dev.nucleos.NucleOS",
+            r"cat ~/Library/Application\ Support/dev.nucleos.NucleOS/logs/core.log",
+        ] {
+            assert!(!line_names_nucleos_data_in(command, &dirs), "{command}");
+        }
+    }
+
+    /// Spec section 11, end to end through `classify`: a hard refusal, in the shell and in the
+    /// write tools, ahead of the prompts and of the safe-read allow.
+    #[test]
+    fn a_shell_line_naming_the_database_is_denied_as_nucleos_data() {
+        for command in [
+            // `cat` is a safe read: only a refusal that outranks the allow can stop it.
+            r"cat %LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db",
+            r#"sqlite3 "$HOME/AppData/Local/nucleos/NucleOS/data/nucleos.db" "select id from correspondents""#,
+            r"cat $env:LOCALAPPDATA\nucleos\NucleOS\data\nucleos.db-wal",
+            "ls && cp ~/.local/share/nucleos/nucleos.db .",
+            "echo x >~/.local/share/nucleos/nucleos.db",
+            "cp -r ~/.local/share/nucleos/backups /tmp/x",
+            r#"cp "~/Library/Application Support/dev.nucleos.NucleOS/nucleos.db" ."#,
+            // The shell-escaped form arrives as two words.
+            r"cp ~/Library/Application\ Support/dev.nucleos.NucleOS/nucleos.db .",
+            r"echo > %LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.pending-restore",
+        ] {
+            for tool in ["Bash", "PowerShell"] {
+                assert_classification(
+                    classify(tool, &json!({ "command": command }), None),
+                    "deny",
+                    "nucleos-data",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_naming_the_database_is_denied_as_nucleos_data() {
+        for (tool, key) in [
+            ("Edit", "file_path"),
+            ("Write", "file_path"),
+            ("NotebookEdit", "notebook_path"),
+        ] {
+            for path in [
+                r"%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db",
+                "~/.local/share/nucleos/nucleos.db-wal",
+                r"~\AppData\Local\nucleos\NucleOS\data\backups\nucleos-1.db",
+                "$HOME/Library/Application Support/dev.nucleos.NucleOS/nucleos.pending-restore",
+                "~/.local/share/nucleos/.restore-new",
+            ] {
+                assert_classification(
+                    classify(tool, &json!({ key: path }), None),
+                    "deny",
+                    "nucleos-data",
+                );
+                // A home-rooted spelling lands "inside" a workspace once glued onto it, so the
+                // compiled outside-workspace deny does not catch it first: this rule does.
+                assert_classification(
+                    classify(tool, &json!({ key: path }), Some(Path::new(r"C:\work\repo"))),
+                    "deny",
+                    "nucleos-data",
+                );
+            }
+            // An absolute spelling is refused with a workspace too (by whichever deny answers first).
+            assert_eq!(
+                classify(
+                    tool,
+                    &json!({ key: r"C:\Users\Ana\AppData\Local\nucleos\NucleOS\data\nucleos.db" }),
+                    Some(Path::new(r"C:\work\repo")),
+                )
+                .decision
+                .decision,
+                "deny",
+                "{tool}"
+            );
+        }
+    }
+
+    /// The machine this test runs on: whatever the daemon would resolve is refused too.
+    #[test]
+    fn the_data_dir_this_machine_resolves_is_denied_as_nucleos_data() {
+        let Ok(dir) = crate::data_dir::data_dir() else {
+            return;
+        };
+        // A relative `NUCLEOS_DATA_DIR` is deliberately never a rule, so there is nothing to assert
+        // for it - skip, do not fail the suite on that machine.
+        if !is_absolute_path(&dir.to_string_lossy().replace('\\', "/")) {
+            return;
+        }
+        for name in [
+            "nucleos.db",
+            "nucleos.db-wal",
+            "nucleos.db-shm",
+            "backups",
+            "nucleos.pending-restore",
+            "nucleos.pending-restore-safety",
+            "nucleos.restore-new",
+        ] {
+            let path = dir.join(name);
+            let line = format!("cat \"{}\"", path.display());
+            assert_classification(
+                classify("Bash", &json!({ "command": line }), None),
+                "deny",
+                "nucleos-data",
+            );
+            assert_classification(
+                classify(
+                    "Write",
+                    &json!({ "file_path": path.to_string_lossy() }),
+                    None,
+                ),
+                "deny",
+                "nucleos-data",
+            );
+        }
+    }
+
+    /// The compiled refusals keep their own, narrower class; this one sits beneath them.
+    #[test]
+    fn a_delete_of_the_database_keeps_its_destructive_class() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        assert_classification(
+            classify(
+                "Bash",
+                &json!({ "command": r#"rm -f "$HOME/AppData/Local/nucleos/NucleOS/data/nucleos.db""# }),
+                cwd,
+            ),
+            "deny",
+            "destructive-outside",
+        );
+    }
+
+    /// Spec section 11: no basename false positives, no other database.
+    #[test]
+    fn the_rule_leaves_a_basename_and_other_databases_alone() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for command in [
+            "grep nucleos.db core/src/main.rs",
+            "ls core/testdata/nucleos.db",
+            r#"sqlite3 ./other.db "select 1""#,
+            "ls ~/.local/share/nucleos",
+        ] {
+            assert_ne!(
+                classify("Bash", &json!({ "command": command }), cwd).action_class,
+                "nucleos-data",
+                "{command}"
+            );
+        }
+        assert_classification(
+            classify(
+                "Write",
+                &json!({ "file_path": "core/testdata/nucleos.db" }),
+                cwd,
+            ),
+            "allow",
+            "read-local",
+        );
+        // `sqlite3` on any OTHER database stays with the judge's guard, which this rule did not touch,
+        // and on a recognised path both answers hold: the rule refuses it, the guard still names it.
+        assert_eq!(
+            guard("Bash", r#"sqlite3 ./other.db "select 1""#),
+            Some(JudgeGuard::SensitiveSource)
+        );
+        let recognised = r#"sqlite3 "$HOME/AppData/Local/nucleos/NucleOS/data/nucleos.db" "select 1""#;
+        assert_eq!(guard("Bash", recognised), Some(JudgeGuard::SensitiveSource));
+        assert_classification(
+            classify("Bash", &json!({ "command": recognised }), cwd),
+            "deny",
+            "nucleos-data",
+        );
+    }
+
+    /// Chunk 6 added `nucleos-core --settings-reset|--settings-rollback`, which edit configuration
+    /// straight in the database - no kill-switch, no `not_ours` check. An agent has no business
+    /// running them, so the line is a hard refusal in the same class. The program may be spelled bare,
+    /// with `.exe`, or through a path; the flags are the constants, never literals.
+    #[test]
+    fn the_settings_cli_is_denied_to_an_agent_as_nucleos_data() {
+        use crate::settings_cli::{RESET_FLAG, ROLLBACK_FLAG};
+        for command in [
+            format!("nucleos-core {RESET_FLAG} machine/verify"),
+            format!("nucleos-core.exe {ROLLBACK_FLAG} machine/verify 3"),
+            format!("./target/debug/nucleos-core {RESET_FLAG} project:abc/policy"),
+            format!(r"C:\Projects\.nucleos-run\nucleos-core.exe {ROLLBACK_FLAG} machine/verify 3"),
+            format!(r#""C:\Program Files\NucleOS\nucleos-core.exe" {RESET_FLAG} machine/verify"#),
+            format!("cd /tmp && /opt/nucleos/nucleos-core {RESET_FLAG} machine/verify"),
+            format!("FOO=1 nucleos-core {RESET_FLAG} machine/verify"),
+            format!("nucleos-core {RESET_FLAG}=machine/verify"),
+            // Through cargo it is still the daemon binary running the flag.
+            format!("cargo run -p nucleos-core -- {RESET_FLAG} machine/verify"),
+        ] {
+            for tool in ["Bash", "PowerShell"] {
+                assert_classification(
+                    classify(tool, &json!({ "command": command }), None),
+                    "deny",
+                    "nucleos-data",
+                );
+            }
+        }
+        // Neither half alone is the CLI: the program without a settings flag and the flag as plain
+        // text for another program.
+        for command in [
+            "nucleos-core --print-token".to_owned(),
+            "cargo test -p nucleos-core --lib settings_cli".to_owned(),
+            format!("grep -rn -- {RESET_FLAG} core/src"),
+            format!("echo {ROLLBACK_FLAG}"),
+        ] {
+            assert_ne!(
+                classify("Bash", &json!({ "command": command }), None).action_class,
+                "nucleos-data",
+                "{command}"
+            );
+        }
+    }
+
+    /// The read tools reach `classify` with their `tool_input`, and the database is not a thing an
+    /// agent reads either: `Read` (`file_path`), `Grep` (`path`, `glob`) and `Glob` (`path`,
+    /// `pattern`). Grep and Glob look INSIDE a directory, so the bare data directory is refused for
+    /// them while `Read` of `logs/` stays allowed. Grep's `pattern` is a regex over file contents,
+    /// not a path, and is never inspected.
+    #[test]
+    fn a_read_tool_naming_the_database_is_denied_as_nucleos_data() {
+        for cwd in [None, Some(Path::new(r"C:\work\repo"))] {
+            for (tool, input) in [
+                ("Read", json!({ "file_path": r"%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db" })),
+                ("Read", json!({ "file_path": "~/.local/share/nucleos/nucleos.db-wal" })),
+                (
+                    "Read",
+                    json!({ "file_path": "$HOME/Library/Application Support/dev.nucleos.NucleOS/nucleos.db" }),
+                ),
+                ("Grep", json!({ "pattern": "x", "path": "~/.local/share/nucleos/backups" })),
+                ("Grep", json!({ "pattern": "x", "path": "~/.local/share/nucleos" })),
+                ("Grep", json!({ "pattern": "x", "path": r"%LOCALAPPDATA%\nucleos\NucleOS\data" })),
+                ("Grep", json!({ "pattern": "x", "glob": "~/.local/share/nucleos/nucleos.*" })),
+                ("Glob", json!({ "pattern": "~/.local/share/nucleos/**" })),
+                ("Glob", json!({ "pattern": r"%LOCALAPPDATA%\nucleos\NucleOS\data\*" })),
+                ("Glob", json!({ "pattern": "~/.local/share/nucleos/nucleos.db*" })),
+                ("Glob", json!({ "pattern": "*.db", "path": "~/.local/share/nucleos" })),
+            ] {
+                assert_classification(classify(tool, &input, cwd), "deny", "nucleos-data");
+            }
+        }
+        // What stays a plain local read: a basename, another directory, the data directory's logs, the
+        // settings files (a different rule), and a regex that merely spells the file name.
+        for (tool, input) in [
+            ("Read", json!({ "file_path": "core/testdata/nucleos.db" })),
+            ("Read", json!({ "file_path": "~/.local/share/nucleos/logs/core.log" })),
+            ("Read", json!({ "file_path": "~/.nucleos/github.yaml" })),
+            ("Grep", json!({ "pattern": "nucleos.db", "path": "core/src" })),
+            ("Grep", json!({ "pattern": "nucleos.db" })),
+            ("Glob", json!({ "pattern": "**/*.rs" })),
+            ("Glob", json!({ "pattern": "*.db", "path": "core/testdata" })),
+        ] {
+            assert_classification(
+                classify(tool, &input, Some(Path::new(r"C:\work\repo"))),
+                "allow",
+                "read-local",
+            );
+        }
+    }
+
+    /// Spec section 7: the importer leaves `<file>.yaml.imported` where it found the file. A
+    /// hand-edited one plus a `--settings-reset` would re-open the import door, so it is guarded
+    /// exactly like the file it came from - machine settings and each project's state, absolute or
+    /// home-spelled. The old `.ai/` copies are not guarded (nothing reads them), imported or not.
+    #[test]
+    fn an_imported_settings_file_is_guarded_like_the_file_it_came_from() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for tool in ["Edit", "Write"] {
+            for path in [
+                "~/.nucleos/github.yaml.imported",
+                "$HOME/.nucleos/nucleos-models.yaml.imported",
+                r"%USERPROFILE%\.nucleos\voice.yaml.imported",
+                // Not home-spelled: only the file name under `.nucleos/` names it.
+                ".nucleos/github.yaml.imported",
+                ".nucleos/nucleos-models.yaml.imported",
+                // Project state: the state directory.
+                "~/.nucleos/projects/alpha/autopilot.yaml.imported",
+                ".nucleos/projects/alpha/workflows.yaml.imported",
+                ".nucleos/projects/alpha/onboarded.yaml.imported",
+                "~/.nucleos/projects/alpha/materialized/job-12-0a1b2c3d.yaml.imported",
+            ] {
+                assert_classification(
+                    classify(tool, &json!({ "file_path": path }), cwd),
+                    "pending_approval",
+                    "self-governing-file",
+                );
+            }
+            // Absolute: refused outright with a workspace, still the owner's file by name without one.
+            let absolute = r"C:\Users\someone\.nucleos\github.yaml.imported";
+            assert_eq!(
+                classify(tool, &json!({ "file_path": absolute }), cwd)
+                    .decision
+                    .decision,
+                "deny",
+                "{tool}"
+            );
+            assert_classification(
+                classify(tool, &json!({ "file_path": absolute }), None),
+                "pending_approval",
+                "self-governing-file",
+            );
+        }
+        for command in [
+            "cp evil.yaml ~/.nucleos/github.yaml.imported",
+            "cp evil.yaml .nucleos/github.yaml.imported",
+            "cp evil.yaml C:/Users/someone/.nucleos/projects/alpha/autopilot.yaml.imported",
+        ] {
+            let asked = classify("Bash", &json!({ "command": command }), cwd);
+            assert_eq!(asked.decision.decision, "pending_approval", "{command}");
+        }
+        // Reading one is still a read, as for the file itself.
+        assert_eq!(
+            classify(
+                "Bash",
+                &json!({ "command": "cat ~/.nucleos/github.yaml.imported" }),
+                cwd
+            )
+            .decision
+            .decision,
+            "allow"
+        );
+        // A same-named file that is nobody's settings stays ordinary, and so does the old `.ai/` copy.
+        for path in [
+            "docs/github.yaml.imported",
+            "docs/email.yaml.imported",
+            ".ai/github.yaml.imported",
+            ".ai/autopilot.yaml.imported",
+        ] {
+            assert_eq!(
+                classify("Write", &json!({ "file_path": path }), cwd)
+                    .decision
+                    .decision,
+                "allow",
+                "{path}"
+            );
+        }
     }
 
     /// A read the owner listed passes, and it is recorded under its own class rather than as one

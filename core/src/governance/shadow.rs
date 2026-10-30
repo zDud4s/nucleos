@@ -1240,6 +1240,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_nucleos_data_class_is_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // A hard deny has no approval path: every decision of the class is a refusal.
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(&pool, run, "nucleos-data", "deny", Some("reject")).await;
+        }
+
+        let readiness = shadow_readiness(&pool)
+            .await
+            .unwrap()
+            .get("project-a")
+            .copied()
+            .unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 1));
+        assert!(promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
     async fn an_unknown_workspace_is_not_evidence_of_restraint() {
         let pool = test_pool().await;
         let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
