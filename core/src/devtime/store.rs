@@ -19,12 +19,20 @@ mod agent_attempts;
 mod attempt_failures;
 mod reads;
 mod rules;
+mod shadow;
 mod turn_stat_window;
 
 pub use self::agent_attempts::*;
 pub use self::attempt_failures::*;
 pub use self::reads::*;
 pub use self::rules::*;
+#[allow(unused_imports)] // the actions step is the reader
+pub use self::shadow::{ActionStateRow, ShadowOutcome, ShadowRow};
+#[allow(unused_imports)] // the actions step is the reader
+pub use self::shadow::{
+    decisions_for, get_action_state, insert_decision, pending_due, resolve, set_action_state,
+    set_human_verdict, void_stale,
+};
 pub use self::turn_stat_window::*;
 
 #[allow(dead_code)] // a table column or closed vocabulary that no reader asks for yet
