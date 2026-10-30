@@ -7,7 +7,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::config::DevtimeRulesConfig;
+use crate::config::{DevtimeActionsConfig, DevtimeRulesConfig};
 use crate::devtime::rules::{Level, RULES, Rule};
 use crate::devtime::store::{
     self as devtime_store, FEEDBACK_CAUSES, FEEDBACK_VERDICTS, FeedbackRow, LEVERS, RuleCaseCounts,
@@ -190,14 +190,11 @@ pub fn wilson_lower(right: i64, n: i64) -> f64 {
 }
 
 /// A rule may drive an action only when it is eligible and the Wilson lower bound of its
-/// precision reaches `wilson_floor`.
+/// precision reaches `cfg.precision_wilson_lower`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn action_eligible(p: &RulePrecision, wilson_floor: f64) -> bool {
-    if !p.eligible || p.level != Level::Base {
-        return false;
-    }
-    let right = (p.n_cases - p.n_not_rework).max(0);
-    wilson_lower(right, p.n_cases) >= wilson_floor
+pub fn action_eligible(p: &RulePrecision, cfg: &DevtimeActionsConfig) -> bool {
+    let _ = (p, cfg);
+    todo!()
 }
 
 #[cfg(test)]
@@ -278,35 +275,50 @@ mod tests {
     }
 
     #[test]
-    fn action_eligible_rejects_16_of_20_at_floor_0_6() {
+    fn action_eligible_rejects_16_of_20_at_default_floor() {
+        let cfg = DevtimeActionsConfig::default();
         assert!(!action_eligible(
             &precision_row(Level::Base, 20, 16, true),
-            0.6
+            &cfg
         ));
     }
 
     #[test]
-    fn action_eligible_accepts_20_of_20_at_floor_0_6() {
+    fn action_eligible_accepts_20_of_20_at_default_floor() {
+        let cfg = DevtimeActionsConfig::default();
         assert!(action_eligible(
             &precision_row(Level::Base, 20, 20, true),
-            0.6
+            &cfg
         ));
     }
 
     #[test]
     fn action_eligible_rejects_when_not_eligible() {
         // 20/20 would pass the floor, but the rule is below min_cases.
+        let cfg = DevtimeActionsConfig::default();
         assert!(!action_eligible(
             &precision_row(Level::Base, 20, 20, false),
-            0.6
+            &cfg
         ));
     }
 
     #[test]
     fn action_eligible_rejects_deferred_rule() {
+        let cfg = DevtimeActionsConfig::default();
         assert!(!action_eligible(
             &precision_row(Level::Deferred, 20, 20, false),
-            0.6
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn action_eligible_follows_the_configured_floor() {
+        // 16/20 has a Wilson lower bound near 0.58: it passes a looser floor from the config.
+        let mut cfg = DevtimeActionsConfig::default();
+        cfg.precision_wilson_lower = 0.5;
+        assert!(action_eligible(
+            &precision_row(Level::Base, 20, 16, true),
+            &cfg
         ));
     }
 
