@@ -165,7 +165,7 @@ import { useNow } from "../lib/useNow";
 import { tokenCount } from "../ui/readings";
 import { SessionColumn } from "../chats/SessionColumn";
 import { ChatTabs } from "../chats/ChatTabs";
-import { ChatChips } from "../chats/AgentMap";
+import { ChatChips, ParallelHint } from "../chats/AgentMap";
 import { ProjectPicker } from "../chats/ProjectPicker";
 import { holdMessage, takeHeld, useHeldMessage } from "../chats/held";
 import { clearDraft, readDraft, readScroll, saveDraft, saveScroll } from "../chats/drafts";
@@ -1103,6 +1103,7 @@ function ChatDetail({
         )}
         {/* Below the transcript and above the box, which is where these words are in time: said
             after everything above them, and not yet said at all. */}
+        <ParallelHint chatId={chatId} turns={transcript.data?.turns} />
         {/* Above what is waiting to be said, because this is what everything else is waiting ON:
             a turn is held while a question stands, and the queue behind it cannot move until it is
             answered. */}
