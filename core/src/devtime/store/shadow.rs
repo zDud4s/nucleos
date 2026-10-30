@@ -83,62 +83,205 @@ pub struct ActionStateRow {
 
 /// Records a decision. The unique key `(action, rule_id, subject_key, COALESCE(session_id, ''),
 /// action_version, mode)` makes a second insert a no-op: returns true when a row was written.
-pub async fn insert_decision(_pool: &SqlitePool, _row: &ShadowRow) -> sqlx::Result<bool> {
-    Ok(false)
+pub async fn insert_decision(pool: &SqlitePool, row: &ShadowRow) -> sqlx::Result<bool> {
+    let params = if row.params.is_empty() {
+        "{}"
+    } else {
+        row.params.as_str()
+    };
+    let res = sqlx::query(
+        "INSERT INTO devtime_shadow (action, rule_id, project_id, session_id, subject_key, mode, \
+         decision, suppress_reason, template_id, params, basis_precision, basis_cases, \
+         basis_recent_count, basis_recent_cost_ms, expected_saving_ms, rule_version, \
+         action_version, thresholds_hash, rules_version, decided_at, window_end_at, outcome_state, \
+         outcome, outcome_finding_key, outcome_cost_ms, outcome_verified, proposal_id, \
+         human_verdict, human_verdict_at, resolved_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+         ?, ?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(&row.action)
+    .bind(&row.rule_id)
+    .bind(&row.project_id)
+    .bind(&row.session_id)
+    .bind(&row.subject_key)
+    .bind(&row.mode)
+    .bind(&row.decision)
+    .bind(&row.suppress_reason)
+    .bind(&row.template_id)
+    .bind(params)
+    .bind(row.basis_precision)
+    .bind(row.basis_cases)
+    .bind(row.basis_recent_count)
+    .bind(row.basis_recent_cost_ms)
+    .bind(row.expected_saving_ms)
+    .bind(row.rule_version)
+    .bind(row.action_version)
+    .bind(&row.thresholds_hash)
+    .bind(&row.rules_version)
+    .bind(&row.decided_at)
+    .bind(&row.window_end_at)
+    .bind(&row.outcome_state)
+    .bind(&row.outcome)
+    .bind(&row.outcome_finding_key)
+    .bind(row.outcome_cost_ms)
+    .bind(&row.outcome_verified)
+    .bind(row.proposal_id)
+    .bind(&row.human_verdict)
+    .bind(&row.human_verdict_at)
+    .bind(&row.resolved_at)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// Pending rows whose window ended at or before `now`, oldest window first.
-pub async fn pending_due(_pool: &SqlitePool, _now: &str) -> sqlx::Result<Vec<ShadowRow>> {
-    Ok(Vec::new())
+pub async fn pending_due(pool: &SqlitePool, now: &str) -> sqlx::Result<Vec<ShadowRow>> {
+    sqlx::query_as::<_, ShadowRow>(
+        "SELECT * FROM devtime_shadow WHERE outcome_state = 'pending' AND window_end_at <= ? \
+         ORDER BY window_end_at, id",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await
 }
 
 /// Closes a `pending` row. A row that is no longer pending is left alone: returns true when the row
 /// was changed.
-pub async fn resolve(
-    _pool: &SqlitePool,
-    _id: i64,
-    _outcome: &ShadowOutcome,
-) -> sqlx::Result<bool> {
-    Ok(false)
+pub async fn resolve(pool: &SqlitePool, id: i64, outcome: &ShadowOutcome) -> sqlx::Result<bool> {
+    if !["resolved", "expired"].contains(&outcome.state.as_str()) {
+        return Err(sqlx::Error::Protocol(format!(
+            "devtime_shadow: invalid closing state {:?}",
+            outcome.state
+        )));
+    }
+    let resolved_at = if outcome.resolved_at.is_empty() {
+        super::now()
+    } else {
+        outcome.resolved_at.clone()
+    };
+    let res = sqlx::query(
+        "UPDATE devtime_shadow SET outcome_state = ?, outcome = ?, outcome_finding_key = ?, \
+         outcome_cost_ms = ?, outcome_verified = ?, proposal_id = ?, resolved_at = ? \
+         WHERE id = ? AND outcome_state = 'pending'",
+    )
+    .bind(&outcome.state)
+    .bind(&outcome.outcome)
+    .bind(&outcome.finding_key)
+    .bind(outcome.cost_ms)
+    .bind(&outcome.verified)
+    .bind(outcome.proposal_id)
+    .bind(resolved_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Marks `void` every row of `rule_id` stamped with the stale `rule_version`, resolved ones included
 /// (their supporting finding is gone); rows of other versions stay. Returns the rows changed.
-pub async fn void_stale(
-    _pool: &SqlitePool,
-    _rule_id: &str,
-    _rule_version: i64,
-) -> sqlx::Result<u64> {
-    Ok(0)
+pub async fn void_stale(pool: &SqlitePool, rule_id: &str, rule_version: i64) -> sqlx::Result<u64> {
+    let res = sqlx::query(
+        "UPDATE devtime_shadow SET outcome_state = 'void' \
+         WHERE rule_id = ? AND rule_version = ? AND outcome_state <> 'void'",
+    )
+    .bind(rule_id)
+    .bind(rule_version)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// The non-void rows of one (action, rule, mode) stamped with any of `action_versions`, oldest first.
 pub async fn decisions_for(
-    _pool: &SqlitePool,
-    _action: &str,
-    _rule_id: &str,
-    _mode: &str,
-    _action_versions: &[i64],
+    pool: &SqlitePool,
+    action: &str,
+    rule_id: &str,
+    mode: &str,
+    action_versions: &[i64],
 ) -> sqlx::Result<Vec<ShadowRow>> {
-    Ok(Vec::new())
+    if action_versions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut qb = sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM devtime_shadow WHERE action = ");
+    qb.push_bind(action);
+    qb.push(" AND rule_id = ").push_bind(rule_id);
+    qb.push(" AND mode = ").push_bind(mode);
+    qb.push(" AND outcome_state <> 'void' AND action_version IN (");
+    let mut sep = qb.separated(", ");
+    for v in action_versions {
+        sep.push_bind(*v);
+    }
+    qb.push(") ORDER BY decided_at, id");
+    qb.build_query_as::<ShadowRow>().fetch_all(pool).await
 }
 
 /// The owner's optional `useful` / `noise` mark on a row. Returns true when the row exists.
-pub async fn set_human_verdict(_pool: &SqlitePool, _id: i64, _verdict: &str) -> sqlx::Result<bool> {
-    Ok(false)
+pub async fn set_human_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Result<bool> {
+    if !["useful", "noise"].contains(&verdict) {
+        return Err(sqlx::Error::Protocol(format!(
+            "devtime_shadow: invalid human verdict {verdict:?}"
+        )));
+    }
+    let res = sqlx::query(
+        "UPDATE devtime_shadow SET human_verdict = ?, human_verdict_at = ? WHERE id = ?",
+    )
+    .bind(verdict)
+    .bind(super::now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 pub async fn get_action_state(
-    _pool: &SqlitePool,
-    _action: &str,
-    _rule_id: &str,
+    pool: &SqlitePool,
+    action: &str,
+    rule_id: &str,
 ) -> sqlx::Result<Option<ActionStateRow>> {
-    Ok(None)
+    sqlx::query_as::<_, ActionStateRow>(
+        "SELECT action, rule_id, mode, since, changed_by, reason FROM devtime_action_state \
+         WHERE action = ? AND rule_id = ?",
+    )
+    .bind(action)
+    .bind(rule_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Upserts the state of one pair. `changed_by` must be one of [`ACTION_CHANGED_BY`], else an error
 /// and nothing is written. An empty `since` means now.
-pub async fn set_action_state(_pool: &SqlitePool, _row: &ActionStateRow) -> sqlx::Result<()> {
+pub async fn set_action_state(pool: &SqlitePool, row: &ActionStateRow) -> sqlx::Result<()> {
+    if !ACTION_CHANGED_BY.contains(&row.changed_by.as_str()) {
+        return Err(sqlx::Error::Protocol(format!(
+            "devtime_action_state: invalid changed_by {:?}",
+            row.changed_by
+        )));
+    }
+    if !["off", "shadow", "live"].contains(&row.mode.as_str()) {
+        return Err(sqlx::Error::Protocol(format!(
+            "devtime_action_state: invalid mode {:?}",
+            row.mode
+        )));
+    }
+    let since = if row.since.is_empty() {
+        super::now()
+    } else {
+        row.since.clone()
+    };
+    sqlx::query(
+        "INSERT INTO devtime_action_state (action, rule_id, mode, since, changed_by, reason) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(action, rule_id) DO UPDATE SET mode = excluded.mode, since = excluded.since, \
+         changed_by = excluded.changed_by, reason = excluded.reason",
+    )
+    .bind(&row.action)
+    .bind(&row.rule_id)
+    .bind(&row.mode)
+    .bind(since)
+    .bind(&row.changed_by)
+    .bind(&row.reason)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -357,7 +500,10 @@ mod tests {
             "resolved_at",
         ];
         expected.sort();
-        assert_eq!(columns, expected, "a new column must be reviewed for privacy");
+        assert_eq!(
+            columns, expected,
+            "a new column must be reviewed for privacy"
+        );
     }
 
     #[tokio::test]
