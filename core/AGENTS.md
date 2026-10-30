@@ -166,6 +166,7 @@ the contract, not a snapshot.
 | `http/remote.rs` | Remote access (`/remote/pair`, `/remote/session`, `/remote/logout`, `/remote/pairing-codes`, `/remote/devices*`): thin over `remote.rs`; who reaches which route is decided in `auth::require_token`. |
 | `http/repo.rs` | Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…). |
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
+| `http/settings.rs` | Settings documents over HTTP (`/settings*`): index, read, history, PUT with optimistic versioning, rollback. |
 | `http/tasks.rs` | The HTTP face of `task_claims`: `/tasks/*` per worktree (tools and runs), `/projects/{id}/tasks*` for the owner only (hooks and the shell). A project off the roster is "claims unavailable", never a server error. |
 | `http/team.rs` | Council and teams (`/council/*`, `/teams/*`, `/team-*`). |
 | `http/themes.rs` | Themes (`/themes/*`, owner-only, spec `2026-10-22-segundo-cerebro-abstrato` section 6): list, detail with the members resolved, accept, refuse, rename, merge, add and exclude a member. One of the three files allowed to name the theme tables. |

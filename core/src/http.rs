@@ -57,6 +57,7 @@ mod relay;
 mod remote;
 mod repo;
 mod run_queue;
+mod settings;
 mod tasks;
 mod team;
 mod themes;
@@ -148,6 +149,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(remote::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
+        .merge(settings::routes())
         .merge(crate::route_index::routes())
         .merge(team::routes())
         .merge(themes::routes())
