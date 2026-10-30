@@ -172,6 +172,40 @@ def macos_is_signed_with_the_stable_certificate_or_not_at_all():
     assert "certificate leaf = H" in text, "the signed app's designated requirement is not verified"
 
 
+def the_smoke_job_gates_the_publish():
+    text = workflow_text()
+    assert "\n  smoke-linux:" in text, "no smoke-linux job"
+    start = text.index("\n  smoke-linux:")
+    end = text.find("\n  publish:", start)
+    smoke = text[start : end if end >= 0 else len(text)]
+    for needle in ("needs: build", "ubuntu:22.04", "fedora", "gh release download", "scripts/smoke-bundle.sh"):
+        assert needle in smoke, f"smoke-linux lacks {needle!r}"
+    publish = text[text.index("\n  publish:") :]
+    assert "needs: [build, smoke-linux]" in publish, "publish does not wait for smoke-linux"
+
+
+def the_smoke_script_checks_the_install_and_the_daemon():
+    path = ROOT / "scripts" / "smoke-bundle.sh"
+    assert path.exists(), "scripts/smoke-bundle.sh is missing"
+    data = path.read_bytes()
+    assert b"\r" not in data, "must be LF"
+    assert data.splitlines()[0] == b"#!/usr/bin/env bash", data.splitlines()[0]
+    body = data.decode("utf-8")
+    for needle in ("set -euo pipefail", "apt-get", "dnf", "kill -9", "8791"):
+        assert needle in body, f"smoke-bundle.sh lacks {needle!r}"
+    for binary in (
+        "nucleos-core",
+        "browser-sidecar",
+        "echo-sidecar",
+        "email-sidecar",
+        "quota-sidecar",
+        "remote-sidecar",
+        "telegram-sidecar",
+        "web-sidecar",
+    ):
+        assert binary in body, f"smoke-bundle.sh does not check {binary}"
+
+
 CASES = [
     verify_accepts_a_complete_release_and_names_what_is_missing,
     a_foreign_version_in_a_versioned_name_is_refused,
@@ -181,6 +215,8 @@ CASES = [
     the_workflow_is_tag_only_and_signs_with_known_secrets,
     the_draft_is_proven_complete_before_it_is_published,
     macos_is_signed_with_the_stable_certificate_or_not_at_all,
+    the_smoke_job_gates_the_publish,
+    the_smoke_script_checks_the_install_and_the_daemon,
 ]
 
 if __name__ == "__main__":
