@@ -657,11 +657,11 @@ pub(super) async fn post_run_message(
     if headers
         .get(runs::ORIGIN_HEADER)
         .and_then(|value| value.to_str().ok())
-        == Some("voice")
+        == Some(crate::assistant_types::Origin::Voice.as_wire())
     {
         tracing::info!(
             run_id = id,
-            origin = "voice",
+            origin = crate::assistant_types::Origin::Voice.as_wire(),
             "message to a run came from the voice supervisor"
         );
     }
