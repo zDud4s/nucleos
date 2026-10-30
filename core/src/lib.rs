@@ -78,7 +78,6 @@ pub use nucleos_base::prompt_budget;
 pub mod proposals;
 pub mod quota;
 pub use nucleos_base::recurrence;
-pub mod relay;
 pub mod remote;
 pub mod repo_trigger;
 pub mod resolver;
@@ -112,7 +111,6 @@ pub use nucleos_base::wake;
 pub use nucleos_base::warm;
 pub use nucleos_base::web_client;
 pub mod wip;
-pub mod work_nodes;
 pub mod workflow_records;
 pub mod workflows;
 
