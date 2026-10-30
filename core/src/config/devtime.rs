@@ -21,6 +21,8 @@ pub struct DevtimeConfig {
     pub parse_failure_min_lines: u64,
     /// The rule engine's vocabularies and thresholds (sub-project 2).
     pub rules: DevtimeRulesConfig,
+    /// The automatic actions' thresholds (phase 2, shadow mode first).
+    pub actions: DevtimeActionsConfig,
 }
 
 impl Default for DevtimeConfig {
@@ -33,6 +35,7 @@ impl Default for DevtimeConfig {
             parse_failure_amber_rate: 0.02,
             parse_failure_min_lines: 200,
             rules: DevtimeRulesConfig::default(),
+            actions: DevtimeActionsConfig::default(),
         }
     }
 }
@@ -392,6 +395,7 @@ pub struct DevtimeAdaptersConfig {
 /// What the grammar alone cannot say: a signature for a class the parser does not have, a fraction
 /// outside [0, 1], or a count that must be at least one. A file that fails this is refused whole.
 pub fn validate_devtime(config: &DevtimeConfig) -> Result<(), String> {
+    validate_actions(&config.actions)?;
     let rules = &config.rules;
     for class in rules.vocab.error_signatures.keys() {
         if !RULES_ERROR_CLASSES.contains(&class.as_str()) {
@@ -590,5 +594,107 @@ fn devtime_answer(entry: &DevtimeCacheEntry) -> Option<ResolvedDevtime> {
         (Some(config), true) => Some((config.clone(), ThresholdsSource::LastGood)),
         (None, true) => Some((DevtimeConfig::default(), ThresholdsSource::Default)),
         (None, false) => None,
+    }
+}
+
+/// The per-action floor on the shadow hit rate (spec 4.1).
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeHitRateMin {
+    pub inject: f64,
+    pub propose: f64,
+}
+
+/// The automatic actions' thresholds (actions design spec, sections 4 and 6). RED stub: the
+/// `Default` is derived (all zero) so that the default tests fail until GREEN writes the spec values.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeActionsConfig {
+    /// Global switch: false puts every pair in `off`.
+    pub enabled: bool,
+    pub precision_wilson_lower: f64,
+    pub effect_min_resolved: u32,
+    pub effect_min_sessions: u32,
+    pub effect_min_days: u32,
+    pub shadow_hit_rate_min: DevtimeHitRateMin,
+    pub min_mean_hit_cost_ms: u64,
+    pub inject_window_days: u32,
+    pub inject_min_count: u32,
+    pub inject_min_cost_ms: u64,
+    pub inject_max_per_session: u32,
+    pub inject_cooldown_days: u32,
+    pub propose_min_sessions: u32,
+    pub propose_min_cost_ms: u64,
+    pub propose_window_days: u32,
+    pub propose_max_open: u32,
+    pub human_min_marks: u32,
+    pub holdout_fraction: f64,
+    pub rollback_window: u32,
+    pub reentry_days: u32,
+    /// Action to the rule ids that start in shadow.
+    pub pairs: BTreeMap<String, Vec<String>>,
+}
+
+/// RED stub: GREEN refuses a `holdout_fraction` outside [0, 1] and a zero `inject_max_per_session`.
+fn validate_actions(_actions: &DevtimeActionsConfig) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod actions_tests {
+    use super::*;
+
+    #[test]
+    fn missing_actions_block_gives_the_spec_defaults() {
+        let config = parse_devtime_config("enabled: true\n").expect("parses");
+        let a = config.actions;
+        assert!(a.enabled);
+        assert_eq!(a.precision_wilson_lower, 0.6);
+        assert_eq!(a.effect_min_resolved, 30);
+        assert_eq!(a.effect_min_sessions, 10);
+        assert_eq!(a.effect_min_days, 14);
+        assert_eq!(a.shadow_hit_rate_min.inject, 0.6);
+        assert_eq!(a.shadow_hit_rate_min.propose, 0.5);
+        assert_eq!(a.min_mean_hit_cost_ms, 30_000);
+        assert_eq!(a.inject_window_days, 14);
+        assert_eq!(a.inject_min_count, 3);
+        assert_eq!(a.inject_min_cost_ms, 120_000);
+        assert_eq!(a.inject_max_per_session, 3);
+        assert_eq!(a.inject_cooldown_days, 3);
+        assert_eq!(a.propose_min_sessions, 3);
+        assert_eq!(a.propose_min_cost_ms, 600_000);
+        assert_eq!(a.propose_window_days, 14);
+        assert_eq!(a.propose_max_open, 5);
+        assert_eq!(a.human_min_marks, 5);
+        assert_eq!(a.holdout_fraction, 0.10);
+        assert_eq!(a.rollback_window, 30);
+        assert_eq!(a.reentry_days, 14);
+        assert_eq!(a.pairs["inject"], vec!["D3", "D6"]);
+        assert_eq!(a.pairs["propose"], vec!["F1", "F2"]);
+    }
+
+    #[test]
+    fn partial_actions_block_keeps_the_other_defaults() {
+        let config =
+            parse_devtime_config("actions:\n  inject_max_per_session: 2\n").expect("parses");
+        assert_eq!(config.actions.inject_max_per_session, 2);
+        assert_eq!(config.actions.inject_cooldown_days, 3);
+    }
+
+    #[test]
+    fn unknown_actions_key_is_refused() {
+        assert!(parse_devtime_config("actions:\n  bogus_key: 1\n").is_err());
+    }
+
+    #[test]
+    fn holdout_fraction_outside_unit_interval_is_refused() {
+        assert!(parse_devtime_config("actions:\n  holdout_fraction: 1.5\n").is_err());
+        assert!(parse_devtime_config("actions:\n  holdout_fraction: -0.1\n").is_err());
+        assert!(parse_devtime_config("actions:\n  holdout_fraction: 0.25\n").is_ok());
+    }
+
+    #[test]
+    fn zero_inject_max_per_session_is_refused() {
+        assert!(parse_devtime_config("actions:\n  inject_max_per_session: 0\n").is_err());
     }
 }

@@ -9,6 +9,47 @@ use super::*;
 /// Who may write `devtime_action_state.changed_by`.
 pub const ACTION_CHANGED_BY: [&str; 2] = ["owner", "rollback"];
 
+/// Alias of [`ACTION_CHANGED_BY`] under the name the actions design spec uses.
+pub const CHANGED_BY: [&str; 2] = ACTION_CHANGED_BY;
+
+/// `devtime_shadow.action`.
+pub const ACTIONS: [&str; 2] = ["inject", "propose"];
+/// `devtime_shadow.mode` (`off` exists only in `devtime_action_state`).
+pub const MODES: [&str; 2] = ["shadow", "live"];
+/// `devtime_shadow.decision`.
+pub const DECISIONS: [&str; 2] = ["fire", "suppress"];
+/// `devtime_shadow.suppress_reason`; `holdout` marks the residual control group (spec 6.1).
+pub const SUPPRESS_REASONS: [&str; 5] = [
+    "cap",
+    "cooldown",
+    "below_threshold",
+    "not_eligible",
+    "holdout",
+];
+/// `devtime_shadow.outcome_state`.
+pub const OUTCOME_STATES: [&str; 4] = ["pending", "resolved", "expired", "void"];
+/// `devtime_shadow.outcome`.
+pub const OUTCOMES: [&str; 5] = ["hit", "miss", "accepted", "rejected", "ignored"];
+/// `devtime_shadow.human_verdict`.
+pub const HUMAN_VERDICTS: [&str; 2] = ["useful", "noise"];
+/// The closed catalogue of `devtime_shadow.template_id`: no free text is ever stored.
+pub const TEMPLATE_IDS: [&str; 4] = [
+    "inject.d3.v1",
+    "inject.d6.v1",
+    "propose.f1.v1",
+    "propose.f2.v1",
+];
+
+/// Hash of the thresholds one `(action, rule)` pair decides under, so a threshold change is visible
+/// in the log. RED stub.
+pub fn thresholds_hash(
+    _config: &crate::config::DevtimeActionsConfig,
+    _action: &str,
+    _rule: &str,
+) -> String {
+    todo!("GREEN: hash the pair's thresholds")
+}
+
 /// One `devtime_shadow` row, every column.
 #[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
 pub struct ShadowRow {
@@ -288,6 +329,30 @@ pub async fn set_action_state(pool: &SqlitePool, row: &ActionStateRow) -> sqlx::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocabularies_match_the_spec() {
+        assert_eq!(ACTIONS, ["inject", "propose"]);
+        assert_eq!(MODES, ["shadow", "live"]);
+        assert_eq!(DECISIONS, ["fire", "suppress"]);
+        assert!(SUPPRESS_REASONS.contains(&"holdout"));
+        assert_eq!(SUPPRESS_REASONS.len(), 5);
+        assert_eq!(OUTCOME_STATES, ["pending", "resolved", "expired", "void"]);
+        assert_eq!(OUTCOMES, ["hit", "miss", "accepted", "rejected", "ignored"]);
+        assert_eq!(HUMAN_VERDICTS, ["useful", "noise"]);
+        assert_eq!(CHANGED_BY, ["owner", "rollback"]);
+        assert!(TEMPLATE_IDS.contains(&"inject.d3.v1"));
+    }
+
+    #[test]
+    fn thresholds_hash_is_stable_per_pair() {
+        let cfg = crate::config::DevtimeActionsConfig::default();
+        let a = thresholds_hash(&cfg, "inject", "D3");
+        assert_eq!(a, thresholds_hash(&cfg, "inject", "D3"));
+        assert!(!a.is_empty());
+        assert_ne!(a, thresholds_hash(&cfg, "inject", "D6"));
+        assert_ne!(a, thresholds_hash(&cfg, "propose", "D3"));
+    }
 
     async fn pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
