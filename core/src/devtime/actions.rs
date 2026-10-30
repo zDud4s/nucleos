@@ -142,8 +142,45 @@ pub fn apply_cap_and_cooldown(
     now_ms: i64,
     cfg: &crate::config::DevtimeActionsConfig,
 ) -> Vec<Decision> {
-    let _ = (decisions, prior, now_ms, cfg);
-    todo!("2.3 GREEN")
+    let window_ms = i64::from(cfg.inject_cooldown_days).saturating_mul(86_400_000);
+    let mut out = decisions;
+    // Cooldown first, so a cooled-down fire takes no cap slot.
+    for d in out.iter_mut().filter(|d| d.decision == "fire") {
+        let cooled = prior.iter().any(|p| {
+            p.rule_id == d.rule_id
+                && p.project_id == d.project_id
+                && p.mode == d.mode
+                && p.action_version == d.action_version
+                && now_ms.saturating_sub(p.at_ms) < window_ms
+        });
+        if cooled {
+            d.decision = "suppress".to_string();
+            d.suppress_reason = Some("cooldown".to_string());
+        }
+    }
+    // Cap: rank the surviving fires by cost desc, ties by rule_id asc (then project_id).
+    let mut fires: Vec<usize> = (0..out.len())
+        .filter(|&i| out[i].decision == "fire")
+        .collect();
+    fires.sort_by(|&a, &b| {
+        out[b]
+            .basis_recent_cost_ms
+            .unwrap_or(0)
+            .cmp(&out[a].basis_recent_cost_ms.unwrap_or(0))
+            .then_with(|| out[a].rule_id.cmp(&out[b].rule_id))
+            .then_with(|| out[a].project_id.cmp(&out[b].project_id))
+    });
+    let keep = usize::try_from(cfg.inject_max_per_session).unwrap_or(usize::MAX);
+    for &i in fires.iter().skip(keep) {
+        out[i].decision = "suppress".to_string();
+        out[i].suppress_reason = Some("cap".to_string());
+    }
+    out.sort_by(|a, b| {
+        a.rule_id
+            .cmp(&b.rule_id)
+            .then_with(|| a.project_id.cmp(&b.project_id))
+    });
+    out
 }
 
 /// Median of `values` (sorted in place); the mean of the two middle ones for an even count.
@@ -203,7 +240,9 @@ mod tests {
     }
 
     fn find<'a>(out: &'a [Decision], rule: &str) -> &'a Decision {
-        out.iter().find(|d| d.rule_id == rule).expect("rule in output")
+        out.iter()
+            .find(|d| d.rule_id == rule)
+            .expect("rule in output")
     }
 
     #[test]
@@ -232,7 +271,12 @@ mod tests {
     #[test]
     fn cap_cooldown_prior_fire_inside_window_suppresses() {
         let input = vec![cand("D3", 300, "live")];
-        let out = apply_cap_and_cooldown(input, &[prior("D3", "live", ACTION_VERSION, 1)], NOW, &cfg());
+        let out = apply_cap_and_cooldown(
+            input,
+            &[prior("D3", "live", ACTION_VERSION, 1)],
+            NOW,
+            &cfg(),
+        );
         assert_eq!(out[0].decision, "suppress");
         assert_eq!(out[0].suppress_reason.as_deref(), Some("cooldown"));
     }
@@ -241,8 +285,12 @@ mod tests {
     fn cap_cooldown_prior_fire_outside_window_does_not_suppress() {
         let input = vec![cand("D3", 300, "live")];
         let days = i64::from(cfg().inject_cooldown_days) + 1;
-        let out =
-            apply_cap_and_cooldown(input, &[prior("D3", "live", ACTION_VERSION, days)], NOW, &cfg());
+        let out = apply_cap_and_cooldown(
+            input,
+            &[prior("D3", "live", ACTION_VERSION, days)],
+            NOW,
+            &cfg(),
+        );
         assert_eq!(out[0].decision, "fire");
         assert_eq!(out[0].suppress_reason, None);
     }
@@ -250,8 +298,12 @@ mod tests {
     #[test]
     fn cap_cooldown_applies_in_shadow_like_live() {
         let input = vec![cand("D3", 300, "shadow")];
-        let out =
-            apply_cap_and_cooldown(input, &[prior("D3", "shadow", ACTION_VERSION, 1)], NOW, &cfg());
+        let out = apply_cap_and_cooldown(
+            input,
+            &[prior("D3", "shadow", ACTION_VERSION, 1)],
+            NOW,
+            &cfg(),
+        );
         assert_eq!(out[0].decision, "suppress");
         assert_eq!(out[0].suppress_reason.as_deref(), Some("cooldown"));
     }
@@ -259,8 +311,12 @@ mod tests {
     #[test]
     fn cap_cooldown_fire_of_other_mode_does_not_count() {
         let input = vec![cand("D3", 300, "live")];
-        let out =
-            apply_cap_and_cooldown(input, &[prior("D3", "shadow", ACTION_VERSION, 1)], NOW, &cfg());
+        let out = apply_cap_and_cooldown(
+            input,
+            &[prior("D3", "shadow", ACTION_VERSION, 1)],
+            NOW,
+            &cfg(),
+        );
         assert_eq!(out[0].decision, "fire");
     }
 
@@ -277,8 +333,12 @@ mod tests {
     fn cap_cooldown_new_action_version_does_not_inherit_old_cooldown() {
         let mut c = cand("D3", 300, "live");
         c.action_version = ACTION_VERSION + 1;
-        let out =
-            apply_cap_and_cooldown(vec![c], &[prior("D3", "live", ACTION_VERSION, 1)], NOW, &cfg());
+        let out = apply_cap_and_cooldown(
+            vec![c],
+            &[prior("D3", "live", ACTION_VERSION, 1)],
+            NOW,
+            &cfg(),
+        );
         assert_eq!(out[0].decision, "fire");
     }
 
@@ -290,9 +350,16 @@ mod tests {
             cand("D3", 400, "live"),
             cand("D4", 300, "live"),
         ];
-        let out =
-            apply_cap_and_cooldown(input, &[prior("D1", "live", ACTION_VERSION, 1)], NOW, &cfg());
-        assert_eq!(find(&out, "D1").suppress_reason.as_deref(), Some("cooldown"));
+        let out = apply_cap_and_cooldown(
+            input,
+            &[prior("D1", "live", ACTION_VERSION, 1)],
+            NOW,
+            &cfg(),
+        );
+        assert_eq!(
+            find(&out, "D1").suppress_reason.as_deref(),
+            Some("cooldown")
+        );
         for kept in ["D2", "D3", "D4"] {
             assert_eq!(find(&out, kept).decision, "fire", "{kept}");
         }
