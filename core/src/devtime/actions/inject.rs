@@ -191,8 +191,13 @@ mod tests {
         const ACTIONS: [&str; 2] = ["inject", "propose"];
         const MODES: [&str; 2] = ["shadow", "live"];
         const DECISIONS: [&str; 2] = ["fire", "suppress"];
-        const SUPPRESS_REASONS: [&str; 5] =
-            ["cap", "cooldown", "below_threshold", "not_eligible", "holdout"];
+        const SUPPRESS_REASONS: [&str; 5] = [
+            "cap",
+            "cooldown",
+            "below_threshold",
+            "not_eligible",
+            "holdout",
+        ];
         for d in [
             decide("D3", &[60_000, 120_000, 180_000], true),
             decide("D3", &[], true),
