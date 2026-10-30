@@ -505,7 +505,10 @@ mod tests {
         assert!(xml_matches_task(&current, exe));
         let old = r"<Task><Exec><Command>C:\x\nucleos-core.exe</Command></Exec></Task>";
         assert!(!xml_matches_task(old, exe));
-        assert!(!xml_matches_task(&current, Path::new(r"C:\other\nucleos-core.exe")));
+        assert!(!xml_matches_task(
+            &current,
+            Path::new(r"C:\other\nucleos-core.exe")
+        ));
     }
 
     #[cfg(unix)]
