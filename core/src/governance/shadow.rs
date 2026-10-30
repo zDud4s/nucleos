@@ -319,14 +319,35 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
                  WHEN shadow_decisions.human_verdict IS NOT NULL AND ({AGREE_CASE}) = 0 THEN 1
                  ELSE 0
              END) AS disagree,
-             -- RED stubs: real aggregates arrive in GREEN.
-             0 AS stricter,
-             0 AS looser,
-             0 AS unreviewed,
-             NULL AS oldest_unreviewed_at,
-             0 AS reviewed_allow,
-             0 AS reviewed_pend,
-             0 AS reviewed_deny
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict = 'reject'
+                      AND shadow_decisions.decision = 'allow' THEN 1
+                 ELSE 0
+             END) AS stricter,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict = 'approve'
+                      AND shadow_decisions.decision IN ('deny', 'pending_approval') THEN 1
+                 ELSE 0
+             END) AS looser,
+             SUM(CASE WHEN shadow_decisions.human_verdict IS NULL THEN 1 ELSE 0 END) AS unreviewed,
+             MIN(CASE
+                 WHEN shadow_decisions.human_verdict IS NULL THEN shadow_decisions.created_at
+             END) AS oldest_unreviewed_at,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'allow' THEN 1
+                 ELSE 0
+             END) AS reviewed_allow,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'pending_approval' THEN 1
+                 ELSE 0
+             END) AS reviewed_pend,
+             SUM(CASE
+                 WHEN shadow_decisions.human_verdict IS NOT NULL
+                      AND shadow_decisions.decision = 'deny' THEN 1
+                 ELSE 0
+             END) AS reviewed_deny
          FROM shadow_decisions
          JOIN runs ON runs.id = shadow_decisions.run_id
          WHERE runs.project_id = ?
