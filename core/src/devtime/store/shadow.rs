@@ -328,6 +328,33 @@ pub async fn session_attempt_verified(
         .await
 }
 
+/// Whether a `cross` finding keyed `finding_key` ended inside `(after, until]`: the key of the
+/// first such finding, if any.
+pub async fn cross_reappearance(
+    pool: &SqlitePool,
+    finding_key: &str,
+    after: &str,
+    until: &str,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT finding_key FROM devtime_findings WHERE scope = 'cross' AND finding_key = ? \
+         AND ended_at > ? AND ended_at <= ? LIMIT 1",
+    )
+    .bind(finding_key)
+    .bind(after)
+    .bind(until)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The `status` of `proposals` row `id`; `None` when there is no such proposal.
+pub async fn proposal_status(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Sets `outcome_state = 'void'` and `resolved_at = now` on row `id` only when it is still `pending`
 /// (a resolved row is never touched here). True when the row changed.
 pub async fn void_pending(pool: &SqlitePool, id: i64) -> sqlx::Result<bool> {

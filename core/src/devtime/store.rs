@@ -30,9 +30,9 @@ pub use self::rules::*;
 pub use self::shadow::{ActionStateRow, SessionFinding, ShadowOutcome, ShadowRow};
 #[allow(unused_imports)] // the actions step is the reader
 pub use self::shadow::{
-    decisions_for, get_action_state, insert_decision, pending_due, resolve,
-    session_attempt_verified, session_findings, set_action_state, set_human_verdict,
-    thresholds_hash, void_pending, void_stale,
+    cross_reappearance, decisions_for, get_action_state, insert_decision, pending_due,
+    proposal_status, resolve, session_attempt_verified, session_findings, set_action_state,
+    set_human_verdict, thresholds_hash, void_pending, void_stale,
 };
 pub use self::turn_stat_window::*;
 

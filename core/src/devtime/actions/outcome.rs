@@ -113,13 +113,73 @@ pub struct ProposeCloseCounts {
     pub expired: usize,
 }
 
-/// Closes every due pending `propose` row at `now_ms`. RED stub: the contract is pinned by the
-/// `propose_close_` tests below.
+/// Closes every due pending `propose` row at `now_ms` (unix milliseconds). A human verdict prevails;
+/// else shadow rows look for the finding reappearing inside the window and live rows read the
+/// proposal's status. A live row with no usable proposal (no id, or the proposal is gone) has no
+/// signal and `expired`s.
 pub async fn close_propose_outcomes(
-    _pool: &SqlitePool,
-    _now_ms: i64,
+    pool: &SqlitePool,
+    now_ms: i64,
 ) -> sqlx::Result<ProposeCloseCounts> {
-    todo!("step 3.2: close propose outcomes")
+    let now = super::ms_text(now_ms);
+    let mut counts = ProposeCloseCounts::default();
+    for row in store::pending_due(pool, &now).await? {
+        if row.action != "propose" {
+            continue;
+        }
+        let mut finding_key = None;
+        let outcome = match row.human_verdict.as_deref() {
+            Some("useful") => Some("accepted"),
+            Some("noise") => Some("rejected"),
+            _ if row.mode == "live" => {
+                let status = match row.proposal_id {
+                    Some(id) => store::proposal_status(pool, id).await?,
+                    None => None,
+                };
+                match status.as_deref() {
+                    Some("approved") => Some("accepted"),
+                    Some("rejected") => Some("rejected"),
+                    Some(_) => Some("ignored"),
+                    None => None,
+                }
+            }
+            _ => {
+                finding_key = store::cross_reappearance(
+                    pool,
+                    &row.subject_key,
+                    &row.decided_at,
+                    &row.window_end_at,
+                )
+                .await?;
+                Some(if finding_key.is_some() { "hit" } else { "miss" })
+            }
+        };
+        let closing = store::ShadowOutcome {
+            state: if outcome.is_some() {
+                "resolved"
+            } else {
+                "expired"
+            }
+            .into(),
+            outcome: outcome.map(Into::into),
+            finding_key,
+            proposal_id: row.proposal_id,
+            resolved_at: now.clone(),
+            ..store::ShadowOutcome::default()
+        };
+        if !store::resolve(pool, row.id, &closing).await? {
+            continue;
+        }
+        match outcome {
+            Some("hit") => counts.hit += 1,
+            Some("miss") => counts.miss += 1,
+            Some("accepted") => counts.accepted += 1,
+            Some("rejected") => counts.rejected += 1,
+            Some(_) => counts.ignored += 1,
+            None => counts.expired += 1,
+        }
+    }
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -374,11 +434,13 @@ mod tests {
             ..st::ShadowRow::default()
         };
         assert!(st::insert_decision(pool, &row).await.unwrap());
-        sqlx::query_scalar("SELECT id FROM devtime_shadow WHERE action = 'propose' AND subject_key = ?")
-            .bind(key)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT id FROM devtime_shadow WHERE action = 'propose' AND subject_key = ?",
+        )
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     async fn cross_finding(pool: &SqlitePool, key: &str, ended_at: &str) {
