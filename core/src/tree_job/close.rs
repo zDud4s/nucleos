@@ -3,6 +3,258 @@
 //! from the report, and only then closes the node. It also holds the two rules that decide whether
 //! a valid report may close at all: the node checklist (R10) and the top branch node's cycle (R3).
 
+use std::collections::HashSet;
+use std::fmt;
+use std::path::Path;
+
+use axum::http::StatusCode;
+use sqlx::SqlitePool;
+
+use super::checklist::may_close;
+use super::engine::branch_node_may_close;
+use super::report::{parse_report, render_handoff, report_problems};
+use super::store::{self, StoreError};
+use crate::work_nodes::{self, CloseArgs, Node, NodeError, NodeLimits};
+
+/// The longest report the daemon accepts, in non-blank lines: the default of `tree_state.py`.
+pub const REPORT_MAX_LINES: usize = 60;
+
+#[derive(Debug)]
+pub enum CloseError {
+    /// 422: every problem found in the report and the checklist, worded for the agent.
+    Invalid(Vec<String>),
+    /// The node layer's own refusal (404, 409, 400, 422, 500).
+    Node(NodeError),
+    /// 500: the node's tree job is gone or unreadable.
+    Store(StoreError),
+    /// 500.
+    Db(sqlx::Error),
+    /// 500: the handoff file could not be written.
+    Io(std::io::Error),
+}
+
+impl CloseError {
+    pub fn status_code(&self) -> StatusCode {
+        match self {
+            CloseError::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            CloseError::Node(NodeError::Invalid(_)) => StatusCode::BAD_REQUEST,
+            CloseError::Node(NodeError::Conflict(_)) => StatusCode::CONFLICT,
+            CloseError::Node(NodeError::Unprocessable(_)) => StatusCode::UNPROCESSABLE_ENTITY,
+            CloseError::Node(NodeError::NotFound) => StatusCode::NOT_FOUND,
+            CloseError::Node(NodeError::Db(_))
+            | CloseError::Store(_)
+            | CloseError::Db(_)
+            | CloseError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// The problems of an `Invalid`, for a 422 body; empty for every other variant.
+    pub fn problems(&self) -> &[String] {
+        match self {
+            CloseError::Invalid(problems) => problems,
+            _ => &[],
+        }
+    }
+}
+
+impl fmt::Display for CloseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CloseError::Invalid(problems) => write!(f, "invalid report: {}", problems.join("; ")),
+            CloseError::Node(error) => write!(f, "{error}"),
+            CloseError::Store(error) => write!(f, "{error}"),
+            CloseError::Db(error) => write!(f, "database error: {error}"),
+            CloseError::Io(error) => write!(f, "could not write the handoff: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CloseError {}
+
+impl From<NodeError> for CloseError {
+    fn from(error: NodeError) -> Self {
+        CloseError::Node(error)
+    }
+}
+
+impl From<StoreError> for CloseError {
+    fn from(error: StoreError) -> Self {
+        CloseError::Store(error)
+    }
+}
+
+impl From<sqlx::Error> for CloseError {
+    fn from(error: sqlx::Error) -> Self {
+        CloseError::Db(error)
+    }
+}
+
+impl From<std::io::Error> for CloseError {
+    fn from(error: std::io::Error) -> Self {
+        CloseError::Io(error)
+    }
+}
+
+/// The tree job a node belongs to, or `None` for a plain node or an unknown id.
+pub async fn tree_job_of(pool: &SqlitePool, node_id: &str) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(job_id,)| job_id))
+}
+
+/// The ids a contract defines, as `contract_ids` in `tree_state.py`: a heading (`#` to `######`)
+/// or the first cell of a table row whose first token is an id like `A3`, skipping fenced blocks.
+pub fn contract_ids(text: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            // Both marks toggle the same flag, as they do in the Python.
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if let Some(id) = heading_id(line).or_else(|| table_id(trimmed)) {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+
+/// A leading letter and digits, and what follows them.
+fn split_id(text: &str) -> Option<(&str, &str)> {
+    let mut chars = text.char_indices();
+    let (_, first) = chars.next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    let digits = text[1..].bytes().take_while(u8::is_ascii_digit).count();
+    (digits > 0).then(|| text.split_at(1 + digits))
+}
+
+fn is_mark(c: char) -> bool {
+    matches!(c, '*' | '`')
+}
+
+/// `^#{1,6}\s+[*`]*ID` with no word character after the id.
+fn heading_id(line: &str) -> Option<String> {
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = &line[hashes..];
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start().trim_start_matches(is_mark);
+    let (id, after) = split_id(rest)?;
+    if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(id.to_owned())
+}
+
+/// `^\s*\|\s*[*`]*ID[*`]*\s*\|`; the caller has trimmed the leading space.
+fn table_id(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix('|')?;
+    let rest = rest.trim_start().trim_start_matches(is_mark);
+    let (id, after) = split_id(rest)?;
+    let after = after.trim_start_matches(is_mark).trim_start();
+    after.starts_with('|').then(|| id.to_owned())
+}
+
+/// Closes a node of a tree job from the agent's report (R2).
+///
+/// Everything is checked before anything is written: the node must be open, must belong to a tree
+/// job and must not be a branch's top node whose branch is still at work; then the report (against
+/// the job's contract), the node it names and the checklist (R10) are validated, and every problem
+/// is returned together as `Invalid`. Only then does the daemon write the handoff from the parsed
+/// report, into `<state_dir>/nodes/<root>/<node>.md` (the node's own ids, never the report's),
+/// and close the node.
+///
+/// A top branch node stays refused until its branch is `merged` or `dropped` (a docs branch: `done`
+/// or `dropped`), whatever the report's status. That includes a `blocked` report: a blocked branch
+/// parks through the transition route, not by closing its node.
+pub async fn close_node(
+    pool: &SqlitePool,
+    state_dir: &Path,
+    node_id: &str,
+    limits: &NodeLimits,
+    report: &str,
+    checklist: Option<&str>,
+) -> Result<Node, CloseError> {
+    let node = work_nodes::get(pool, node_id).await?;
+    let Some(job_id) = tree_job_of(pool, node_id).await? else {
+        return Err(NodeError::Conflict(format!("node {node_id} is not a tree node")).into());
+    };
+    if let Some(closed_at) = &node.closed_at {
+        return Err(NodeError::Conflict(format!(
+            "node is already closed as {} at {closed_at}",
+            node.status
+        ))
+        .into());
+    }
+    let job = store::load(pool, &job_id)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(job_id.clone()))?;
+
+    if let Some(branch) = job
+        .manifest
+        .branches
+        .values()
+        .find(|branch| branch.node_id.as_deref() == Some(node_id))
+        && !branch_node_may_close(branch)
+    {
+        return Err(NodeError::Conflict(format!(
+            "node {node_id} is the top node of branch {}, which is {}; it closes only once the \
+             branch is merged or dropped",
+            branch.name, branch.state
+        ))
+        .into());
+    }
+
+    let parsed = parse_report(report);
+    let known = job.contract.as_deref().map(contract_ids);
+    let mut problems = report_problems(&parsed, REPORT_MAX_LINES, known.as_ref());
+    if !parsed.node_id.is_empty() && parsed.node_id != node.id {
+        problems.push(format!(
+            "Node ID is '{}' but this node is {}",
+            parsed.node_id, node.id
+        ));
+    }
+    if !parsed.root_id.is_empty() && parsed.root_id != node.root_id {
+        problems.push(format!(
+            "Root ID is '{}' but this node's root is {}",
+            parsed.root_id, node.root_id
+        ));
+    }
+    if let Some(text) = checklist
+        && let Err(reason) = may_close(text)
+    {
+        problems.push(reason);
+    }
+    if !problems.is_empty() {
+        return Err(CloseError::Invalid(problems));
+    }
+
+    let dir = state_dir.join("nodes").join(&node.root_id);
+    tokio::fs::create_dir_all(&dir).await?;
+    let file = dir.join(format!("{}.md", node.id));
+    tokio::fs::write(&file, render_handoff(&parsed)).await?;
+    let args = CloseArgs {
+        status: parsed.status.clone(),
+        summary: parsed.summary.clone(),
+        handoff_path: file.to_string_lossy().into_owned(),
+    };
+    Ok(work_nodes::close(pool, &node.id, limits, &args).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

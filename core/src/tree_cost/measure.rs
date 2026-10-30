@@ -3,6 +3,204 @@
 //! and the distribution of granted TTLs. The caller (E-REPORT) reads the rows and
 //! filters them to the main lane.
 
+use chrono::{DateTime, Utc};
+
+/// A bucket with fewer samples than this says nothing about the rate.
+pub const MIN_BUCKET_SAMPLES: u32 = 20;
+/// The miss rate at which a bucket counts as past the TTL.
+pub const JUMP_MISS_RATE: f64 = 0.5;
+
+/// A wait only counts for P(resume) above this floor: spec 6.1 looks at gaps over 5 min.
+const MIN_WAIT_S: i64 = 300;
+
+/// One `devtime_messages` row, already filtered to the main lane by the caller.
+#[derive(Debug, Clone)]
+pub struct Turn {
+    pub session_id: String,
+    pub first_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+    pub input_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+/// The gap between two turns of a session, in the spec's six ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapBucket {
+    Under5,
+    From5To10,
+    From10To30,
+    From30To55,
+    From55To65,
+    Over65,
+}
+
+impl GapBucket {
+    const ALL: [GapBucket; 6] = [
+        GapBucket::Under5,
+        GapBucket::From5To10,
+        GapBucket::From10To30,
+        GapBucket::From30To55,
+        GapBucket::From55To65,
+        GapBucket::Over65,
+    ];
+
+    /// The inclusive lower edge in seconds. `Under5` has none: it also takes the
+    /// negative gaps of overlapping turns. 3900 is why a real 1 h TTL reads as
+    /// 65 minutes: the jump shows in the bucket that starts there.
+    fn lower_edge_s(self) -> Option<i64> {
+        match self {
+            GapBucket::Under5 => None,
+            GapBucket::From5To10 => Some(300),
+            GapBucket::From10To30 => Some(600),
+            GapBucket::From30To55 => Some(1800),
+            GapBucket::From55To65 => Some(3300),
+            GapBucket::Over65 => Some(3900),
+        }
+    }
+
+    fn from_gap_s(gap_s: i64) -> GapBucket {
+        Self::ALL
+            .into_iter()
+            .rev()
+            .find(|bucket| bucket.lower_edge_s().is_some_and(|edge| gap_s >= edge))
+            .unwrap_or(GapBucket::Under5)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketCount {
+    pub bucket: GapBucket,
+    pub total: u32,
+    pub misses: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketRate {
+    pub bucket: GapBucket,
+    pub total: u32,
+    /// `None` only for an empty bucket: sampled with no misses is `Some(0.0)`.
+    pub rate: Option<f64>,
+}
+
+/// A wait the session was seen to make, and when it spoke again, if it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedWait {
+    pub expected_s: i64,
+    pub returned_after_s: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TtlDistribution {
+    pub one_hour: u32,
+    pub five_minutes: u32,
+    pub unknown: u32,
+}
+
+/// Whether `turn` rebuilt the cache instead of reading it, against the context of
+/// `prev`. Both halves compare doubled values, because integer division would lose
+/// the half of an odd context.
+pub fn is_miss(prev: &Turn, turn: &Turn) -> bool {
+    let context = prev.input_tokens + prev.cache_read_tokens + prev.cache_creation_tokens;
+    2 * turn.cache_read_tokens < context && 2 * turn.cache_creation_tokens >= context
+}
+
+/// Misses and totals per gap bucket: always all six, in enum order. Turns are ordered
+/// per session here, and a session's first turn has no gap, so it counts nowhere.
+pub fn gap_buckets(turns: &[Turn]) -> Vec<BucketCount> {
+    let mut sorted: Vec<&Turn> = turns.iter().collect();
+    sorted.sort_by(|a, b| (&a.session_id, a.first_at).cmp(&(&b.session_id, b.first_at)));
+
+    let mut counts: Vec<BucketCount> = GapBucket::ALL
+        .into_iter()
+        .map(|bucket| BucketCount {
+            bucket,
+            total: 0,
+            misses: 0,
+        })
+        .collect();
+
+    for pair in sorted.windows(2) {
+        let (prev, turn) = (pair[0], pair[1]);
+        if prev.session_id != turn.session_id {
+            continue;
+        }
+        let gap_s = (turn.first_at - prev.last_at).num_seconds();
+        // `counts` was built from `ALL`, so a bucket's discriminant is its index.
+        let count = &mut counts[GapBucket::from_gap_s(gap_s) as usize];
+        count.total += 1;
+        if is_miss(prev, turn) {
+            count.misses += 1;
+        }
+    }
+    counts
+}
+
+pub fn miss_rate_by_bucket(counts: &[BucketCount]) -> Vec<BucketRate> {
+    counts
+        .iter()
+        .map(|count| BucketRate {
+            bucket: count.bucket,
+            total: count.total,
+            rate: (count.total > 0).then(|| f64::from(count.misses) / f64::from(count.total)),
+        })
+        .collect()
+}
+
+/// The lower edge in seconds of the bucket where the miss rate jumps. A jump needs a
+/// sampled low bucket before it: a rate that is high from the start shows no TTL.
+pub fn effective_ttl(rates: &[BucketRate]) -> Option<i64> {
+    let mut saw_low = false;
+    for bucket_rate in rates {
+        let rate = match bucket_rate.rate {
+            Some(rate) if bucket_rate.total >= MIN_BUCKET_SAMPLES => rate,
+            _ => continue,
+        };
+        if rate >= JUMP_MISS_RATE {
+            return if saw_low {
+                bucket_rate.bucket.lower_edge_s()
+            } else {
+                None
+            };
+        }
+        saw_low = true;
+    }
+    None
+}
+
+/// The fraction of waits over 5 minutes where the session spoke again within twice
+/// the wait. `None` when no wait qualifies.
+pub fn p_resume(waits: &[ObservedWait]) -> Option<f64> {
+    let qualifying: Vec<&ObservedWait> = waits
+        .iter()
+        .filter(|wait| wait.expected_s > MIN_WAIT_S)
+        .collect();
+    if qualifying.is_empty() {
+        return None;
+    }
+    let returned = qualifying
+        .iter()
+        .filter(|wait| {
+            wait.returned_after_s
+                .is_some_and(|after_s| after_s <= 2 * wait.expected_s)
+        })
+        .count();
+    Some(returned as f64 / qualifying.len() as f64)
+}
+
+/// The granted TTLs by exact value: anything but `"1h"` and `"5m"` is unknown.
+pub fn ttl_distribution(ttls: &[Option<&str>]) -> TtlDistribution {
+    let mut distribution = TtlDistribution::default();
+    for ttl in ttls {
+        match *ttl {
+            Some("1h") => distribution.one_hour += 1,
+            Some("5m") => distribution.five_minutes += 1,
+            _ => distribution.unknown += 1,
+        }
+    }
+    distribution
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

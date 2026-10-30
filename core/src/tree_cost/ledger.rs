@@ -1,4 +1,131 @@
-//! stub: tree cost ledger
+//! What one tree of work nodes has cost so far: what its runs reported, what the runs that reported
+//! nothing are assumed to have cost, and what the judge cost on those runs (spec 5.1).
+//!
+//! The sums and tokens are the view `tree_run_costs`, and the price of an unmeasured run is
+//! `governance::budget::unmeasured_usd`: neither is restated here. Only the judge sum is local,
+//! because `judge_spend` has no per-tree scope. The token estimate spec 5.1 adds for top-level
+//! sessions (`devtime_messages`) is not part of this figure yet.
+
+use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
+
+use crate::governance::budget::{load_budget_config, parse_run_timestamp, unmeasured_usd};
+
+/// The cost of one tree. `total_usd` is `measured_usd + unmeasured_usd + judges_usd`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TreeCost {
+    pub runs: i64,
+    pub unmeasured_runs: i64,
+    pub measured_usd: f64,
+    pub unmeasured_usd: f64,
+    pub judges_usd: f64,
+    pub total_usd: f64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+/// The cost of the tree rooted at `root_id`. `now` closes the duration of a run still open. A root
+/// with no run has no row in the view, and costs nothing.
+pub async fn tree_cost(
+    pool: &SqlitePool,
+    root_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TreeCost> {
+    let row: Option<(i64, i64, f64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT runs, unmeasured_runs, measured_usd,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+         FROM tree_run_costs WHERE root_id = ?",
+    )
+    .bind(root_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((
+        runs,
+        unmeasured_runs,
+        measured_usd,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    )) = row
+    else {
+        return Ok(TreeCost::default());
+    };
+
+    let unmeasured = if unmeasured_runs == 0 {
+        0.0
+    } else {
+        price_unmeasured_runs(pool, root_id, now).await?
+    };
+    let judges_usd = judges_usd(pool, root_id).await?;
+
+    Ok(TreeCost {
+        runs,
+        unmeasured_runs,
+        measured_usd,
+        unmeasured_usd: unmeasured,
+        judges_usd,
+        total_usd: measured_usd + unmeasured + judges_usd,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    })
+}
+
+/// The tree's runs with no reported cost, each priced by the governance rule at the configured rate.
+async fn price_unmeasured_runs(
+    pool: &SqlitePool,
+    root_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<f64> {
+    let rate = load_budget_config(pool).await?.time_cost_per_hour_usd;
+    let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT r.created_at, r.completed_at, r.model_watch, r.model_requested_at
+         FROM work_nodes n
+         JOIN runs r ON r.id = CAST(n.run_id AS INTEGER)
+         WHERE n.root_id = ? AND r.cost_usd IS NULL",
+    )
+    .bind(root_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut total = 0.0;
+    for (created_at, completed, model_watch, model_requested_at) in rows {
+        let completed_at = completed.as_deref().map(parse_run_timestamp).transpose()?;
+        total += unmeasured_usd(
+            parse_run_timestamp(&created_at)?,
+            completed_at.unwrap_or(now),
+            model_watch.as_deref(),
+            model_requested_at.as_deref(),
+            completed_at.is_some(),
+            rate,
+        );
+    }
+    Ok(total)
+}
+
+/// What the judge cost on the tree's runs. Like `judge_spend`, every row counts, observation
+/// included, but over the whole life of the tree instead of a window. Each table is summed in its
+/// own subselect: joining them would count a resolution once per verdict on the same run.
+async fn judges_usd(pool: &SqlitePool, root_id: &str) -> sqlx::Result<f64> {
+    sqlx::query_scalar(
+        "SELECT
+           (SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_verdicts
+            WHERE run_id IN (SELECT r.id FROM work_nodes n
+                             JOIN runs r ON r.id = CAST(n.run_id AS INTEGER)
+                             WHERE n.root_id = ?1))
+         + (SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_resolutions
+            WHERE run_id IN (SELECT r.id FROM work_nodes n
+                             JOIN runs r ON r.id = CAST(n.run_id AS INTEGER)
+                             WHERE n.root_id = ?1))",
+    )
+    .bind(root_id)
+    .fetch_one(pool)
+    .await
+}
 
 #[cfg(test)]
 mod tests {

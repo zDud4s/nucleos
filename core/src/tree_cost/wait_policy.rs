@@ -1,4 +1,101 @@
-//! stub: wait policy decision
+//! What a session should do during a long wait: park, keep its prompt cache warm, or rotate.
+//!
+//! Pure decision only, with no I/O: the `wait_policy` table and the `cache_waits` log live
+//! elsewhere. [`decide_wait`] is the ordered rule of spec 6.3 with the keep-warm inequality of
+//! spec 6.2, not a price comparison between the three actions. The inequality's formula is
+//! normative; the examples beside it in 6.2 are orders of magnitude and disagree with it on `n`.
+
+/// One wait to decide on.
+#[derive(Debug, Clone)]
+pub struct WaitInput {
+    pub context_tokens: i64,
+    pub expected_wait_s: i64,
+    /// Effective cache TTL. Zero or less means no cache to keep, so the wait parks.
+    pub ttl_s: i64,
+    /// Falls back to [`WaitSettings::resume_probability`] when `None`.
+    pub resume_probability: Option<f64>,
+    /// Cache write price, as a multiple of the input price.
+    pub write_multiplier: f64,
+    /// False when an event can wake the work without a live session, which always parks.
+    pub needs_live_session: bool,
+}
+
+/// The tunable thresholds of the policy.
+#[derive(Debug, Clone)]
+pub struct WaitSettings {
+    pub rotate_context_tokens: i64,
+    /// Rotation needs a wait above this multiple of the TTL.
+    pub rotate_min_wait_over_ttl: f64,
+    pub keep_warm_enabled: bool,
+    pub resume_probability: f64,
+    /// Cache read price, as a multiple of the input price.
+    pub read_multiplier: f64,
+}
+
+impl Default for WaitSettings {
+    fn default() -> Self {
+        Self {
+            rotate_context_tokens: 60_000,
+            rotate_min_wait_over_ttl: 1.0,
+            keep_warm_enabled: false,
+            resume_probability: 0.5,
+            // The migration seed has no `read_multiplier` key, so this is the value in force
+            // whenever the settings are loaded from the `wait_policy` table.
+            read_multiplier: 0.1,
+        }
+    }
+}
+
+/// The outcome of [`decide_wait`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitAction {
+    /// End the live session; an event wakes the work later.
+    Park,
+    /// Ping before each TTL expiry so that resuming reads the cache instead of rewriting it.
+    KeepWarm,
+    /// Close with a handoff and resume from a small brief.
+    Rotate,
+}
+
+/// Decides one wait. The first matching rule wins, so Rotate beats a keep-warm that would pass.
+pub fn decide_wait(inp: &WaitInput, set: &WaitSettings) -> WaitAction {
+    if !inp.needs_live_session || inp.ttl_s <= 0 {
+        return WaitAction::Park;
+    }
+
+    let wait_outlasts_ttl =
+        inp.expected_wait_s as f64 > set.rotate_min_wait_over_ttl * inp.ttl_s as f64;
+    if inp.context_tokens > set.rotate_context_tokens && wait_outlasts_ttl {
+        return WaitAction::Rotate;
+    }
+
+    if !set.keep_warm_enabled {
+        return WaitAction::Park;
+    }
+
+    let pings = keep_warm_pings(inp.expected_wait_s, inp.ttl_s);
+    if pings <= 0 {
+        return WaitAction::Park;
+    }
+
+    let probability = inp.resume_probability.unwrap_or(set.resume_probability);
+    let read = set.read_multiplier;
+    if (pings as f64) * read < probability * (inp.write_multiplier - read) {
+        WaitAction::KeepWarm
+    } else {
+        WaitAction::Park
+    }
+}
+
+/// `n = ceil(W / (0.9 T)) - 1`, in integers as `ceil(10 W / 9 T) - 1` so that a wait that is an
+/// exact multiple of `0.9 T` picks up no float noise. `ttl_s` must be positive. Saturating, since
+/// an absurd wait must decide rather than overflow.
+fn keep_warm_pings(expected_wait_s: i64, ttl_s: i64) -> i64 {
+    let wait = expected_wait_s.saturating_mul(10);
+    let period = ttl_s.saturating_mul(9);
+    let round_up = i64::from(wait % period > 0);
+    wait / period + round_up - 1
+}
 
 #[cfg(test)]
 mod tests {

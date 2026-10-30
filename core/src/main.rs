@@ -134,6 +134,17 @@ async fn main() {
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
     startup::reconcile_after_restart(&pool).await;
+    // After the runs were reconciled and before the server or any loop can call `launch`: it clears
+    // the empty launch reservations of unfinished tree jobs. It relaunches nothing; that arrives later.
+    match tree_job::store::resume_all(&pool).await {
+        Ok(resumed) => tracing::info!(
+            jobs = resumed.jobs.len(),
+            failed_nodes = resumed.failed_nodes.len(),
+            cleared_launches = resumed.cleared_launches.len(),
+            "resumed tree jobs"
+        ),
+        Err(error) => tracing::error!(%error, "could not resume tree jobs; continuing startup"),
+    }
     startup::install_agents(&pool, is_primary).await;
 
     // Before anything can launch a Claude run, so the first run's credential is already watched.

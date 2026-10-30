@@ -1,5 +1,433 @@
 //! Spec backlog storage: reads and writes over `specs`, `spec_criteria`, `spec_deps` and
 //! `spec_questions`, and the owner's single list of decisions.
+//!
+//! A function that holds a transaction runs every query on it, never on the pool: the test pool has a
+//! single connection.
+
+use std::fmt;
+
+use chrono::{DateTime, Utc};
+use rand::RngExt;
+use sqlx::SqlitePool;
+
+use super::model::{
+    spec_id, Criterion, CriterionKind, CriterionStatus, Dep, DepSource, NewCriterion,
+    OwnerDecision, Question, Spec, SpecKind, SpecStatus,
+};
+
+#[derive(Debug)]
+pub enum StoreError {
+    NotFound(String),
+    /// A stored value outside its closed vocabulary.
+    Invalid(String),
+    Db(sqlx::Error),
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreError::NotFound(id) => write!(f, "{id} not found"),
+            StoreError::Invalid(what) => write!(f, "invalid stored value: {what}"),
+            StoreError::Db(error) => write!(f, "database error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(error: sqlx::Error) -> Self {
+        StoreError::Db(error)
+    }
+}
+
+fn now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+#[derive(sqlx::FromRow)]
+struct SpecRow {
+    id: String,
+    project_id: Option<String>,
+    path: String,
+    title: String,
+    content_sha: String,
+    kind: String,
+    status: String,
+    status_reason: Option<String>,
+    tree_id: Option<String>,
+    last_audited_sha: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl SpecRow {
+    fn into_spec(self) -> Result<Spec, StoreError> {
+        Ok(Spec {
+            kind: SpecKind::parse(&self.kind)
+                .ok_or_else(|| StoreError::Invalid(format!("spec kind {:?}", self.kind)))?,
+            status: SpecStatus::parse(&self.status)
+                .ok_or_else(|| StoreError::Invalid(format!("spec status {:?}", self.status)))?,
+            id: self.id,
+            project_id: self.project_id,
+            path: self.path,
+            title: self.title,
+            content_sha: self.content_sha,
+            status_reason: self.status_reason,
+            tree_id: self.tree_id,
+            last_audited_sha: self.last_audited_sha,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+const SELECT_SPEC: &str = "SELECT id, project_id, path, title, content_sha, kind, status, \
+     status_reason, tree_id, last_audited_sha, created_at, updated_at FROM specs WHERE id = ?";
+
+pub async fn get_spec(pool: &SqlitePool, id: &str) -> Result<Option<Spec>, StoreError> {
+    let row: Option<SpecRow> = sqlx::query_as(SELECT_SPEC)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(SpecRow::into_spec).transpose()
+}
+
+/// Registers a spec file or refreshes it. The id is derived from project and path, so a second call
+/// finds the same row (also for a NULL project, where the unique index sees every row as distinct).
+/// A changed `content_sha` sends the spec back to `discovered` and marks its criteria `stale`
+/// (their own `spec_sha` stays, naming the version they were extracted from); an unchanged one
+/// leaves status and criteria alone. `created_at`, `tree_id` and `last_audited_sha` are never touched.
+pub async fn upsert_by_path(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    path: &str,
+    title: &str,
+    content_sha: &str,
+) -> Result<Spec, StoreError> {
+    let id = spec_id(project_id, path);
+    let stamp = now();
+    let mut tx = pool.begin().await?;
+
+    let existing: Option<String> = sqlx::query_scalar("SELECT content_sha FROM specs WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    match existing {
+        None => {
+            sqlx::query(
+                "INSERT INTO specs (id, project_id, path, title, content_sha, kind, status, \
+                 created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'unknown', 'discovered', ?, ?)",
+            )
+            .bind(&id)
+            .bind(project_id)
+            .bind(path.replace('\\', "/"))
+            .bind(title)
+            .bind(content_sha)
+            .bind(&stamp)
+            .bind(&stamp)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Some(stored) if stored != content_sha => {
+            sqlx::query(
+                "UPDATE specs SET title = ?, content_sha = ?, status = 'discovered', \
+                 updated_at = ? WHERE id = ?",
+            )
+            .bind(title)
+            .bind(content_sha)
+            .bind(&stamp)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE spec_criteria SET status = 'stale' WHERE spec_id = ?")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        Some(_) => {
+            sqlx::query("UPDATE specs SET title = ?, updated_at = ? WHERE id = ?")
+                .bind(title)
+                .bind(&stamp)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    let row: SpecRow = sqlx::query_as(SELECT_SPEC)
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    row.into_spec()
+}
+
+#[derive(sqlx::FromRow)]
+struct CriterionRow {
+    id: i64,
+    spec_id: String,
+    ordinal: i64,
+    text: String,
+    kind: String,
+    verify_hint: Option<String>,
+    status: String,
+    evidence: Option<String>,
+    reviewer_run_id: Option<String>,
+    spec_sha: String,
+    checked_at: Option<String>,
+}
+
+impl CriterionRow {
+    fn into_criterion(self) -> Result<Criterion, StoreError> {
+        Ok(Criterion {
+            kind: CriterionKind::parse(&self.kind)
+                .ok_or_else(|| StoreError::Invalid(format!("criterion kind {:?}", self.kind)))?,
+            status: CriterionStatus::parse(&self.status).ok_or_else(|| {
+                StoreError::Invalid(format!("criterion status {:?}", self.status))
+            })?,
+            id: self.id,
+            spec_id: self.spec_id,
+            ordinal: self.ordinal,
+            text: self.text,
+            verify_hint: self.verify_hint,
+            evidence: self.evidence,
+            reviewer_run_id: self.reviewer_run_id,
+            spec_sha: self.spec_sha,
+            checked_at: self.checked_at,
+        })
+    }
+}
+
+/// Replaces all of a spec's criteria in one transaction, numbering from 1 and stamping each with
+/// `spec_sha`. A failure part-way leaves the previous criteria in place.
+pub async fn replace_criteria(
+    pool: &SqlitePool,
+    spec_id: &str,
+    spec_sha: &str,
+    items: &[NewCriterion],
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM spec_criteria WHERE spec_id = ?")
+        .bind(spec_id)
+        .execute(&mut *tx)
+        .await?;
+    for (index, item) in items.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO spec_criteria (spec_id, ordinal, text, kind, verify_hint, status, \
+             spec_sha) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(spec_id)
+        .bind(index as i64 + 1)
+        .bind(&item.text)
+        .bind(item.kind.as_str())
+        .bind(&item.verify_hint)
+        .bind(item.status.as_str())
+        .bind(spec_sha)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn list_criteria(pool: &SqlitePool, spec_id: &str) -> Result<Vec<Criterion>, StoreError> {
+    let rows: Vec<CriterionRow> = sqlx::query_as(
+        "SELECT id, spec_id, ordinal, text, kind, verify_hint, status, evidence, reviewer_run_id, \
+         spec_sha, checked_at FROM spec_criteria WHERE spec_id = ? ORDER BY ordinal",
+    )
+    .bind(spec_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(CriterionRow::into_criterion).collect()
+}
+
+/// Records that `spec_id` depends on `depends_on`. The pair is the key: a repeat, under either
+/// source, changes nothing.
+pub async fn add_dep(
+    pool: &SqlitePool,
+    spec_id: &str,
+    depends_on: &str,
+    source: DepSource,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO spec_deps (spec_id, depends_on, source) VALUES (?, ?, ?) \
+         ON CONFLICT (spec_id, depends_on) DO NOTHING",
+    )
+    .bind(spec_id)
+    .bind(depends_on)
+    .bind(source.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_deps(pool: &SqlitePool, spec_id: &str) -> Result<Vec<Dep>, StoreError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT spec_id, depends_on, source FROM spec_deps WHERE spec_id = ? ORDER BY depends_on",
+    )
+    .bind(spec_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(spec_id, depends_on, source)| {
+            Ok(Dep {
+                source: DepSource::parse(&source)
+                    .ok_or_else(|| StoreError::Invalid(format!("dep source {source:?}")))?,
+                spec_id,
+                depends_on,
+            })
+        })
+        .collect()
+}
+
+#[derive(sqlx::FromRow)]
+struct QuestionRow {
+    id: String,
+    spec_id: String,
+    question: String,
+    answer: Option<String>,
+    status: String,
+    created_at: String,
+    answered_at: Option<String>,
+}
+
+fn new_question_id() -> String {
+    let bytes = rand::rng().random::<[u8; 8]>();
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sq-{hex}")
+}
+
+/// Puts a question to the owner and returns its id. Asking the same text twice makes two questions.
+pub async fn add_question(
+    pool: &SqlitePool,
+    spec_id: &str,
+    question: &str,
+) -> Result<String, StoreError> {
+    let id = new_question_id();
+    sqlx::query(
+        "INSERT INTO spec_questions (id, spec_id, question, status, created_at) \
+         VALUES (?, ?, ?, 'open', ?)",
+    )
+    .bind(&id)
+    .bind(spec_id)
+    .bind(question)
+    .bind(now())
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn answer_question(
+    pool: &SqlitePool,
+    question_id: &str,
+    answer: &str,
+) -> Result<(), StoreError> {
+    let done = sqlx::query(
+        "UPDATE spec_questions SET answer = ?, status = 'answered', answered_at = ? WHERE id = ?",
+    )
+    .bind(answer)
+    .bind(now())
+    .bind(question_id)
+    .execute(pool)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(StoreError::NotFound(format!("question {question_id}")));
+    }
+    Ok(())
+}
+
+pub async fn list_questions(pool: &SqlitePool, spec_id: &str) -> Result<Vec<Question>, StoreError> {
+    let rows: Vec<QuestionRow> = sqlx::query_as(
+        "SELECT id, spec_id, question, answer, status, created_at, answered_at \
+         FROM spec_questions WHERE spec_id = ? ORDER BY created_at, id",
+    )
+    .bind(spec_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| Question {
+            id: row.id,
+            spec_id: row.spec_id,
+            question: row.question,
+            answer: row.answer,
+            status: row.status,
+            created_at: row.created_at,
+            answered_at: row.answered_at,
+        })
+        .collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct DecisionRow {
+    id: String,
+    tree_id: Option<String>,
+    question: String,
+    answer: Option<String>,
+    status: String,
+    at: String,
+}
+
+/// The owner's single list: every spec question and, when the tree-job `decisions` table exists,
+/// every tree decision, oldest first. The migration's view covers the questions; the union is here
+/// because that view cannot reference a table that may not exist.
+pub async fn list_owner_decisions(pool: &SqlitePool) -> Result<Vec<OwnerDecision>, StoreError> {
+    let questions: Vec<QuestionRow> = sqlx::query_as(
+        "SELECT id, subject AS spec_id, question, answer, status, created_at, answered_at \
+         FROM owner_decisions",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut rows: Vec<OwnerDecision> = questions
+        .into_iter()
+        .map(|row| OwnerDecision {
+            origin: "spec_question".to_owned(),
+            id: row.id,
+            subject: row.spec_id,
+            question: row.question,
+            answer: row.answer,
+            status: row.status,
+            created_at: row.created_at,
+            answered_at: row.answered_at,
+        })
+        .collect();
+
+    let has_decisions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'decisions'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_decisions > 0 {
+        let decisions: Vec<DecisionRow> = sqlx::query_as(
+            "SELECT id, tree_id, question, answer, status, at FROM decisions",
+        )
+        .fetch_all(pool)
+        .await?;
+        rows.extend(decisions.into_iter().map(|row| OwnerDecision {
+            origin: "tree_decision".to_owned(),
+            id: row.id,
+            subject: row.tree_id.unwrap_or_default(),
+            question: row.question,
+            answer: row.answer,
+            status: row.status,
+            created_at: row.at,
+            answered_at: None,
+        }));
+    }
+
+    // Parsed instants first, so differing fractional-second or offset spellings still order by time.
+    rows.sort_by_cached_key(|row| {
+        (
+            DateTime::parse_from_rfc3339(&row.created_at)
+                .ok()
+                .map(|at| at.with_timezone(&Utc)),
+            row.created_at.clone(),
+            row.id.clone(),
+        )
+    });
+    Ok(rows)
+}
 
 #[cfg(test)]
 mod tests {

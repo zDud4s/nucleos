@@ -4,6 +4,7 @@
 //! parks the run. Characters and flags are allow-lists rather than deny-lists, because a new
 //! metacharacter or a new cargo flag must park until somebody has looked at it.
 
+use crate::tree_job::model::Branch;
 use crate::work_nodes::{normalise_glob, path_contained};
 
 /// A command the daemon may run for this branch, already split into its program and arguments so
@@ -339,6 +340,156 @@ fn parse_flags<'a>(tool: &str, args: &[&'a str], flags: &Flags) -> Result<Parsed
         parsed.values.push((name, value));
     }
     Ok(parsed)
+}
+
+/// `scripts/heavy.py` exits with this when the machine is busy and the command did not run.
+const HEAVY_BUSY_EXIT: i32 = 75;
+/// Attempts per command while the broker answers busy. Far below any runaway, and the backoff
+/// below bounds the wait: a command still busy after this is reported with its 75.
+const MAX_BUSY_ATTEMPTS: u32 = 8;
+const BUSY_BACKOFF_STEP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One process for the daemon to start: no shell, so `args` are passed as they stand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: std::path::PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+/// What one command left behind. `exit_code` is `None` when it never started or was killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRun {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub output: String,
+}
+
+/// The result of a whole command list: all of it ran, or none of it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    Ran(Vec<CommandRun>),
+    Parked(Parked),
+}
+
+/// **Pure.** The process that runs `allowed` through the broker `heavy`, inside the branch's
+/// worktree. Cargo gets the branch's own `CARGO_TARGET_DIR` and parks without one, since sharing
+/// a target dir between branches is what the broker slots exist to avoid; `go` needs none. A
+/// branch with no worktree (a docs branch) cannot run anything.
+pub fn heavy_invocation(
+    allowed: &Allowed,
+    branch: &Branch,
+    heavy: &std::path::Path,
+) -> Result<Invocation, Parked> {
+    let command = allowed.argv.join(" ");
+    let park = |why: &str| Parked {
+        needs: format!("a decision on running {command:?}, because {why}"),
+    };
+    let Some(worktree) = branch.worktree.as_deref() else {
+        return Err(park("the branch has no worktree to run it in"));
+    };
+    let kind = match allowed.argv.first().map(String::as_str) {
+        Some("cargo") => "cargo",
+        Some("go") => "go",
+        _ => return Err(park("it is not a cargo or go command")),
+    };
+    let mut env = Vec::new();
+    if kind == "cargo" {
+        let Some(target_dir) = branch.target_dir.as_deref() else {
+            return Err(park("the branch has no target dir of its own for cargo"));
+        };
+        env.push(("CARGO_TARGET_DIR".to_owned(), target_dir.to_owned()));
+    }
+    let mut args = vec![
+        heavy.to_string_lossy().into_owned(),
+        "--agent".to_owned(),
+        branch.name.clone(),
+        "--kind".to_owned(),
+        kind.to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(allowed.argv.iter().cloned());
+    Ok(Invocation {
+        program: crate::governance::autopilot::HOOK_INTERPRETER.to_owned(),
+        args,
+        cwd: std::path::PathBuf::from(worktree),
+        env,
+    })
+}
+
+/// Validates every command, then runs them in order through `run`, so a bad command or a branch
+/// that cannot run one parks the list before anything starts. A mixed list with a command the
+/// branch cannot run (say `[go test, cargo test]` on a branch with a worktree and no target dir)
+/// therefore parks whole: `RunOutcome` carries no partial result. A non-zero exit is a result and
+/// later commands still run; exit 75 (broker busy) is retried under `MAX_BUSY_ATTEMPTS`; a
+/// command that never started (`exit_code: None`) is a result and is not retried.
+pub async fn run_for_leaf<F, Fut>(
+    commands: &[String],
+    branch: &Branch,
+    heavy: &std::path::Path,
+    mut run: F,
+) -> RunOutcome
+where
+    F: FnMut(Invocation) -> Fut,
+    Fut: std::future::Future<Output = CommandRun>,
+{
+    let mut invocations = Vec::with_capacity(commands.len());
+    for cmd in commands {
+        let planned = validate(cmd, &branch.paths)
+            .and_then(|allowed| heavy_invocation(&allowed, branch, heavy));
+        match planned {
+            Ok(invocation) => invocations.push(invocation),
+            Err(parked) => return RunOutcome::Parked(parked),
+        }
+    }
+    let mut runs = Vec::with_capacity(invocations.len());
+    for invocation in invocations {
+        let mut attempt = 1;
+        let result = loop {
+            let result = run(invocation.clone()).await;
+            if result.exit_code != Some(HEAVY_BUSY_EXIT) || attempt >= MAX_BUSY_ATTEMPTS {
+                break result;
+            }
+            tokio::time::sleep(BUSY_BACKOFF_STEP * attempt).await;
+            attempt += 1;
+        };
+        runs.push(result);
+    }
+    RunOutcome::Ran(runs)
+}
+
+/// Starts one invocation and waits for it, returning stdout then stderr as the output. A program
+/// that cannot start is a result with no exit code and the reason as its output.
+pub async fn spawn_heavy(invocation: Invocation) -> CommandRun {
+    let command = std::iter::once(invocation.program.as_str())
+        .chain(invocation.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let spawned = tokio::process::Command::new(&invocation.program)
+        .args(&invocation.args)
+        .current_dir(&invocation.cwd)
+        .envs(invocation.env.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match spawned {
+        Ok(out) => {
+            let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
+            output.push_str(&String::from_utf8_lossy(&out.stderr));
+            CommandRun {
+                command,
+                exit_code: out.status.code(),
+                output,
+            }
+        }
+        Err(err) => CommandRun {
+            command,
+            exit_code: None,
+            output: format!("could not start {:?}: {err}", invocation.program),
+        },
+    }
 }
 
 #[cfg(test)]

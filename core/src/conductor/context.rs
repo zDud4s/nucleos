@@ -1,4 +1,111 @@
-//! stub: context-fill limits and verdicts
+//! Context-fill limits per node kind and the verdict they give on a run's fill.
+//!
+//! Pure: nothing here reads a file or the database. `limits` holds the defaults and
+//! `limits_from_speed_yaml` overlays the `nodes:` mapping of a `speed.yaml` the caller has
+//! already read. The caller enforces the verdict.
+
+/// How full a node's context is, from least to most severe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fill {
+    Ok,
+    Warn,
+    Wrap,
+    Block,
+}
+
+/// Context-fill thresholds in tokens; each one is reached at exactly its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextLimits {
+    pub warn: i64,
+    pub wrap: i64,
+    pub block: i64,
+}
+
+/// The default of `nodes.ceiling` in `speed.yaml`.
+const DEFAULT_BLOCK: i64 = 200_000;
+
+/// Whether `kind` gets the orchestrator numbers. Everything else gets the leaf numbers, so an
+/// unknown kind takes the stricter ones.
+fn is_orchestrator(kind: &str) -> bool {
+    matches!(kind, "orchestrator" | "root")
+}
+
+/// The default limits for a node kind.
+pub fn limits(kind: &str) -> ContextLimits {
+    let (warn, wrap) = if is_orchestrator(kind) {
+        (100_000, 125_000)
+    } else {
+        (80_000, 100_000)
+    };
+    ContextLimits {
+        warn,
+        wrap,
+        block: DEFAULT_BLOCK,
+    }
+}
+
+/// The verdict for `fill` against the default limits of `kind`.
+pub fn verdict(kind: &str, fill: Option<i64>) -> Fill {
+    verdict_against(&limits(kind), fill)
+}
+
+/// The verdict for `fill` against explicit limits. An unknown fill is `Ok`.
+pub fn verdict_against(limits: &ContextLimits, fill: Option<i64>) -> Fill {
+    let Some(fill) = fill else {
+        return Fill::Ok;
+    };
+    if fill >= limits.block {
+        Fill::Block
+    } else if fill >= limits.wrap {
+        Fill::Wrap
+    } else if fill >= limits.warn {
+        Fill::Warn
+    } else {
+        Fill::Ok
+    }
+}
+
+/// The limits of `kind` with the `nodes:` mapping of a `speed.yaml` over the defaults. A missing
+/// or non-integer key keeps its default; empty, malformed or `nodes`-less text gives
+/// `limits(kind)`.
+pub fn limits_from_speed_yaml(text: &str, kind: &str) -> ContextLimits {
+    let defaults = limits(kind);
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return defaults;
+    };
+    let Some(nodes) = doc.get("nodes") else {
+        return defaults;
+    };
+    let (warn_key, wrap_key) = if is_orchestrator(kind) {
+        ("orchestrator_warn", "orchestrator_wrap")
+    } else {
+        ("leaf_warn", "leaf_wrap")
+    };
+    let read = |key: &str, default: i64| {
+        nodes
+            .get(key)
+            .and_then(serde_yaml::Value::as_i64)
+            .unwrap_or(default)
+    };
+    ContextLimits {
+        warn: read(warn_key, defaults.warn),
+        wrap: read(wrap_key, defaults.wrap),
+        block: read("ceiling", defaults.block),
+    }
+}
+
+/// Whether a tool may still run once a node is at `Wrap` or `Block`. Exact match on the name only:
+/// the handoff-path restriction on `Write` and the orchestrator-only restriction on `node_open`
+/// are added by D-PRETOOL, which has the arguments.
+pub fn allowed_when_wrapping(tool: &str) -> bool {
+    matches!(
+        tool,
+        "mcp__nucleos__node_update"
+            | "mcp__nucleos__node_close"
+            | "mcp__nucleos__node_open"
+            | "Write"
+    )
+}
 
 #[cfg(test)]
 mod tests {

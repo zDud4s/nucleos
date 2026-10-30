@@ -143,16 +143,32 @@ struct CloseBody {
     status: Option<String>,
     summary: Option<String>,
     handoff_path: Option<String>,
+    /// A tree node's report; read from `handoff_path` when absent.
+    report: Option<String>,
+    /// A tree node's checklist, validated with the report.
+    checklist: Option<String>,
 }
 
 /// `POST /nodes/{id}/close`: `{status, summary, handoff_path}`; 422 when the summary is too long
 /// or the handoff file does not exist.
+///
+/// A node of a tree job closes through `tree_job::close::close_node` instead, from `{report,
+/// checklist}` (the report falls back to the file at `handoff_path`); a 422 there carries every
+/// problem in `problems`.
 async fn post_close(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Result<Json<CloseBody>, JsonRejection>,
 ) -> Result<Json<work_nodes::Node>, Refusal> {
     let Json(body) = body.map_err(bad_body)?;
+    let tree_job = crate::tree_job::close::tree_job_of(&state.pool, &id)
+        .await
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if tree_job.is_some() {
+        let closed = close_tree_node(&state, &id, body).await?;
+        announce_close(&state.pool, &closed).await;
+        return Ok(Json(closed));
+    }
     let args = CloseArgs {
         status: required("status", body.status)?,
         summary: required("summary", body.summary)?,
@@ -165,6 +181,67 @@ async fn post_close(
         .map_err(refused)?;
     announce_close(&state.pool, &closed).await;
     Ok(Json(closed))
+}
+
+/// The tree-node half of `post_close`. The handoff lands in the node's project state directory
+/// (`<state_dir>/nodes/<root>/<id>.md`), so a node without a project cannot close this way.
+async fn close_tree_node(
+    state: &AppState,
+    id: &str,
+    body: CloseBody,
+) -> Result<work_nodes::Node, Refusal> {
+    let report = match (body.report, body.handoff_path) {
+        (Some(report), _) => report,
+        (None, Some(path)) => tokio::fs::read_to_string(&path).await.map_err(|error| {
+            refuse(
+                StatusCode::BAD_REQUEST,
+                format!("could not read the handoff file {path}: {error}"),
+            )
+        })?,
+        (None, None) => {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "report is required (or a readable handoff_path)",
+            ));
+        }
+    };
+    let node = work_nodes::get(&state.pool, id).await.map_err(refused)?;
+    let Some(project_id) = node.project_id.as_deref() else {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this tree node has no project, so there is no state directory for its handoff",
+        ));
+    };
+    let state_dir = project_state_dir(state, project_id)?;
+    let limits = limits_for(state, Some(project_id)).await;
+    crate::tree_job::close::close_node(
+        &state.pool,
+        &state_dir,
+        id,
+        &limits,
+        &report,
+        body.checklist.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        let status = error.status_code();
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::warn!(node = id, error = ?error, "tree node close failed");
+        }
+        let body = match error.problems() {
+            [] => json!({ "error": close_message(&error) }),
+            problems => json!({ "error": "the report is not acceptable", "problems": problems }),
+        };
+        (status, Json(body))
+    })
+}
+
+fn close_message(error: &crate::tree_job::close::CloseError) -> String {
+    use crate::tree_job::close::CloseError;
+    match error {
+        CloseError::Node(error) => error.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Leaves the feed line a close earns (`work_nodes::feed_line`), if any.

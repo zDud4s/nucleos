@@ -151,6 +151,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::route_index::routes())
         .merge(team::routes())
         .merge(themes::routes())
+        .merge(crate::tree_job::http::routes())
         .merge(workflows::routes())
         // While the daemon drains for an update, the routes that start work answer 503
         // (`shutdown.rs`). Added before the token check, so it runs inside it: only a caller that

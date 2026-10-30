@@ -13,7 +13,7 @@ use crate::tree_job::model::JOB_TERMINAL_STATE;
 use crate::tree_job::store::{self, StoreError, TreeJob};
 
 /// The transition name `launch` records its key under.
-const LAUNCH: &str = "launch";
+pub(super) const LAUNCH: &str = "launch";
 
 #[derive(Debug)]
 pub enum NodeRunError {
@@ -23,8 +23,9 @@ pub enum NodeRunError {
     /// No `work_nodes` row has this id.
     NodeNotFound(String),
     /// The key is reserved but holds no run id: another call is creating the run right now, or an
-    /// earlier call died (or `create_run_inner` failed) after reserving it. Nothing recovers such a
-    /// reservation; the caller sees this error and decides.
+    /// earlier call died (or `create_run_inner` failed) after reserving it. `launch` itself does not
+    /// recover such a reservation: `store::launch_recovering` clears a key whose reservation its own
+    /// failing call made, and `store::resume_all` clears the rest at boot.
     Unresolved { node_id: String, key: String },
 }
 
@@ -194,8 +195,9 @@ pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRun
 ///
 /// Known limit, deliberately not recovered here: a caller that finds the key reserved with an empty
 /// result gets `NodeRunError::Unresolved`, and that reservation stays after a crash between the
-/// reservation and the run id being stored, or after `create_run_inner` fails. The key is then
-/// spent: retrying with it keeps failing, so the caller must use a new key.
+/// reservation and the run id being stored, or after `create_run_inner` fails. This function alone
+/// leaves the key spent. `store::launch_recovering` clears a key whose reservation its own failing
+/// call made, and `store::resume_all` clears the remaining empty reservations at boot.
 pub async fn launch(
     state: &AppState,
     node_id: &str,

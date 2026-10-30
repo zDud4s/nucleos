@@ -4,6 +4,792 @@
 //! daemon. The async parts wrap them around the verify gate, the VCS queue and `land::submit`, and
 //! persist the job themselves. Merge and land are each two steps, submit and settle, because the
 //! queue runs the operation later and a daemon that restarts in between has to be able to resume.
+//!
+//! **Origins, since no production caller exists yet.** `origin` is a parameter of `submit_merge` and
+//! `land_job`; nothing here refuses by it. A branch merging into the tree's own base
+//! (`feature_branch`) should pass `Origin::Daemon`: the daemon drives it, and `Run`/`Job` rows would
+//! start `awaiting_approval` with nothing to move them. The landing of the whole tree into the
+//! integration branch should pass `Origin::Shell`, which is what the `--land` path
+//! (`POST /vcs/land`, `http/run_queue.rs`) uses; it goes through the task-claims gate, and
+//! `Origin::Daemon` must not be used to step past that gate.
+//!
+//! **Escalated merges and the conflict resolver.** A conflicting branch merge escalates in the
+//! queue, and `resolver::next_conflict` would mint an agent for any such row. A tree merge has its
+//! own owner (the branch stays `green` and resubmits), so `settle_merge` marks the row settled while
+//! no resolution has claimed it. The resolver can claim it first, on its tick between the
+//! escalation and the settle; then the settle reports `Pending` while that run is live, and follows
+//! a later identical success or a landed resolution as a merge. What stays open: a resolution that
+//! claimed the row and then ends without landing is reported as `NotMerged`, and one the resolver
+//! lands after that is seen only by a resubmit (which merges trivially).
+
+use std::collections::HashMap;
+use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use chrono::{SecondsFormat, Utc};
+use serde_json::{Map, Value, json};
+use sqlx::SqlitePool;
+
+use super::engine::apply_transition;
+use super::model::{Branch, JOB_TERMINAL_STATE, Manifest};
+use super::store::{self, StoreError, TreeJob};
+use crate::execution::vcs::{self, Op, Origin, ResolvedRepo};
+use crate::gate::GateOutcome;
+use crate::verify::exec::Executor;
+use crate::verify::{ScopeVerdict, gate_job_scope};
+
+/// The states of a finding (`FINDING_STATES` in `tree_state.py`).
+const FINDING_STATES: [&str; 4] = ["open", "fixed", "drop", "defer"];
+
+/// The branch states a gate may run from. `merged`, `parked`, `dropped`, `queued`, `open` and a
+/// docs branch's `done` have nothing to gate.
+const GATE_STATES: [&str; 6] = ["building", "gating", "fixing", "red", "green", "reviewing"];
+
+/// Request statuses that can still change, so a request in one of them is not a dead merge.
+const LIVE_REQUEST_STATUSES: [&str; 5] = [
+    "queued",
+    "running",
+    "awaiting_approval",
+    "awaiting_owner",
+    "awaiting_gate",
+];
+
+/// Longest tail of a failed gate's output kept in a gate entry.
+const LOG_TAIL_MAX: usize = 4000;
+
+#[derive(Debug)]
+pub enum LandingError {
+    /// The manifest has no branch of this name.
+    UnknownBranch(String),
+    /// The reviewer's findings are not a well-formed list.
+    InvalidFindings(String),
+    /// A rule says no (state, findings, base, nothing to settle); the message names the cause.
+    Refused(String),
+    /// `land::submit` refused the landing; the text is its own.
+    LandRefused(String),
+    /// The branch's uncommitted work could not be committed, so nothing was queued.
+    Checkpoint(String),
+    Store(StoreError),
+    Db(sqlx::Error),
+}
+
+impl fmt::Display for LandingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LandingError::UnknownBranch(name) => write!(f, "unknown branch {name}"),
+            LandingError::InvalidFindings(reason) => write!(f, "invalid findings: {reason}"),
+            LandingError::Refused(reason) => write!(f, "{reason}"),
+            LandingError::LandRefused(reason) => write!(f, "landing refused: {reason}"),
+            LandingError::Checkpoint(reason) => {
+                write!(f, "could not commit the branch's work: {reason}")
+            }
+            LandingError::Store(error) => write!(f, "{error}"),
+            LandingError::Db(error) => write!(f, "database error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LandingError {}
+
+impl From<StoreError> for LandingError {
+    fn from(error: StoreError) -> Self {
+        LandingError::Store(error)
+    }
+}
+
+impl From<sqlx::Error> for LandingError {
+    fn from(error: sqlx::Error) -> Self {
+        LandingError::Db(error)
+    }
+}
+
+fn now_iso() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false)
+}
+
+/// Stamps the job and writes it as it stands.
+async fn persist(pool: &SqlitePool, job: &mut TreeJob) -> Result<(), LandingError> {
+    job.updated_at = now_iso();
+    store::update(pool, job).await?;
+    Ok(())
+}
+
+fn branch_of<'a>(manifest: &'a Manifest, name: &str) -> Result<&'a Branch, LandingError> {
+    manifest
+        .branches
+        .get(name)
+        .ok_or_else(|| LandingError::UnknownBranch(name.to_owned()))
+}
+
+// ---- findings as data --------------------------------------------------------------------------
+
+/// `read_findings` (`tree.py`): a list of objects with a non-blank text `id` and a known `state`,
+/// no id twice. The list is taken whole, so one bad entry keeps all of them out.
+fn read_findings(findings: &Value) -> Result<Vec<Map<String, Value>>, LandingError> {
+    let invalid = |reason: String| LandingError::InvalidFindings(reason);
+    let list = findings
+        .as_array()
+        .ok_or_else(|| invalid("the findings must be a JSON list".to_owned()))?;
+    let mut seen: Vec<&str> = Vec::new();
+    let mut read = Vec::with_capacity(list.len());
+    for finding in list {
+        let object = finding
+            .as_object()
+            .ok_or_else(|| invalid("every finding needs an id".to_owned()))?;
+        let id = match object.get("id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => id,
+            _ => return Err(invalid("every finding needs an id".to_owned())),
+        };
+        let known = object
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| FINDING_STATES.contains(&state));
+        if !known {
+            return Err(invalid(format!(
+                "finding {id}: state must be one of {FINDING_STATES:?}"
+            )));
+        }
+        if seen.contains(&id) {
+            return Err(invalid(format!("duplicate finding id {id}")));
+        }
+        seen.push(id);
+        read.push(object.clone());
+    }
+    Ok(read)
+}
+
+/// Appends a review to `branch`. The new list is folded over the last review's findings, as
+/// `run_review` does (`tree.py:651-655`): a finding the reviewer does not mention stays as it was,
+/// and one that is mentioned takes the new values and keeps the keys it had. Without that, silence
+/// would close a finding. Nothing changes when the list is refused.
+pub fn record_findings(
+    manifest: &mut Manifest,
+    branch: &str,
+    findings: Value,
+) -> Result<(), LandingError> {
+    let holder = manifest
+        .branches
+        .get_mut(branch)
+        .ok_or_else(|| LandingError::UnknownBranch(branch.to_owned()))?;
+    let submitted = read_findings(&findings)?;
+
+    let mut merged: Vec<Map<String, Value>> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let before = holder
+        .reviews
+        .last()
+        .and_then(|review| review.get("findings"))
+        .and_then(Value::as_array);
+    for prior in before.into_iter().flatten() {
+        if let Some(object) = prior.as_object()
+            && let Some(id) = object.get("id").and_then(Value::as_str)
+        {
+            index.insert(id.to_owned(), merged.len());
+            merged.push(object.clone());
+        }
+    }
+    for finding in submitted {
+        let id = finding
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match index.get(&id) {
+            Some(&at) => merged[at].extend(finding),
+            None => {
+                index.insert(id, merged.len());
+                merged.push(finding);
+            }
+        }
+    }
+
+    let list: Vec<Value> = merged.into_iter().map(Value::Object).collect();
+    holder
+        .reviews
+        .push(json!({"at": now_iso(), "findings": list}));
+    Ok(())
+}
+
+/// The findings of the last review whose state is `open`. Only the last review counts, because it
+/// already carries every earlier finding forward.
+pub fn open_findings(branch: &Branch) -> Vec<Value> {
+    branch
+        .reviews
+        .last()
+        .and_then(|review| review.get("findings"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|finding| finding.get("state").and_then(Value::as_str) == Some("open"))
+        .cloned()
+        .collect()
+}
+
+// ---- the gate ----------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateResult {
+    Green,
+    Red,
+    /// Nothing was measured that could bless or fail the work; the branch stays where it was.
+    Undecided { reason: String },
+}
+
+fn tail(text: &str) -> String {
+    if text.len() <= LOG_TAIL_MAX {
+        return text.to_owned();
+    }
+    let mut start = text.len() - LOG_TAIL_MAX;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
+
+fn gate_refusal(branch: &Branch) -> Result<(), LandingError> {
+    if GATE_STATES.contains(&branch.state.as_str()) {
+        return Ok(());
+    }
+    Err(LandingError::Refused(format!(
+        "branch {} is {}: only a branch at work or under review is gated",
+        branch.name, branch.state
+    )))
+}
+
+/// Records a gate verdict on the branch: `Passed` moves it to `green`, `Failed` to `red`, and
+/// anything undecided leaves the state and says why. A repeated verdict is legal (`run_gate` has no
+/// source guard) and still appends its entry. `merged` is never reached from here.
+pub fn apply_gate_verdict(
+    branch: &mut Branch,
+    verdict: &ScopeVerdict,
+) -> Result<GateResult, LandingError> {
+    gate_refusal(branch)?;
+    let at = now_iso();
+    let (result, entry) = match verdict {
+        ScopeVerdict::Measured(GateOutcome::Passed) => (
+            GateResult::Green,
+            json!({"at": at, "verdict": "green", "exit": 0}),
+        ),
+        ScopeVerdict::Measured(GateOutcome::Failed { exit_code, output }) => (
+            GateResult::Red,
+            json!({"at": at, "verdict": "red", "exit": exit_code, "log_tail": tail(output)}),
+        ),
+        undecided => {
+            let reason = match undecided {
+                ScopeVerdict::Measured(GateOutcome::Errored { reason }) => reason.clone(),
+                ScopeVerdict::NothingRan => {
+                    "no test unit agrees with the branch's diff, so nothing was measured".to_owned()
+                }
+                _ => "the scope gate could not be submitted, so nothing was measured".to_owned(),
+            };
+            (
+                GateResult::Undecided {
+                    reason: reason.clone(),
+                },
+                json!({"at": at, "verdict": "undecided", "reason": reason}),
+            )
+        }
+    };
+    match result {
+        GateResult::Green => branch.state = "green".to_owned(),
+        GateResult::Red => branch.state = "red".to_owned(),
+        GateResult::Undecided { .. } => {}
+    }
+    branch.gates.push(entry);
+    Ok(result)
+}
+
+/// The number `gate_job_scope` takes for a tree job, whose id is text. It only labels the
+/// `verify_requests.caller` row as `job:{id}`, so it is derived from the text (FNV-1a) instead of
+/// read from a table: stable for the life of the job, and above `u32::MAX` so it does not read as
+/// a row of the `jobs` table.
+pub fn scope_caller_id(job_id: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in job_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    // 62 bits keep it positive; bit 40 keeps it above `u32::MAX`.
+    ((hash & 0x3fff_ffff_ffff_ffff) | (1 << 40)) as i64
+}
+
+/// Gates the branch's worktree with the verify `scope` gate, applies the verdict and persists the
+/// job. A branch that may not gate, or has no worktree, is refused before anything is submitted.
+pub async fn gate_branch(
+    executor: &Arc<Executor>,
+    job: &mut TreeJob,
+    branch: &str,
+    wait: Duration,
+) -> Result<GateResult, LandingError> {
+    let held = branch_of(&job.manifest, branch)?;
+    gate_refusal(held)?;
+    let worktree = held.worktree.clone().ok_or_else(|| {
+        LandingError::Refused(format!("branch {branch} has no worktree to gate"))
+    })?;
+
+    let verdict = gate_job_scope(
+        executor,
+        scope_caller_id(&job.id),
+        Path::new(&worktree),
+        wait,
+    )
+    .await;
+
+    let held = job
+        .manifest
+        .branches
+        .get_mut(branch)
+        .ok_or_else(|| LandingError::UnknownBranch(branch.to_owned()))?;
+    let result = apply_gate_verdict(held, &verdict)?;
+    persist(&executor.pool, job).await?;
+    Ok(result)
+}
+
+// ---- merge -------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeDecision {
+    /// Merge `source` into `target`.
+    Proceed { source: String, target: String },
+    /// Already merged; `sha` is the one stored then.
+    AlreadyMerged { sha: String },
+}
+
+/// PURE: whether `branch` may be queued for a merge into the tree's feature branch. A merged branch
+/// answers with its stored sha. Otherwise it has to be a green code branch with a git branch, no
+/// open finding, and a base (if any) that is merged already (`run_merge`, `tree.py:693`).
+pub fn check_may_merge(manifest: &Manifest, branch: &str) -> Result<MergeDecision, LandingError> {
+    let held = branch_of(manifest, branch)?;
+    if held.state == "merged" {
+        return match held.extra.get("merge_sha").and_then(Value::as_str) {
+            Some(sha) => Ok(MergeDecision::AlreadyMerged {
+                sha: sha.to_owned(),
+            }),
+            None => Err(LandingError::Refused(format!(
+                "branch {branch} is merged but records no merge sha"
+            ))),
+        };
+    }
+    if held.state != "green" {
+        return Err(LandingError::Refused(format!(
+            "branch {branch} is {}: only a green branch merges",
+            held.state
+        )));
+    }
+    if held.layer == "docs" {
+        return Err(LandingError::Refused(format!(
+            "branch {branch} is a docs branch: it closes on done and never merges"
+        )));
+    }
+    let Some(source) = held.git_branch.clone() else {
+        return Err(LandingError::Refused(format!(
+            "branch {branch} has no git branch to merge"
+        )));
+    };
+    if let Some(base) = &held.base
+        && manifest.branches.get(base).map(|b| b.state.as_str()) != Some("merged")
+    {
+        return Err(LandingError::Refused(format!(
+            "branch {branch} stands on {base}, which is not merged yet"
+        )));
+    }
+    let open = open_findings(held);
+    if !open.is_empty() {
+        let ids: Vec<&str> = open
+            .iter()
+            .filter_map(|finding| finding.get("id").and_then(Value::as_str))
+            .collect();
+        return Err(LandingError::Refused(format!(
+            "branch {branch} has open findings: {}",
+            ids.join(", ")
+        )));
+    }
+    Ok(MergeDecision::Proceed {
+        source,
+        target: manifest.feature_branch.clone(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeSubmission {
+    /// A merge request is in the queue (new, or the one already there).
+    Queued { request_id: i64 },
+    AlreadyMerged { sha: String },
+}
+
+fn stored_request_id(branch: &Branch, key: &str) -> Option<i64> {
+    branch.extra.get(key).and_then(Value::as_i64)
+}
+
+async fn request_is_live(pool: &SqlitePool, id: i64) -> Result<bool, LandingError> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM vcs_requests WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status.is_some_and(|status| LIVE_REQUEST_STATUSES.contains(&status.as_str())))
+}
+
+/// The id of a request still in the queue for exactly this operation, if any: what a daemon that
+/// died between the INSERT and the store write has left behind.
+async fn live_request_for(
+    pool: &SqlitePool,
+    project_id: &str,
+    op: &Op,
+) -> Result<Option<i64>, LandingError> {
+    let id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM vcs_requests
+          WHERE project_id = ? AND op = 'merge' AND args = ?
+            AND status IN ('queued','running','awaiting_approval','awaiting_owner','awaiting_gate')
+          ORDER BY id DESC LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(op.to_args())
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Queues the merge of a green branch into the feature branch and records the request on the
+/// branch. A merge already queued is answered with its own id and enqueues nothing; a dead one (the
+/// queue escalated or failed it) does not answer, so a conflicted branch can resubmit. The branch's
+/// worktree is checkpointed first: an implement node leaves its work uncommitted, and merging the
+/// bare branch would succeed with nothing in it. `origin`: see the module doc.
+pub async fn submit_merge(
+    pool: &SqlitePool,
+    repo: &ResolvedRepo,
+    job: &mut TreeJob,
+    branch: &str,
+    origin: Origin,
+) -> Result<MergeSubmission, LandingError> {
+    let (source, target) = match check_may_merge(&job.manifest, branch)? {
+        MergeDecision::AlreadyMerged { sha } => return Ok(MergeSubmission::AlreadyMerged { sha }),
+        MergeDecision::Proceed { source, target } => (source, target),
+    };
+    let held = branch_of(&job.manifest, branch)?;
+    if let Some(id) = stored_request_id(held, "merge_request_id")
+        && request_is_live(pool, id).await?
+    {
+        return Ok(MergeSubmission::Queued { request_id: id });
+    }
+
+    let op = Op::Merge {
+        source: vcs::Branch::new(&source).map_err(LandingError::Refused)?,
+        target: vcs::Branch::new(&target).map_err(LandingError::Refused)?,
+    };
+    let request_id = match live_request_for(pool, repo.project_id(), &op).await? {
+        Some(id) => id,
+        None => {
+            if let Some(worktree) = held.worktree.clone() {
+                crate::execution::worktree::checkpoint(Path::new(&worktree))
+                    .await
+                    .map_err(|error| LandingError::Checkpoint(error.to_string()))?;
+            }
+            vcs::submit(pool, repo, &op, origin).await?
+        }
+    };
+
+    let held = job
+        .manifest
+        .branches
+        .get_mut(branch)
+        .ok_or_else(|| LandingError::UnknownBranch(branch.to_owned()))?;
+    held.extra
+        .insert("merge_request_id".to_owned(), json!(request_id));
+    persist(pool, job).await?;
+    Ok(MergeSubmission::Queued { request_id })
+}
+
+/// How a queued request stands.
+enum RequestEnd {
+    Pending,
+    Succeeded(Option<String>),
+    Failed { reason: String, escalated: bool },
+}
+
+/// Reads request `id` (following `resolved_by` to a landed resolution, as `wait_for` does) for up to
+/// `wait`. `claim_conflict` is set for a tree branch merge: an escalated row that no resolution has
+/// claimed is marked settled so `resolver::next_conflict` never picks it up. See the module doc for
+/// the race with the resolver.
+async fn settle_request(
+    pool: &SqlitePool,
+    id: i64,
+    wait: Duration,
+    claim_conflict: bool,
+) -> Result<RequestEnd, LandingError> {
+    let ticket = vcs::wait_for(pool, id, wait).await?;
+    let reason = || {
+        ticket
+            .failure_reason
+            .clone()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| format!("the queue ended request {id} as {}", ticket.status))
+    };
+    match ticket.status.as_str() {
+        "succeeded" => Ok(RequestEnd::Succeeded(ticket.result_sha.clone())),
+        "escalated" => settle_escalated(pool, id, reason(), claim_conflict).await,
+        "failed" | "blocked" | "rejected" | "cancelled" | "interrupted" => Ok(RequestEnd::Failed {
+            reason: reason(),
+            escalated: false,
+        }),
+        _ => Ok(RequestEnd::Pending),
+    }
+}
+
+async fn settle_escalated(
+    pool: &SqlitePool,
+    id: i64,
+    reason: String,
+    claim_conflict: bool,
+) -> Result<RequestEnd, LandingError> {
+    let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT project_id, args, resolution_run_id FROM vcs_requests WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((project_id, args, resolution_run)) = row else {
+        return Ok(RequestEnd::Failed {
+            reason,
+            escalated: true,
+        });
+    };
+
+    // A later identical success (somebody merged it by hand) is a merge.
+    let later: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT result_sha FROM vcs_requests
+          WHERE project_id = ? AND args = ? AND status = 'succeeded' AND id > ?
+          ORDER BY id LIMIT 1",
+    )
+    .bind(&project_id)
+    .bind(&args)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(sha) = later {
+        return Ok(RequestEnd::Succeeded(sha));
+    }
+
+    match resolution_run {
+        Some(run) => {
+            let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(run)
+                .fetch_optional(pool)
+                .await?;
+            if matches!(status.as_deref(), Some("running" | "awaiting_approval")) {
+                tracing::info!(request_id = id, run, "a conflict resolution is still running");
+                return Ok(RequestEnd::Pending);
+            }
+        }
+        None if claim_conflict => {
+            // Guarded by `resolution_run_id IS NULL`, so a resolution that claimed the row first is
+            // never overwritten.
+            sqlx::query(
+                "UPDATE vcs_requests SET settled_at = ?, settled_reason = 'tree-merge'
+                  WHERE id = ? AND status = 'escalated' AND resolution_run_id IS NULL
+                    AND settled_at IS NULL",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
+        None => {}
+    }
+    Ok(RequestEnd::Failed {
+        reason,
+        escalated: true,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeSettlement {
+    Merged { sha: String },
+    /// The queue did not merge it. The branch stays `green` and may resubmit.
+    NotMerged { reason: String },
+    /// The queue has not finished (or a resolution is running); nothing changed.
+    Pending,
+}
+
+/// Reads the outcome of the branch's queued merge for up to `wait` and records it: a success moves
+/// the branch to `merged` with `merge_sha` and `merged_at`; a failure or conflict keeps it `green`
+/// and records `merge_failure`. Either way the request id is dropped so a new submit queues afresh.
+pub async fn settle_merge(
+    pool: &SqlitePool,
+    job: &mut TreeJob,
+    branch: &str,
+    wait: Duration,
+) -> Result<MergeSettlement, LandingError> {
+    let held = branch_of(&job.manifest, branch)?;
+    if held.state == "merged"
+        && let Some(sha) = held.extra.get("merge_sha").and_then(Value::as_str)
+    {
+        return Ok(MergeSettlement::Merged {
+            sha: sha.to_owned(),
+        });
+    }
+    let id = stored_request_id(held, "merge_request_id").ok_or_else(|| {
+        LandingError::Refused(format!("branch {branch} has no merge in the queue"))
+    })?;
+
+    let end = settle_request(pool, id, wait, true).await?;
+    let held = job
+        .manifest
+        .branches
+        .get_mut(branch)
+        .ok_or_else(|| LandingError::UnknownBranch(branch.to_owned()))?;
+    match end {
+        RequestEnd::Pending => Ok(MergeSettlement::Pending),
+        RequestEnd::Succeeded(sha) => {
+            let sha = sha.filter(|sha| !sha.trim().is_empty()).ok_or_else(|| {
+                LandingError::Refused(format!(
+                    "the queue merged branch {branch} but recorded no sha"
+                ))
+            })?;
+            apply_transition(held, "merged")
+                .map_err(|error| LandingError::Refused(error.to_string()))?;
+            held.extra.insert("merge_sha".to_owned(), json!(sha));
+            held.extra.insert("merged_at".to_owned(), json!(now_iso()));
+            held.extra.remove("merge_request_id");
+            held.extra.remove("merge_failure");
+            persist(pool, job).await?;
+            Ok(MergeSettlement::Merged { sha })
+        }
+        RequestEnd::Failed { reason, .. } => {
+            held.extra.insert("merge_failure".to_owned(), json!(reason));
+            held.extra.remove("merge_request_id");
+            persist(pool, job).await?;
+            Ok(MergeSettlement::NotMerged { reason })
+        }
+    }
+}
+
+// ---- land --------------------------------------------------------------------------------------
+
+/// PURE: whether the whole tree may land. Every branch has to be `merged`, `dropped`, or a docs
+/// branch that is `done`, and at least one has to be merged. A branch that is still at work, or
+/// parked, blocks the landing and is named.
+pub fn check_may_land(manifest: &Manifest) -> Result<(), LandingError> {
+    let mut merged = 0usize;
+    let mut blocking: Vec<String> = Vec::new();
+    for branch in manifest.branches.values() {
+        match branch.state.as_str() {
+            "merged" => merged += 1,
+            "dropped" => {}
+            "done" if branch.layer == "docs" => {}
+            state => blocking.push(format!("{} ({state})", branch.name)),
+        }
+    }
+    if !blocking.is_empty() {
+        return Err(LandingError::Refused(format!(
+            "the tree cannot land while these branches are not finished: {}",
+            blocking.join(", ")
+        )));
+    }
+    if merged == 0 {
+        return Err(LandingError::Refused(
+            "the tree cannot land: no branch has been merged".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Admits the landing of the feature branch into the project's integration branch through
+/// `land::submit` and records its id, which a second call answers without queuing again. Admission
+/// is not landing: the job stays live until `settle_land` sees the queue succeed. A refusal from
+/// `land::submit` is recorded as `land_refusal` and returned as `LandRefused`. `origin`: see the
+/// module doc (`Origin::Shell`, so the claims gate applies).
+pub async fn land_job(
+    pool: &SqlitePool,
+    repo: &ResolvedRepo,
+    job: &mut TreeJob,
+    deadline: Instant,
+    origin: Origin,
+) -> Result<i64, LandingError> {
+    if let Some(id) = job.manifest.extra.get("land_id").and_then(Value::as_i64) {
+        return Ok(id);
+    }
+    check_may_land(&job.manifest)?;
+
+    let admitted = crate::execution::land::submit(
+        pool,
+        repo,
+        Path::new(repo.root()),
+        &job.manifest.feature_branch,
+        None,
+        deadline,
+        origin,
+    )
+    .await;
+    match admitted {
+        Ok(id) => {
+            job.manifest.extra.insert("land_id".to_owned(), json!(id));
+            job.manifest.extra.remove("land_refusal");
+            persist(pool, job).await?;
+            Ok(id)
+        }
+        Err(refusal) => {
+            let reason = refusal.message().to_owned();
+            job.manifest
+                .extra
+                .insert("land_refusal".to_owned(), json!(reason));
+            persist(pool, job).await?;
+            Err(LandingError::LandRefused(reason))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LandSettlement {
+    /// The queue landed it; the job is `finished`.
+    Finished { sha: Option<String> },
+    /// The queue did not land it; the job stays live with `land_failure` recorded.
+    NotLanded { reason: String },
+    Pending,
+}
+
+/// Reads the outcome of the queued landing for up to `wait`. Only a success finishes the job. A
+/// failure is recorded as `land_failure` and drops the landing id so `land_job` can try again; a
+/// conflict keeps the id, because the conflict resolver owns that request and may still land it
+/// under a link `settle_land` follows.
+pub async fn settle_land(
+    pool: &SqlitePool,
+    job: &mut TreeJob,
+    wait: Duration,
+) -> Result<LandSettlement, LandingError> {
+    let id = job
+        .manifest
+        .extra
+        .get("land_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| LandingError::Refused("the job has no landing in the queue".to_owned()))?;
+
+    match settle_request(pool, id, wait, false).await? {
+        RequestEnd::Pending => Ok(LandSettlement::Pending),
+        RequestEnd::Succeeded(sha) => {
+            job.state = JOB_TERMINAL_STATE.to_owned();
+            job.manifest.state = JOB_TERMINAL_STATE.to_owned();
+            job.manifest.extra.remove("land_failure");
+            job.manifest.extra.remove("land_refusal");
+            if let Some(sha) = &sha {
+                job.manifest.extra.insert("land_sha".to_owned(), json!(sha));
+            }
+            persist(pool, job).await?;
+            Ok(LandSettlement::Finished { sha })
+        }
+        RequestEnd::Failed { reason, escalated } => {
+            job.manifest
+                .extra
+                .insert("land_failure".to_owned(), json!(reason));
+            if !escalated {
+                job.manifest.extra.remove("land_id");
+            }
+            persist(pool, job).await?;
+            Ok(LandSettlement::NotLanded { reason })
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

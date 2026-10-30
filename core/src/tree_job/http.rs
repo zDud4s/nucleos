@@ -3,6 +3,641 @@
 //! Every refusal is `{error}`, and a field sent as `null` reads as an absent one, the conventions
 //! of `http/nodes.rs`. A transition is idempotent per node, transition and key. A manifest is
 //! written whole, so every handler that changes one holds a lock on its job.
+//!
+//! **Who reaches them.** No route here is in any `auth.rs` table, so, as for `/nodes*`, only the
+//! control token and an Admin API key get in.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path as FsPath;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Duration;
+
+use axum::Json;
+use axum::Router;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::execution::admission::{AdmissionBook, default_capacity, installed};
+use crate::execution::runs::CreateRunError;
+use crate::state::AppState;
+use crate::tree_job::budget::{Admission, check_admission, layer_cost_gb};
+use crate::tree_job::docs_paths::is_allowed_docs_path;
+use crate::tree_job::engine::{apply_transition, overlapping_branch};
+use crate::tree_job::model::{BRANCH_STATES, Branch, JOB_TERMINAL_STATE, Manifest};
+use crate::tree_job::node_run::{self, NodeRunError};
+use crate::tree_job::store::{self, StoreError, TreeJob, launch_recovering};
+use crate::work_nodes::{self, NodeError, NodeLimits, OpenArgs};
+
+const DOCS_LAYER: &str = "docs";
+/// The states of a branch that hold a slot and grow on disk (`OPEN_STATES` in `tree_resources.py`).
+/// `queued` and `parked` are not among them.
+const LIVE_STATES: [&str; 7] = [
+    "open",
+    "building",
+    "gating",
+    "green",
+    "red",
+    "reviewing",
+    "fixing",
+];
+/// The defaults of `tree:` in `speed.yaml`, used when a project has no config.
+const DEFAULT_FLOOR_GB: f64 = 15.0;
+const DEFAULT_MAX_LIVE_BRANCHES: usize = 4;
+const BYTES_PER_GB: f64 = 1_073_741_824.0;
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/trees", post(post_tree))
+        .route("/trees/{id}", get(get_tree))
+        .route("/trees/{id}/branches", post(post_branch))
+        .route("/trees/{id}/nodes/{node}/transition", post(post_transition))
+}
+
+type Refusal = (StatusCode, Json<Value>);
+
+fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
+    (status, Json(json!({ "error": message.into() })))
+}
+
+fn bad_body(rejection: JsonRejection) -> Refusal {
+    refuse(StatusCode::BAD_REQUEST, rejection.body_text())
+}
+
+fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
+    value
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, format!("{field} is required")))
+}
+
+fn db_refusal(error: sqlx::Error) -> Refusal {
+    tracing::warn!(%error, "tree job storage failed");
+    refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("database error: {error}"))
+}
+
+fn store_refusal(error: StoreError) -> Refusal {
+    let status = match &error {
+        StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+        _ => {
+            tracing::warn!(%error, "tree job storage failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    refuse(status, error.to_string())
+}
+
+fn node_refusal(error: NodeError) -> Refusal {
+    refuse(error.status_code(), error.to_string())
+}
+
+fn run_refusal(error: NodeRunError) -> Refusal {
+    let status = match &error {
+        NodeRunError::NodeNotFound(_) => StatusCode::NOT_FOUND,
+        NodeRunError::Unresolved { .. } => StatusCode::CONFLICT,
+        NodeRunError::Create(CreateRunError::Invalid(_)) => StatusCode::UNPROCESSABLE_ENTITY,
+        NodeRunError::Create(CreateRunError::Busy | CreateRunError::NoRoomOnDisk(_)) => {
+            StatusCode::CONFLICT
+        }
+        _ => {
+            tracing::warn!(%error, "tree job node run failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    refuse(status, error.to_string())
+}
+
+/// One lock per job: a manifest is loaded and written whole, so two handlers that change the same
+/// job must not interleave.
+fn job_lock(id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(id.to_owned()).or_default().clone()
+}
+
+async fn load_job(state: &AppState, id: &str) -> Result<TreeJob, Refusal> {
+    store::load(&state.pool, id)
+        .await
+        .map_err(store_refusal)?
+        .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("tree job {id} not found")))
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+// ----- budget -----
+
+fn live_code_branches(manifest: &Manifest) -> impl Iterator<Item = &Branch> {
+    manifest
+        .branches
+        .values()
+        .filter(|branch| branch.layer != DOCS_LAYER && LIVE_STATES.contains(&branch.state.as_str()))
+}
+
+/// Decides whether a new branch of `layer` may start. Growth first: every live code branch will
+/// still grow to its layer's cost, so what it has yet to take is subtracted from the free disk
+/// (an absent size counts as 0). Then the cap on live branches, then [`check_admission`].
+pub fn branch_admission(
+    book: &AdmissionBook,
+    manifest: &Manifest,
+    layer: &str,
+    free_disk_gb: f64,
+    floor_gb: f64,
+    max_live_branches: usize,
+    live_sizes_gb: &BTreeMap<String, f64>,
+) -> Admission {
+    if layer == DOCS_LAYER {
+        return check_admission(book, manifest, layer, free_disk_gb, floor_gb);
+    }
+    let growth_gb: f64 = live_code_branches(manifest)
+        .map(|branch| {
+            let size = live_sizes_gb.get(&branch.name).copied().unwrap_or(0.0);
+            (layer_cost_gb(manifest, &branch.layer) - size).max(0.0)
+        })
+        .sum();
+    let live = live_code_branches(manifest).count();
+    let mut reasons = Vec::new();
+    if live >= max_live_branches {
+        reasons.push(format!(
+            "max_live_branches: {live} branches are live, the limit is {max_live_branches}"
+        ));
+    }
+    let checked = check_admission(book, manifest, layer, free_disk_gb - growth_gb, floor_gb);
+    reasons.extend(checked.reasons);
+    if !reasons.is_empty() && growth_gb > 0.0 {
+        reasons.push(format!(
+            "{growth_gb:.1} GB is still to grow on the live branches and was counted against the disk"
+        ));
+    }
+    Admission {
+        admit: reasons.is_empty(),
+        cost_gb: checked.cost_gb,
+        reasons,
+    }
+}
+
+/// The first branch, by name, outside the new branch's base chain that still holds paths
+/// overlapping `paths`. The chain is the base, its base, and so on, and is cut where a name repeats
+/// or names no branch. It is filtered out before the search, since `overlapping_branch` answers
+/// only the first overlap by name and that one may belong to the chain.
+pub fn overlap_outside_base_chain(
+    manifest: &Manifest,
+    paths: &[String],
+    base: Option<&str>,
+) -> Option<String> {
+    let mut chain = BTreeSet::new();
+    let mut next = base;
+    while let Some(name) = next {
+        let Some(branch) = manifest.branches.get(name) else {
+            break;
+        };
+        if !chain.insert(name) {
+            break;
+        }
+        next = branch.base.as_deref();
+    }
+    let mut rest = manifest.clone();
+    rest.branches.retain(|name, _| !chain.contains(name.as_str()));
+    overlapping_branch(&rest, paths)
+}
+
+/// `tree.floor_gb` and `tree.max_live_branches` of the project's `speed.yaml`, else the defaults.
+fn tree_limits(project_root: &str) -> (f64, usize) {
+    let doc = std::fs::read_to_string(
+        FsPath::new(project_root).join(".nucleos/workflow/speed.yaml"),
+    )
+    .ok()
+    .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok());
+    let tree = doc.as_ref().and_then(|doc| doc.get("tree"));
+    let floor = tree
+        .and_then(|tree| tree.get("floor_gb"))
+        .and_then(serde_yaml::Value::as_f64)
+        .unwrap_or(DEFAULT_FLOOR_GB);
+    let cap = tree
+        .and_then(|tree| tree.get("max_live_branches"))
+        .and_then(serde_yaml::Value::as_u64)
+        .and_then(|cap| usize::try_from(cap).ok())
+        .unwrap_or(DEFAULT_MAX_LIVE_BRANCHES);
+    (floor, cap)
+}
+
+fn dir_size_bytes(root: &FsPath) -> u64 {
+    let mut total = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                total += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+/// The measured size in GB of each live code branch's target directory. A branch with none, or one
+/// that cannot be read, has no entry and counts as 0.
+async fn live_sizes_gb(manifest: &Manifest) -> BTreeMap<String, f64> {
+    let targets: Vec<(String, String)> = live_code_branches(manifest)
+        .filter_map(|branch| Some((branch.name.clone(), branch.target_dir.clone()?)))
+        .collect();
+    if targets.is_empty() {
+        return BTreeMap::new();
+    }
+    tokio::task::spawn_blocking(move || {
+        targets
+            .into_iter()
+            .map(|(name, dir)| (name, dir_size_bytes(FsPath::new(&dir)) as f64 / BYTES_PER_GB))
+            .collect::<BTreeMap<String, f64>>()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn admission_book() -> Arc<AdmissionBook> {
+    installed().unwrap_or_else(|| {
+        Arc::new(AdmissionBook::new(
+            default_capacity(),
+            Duration::from_secs(900),
+            Duration::from_secs(7200),
+        ))
+    })
+}
+
+// ----- POST /trees, GET /trees/{id} -----
+
+#[derive(Debug, Deserialize)]
+struct TreeBody {
+    id: Option<String>,
+    goal: Option<String>,
+    feature_branch: Option<String>,
+    project_root: Option<String>,
+    project_id: Option<String>,
+    contract: Option<String>,
+    dirty_owner_files: Option<Vec<String>>,
+}
+
+fn summary(job: &TreeJob, replayed: bool) -> Value {
+    json!({
+        "id": job.id,
+        "root_node_id": job.root_node_id,
+        "state": job.state,
+        "replayed": replayed,
+    })
+}
+
+/// The first non-blank line of the goal, cut short, as the root node's title.
+fn title_of(goal: &str) -> String {
+    let line = goal
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Tree job");
+    line.chars().take(80).collect()
+}
+
+/// `POST /trees`: opens a root node, stores the job and links the two. A repeated id answers with
+/// the stored job and opens nothing.
+async fn post_tree(
+    State(state): State<AppState>,
+    body: Result<Json<TreeBody>, JsonRejection>,
+) -> Result<Json<Value>, Refusal> {
+    let Json(body) = body.map_err(bad_body)?;
+    let id = required("id", body.id)?;
+    let goal = required("goal", body.goal)?;
+    let feature_branch = required("feature_branch", body.feature_branch)?;
+    let project_root = required("project_root", body.project_root)?;
+
+    let lock = job_lock(&id);
+    let _guard = lock.lock().await;
+    if let Some(job) = store::load(&state.pool, &id).await.map_err(store_refusal)? {
+        return Ok(Json(summary(&job, true)));
+    }
+
+    let opened = work_nodes::open(
+        &state.pool,
+        body.project_id.as_deref(),
+        &NodeLimits::default(),
+        &OpenArgs {
+            kind: "root".to_owned(),
+            title: title_of(&goal),
+            goal: goal.clone(),
+            ..OpenArgs::default()
+        },
+    )
+    .await
+    .map_err(node_refusal)?;
+    let dirty = body.dirty_owner_files.unwrap_or_default();
+    let created = now();
+    let job = TreeJob {
+        id: id.clone(),
+        root_node_id: opened.id.clone(),
+        project_id: body.project_id,
+        feature_branch: Some(feature_branch.clone()),
+        manifest: Manifest::new(&id, &feature_branch, &goal, &project_root, &dirty),
+        goal,
+        state: "open".to_owned(),
+        contract: body.contract,
+        created_at: created.clone(),
+        updated_at: created,
+    };
+    store::save(&state.pool, &job).await.map_err(store_refusal)?;
+    sqlx::query("UPDATE work_nodes SET tree_job_id = ? WHERE id = ?")
+        .bind(&id)
+        .bind(&opened.id)
+        .execute(&state.pool)
+        .await
+        .map_err(db_refusal)?;
+    Ok(Json(summary(&job, false)))
+}
+
+/// `GET /trees/{id}`: the job with its manifest.
+async fn get_tree(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Refusal> {
+    let job = load_job(&state, &id).await?;
+    let manifest = serde_json::to_value(&job.manifest)
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(json!({
+        "id": job.id,
+        "root_node_id": job.root_node_id,
+        "project_id": job.project_id,
+        "feature_branch": job.feature_branch,
+        "goal": job.goal,
+        "state": job.state,
+        "contract": job.contract,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "manifest": manifest,
+    })))
+}
+
+// ----- POST /trees/{id}/branches -----
+
+#[derive(Debug, Deserialize)]
+struct BranchBody {
+    name: Option<String>,
+    paths: Option<Vec<String>>,
+    layer: Option<String>,
+    base: Option<String>,
+}
+
+/// `POST /trees/{id}/branches`: adds a `queued` branch. Checked in this order: replay, finished
+/// job, base, docs paths, overlap outside the base chain, admission. Nothing is stored on a refusal.
+async fn post_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<BranchBody>, JsonRejection>,
+) -> Result<Json<Value>, Refusal> {
+    let Json(body) = body.map_err(bad_body)?;
+    let name = required("name", body.name)?;
+    let paths = body
+        .paths
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "paths is required"))?;
+    let layer = required("layer", body.layer)?;
+    let base = body.base.filter(|base| !base.trim().is_empty());
+
+    let lock = job_lock(&id);
+    let _guard = lock.lock().await;
+    let mut job = load_job(&state, &id).await?;
+
+    if let Some(existing) = job.manifest.branches.get(&name) {
+        if existing.paths == paths && existing.layer == layer && existing.base == base {
+            return Ok(Json(json!({
+                "name": name, "state": existing.state, "layer": layer, "base": base,
+                "replayed": true,
+            })));
+        }
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("branch {name} already exists with other paths, layer or base"),
+        ));
+    }
+    if job.state == JOB_TERMINAL_STATE {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("tree job {id} is finished and takes no new branch"),
+        ));
+    }
+    if let Some(base) = base.as_deref()
+        && !job.manifest.branches.contains_key(base)
+    {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("base branch {base} is not in this tree"),
+        ));
+    }
+    if layer == DOCS_LAYER
+        && let Some(path) = paths.iter().find(|path| !is_allowed_docs_path(path))
+    {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{path} is not a path a docs branch may write"),
+        ));
+    }
+    if let Some(other) = overlap_outside_base_chain(&job.manifest, &paths, base.as_deref()) {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("paths overlap branch {other}"),
+        ));
+    }
+
+    let (floor_gb, max_live) = tree_limits(&job.manifest.project_root);
+    let free_disk_gb = if layer == DOCS_LAYER {
+        0.0
+    } else {
+        crate::health::available_space(FsPath::new(&job.manifest.project_root))
+            .map_err(|error| {
+                refuse(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not read the free disk space: {error}"),
+                )
+            })? as f64
+            / BYTES_PER_GB
+    };
+    let sizes = live_sizes_gb(&job.manifest).await;
+    let admission = branch_admission(
+        &admission_book(),
+        &job.manifest,
+        &layer,
+        free_disk_gb,
+        floor_gb,
+        max_live,
+        &sizes,
+    );
+    if !admission.admit {
+        let error = format!("branch not admitted: {}", admission.reasons.join("; "));
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error, "reasons": admission.reasons })),
+        ));
+    }
+
+    let branch = Branch::new(&name, &paths, &layer, base.as_deref());
+    let queued = branch.state.clone();
+    job.manifest.branches.insert(name.clone(), branch);
+    job.updated_at = now();
+    store::update(&state.pool, &job).await.map_err(store_refusal)?;
+    Ok(Json(json!({
+        "name": name, "state": queued, "layer": layer, "base": base,
+        "cost_gb": admission.cost_gb, "replayed": false,
+    })))
+}
+
+// ----- POST /trees/{id}/nodes/{n}/transition -----
+
+#[derive(Debug, Deserialize)]
+struct TransitionBody {
+    transition: Option<String>,
+    key: Option<String>,
+    prompt: Option<String>,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: Option<String>,
+    reason: Option<String>,
+}
+
+/// The result `tree_transitions` holds for the key, if the row exists and holds one.
+async fn stored_result(
+    state: &AppState,
+    node: &str,
+    transition: &str,
+    key: &str,
+) -> Result<Option<String>, Refusal> {
+    let stored: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(node)
+    .bind(transition)
+    .bind(key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db_refusal)?;
+    Ok(stored.flatten().filter(|result| !result.is_empty()))
+}
+
+/// `POST /trees/{id}/nodes/{n}/transition`: either `launch`, which starts the agent run behind the
+/// node, or a branch state, which moves the branch that node tops. Both are idempotent per node,
+/// transition and key. A blocked branch parks through here, since closing a top branch node is
+/// refused until its branch is merged or dropped.
+async fn post_transition(
+    State(state): State<AppState>,
+    Path((id, node)): Path<(String, String)>,
+    body: Result<Json<TransitionBody>, JsonRejection>,
+) -> Result<Json<Value>, Refusal> {
+    let Json(body) = body.map_err(bad_body)?;
+    let transition = required("transition", body.transition.clone())?;
+    let key = required("key", body.key.clone())?;
+
+    let linked: Option<Option<String>> =
+        sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+            .bind(&node)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(db_refusal)?;
+    if linked.flatten().as_deref() != Some(id.as_str()) {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!("node {node} is not a node of tree job {id}"),
+        ));
+    }
+
+    if transition == "launch" {
+        return launch(&state, &id, &node, &key, body).await;
+    }
+    if !BRANCH_STATES.contains(&transition.as_str()) && transition != "done" {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{transition} is not a known transition"),
+        ));
+    }
+
+    let lock = job_lock(&id);
+    let _guard = lock.lock().await;
+    let mut job = load_job(&state, &id).await?;
+    let Some(name) = job
+        .manifest
+        .branches
+        .values()
+        .find(|branch| branch.node_id.as_deref() == Some(node.as_str()))
+        .map(|branch| branch.name.clone())
+    else {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!("node {node} tops no branch of tree job {id}"),
+        ));
+    };
+    if let Some(result) = stored_result(&state, &node, &transition, &key).await? {
+        return Ok(Json(json!({ "result": result, "replayed": true })));
+    }
+
+    let Some(branch) = job.manifest.branches.get_mut(&name) else {
+        return Err(refuse(StatusCode::NOT_FOUND, format!("branch {name} not found")));
+    };
+    let from = branch.state.clone();
+    apply_transition(branch, &transition)
+        .map_err(|error| refuse(StatusCode::CONFLICT, error.to_string()))?;
+    if transition == "parked" {
+        let mut park = json!({ "prev_state": from });
+        if let Some(reason) = body.reason.as_deref().filter(|reason| !reason.trim().is_empty()) {
+            park["reason"] = json!(reason);
+        }
+        branch.park = Some(park);
+    } else if from == "parked" && transition != "dropped" {
+        branch.park = None;
+    }
+    // The branch is written before the key is claimed: a crash between the two leaves the key
+    // unspent, and a retry is refused as illegal instead of answering a move that never happened.
+    job.updated_at = now();
+    store::update(&state.pool, &job).await.map_err(store_refusal)?;
+    let applied = node_run::apply(&state.pool, &node, &transition, &key, &transition)
+        .await
+        .map_err(run_refusal)?;
+    Ok(Json(json!({ "result": applied.result, "replayed": applied.replayed })))
+}
+
+/// The `launch` transition. No job lock: it changes no manifest, and the key alone makes it once.
+async fn launch(
+    state: &AppState,
+    id: &str,
+    node: &str,
+    key: &str,
+    body: TransitionBody,
+) -> Result<Json<Value>, Refusal> {
+    let prompt = body
+        .prompt
+        .filter(|prompt| !prompt.trim().is_empty())
+        .ok_or_else(|| refuse(StatusCode::UNPROCESSABLE_ENTITY, "prompt is required to launch"))?;
+    let project_id = match body.project_id {
+        Some(project_id) => Some(project_id),
+        None => store::load(&state.pool, id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|job| job.project_id),
+    };
+    let mode = body.mode.unwrap_or_else(|| "shadow".to_owned());
+    let replayed = stored_result(state, node, "launch", key).await?.is_some();
+    let run_id = launch_recovering(state, node, key, prompt, project_id, body.cwd, &mode)
+        .await
+        .map_err(run_refusal)?;
+    Ok(Json(json!({ "result": run_id.to_string(), "replayed": replayed })))
+}
 
 #[cfg(test)]
 mod tests {

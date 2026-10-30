@@ -1,4 +1,146 @@
-//! stub: tree budgets
+//! A tree's spending budget (spec 5.2): whether its next node may open, and the one feed line that
+//! says it crossed the soft threshold.
+//!
+//! Nothing here changes a node or a run: a node in flight is never killed. The limit only stops the
+//! next node from opening.
+
+use chrono::{DateTime, Utc};
+use sqlx::SqlitePool;
+
+use super::ledger::tree_cost;
+use crate::governance::budget::load_budget_config;
+
+/// The default of `tree_budgets.soft_pct`, for a tree with no row in that table.
+const DEFAULT_SOFT_PCT: f64 = 80.0;
+
+/// Whether the next node of a tree may open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Permit {
+    Yes,
+    No { reason: String },
+}
+
+/// A tree's spend against its budget. With no limit, nothing can be crossed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spend {
+    pub total_usd: f64,
+    pub limit_usd: Option<f64>,
+    pub soft_pct: f64,
+    pub soft_crossed: bool,
+    pub hard_crossed: bool,
+}
+
+/// The tree's `tree_budgets` row as `(limit_usd, soft_pct)`, if it has one.
+async fn load_tree_budget(
+    pool: &SqlitePool,
+    root_id: &str,
+) -> sqlx::Result<Option<(Option<f64>, f64)>> {
+    sqlx::query_as("SELECT limit_usd, soft_pct FROM tree_budgets WHERE tree_id = ?")
+        .bind(root_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// What the tree has spent, against its limit and soft threshold.
+pub async fn tree_spend(
+    pool: &SqlitePool,
+    root_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Spend> {
+    let total_usd = tree_cost(pool, root_id, now).await?.total_usd;
+    let (limit_usd, soft_pct) = load_tree_budget(pool, root_id)
+        .await?
+        .unwrap_or((None, DEFAULT_SOFT_PCT));
+    let (soft_crossed, hard_crossed) = match limit_usd {
+        Some(limit) => (total_usd >= limit * soft_pct / 100.0, total_usd >= limit),
+        None => (false, false),
+    };
+    Ok(Spend {
+        total_usd,
+        limit_usd,
+        soft_pct,
+        soft_crossed,
+        hard_crossed,
+    })
+}
+
+/// Reads the limit first, so a tree with no ceiling is permitted without pricing anything: only a
+/// tree that has a limit can be refused over what it spent.
+async fn evaluate_next_node(
+    pool: &SqlitePool,
+    root_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Permit> {
+    let Some((Some(limit), _)) = load_tree_budget(pool, root_id).await? else {
+        return Ok(Permit::Yes);
+    };
+
+    let spent = tree_cost(pool, root_id, now).await?.total_usd;
+    if spent >= limit {
+        return Ok(Permit::No {
+            reason: format!("tree budget reached: spent ${spent:.2} of the ${limit:.2} limit"),
+        });
+    }
+    // The same strict rule as the global ceiling in `governance::budget::evaluate_budget`.
+    let reserve = load_budget_config(pool).await?.per_run_reserve_usd;
+    if spent + reserve > limit {
+        return Ok(Permit::No {
+            reason: format!(
+                "tree budget: spent ${spent:.2} + ${reserve:.2} reserve would exceed the ${limit:.2} limit"
+            ),
+        });
+    }
+    Ok(Permit::Yes)
+}
+
+/// Whether the tree's budget permits opening its next node. Fails closed on any database error, as
+/// `governance::budget::budget_permits_new_run` does.
+pub async fn permits_next_node(pool: &SqlitePool, root_id: &str) -> Permit {
+    match evaluate_next_node(pool, root_id, Utc::now()).await {
+        Ok(permit) => permit,
+        Err(error) => Permit::No {
+            reason: format!("tree budget check failed, refusing to be safe: {error}"),
+        },
+    }
+}
+
+/// Writes the tree's `tree_budget_soft` feed line the first time its soft threshold is found
+/// crossed, and says whether this call wrote it. One statement, so two concurrent callers cannot
+/// both write it. The guard compares the whole subject, so `tree-1` and `tree-10` stay apart.
+pub async fn report_soft_threshold(
+    pool: &SqlitePool,
+    root_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let spend = tree_spend(pool, root_id, now).await?;
+    let (true, Some(limit)) = (spend.soft_crossed, spend.limit_usd) else {
+        return Ok(false);
+    };
+
+    let summary = format!(
+        "tree {root_id} crossed its soft budget threshold ({}%): spent ${:.2} of the ${limit:.2} limit",
+        spend.soft_pct, spend.total_usd
+    );
+    let subject = format!("tree:{root_id}");
+    let written = sqlx::query(
+        "INSERT INTO feed (kind, summary, subject, created_at)
+         SELECT 'tree_budget_soft', ?, ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM feed WHERE kind = 'tree_budget_soft' AND subject = ?)",
+    )
+    .bind(summary)
+    .bind(&subject)
+    .bind(now.to_rfc3339())
+    .bind(&subject)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1;
+    if written {
+        // `nucleos_base::feed::append` always does this; a raw insert has to do it itself.
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Feed);
+    }
+    Ok(written)
+}
 
 #[cfg(test)]
 mod tests {

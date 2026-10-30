@@ -1,6 +1,158 @@
 //! Pure dependency planning for specs: a topological order, a cycle reported as a question for the
 //! owner instead of being cut silently, and the groups of specs that may run in parallel.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::work_nodes::sets_overlap;
+
+/// Specs that depend on each other in a loop. Downstream specs that merely wait on the loop are
+/// not members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cycle {
+    pub specs: Vec<String>,
+}
+
+impl Cycle {
+    /// The question put to the owner instead of cutting the loop silently.
+    pub fn owner_question(&self) -> String {
+        format!(
+            "These specs depend on each other in a loop: {}. Which dependency should be dropped \
+             or reversed so they can be ordered?",
+            self.specs.join(", ")
+        )
+    }
+}
+
+/// A spec to schedule, with the paths it will write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSpec {
+    pub id: String,
+    /// Empty means the scope is unknown, so the spec runs alone.
+    pub owned_paths: Vec<String>,
+}
+
+/// In-set dependencies as `spec -> specs it waits on`; edges touching an outside id are ignored.
+fn in_set_deps(
+    specs: &BTreeSet<String>,
+    deps: &[(String, String)],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut map: BTreeMap<String, BTreeSet<String>> =
+        specs.iter().map(|id| (id.clone(), BTreeSet::new())).collect();
+    for (spec, depends_on) in deps {
+        if specs.contains(spec) && specs.contains(depends_on) {
+            map.entry(spec.clone()).or_default().insert(depends_on.clone());
+        }
+    }
+    map
+}
+
+/// Everything reachable from `start` by following dependencies (not including `start` unless a
+/// loop leads back to it).
+fn reachable(start: &str, map: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<&String> = map.get(start).into_iter().flatten().collect();
+    while let Some(next) = stack.pop() {
+        if seen.insert(next.clone()) {
+            stack.extend(map.get(next).into_iter().flatten());
+        }
+    }
+    seen
+}
+
+/// Dependencies first; ties broken by id, so the result is deterministic. A loop is returned as a
+/// `Cycle` (its smallest member's strongly connected group), never cut.
+pub fn topological_order(
+    specs: &[String],
+    deps: &[(String, String)],
+) -> Result<Vec<String>, Cycle> {
+    let ids: BTreeSet<String> = specs.iter().cloned().collect();
+    let map = in_set_deps(&ids, deps);
+    let mut placed: BTreeSet<&String> = BTreeSet::new();
+    let mut order = Vec::with_capacity(ids.len());
+    while order.len() < ids.len() {
+        let ready: Vec<&String> = map
+            .iter()
+            .filter(|(id, waits)| !placed.contains(id) && waits.iter().all(|w| placed.contains(w)))
+            .map(|(id, _)| id)
+            .collect();
+        if ready.is_empty() {
+            // What is left holds loops and their downstream; keep only a spec that reaches itself.
+            let left: Vec<&String> = map.keys().filter(|id| !placed.contains(id)).collect();
+            let reach: BTreeMap<&String, BTreeSet<String>> =
+                left.iter().map(|id| (*id, reachable(id, &map))).collect();
+            let first = left
+                .iter()
+                .find(|id| reach[**id].contains(id.as_str()))
+                .expect("a stuck remainder contains a loop");
+            let members = left
+                .iter()
+                .filter(|id| {
+                    reach[**id].contains(first.as_str()) && reach[*first].contains(id.as_str())
+                })
+                .map(|id| (*id).clone())
+                .collect();
+            return Err(Cycle { specs: members });
+        }
+        for id in ready {
+            placed.insert(id);
+            order.push(id.clone());
+        }
+    }
+    Ok(order)
+}
+
+/// Groups of specs that may run together: a dependent lands in a later group than what it waits
+/// on, specs with overlapping owned paths never share a group, and an unknown scope is alone.
+pub fn parallel_groups(
+    specs: &[PlannedSpec],
+    deps: &[(String, String)],
+) -> Result<Vec<Vec<String>>, Cycle> {
+    let ids: Vec<String> = specs.iter().map(|spec| spec.id.clone()).collect();
+    let order = topological_order(&ids, deps)?;
+    let set: BTreeSet<String> = ids.iter().cloned().collect();
+    let map = in_set_deps(&set, deps);
+
+    // Level = longest chain of dependencies below the spec; `order` guarantees they are set.
+    let mut level: BTreeMap<&String, usize> = BTreeMap::new();
+    for id in &order {
+        let below = map[id].iter().map(|dep| level[dep] + 1).max().unwrap_or(0);
+        level.insert(id, below);
+    }
+
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let top = level.values().copied().max().map_or(0, |max| max + 1);
+    for current in 0..top {
+        // Input order inside a level keeps the packing deterministic.
+        let mut level_groups: Vec<Vec<&PlannedSpec>> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for spec in specs
+            .iter()
+            .filter(|spec| level[&spec.id] == current && seen.insert(&spec.id))
+        {
+            let slot = if spec.owned_paths.is_empty() {
+                None
+            } else {
+                level_groups.iter().position(|group| {
+                    group.iter().all(|other| {
+                        !other.owned_paths.is_empty()
+                            && sets_overlap(&spec.owned_paths, &other.owned_paths).is_none()
+                    })
+                })
+            };
+            match slot {
+                Some(index) => level_groups[index].push(spec),
+                None => level_groups.push(vec![spec]),
+            }
+        }
+        groups.extend(
+            level_groups
+                .into_iter()
+                .map(|group| group.into_iter().map(|spec| spec.id.clone()).collect()),
+        );
+    }
+    Ok(groups)
+}
+
 #[cfg(test)]
 mod tests {
     // `topological_order` stays qualified as `super::` here: a test of the same name, fixed by the

@@ -1,4 +1,106 @@
-//! stub: child-node depth guards
+//! Structural guards on opening a child node, in place of a fixed depth cap.
+//!
+//! Depth follows the task's complexity, so what stops a runaway tree is its shape:
+//! a child must divide its parent's scope, must not restate an ancestor's goal, and
+//! must fit under the tree's node ceiling. [`check_child`] is pure: the caller reads
+//! the chain and the total, and acts on the refusal.
+//!
+//! Two checks stay in `work_nodes` and are not repeated here: containment of the
+//! child's paths in the parent's (`check_containment`) and the optional configured
+//! `max_depth`.
+
+use std::collections::BTreeSet;
+
+/// What the guards need to know about one ancestor of the node being opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorView {
+    pub owned_paths: Vec<String>,
+    pub goal: String,
+    pub open_children: i64,
+}
+
+/// The node being opened, as requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildArgs {
+    pub owned_paths: Vec<String>,
+    pub goal: String,
+}
+
+/// Per-tree limits. Deliberately has no depth field: see the module docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeLimits {
+    pub max_nodes: i64,
+}
+
+impl Default for TreeLimits {
+    fn default() -> Self {
+        Self { max_nodes: 300 }
+    }
+}
+
+/// Why a child was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepthRefusal {
+    /// The parent already has a child, and this one owns the parent's whole scope.
+    SameScopeAsParent,
+    /// It would be the parent's only child, on the parent's whole scope: a handoff,
+    /// not a split.
+    SingleChildChain,
+    /// Its goal normalizes to the same text as an ancestor's.
+    RepeatedGoal,
+    /// The tree is already at its node ceiling.
+    TreeNodeCeiling,
+}
+
+/// Normalizes a goal for comparison: lowercase, whitespace runs collapsed to one
+/// space, trimmed.
+pub fn goal_fingerprint(goal: &str) -> String {
+    goal.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Decides whether a child may open. `chain` is root first, so the direct parent is
+/// its last element; an empty chain means a root. The first refusal wins: ceiling,
+/// then scope, then goal.
+pub fn check_child(
+    chain: &[AncestorView],
+    args: &ChildArgs,
+    tree_total: i64,
+    limits: &TreeLimits,
+) -> Result<(), DepthRefusal> {
+    if tree_total >= limits.max_nodes {
+        return Err(DepthRefusal::TreeNodeCeiling);
+    }
+
+    // A child with no paths owns nothing, so it cannot fail to divide its parent.
+    let same_scope_parent = chain.last().filter(|parent| {
+        !args.owned_paths.is_empty() && path_set(&args.owned_paths) == path_set(&parent.owned_paths)
+    });
+    if let Some(parent) = same_scope_parent {
+        return Err(if parent.open_children >= 1 {
+            DepthRefusal::SameScopeAsParent
+        } else {
+            DepthRefusal::SingleChildChain
+        });
+    }
+
+    let fingerprint = goal_fingerprint(&args.goal);
+    if chain
+        .iter()
+        .any(|ancestor| goal_fingerprint(&ancestor.goal) == fingerprint)
+    {
+        return Err(DepthRefusal::RepeatedGoal);
+    }
+
+    Ok(())
+}
+
+/// A path list as a set: order and duplicates do not change a scope.
+fn path_set(paths: &[String]) -> BTreeSet<&str> {
+    paths.iter().map(String::as_str).collect()
+}
 
 #[cfg(test)]
 mod tests {

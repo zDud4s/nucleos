@@ -1,4 +1,162 @@
-//! stub: session liveness classification
+//! Session liveness: tells a session that is alive and producing from one that only looks alive.
+//!
+//! [`classify`] is a pure function from one [`Observation`] of a subject (a daemon run, a tree
+//! node, a fleet root) to a [`Veredicto`]. It reads no clock, registry or file: the sources that
+//! fill the observation and the sweep that acts on the verdict live elsewhere.
+//!
+//! It never alarms without evidence: an observation with nothing known about it is `Healthy`.
+
+use chrono::{DateTime, Duration, Utc};
+
+/// What a subject is doing, as far as its observation shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Veredicto {
+    Healthy,
+    /// Quiet for a legitimate reason. Does not alarm.
+    Waiting(Motivo),
+    /// Process alive, and no transcript write since it started.
+    SilentSinceStart,
+    /// Registry status `Waiting` for too long with no reason the daemon knows of, such as a trust
+    /// or permission dialog.
+    BlockedOnPrompt,
+    /// Registry status `Busy` with a transcript that stopped being written.
+    Stalled,
+    /// No process, while the registry still shows a running state.
+    Dead,
+}
+
+/// Why a [`Veredicto::Waiting`] subject is legitimately quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motivo {
+    RunningChildren,
+    OwnerDecision,
+    AwaitingApproval,
+    ToolInFlight,
+}
+
+/// The `status` a subject holds in the session registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectStatus {
+    Busy,
+    Waiting,
+}
+
+/// Everything known about one subject at one moment. `None` means unknown, not "no".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Observation {
+    pub process_alive: Option<bool>,
+    pub status: Option<SubjectStatus>,
+    pub status_since: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub last_transcript_write: Option<DateTime<Utc>>,
+    /// Carried for the wave 3 sources; not consulted by [`classify`].
+    pub last_stream_event: Option<DateTime<Utc>>,
+    /// Carried for the wave 3 sources; not consulted by [`classify`].
+    pub last_hook_seen: Option<DateTime<Utc>>,
+    /// Deadline of the tool call in flight, from the policy clock.
+    pub tool_in_flight_until: Option<DateTime<Utc>>,
+    pub running_children: i64,
+    pub owner_decision_pending: bool,
+    pub awaiting_approval: bool,
+}
+
+/// How long each symptom must last before it counts. All comparisons are strict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub silent_after: Duration,
+    pub blocked_after: Duration,
+    pub stalled_after: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            silent_after: Duration::minutes(3),
+            blocked_after: Duration::minutes(2),
+            stalled_after: Duration::minutes(10),
+        }
+    }
+}
+
+/// Classifies one observation. The first matching rule wins, so the order below is the contract.
+pub fn classify(obs: &Observation, limits: &Limits, now: DateTime<Utc>) -> Veredicto {
+    // A dead process outranks every reason to wait: nothing is left to wait for.
+    if obs.process_alive == Some(false) {
+        return if obs.status.is_some() {
+            Veredicto::Dead
+        } else {
+            // No running state left in the registry: a finished process.
+            Veredicto::Healthy
+        };
+    }
+
+    if let Some(motivo) = waiting_reason(obs, now) {
+        return Veredicto::Waiting(motivo);
+    }
+
+    // Before silence on purpose: a trust dialog also never writes a transcript, and this verdict
+    // is the more specific one.
+    if obs.status == Some(SubjectStatus::Waiting)
+        && obs
+            .status_since
+            .is_some_and(|since| now - since > limits.blocked_after)
+    {
+        return Veredicto::BlockedOnPrompt;
+    }
+
+    if is_silent_since_start(obs, limits, now) {
+        return Veredicto::SilentSinceStart;
+    }
+
+    if is_stalled(obs, limits, now) {
+        return Veredicto::Stalled;
+    }
+
+    Veredicto::Healthy
+}
+
+fn waiting_reason(obs: &Observation, now: DateTime<Utc>) -> Option<Motivo> {
+    if obs.running_children > 0 {
+        Some(Motivo::RunningChildren)
+    } else if obs.owner_decision_pending {
+        Some(Motivo::OwnerDecision)
+    } else if obs.awaiting_approval {
+        Some(Motivo::AwaitingApproval)
+    } else if obs.tool_in_flight_until.is_some_and(|until| until > now) {
+        // Strict: a deadline equal to now has already run out.
+        Some(Motivo::ToolInFlight)
+    } else {
+        None
+    }
+}
+
+fn is_silent_since_start(obs: &Observation, limits: &Limits, now: DateTime<Utc>) -> bool {
+    let Some(started_at) = obs.started_at else {
+        return false;
+    };
+    obs.process_alive == Some(true)
+        && now - started_at > limits.silent_after
+        && obs
+            .last_transcript_write
+            .is_none_or(|written| written < started_at)
+}
+
+fn is_stalled(obs: &Observation, limits: &Limits, now: DateTime<Utc>) -> bool {
+    if obs.status != Some(SubjectStatus::Busy) {
+        return false;
+    }
+    // A never-written transcript is the silence rule's case: an unknown process must not alarm
+    // here without evidence.
+    let Some(written) = obs.last_transcript_write else {
+        return false;
+    };
+    // A write from before this start says nothing about this start, so the clock runs from
+    // whichever came later.
+    let active_since = obs
+        .started_at
+        .map_or(written, |started| written.max(started));
+    now - active_since > limits.stalled_after
+}
 
 #[cfg(test)]
 mod tests {

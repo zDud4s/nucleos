@@ -1,5 +1,182 @@
 //! Spec backlog model: closed vocabularies, the stable spec id and the registry's row types.
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Declares a closed vocabulary stored as text: `as_str` and a strict, case-sensitive `parse`.
+macro_rules! vocabulary {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum $name {
+            $(
+                #[serde(rename = $text)]
+                $variant,
+            )+
+        }
+
+        impl $name {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text,)+
+                }
+            }
+
+            pub fn parse(text: &str) -> Option<Self> {
+                match text {
+                    $($text => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+vocabulary! {
+    /// What a file under `.ai/specs` turned out to be.
+    SpecKind {
+        Spec => "spec",
+        Review => "review",
+        Note => "note",
+        Unknown => "unknown",
+    }
+}
+
+vocabulary! {
+    /// Where a spec stands in the backlog.
+    SpecStatus {
+        Discovered => "discovered",
+        Extracting => "extracting",
+        Extracted => "extracted",
+        Audited => "audited",
+        Queued => "queued",
+        InProgress => "in_progress",
+        Done => "done",
+        Blocked => "blocked",
+        NeedsOwner => "needs_owner",
+        Abandoned => "abandoned",
+    }
+}
+
+vocabulary! {
+    CriterionKind {
+        Behavior => "behavior",
+        Test => "test",
+        Doc => "doc",
+        Decision => "decision",
+    }
+}
+
+vocabulary! {
+    CriterionStatus {
+        Open => "open",
+        Met => "met",
+        Unmet => "unmet",
+        Doubt => "doubt",
+        Stale => "stale",
+    }
+}
+
+vocabulary! {
+    DepSource {
+        Extracted => "extracted",
+        Owner => "owner",
+    }
+}
+
+/// The stable id of a spec: a sha256 over the project and the `/`-normalised path, hex, so it is the
+/// same in every process. The project is length-prefixed (and `None` marked apart from `Some("")`)
+/// so the two parts can never run together into the same bytes.
+pub fn spec_id(project_id: Option<&str>, rel_path: &str) -> String {
+    let path = rel_path.replace('\\', "/");
+    let mut hasher = Sha256::new();
+    match project_id {
+        None => hasher.update(b"-\n"),
+        Some(project) => {
+            hasher.update(format!("p{}:", project.len()).as_bytes());
+            hasher.update(project.as_bytes());
+            hasher.update(b"\n");
+        }
+    }
+    hasher.update(path.as_bytes());
+    let digest = hasher.finalize();
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spec {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub path: String,
+    pub title: String,
+    pub content_sha: String,
+    pub kind: SpecKind,
+    pub status: SpecStatus,
+    pub status_reason: Option<String>,
+    pub tree_id: Option<String>,
+    pub last_audited_sha: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Criterion {
+    pub id: i64,
+    pub spec_id: String,
+    pub ordinal: i64,
+    pub text: String,
+    pub kind: CriterionKind,
+    pub verify_hint: Option<String>,
+    pub status: CriterionStatus,
+    pub evidence: Option<String>,
+    pub reviewer_run_id: Option<String>,
+    pub spec_sha: String,
+    pub checked_at: Option<String>,
+}
+
+/// A criterion as extracted, before it has an id, an ordinal or a spec sha.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewCriterion {
+    pub text: String,
+    pub kind: CriterionKind,
+    pub verify_hint: Option<String>,
+    pub status: CriterionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dep {
+    pub spec_id: String,
+    pub depends_on: String,
+    pub source: DepSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub id: String,
+    pub spec_id: String,
+    pub question: String,
+    pub answer: Option<String>,
+    /// `open` or `answered`.
+    pub status: String,
+    pub created_at: String,
+    pub answered_at: Option<String>,
+}
+
+/// One row of the owner's single list: a spec question or a tree-job decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerDecision {
+    /// `spec_question` or `tree_decision`.
+    pub origin: String,
+    pub id: String,
+    /// The spec id for a spec question, the tree id (possibly empty) for a tree decision.
+    pub subject: String,
+    pub question: String,
+    pub answer: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub answered_at: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

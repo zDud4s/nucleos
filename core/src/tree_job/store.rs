@@ -158,6 +158,106 @@ pub async fn list_non_terminal(pool: &SqlitePool) -> Result<Vec<TreeJob>, StoreE
     rows.into_iter().map(JobRow::into_job).collect()
 }
 
+/// What a boot pass found and repaired. It relaunches nothing: no prompt is persisted, so the
+/// caller only learns what is free to relaunch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resumed {
+    /// Ids of the jobs that are not finished, oldest first (parked ones included).
+    pub jobs: Vec<String>,
+    /// Running nodes marked `failed` because their run is no longer live.
+    pub failed_nodes: Vec<String>,
+    /// `(node_id, key)` of every empty launch reservation deleted for a node of an unfinished job.
+    pub cleared_launches: Vec<(String, String)>,
+}
+
+/// Boot recovery. Call it once, after the runs were reconciled and before anything can call
+/// `launch`: it deletes every empty launch reservation of an unfinished job, which is only safe
+/// while no call can still be creating a run. Job rows are never written.
+///
+/// A corrupt manifest makes `list_non_terminal` (and `reconcile_running`) fail whole, so one bad
+/// row stops the pass for every job; this keeps the `?` behaviour of both.
+pub async fn resume_all(pool: &SqlitePool) -> Result<Resumed, StoreError> {
+    let jobs: Vec<String> = list_non_terminal(pool)
+        .await?
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+    let failed_nodes = super::node_run::reconcile_running(pool)
+        .await
+        .map_err(|error| match error {
+            super::node_run::NodeRunError::Store(error) => error,
+            super::node_run::NodeRunError::Db(error) => StoreError::Db(error),
+            other => StoreError::Db(sqlx::Error::Protocol(other.to_string())),
+        })?;
+
+    let spent: Vec<(String, String)> = sqlx::query_as(
+        "SELECT t.node_id, t.key FROM tree_transitions t
+         JOIN work_nodes n ON n.id = t.node_id
+         JOIN tree_jobs j ON j.id = n.tree_job_id
+         WHERE t.transition = ? AND (t.result IS NULL OR t.result = '') AND j.state != ?
+         ORDER BY t.node_id, t.key",
+    )
+    .bind(super::node_run::LAUNCH)
+    .bind(JOB_TERMINAL_STATE)
+    .fetch_all(pool)
+    .await?;
+    let mut cleared_launches = Vec::with_capacity(spent.len());
+    for (node_id, key) in spent {
+        if clear_spent_launch(pool, &node_id, &key).await? {
+            cleared_launches.push((node_id, key));
+        }
+    }
+    Ok(Resumed {
+        jobs,
+        failed_nodes,
+        cleared_launches,
+    })
+}
+
+/// Deletes the launch reservation `(node_id, key)` when it still holds no run id, and answers
+/// whether it did. A row holding a run id is never touched: it is what makes a launch replay-safe.
+pub async fn clear_spent_launch(
+    pool: &SqlitePool,
+    node_id: &str,
+    key: &str,
+) -> Result<bool, StoreError> {
+    let deleted = sqlx::query(
+        "DELETE FROM tree_transitions
+         WHERE node_id = ? AND transition = ? AND key = ? AND (result IS NULL OR result = '')",
+    )
+    .bind(node_id)
+    .bind(super::node_run::LAUNCH)
+    .bind(key)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(deleted == 1)
+}
+
+/// `node_run::launch`, but a call whose own `create_run_inner` failed gives its key back, so the
+/// same key can start the run later. `Create` can only come from the call that made the
+/// reservation (a replay returns before the create), so that is the one case a live daemon may
+/// clear; an `Unresolved` reservation may belong to a call still creating its run, and only boot
+/// clears that.
+pub async fn launch_recovering(
+    state: &crate::state::AppState,
+    node_id: &str,
+    key: &str,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+) -> Result<i64, super::node_run::NodeRunError> {
+    let outcome =
+        super::node_run::launch(state, node_id, key, prompt, project_id, cwd, mode).await;
+    if let Err(super::node_run::NodeRunError::Create(_)) = &outcome {
+        // Best effort: the create error is the answer, and a failed clear only leaves the old
+        // behaviour (the key stays spent until the next boot).
+        let _ = clear_spent_launch(&state.pool, node_id, key).await;
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

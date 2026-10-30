@@ -1,6 +1,136 @@
 //! The pure "finished" rule: a spec is done only with a green verify and an independent reviewer
 //! confirming every criterion against the code. In doubt, or with any fact missing, it is not done.
 
+use super::model::{Criterion, CriterionStatus, Spec};
+
+/// Result of the spec's verify command; anything but a known green counts against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyState {
+    Green,
+    Red,
+    Unknown,
+}
+
+/// A run that reviewed criteria, with the root of its lineage when the daemon knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerRun {
+    pub run_id: String,
+    pub lineage_root_id: Option<String>,
+}
+
+/// Facts the daemon resolves before asking for a verdict, so the rule itself stays pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFacts {
+    /// Runs of the tree that implemented the spec (empty for an audit without a tree).
+    pub tree_run_ids: Vec<String>,
+    /// Lineage roots of that tree.
+    pub tree_lineage_roots: Vec<String>,
+    /// Reviewer runs the daemon could resolve.
+    pub reviewers: Vec<ReviewerRun>,
+    /// Evidence strings confirmed to exist, matched by exact string.
+    pub existing_evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotDoneReason {
+    VerifyNotGreen,
+    NoCriteria,
+    Unresolved {
+        ordinal: i64,
+        status: CriterionStatus,
+    },
+    Stale {
+        ordinal: i64,
+    },
+    NoReviewer {
+        ordinal: i64,
+    },
+    ReviewerNotIndependent {
+        ordinal: i64,
+    },
+    EvidenceMissing {
+        ordinal: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Done,
+    NotDone(Vec<NotDoneReason>),
+}
+
+/// Whether the reviewer belongs to the implementing tree's own lineage.
+fn inside_tree_lineage(reviewer: &ReviewerRun, facts: &ReviewFacts) -> bool {
+    let tree_owns = |id: &str| {
+        facts.tree_run_ids.iter().any(|run| run == id)
+            || facts.tree_lineage_roots.iter().any(|root| root == id)
+    };
+    tree_owns(&reviewer.run_id)
+        || reviewer
+            .lineage_root_id
+            .as_deref()
+            .is_some_and(|root| tree_owns(root))
+}
+
+/// A spec is done only when verify is green, it has criteria, and every one is met against the
+/// current spec sha, by an independent resolved reviewer, with existing evidence. Every failed
+/// fact is reported; any missing fact means not done.
+pub fn done(
+    spec: &Spec,
+    criteria: &[Criterion],
+    verify: VerifyState,
+    facts: &ReviewFacts,
+) -> Verdict {
+    let mut reasons = Vec::new();
+    if verify != VerifyState::Green {
+        reasons.push(NotDoneReason::VerifyNotGreen);
+    }
+    // No criteria is not done for every kind, review and note included.
+    if criteria.is_empty() {
+        reasons.push(NotDoneReason::NoCriteria);
+    }
+    for criterion in criteria {
+        let ordinal = criterion.ordinal;
+        match criterion.status {
+            CriterionStatus::Met => {}
+            CriterionStatus::Stale => {
+                reasons.push(NotDoneReason::Stale { ordinal });
+                continue;
+            }
+            status => {
+                reasons.push(NotDoneReason::Unresolved { ordinal, status });
+                continue;
+            }
+        }
+        if criterion.spec_sha != spec.content_sha {
+            reasons.push(NotDoneReason::Stale { ordinal });
+            continue;
+        }
+        let reviewer = criterion
+            .reviewer_run_id
+            .as_deref()
+            .and_then(|id| facts.reviewers.iter().find(|run| run.run_id == id));
+        match reviewer {
+            None => reasons.push(NotDoneReason::NoReviewer { ordinal }),
+            Some(run) if inside_tree_lineage(run, facts) => {
+                reasons.push(NotDoneReason::ReviewerNotIndependent { ordinal });
+            }
+            Some(_) => {}
+        }
+        let evidence_ok = criterion.evidence.as_deref().is_some_and(|evidence| {
+            !evidence.trim().is_empty() && facts.existing_evidence.iter().any(|e| e == evidence)
+        });
+        if !evidence_ok {
+            reasons.push(NotDoneReason::EvidenceMissing { ordinal });
+        }
+    }
+    if reasons.is_empty() {
+        Verdict::Done
+    } else {
+        Verdict::NotDone(reasons)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{done, NotDoneReason, ReviewFacts, ReviewerRun, Verdict, VerifyState};

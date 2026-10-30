@@ -1,6 +1,168 @@
 //! Validation of what the extraction agent returns: `parse` turns the agent's raw output into
 //! an `Extraction` of the kind of spec, its criteria, its dependencies and its open questions.
 
+use std::fmt;
+
+use serde_json::Value;
+
+use crate::spec_backlog::model::{CriterionKind, CriterionStatus, NewCriterion, SpecKind};
+
+/// What the extraction agent returned, validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extraction {
+    pub kind: SpecKind,
+    pub criteria: Vec<NewCriterion>,
+    /// Only paths that are in the registry; the rest became questions.
+    pub depends_on: Vec<String>,
+    pub questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    NoJsonBlock,
+    InvalidShape(String),
+    EmptyCriterion { index: usize },
+    NoCriteria,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoJsonBlock => write!(f, "the answer contains no JSON object"),
+            Self::InvalidShape(why) => write!(f, "the JSON object has the wrong shape: {why}"),
+            Self::EmptyCriterion { index } => write!(f, "criterion {index} has an empty text"),
+            Self::NoCriteria => write!(f, "a spec must have at least one criterion"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+fn shape<T>(why: impl Into<String>) -> Result<T, ParseError> {
+    Err(ParseError::InvalidShape(why.into()))
+}
+
+/// The JSON text in the agent's answer: the body of the first ```json fence if it has one,
+/// otherwise everything from the first `{` to the last `}`.
+fn json_block(raw: &str) -> Option<&str> {
+    if let Some(open) = raw.find("```json") {
+        let body = &raw[open + "```json".len()..];
+        if let Some(close) = body.find("```") {
+            return Some(body[..close].trim());
+        }
+    }
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end > start).then(|| &raw[start..=end])
+}
+
+fn string_list(object: &Value, field: &str) -> Result<Vec<String>, ParseError> {
+    let Some(items) = object.get(field).and_then(Value::as_array) else {
+        return shape(format!("`{field}` must be a list"));
+    };
+    items
+        .iter()
+        .map(|item| match item.as_str() {
+            Some(text) => Ok(text.to_string()),
+            None => shape(format!("`{field}` must hold only strings")),
+        })
+        .collect()
+}
+
+/// Validates the agent's raw output. Strict by design: in doubt the answer is rejected (and the
+/// caller retries) rather than guessed at. The agent's own `status` is ignored, so a criterion
+/// comes out `Open` or, when flagged `ambiguous`, `Doubt`; never `Met`.
+pub fn parse(raw: &str, known_paths: &[String]) -> Result<Extraction, ParseError> {
+    let block = json_block(raw).ok_or(ParseError::NoJsonBlock)?;
+    let value: Value = match serde_json::from_str(block) {
+        Ok(value) => value,
+        Err(err) => return shape(format!("invalid JSON: {err}")),
+    };
+    if !value.is_object() {
+        return shape("the JSON value must be an object");
+    }
+
+    let kind = match value.get("kind").and_then(Value::as_str) {
+        Some(text) => match SpecKind::parse(text) {
+            Some(kind) => kind,
+            None => return shape(format!("unknown spec kind `{text}`")),
+        },
+        None => return shape("`kind` must be a string"),
+    };
+    let Some(items) = value.get("criteria").and_then(Value::as_array) else {
+        return shape("`criteria` must be a list");
+    };
+
+    let mut criteria = Vec::with_capacity(items.len());
+    let mut empty_at = None;
+    for (index, item) in items.iter().enumerate() {
+        let Some(text) = item.get("text").and_then(Value::as_str) else {
+            return shape(format!("criterion {index} needs a string `text`"));
+        };
+        let criterion_kind = match item.get("kind").and_then(Value::as_str) {
+            Some(text) => match CriterionKind::parse(text) {
+                Some(kind) => kind,
+                None => return shape(format!("criterion {index} has unknown kind `{text}`")),
+            },
+            None => return shape(format!("criterion {index} needs a string `kind`")),
+        };
+        // `verify_hint` is required but may be null.
+        let verify_hint = match item.get("verify_hint") {
+            Some(Value::Null) => None,
+            Some(Value::String(hint)) => Some(hint.trim().to_string()).filter(|h| !h.is_empty()),
+            _ => return shape(format!("criterion {index} needs `verify_hint` (string or null)")),
+        };
+        let ambiguous = match item.get("ambiguous") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return shape(format!("criterion {index} has a non-boolean `ambiguous`")),
+        };
+        if text.trim().is_empty() {
+            empty_at.get_or_insert(index);
+        }
+        criteria.push(NewCriterion {
+            text: text.trim().to_string(),
+            kind: criterion_kind,
+            verify_hint,
+            status: if ambiguous {
+                CriterionStatus::Doubt
+            } else {
+                CriterionStatus::Open
+            },
+        });
+    }
+
+    let declared_deps = string_list(&value, "depends_on")?;
+    let mut questions = string_list(&value, "questions")?;
+
+    if let Some(index) = empty_at {
+        return Err(ParseError::EmptyCriterion { index });
+    }
+    if criteria.is_empty() && !matches!(kind, SpecKind::Review | SpecKind::Note) {
+        return Err(ParseError::NoCriteria);
+    }
+
+    let mut depends_on: Vec<String> = Vec::new();
+    for dep in declared_deps {
+        if known_paths.contains(&dep) {
+            if !depends_on.contains(&dep) {
+                depends_on.push(dep);
+            }
+        } else {
+            questions.push(format!(
+                "Depends on `{dep}`, which is not a known spec: does it exist, or is the path wrong?"
+            ));
+        }
+    }
+
+    Ok(Extraction {
+        kind,
+        criteria,
+        depends_on,
+        questions,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse, Extraction, ParseError};
