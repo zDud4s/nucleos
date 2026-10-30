@@ -110,10 +110,11 @@ export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
       const payload: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
 
       if (segments.length === 1) {
-        const wanted = new URLSearchParams(query).get("scope");
+        // No scope is the machine's scope, as the núcleo answers it.
+        const wanted = new URLSearchParams(query).get("scope") ?? "machine";
         const rows: SettingIndexRow[] = [];
         for (const doc of docs.values()) {
-          if (wanted !== null && doc.seed.scope !== wanted) continue;
+          if (doc.seed.scope !== wanted) continue;
           rows.push({
             scope: doc.seed.scope,
             name: doc.seed.name,

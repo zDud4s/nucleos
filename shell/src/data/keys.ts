@@ -699,18 +699,6 @@ export const keys = {
     notifyPolicyFor: (channel: string) => ["system", "notify-policy", channel] as const,
     notifyKinds: ["system", "notify-kinds"] as const,
     config: (area: string) => ["system", "config", area] as const,
-    /**
-     * This machine's settings files — `GET /config/machine`.
-     *
-     * A sibling of `config` above rather than a child of it, and the difference
-     * is not cosmetic: that one keys the daemon's PARSED view of a pillar — what
-     * it is actually doing, clamps applied — and this one keys the files on
-     * disk. The two disagree exactly when somebody has edited a file and not
-     * restarted, which is the state the settings page exists to show. A write
-     * invalidating this must not also throw away the running readout it is
-     * about to be compared against.
-     */
-    machine: ["system", "machine"] as const,
     /** `GET /config/distiller` — which brain the distiller asks. */
     distiller: ["system", "distiller"] as const,
     /** `GET /config/distiller-sources` — the chat and calendar switches. */

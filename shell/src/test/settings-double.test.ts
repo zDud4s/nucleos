@@ -28,10 +28,10 @@ describe("isSettingsPath", () => {
 });
 
 describe("the double", () => {
-  it("lists the index, filtered by ?scope", async () => {
+  it("lists the machine's documents with no scope, and a project's with ?scope", async () => {
     const double = seeded();
-    const all = (await double.handle("/settings", undefined)) as { scope: string; present: boolean }[];
-    expect(all.map((row) => row.scope).sort()).toEqual(["machine", "project:alpha"]);
+    const machine = (await double.handle("/settings", undefined)) as { scope: string; present: boolean }[];
+    expect(machine.map((row) => row.scope)).toEqual(["machine"]);
     const project = (await double.handle("/settings?scope=project%3Aalpha", undefined)) as { name: string }[];
     expect(project.map((row) => row.name)).toEqual(["autopilot"]);
   });
@@ -153,8 +153,8 @@ describe("the double", () => {
   });
 
   it("marks a readable row as readable in the index", async () => {
-    const rows = (await seeded().handle("/settings", undefined)) as { unreadable: boolean }[];
-    expect(rows.map((row) => row.unreadable)).toEqual([false, false]);
+    const rows = (await seeded().handle("/settings?scope=machine", undefined)) as { unreadable: boolean }[];
+    expect(rows.map((row) => row.unreadable)).toEqual([false]);
   });
 
   it("keeps a channel's name as one encoded segment", async () => {
