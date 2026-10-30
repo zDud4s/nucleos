@@ -193,8 +193,11 @@ pub fn wilson_lower(right: i64, n: i64) -> f64 {
 /// precision reaches `cfg.precision_wilson_lower`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn action_eligible(p: &RulePrecision, cfg: &DevtimeActionsConfig) -> bool {
-    let _ = (p, cfg);
-    todo!()
+    if !p.eligible || p.level != Level::Base {
+        return false;
+    }
+    let right = (p.n_cases - p.n_not_rework).max(0);
+    wilson_lower(right, p.n_cases) >= cfg.precision_wilson_lower
 }
 
 #[cfg(test)]
@@ -314,8 +317,10 @@ mod tests {
     #[test]
     fn action_eligible_follows_the_configured_floor() {
         // 16/20 has a Wilson lower bound near 0.58: it passes a looser floor from the config.
-        let mut cfg = DevtimeActionsConfig::default();
-        cfg.precision_wilson_lower = 0.5;
+        let cfg = DevtimeActionsConfig {
+            precision_wilson_lower: 0.5,
+            ..Default::default()
+        };
         assert!(action_eligible(
             &precision_row(Level::Base, 20, 16, true),
             &cfg
