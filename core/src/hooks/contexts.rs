@@ -75,6 +75,11 @@ pub(super) async fn assistant_decision(
                     "pretooluse-decision: the turn is marked but what it read could not be written down"
                 );
             }
+            // Non-blocking notice: remember the first untrusted tool of this chat's session so the
+            // screen can say the turn's end will rotate it. Never feeds the decision.
+            if let Some(chat_id) = chat_of_run(&state.pool, payload.run_id).await {
+                note_untrusted_call(&chat_id, tool);
+            }
             Json(Decision {
                 decision: "allow".to_owned(),
                 reason: "orchestrator NucleOS tool".to_owned(),

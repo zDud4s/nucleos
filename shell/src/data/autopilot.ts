@@ -57,6 +57,17 @@ export interface ClassTally {
   reviewed: number;
   agree: number;
   disagree: number;
+  /** Reviewed decisions where the verdict was stricter than the classifier's. */
+  stricter: number;
+  /** Reviewed decisions where the verdict was looser than the classifier's. */
+  looser: number;
+  /** Decisions no human has reviewed yet. */
+  unreviewed: number;
+  reviewed_allow: number;
+  reviewed_pend: number;
+  reviewed_deny: number;
+  /** Timestamp of the oldest decision still unreviewed, or null when none is. */
+  oldest_unreviewed_at: string | null;
 }
 
 /** One decision the classifier made without enforcing it, awaiting a human verdict. */

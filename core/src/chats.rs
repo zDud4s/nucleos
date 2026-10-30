@@ -662,6 +662,26 @@ pub async fn set_extra_dirs(
     Ok(())
 }
 
+/// Whether automatic compaction is switched on for the chat; `false` for a chat with no row.
+pub async fn auto_compact(pool: &SqlitePool, chat_id: &str) -> bool {
+    let on: Option<i64> = sqlx::query_scalar("SELECT auto_compact FROM chats WHERE chat_id = ?")
+        .bind(chat_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+    on == Some(1)
+}
+
+/// Switches automatic compaction on or off for the chat.
+pub async fn set_auto_compact(pool: &SqlitePool, chat_id: &str, on: bool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE chats SET auto_compact = ? WHERE chat_id = ?")
+        .bind(i64::from(on))
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Moves the floor of this conversation's replay to now — the app's `/clear`.
 ///
 /// Stores the id of the last run rather than a timestamp, because that is what it is compared
@@ -1494,6 +1514,18 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
+    }
+
+    #[tokio::test]
+    async fn auto_compact_defaults_off_and_round_trips() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        assert!(!auto_compact(&pool, &id).await);
+        set_auto_compact(&pool, &id, true).await.unwrap();
+        assert!(auto_compact(&pool, &id).await);
+        set_auto_compact(&pool, &id, false).await.unwrap();
+        assert!(!auto_compact(&pool, &id).await);
+        assert!(!auto_compact(&pool, "no-such-chat").await);
     }
 
     async fn seed_run(pool: &SqlitePool, chat: &str, status: &str, tools: Option<&str>) {

@@ -148,6 +148,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(remote::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
+        .merge(crate::route_index::routes())
         .merge(team::routes())
         .merge(themes::routes())
         .merge(workflows::routes())
@@ -21217,7 +21218,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["project_id"], serde_json::Value::Null);
         assert_eq!(entries[0]["summary"], "global summary");
-        assert_eq!(parsed, serde_json::to_value(legacy_entries).unwrap());
+        // The wire shape is the legacy entry plus an explicit `origin` (F4); these rows have no run.
+        let mut expected = serde_json::to_value(legacy_entries).unwrap();
+        for row in expected.as_array_mut().unwrap() {
+            row["origin"] = serde_json::Value::Null;
+        }
+        assert_eq!(parsed, expected);
     }
 
     fn preset_body(name: &str, prompt: &str, mode: &str) -> Body {
@@ -21547,6 +21553,7 @@ mod tests {
                 "created_at",
                 "id",
                 "kind",
+                "origin",
                 "project_id",
                 "run_id",
                 "subject",
@@ -26411,6 +26418,337 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.status(), StatusCode::FORBIDDEN);
+        db.close().await;
+    }
+
+    /// One `devtime_shadow` row of D3 in `alpha`, `minutes` minutes ago, resolved as a miss; raw
+    /// SQL for the same reason as `seed_devtime`. Returns its id. The columns that must never reach
+    /// the wire (`session_id`, `subject_key`) carry a recognisable marker.
+    async fn seed_shadow(
+        state: &AppState,
+        tag: &str,
+        mode: &str,
+        decision: &str,
+        minutes: i64,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO devtime_shadow (action, rule_id, project_id, session_id, subject_key,
+                 mode, decision, suppress_reason, template_id, params, rule_version,
+                 action_version, thresholds_hash, rules_version, decided_at, window_end_at,
+                 outcome_state, outcome, outcome_cost_ms, resolved_at)
+             VALUES ('inject', 'D3', 'alpha', 'secret-session', 'secret-subject-' || ?1, ?2, ?3,
+                 CASE WHEN ?3 = 'suppress' THEN 'cooldown' END, 'inject.d3.v1', '{\"count\":3}', 1,
+                 1, 'th', 'rv',
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || ?4 || ' minutes'),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || ?4 || ' minutes', '+30 minutes'),
+                 'resolved', 'miss', 0,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(tag)
+        .bind(mode)
+        .bind(decision)
+        .bind(minutes)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar(
+            "SELECT id FROM devtime_shadow WHERE subject_key = 'secret-subject-' || ?",
+        )
+        .bind(tag)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn post_json(
+        state: &AppState,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        api_token_request(state.clone(), "POST", uri, "test-token", body).await
+    }
+
+    /// `GET /analytics/devtime/actions`: one entry per configured pair (the defaults: inject D3 and
+    /// D6, propose F1 and F2), a pair with no row in shadow, a stored row's mode and owner shown, and
+    /// a zeroed report (never a 500) for a pair without decisions.
+    #[tokio::test]
+    async fn analytics_devtime_actions_lists_every_pair_with_its_state_and_report() {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO devtime_action_state (action, rule_id, mode, since, changed_by)
+             VALUES ('inject', 'D3', 'live', '2026-10-01T00:00:00.000Z', 'owner')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let body = get_json(&state, "/analytics/devtime/actions").await;
+        let pairs = body["pairs"].as_array().unwrap_or_else(|| panic!("{body}"));
+        let keys: Vec<_> = pairs
+            .iter()
+            .map(|p| {
+                (
+                    p["action"].as_str().unwrap(),
+                    p["rule_id"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("inject", "D3"),
+                ("inject", "D6"),
+                ("propose", "F1"),
+                ("propose", "F2")
+            ],
+            "{body}"
+        );
+        assert_eq!(pairs[0]["mode"], "live", "{body}");
+        assert_eq!(pairs[0]["changed_by"], "owner", "{body}");
+        assert_eq!(pairs[0]["since"], "2026-10-01T00:00:00.000Z", "{body}");
+        assert_eq!(
+            pairs[1]["mode"], "shadow",
+            "no row: the pair runs in shadow: {body}"
+        );
+        assert!(
+            pairs[1]["since"].is_null() && pairs[1]["changed_by"].is_null(),
+            "{body}"
+        );
+        let report = &pairs[1]["report"];
+        assert_eq!(report["n_resolved"], 0, "{body}");
+        assert_eq!(report["ready"], false, "{body}");
+        assert!(report["hit_rate"].is_null(), "{body}");
+    }
+
+    /// `GET /analytics/devtime/actions/shadow`: newest first, shadow rows only, closed fields only,
+    /// paged by an opaque cursor, and the 400s as `{"error": code}`.
+    #[tokio::test]
+    async fn analytics_devtime_actions_shadow_pages_and_refuses_bad_params() {
+        let state = test_state().await;
+        let newest = seed_shadow(&state, "a", "shadow", "fire", 10).await;
+        seed_shadow(&state, "b", "shadow", "suppress", 20).await;
+        seed_shadow(&state, "c", "shadow", "fire", 30).await;
+        seed_shadow(&state, "live", "live", "fire", 5).await;
+
+        let first = get_json(
+            &state,
+            "/analytics/devtime/actions/shadow?action=inject&rule=D3&limit=2",
+        )
+        .await;
+        let items = first["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{first}"));
+        assert_eq!(items.len(), 2, "{first}");
+        assert_eq!(items[0]["id"], newest, "newest first: {first}");
+        assert_eq!(items[1]["decision"], "suppress", "{first}");
+        assert_eq!(items[1]["suppress_reason"], "cooldown", "{first}");
+        assert_eq!(items[0]["template_id"], "inject.d3.v1", "{first}");
+        assert_eq!(
+            items[0]["params"]["count"], 3,
+            "params is an object: {first}"
+        );
+        let text = first.to_string();
+        for leaked in [
+            "secret-session",
+            "secret-subject",
+            "session_id",
+            "subject_key",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {first}");
+        }
+        let cursor = first["next_cursor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{first}"));
+        let second = get_json(
+            &state,
+            &format!(
+                "/analytics/devtime/actions/shadow?action=inject&rule=D3&limit=2&cursor={cursor}"
+            ),
+        )
+        .await;
+        assert_eq!(
+            second["items"].as_array().unwrap().len(),
+            1,
+            "live rows are not listed: {second}"
+        );
+        assert!(second["next_cursor"].is_null(), "{second}");
+
+        for (uri, code) in [
+            (
+                "/analytics/devtime/actions/shadow?action=nuke",
+                "bad_action",
+            ),
+            ("/analytics/devtime/actions/shadow?limit=0", "bad_limit"),
+            ("/analytics/devtime/actions/shadow?limit=201", "bad_limit"),
+            ("/analytics/devtime/actions/shadow?limit=abc", "bad_limit"),
+            (
+                "/analytics/devtime/actions/shadow?cursor=garbage",
+                "bad_cursor",
+            ),
+        ] {
+            let response = api_token_request(state.clone(), "GET", uri, "test-token", None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                json_body(response).await,
+                serde_json::json!({ "error": code }),
+                "{uri}"
+            );
+        }
+    }
+
+    /// `POST .../shadow/{id}/verdict`: 400 `bad_verdict`, 404 `unknown_shadow` (also for a live or
+    /// suppressed row), 200 with the updated item, and the same mark twice is the same state.
+    #[tokio::test]
+    async fn analytics_devtime_actions_verdict_maps_refusals_and_marks_idempotently() {
+        let state = test_state().await;
+        let fire = seed_shadow(&state, "a", "shadow", "fire", 10).await;
+        let suppressed = seed_shadow(&state, "b", "shadow", "suppress", 20).await;
+        let live = seed_shadow(&state, "c", "live", "fire", 30).await;
+        let uri = |id: i64| format!("/analytics/devtime/actions/shadow/{id}/verdict");
+
+        let bad = post_json(
+            &state,
+            &uri(fire),
+            Some(serde_json::json!({"verdict": "maybe"})),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(bad).await,
+            serde_json::json!({"error": "bad_verdict"})
+        );
+        for id in [9_999, suppressed, live] {
+            let response = post_json(
+                &state,
+                &uri(id),
+                Some(serde_json::json!({"verdict": "useful"})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{id}");
+            assert_eq!(
+                json_body(response).await,
+                serde_json::json!({"error": "unknown_shadow"}),
+                "{id}"
+            );
+        }
+        for _ in 0..2 {
+            let ok = post_json(
+                &state,
+                &uri(fire),
+                Some(serde_json::json!({"verdict": "noise"})),
+            )
+            .await;
+            assert_eq!(ok.status(), StatusCode::OK, "idempotent");
+            let item = json_body(ok).await;
+            assert_eq!(item["id"], fire, "{item}");
+            assert_eq!(item["human_verdict"], "noise", "{item}");
+        }
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT human_verdict FROM devtime_shadow WHERE id = ?")
+                .bind(fire)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("noise"));
+    }
+
+    /// `POST .../{action}/{rule}/promote`: 400 `bad_action`, 404 `unknown_rule`, and 409 `not_ready`
+    /// with nothing written for a pair whose report is not ready (the ready path, which needs a
+    /// 30-row fixture, is pinned in `analytics::devtime::actions`).
+    #[tokio::test]
+    async fn analytics_devtime_actions_promote_maps_refusals_and_writes_nothing_when_not_ready() {
+        let state = test_state().await;
+        seed_shadow(&state, "a", "shadow", "fire", 10).await;
+        for (uri, status, code) in [
+            (
+                "/analytics/devtime/actions/nuke/D3/promote",
+                StatusCode::BAD_REQUEST,
+                "bad_action",
+            ),
+            (
+                "/analytics/devtime/actions/inject/ZZ/promote",
+                StatusCode::NOT_FOUND,
+                "unknown_rule",
+            ),
+            (
+                "/analytics/devtime/actions/propose/D3/promote",
+                StatusCode::NOT_FOUND,
+                "unknown_rule",
+            ),
+            (
+                "/analytics/devtime/actions/inject/D3/promote",
+                StatusCode::CONFLICT,
+                "not_ready",
+            ),
+        ] {
+            let response = post_json(&state, uri, None).await;
+            assert_eq!(response.status(), status, "{uri}");
+            assert_eq!(
+                json_body(response).await,
+                serde_json::json!({ "error": code }),
+                "{uri}"
+            );
+        }
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devtime_action_state")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0, "a refused promotion writes nothing");
+    }
+
+    /// A read-only key reads both new GETs (200); the verdict and the promotion are writes (403, in
+    /// no scope table); no token at all is 401 on all four.
+    #[tokio::test]
+    async fn analytics_devtime_actions_are_readable_with_a_read_only_key_and_the_posts_are_not() {
+        let (state, db) = file_test_state().await;
+        let id = seed_shadow(&state, "a", "shadow", "fire", 10).await;
+        let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        for uri in [
+            "/analytics/devtime/actions",
+            "/analytics/devtime/actions/shadow",
+        ] {
+            let response = api_token_request(state.clone(), "GET", uri, &token, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        let verdict_uri = format!("/analytics/devtime/actions/shadow/{id}/verdict");
+        for (uri, body) in [
+            (
+                verdict_uri.as_str(),
+                Some(serde_json::json!({"verdict": "useful"})),
+            ),
+            ("/analytics/devtime/actions/inject/D3/promote", None),
+        ] {
+            let response = api_token_request(state.clone(), "POST", uri, &token, body).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM devtime_shadow WHERE human_verdict IS NOT NULL",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(marked, 0, "the forbidden mark wrote nothing");
+        for (method, uri) in [
+            ("GET", "/analytics/devtime/actions"),
+            ("GET", "/analytics/devtime/actions/shadow"),
+            ("POST", verdict_uri.as_str()),
+            ("POST", "/analytics/devtime/actions/inject/D3/promote"),
+        ] {
+            let response = build_router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
         db.close().await;
     }
 

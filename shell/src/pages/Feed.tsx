@@ -162,6 +162,8 @@ const GRAVITY_WORDS: Record<Exclude<FeedGravity, "routine">, [string, string]> =
 };
 /** How long the "Marked … seen" line offers its Undo. */
 const UNDO_MS = 8000;
+/** The `origin` the voice supervisor stamps on the lines it starts. */
+const VOICE_ORIGIN = "voice";
 const EXCEPTIONS: Exclude<FeedGravity, "routine">[] = ["wrong", "held", "asks"];
 
 export function Feed() {
@@ -238,9 +240,14 @@ export function Feed() {
   );
 
   const ownerFiltered = search.project !== undefined;
+  /** The "origin: voice" toggle: client side only, over the lines already fetched. */
+  const [voiceOnly, setVoiceOnly] = useState(false);
   const entries = useMemo(
-    () => allEntries.filter((entry) => ownsLine(entry, search.project)),
-    [allEntries, search.project],
+    () =>
+      allEntries.filter(
+        (entry) => ownsLine(entry, search.project) && (!voiceOnly || entry.origin === VOICE_ORIGIN),
+      ),
+    [allEntries, search.project, voiceOnly],
   );
 
   /* ---------------------------------------- marking seen on the way out -- */
@@ -427,6 +434,11 @@ export function Feed() {
             if (next !== "") choosePreset(next);
           }}
         />
+        {!searching && (
+          <Chip pressed={voiceOnly} onToggle={() => setVoiceOnly(!voiceOnly)}>
+            origin: voice
+          </Chip>
+        )}
         {unseenExists && (
           <Button variant="quiet" onClick={() => void markEverythingSeen()}>
             Mark everything seen
@@ -1250,6 +1262,11 @@ const FeedLine = memo(function FeedLine({
             opposite answers. The reading comes from the one non-collapsing map
             rather than from this page. */}
         {waiting !== null && <StateBadge domain="wait_reason" state={waiting} />}
+        {entry.origin === VOICE_ORIGIN && (
+          <Badge tone="info" title="started by the voice supervisor">
+            voice
+          </Badge>
+        )}
       </div>
       <div className="feed-line-body">
         <p className="feed-line-summary">{entry.summary}</p>

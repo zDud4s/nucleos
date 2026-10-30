@@ -798,3 +798,68 @@ describe("Feed - date bounds", () => {
     expect(screen.getByLabelText("Until").getAttribute("lang")).toBe("en-GB");
   });
 });
+
+/* ------------------------------------------------- C6: the voice origin -- */
+
+describe("Feed - lines born of the voice supervisor", () => {
+  // Local widening of the type (CR6 fallback): the daemon adds `origin` to each line, `null` when unknown.
+  type OriginEntry = FeedEntry & { origin?: string | null };
+  const withOrigin = (overrides: Partial<OriginEntry> & { minutesAgo?: number }): OriginEntry =>
+    entry(overrides as Partial<FeedEntry> & { minutesAgo?: number }) as OriginEntry & FeedEntry;
+
+  /** The list row that carries `summary`. */
+  async function row(summary: string): Promise<HTMLElement> {
+    const list = await lines();
+    const found = within(list).getByText(summary).closest("li.feed-line");
+    expect(found).not.toBeNull();
+    return found as HTMLElement;
+  }
+
+  it("badges a line whose origin is voice", async () => {
+    useLines([withOrigin({ id: 1, kind: "job_gate_failed", summary: "gate failed on alpha", origin: "voice", minutesAgo: 20 })]);
+    await renderFeed();
+    expect(within(await row("gate failed on alpha")).getByText(/voice/i)).toBeDefined();
+  });
+
+  it("shows no badge for a null origin or for a payload without the key", async () => {
+    useLines([
+      withOrigin({ id: 1, kind: "job_gate_failed", summary: "null origin line", origin: null, minutesAgo: 20 }),
+      withOrigin({ id: 2, kind: "job_gate_failed", summary: "absent origin line", minutesAgo: 10 }),
+    ]);
+    await renderFeed();
+    expect(within(await row("null origin line")).queryByText(/voice/i)).toBeNull();
+    expect(within(await row("absent origin line")).queryByText(/voice/i)).toBeNull();
+  });
+
+  it("the origin: voice toggle hides the lines that did not come from voice, and lets go when pressed again", async () => {
+    useLines([
+      withOrigin({ id: 1, kind: "job_gate_failed", summary: "spoken failure", origin: "voice", minutesAgo: 30 }),
+      withOrigin({ id: 2, kind: "job_gate_failed", summary: "manual failure", origin: "manual", minutesAgo: 20 }),
+      withOrigin({ id: 3, kind: "job_gate_failed", summary: "unknown failure", origin: null, minutesAgo: 10 }),
+      withOrigin({ id: 4, kind: "job_gate_failed", summary: "legacy failure", minutesAgo: 5 }),
+    ]);
+    await renderFeed();
+    const list = await lines();
+    expect(within(list).getByText("manual failure")).toBeDefined();
+
+    const toggle = await screen.findByRole("button", { name: /origin: voice/i });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(within(list).queryByText("manual failure")).toBeNull());
+    expect(within(list).queryByText("unknown failure")).toBeNull();
+    expect(within(list).queryByText("legacy failure")).toBeNull();
+    expect(within(list).getByText("spoken failure")).toBeDefined();
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    expect(await within(list).findByText("legacy failure")).toBeDefined();
+  });
+
+  it("an old daemon payload with no origin key on any line still renders", async () => {
+    useLines([withOrigin({ id: 1, kind: "job_gate_failed", summary: "old payload line", minutesAgo: 20 })]);
+    await renderFeed();
+    const found = await row("old payload line");
+    expect(found.textContent).toMatch(/job gate failed/);
+    expect(await screen.findByRole("button", { name: /origin: voice/i })).toBeDefined();
+  });
+});

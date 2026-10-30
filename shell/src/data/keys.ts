@@ -57,6 +57,11 @@ export const keys = {
     devtime: (days: number) => ["analytics", "devtime", days] as const,
     devtimeFindings: (days: number, order: string, cursor: string) =>
       ["analytics", "devtime-findings", days, order, cursor] as const,
+    /** The automatic actions' pairs with their promotion reports (not windowed by `days`). */
+    devtimeActions: () => ["analytics", "devtime-actions"] as const,
+    /** One page of the shadow decisions, for one (action, rule) filter. */
+    devtimeShadow: (action: string, rule: string, cursor: string) =>
+      ["analytics", "devtime-shadow", action, rule, cursor] as const,
   },
 
   autopilot: {

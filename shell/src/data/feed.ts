@@ -42,6 +42,11 @@ export interface FeedEntry {
    */
   subject: string | null;
   created_at: string;
+  /**
+   * Who started the work behind the line (`"voice"` for the voice supervisor), `null` when the
+   * núcleo does not know. Absent on payloads from a daemon that predates the field.
+   */
+  origin?: string | null;
 }
 
 /**

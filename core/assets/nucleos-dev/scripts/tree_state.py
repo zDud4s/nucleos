@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
+import tree_yaml as yaml  # vendored minimal reader: no PyYAML dependency
 
 import nucleos_paths
 

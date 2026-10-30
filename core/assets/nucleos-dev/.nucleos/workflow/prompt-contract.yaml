@@ -75,6 +75,16 @@ phases:
     allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
     required: [phase_skill, packet_schema, project_yaml, objective]
 
+  # Model-routing variants of a tree node: a leaf runs the executor's skill in `wf-leaf`, an
+  # inner node runs the orchestrate-node skill in `wf-tree-orchestrator`.
+  tree_orchestrate:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective]
+
+  tree_leaf:
+    allowed: [phase_skill, packet_schema, project_yaml, objective, memory_slice, prior_artifacts]
+    required: [phase_skill, packet_schema, project_yaml, objective, memory_slice]
+
   # The final fold of a user agent-pipeline's outputs (`run-pipeline`, sink kind `synthesize`).
   synthesize:
     # No `project_yaml`: assemble_prompt.py attaches it whenever it is allowed, and a fold of

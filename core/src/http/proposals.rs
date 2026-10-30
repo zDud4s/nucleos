@@ -210,9 +210,11 @@ pub(super) async fn post_proposal_dismiss(
 /// the prompt well, and knows the engine, the model and the tool policy badly, because those are
 /// what cost money per turn and what widen a surface. So the person approving may correct them, and
 /// `agent::validate` runs over the correction.
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub(super) struct ApproveBody {
+    // `AgentRequest` does not derive `JsonSchema`; the index shows it as free-form JSON.
+    #[schemars(with = "Option<serde_json::Value>")]
     pub(super) hire: Option<crate::agent::AgentRequest>,
     /// Only a browser-wheel approval reads it: `"shell"` or `"window"`.
     pub(super) seat: Option<String>,

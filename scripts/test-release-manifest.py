@@ -31,6 +31,7 @@ GOOD = [
     f"NucleOS_{V}_amd64.AppImage",
     f"NucleOS_{V}_amd64.AppImage.sig",
     f"NucleOS_{V}_amd64.deb",
+    f"NucleOS-{V}-1.x86_64.rpm",
     f"NucleOS_{V}_aarch64.dmg",
     "NucleOS_aarch64.app.tar.gz",
     "NucleOS_aarch64.app.tar.gz.sig",
@@ -235,6 +236,50 @@ def the_nsis_preinstall_hook_still_stops_the_daemon():
     assert "NUCLEOS_STOP_DAEMON" in m.group(1), "NSIS_HOOK_PREINSTALL no longer stops the daemon"
 
 
+TAURI_CONF = ROOT / "shell" / "src-tauri" / "tauri.conf.json"
+
+
+def the_bundle_identity_is_nucleos_not_the_old_product_name():
+    raw = TAURI_CONF.read_text(encoding="utf-8")
+    conf = json.loads(raw)
+    assert conf["identifier"] == "com.nucleos.app", conf["identifier"]
+    assert conf["bundle"].get("publisher") == "NucleOS", conf["bundle"].get("publisher")
+    assert "pc-multimedia" not in raw, "the old identifier survives in tauri.conf.json"
+
+
+def a_missing_rpm_is_named_and_a_foreign_rpm_version_is_refused():
+    d = release_dir()
+    try:
+        rpm = d / f"NucleOS-{V}-1.x86_64.rpm"
+        assert rpm.exists()
+        rpm.rename(d / "NucleOS-9.9.9-1.x86_64.rpm")
+        res = run("verify", "--dir", str(d), "--version", V)
+        assert res.returncode == 1 and "9.9.9" in res.stderr, res.stderr
+        (d / "NucleOS-9.9.9-1.x86_64.rpm").unlink()
+        res = run("verify", "--dir", str(d), "--version", V)
+        assert res.returncode == 1 and ".rpm" in res.stderr, res.stderr
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def the_workflow_builds_and_installs_the_rpm_toolchain():
+    text = workflow_text()
+    assert "--bundles appimage,deb,rpm" in text, "linux does not build the rpm bundle"
+    apt_lines = [l for l in text.splitlines() if "apt" in l and "install" in l]
+    assert any(re.search(r"\brpm\b", l) for l in apt_lines), apt_lines
+
+
+def the_linux_packages_declare_dependencies_and_recommend_a_keyring():
+    linux = json.loads(TAURI_CONF.read_text(encoding="utf-8"))["bundle"]["linux"]
+    for fmt in ("deb", "rpm"):
+        depends = linux[fmt].get("depends") or []
+        recommends = linux[fmt].get("recommends") or []
+        assert depends, f"{fmt}.depends is empty"
+        assert "gnome-keyring" in recommends, f"{fmt}.recommends lacks gnome-keyring: {recommends}"
+        assert not set(depends) & set(recommends), f"{fmt}: in both depends and recommends: {set(depends) & set(recommends)}"
+
+
+
 CASES = [
     verify_accepts_a_complete_release_and_names_what_is_missing,
     a_foreign_version_in_a_versioned_name_is_refused,
@@ -248,6 +293,10 @@ CASES = [
     the_smoke_script_checks_the_install_and_the_daemon,
     releasing_documents_the_identifier_change,
     the_nsis_preinstall_hook_still_stops_the_daemon,
+    the_bundle_identity_is_nucleos_not_the_old_product_name,
+    a_missing_rpm_is_named_and_a_foreign_rpm_version_is_refused,
+    the_workflow_builds_and_installs_the_rpm_toolchain,
+    the_linux_packages_declare_dependencies_and_recommend_a_keyring,
 ]
 
 if __name__ == "__main__":

@@ -128,6 +128,25 @@ class BudgetTest(Env):
         self.assertEqual(res["can_open"], ["a", "b"])  # 8 + 8 fit in 20, a third does not
         self.assertTrue(any("c" in r and "disco" in r for r in res["reasons"]))
 
+    def test_docs_layer_costs_nothing(self):
+        self.assertEqual(tr._cost(self.cfg, self.store.m or {}, "docs"), 0)
+        self.assertEqual(tr._cost(self.cfg, {"costs_gb": {"docs": 5}}, "docs"), 0)
+        self.assertEqual(tr._cost(self.cfg, {}, "core"), 8.0)
+
+    def test_budget_ignores_docs_branches(self):
+        self.put([
+            make_branch("x", state="building", target="X"),
+            make_branch("d1", layer="docs", state="building"),
+            make_branch("d2", layer="docs"),
+            make_branch("a"), make_branch("b"), make_branch("c"),
+        ])
+        self.sizes["X"] = 3.0
+        self.free_dev = self.free_root = 40.0
+        res = self.budget()
+        self.assertEqual(res["slack_gb"], 20.0)  # docs add no growth
+        self.assertEqual(res["can_open"], ["a", "b"])  # docs neither take a slot nor appear
+        self.assertNotIn("d2", res["can_open"])
+
     def test_uses_the_smaller_of_the_two_volumes(self):
         self.put([make_branch("a")])
         self.free_dev, self.free_root = 50.0, 20.0
@@ -362,6 +381,31 @@ class OpenTest(Env):
         self.assertTrue(res["workflow_sync"].startswith("failed"))
         self.assertEqual(self.store.m["branches"]["a"]["state"], "open")
 
+    def test_docs_branch_opens_without_worktree_or_target_dir(self):
+        self.put([make_branch("d", layer="docs")])
+        res = tr.run_open(self.args(branch="d"))
+        self.assertEqual(self.fake.calls, [])  # no git, no link, no workflow sync
+        self.assertIsNone(res["worktree"])
+        self.assertNotIn("CARGO_TARGET_DIR", res.get("env") or {})
+        self.assertFalse((Path(self.home) / "cargo-target" / "T1-d").exists())
+        b = self.store.m["branches"]["d"]
+        self.assertEqual(b["state"], "open")
+        self.assertIsNone(b["worktree"])
+        self.assertIsNone(b["target_dir"])
+
+    def test_docs_branch_opens_even_below_the_disk_floor(self):
+        self.put([make_branch("d", layer="docs")])
+        self.free_dev = 10.0
+        tr.run_open(self.args(branch="d"))
+        self.assertEqual(self.store.m["branches"]["d"]["state"], "open")
+
+    def test_workflow_sync_names_the_no_project_refusal_and_its_repair(self):
+        self.fake.fail = {"--workflow-sync": (1, '{"refusal":"no_project"}')}
+        with mock.patch.object(tr, "find_core", lambda: "/x/nucleos-core"):
+            res = tr._workflow_sync(self.wt)
+        self.assertIn("no_project", res)
+        self.assertNotIn("once the daemon is up", res)  # not the generic daemon-down advice
+
     def test_missing_link_source_is_skipped(self):
         shutil.rmtree(os.path.join(self.root, "shell"))
         res = self.open()
@@ -388,6 +432,12 @@ class CloseTest(Env):
 
     def close(self):
         return tr.run_close(self.args(branch="a"))
+
+    def test_docs_branch_close_points_at_the_exit_verbs(self):
+        self.store.m["branches"]["a"].update(layer="docs", worktree=None, target_dir=None)
+        with self.assertRaises(tr.TreeError) as ctx:
+            self.close()
+        self.assertIn("merge", str(ctx.exception))
 
     def test_teardown_order_links_worktree_target_branch(self):
         res = self.close()

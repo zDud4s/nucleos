@@ -101,6 +101,8 @@ Leaf phases (`plan`, `execute`, `review`, `rescue`, `bootstrap`, `maintenance`; 
 
 A sub-orchestrator runs in the `wf-orchestrator` cockpit (skill `orchestrate-node`) and may dispatch only `wf-orchestrator`, `wf-planner`, `wf-executor` and `wf-reviewer`. Its phase name for model routing is `orchestrate_node`.
 
+In a tree driven by `tree.py` there are two more cockpits. The top-of-branch orchestrator runs in `wf-tree-orchestrator` (same walls as `wf-orchestrator`; its node is not closed by itself, it stays `running` until the branch merges), routing phase `tree_orchestrate`. A leaf `execute` runs in `wf-leaf` (routing phase `tree_leaf`): it is the one leaf cockpit with `node_update` and `node_close`, usable on **its own node only**. Reviewers get no `node_close`; they return their report as text and the controller stores it.
+
 When a leaf fails, is blocked, or thinks the task needs rescuing, its only move is to emit the `## Escalation` block below and exit non-zero. The controller of its node decides what happens next; that decision is not delegable downward.
 
 This needs stating because it is reachable by accident: `AGENTS.md` and `CLAUDE.md` point every agent at `.nucleos/workflow/workflow.md`, so a codex executor doing ordinary orientation reads its way into a controller's instructions and finds "on failure, dispatch rescue" written as if addressed to it. It is not. A dispatched executor that follows that line spawns a phase the controller never asked for, outside its timeout, unrecorded, and, when the target is `claude`, visible to the user as an unexplained session in their own session list.
@@ -192,9 +194,11 @@ The Task tool returns the phase output directly. Apply the same exit/escalation 
 | `maintenance` | `wf-maintenance` | Read, Glob, Grep, Edit, Write, Bash |
 | `bootstrap` | `wf-bootstrap` | Read, Glob, Grep, Edit, Write, Bash |
 | `run_pipeline.synthesize` | `wf-synthesizer` | Read, Glob, Grep |
+| `tree_leaf` | `wf-leaf` | Bash, Read, Edit, Write, Glob, Grep, mcp__nucleos__node_update, mcp__nucleos__node_close (own node only) |
+| `tree_orchestrate` | `wf-tree-orchestrator` | same tools as `wf-orchestrator`; the top-of-branch node does not close itself |
 | `orchestrate_node` | `wf-orchestrator` | Read, Glob, Grep, Write, Agent, mcp__nucleos__node_open, mcp__nucleos__node_update, mcp__nucleos__node_close, mcp__nucleos__node_tree, mcp__nucleos__node_active, mcp__nucleos__record, mcp__nucleos__verify, mcp__nucleos__verify_status |
 
-The definitions live in `.claude/agents/wf-<phase>.md` (`wf-orchestrator.md` for `orchestrate_node`); the `tools:` line in each is the allowlist the harness actually enforces.
+The definitions live in `.claude/agents/wf-<phase>.md` (`wf-orchestrator.md` for `orchestrate_node`, `wf-tree-orchestrator.md` for `tree_orchestrate`, `wf-leaf.md` for `tree_leaf`); the `tools:` line in each is the allowlist the harness actually enforces.
 
 **Never dispatch a phase as `general-purpose`.** That subagent type carries every tool there is, so a `wf-rescue` sent through it gets `Edit`, `Write` and `Bash`, and a `wf-reviewer` gets `Edit` and `Write` — which is exactly the wall these phases exist behind. A skill's `tools:` frontmatter is never enforced (it is the **agent** frontmatter field; a skill body arrives at a subagent as prompt text with its frontmatter stripped), so without the cockpit the allowlist is prose describing a wall that is not there.
 
