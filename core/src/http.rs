@@ -148,6 +148,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(remote::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
+        .merge(crate::route_index::routes())
         .merge(team::routes())
         .merge(themes::routes())
         .merge(workflows::routes())
