@@ -309,7 +309,6 @@ pub mod testing {
     }
 
     /// Makes the document absent (the old "file does not exist").
-    #[cfg(test)]
     pub fn clear(project_id: &str, name: &str) {
         edit(|mut snapshot| {
             snapshot.remove(&Scope::project(project_id), name);
@@ -318,7 +317,6 @@ pub mod testing {
     }
 
     /// Records the document as stored-but-unreadable (the old "file does not parse").
-    #[cfg(test)]
     pub fn publish_unreadable(project_id: &str, name: &str, reason: &str) {
         edit(|mut snapshot| {
             snapshot.mark_unreadable(settings::Unreadable {
