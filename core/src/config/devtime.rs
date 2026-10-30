@@ -598,16 +598,25 @@ fn devtime_answer(entry: &DevtimeCacheEntry) -> Option<ResolvedDevtime> {
 }
 
 /// The per-action floor on the shadow hit rate (spec 4.1).
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeHitRateMin {
     pub inject: f64,
     pub propose: f64,
 }
 
-/// The automatic actions' thresholds (actions design spec, sections 4 and 6). RED stub: the
-/// `Default` is derived (all zero) so that the default tests fail until GREEN writes the spec values.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+impl Default for DevtimeHitRateMin {
+    fn default() -> Self {
+        Self {
+            inject: 0.6,
+            propose: 0.5,
+        }
+    }
+}
+
+/// The automatic actions' thresholds (actions design spec, sections 4 and 6). A partial or absent
+/// block is valid: every field has the spec default.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeActionsConfig {
     /// Global switch: false puts every pair in `off`.
@@ -635,8 +644,62 @@ pub struct DevtimeActionsConfig {
     pub pairs: BTreeMap<String, Vec<String>>,
 }
 
-/// RED stub: GREEN refuses a `holdout_fraction` outside [0, 1] and a zero `inject_max_per_session`.
-fn validate_actions(_actions: &DevtimeActionsConfig) -> Result<(), String> {
+impl Default for DevtimeActionsConfig {
+    fn default() -> Self {
+        let mut pairs = BTreeMap::new();
+        pairs.insert("inject".to_string(), owned(&["D3", "D6"]));
+        pairs.insert("propose".to_string(), owned(&["F1", "F2"]));
+        Self {
+            enabled: true,
+            precision_wilson_lower: 0.6,
+            effect_min_resolved: 30,
+            effect_min_sessions: 10,
+            effect_min_days: 14,
+            shadow_hit_rate_min: DevtimeHitRateMin::default(),
+            min_mean_hit_cost_ms: 30_000,
+            inject_window_days: 14,
+            inject_min_count: 3,
+            inject_min_cost_ms: 120_000,
+            inject_max_per_session: 3,
+            inject_cooldown_days: 3,
+            propose_min_sessions: 3,
+            propose_min_cost_ms: 600_000,
+            propose_window_days: 14,
+            propose_max_open: 5,
+            human_min_marks: 5,
+            holdout_fraction: 0.10,
+            rollback_window: 30,
+            reentry_days: 14,
+            pairs,
+        }
+    }
+}
+
+/// Refuses a fraction outside [0, 1] and an injection cap of zero.
+fn validate_actions(actions: &DevtimeActionsConfig) -> Result<(), String> {
+    let fractions = [
+        ("actions.holdout_fraction", actions.holdout_fraction),
+        (
+            "actions.precision_wilson_lower",
+            actions.precision_wilson_lower,
+        ),
+        (
+            "actions.shadow_hit_rate_min.inject",
+            actions.shadow_hit_rate_min.inject,
+        ),
+        (
+            "actions.shadow_hit_rate_min.propose",
+            actions.shadow_hit_rate_min.propose,
+        ),
+    ];
+    for (name, value) in fractions {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(format!("{name} must be within [0, 1], got {value}"));
+        }
+    }
+    if actions.inject_max_per_session == 0 {
+        return Err("actions.inject_max_per_session must be at least 1".to_string());
+    }
     Ok(())
 }
 

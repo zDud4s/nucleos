@@ -41,13 +41,49 @@ pub const TEMPLATE_IDS: [&str; 4] = [
 ];
 
 /// Hash of the thresholds one `(action, rule)` pair decides under, so a threshold change is visible
-/// in the log. RED stub.
+/// in the log. Only the thresholds that action reads go in, so tuning `propose` leaves `inject`
+/// hashes alone. SHA-256 hex of a fixed text form: stable across runs and versions of the std hasher.
 pub fn thresholds_hash(
-    _config: &crate::config::DevtimeActionsConfig,
-    _action: &str,
-    _rule: &str,
+    config: &crate::config::DevtimeActionsConfig,
+    action: &str,
+    rule: &str,
 ) -> String {
-    todo!("GREEN: hash the pair's thresholds")
+    use sha2::{Digest, Sha256};
+    let hit_rate_min = match action {
+        "inject" => config.shadow_hit_rate_min.inject,
+        _ => config.shadow_hit_rate_min.propose,
+    };
+    let mut text = format!(
+        "{action}|{rule}|{}|{}|{}|{}|{}|{hit_rate_min}|{}",
+        config.precision_wilson_lower,
+        config.effect_min_resolved,
+        config.effect_min_sessions,
+        config.effect_min_days,
+        config.min_mean_hit_cost_ms,
+        config.holdout_fraction,
+    );
+    let specific = match action {
+        "inject" => format!(
+            "|{}|{}|{}|{}|{}",
+            config.inject_window_days,
+            config.inject_min_count,
+            config.inject_min_cost_ms,
+            config.inject_max_per_session,
+            config.inject_cooldown_days,
+        ),
+        _ => format!(
+            "|{}|{}|{}|{}",
+            config.propose_min_sessions,
+            config.propose_min_cost_ms,
+            config.propose_window_days,
+            config.propose_max_open,
+        ),
+    };
+    text.push_str(&specific);
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// One `devtime_shadow` row, every column.
