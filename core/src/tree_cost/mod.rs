@@ -38,8 +38,9 @@ mod tests {
 
     async fn insert_run(pool: &sqlx::SqlitePool, cost: Option<f64>, input: i64, output: i64) -> i64 {
         sqlx::query(
-            "INSERT INTO runs (status, cost_usd, created_at, input_tokens, output_tokens, \
-             cache_read_tokens, cache_creation_tokens) VALUES ('completed', ?, ?, ?, ?, 10, 20)",
+            "INSERT INTO runs (prompt, status, cost_usd, created_at, input_tokens, output_tokens, \
+             cache_read_tokens, cache_creation_tokens) \
+             VALUES ('p', 'completed', ?, ?, ?, ?, 10, 20)",
         )
         .bind(cost)
         .bind(NOW)

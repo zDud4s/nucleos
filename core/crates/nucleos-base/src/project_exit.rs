@@ -63,6 +63,10 @@ const PROJECT_SCOPED: &[&str] = &[
     "devtime_findings",
     // The parent of six session-keyed tables; those are written out in `remove`, ahead of the loop.
     "devtime_sessions",
+    // What the automatic actions decided, or would have decided, about the project (migration 0260).
+    // It is derived from the project's dev time, so it goes with it. `devtime_action_state` has no
+    // project: it is the house's switch per (action, rule), and it stays.
+    "devtime_shadow",
     "devtime_turn_stats",
     // Pending distillations are the project's history; a forgotten project must not be distilled later.
     "distill_queue",
@@ -111,6 +115,12 @@ const PROJECT_SCOPED: &[&str] = &[
     // house's rows (`project_id` NULL raw, '' daily) never match a project id, so they stay.
     "slot_samples",
     "slot_samples_daily",
+    // The registry of the project's spec files (migration 0264). Only the registry row goes: the
+    // files on disk are not touched. Specs with no project (`project_id` NULL) never match a
+    // project id, so they stay. `spec_criteria`, `spec_deps` and `spec_questions` have no `project_id`
+    // and no foreign key, so neither this list nor VIA_PARENT reaches them: they are written out in
+    // `remove`, ahead of the loop.
+    "specs",
     // The project's unresolved and past task claims (migration 0250) and the sessions registered for it:
     // working history, so forgetting the project takes them. Their event log hangs off task_claims
     // (VIA_PARENT below).
@@ -118,7 +128,8 @@ const PROJECT_SCOPED: &[&str] = &[
     "task_sessions",
     // A tree job (migration 0262) is the project's work history, like the `work_nodes` it drives. Jobs
     // with no project (`project_id` NULL) never match a project id, so they stay. `tree_transitions`
-    // has no `project_id` and no foreign key, so neither this list nor VIA_PARENT reaches it.
+    // and `tree_budgets` have no `project_id` and no foreign key, so neither this list nor VIA_PARENT
+    // reaches them: they are written out in `remove`, ahead of the loop.
     "tree_jobs",
     "vcs_requests",
     // What a project's verification asked, cached, did and observed is its history.
@@ -607,6 +618,44 @@ pub async fn remove(
         .execute(&mut *tx)
         .await?
         .rows_affected();
+
+        // The spec registry's children and the tree tables name their parent in a TEXT column with no
+        // foreign key, and `every_child_of_a_project_scoped_table_is_listed` holds `VIA_PARENT` to
+        // exactly the tables that have one, so they are written out here. BEFORE the `PROJECT_SCOPED`
+        // loop, which deletes the `specs`, `work_nodes` and `tree_jobs` these read.
+        //
+        // A dependency goes if either end does: an edge from a surviving spec to a forgotten one
+        // points at nothing. A transition is recorded per node, and a job's root or linked node may
+        // carry no `project_id`, so the job reaches it too. A budget is per tree, keyed on the root
+        // (0265), so only a root of this project takes it: a node of this project inside another
+        // project's tree does not (`work_nodes` lets a child name its own project).
+        for sql in [
+            "DELETE FROM spec_criteria
+              WHERE spec_id IN (SELECT id FROM specs WHERE project_id = ?1)",
+            "DELETE FROM spec_questions
+              WHERE spec_id IN (SELECT id FROM specs WHERE project_id = ?1)",
+            "DELETE FROM spec_deps
+              WHERE spec_id IN (SELECT id FROM specs WHERE project_id = ?1)
+                 OR depends_on IN (SELECT id FROM specs WHERE project_id = ?1)",
+            "DELETE FROM tree_transitions
+              WHERE node_id IN (
+                    SELECT id FROM work_nodes
+                     WHERE project_id = ?1
+                        OR tree_job_id IN (SELECT id FROM tree_jobs WHERE project_id = ?1)
+                    UNION
+                    SELECT root_node_id FROM tree_jobs WHERE project_id = ?1)",
+            "DELETE FROM tree_budgets
+              WHERE tree_id IN (
+                    SELECT id FROM work_nodes WHERE project_id = ?1 AND id = root_id
+                    UNION
+                    SELECT root_node_id FROM tree_jobs WHERE project_id = ?1)",
+        ] {
+            forgotten += sqlx::query(sql)
+                .bind(project_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
 
         // Children first. The deferral above means it would work in any order, and doing it in the
         // order the rows actually depend on keeps the statement log readable when one of them fails.
@@ -1992,6 +2041,129 @@ mod tests {
                 "{table}: alpha's rows must go and bravo's must stay"
             );
         }
+    }
+
+    /// None of these tables can name a project, so each is reached through a parent: a spec, a node,
+    /// a job or a tree's root. Another project's rows and the house's stay, and so does the budget of
+    /// bravo's tree when one node inside it belongs to alpha.
+    #[tokio::test]
+    async fn forgetting_a_project_removes_its_spec_children_and_tree_rows() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        register(&pool, "bravo").await;
+
+        for (spec, project) in [
+            ("spec-alpha", Some("alpha")),
+            ("spec-bravo", Some("bravo")),
+            ("spec-house", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO specs (id, project_id, path, content_sha, created_at, updated_at)
+                 VALUES (?1, ?2, ?1, 'sha', 'x', 'x')",
+            )
+            .bind(spec)
+            .bind(project)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO spec_criteria (spec_id, ordinal, text, spec_sha)
+                 VALUES (?, 1, 't', 'sha')",
+            )
+            .bind(spec)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO spec_questions (id, spec_id, question, created_at)
+                 VALUES (?1, ?1, 'q', 'x')",
+            )
+            .bind(spec)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        for sql in [
+            "INSERT INTO spec_deps (spec_id, depends_on) VALUES
+                 ('spec-alpha', 'spec-bravo'),
+                 ('spec-bravo', 'spec-alpha'),
+                 ('spec-bravo', 'spec-house')",
+            // The job roots have no `work_nodes` row: only `tree_jobs` knows whose they are.
+            "INSERT INTO tree_jobs (id, root_node_id, project_id, goal, state, manifest, created_at, updated_at) VALUES
+                 ('job-alpha', 'job-root-alpha', 'alpha', 'g', 's', '{}', 'x', 'x'),
+                 ('job-bravo', 'job-root-bravo', 'bravo', 'g', 's', '{}', 'x', 'x'),
+                 ('job-house', 'job-root-house', NULL, 'g', 's', '{}', 'x', 'x')",
+            "INSERT INTO work_nodes (id, project_id, root_id, parent_id, depth, kind, title, goal, status, tree_job_id, created_at, updated_at) VALUES
+                 ('root-alpha', 'alpha', 'root-alpha', NULL, 0, 'root', 't', 'g', 'running', NULL, 'x', 'x'),
+                 ('leaf-alpha', 'alpha', 'root-alpha', 'root-alpha', 1, 'leaf', 't', 'g', 'running', NULL, 'x', 'x'),
+                 ('linked-alpha', NULL, 'linked-alpha', NULL, 0, 'leaf', 't', 'g', 'running', 'job-alpha', 'x', 'x'),
+                 ('root-bravo', 'bravo', 'root-bravo', NULL, 0, 'root', 't', 'g', 'running', NULL, 'x', 'x'),
+                 ('alpha-in-bravo', 'alpha', 'root-bravo', 'root-bravo', 1, 'leaf', 't', 'g', 'running', NULL, 'x', 'x')",
+            "INSERT INTO tree_transitions (node_id, transition, key, created_at) VALUES
+                 ('job-root-alpha', 'close', 'k', 'x'),
+                 ('root-alpha', 'close', 'k', 'x'),
+                 ('leaf-alpha', 'close', 'k', 'x'),
+                 ('linked-alpha', 'close', 'k', 'x'),
+                 ('alpha-in-bravo', 'close', 'k', 'x'),
+                 ('job-root-bravo', 'close', 'k', 'x'),
+                 ('root-bravo', 'close', 'k', 'x'),
+                 ('job-root-house', 'close', 'k', 'x')",
+            "INSERT INTO tree_budgets (tree_id, created_at, updated_at) VALUES
+                 ('job-root-alpha', 'x', 'x'),
+                 ('root-alpha', 'x', 'x'),
+                 ('job-root-bravo', 'x', 'x'),
+                 ('root-bravo', 'x', 'x'),
+                 ('job-root-house', 'x', 'x')",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+
+        let removed = remove(&pool, "alpha", true).await.unwrap();
+        assert!(
+            matches!(removed, Removed::Done { .. }),
+            "the forget was refused rather than performed: {removed:?}"
+        );
+
+        let rows = |sql: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(sql)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            rows("SELECT id FROM specs ORDER BY id").await,
+            ["spec-bravo", "spec-house"]
+        );
+        assert_eq!(
+            rows("SELECT spec_id FROM spec_criteria ORDER BY spec_id").await,
+            ["spec-bravo", "spec-house"]
+        );
+        assert_eq!(
+            rows("SELECT spec_id FROM spec_questions ORDER BY spec_id").await,
+            ["spec-bravo", "spec-house"]
+        );
+        assert_eq!(
+            rows("SELECT spec_id || '>' || depends_on FROM spec_deps").await,
+            ["spec-bravo>spec-house"],
+            "an edge with a forgotten spec at either end must go, and no other"
+        );
+        assert_eq!(
+            rows("SELECT id FROM tree_jobs ORDER BY id").await,
+            ["job-bravo", "job-house"]
+        );
+        assert_eq!(
+            rows("SELECT node_id FROM tree_transitions ORDER BY node_id").await,
+            ["job-root-bravo", "job-root-house", "root-bravo"]
+        );
+        assert_eq!(
+            rows("SELECT tree_id FROM tree_budgets ORDER BY tree_id").await,
+            ["job-root-bravo", "job-root-house", "root-bravo"],
+            "alpha's node inside bravo's tree must not take bravo's budget"
+        );
     }
 
     /// A digest names jobs of several projects and its feed line quotes their headers, so it goes

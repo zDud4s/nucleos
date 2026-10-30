@@ -42,8 +42,9 @@ pub use self::turn::*;
 /// The context window a conversation is given, unless its own row asks for a different one.
 ///
 /// An ABSOLUTE token count, not a fraction, because everything it is compared against is one:
-/// `runs.context_fill` is `input_tokens + cache_read_input_tokens` off the live assistant events,
-/// and `sessions::Conversation::context_estimate` is a character count divided by four. 140k is
+/// `runs.context_fill` is `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` off
+/// the live assistant events, and `sessions::Conversation::context_estimate` is a character count
+/// divided by four. 140k is
 /// ≈0.7 of the 200k window the runner assumes as its conservative floor — deliberately below it, so
 /// an ordinary conversation is summarised while it is still cheap to summarise.
 ///

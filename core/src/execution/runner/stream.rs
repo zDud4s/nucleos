@@ -201,10 +201,21 @@ pub fn context_fill_from_line(line: &str, current: Option<i64>) -> Option<i64> {
         let cache_read_tokens = usage
             .and_then(|usage| usage.get("cache_read_input_tokens"))
             .and_then(serde_json::Value::as_i64);
+        // Optional: older streams do not carry this counter, and for them the sum stays as it was.
+        let cache_creation_tokens = usage
+            .and_then(|usage| usage.get("cache_creation_input_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
 
         if let (Some(input_tokens), Some(cache_read_tokens)) = (input_tokens, cache_read_tokens) {
-            // Cache-read tokens occupy the context window exactly as fresh input tokens do.
-            return input_tokens.checked_add(cache_read_tokens).or(current);
+            // Cached tokens occupy the context window exactly as fresh input tokens do, whether
+            // they were read from the cache or written to it. After a cache miss the read is 0 and
+            // nearly the whole prompt arrives as creation, so leaving it out reads a full window
+            // as nearly empty.
+            return input_tokens
+                .checked_add(cache_read_tokens)
+                .and_then(|sum| sum.checked_add(cache_creation_tokens))
+                .or(current);
         }
     }
 
@@ -219,8 +230,8 @@ pub fn context_fill_from_line(line: &str, current: Option<i64>) -> Option<i64> {
 /// The fullest the stream ever got, rather than where it ended.
 ///
 /// Written on top of `context_fill_from_line` instead of re-reading the JSON: there is one
-/// definition of "what occupies the window" — `input_tokens + cache_read_input_tokens` — and it
-/// lives there. Two copies would drift the day the CLI added a third counter, and drift silently.
+/// definition of "what occupies the window" — `input_tokens + cache_read_input_tokens +
+/// cache_creation_input_tokens` — and it lives there. Two copies would drift the day the CLI added a third counter, and drift silently.
 ///
 /// The `None` in the call is deliberate: what is wanted is what THIS line says, not the running
 /// total, so that the larger of the two can be chosen here.

@@ -473,3 +473,38 @@ pub(super) async fn run_read_effect(
         }
     }
 }
+
+/// `effect_of_call` for the stdio MCP server, which holds a `DaemonClient` and no pool: `get_run`'s
+/// mode comes from `GET /runs/{id}` rather than from the row.
+///
+/// Stricter than `run_read_effect` in one place, on purpose: a run the daemon does not answer for
+/// is `ReadsUntrusted` here, because its caller refuses that answer instead of marking a turn, so
+/// nothing is lost by refusing, and the daemon being down or older (no `mode` field) is "I could
+/// not tell". The mode is read in one request and the tool reads the run in another; a run's mode
+/// does not change after it is created, so the two cannot disagree.
+pub(super) async fn effect_of_call_via_daemon(
+    client: &crate::daemon_client::DaemonClient,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> ToolEffect {
+    let effect = tool_effect(tool);
+    if effect != ToolEffect::ReadsOwn {
+        return effect;
+    }
+    match tool {
+        "get_run" => {
+            let Some(id) = arguments.get("id").and_then(serde_json::Value::as_i64) else {
+                return ToolEffect::ReadsUntrusted;
+            };
+            let run = client.get_run(id).await.unwrap_or_default();
+            match run.get("mode").and_then(serde_json::Value::as_str) {
+                Some(mode) if mode != crate::integrations::email::TRIAGE_MODE => {
+                    ToolEffect::ReadsOwn
+                }
+                _ => ToolEffect::ReadsUntrusted,
+            }
+        }
+        "github_read" => github_read_effect(arguments),
+        _ => effect,
+    }
+}

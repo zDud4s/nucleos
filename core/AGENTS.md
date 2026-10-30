@@ -307,6 +307,33 @@ the contract, not a snapshot.
 | `tree_job/landing.rs` | Stub, not implemented yet (wave 6): gates, merge and land of a tree, with the reviewer's findings kept as data in the manifest. |
 | `tree_job/http.rs` | Stub, not implemented yet (wave 6): the local `/trees` routes. |
 | `tree_job/decisions.rs` | Stub, not implemented yet (wave 7): parking a branch on a decision for the owner, resuming it on the answer, and the single list of decisions. |
+| `conductor/mod.rs` | Conductor: session liveness, context limits, depth guards and resume. Module root; declares the submodules. |
+| `conductor/liveness.rs` | Stub, not implemented yet: session liveness classification. |
+| `conductor/context.rs` | Stub, not implemented yet: context-fill limits and verdicts. |
+| `conductor/depth.rs` | Stub, not implemented yet: child-node depth guards. |
+| `conductor/continuation.rs` | Stub, not implemented yet: continuation of a handed-off node. |
+| `conductor/resume.rs` | Stub, not implemented yet: run resume after a stop. |
+| `conductor/sweep.rs` | Stub, not implemented yet: the liveness sweep. |
+| `conductor/http.rs` | Stub, not implemented yet: the conductor's HTTP routes. |
+| `spec_backlog/mod.rs` | Spec backlog (migration 0264): a registry of spec files, their criteria, dependencies and owner questions. Module root; declares the submodules. |
+| `spec_backlog/model.rs` | Stub, not implemented yet: the spec backlog's types. |
+| `spec_backlog/store.rs` | Stub, not implemented yet: the spec backlog's storage. |
+| `spec_backlog/scan.rs` | Stub, not implemented yet: the scan of spec files. |
+| `spec_backlog/criteria.rs` | Stub, not implemented yet: parsing a spec's criteria. |
+| `spec_backlog/extract.rs` | Stub, not implemented yet: extracting a spec's criteria. |
+| `spec_backlog/prompts.rs` | Stub, not implemented yet: the extraction prompts. |
+| `spec_backlog/deps.rs` | Stub, not implemented yet: the dependencies between specs. |
+| `spec_backlog/audit.rs` | Stub, not implemented yet: the spec audit. |
+| `spec_backlog/verdict.rs` | Stub, not implemented yet: a spec's done verdict. |
+| `spec_backlog/finish.rs` | Stub, not implemented yet: finishing specs. |
+| `spec_backlog/http.rs` | Stub, not implemented yet: the spec backlog's HTTP routes. |
+| `tree_cost/mod.rs` | Tree cost (migration 0265): per-tree spending, budgets, cache measurement and the wait policy. Module root; declares the submodules and holds the migration's tests. |
+| `tree_cost/ledger.rs` | Stub, not implemented yet: the tree cost ledger. |
+| `tree_cost/budget.rs` | Stub, not implemented yet: tree budgets. |
+| `tree_cost/measure.rs` | Stub, not implemented yet: cache measurement. |
+| `tree_cost/report.rs` | Stub, not implemented yet: the cache report. |
+| `tree_cost/wait_policy.rs` | Stub, not implemented yet: the wait policy decision. |
+| `tree_cost/http.rs` | Stub, not implemented yet: the tree cost HTTP routes. |
 | `workflow_records.rs` | The AI workflow's ledgers kept by the daemon (F4, migration 0204): the `workflow_records` table (kind `metric`/`rework`/`intent`/`event`, `task_id`, `phase`, `caught_by`, a JSON `payload` capped at 16 KiB), `POST /workflow/records` behind the `record` MCP tool (owner or run key; the worktree and project are resolved and fenced exactly as `verify` does, never taken from the caller), and the reads that join a task's rework to the step that caught it and to its verifications (`verify_runs.task_id`, set from `verify`'s optional `task_id`). |
 | `crates/nucleos-base/src/verify_sched.rs` | **Pure.** Picks the next verification unit to start from the queue, the free capacity and when each project last started something: best effective priority (one level better after aging), then the project whose last start is oldest, then FIFO. A head that does not fit blocks the queue, so heavy units are not starved. No I/O. |
 | `crates/nucleos-base/src/wake.rs` | Process-wide level-triggered change hints (`Topic::{Feed,Proposals,Kill,Budget,Runs}`, `bump`, `subscribe`) over one `tokio::sync::watch<u64>` per topic. A hint carries no data and may be spurious; bursts coalesce into one wake-up and the database stays the source of truth. Global to the process so writers that only hold a pool need no bus handle. |

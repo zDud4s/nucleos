@@ -387,6 +387,9 @@ pub struct RunStatusResponse {
     pub id: i64,
     pub project_id: Option<String>,
     pub status: String,
+    /// Answered because the stdio MCP server holds no pool: `effect_of_call_via_daemon` reads this
+    /// to tell a triage run, whose stdout carries a stranger's words, from any other.
+    pub mode: String,
     pub gate_status: Option<String>,
     pub gate_exit_code: Option<i32>,
     pub gate_output: Option<String>,
@@ -740,8 +743,8 @@ pub async fn get_run(
         // the two inputs `with_prompt_budget` needs to derive the pair of estimates this response
         // does answer. Selecting them here rather than in a second query keeps the residual and the
         // numbers it was computed from as one read of one row.
-        "SELECT id, project_id, status, gate_status, gate_exit_code, gate_output, exit_code, stdout,
-                stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
+        "SELECT id, project_id, status, mode, gate_status, gate_exit_code, gate_output, exit_code,
+                stdout, stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
                 num_turns, context_fill, steerable, successor_run_id, chat_id, cache_creation_tokens,
                 authored_prompt_chars, model, effort, runner, route_mode, route_decision_id,
                 advised_runner, advised_model, advised_effort, route_failed

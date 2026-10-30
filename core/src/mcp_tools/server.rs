@@ -7,8 +7,8 @@ pub enum McpBox {
     All,
     JobNode(i64),
     /// An interactive (IDE/terminal) session's box: it serves `WORKTREE_BOX_TOOLS` (the verify tools,
-    /// `record` and the work-node tools) and nothing else, and every call is held to this absolute
-    /// worktree path. See `worktree_for_call`.
+    /// `record`, the work-node tools and the launch tools) and nothing else. The tools that take a
+    /// worktree are held to this absolute path (see `worktree_for_call`); the launch tools take none.
     Worktree(String),
     /// A team agent's NODE run id; the box serves `TEAM_BASE` and `TEAM_EXTRAS`.
     Team(i64),
@@ -172,6 +172,23 @@ impl ServerHandler for NucleosTools {
                     request.name,
                 )),
             ]));
+        }
+        // `serves` reads the table by name. The worktree box can also launch work and nothing marks
+        // its session as having read a stranger's words, so a call that would read them is refused.
+        if matches!(self.served, McpBox::Worktree(_)) {
+            let arguments =
+                serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+            if effect_of_call_via_daemon(&self.client, &request.name, &arguments).await
+                == ToolEffect::ReadsUntrusted
+            {
+                return Ok(rmcp::model::CallToolResult::error(vec![
+                    rmcp::model::ContentBlock::text(format!(
+                        "{} is refused in this box: the answer may carry third-party text, such as \
+                         a triage run's output, and this box can also start work",
+                        request.name,
+                    )),
+                ]));
+            }
         }
         // Read before the request is moved into the context, and that is the whole of this line:
         // `filter_outgoing` has to know WHICH tool answered, and by the line below the name is gone.

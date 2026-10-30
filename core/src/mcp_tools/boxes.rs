@@ -196,7 +196,9 @@ pub const EVERY_BOX_TOOLS: &[&str] = &[
 pub const TASK_TOOL_NAMES: [&str; 4] = ["task_list", "task_claim", "task_release", "task_done"];
 
 /// What an interactive (IDE/terminal) session's worktree box serves: `EVERY_BOX_TOOLS` plus the five
-/// work-node tools, so the `orchestrate` skill can run a node tree there. Sorted.
+/// work-node tools, so the `orchestrate` skill can run a node tree there, and the five launch tools
+/// (`create_job`, `create_run`, `get_job`, `get_run`, `list_jobs`), so that session can start work
+/// and follow it. Sorted.
 ///
 /// Not `EVERY_BOX_TOOLS`: that list is also served by `McpBox::All` and `McpBox::JobNode`, and a job
 /// node holds a `Scope::Run` token the `/nodes` routes refuse, so offering it `node_*` would be a
@@ -205,12 +207,23 @@ pub const TASK_TOOL_NAMES: [&str; 4] = ["task_list", "task_claim", "task_release
 /// No new authority: this box's client already holds the owner's control token (the stored-token
 /// fallback of `client_for_box`), `/nodes` admits exactly that token and an Admin key, and the same
 /// session's SessionStart hook forwarder calls them already. The box only decides what the MODEL is
-/// offered. The effects stay low: `node_open/update/close` are `WritesOwn`, `node_tree/active` are
-/// `ReadsOwn`; none `Acts`, none `ReadsUntrusted`, and this box serves no untrusted read, so the taint
-/// rule has nothing to guard. The daemon enforces depth, sibling and `owned_paths` limits itself.
+/// offered. The node effects stay low: `node_open/update/close` are `WritesOwn`, `node_tree/active`
+/// are `ReadsOwn`. The daemon enforces depth, sibling and `owned_paths` limits itself.
 /// Accepted residual: node ids are not fenced to the worktree; they are the owner's own bookkeeping
 /// rows and run nothing. The task tools ride with `verify` here as in every box (`TASK_TOOL_NAMES`).
+///
+/// The only `Acts` tools here are `create_job` and `create_run`, and the person at this session is
+/// who asks for them. No tool here is `ReadsUntrusted` in `TOOL_EFFECTS`, but one call can be: by
+/// content, `get_run` on a triage run returns a model's answer over a stranger's mail (see
+/// `effect_of_call`). Nothing marks an interactive session for that read, so the taint rule could
+/// not bar a later `create_run` here; `call_tool` refuses that call instead, through
+/// `effect_of_call_via_daemon`. The launch tools take no worktree: they are not fenced to this one.
 pub const WORKTREE_BOX_TOOLS: &[&str] = &[
+    "create_job",
+    "create_run",
+    "get_job",
+    "get_run",
+    "list_jobs",
     "node_active",
     "node_close",
     "node_open",
