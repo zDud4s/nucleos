@@ -2958,7 +2958,8 @@ ol.ui-well {
 }
 
 .ui-field input,
-.ui-field textarea {
+.ui-field textarea,
+.ui-field select {
   min-width: 14rem;
   padding: var(--space-2);
   border: 1px solid var(--border-field);
@@ -2980,7 +2981,8 @@ ol.ui-well {
 }
 
 .ui-field input:focus-visible,
-.ui-field textarea:focus-visible {
+.ui-field textarea:focus-visible,
+.ui-field select:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
