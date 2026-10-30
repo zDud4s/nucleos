@@ -202,8 +202,7 @@ pub(super) async fn judge_status(
     let readiness = crate::judge::readiness(&state.pool, &project_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rules_error =
-        crate::judge::rules_problem(state.machine_config_root.clone(), &project_id).await;
+    let rules_error = crate::judge::rules_problem(&project_id);
     Ok(AutopilotJudgeResponse {
         project_id,
         judge,

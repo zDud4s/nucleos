@@ -137,38 +137,33 @@ pub(super) async fn queue_revert(
     {
         return waiting();
     }
-    let still_on =
-        match crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id) {
-            Ok(rules) => rules.revert_on_red,
-            Err(error) => {
-                // Unreadable is not "off": hold the revert and say so, so it goes ahead once the
-                // rules can be read again and the switch is still on.
-                let rules_path = crate::project::state::display_path(
-                    project_id,
-                    crate::project::state::AUTOPILOT_FILE,
-                );
-                let summary = format!(
-                    "post-merge gate on {target}: the revert of {} is held because {rules_path} \
-                     could not be read ({error}). Nothing was reverted yet; it goes ahead once \
-                     the rules can be read and revert_on_red is still on.",
-                    short(merge_sha),
-                    target = state.target
-                );
-                if let Err(error) = crate::feed::append(
-                    pool,
-                    Some(project_id),
-                    crate::verify::postgate::POSTGATE_RED_KIND,
-                    &summary,
-                    None,
-                    None,
-                )
-                .await
-                {
-                    tracing::warn!(%error, "postgate: cannot tell the owner the revert is held");
-                }
-                return waiting();
+    let still_on = match crate::project::rules::autopilot(project_id) {
+        Ok(rules) => rules.revert_on_red,
+        Err(error) => {
+            // Unreadable is not "off": hold the revert and say so, so it goes ahead once the
+            // rules can be read again and the switch is still on.
+            let summary = format!(
+                "post-merge gate on {target}: the revert of {} is held because the stored \
+                 rules of this project could not be read ({error}). Nothing was reverted \
+                 yet; it goes ahead once the rules can be read and revert_on_red is still on.",
+                short(merge_sha),
+                target = state.target
+            );
+            if let Err(error) = crate::feed::append(
+                pool,
+                Some(project_id),
+                crate::verify::postgate::POSTGATE_RED_KIND,
+                &summary,
+                None,
+                None,
+            )
+            .await
+            {
+                tracing::warn!(%error, "postgate: cannot tell the owner the revert is held");
             }
-        };
+            return waiting();
+        }
+    };
     if !still_on {
         let summary = format!(
             "post-merge gate on {target}: the revert of {} was NOT made because revert_on_red \

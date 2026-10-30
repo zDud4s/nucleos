@@ -258,8 +258,11 @@ pub mod testing {
                 return;
             }
             *held = None;
-            let gate = GATE.write().unwrap_or_else(PoisonError::into_inner);
+            // Lock order is SERIAL (inside `install`) first, then GATE, the same as a test that calls
+            // `settings::testing::install` itself and then `hold_shared()` through `test_state()`. The
+            // reverse order (GATE, then SERIAL) deadlocked against such a test.
             let installed = settings::testing::install(Settings::new());
+            let gate = GATE.write().unwrap_or_else(PoisonError::into_inner);
             *held = Some(Held::Exclusive {
                 _installed: installed,
                 _gate: gate,

@@ -141,9 +141,7 @@ pub(super) async fn post_admit(
         _ => return Json(AdmitAnswer::none()),
     };
     let kinds = project_id
-        .and_then(|pid| {
-            crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &pid).ok()
-        })
+        .and_then(|pid| crate::project::rules::autopilot(&pid).ok())
         .map(|rules| rules.command_kinds)
         .unwrap_or_default();
     let config = state

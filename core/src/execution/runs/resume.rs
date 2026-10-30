@@ -373,8 +373,7 @@ pub async fn resume_for_correction(
     let correction = write_correction(&state.pool, &draft).await?;
 
     let daemon_token = mint_run_token(&state.pool, correction).await;
-    let rules =
-        crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id);
+    let rules = crate::project::rules::autopilot(&project_id);
     // A correction is the same work continuing, so it runs under the ceiling the project names.
     let max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
     let gate_config = GateConfig::of_project(&project_id, &project_root);
@@ -1069,8 +1068,7 @@ pub(super) async fn continue_paused_run(
 
     // After the commit, because the resume row does not exist to be UPDATEd before it.
     let daemon_token = mint_run_token(&state.pool, resume_id).await;
-    let rules =
-        crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &wt_project_id);
+    let rules = crate::project::rules::autopilot(&wt_project_id);
     // A resumed run is the same work continuing, so it runs under the same ceiling the project
     // names - read here rather than carried on the row, because the row would hold what the file
     // said when the run first started and an operator who raised the ceiling to let this very run

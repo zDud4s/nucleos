@@ -1108,7 +1108,6 @@ async fn main() {
     tokio::spawn(execution::vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(execution::git_exec::GitExecutor {
-            machine_root: machine_config_root.clone(),
             pool: Some(state.pool.clone()),
             verify: verify::installed(),
             ..execution::git_exec::GitExecutor::default()

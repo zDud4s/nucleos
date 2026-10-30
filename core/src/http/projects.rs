@@ -618,15 +618,21 @@ pub(super) async fn onboarding_view(
     state: &AppState,
     id: &str,
     root: PathBuf,
+    just_confirmed: Option<&str>,
 ) -> Result<OnboardingView, (StatusCode, Json<serde_json::Value>)> {
     let machine_root = machine_config_root(state)?;
     let project_id = id.to_string();
+    let just_confirmed = just_confirmed.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
         let found = crate::detect::inspect_folder(&root);
-        // An unreadable rules file has no gate this can name; the POST refuses it by name.
-        let configured_gate = crate::config::load_schedule_rules(Some(&machine_root), &project_id)
-            .ok()
-            .and_then(|rules| rules.gate_command);
+        // Stored rules that cannot be read have no gate this can name; the POST refuses them by name.
+        // A gate the caller has just confirmed is the configured gate, stored or about to be seen
+        // (the onboarding writer still stores a file until it publishes the document).
+        let configured_gate = just_confirmed.or_else(|| {
+            crate::project::rules::autopilot(&project_id)
+                .ok()
+                .and_then(|rules| rules.gate_command)
+        });
         OnboardingView {
             onboarded: crate::onboarding::read_marker(Some(&machine_root), &project_id),
             marker_path: crate::project::state::display_path(
@@ -657,7 +663,7 @@ pub(super) async fn get_project_onboarding(
 ) -> Result<Json<OnboardingView>, (StatusCode, Json<serde_json::Value>)> {
     project_state_dir(&state, &id)?;
     let root = onboarding_root(&state, &id, query.root).await?;
-    onboarding_view(&state, &id, root).await.map(Json)
+    onboarding_view(&state, &id, root, None).await.map(Json)
 }
 
 /// Onboards a project to NucleOS, with the gate command a person confirmed. Idempotent.
@@ -785,7 +791,9 @@ pub(super) async fn post_project_onboard(
         pin_default_workflow(&state, &id, &root, home, library).await;
     }
 
-    onboarding_view(&state, &id, root).await.map(Json)
+    onboarding_view(&state, &id, root, gate.as_deref())
+        .await
+        .map(Json)
 }
 
 /// Pin the default workflow for a project being brought in, place its files in the project, and

@@ -8,7 +8,6 @@
 //!
 //! The first half is PURE (the rules). The second is the I/O: the question put to the judge and
 //! the row written for every answer (D10, D11, D13), which decides nothing by itself.
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -374,8 +373,6 @@ pub struct Asked {
     /// action a reviewer reads. E4: none; the row's `run_id` names the gate.
     pub event_ref: Option<i64>,
     pub project_id: Option<String>,
-    /// `AppState::machine_config_root`: where the project's `autopilot.yaml` lives (D4).
-    pub machine_root: Option<PathBuf>,
     pub subject: Subject,
 }
 
@@ -433,23 +430,16 @@ impl ResolutionRow {
     }
 }
 
-/// D4: the project's thresholds, read at decision time, like spec A's `thresholds_for`. An
-/// UNREADABLE file is an error, and the call gives today's outcome (D1): the defaults may be
-/// looser than what the project wrote down.
-async fn thresholds_for(
-    machine_root: Option<PathBuf>,
-    project_id: Option<&str>,
-) -> Result<ResolveThresholds, String> {
-    let Some(project_id) = project_id.map(str::to_owned) else {
+/// D4: the project's thresholds, read at decision time, like spec A's `thresholds_for`. UNREADABLE
+/// stored rules are an error, and the call gives today's outcome (D1): the defaults may be looser
+/// than what the project wrote down.
+fn thresholds_for(project_id: Option<&str>) -> Result<ResolveThresholds, String> {
+    let Some(project_id) = project_id else {
         return Ok(ResolveThresholds::default());
     };
-    tokio::task::spawn_blocking(move || {
-        crate::config::load_schedule_rules(machine_root.as_deref(), &project_id)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map(|rules| rules.resolve_thresholds())
-    .map_err(|error| error.to_string())
+    crate::project::rules::autopilot(project_id)
+        .map(|rules| rules.resolve_thresholds())
+        .map_err(|error| error.to_string())
 }
 
 /// D10's E4 state: the task, and the gate's output as DATA (the agent may have written what the
@@ -488,7 +478,6 @@ async fn state_of(pool: &SqlitePool, asked: &Asked) -> Result<String, String> {
                 run_id: asked.run_id,
                 shadow_decision_id: asked.event_ref,
                 project_id: asked.project_id.clone(),
-                machine_root: asked.machine_root.clone(),
                 tool_name: tool_name.clone(),
                 tool_input: tool_input.clone(),
                 cwd: cwd.clone(),
@@ -555,8 +544,7 @@ async fn ask_within(
     // may have been sent and billed (spec A's `sent_chars`, for the same reason).
     let mut sent_chars: Option<usize> = None;
     let outcome = tokio::time::timeout(deadline, async {
-        let thresholds = thresholds_for(asked.machine_root.clone(), asked.project_id.as_deref())
-            .await
+        let thresholds = thresholds_for(asked.project_id.as_deref())
             .map_err(|error| Failure::Prepare(format!("config: {error}")))?;
         let state = state_of(pool, asked).await.map_err(Failure::Prepare)?;
         sent_chars = Some(state.chars().count());
@@ -1019,7 +1007,6 @@ mod tests {
             event,
             event_ref: None,
             project_id: Some("p".to_owned()),
-            machine_root: None,
             subject: Subject::Call {
                 tool_name: "Bash".to_owned(),
                 tool_input: json!({ "command": command }),
@@ -1323,55 +1310,8 @@ mod tests {
         assert_eq!(deadline_for(Event::Park), crate::judge::JUDGE_DEADLINE);
     }
 
-    fn write_rules(root: &std::path::Path, yaml: &str) {
-        let dir = crate::project::state::dir(root, "p").unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(crate::project::state::AUTOPILOT_FILE), yaml).unwrap();
-    }
-
-    /// D4/D1: an unreadable `autopilot.yaml` may be looser than what the project wrote down, so
-    /// the call gives today's outcome and says it was the config.
-    #[tokio::test]
-    async fn an_invalid_rules_file_gives_the_default_outcome_and_a_config_error() {
-        let pool = pool().await;
-        let run_id = running_run(&pool).await;
-        let root = tempfile::tempdir().unwrap();
-        write_rules(root.path(), "judge_resolve:\n  offtask: 0.7\n");
-        let judge = ScriptedJudge::answering_keys(&[("off_task", 0.1), ("needed", 0.1)]);
-        let runtime = JudgeRuntime::with(judge.clone());
-        let mut question = asked(run_id, Event::HardDeny, "rm -rf x", "destructive");
-        question.machine_root = Some(root.path().to_path_buf());
-        let row = ask(&pool, &runtime, &question).await;
-        assert_eq!(row.judge_outcome, None);
-        assert_eq!(row.final_outcome, Event::HardDeny.default_outcome());
-        assert!(row.error.unwrap().starts_with("config:"));
-        assert_eq!(judge.calls(), 0);
-    }
-
-    /// D4: the project's thresholds, read at decision time, move the judge's opinion.
-    #[tokio::test]
-    async fn a_projects_lowered_threshold_changes_the_opinion() {
-        let pool = pool().await;
-        let run_id = running_run(&pool).await;
-        let answers = [("off_task", 0.5), ("needed", 0.1)];
-        let question = asked(run_id, Event::HardDeny, "rm -rf x", "destructive");
-
-        let runtime = JudgeRuntime::with(ScriptedJudge::answering_keys(&answers));
-        let defaults = ask(&pool, &runtime, &question).await;
-        assert_eq!(defaults.judge_outcome, Some(Outcome::Deny));
-
-        let root = tempfile::tempdir().unwrap();
-        write_rules(root.path(), "judge_resolve:\n  off_task_at: 0.4\n");
-        let mut lowered = question.clone();
-        lowered.machine_root = Some(root.path().to_path_buf());
-        let runtime = JudgeRuntime::with(ScriptedJudge::answering_keys(&answers));
-        let row = ask(&pool, &runtime, &lowered).await;
-        assert_eq!(row.error, None);
-        assert_eq!(row.judge_outcome, Some(Outcome::Stop));
-    }
-
     /// D4/D1: stored rules that cannot be read may be looser than what the project wrote down, so the
-    /// call gives today's outcome and says it was the config. (No `machine_root`: rules are not files.)
+    /// call gives today's outcome and says it was the config.
     #[tokio::test]
     async fn invalid_stored_rules_give_the_default_outcome_and_a_config_error() {
         let pool = pool().await;
@@ -1385,7 +1325,10 @@ mod tests {
         let runtime = JudgeRuntime::with(judge.clone());
         let question = asked(run_id, Event::HardDeny, "rm -rf x", "destructive");
         let row = ask(&pool, &runtime, &question).await;
-        assert_eq!(row.judge_outcome, None, "an unreadable document must not reach the judge");
+        assert_eq!(
+            row.judge_outcome, None,
+            "an unreadable document must not reach the judge"
+        );
         assert_eq!(row.final_outcome, Event::HardDeny.default_outcome());
         let error = row.error.expect("the row names the config error");
         assert!(error.starts_with("config:"), "{error}");
@@ -1406,18 +1349,29 @@ mod tests {
         let defaults = ask(&pool, &runtime, &question).await;
         assert_eq!(defaults.judge_outcome, Some(Outcome::Deny));
 
-        publish_rules("p", "judge_resolve:
+        publish_rules(
+            "p",
+            "judge_resolve:
   off_task_at: 0.4
-");
+",
+        );
         let runtime = JudgeRuntime::with(ScriptedJudge::answering_keys(&answers));
         let row = ask(&pool, &runtime, &question).await;
         assert_eq!(row.error, None);
-        assert_eq!(row.judge_outcome, Some(Outcome::Stop), "the stored threshold is read");
+        assert_eq!(
+            row.judge_outcome,
+            Some(Outcome::Stop),
+            "the stored threshold is read"
+        );
 
         clear("p", "autopilot");
         let runtime = JudgeRuntime::with(ScriptedJudge::answering_keys(&answers));
         let back = ask(&pool, &runtime, &question).await;
-        assert_eq!(back.judge_outcome, Some(Outcome::Deny), "removing the document restores defaults");
+        assert_eq!(
+            back.judge_outcome,
+            Some(Outcome::Deny),
+            "removing the document restores defaults"
+        );
     }
 
     async fn recorded_runs(pool: &sqlx::SqlitePool) -> Vec<i64> {

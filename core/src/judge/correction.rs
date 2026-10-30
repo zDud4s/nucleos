@@ -288,7 +288,6 @@ pub async fn after_gate_failed(state: AppState, run_id: i64, exit_code: i32) {
         event: Event::GateFailed,
         event_ref: None,
         project_id: Some(project_id.clone()),
-        machine_root: state.machine_config_root.clone(),
         subject: Subject::Gate {
             exit_code,
             output: gate_output.unwrap_or_default(),

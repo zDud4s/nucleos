@@ -4,15 +4,11 @@ use super::*;
 
 /// The `VcsExecutor` the daemon actually runs.
 ///
-/// A deadline, and where project state lives: everything else it needs comes from the claimed
-/// request, which is the only thing that knows which repository and which operation.
+/// A deadline: everything else it needs comes from the claimed request, which is the only thing
+/// that knows which repository and which operation, and from the settings snapshot, which is where
+/// a project's rules are stored.
 pub struct GitExecutor {
     pub timeout: Duration,
-    /// `AppState::machine_config_root`, so the queue reads a project's `autopilot.yaml` from the
-    /// same `~/.nucleos/projects/<id>/` every other reader does. `None` — what `Default` gives —
-    /// reads every project as having no rules file, which is how a test that never configures one
-    /// stays out of the real home directory.
-    pub machine_root: Option<std::path::PathBuf>,
     /// Where a gated merge records its measurement (`verify_runs`). `None` - what `Default`
     /// gives - measures exactly as before and records nothing, which is every test that never
     /// asked for a database.
@@ -27,7 +23,6 @@ impl Default for GitExecutor {
     fn default() -> Self {
         Self {
             timeout: OPERATION_TIMEOUT,
-            machine_root: None,
             pool: None,
             verify: None,
         }
@@ -163,7 +158,6 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                             .map(|branch| branch.as_str())
                             .filter(|branch| *branch == target.as_str());
                         let measured = match gate_the_merge(
-                            self.machine_root.as_deref(),
                             self.pool.as_ref(),
                             request.id,
                             &request.project_id,
@@ -300,12 +294,11 @@ impl GitExecutor {
         let Some(pool) = self.pool.as_ref() else {
             return push(project_root, remote, branch, deadline).await;
         };
-        // Fails open like an unreadable rules file: with no `gate_command` no gate will ever run, so
+        // Fails open like unreadable stored rules: with no `gate_command` no gate will ever run, so
         // a push parked for it would wait for ever.
-        let gate_after_land =
-            crate::config::load_schedule_rules(self.machine_root.as_deref(), &request.project_id)
-                .map(|rules| rules.gate_after_land && rules.gate_command.is_some())
-                .unwrap_or(false);
+        let gate_after_land = crate::project::rules::autopilot(&request.project_id)
+            .map(|rules| rules.gate_after_land && rules.gate_command.is_some())
+            .unwrap_or(false);
         if !gate_after_land {
             return push(project_root, remote, branch, deadline).await;
         }
@@ -379,11 +372,11 @@ impl GitExecutor {
 /// With the switch off nothing here changes.
 ///
 /// **Three refusals rather than one, and each is a different sentence to its reader.**
-/// - The rules file exists and will not parse: we cannot tell whether this repository wanted its
-///   merges measured, and publishing unmeasured is the failure itself. A project with NO file is
-///   untouched — `load_schedule_rules` answers `Ok(default)` for an absent one — so this only
-///   refuses a repository that has the file and broke it, which is a repository whose scheduler,
-///   triggers and run gate are already all dead for the same reason.
+/// - The stored rules exist and cannot be read: we cannot tell whether this repository wanted its
+///   merges measured, and publishing unmeasured is the failure itself. A project with NO stored
+///   rules is untouched — `project::rules::autopilot` answers the default for an absent document —
+///   so this only refuses a repository whose rules were stored and then broke, which is a
+///   repository whose scheduler, triggers and run gate are already all dead for the same reason.
 /// - `gate_before_publish` with no `gate_command`: the configuration asks for a measurement and
 ///   names none. Publishing anyway would make the key decorative, which is the exact failure it was
 ///   added to end.
@@ -404,7 +397,6 @@ impl GitExecutor {
 /// every other red suite is fixed — in their own worktree, on their own branch.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn gate_the_merge(
-    machine_root: Option<&Path>,
     pool: Option<&sqlx::SqlitePool>,
     request_id: i64,
     project_id: &str,
@@ -423,12 +415,12 @@ pub(super) async fn gate_the_merge(
 
     let rules_path =
         crate::project::state::display_path(project_id, crate::project::state::AUTOPILOT_FILE);
-    let rules = match crate::config::load_schedule_rules(machine_root, project_id) {
+    let rules = match crate::project::rules::autopilot(project_id) {
         Ok(rules) => rules,
         Err(error) => {
             return Err(refuse(format!(
-                "{rules_path} could not be read, so whether this repository wants its merges \
-                 measured is unknown and nothing was published: {error}"
+                "the stored rules of this project could not be read, so whether this repository \
+                 wants its merges measured is unknown and nothing was published: {error}"
             )));
         }
     };

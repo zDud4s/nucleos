@@ -4068,13 +4068,10 @@ mod tests {
         yaml: &str,
     ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        if let Some(home) = state.machine_config_root.as_deref() {
-            crate::project::state::write_for_test(
-                home,
-                id,
-                crate::project::state::AUTOPILOT_FILE,
-                yaml,
-            );
+        if yaml.is_empty() {
+            crate::project::rules::testing::hold_shared();
+        } else {
+            crate::project::rules::testing::publish_rules(id, yaml);
         }
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
@@ -4085,6 +4082,22 @@ mod tests {
         .await
         .unwrap();
         dir
+    }
+
+    /// Also stores `yaml` as the FILE `<home>/projects/<id>/autopilot.yaml`, for the tests of the
+    /// routes that are still writers on files (`POST /write`, the ownership read: chunk 4 moves
+    /// them). `project_with_rules` only publishes to the snapshot now, so a test that looks at the
+    /// file calls this beside it. Chunk 4 deletes this helper (Task 3.6 and decision 6 of chunk 3).
+    fn store_rules_file(state: &AppState, id: &str, yaml: &str) {
+        crate::project::state::write_for_test(
+            state
+                .machine_config_root
+                .as_deref()
+                .expect("a stand-in home (`with_project_home`)"),
+            id,
+            crate::project::state::AUTOPILOT_FILE,
+            yaml,
+        );
     }
 
     async fn read_rules(state: AppState, id: &str) -> (StatusCode, serde_json::Value) {
@@ -4301,17 +4314,22 @@ mod tests {
 
     /// `deny_unknown_fields` exists so a typo is an error instead of an empty ruleset — but the
     /// error only ever reached a log line, so `schedule:` for `schedules:` stopped every scheduled
-    /// run for that project and looked exactly like having no rules.
+    /// run for that project and looked exactly like having no rules. Two halves now (Task 3.6 of
+    /// chunk 3): the parser still refuses the typo, and a document that is stored but cannot be read
+    /// is reported by name.
     #[tokio::test]
     async fn a_misspelt_key_is_reported_rather_than_read_as_no_rules_at_all() {
+        let typo =
+            "schedule:\n\x20 - name: nightly\n\x20   cron: '0 8 * * *'\n\x20   prompt: sweep\n";
+        let refusal = crate::config::parse_schedule_rules(typo)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("schedule"), "{refusal}");
+
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
-        let _dir = project_with_rules(
-            &state,
-            "alpha",
-            "schedule:\n\x20 - name: nightly\n\x20   cron: '0 8 * * *'\n\x20   prompt: sweep\n",
-        )
-        .await;
+        let _dir = project_with_rules(&state, "alpha", "").await;
+        crate::project::rules::testing::publish_unreadable("alpha", "autopilot", &refusal);
 
         let (_, body) = read_rules(state, "alpha").await;
         drop(home);
@@ -4351,15 +4369,21 @@ mod tests {
         let state = test_state().await;
         let _home = Home::new();
         let _dir = project_with_rules(&state, "alpha", "").await;
-        publish_rules("alpha", "gate_command: cargo test
-");
+        publish_rules(
+            "alpha",
+            "gate_command: cargo test
+",
+        );
 
         let (_, first) = read_rules(state.clone(), "alpha").await;
         assert_eq!(first["rules_file"], "present", "{first}");
         assert_eq!(first["gate_command"], "cargo test", "{first}");
 
-        publish_rules("alpha", "gate_command: cargo clippy
-");
+        publish_rules(
+            "alpha",
+            "gate_command: cargo clippy
+",
+        );
         let (_, second) = read_rules(state.clone(), "alpha").await;
         assert_eq!(second["gate_command"], "cargo clippy", "{second}");
 
@@ -4383,8 +4407,11 @@ mod tests {
         )
         .unwrap();
         let root = folder.path().to_string_lossy().into_owned();
-        crate::project::rules::testing::publish_rules("alpha", "gate_command: npm run test
-");
+        crate::project::rules::testing::publish_rules(
+            "alpha",
+            "gate_command: npm run test
+",
+        );
 
         let (status, view) = workflow_call(
             state,
@@ -4669,8 +4696,31 @@ mod tests {
         assert_eq!(view["onboarded"]["gate_command"], "npm run test");
         assert_eq!(view["configured_gate"], "npm run test");
         assert_eq!(view["hook_wired"], true);
-        let rules = crate::config::load_schedule_rules(Some(home.path()), "alpha").unwrap();
+        // The writer (`onboarding::onboard`, chunk 4's) still stores the FILE. Reading it back through
+        // the parser is what this line proved; chunk 4 turns it into a snapshot read.
+        let written = std::fs::read_to_string(
+            crate::project::state::file(
+                Some(home.path()),
+                "alpha",
+                crate::project::state::AUTOPILOT_FILE,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rules = crate::config::parse_schedule_rules(&written).unwrap();
         assert_eq!(rules.gate_command.as_deref(), Some("npm run test"));
+
+        // The reader proper: with the gate stored, a GET (no `just_confirmed`) reports it too.
+        crate::project::rules::testing::publish_rules("alpha", "gate_command: npm run test\n");
+        let (status, view) = workflow_call(
+            state.clone(),
+            "GET",
+            &format!("/projects/alpha/onboard?root={}", urlencoding(&root)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["configured_gate"], "npm run test");
 
         let kind: String = sqlx::query_scalar(
             "SELECT kind FROM feed WHERE project_id = 'alpha' ORDER BY id DESC LIMIT 1",
@@ -4912,6 +4962,12 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+        // TRANSITIONAL (chunk 3 -> chunk 4): `POST /write` still stores the FILE; the reader below
+        // now reads the snapshot. Chunk 4 makes the write publish and deletes this call.
+        crate::project::rules::testing::publish_rules(
+            "alpha",
+            "gate_command: cargo clippy\nschedules:\n  - name: nightly\n    cron: '0 3 * * *'\n    prompt: sweep\n",
+        );
 
         let (status, body) = read_rules(state.clone(), "alpha").await;
         assert_eq!(status, StatusCode::OK);
@@ -4955,6 +5011,7 @@ mod tests {
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        store_rules_file(&state, "alpha", "gate_command: cargo test\n");
 
         for path in [
             // Layer 2: read, plus a door to an editor. Never written from here.
@@ -4981,7 +5038,7 @@ mod tests {
         assert!(!dir.path().join(".ai").join("models.yaml").exists());
         assert!(!dir.path().parent().unwrap().join("escape.yaml").exists());
         assert!(!dir.path().join(".ai").join("autopilot.yaml").exists());
-        // The only file in the stand-in home is the one `project_with_rules` wrote.
+        // The only file in the stand-in home is the one `store_rules_file` wrote.
         assert_eq!(
             std::fs::read_dir(home.path().join("projects").join("alpha"))
                 .unwrap()
@@ -5004,6 +5061,7 @@ mod tests {
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        store_rules_file(&state, "alpha", "gate_command: cargo test\n");
         let file = home
             .path()
             .join("projects")
@@ -5044,6 +5102,7 @@ mod tests {
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        store_rules_file(&state, "alpha", "gate_command: cargo test\n");
         let file = home
             .path()
             .join("projects")
@@ -5186,6 +5245,7 @@ mod tests {
         let mut state = test_state().await;
         let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        store_rules_file(&state, "alpha", "gate_command: cargo test\n");
 
         let (status, text) = owned_text(state.clone(), "alpha", "autopilot.yaml").await;
         assert_eq!(status, StatusCode::OK);
@@ -8746,21 +8806,17 @@ mod tests {
         );
     }
 
-    /// Review item G: a rules file the judge cannot read leaves the judge without effect for that
-    /// project, and the panel has to be able to say so, not only the verdict rows.
+    /// Review item G: stored rules the judge cannot read leave the judge without effect for that
+    /// project, and the panel has to be able to say so, not only the verdict rows (Task 3.6 of
+    /// chunk 3: the fixture marks the stored document unreadable instead of writing a file).
     #[tokio::test]
     async fn a_projects_unreadable_rules_are_named_beside_its_judge() {
-        let mut state = test_state().await;
-        let root = tempfile::tempdir().unwrap();
-        let project_dir = root.path().join("projects").join("p");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(
-            project_dir.join("autopilot.yaml"),
-            "judge: [not, a, map]
-",
-        )
-        .unwrap();
-        state.machine_config_root = Some(root.path().to_path_buf());
+        let state = test_state().await;
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "judge: invalid type: sequence, expected struct JudgeConfig",
+        );
         sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
             .execute(&state.pool)
             .await
@@ -8771,7 +8827,7 @@ mod tests {
         assert!(
             body["rules_error"]
                 .as_str()
-                .is_some_and(|error| !error.is_empty())
+                .is_some_and(|error| error.contains("expected struct JudgeConfig"))
         );
     }
 

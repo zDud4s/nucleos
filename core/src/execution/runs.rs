@@ -1199,12 +1199,8 @@ pub mod tests {
     /// with `machine_root` a temporary directory standing in for `~/.nucleos`. Nothing is written into
     /// the repository, which is the point — the rules are not the project's files any more.
     fn configure_rules(machine_root: &FsPath, body: &str) {
-        crate::project::state::write_for_test(
-            machine_root,
-            "proj",
-            crate::project::state::AUTOPILOT_FILE,
-            body,
-        );
+        let _ = machine_root;
+        crate::project::rules::testing::publish_rules("proj", body);
     }
 
     /// Publishes project `proj`'s gate where a run reads it: the installed settings snapshot.
