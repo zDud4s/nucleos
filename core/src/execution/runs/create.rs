@@ -526,27 +526,10 @@ pub(super) async fn create_run_with(
         // refusing: the gate below already turns that into `Unreadable`, which stops the run with a
         // reason. A second refusal here would report the same fault as a different one.
         max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
-        gate_config = match (node.is_some() || item.is_some(), rules) {
-            (true, _) => GateConfig::NotConfigured,
-            (false, Ok(rules)) => {
-                let scoped_final = rules.scoped_final();
-                rules
-                    .gate_command
-                    .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
-                        command,
-                        project_root: project_root.to_string(),
-                        scoped_final,
-                    })
-            }
-            (false, Err(error)) => {
-                tracing::warn!(
-                    project_id = worktree_project_id,
-                    project_root,
-                    %error,
-                    "failed to load worktree gate configuration"
-                );
-                GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
-            }
+        gate_config = if node.is_some() || item.is_some() {
+            GateConfig::NotConfigured
+        } else {
+            GateConfig::of_project(worktree_project_id, project_root)
         };
         // A job node inherits its job's worktree; only a standalone run provisions one. Skipping
         // both the `create` and the `record` is what lets a sequence of nodes accumulate work on one

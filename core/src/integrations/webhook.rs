@@ -36,7 +36,7 @@ pub enum DeliveryError {
     Invalid,
     Unconfigured,
     Storage(sqlx::Error),
-    Config(std::io::Error),
+    Config(crate::project::rules::DocumentUnreadable),
 }
 
 fn valid_field(value: &str) -> bool {
@@ -127,9 +127,7 @@ pub async fn deliver(
         return Err(DeliveryError::Unconfigured);
     };
 
-    let rules =
-        crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id)
-            .map_err(DeliveryError::Config)?;
+    let rules = crate::project::rules::autopilot(&project_id).map_err(DeliveryError::Config)?;
     let triggers = rules
         .repo_triggers
         .into_iter()

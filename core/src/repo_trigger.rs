@@ -349,10 +349,7 @@ pub async fn poll_tick(state: &crate::state::AppState, now: chrono::DateTime<chr
             continue;
         }
 
-        let triggers = match crate::config::load_schedule_rules(
-            state.machine_config_root.as_deref(),
-            &project_id,
-        ) {
+        let triggers = match crate::project::rules::autopilot(&project_id) {
             Ok(rules) => rules.repo_triggers,
             Err(error) => {
                 tracing::warn!(

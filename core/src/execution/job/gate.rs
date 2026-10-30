@@ -277,10 +277,7 @@ pub(super) async fn gate_item_with(
             .await;
     }
 
-    let (command, scoped_final) = match crate::config::load_schedule_rules(
-        state.machine_config_root.as_deref(),
-        &job.project_id,
-    ) {
+    let (command, scoped_final) = match crate::project::rules::autopilot(&job.project_id) {
         Ok(rules) => {
             let scoped_final = rules.scoped_final();
             (rules.gate_command, scoped_final)

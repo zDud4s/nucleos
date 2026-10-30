@@ -7,7 +7,7 @@
 //! unreadable is an `Err`, and each caller keeps the safe side it already had for that `Err`.
 
 use crate::config::AutopilotRules;
-use crate::settings::{Document, Snapshot};
+use crate::settings::{Document, Scope, Snapshot};
 use crate::workflows::Pins;
 
 /// A stored document that exists but no longer fits its type. `reason` is the decoder's own text.
@@ -29,23 +29,33 @@ impl std::fmt::Display for DocumentUnreadable {
 
 impl std::error::Error for DocumentUnreadable {}
 
-pub fn autopilot(_project_id: &str) -> Result<AutopilotRules, DocumentUnreadable> {
-    unimplemented!()
+pub fn autopilot(project_id: &str) -> Result<AutopilotRules, DocumentUnreadable> {
+    read_from(&crate::settings::global().snapshot(), project_id)
 }
 
-pub fn pins(_project_id: &str) -> Result<Pins, DocumentUnreadable> {
-    unimplemented!()
+pub fn pins(project_id: &str) -> Result<Pins, DocumentUnreadable> {
+    read_from(&crate::settings::global().snapshot(), project_id)
 }
 
-pub fn is_stored(_project_id: &str, _name: &str) -> bool {
-    unimplemented!()
+/// Whether the project has a readable stored document called `name`.
+pub fn is_stored(project_id: &str, name: &str) -> bool {
+    let snapshot = crate::settings::global().snapshot();
+    let scope = Scope::project(project_id);
+    snapshot.entry(&scope, name).is_some() && !snapshot.is_unreadable(&scope, name)
 }
 
 pub fn read_from<T: Document + Default + Clone>(
-    _snapshot: &Snapshot,
-    _project_id: &str,
+    snapshot: &Snapshot,
+    project_id: &str,
 ) -> Result<T, DocumentUnreadable> {
-    unimplemented!()
+    let scope = Scope::project(project_id);
+    if let Some(record) = snapshot.unreadable_for(&scope, T::NAME) {
+        return Err(DocumentUnreadable {
+            name: T::NAME,
+            reason: record.reason.clone(),
+        });
+    }
+    Ok((*snapshot.get::<T>(&scope)).clone())
 }
 
 #[cfg(test)]

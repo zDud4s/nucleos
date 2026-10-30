@@ -377,19 +377,7 @@ pub async fn resume_for_correction(
         crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id);
     // A correction is the same work continuing, so it runs under the ceiling the project names.
     let max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
-    let gate_config = match rules {
-        Ok(rules) => {
-            let scoped_final = rules.scoped_final();
-            rules
-                .gate_command
-                .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
-                    command,
-                    project_root: project_root.clone(),
-                    scoped_final,
-                })
-        }
-        Err(error) => GateConfig::Unreadable(format!("gate configuration is unreadable: {error}")),
-    };
+    let gate_config = GateConfig::of_project(&project_id, &project_root);
     let governed_by_classifier = classifier_governs_tools(
         "worktree",
         crate::execution::runner::ToolPolicy::Unrestricted,
@@ -1088,27 +1076,7 @@ pub(super) async fn continue_paused_run(
     // said when the run first started and an operator who raised the ceiling to let this very run
     // finish would find the old one still in force.
     let max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
-    let gate_config = match rules {
-        Ok(rules) => {
-            let scoped_final = rules.scoped_final();
-            rules
-                .gate_command
-                .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
-                    command,
-                    project_root: project_root.clone(),
-                    scoped_final,
-                })
-        }
-        Err(error) => {
-            tracing::warn!(
-                project_id = %wt_project_id,
-                project_root = %project_root,
-                %error,
-                "failed to load worktree gate configuration for resumed run"
-            );
-            GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
-        }
-    };
+    let gate_config = GateConfig::of_project(&wt_project_id, &project_root);
     // Asked again against the worktree being resumed rather than inherited, because it is a fresh
     // launch into a tree that has since been worked in: the run it continues may have rewritten the
     // very settings file this reads. Re-checking is the conservative direction — a tree that no

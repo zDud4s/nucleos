@@ -639,10 +639,31 @@ pub(super) enum GateConfig {
 }
 
 impl GateConfig {
-    /// RED stub: the GREEN reads the settings snapshot (see the chunk-3 plan, Task 3.4, Step 3).
-    #[allow(dead_code)]
-    pub(super) fn of_project(_project_id: &str, _project_root: &str) -> GateConfig {
-        unimplemented!()
+    /// The gate a run of `project_id` is measured by, read from the settings snapshot on every call.
+    /// Nothing stored, or no gate command in it, is `NotConfigured`; a document that cannot be read is
+    /// `Unreadable`, which stops the run with a reason instead of passing it unmeasured.
+    pub(super) fn of_project(project_id: &str, project_root: &str) -> GateConfig {
+        match crate::project::rules::autopilot(project_id) {
+            Ok(rules) => {
+                let scoped_final = rules.scoped_final();
+                rules
+                    .gate_command
+                    .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                        command,
+                        project_root: project_root.to_string(),
+                        scoped_final,
+                    })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project_id,
+                    project_root,
+                    %error,
+                    "failed to load worktree gate configuration"
+                );
+                GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
+            }
+        }
     }
 }
 

@@ -8,7 +8,7 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 
-use crate::config::{self, ScheduleRule};
+use crate::config::ScheduleRule;
 use crate::execution::runs::{CreateRunError, create_run_inner};
 use crate::governance::autopilot::Mode;
 use crate::state::AppState;
@@ -414,19 +414,18 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             continue;
         }
 
-        let rules =
-            match config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id) {
-                Ok(rules) => rules.schedules,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = %project_id,
-                        project_root = %project_root,
-                        %error,
-                        "failed to load project schedule rules"
-                    );
-                    continue;
-                }
-            };
+        let rules = match crate::project::rules::autopilot(&project_id) {
+            Ok(rules) => rules.schedules,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    project_root = %project_root,
+                    %error,
+                    "failed to load project schedule rules"
+                );
+                continue;
+            }
+        };
 
         let rows: Vec<RuleState> = match sqlx::query_as(
             "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today

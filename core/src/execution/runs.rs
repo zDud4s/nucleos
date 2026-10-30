@@ -8561,7 +8561,7 @@ tests:
 
         publish_rules(
             "proj",
-            "gate_command: make gate@Ngate_after_land: true@Nscoped_final_gate: true@N",
+            "gate_command: make gate\ngate_after_land: true\nscoped_final_gate: true\n",
         );
         assert!(matches!(
             GateConfig::of_project("proj", "/repo"),
@@ -8569,7 +8569,7 @@ tests:
                 if command == "make gate" && project_root == "/repo"
         ));
 
-        publish_rules("proj", "gate_command: make other@N");
+        publish_rules("proj", "gate_command: make other\n");
         assert!(matches!(
             GateConfig::of_project("proj", "/repo"),
             GateConfig::Command { ref command, scoped_final: false, .. } if command == "make other"
