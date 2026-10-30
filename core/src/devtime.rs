@@ -1005,8 +1005,17 @@ pub async fn ingest_cycle(
 /// same instant returns 0. Rows not yet due stay `pending`. The caller logs an error and goes on, as
 /// it does for the rules pass.
 pub async fn close_due_outcomes(pool: &SqlitePool, now_ms: i64) -> sqlx::Result<usize> {
-    let _ = (pool, now_ms);
-    todo!("close inject and propose outcomes (plan 3.4)")
+    let inject = devtime_actions::outcome::close_inject_outcomes(pool, now_ms).await?;
+    let propose = devtime_actions::outcome::close_propose_outcomes(pool, now_ms).await?;
+    Ok(inject.hit
+        + inject.miss
+        + inject.void
+        + propose.hit
+        + propose.miss
+        + propose.accepted
+        + propose.rejected
+        + propose.ignored
+        + propose.expired)
 }
 
 // ---- the loop --------------------------------------------------------------------------------
@@ -1062,6 +1071,12 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
         ticker.tick().await;
         let stats = ingest_cycle(&pool, &cfg, &projects_dir).await;
         accumulate(&mut totals, &stats);
+        if cfg.rules.enabled && cfg.actions.enabled {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if let Err(error) = close_due_outcomes(&pool, now_ms).await {
+                tracing::warn!(%error, "devtime: closing the actions' outcomes failed");
+            }
+        }
         let row = status_row(true, &cfg, &stats, &totals);
         if let Err(error) = devtime_store::write_ingest_status(&pool, &row).await {
             tracing::warn!(%error, "devtime: could not write the ingest status");
@@ -1117,9 +1132,21 @@ mod tests {
             }
         };
         for r in [
-            row("inject", "D3", "D3|p1", Some("s-close"), "2026-10-05T10:30:00.000Z"),
+            row(
+                "inject",
+                "D3",
+                "D3|p1",
+                Some("s-close"),
+                "2026-10-05T10:30:00.000Z",
+            ),
             row("propose", "F1", "F1|k1", None, "2026-10-19T10:30:00.000Z"),
-            row("inject", "D6", "D6|p1", Some("s-open"), "2026-10-20T10:30:00.000Z"),
+            row(
+                "inject",
+                "D6",
+                "D6|p1",
+                Some("s-open"),
+                "2026-10-20T10:30:00.000Z",
+            ),
         ] {
             assert!(devtime_store::insert_decision(&pool, &r).await.unwrap());
         }
@@ -1139,7 +1166,11 @@ mod tests {
         assert_eq!(state("D3").await, ("resolved".into(), Some("miss".into())));
         assert_eq!(state("F1").await, ("resolved".into(), Some("miss".into())));
         assert_eq!(state("D6").await, ("pending".into(), None));
-        assert_eq!(close_due_outcomes(&pool, now_ms).await.unwrap(), 0, "idempotent");
+        assert_eq!(
+            close_due_outcomes(&pool, now_ms).await.unwrap(),
+            0,
+            "idempotent"
+        );
     }
 
     #[test]

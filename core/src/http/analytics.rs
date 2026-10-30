@@ -345,7 +345,6 @@ pub(super) async fn post_devtime_mark(
 /// Every parameter read as text, so a bad value is this module's 400, not the extractor's. There is
 /// no `days` here: the shadow list and the promotion report are not windowed by the page's range.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // the handlers' bodies (GREEN) read the fields
 pub(super) struct ShadowParams {
     action: Option<String>,
     rule: Option<String>,
@@ -354,44 +353,103 @@ pub(super) struct ShadowParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // the handler's body (GREEN) reads the field
 pub(super) struct ShadowVerdictBody {
     verdict: String,
+}
+
+/// The whole devtime config (actions block included), read like [`devtime_rules`]. No root (every
+/// test state) is the defaults.
+fn devtime_full_config(state: &AppState) -> crate::config::DevtimeConfig {
+    match state.machine_config_root.as_deref() {
+        Some(root) => {
+            crate::config::devtime_config_now(&root.join(crate::machine_config::DEVTIME_FILE)).0
+        }
+        None => Default::default(),
+    }
+}
+
+fn action_refusal(error: crate::analytics::devtime::ActionError) -> Response {
+    use crate::analytics::devtime::ActionError;
+    match error {
+        ActionError::BadAction => refuse(StatusCode::BAD_REQUEST, "bad_action"),
+        ActionError::BadVerdict => refuse(StatusCode::BAD_REQUEST, "bad_verdict"),
+        ActionError::UnknownRule => refuse(StatusCode::NOT_FOUND, "unknown_rule"),
+        ActionError::UnknownShadow => refuse(StatusCode::NOT_FOUND, "unknown_shadow"),
+        ActionError::NotReady => refuse(StatusCode::CONFLICT, "not_ready"),
+        // Generic, no SQL echoed (spec §6.8).
+        ActionError::Db(error) => failed(error, "devtime actions").into_response(),
+    }
 }
 
 /// `{ "pairs": [...] }`: every configured `(action, rule)` pair with its mode and promotion report
 /// (contract: the module docs of `analytics/devtime/actions.rs`). 200 with a zeroed report for a
 /// pair without rows.
 pub(super) async fn get_devtime_actions(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<Json<crate::analytics::devtime::ActionPairs>, Response> {
-    todo!("GET /analytics/devtime/actions (plan 3.4)")
+    let cfg = devtime_full_config(&state);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    crate::analytics::devtime::action_pairs(&state.pool, &cfg, now_ms)
+        .await
+        .map(Json)
+        .map_err(|error| failed(error, "devtime actions").into_response())
 }
 
 /// `{ items, next_cursor }`: what the system would have said, closed fields only. Refusals
 /// `bad_action`, `bad_limit` (1..=200, default 50) and `bad_cursor` as `{"error": code}`, 400.
 pub(super) async fn get_devtime_actions_shadow(
-    State(_state): State<AppState>,
-    Query(_params): Query<ShadowParams>,
+    State(state): State<AppState>,
+    Query(params): Query<ShadowParams>,
 ) -> Result<Json<crate::analytics::devtime::ShadowPage>, Response> {
-    todo!("GET /analytics/devtime/actions/shadow (plan 3.4)")
+    let limit = match params.limit.as_deref() {
+        None => DEFAULT_FINDINGS,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if (1..=MAX_FINDINGS).contains(&n) => n,
+            _ => return Err(refuse(StatusCode::BAD_REQUEST, "bad_limit")),
+        },
+    };
+    let cursor = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            crate::analytics::devtime::decode_shadow_cursor(raw)
+                .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "bad_cursor"))?,
+        ),
+    };
+    let query = crate::analytics::devtime::ShadowQuery {
+        action: params.action.as_deref(),
+        rule_id: params.rule.as_deref(),
+        limit,
+        cursor,
+    };
+    crate::analytics::devtime::shadow_list(&state.pool, &query)
+        .await
+        .map(Json)
+        .map_err(action_refusal)
 }
 
 /// The owner's `useful` / `noise` mark on one shadow decision; answers the updated item. 400
 /// `bad_verdict`, 404 `unknown_shadow`.
 pub(super) async fn post_devtime_shadow_verdict(
-    State(_state): State<AppState>,
-    Path(_id): Path<i64>,
-    Json(_body): Json<ShadowVerdictBody>,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ShadowVerdictBody>,
 ) -> Result<Json<crate::analytics::devtime::ShadowItem>, Response> {
-    todo!("POST /analytics/devtime/actions/shadow/{{id}}/verdict (plan 3.4)")
+    crate::analytics::devtime::mark_shadow(&state.pool, id, &body.verdict)
+        .await
+        .map(Json)
+        .map_err(action_refusal)
 }
 
 /// D2, manual: promotes a pair to `live` as `owner`. 400 `bad_action`, 404 `unknown_rule`, 409
 /// `not_ready` (nothing written); answers the pair.
 pub(super) async fn post_devtime_action_promote(
-    State(_state): State<AppState>,
-    Path((_action, _rule)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Path((action, rule)): Path<(String, String)>,
 ) -> Result<Json<crate::analytics::devtime::ActionPair>, Response> {
-    todo!("POST /analytics/devtime/actions/{{action}}/{{rule}}/promote (plan 3.4)")
+    let cfg = devtime_full_config(&state);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    crate::analytics::devtime::promote_pair(&state.pool, &cfg, &action, &rule, now_ms)
+        .await
+        .map(Json)
+        .map_err(action_refusal)
 }

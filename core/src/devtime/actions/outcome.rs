@@ -17,8 +17,6 @@
 //! - A row without `session_id` cannot be matched: it is `void`.
 //! - `human_verdict` is never touched. Closing is idempotent: a second call changes nothing.
 
-#![allow(dead_code)] // the ingest cycle is the caller (3.1 wiring)
-
 use sqlx::SqlitePool;
 
 use crate::devtime::store;

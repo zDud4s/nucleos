@@ -26479,18 +26479,34 @@ mod tests {
         let pairs = body["pairs"].as_array().unwrap_or_else(|| panic!("{body}"));
         let keys: Vec<_> = pairs
             .iter()
-            .map(|p| (p["action"].as_str().unwrap(), p["rule_id"].as_str().unwrap()))
+            .map(|p| {
+                (
+                    p["action"].as_str().unwrap(),
+                    p["rule_id"].as_str().unwrap(),
+                )
+            })
             .collect();
         assert_eq!(
             keys,
-            [("inject", "D3"), ("inject", "D6"), ("propose", "F1"), ("propose", "F2")],
+            [
+                ("inject", "D3"),
+                ("inject", "D6"),
+                ("propose", "F1"),
+                ("propose", "F2")
+            ],
             "{body}"
         );
         assert_eq!(pairs[0]["mode"], "live", "{body}");
         assert_eq!(pairs[0]["changed_by"], "owner", "{body}");
         assert_eq!(pairs[0]["since"], "2026-10-01T00:00:00.000Z", "{body}");
-        assert_eq!(pairs[1]["mode"], "shadow", "no row: the pair runs in shadow: {body}");
-        assert!(pairs[1]["since"].is_null() && pairs[1]["changed_by"].is_null(), "{body}");
+        assert_eq!(
+            pairs[1]["mode"], "shadow",
+            "no row: the pair runs in shadow: {body}"
+        );
+        assert!(
+            pairs[1]["since"].is_null() && pairs[1]["changed_by"].is_null(),
+            "{body}"
+        );
         let report = &pairs[1]["report"];
         assert_eq!(report["n_resolved"], 0, "{body}");
         assert_eq!(report["ready"], false, "{body}");
@@ -26512,18 +26528,30 @@ mod tests {
             "/analytics/devtime/actions/shadow?action=inject&rule=D3&limit=2",
         )
         .await;
-        let items = first["items"].as_array().unwrap_or_else(|| panic!("{first}"));
+        let items = first["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{first}"));
         assert_eq!(items.len(), 2, "{first}");
         assert_eq!(items[0]["id"], newest, "newest first: {first}");
         assert_eq!(items[1]["decision"], "suppress", "{first}");
         assert_eq!(items[1]["suppress_reason"], "cooldown", "{first}");
         assert_eq!(items[0]["template_id"], "inject.d3.v1", "{first}");
-        assert_eq!(items[0]["params"]["count"], 3, "params is an object: {first}");
+        assert_eq!(
+            items[0]["params"]["count"], 3,
+            "params is an object: {first}"
+        );
         let text = first.to_string();
-        for leaked in ["secret-session", "secret-subject", "session_id", "subject_key"] {
+        for leaked in [
+            "secret-session",
+            "secret-subject",
+            "session_id",
+            "subject_key",
+        ] {
             assert!(!text.contains(leaked), "{leaked} leaked: {first}");
         }
-        let cursor = first["next_cursor"].as_str().unwrap_or_else(|| panic!("{first}"));
+        let cursor = first["next_cursor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{first}"));
         let second = get_json(
             &state,
             &format!(
@@ -26539,15 +26567,25 @@ mod tests {
         assert!(second["next_cursor"].is_null(), "{second}");
 
         for (uri, code) in [
-            ("/analytics/devtime/actions/shadow?action=nuke", "bad_action"),
+            (
+                "/analytics/devtime/actions/shadow?action=nuke",
+                "bad_action",
+            ),
             ("/analytics/devtime/actions/shadow?limit=0", "bad_limit"),
             ("/analytics/devtime/actions/shadow?limit=201", "bad_limit"),
             ("/analytics/devtime/actions/shadow?limit=abc", "bad_limit"),
-            ("/analytics/devtime/actions/shadow?cursor=garbage", "bad_cursor"),
+            (
+                "/analytics/devtime/actions/shadow?cursor=garbage",
+                "bad_cursor",
+            ),
         ] {
             let response = api_token_request(state.clone(), "GET", uri, "test-token", None).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
-            assert_eq!(json_body(response).await, serde_json::json!({ "error": code }), "{uri}");
+            assert_eq!(
+                json_body(response).await,
+                serde_json::json!({ "error": code }),
+                "{uri}"
+            );
         }
     }
 
@@ -26561,12 +26599,24 @@ mod tests {
         let live = seed_shadow(&state, "c", "live", "fire", 30).await;
         let uri = |id: i64| format!("/analytics/devtime/actions/shadow/{id}/verdict");
 
-        let bad = post_json(&state, &uri(fire), Some(serde_json::json!({"verdict": "maybe"}))).await;
+        let bad = post_json(
+            &state,
+            &uri(fire),
+            Some(serde_json::json!({"verdict": "maybe"})),
+        )
+        .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(json_body(bad).await, serde_json::json!({"error": "bad_verdict"}));
+        assert_eq!(
+            json_body(bad).await,
+            serde_json::json!({"error": "bad_verdict"})
+        );
         for id in [9_999, suppressed, live] {
-            let response =
-                post_json(&state, &uri(id), Some(serde_json::json!({"verdict": "useful"}))).await;
+            let response = post_json(
+                &state,
+                &uri(id),
+                Some(serde_json::json!({"verdict": "useful"})),
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{id}");
             assert_eq!(
                 json_body(response).await,
@@ -26575,8 +26625,12 @@ mod tests {
             );
         }
         for _ in 0..2 {
-            let ok =
-                post_json(&state, &uri(fire), Some(serde_json::json!({"verdict": "noise"}))).await;
+            let ok = post_json(
+                &state,
+                &uri(fire),
+                Some(serde_json::json!({"verdict": "noise"})),
+            )
+            .await;
             assert_eq!(ok.status(), StatusCode::OK, "idempotent");
             let item = json_body(ok).await;
             assert_eq!(item["id"], fire, "{item}");
@@ -26599,14 +26653,34 @@ mod tests {
         let state = test_state().await;
         seed_shadow(&state, "a", "shadow", "fire", 10).await;
         for (uri, status, code) in [
-            ("/analytics/devtime/actions/nuke/D3/promote", StatusCode::BAD_REQUEST, "bad_action"),
-            ("/analytics/devtime/actions/inject/ZZ/promote", StatusCode::NOT_FOUND, "unknown_rule"),
-            ("/analytics/devtime/actions/propose/D3/promote", StatusCode::NOT_FOUND, "unknown_rule"),
-            ("/analytics/devtime/actions/inject/D3/promote", StatusCode::CONFLICT, "not_ready"),
+            (
+                "/analytics/devtime/actions/nuke/D3/promote",
+                StatusCode::BAD_REQUEST,
+                "bad_action",
+            ),
+            (
+                "/analytics/devtime/actions/inject/ZZ/promote",
+                StatusCode::NOT_FOUND,
+                "unknown_rule",
+            ),
+            (
+                "/analytics/devtime/actions/propose/D3/promote",
+                StatusCode::NOT_FOUND,
+                "unknown_rule",
+            ),
+            (
+                "/analytics/devtime/actions/inject/D3/promote",
+                StatusCode::CONFLICT,
+                "not_ready",
+            ),
         ] {
             let response = post_json(&state, uri, None).await;
             assert_eq!(response.status(), status, "{uri}");
-            assert_eq!(json_body(response).await, serde_json::json!({ "error": code }), "{uri}");
+            assert_eq!(
+                json_body(response).await,
+                serde_json::json!({ "error": code }),
+                "{uri}"
+            );
         }
         let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devtime_action_state")
             .fetch_one(&state.pool)
@@ -26622,23 +26696,30 @@ mod tests {
         let (state, db) = file_test_state().await;
         let id = seed_shadow(&state, "a", "shadow", "fire", 10).await;
         let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
-        for uri in ["/analytics/devtime/actions", "/analytics/devtime/actions/shadow"] {
+        for uri in [
+            "/analytics/devtime/actions",
+            "/analytics/devtime/actions/shadow",
+        ] {
             let response = api_token_request(state.clone(), "GET", uri, &token, None).await;
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
         }
         let verdict_uri = format!("/analytics/devtime/actions/shadow/{id}/verdict");
         for (uri, body) in [
-            (verdict_uri.as_str(), Some(serde_json::json!({"verdict": "useful"}))),
+            (
+                verdict_uri.as_str(),
+                Some(serde_json::json!({"verdict": "useful"})),
+            ),
             ("/analytics/devtime/actions/inject/D3/promote", None),
         ] {
             let response = api_token_request(state.clone(), "POST", uri, &token, body).await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
         }
-        let marked: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM devtime_shadow WHERE human_verdict IS NOT NULL")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM devtime_shadow WHERE human_verdict IS NOT NULL",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
         assert_eq!(marked, 0, "the forbidden mark wrote nothing");
         for (method, uri) in [
             ("GET", "/analytics/devtime/actions"),
@@ -26647,10 +26728,20 @@ mod tests {
             ("POST", "/analytics/devtime/actions/inject/D3/promote"),
         ] {
             let response = build_router(state.clone())
-                .oneshot(Request::builder().method(method).uri(uri).body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
         }
         db.close().await;
     }

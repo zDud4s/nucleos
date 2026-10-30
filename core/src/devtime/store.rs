@@ -27,7 +27,10 @@ pub use self::attempt_failures::*;
 pub use self::reads::*;
 pub use self::rules::*;
 #[allow(unused_imports)] // the actions step is the reader
-pub use self::shadow::{ActionStateRow, SessionFinding, ShadowOutcome, ShadowRow};
+pub use self::shadow::{
+    ACTION_CHANGED_BY, ACTIONS, ActionStateRow, HUMAN_VERDICTS, SessionFinding, ShadowOutcome,
+    ShadowRow,
+};
 #[allow(unused_imports)] // the actions step is the reader
 pub use self::shadow::{
     cross_reappearance, decisions_for, get_action_state, insert_decision, pending_due,

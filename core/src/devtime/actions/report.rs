@@ -42,8 +42,6 @@
 //!   without rows); `ignored` = counted-scope rows (shadow, current versions, fire) with stored
 //!   `outcome == 'ignored'` and no human verdict.
 
-#![allow(dead_code)] // the routes (3.4) are the caller
-
 use serde::Serialize;
 use sqlx::SqlitePool;
 

@@ -32,7 +32,10 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 
 use crate::config::DevtimeConfig;
-use crate::devtime::actions::report::PromotionReport;
+use crate::devtime::actions::ACTION_VERSION;
+use crate::devtime::actions::report::{PromotionReport, PromotionScope, action_promotion_report};
+use crate::devtime::precision::{RulePrecision, rule_report};
+use crate::devtime::store::{self, ACTIONS, HUMAN_VERDICTS};
 
 /// Why a read or write of this module refused. The HTTP layer maps the first five to a JSON code.
 #[derive(Debug)]
@@ -107,15 +110,83 @@ pub struct ShadowQuery<'a> {
 }
 
 /// Opaque text for [`ShadowCursor`]; [`decode_shadow_cursor`] reads back exactly what this wrote.
+/// Hex of `id|decided_at`, so it is URL-safe and says nothing to the eye.
 pub fn encode_shadow_cursor(cursor: &ShadowCursor) -> String {
-    let _ = cursor;
-    todo!("encode the shadow cursor (plan 3.4)")
+    format!("{}|{}", cursor.id, cursor.decided_at)
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// `None` for anything [`encode_shadow_cursor`] did not write.
 pub fn decode_shadow_cursor(raw: &str) -> Option<ShadowCursor> {
-    let _ = raw;
-    todo!("decode the shadow cursor (plan 3.4)")
+    if raw.is_empty() || !raw.len().is_multiple_of(2) || !raw.is_ascii() {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..raw.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).ok())
+        .collect();
+    let text = String::from_utf8(bytes?).ok()?;
+    let (id, decided_at) = text.split_once('|')?;
+    chrono::DateTime::parse_from_rfc3339(decided_at).ok()?;
+    Some(ShadowCursor {
+        decided_at: decided_at.to_string(),
+        id: id.parse().ok()?,
+    })
+}
+
+/// Unix milliseconds to the `%Y-%m-%dT%H:%M:%S%.3fZ` text the devtime tables store.
+fn ms_text(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap_or_default()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+/// One pair's view, or `None` when the rule is not in the registry (nothing to report on).
+async fn pair_view(
+    pool: &SqlitePool,
+    cfg: &DevtimeConfig,
+    precisions: &[RulePrecision],
+    action: &str,
+    rule_id: &str,
+    now_ms: i64,
+) -> sqlx::Result<Option<ActionPair>> {
+    let Some(rule) = crate::devtime::rules::rule(rule_id) else {
+        return Ok(None);
+    };
+    let Some(precision) = precisions.iter().find(|p| p.rule_id == rule_id) else {
+        return Ok(None);
+    };
+    let state = store::get_action_state(pool, action, rule_id).await?;
+    let report = action_promotion_report(
+        pool,
+        &cfg.actions,
+        precision,
+        &PromotionScope {
+            action,
+            rule_id,
+            project_id: None,
+            rule_version: i64::from(rule.version),
+            action_version: ACTION_VERSION,
+            now_ms,
+        },
+    )
+    .await?;
+    // No stored row: the pair runs in shadow (`actions::pair_mode`).
+    let (mode, since, changed_by) = match state {
+        Some(row) => (row.mode, Some(row.since), Some(row.changed_by)),
+        None => ("shadow".to_string(), None, None),
+    };
+    Ok(Some(ActionPair {
+        action: action.to_string(),
+        rule_id: rule_id.to_string(),
+        mode,
+        since,
+        changed_by,
+        report,
+    }))
 }
 
 /// Every configured pair with its state and report. See the module contract.
@@ -124,8 +195,40 @@ pub async fn action_pairs(
     cfg: &DevtimeConfig,
     now_ms: i64,
 ) -> sqlx::Result<ActionPairs> {
-    let _ = (pool, cfg, now_ms);
-    todo!("report every configured action pair (plan 3.4)")
+    let precisions = rule_report(pool, &cfg.rules, None).await?;
+    let mut pairs = Vec::new();
+    for (action, rules) in &cfg.actions.pairs {
+        if !ACTIONS.contains(&action.as_str()) {
+            continue;
+        }
+        for rule_id in rules {
+            if let Some(pair) = pair_view(pool, cfg, &precisions, action, rule_id, now_ms).await? {
+                pairs.push(pair);
+            }
+        }
+    }
+    Ok(ActionPairs { pairs })
+}
+
+fn item_of(row: store::ShadowRow) -> ShadowItem {
+    let params = serde_json::from_str::<serde_json::Value>(&row.params)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    ShadowItem {
+        id: row.id,
+        action: row.action,
+        rule_id: row.rule_id,
+        project_id: row.project_id,
+        decision: row.decision,
+        suppress_reason: row.suppress_reason,
+        template_id: row.template_id,
+        params,
+        decided_at: row.decided_at,
+        outcome_state: row.outcome_state,
+        outcome: row.outcome,
+        human_verdict: row.human_verdict,
+    }
 }
 
 /// A page of the shadow decisions. See the module contract.
@@ -133,8 +236,47 @@ pub async fn shadow_list(
     pool: &SqlitePool,
     query: &ShadowQuery<'_>,
 ) -> Result<ShadowPage, ActionError> {
-    let _ = (pool, query);
-    todo!("list the shadow decisions (plan 3.4)")
+    if query.action.is_some_and(|a| !ACTIONS.contains(&a)) {
+        return Err(ActionError::BadAction);
+    }
+    let limit = query.limit.max(1);
+    let (after_at, after_id) = match &query.cursor {
+        Some(c) => (Some(c.decided_at.as_str()), Some(c.id)),
+        None => (None, None),
+    };
+    let mut rows = sqlx::query_as::<_, store::ShadowRow>(
+        "SELECT * FROM devtime_shadow WHERE mode = 'shadow' AND outcome_state != 'void' \
+         AND (?1 IS NULL OR action = ?1) AND (?2 IS NULL OR rule_id = ?2) \
+         AND (?3 IS NULL OR decided_at < ?3 OR (decided_at = ?3 AND id < ?4)) \
+         ORDER BY decided_at DESC, id DESC LIMIT ?5",
+    )
+    .bind(query.action)
+    .bind(query.rule_id)
+    .bind(after_at)
+    .bind(after_id)
+    .bind(limit.saturating_add(1))
+    .fetch_all(pool)
+    .await?;
+    let more = i64::try_from(rows.len()).unwrap_or(i64::MAX) > limit;
+    rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let next_cursor = match rows.last() {
+        Some(last) if more => Some(encode_shadow_cursor(&ShadowCursor {
+            decided_at: last.decided_at.clone(),
+            id: last.id,
+        })),
+        _ => None,
+    };
+    Ok(ShadowPage {
+        items: rows.into_iter().map(item_of).collect(),
+        next_cursor,
+    })
+}
+
+async fn shadow_row_by_id(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<store::ShadowRow>> {
+    sqlx::query_as::<_, store::ShadowRow>("SELECT * FROM devtime_shadow WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// The owner's `useful` / `noise` mark on one shadow decision. See the module contract.
@@ -143,8 +285,20 @@ pub async fn mark_shadow(
     id: i64,
     verdict: &str,
 ) -> Result<ShadowItem, ActionError> {
-    let _ = (pool, id, verdict);
-    todo!("mark a shadow decision (plan 3.4)")
+    if !HUMAN_VERDICTS.contains(&verdict) {
+        return Err(ActionError::BadVerdict);
+    }
+    match shadow_row_by_id(pool, id).await? {
+        Some(row) if row.mode == "shadow" && row.decision == "fire" => {}
+        _ => return Err(ActionError::UnknownShadow),
+    }
+    if !store::set_human_verdict(pool, id, verdict).await? {
+        return Err(ActionError::UnknownShadow);
+    }
+    shadow_row_by_id(pool, id)
+        .await?
+        .map(item_of)
+        .ok_or(ActionError::UnknownShadow)
 }
 
 /// The owner's manual promotion of a pair to `live`. See the module contract.
@@ -155,8 +309,39 @@ pub async fn promote_pair(
     rule_id: &str,
     now_ms: i64,
 ) -> Result<ActionPair, ActionError> {
-    let _ = (pool, cfg, action, rule_id, now_ms);
-    todo!("promote a pair to live (plan 3.4)")
+    if !ACTIONS.contains(&action) {
+        return Err(ActionError::BadAction);
+    }
+    if !cfg
+        .actions
+        .pairs
+        .get(action)
+        .is_some_and(|rules| rules.iter().any(|r| r == rule_id))
+    {
+        return Err(ActionError::UnknownRule);
+    }
+    let precisions = rule_report(pool, &cfg.rules, None).await?;
+    let before = pair_view(pool, cfg, &precisions, action, rule_id, now_ms)
+        .await?
+        .ok_or(ActionError::UnknownRule)?;
+    if !before.report.ready {
+        return Err(ActionError::NotReady);
+    }
+    store::set_action_state(
+        pool,
+        &store::ActionStateRow {
+            action: action.to_string(),
+            rule_id: rule_id.to_string(),
+            mode: "live".to_string(),
+            since: ms_text(now_ms),
+            changed_by: "owner".to_string(),
+            reason: None,
+        },
+    )
+    .await?;
+    pair_view(pool, cfg, &precisions, action, rule_id, now_ms)
+        .await?
+        .ok_or(ActionError::UnknownRule)
 }
 
 #[cfg(test)]
@@ -313,7 +498,10 @@ mod tests {
         assert!(d6.since.is_none() && d6.changed_by.is_none());
         for pair in &got.pairs {
             assert_eq!(pair.report.n_resolved, 0, "{pair:?}");
-            assert!(pair.report.hit_rate.is_none() && !pair.report.ready, "{pair:?}");
+            assert!(
+                pair.report.hit_rate.is_none() && !pair.report.ready,
+                "{pair:?}"
+            );
         }
     }
 
@@ -327,7 +515,11 @@ mod tests {
         let d3 = got.pairs.iter().find(|p| p.rule_id == "D3").unwrap();
         assert_eq!(d3.report.n_resolved, 30);
         assert!(d3.report.ready, "{:?}", d3.report);
-        assert!(!got.pairs.iter().any(|p| p.rule_id != "D3" && p.report.ready));
+        assert!(
+            !got.pairs
+                .iter()
+                .any(|p| p.rule_id != "D3" && p.report.ready)
+        );
     }
 
     #[tokio::test]
@@ -363,7 +555,12 @@ mod tests {
         let second = shadow_list(&pool, &query(4, Some(cursor))).await.unwrap();
         assert_eq!(second.items.len(), 2);
         assert!(second.next_cursor.is_none());
-        let mut ids: Vec<_> = first.items.iter().chain(&second.items).map(|i| i.id).collect();
+        let mut ids: Vec<_> = first
+            .items
+            .iter()
+            .chain(&second.items)
+            .map(|i| i.id)
+            .collect();
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 6, "no row twice, none lost");
@@ -488,18 +685,25 @@ mod tests {
             r.suppress_reason = Some("cooldown".into());
         })
         .await;
-        let live = shadow_row(&pool, "l", "s3", NOW_MS - HOUR_MS, |r| r.mode = "live".into()).await;
+        let live = shadow_row(&pool, "l", "s3", NOW_MS - HOUR_MS, |r| {
+            r.mode = "live".into()
+        })
+        .await;
         let bad = mark_shadow(&pool, fire, "maybe").await;
         assert!(matches!(bad, Err(ActionError::BadVerdict)), "{bad:?}");
         for id in [suppressed, live, 9_999] {
             let got = mark_shadow(&pool, id, "useful").await;
-            assert!(matches!(got, Err(ActionError::UnknownShadow)), "{id}: {got:?}");
+            assert!(
+                matches!(got, Err(ActionError::UnknownShadow)),
+                "{id}: {got:?}"
+            );
         }
-        let marked: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM devtime_shadow WHERE human_verdict IS NOT NULL")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM devtime_shadow WHERE human_verdict IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(marked, 0, "a refused mark writes nothing");
     }
 
@@ -529,13 +733,19 @@ mod tests {
         let pair = promote_pair(&pool, &DevtimeConfig::default(), "inject", "D3", NOW_MS)
             .await
             .unwrap();
-        assert_eq!((pair.mode.as_str(), pair.changed_by.as_deref()), ("live", Some("owner")));
+        assert_eq!(
+            (pair.mode.as_str(), pair.changed_by.as_deref()),
+            ("live", Some("owner"))
+        );
         assert!(pair.since.is_some());
         let stored = st::get_action_state(&pool, "inject", "D3")
             .await
             .unwrap()
             .expect("the state row was written");
-        assert_eq!((stored.mode.as_str(), stored.changed_by.as_str()), ("live", "owner"));
+        assert_eq!(
+            (stored.mode.as_str(), stored.changed_by.as_str()),
+            ("live", "owner")
+        );
     }
 
     #[tokio::test]
@@ -549,6 +759,9 @@ mod tests {
             .unwrap();
         let got = promote_pair(&pool, &DevtimeConfig::default(), "inject", "D3", NOW_MS).await;
         assert!(matches!(got, Err(ActionError::NotReady)), "{got:?}");
-        assert_eq!(st::get_action_state(&pool, "inject", "D3").await.unwrap(), None);
+        assert_eq!(
+            st::get_action_state(&pool, "inject", "D3").await.unwrap(),
+            None
+        );
     }
 }
