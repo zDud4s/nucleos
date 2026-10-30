@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateRunRequest {
     pub prompt: String,
     #[serde(default)]
@@ -37,6 +37,9 @@ pub struct CreateRunRequest {
     /// before the column existed still parse, and applying that leniency to a REQUEST would let
     /// a typo quietly widen what an unattended run may do.
     #[serde(default)]
+    // `PermissionMode` lives outside this module and does not derive `JsonSchema`; on the wire it
+    // is its snake_case spelling.
+    #[schemars(with = "Option<String>")]
     pub permission_mode: Option<crate::chats::PermissionMode>,
 }
 
@@ -44,7 +47,7 @@ pub(super) fn default_run_mode() -> String {
     "real".to_owned()
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CreateRunResponse {
     pub id: i64,
 }
@@ -514,6 +517,7 @@ pub async fn create_run_route(
     let pool = state.pool.clone();
     let created = create_run(State(state), Json(req)).await?;
     tag_launching_chat(&pool, created.0.id, &headers).await;
+    tag_origin(&pool, created.0.id, &headers).await;
     Ok(created)
 }
 
@@ -751,3 +755,35 @@ pub async fn get_run(
 
     Ok(Json(run.with_prompt_budget()))
 }
+
+/// The header a caller sets to label the run it creates with where it came from. Only `voice` is
+/// honoured; see `tag_origin`.
+pub const ORIGIN_HEADER: &str = "x-nucleos-origin";
+
+/// Stamps run `id` with `Origin::Voice` when `ORIGIN_HEADER` says `voice`.
+///
+/// Only `voice` is honoured: any other or absent value leaves the column NULL, because an origin
+/// is never invented. `AND origin IS NULL` keeps a label the run already carries. Written after
+/// the INSERT and best effort, like `tag_launching_chat`: the label decides nothing, so a run left
+/// unlabelled is still a run.
+pub(crate) async fn tag_origin(pool: &sqlx::SqlitePool, id: i64, headers: &axum::http::HeaderMap) {
+    let voice = crate::assistant_types::Origin::Voice.as_wire();
+    let Some(value) = headers
+        .get(ORIGIN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| *value == voice)
+    else {
+        return;
+    };
+    let tagged = sqlx::query("UPDATE runs SET origin = ? WHERE id = ? AND origin IS NULL")
+        .bind(value)
+        .bind(id)
+        .execute(pool)
+        .await;
+    if let Err(error) = tagged {
+        tracing::warn!(%error, id, "the run was created but not labelled with its origin");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests;

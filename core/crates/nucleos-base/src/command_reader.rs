@@ -43,6 +43,7 @@
 //! is `Parsed::Unreadable`, never a guess. `read` and `segments` stay as they are until every caller
 //! has migrated (the git-queue scan wants a reader that never refuses, which `parse` is not).
 mod parse;
+pub mod pwsh;
 pub use parse::{
     Context, MAX_SUBSTITUTION_DEPTH, Parsed, Quoting, Redirect, SUBSTITUTION_PLACEHOLDER,
     SimpleCommand, Word, parse,
