@@ -404,13 +404,23 @@ pub fn parse_council_config(
 /// The stored council as startup may run it: `None` when there is none, or when it names a `kind: local` seat and
 /// no local model answered the probe.
 ///
-/// RED stub: the real body checks `CouncilConfig::faults(&stored, local_available)`.
+/// The stored document was accepted with `local_available = true` (the write route's rule, and the importer's); the
+/// machine this daemon runs on may disagree today, and a roster naming a local seat that cannot be answered is
+/// refused rather than quietly re-routed to the cloud, the failure [`load_council_config`] was written to prevent.
 pub fn runnable_council(
     stored: Option<std::sync::Arc<CouncilConfig>>,
     local_available: bool,
 ) -> Option<CouncilConfig> {
-    let _ = (stored, local_available);
-    todo!("runnable_council")
+    let stored = stored?;
+    let faults = stored.faults(local_available);
+    if !faults.is_empty() {
+        tracing::warn!(
+            faults = %faults.join("; "),
+            "the stored council roster is not runnable on this machine, so the council stays off"
+        );
+        return None;
+    }
+    Some((*stored).clone())
 }
 
 #[cfg(test)]
@@ -418,10 +428,12 @@ mod runnable_tests {
     use super::*;
     use std::sync::Arc;
 
+    // Flush-left on purpose: a raw continuation line keeps its indentation, and an indented
+    // `members:` under an unindented `chairman:` is not a YAML mapping.
     const MIXED: &str = "chairman: { kind: cloud, ref: claude-opus-4-8 }
-                         members:
-                           - { kind: cloud, ref: claude-opus-4-8 }
-                           - { kind: local, ref: qwen3.5:4b }
+members:
+  - { kind: cloud, ref: claude-opus-4-8 }
+  - { kind: local, ref: 'qwen3.5:4b' }
 ";
 
     #[test]

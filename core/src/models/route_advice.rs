@@ -220,6 +220,23 @@ pub fn load_config(path: &Path) -> RouterConfig {
     }
 }
 
+/// The stored `router` document as a configuration; `off` when none is stored or the document
+/// names a router off this machine (`RouterDoc::to_config` is the loopback fence).
+pub fn current_config() -> RouterConfig {
+    let Some(doc) =
+        crate::settings::get_opt::<super::route_doc::RouterDoc>(&crate::settings::Scope::Machine)
+    else {
+        return RouterConfig::off();
+    };
+    match doc.to_config() {
+        Ok(config) => config,
+        Err(why) => {
+            tracing::warn!(%why, "stored router document refused; routing is off");
+            RouterConfig::off()
+        }
+    }
+}
+
 /// The pure half of [`load_config`]: the reason a file is refused, or the configuration it names.
 pub fn parse_config(text: &str) -> Result<RouterConfig, String> {
     let raw: RawConfig = serde_yaml::from_str(text).map_err(|error| error.to_string())?;

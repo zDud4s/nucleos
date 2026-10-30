@@ -254,44 +254,33 @@ pub fn is_effort_level(config: &ModelsConfig, value: &str) -> bool {
             .any(|choice| choice.efforts.iter().any(|level| level == value))
 }
 
-/// Loads the current models configuration, falling back to defaults on failure.
+/// The current models configuration: the `models` document in the settings snapshot, or the defaults when there is
+/// none (or it is unreadable: `settings::get`'s rule, and the health row `settings` says so).
 ///
-/// An unreadable or unparseable file is NOT the same as an absent one: absent means defaults, but a
-/// typo in the YAML silently becoming defaults would drop a local routing and send turns to the
-/// cloud. So the failure is logged with its path and cause, and the last configuration that did
-/// parse keeps applying; only a daemon that never saw a good one falls back to defaults.
-///
-/// Handlers call this on the async path, so it costs one `metadata` call and re-reads the file only
-/// when its length or modification time moved.
+/// Sync and cheap, so the callers that used to re-read the file per request keep calling it per request: a write
+/// through the settings door swaps the snapshot, and the next call sees it.
 pub fn models_config_now() -> ModelsConfig {
-    static CACHE: std::sync::Mutex<Option<ModelsConfigCache>> = std::sync::Mutex::new(None);
-    let (config, problem) = match models_config_path() {
-        Some(path) => cached_models_config(&path, &CACHE),
-        None => (ModelsConfig::default(), None),
-    };
-    if let Ok(mut slot) = MODELS_CONFIG_PROBLEM.lock() {
-        *slot = problem;
-    }
-    config
+    (*crate::settings::get::<ModelsConfig>(&crate::settings::Scope::Machine)).clone()
 }
 
-/// Why the models file in force is not the one on disk, or `None` when it is.
+/// Why the models document in force is not the one stored, or `None` when it is.
 ///
-/// The log line a failed load writes is the only trace of it otherwise, and nobody reads the
-/// daemon's log while wondering why the picker offers Opus, Sonnet and Fable and not the local
-/// model they configured. This is what `GET /assistant/models` hands the window so it can say so.
+/// A stored document this daemon cannot decode is replaced by the defaults for every reader, and the log line is the
+/// only other trace of it. This is what `GET /assistant/models` hands the window so it can say why the picker offers
+/// Opus, Sonnet and Fable and not the local model they configured.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ModelsConfigProblem {
-    /// The file that would not load.
+    /// The file the document came from (shown, not read).
     pub path: String,
-    /// The parse or read error, as the loader worded it.
+    /// Why the stored document would not decode.
     pub error: String,
-    /// What applies instead: `last_good` when an earlier parse of this daemon is still in force,
-    /// `defaults` when the daemon never saw a good one and the built-in catalogue is serving.
+    /// What applies instead. Always `defaults`: the snapshot keeps no earlier copy of an unreadable document.
     pub using: &'static str,
 }
 
+#[cfg(test)]
 impl ModelsConfigProblem {
+    /// The legacy file reader's problem (tests only, until chunk 6 removes the YAML loaders).
     fn new(error: &std::io::Error, path: &Path, kept_last_good: bool) -> Self {
         Self {
             path: path.display().to_string(),
@@ -305,22 +294,22 @@ impl ModelsConfigProblem {
     }
 }
 
-/// The problem the most recent [`models_config_now`] ran into, if it ran into one.
-///
-/// Updated by every call to [`models_config_now`] and so only as current as the last one; the
-/// route that reports it calls that first, through the menu it builds.
-static MODELS_CONFIG_PROBLEM: std::sync::Mutex<Option<ModelsConfigProblem>> =
-    std::sync::Mutex::new(None);
-
-/// See [`ModelsConfigProblem`].
+/// See [`ModelsConfigProblem`]. Read from the current settings snapshot, so it is as current as the snapshot.
 pub fn models_config_problem() -> Option<ModelsConfigProblem> {
-    MODELS_CONFIG_PROBLEM
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
+    let snapshot = crate::settings::global().snapshot();
+    snapshot
+        .unreadable_for(&crate::settings::Scope::Machine, "models")
+        .map(|record| ModelsConfigProblem {
+            path: MODELS_CONFIG_DISPLAY_PATH.to_string(),
+            error: record.reason.clone(),
+            using: "defaults",
+        })
 }
 
 /// A parsed file and the (path, length, mtime) it was parsed at.
+///
+/// Legacy file reader, kept for its own tests only until the YAML loaders go (chunk 6).
+#[cfg(test)]
 struct ModelsConfigCache {
     path: std::path::PathBuf,
     len: u64,
@@ -328,10 +317,11 @@ struct ModelsConfigCache {
     config: ModelsConfig,
 }
 
-/// The stat-checked read behind [`models_config_now`]. A missing (or unstat-able) file answers the
+/// The legacy stat-checked file read (tests only; `models_config_now` reads the snapshot). A missing (or unstat-able) file answers the
 /// default. A failed read or parse answers the last good configuration (the default if there is
 /// none) together with the [`ModelsConfigProblem`] that explains it, and is never cached as a hit,
 /// so the next call tries again.
+#[cfg(test)]
 fn cached_models_config(
     path: &Path,
     cache: &std::sync::Mutex<Option<ModelsConfigCache>>,
@@ -369,7 +359,8 @@ fn cached_models_config(
     (config, problem)
 }
 
-/// The decision inside [`models_config_now`], apart from the file and the static so a test can drive it.
+/// The legacy file loader's decision, apart from the file so a test can drive it (chunk 6 removes it).
+#[cfg(test)]
 pub(super) fn resolve_models_config(
     loaded: std::io::Result<ModelsConfig>,
     last_good: &mut Option<ModelsConfig>,
@@ -913,9 +904,8 @@ where
 
 /// The file the pinned model names live in, relative to [`crate::machine_config::root`].
 ///
-/// A constant because several places need it and they must not drift: startup builds the runner
-/// from this file, and `GET /assistant/models` re-reads it per request so a choice added to it works
-/// without a restart. The second reader is the reason it stopped being a literal in `main.rs`.
+/// It is the file the one-time import reads, and the name settings messages still show; the live
+/// copy is the `models` document.
 pub const MODELS_CONFIG_FILE: &str = "nucleos-models.yaml";
 
 /// The same file as a person is shown it, and the only spelling a message uses. See
@@ -1203,22 +1193,6 @@ impl ModelsConfig {
     }
 }
 
-/// Where the daemon reads [`MODELS_CONFIG_FILE`], or `None` when there is nowhere to read it from —
-/// which every reader treats as an absent file, i.e. [`ModelsConfig::default`].
-///
-/// `None` under `cargo test` as well, and that is deliberate rather than a convenience: this file
-/// used to resolve against the working directory, a test runs from `core/`, `core/.ai/` never
-/// existed, and a whole family of tests was written against the defaults that absence produced.
-/// Resolving it now would hand those tests whatever this machine's owner has configured — a local
-/// model in one place, none in another — and a unit test must not read a real `~/.nucleos`.
-pub fn models_config_path() -> Option<std::path::PathBuf> {
-    // `testkit` too: the binary's tests (`http.rs`) build this library without `cfg(test)`.
-    if cfg!(any(test, feature = "testkit")) {
-        return None;
-    }
-    crate::machine_config::root().map(|root| root.join(MODELS_CONFIG_FILE))
-}
-
 /// `nucleos-models.yaml`'s grammar, and the only place that decides what a valid one is.
 ///
 /// Unlike its seven neighbours this file's loader could already refuse, so splitting the parser out
@@ -1411,8 +1385,10 @@ mod snapshot_tests {
     /// installers but not readers, so a field a concurrent test reads would make this a race.
     #[test]
     fn models_config_now_answers_the_installed_document() {
-        let mut stored = ModelsConfig::default();
-        stored.embedding_model = "test-embed-from-the-snapshot".to_string();
+        let stored = ModelsConfig {
+            embedding_model: "test-embed-from-the-snapshot".to_string(),
+            ..Default::default()
+        };
         let snapshot = Snapshot::default().with_document(&Scope::Machine, stored.clone());
         let _installed = testing::install(Settings::from_snapshot(snapshot));
 

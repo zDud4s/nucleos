@@ -401,17 +401,13 @@ pub(super) fn chars(text: &str) -> Vec<char> {
     text.chars().collect()
 }
 
-/// The pinned model names as they are on disk right now.
+/// The `models` document from the settings snapshot, per request, so a choice written through the
+/// settings door is live without a restart (the snapshot is swapped on each committed write, and
+/// is not held on `AppState`, which every caller of this depends on).
 ///
-/// Re-read per request rather than held on `AppState`, which every caller of this depends on: a
-/// pinned choice travels as `--model` on the turn itself, so a name added to the file is one this
-/// daemon can already run — and a catalogue cached at startup would spend a whole daemon lifetime
-/// refusing it. The daemon's price refresh (`crate::price_refresh`) and `scripts/refresh-models.py`
-/// both rewrite this file, and nothing should have to be restarted for that to take.
-///
-/// An unreadable or missing file answers with the built-in defaults rather than an error, matching
-/// what startup does: a picker that fails closed leaves somebody unable to change a model because
-/// of a typo in a key that has nothing to do with models.
+/// Unreadable or absent answers the defaults, matching what startup does: a picker that fails
+/// closed leaves somebody unable to change a model because of a typo in a key that has nothing to
+/// do with models.
 pub(super) fn models_config() -> crate::config::ModelsConfig {
     crate::config::models_config_now()
 }

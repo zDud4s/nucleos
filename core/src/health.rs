@@ -28,6 +28,9 @@ use crate::execution::worktree;
 use crate::sidecar::Liveness;
 use crate::state::AppState;
 
+mod settings_row;
+use settings_row::{router_probe, settings_probe};
+
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const SUBSYSTEM_TIMEOUT: Duration = Duration::from_millis(500);
 const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -257,6 +260,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         github,
         hook,
         router,
+        settings,
         devtime,
         distiller,
         embeddings,
@@ -304,6 +308,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             hook_interpreter_probe(state.pool.clone()),
         ),
         run_subsystem("llm_router", router_probe()),
+        run_subsystem("settings", settings_probe()),
         run_subsystem("devtime_ingest", devtime_probe(state.pool.clone())),
         run_subsystem("distiller", distiller_probe(state.pool.clone())),
         run_subsystem("embeddings", embeddings_probe()),
@@ -325,6 +330,7 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         github,
         hook,
         router,
+        settings,
         devtime,
         distiller,
         embeddings,
@@ -429,27 +435,6 @@ async fn machine_config_probe(root: Option<PathBuf>) -> SubsystemReadout {
         Ok(checks) => machine_config_row(&checks),
         Err(_) => SubsystemReadout::down("machine_config", FailureCategory::Unknown),
     }
-}
-
-/// What `router.yaml` asks of the daemon, before anybody has asked the router anything.
-#[derive(Debug, PartialEq)]
-enum RouterPlan {
-    /// No file, or every surface off: routing is not asked for, so there is nothing to measure.
-    Off,
-    /// A file that does not parse, or names a router off this machine. The daemon runs without
-    /// routing, but the owner believes it is on, which is what a red row is for.
-    Refused,
-    /// Routing is on. The URL and the budget are the file's own.
-    Ask { url: String, timeout: Duration },
-}
-
-/// PURE: the stored router document (`None` for an absent one) as a plan.
-///
-/// RED stub: the real body converts with `RouterDoc::to_config` (the loopback fence) and answers
-/// `Refused` / `Off` / `Ask`; until then every document is read as "off".
-fn router_plan(doc: Option<&crate::models::route_doc::RouterDoc>) -> RouterPlan {
-    let _ = doc;
-    RouterPlan::Off
 }
 
 /// The summary `devtime`'s ingestion loop writes after every cycle and this readout reads back.
@@ -684,57 +669,6 @@ async fn embeddings_probe() -> SubsystemReadout {
     embeddings_row(Some(embedder.model()), &listed)
 }
 
-/// PURE: the row. `reachable` matters only for a plan that asks.
-///
-/// An unreachable router is `degraded` and not `down`: the daemon falls back to the choice it
-/// made before routing existed, so nothing stops, and a `down` here would take the whole readout
-/// down for an adviser.
-fn router_row(plan: &RouterPlan, reachable: bool) -> SubsystemReadout {
-    match (plan, reachable) {
-        (RouterPlan::Off, _) => {
-            SubsystemReadout::disabled("llm_router", FailureCategory::NotConfigured)
-        }
-        (RouterPlan::Refused, _) => {
-            SubsystemReadout::down("llm_router", FailureCategory::NotConfigured)
-        }
-        (RouterPlan::Ask { .. }, true) => SubsystemReadout::ok("llm_router"),
-        (RouterPlan::Ask { .. }, false) => {
-            SubsystemReadout::degraded("llm_router", FailureCategory::Unreachable)
-        }
-    }
-}
-
-/// Reads the stored `router` document, then asks the router for its tiers.
-/// Task text never travels: `targets` is a GET with no body.
-async fn router_probe() -> SubsystemReadout {
-    let doc = crate::settings::get_opt::<crate::models::route_doc::RouterDoc>(
-        &crate::settings::Scope::Machine,
-    );
-    router_answer(router_plan(doc.as_deref())).await
-}
-
-/// The probe's one question, for a plan already made: does the router answer `targets`?
-async fn router_answer(plan: RouterPlan) -> SubsystemReadout {
-    let reachable = match &plan {
-        RouterPlan::Ask { url, timeout } => crate::router_client::RouterClient::new(url, *timeout)
-            .targets()
-            .await
-            .is_ok(),
-        _ => false,
-    };
-    router_row(&plan, reachable)
-}
-
-/// PURE: the settings row, from the snapshot the daemon is reading.
-///
-/// RED stub: the real body is `down` + `NotConfigured` with `counts` keyed by document name when
-/// `snapshot.unreadable()` is non-empty, and `ok` otherwise. Not wired into `collect_readout` yet.
-#[cfg_attr(not(test), allow(dead_code))]
-fn settings_row(snapshot: &crate::settings::Snapshot) -> SubsystemReadout {
-    let _ = snapshot;
-    todo!("settings health row")
-}
-
 /// PURE: the row, from whether the interpreter resolved and whether any rostered project wires
 /// the hook. A resolvable interpreter is `ok` either way.
 fn hook_interpreter_row(resolved: Option<PathBuf>, wired_anywhere: bool) -> SubsystemReadout {
@@ -899,8 +833,8 @@ async fn speaker_probe(configured: bool, command: String) -> SubsystemReadout {
 
 /// Whether the GitHub pillar could act if it were asked to.
 ///
-/// **`asked_for` is `enabled` AND the file existing, and both halves are load-bearing.**
-/// `GithubConfig::enabled` defaults to TRUE so that a machine with no `~/.nucleos/github.yaml` is capable
+/// **`asked_for` is `enabled` AND the document existing, and both halves are load-bearing.**
+/// `GithubConfig::enabled` defaults to TRUE so that a machine with no stored `github` document is capable
 /// of everything and autonomous in nothing — which means `enabled` alone can no longer distinguish
 /// "the owner wants this" from "the owner has never heard of it". Grading on `enabled` alone would
 /// put a red row on every installation that has never touched GitHub, and this module's own header
@@ -1098,7 +1032,7 @@ fn binary_candidate(path: &Path) -> Option<PathBuf> {
 
 type ExecVerdict = Result<HealthState, FailureCategory>;
 
-/// How long a slow-moving lookup (a PATH scan, a Credential Manager read, `router.yaml`'s text) is
+/// How long a slow-moving lookup (a PATH scan, a Credential Manager read) is
 /// trusted. The shell polls the readout about once a second; none of these change on that scale.
 const LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -1370,6 +1304,7 @@ fn classify_error<E>(_error: E) -> FailureCategory {
 
 #[cfg(test)]
 mod tests {
+    use super::settings_row::{RouterPlan, router_answer, router_plan, router_row, settings_row};
     use super::*;
     use crate::models::route_doc::RouterDoc;
 
@@ -1412,17 +1347,21 @@ mod tests {
     fn the_router_row_follows_the_document_and_then_the_router() {
         assert_eq!(router_plan(None), RouterPlan::Off);
         assert_eq!(
-            router_plan(Some(&router_doc("mode: off
-"))),
+            router_plan(Some(&router_doc(
+                "mode: off
+"
+            ))),
             RouterPlan::Off
         );
         assert_eq!(
             router_plan(Some(&router_doc_off_this_machine())),
             RouterPlan::Refused
         );
-        let ask = router_plan(Some(&router_doc("mode: shadow
+        let ask = router_plan(Some(&router_doc(
+            "mode: shadow
 url: http://127.0.0.1:9
-")));
+",
+        )));
         assert!(matches!(ask, RouterPlan::Ask { .. }));
 
         let off = router_row(&RouterPlan::Off, false);
@@ -1513,16 +1452,19 @@ url: http://127.0.0.1:{port}
     #[tokio::test]
     async fn an_unreadable_document_is_a_red_row_naming_it() {
         let pool = migrated_pool().await;
-        for (scope, name) in [
-            ("machine", "email"),
-            ("project:p1", "autopilot"),
-            ("project:p2", "autopilot"),
+        // A key the type does not know is stripped on load (a row from a newer daemon), so the autopilot
+        // body must be a real type error to be unreadable.
+        for (scope, name, body) in [
+            ("machine", "email", r#"{"enabled": "not a bool"}"#),
+            ("project:p1", "autopilot", r#"{"schedules": "daily"}"#),
+            ("project:p2", "autopilot", r#"{"schedules": "daily"}"#),
         ] {
             sqlx::query(
-                "INSERT INTO settings (scope, name, body_json, version, updated_at, updated_by)                  VALUES (?, ?, '{\"enabled\": \"not a bool\"}', 1, '2026-10-11T00:00:00.000Z', 'test')",
+                "INSERT INTO settings (scope, name, body_json, version, updated_at, updated_by)                  VALUES (?, ?, ?, 1, '2026-10-11T00:00:00.000Z', 'test')",
             )
             .bind(scope)
             .bind(name)
+            .bind(body)
             .execute(&pool)
             .await
             .unwrap();

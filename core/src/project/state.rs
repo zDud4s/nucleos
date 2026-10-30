@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 
 /// The directory under [`crate::machine_config::root`] that holds one directory per project.
-const PROJECTS_DIR: &str = "projects";
+pub const PROJECTS_DIR: &str = "projects";
 
 /// What a project does on its own: schedules, repository triggers, and the gate command.
 /// Parsed by [`crate::config::parse_schedule_rules`].

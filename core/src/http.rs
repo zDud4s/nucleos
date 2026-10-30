@@ -6744,9 +6744,9 @@ mod tests {
         // the cloud would break both promises at once, silently, on the bill.
         //
         // The condition needs no setup and is not at the mercy of a file outside the repository:
-        // it is the same one `cloud_choice` documents relying on. `config::models_config_path` is
-        // `None` under `cargo test`, so `models_config` is served `ModelsConfig::default`, which
-        // has `local_triage_model: None`.
+        // it is the same one `cloud_choice` documents relying on. `config::models_config_now` reads
+        // the empty settings snapshot under `cargo test`, so `models_config` is served
+        // `ModelsConfig::default`, which has `local_triage_model: None`.
         let mut state = test_state().await;
         // A fake that WOULD answer, so a fallback would succeed and this test would not see it.
         state.runner = extracting_runner();
@@ -15201,6 +15201,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_menu_route_takes_a_conversation() {
+        let _snapshot = crate::settings::testing::install(crate::settings::Settings::new());
         let state = test_state().await;
         let (created, body) = call(
             state.clone(),
@@ -15230,6 +15231,7 @@ mod tests {
     /// the feature silently absent rather than visibly broken.
     #[tokio::test]
     async fn the_catalogue_route_answers_with_choices_and_efforts() {
+        let _snapshot = crate::settings::testing::install(crate::settings::Settings::new());
         let state = test_state().await;
 
         let (status, body) = call(state, "GET", "/assistant/models", None).await;
@@ -15325,6 +15327,7 @@ mod tests {
     /// against what the picker offers.
     #[tokio::test]
     async fn a_fallback_catalogue_model_can_be_pinned_on_a_chat() {
+        let _snapshot = crate::settings::testing::install(crate::settings::Settings::new());
         let state = test_state().await;
         let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
             .await
@@ -15344,14 +15347,15 @@ mod tests {
     ///
     /// The other half — `true` for a model this machine has, `false` for one it does not — is
     /// pinned by `config.rs`'s `a_local_row_is_marked_by_whether_this_machine_has_it` and NOT here,
-    /// and that is a limit rather than a preference: `models_config()` reads no
-    /// file at all under `cargo test` (see `config::models_config_path`), so a unit
+    /// and that is a limit rather than a preference: `models_config()` reads the
+    /// empty settings snapshot under `cargo test`, i.e. the defaults (see `config::models_config_now`), so a unit
     /// test here is served the built-in defaults and those name no local model at all. What this
     /// test can prove is the half that travels: the route serves the field, and a route that is not
     /// `local` reports it as `null` rather than as a `false` that would put "not installed" on most
     /// of the menu — the same argument `AssistantChoice::tools` makes for never guessing `false`.
     #[tokio::test]
     async fn the_menu_reports_installed_for_local_rows_and_nothing_else() {
+        let _snapshot = crate::settings::testing::install(crate::settings::Settings::new());
         let state = test_state().await;
 
         let (status, body) = call(state, "GET", "/assistant/models", None).await;
@@ -15385,13 +15389,14 @@ mod tests {
     ///
     /// The accept path is deliberately not tested here, and the reason is the one
     /// `the_menu_reports_installed_for_local_rows_and_nothing_else` above gives: `models_config()`
-    /// reads no file at all under `cargo test` (see `config::models_config_path`), so the
+    /// reads the empty settings snapshot under `cargo test`, i.e. the defaults (see `config::models_config_now`), so the
     /// menu a unit test is served names no local model to accept. What CAN be proved here is the
     /// half that matters for safety — a name the menu does not carry is refused before any network
     /// call is made — and it is proved with a name that is real on a real machine (`llama3.2:3b`)
     /// rather than a nonsense string, so the test would still fail if the check were dropped.
     #[tokio::test]
     async fn a_pull_is_refused_for_a_model_the_menu_does_not_name() {
+        let _snapshot = crate::settings::testing::install(crate::settings::Settings::new());
         let state = test_state().await;
 
         let (status, body) = call(
@@ -19149,6 +19154,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_readout_returns_200_when_the_verdict_is_down() {
+        let _snapshot = crate::settings::testing::install(crate::settings::Settings::new());
         let app = build_router(test_state().await);
         let response = app
             .oneshot(
