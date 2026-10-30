@@ -442,6 +442,65 @@ mod tests {
         );
     }
 
+    /// Ported from `machine_config`'s models door when that table was deleted. `local_engine`'s refusals
+    /// all deserialise perfectly, so a door that stopped at serde would accept the write and leave the
+    /// daemon to refuse the same document on its next start.
+    #[test]
+    fn the_models_document_refuses_a_local_engine_the_daemon_would_refuse_at_startup() {
+        let models = |engine: Option<&str>, base_url: Option<&str>| {
+            let mut value = serde_json::to_value(ModelsConfig::default()).unwrap();
+            if let Some(engine) = engine {
+                value["local_engine"] = json!(engine);
+            }
+            if let Some(base_url) = base_url {
+                value["local_base_url"] = json!(base_url);
+            }
+            value
+        };
+
+        let why = prepared_text("models", &models(Some("openai_compatible"), None)).unwrap_err();
+        assert!(
+            why.contains(&crate::config::LocalEngineRefusal::NoBaseUrl.message()),
+            "the document says what startup would have said: {why}"
+        );
+        assert!(
+            prepared_text("models", &models(Some("llamafile"), None)).is_err(),
+            "an engine this daemon does not serve is refused"
+        );
+        assert!(
+            prepared_text(
+                "models",
+                &models(
+                    Some("openai_compatible"),
+                    Some("http://127.0.0.1.example.com/v1")
+                )
+            )
+            .is_err(),
+            "an address that only begins like the loopback is refused"
+        );
+        assert!(
+            prepared_text("models", &models(None, None)).is_ok(),
+            "a document that names no engine still passes"
+        );
+        assert!(
+            prepared_text("models", &models(Some("ollama"), None)).is_ok(),
+            "naming the engine it already used changes nothing"
+        );
+    }
+
+    /// Ported from `machine_config`'s channel door when that table was deleted: `stream_edits` is a bool
+    /// or the write is refused, and absent means on.
+    #[test]
+    fn the_channel_document_takes_stream_edits_as_a_bool_and_absent_means_on() {
+        let stored = |body: &Value| -> ChannelConfig {
+            let text = prepared_text("channels/telegram", body).expect("a valid channel document");
+            serde_json::from_str(&text).unwrap()
+        };
+        assert!(!stored(&json!({"stream_edits": false})).stream_edits());
+        assert!(stored(&json!({"doctrine": "x"})).stream_edits());
+        assert!(prepared_text("channels/telegram", &json!({"stream_edits": "maybe"})).is_err());
+    }
+
     #[test]
     fn the_router_is_stored_in_its_canonical_form() {
         let text = prepared_text("router", &json!({"mode": " shadow ", "timeout_ms": 5})).unwrap();
