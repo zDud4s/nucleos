@@ -267,7 +267,22 @@ async fn write_document(
     )
     .await
     .map_err(refused)?;
+    reload_channels_after(&state, &scope, doc.name);
     Ok(Json(json!({ "version": version })))
+}
+
+/// A published `channels/<id>` document applies at once: the hub re-reads its configuration from the snapshot,
+/// which the store has already swapped by the time a write returns. `reload` cannot fail (a poisoned lock
+/// keeps the old map and the next publish retries), so the write's success is never in question here. Its root
+/// argument is ignored since the configuration lives in the settings store.
+fn reload_channels_after(state: &AppState, scope: &Scope, name: &str) {
+    if matches!(scope, Scope::Machine) && name.starts_with("channels/") {
+        let root = state
+            .machine_config_root
+            .as_deref()
+            .unwrap_or(std::path::Path::new(""));
+        state.channels.reload(root);
+    }
 }
 
 /// `POST /settings/{scope}/{name}/rollback/{version}`: the body of an earlier version, written as a new one.
@@ -296,6 +311,7 @@ async fn rollback_document(
     )
     .await
     .map_err(refused)?;
+    reload_channels_after(&state, &scope, doc.name);
     Ok(Json(json!({ "version": version })))
 }
 
@@ -387,6 +403,14 @@ mod tests {
 
     fn autopilot_body() -> Value {
         serde_json::to_value(AutopilotRules::default()).unwrap()
+    }
+
+    /// A hub that already holds the `channels/telegram` document as it stands in the snapshot, the way
+    /// `main.rs` builds it at startup. The reads of a running turn go through `state.channels.configs`.
+    fn seed_channel_hub(state: &mut AppState) {
+        state.channels = std::sync::Arc::new(crate::channels::ChannelsRuntime::load(Some(
+            std::path::Path::new("."),
+        )));
     }
 
     fn row<'a>(rows: &'a Value, name: &str) -> &'a Value {
@@ -651,6 +675,36 @@ mod tests {
     /// Task 5.4: the optimistic write, refused in the order of spec section 5 (423, 403, 422, 409).
     mod put {
         use super::*;
+
+        /// The registry promises the hub re-reads a channel document when it is published.
+        #[tokio::test]
+        async fn put_of_a_channel_document_reloads_the_channel_config() {
+            let (_home, mut state) = fixture().await;
+            seed_channel_hub(&mut state);
+            assert!(
+                state.channels.config("telegram").unwrap().stream_edits(),
+                "the default is on"
+            );
+
+            let (status, answer) = put_doc(
+                &state,
+                "machine",
+                "channels%2Ftelegram",
+                json!({ "stream_edits": false }),
+                0,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+
+            let config = state
+                .channels
+                .config("telegram")
+                .expect("telegram is loaded");
+            assert!(
+                !config.stream_edits(),
+                "the hub still serves the old configuration: {config:?}"
+            );
+        }
 
         #[tokio::test]
         async fn put_during_the_kill_switch_is_423() {
@@ -1015,6 +1069,43 @@ mod tests {
                 verify_history(&state).await.len(),
                 3,
                 "it is in the history too"
+            );
+        }
+
+        #[tokio::test]
+        async fn rollback_of_a_channel_document_reloads_the_channel_config() {
+            let (_home, mut state) = fixture().await;
+            for (stream_edits, expected) in [(false, 0), (true, 1)] {
+                store::put(
+                    &state.pool,
+                    &Scope::Machine,
+                    "channels/telegram",
+                    &json!({ "stream_edits": stream_edits }),
+                    "test",
+                    Some(expected),
+                )
+                .await
+                .expect("seed the channel document");
+            }
+            seed_channel_hub(&mut state);
+            assert!(state.channels.config("telegram").unwrap().stream_edits());
+
+            let (status, answer) = call(
+                &state,
+                "POST",
+                "/settings/machine/channels%2Ftelegram/rollback/1",
+                Some(json!({ "version": 2 })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+
+            let config = state
+                .channels
+                .config("telegram")
+                .expect("telegram is loaded");
+            assert!(
+                !config.stream_edits(),
+                "the hub still serves the old configuration: {config:?}"
             );
         }
 
