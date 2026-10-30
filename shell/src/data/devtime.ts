@@ -208,6 +208,123 @@ export function devtimeMarkPath(findingKey: string, days: AnalyticsDays): string
 
 export const DEVTIME_PRICES_REFRESH_PATH = "/analytics/devtime/prices/refresh";
 
+/* ------------------------------------------------------- automatic actions -- */
+
+/**
+ * The automatic actions (`core/src/analytics/devtime/actions.rs`): every configured `(action, rule)`
+ * pair with its mode and promotion report, the shadow decisions ("what the system would have said"),
+ * the owner's mark on one of them, and the manual shadow-to-live promotion. Errors arrive as
+ * `{"error": code}`: `bad_action`, `bad_verdict`, `bad_limit`, `bad_cursor`, `unknown_rule`,
+ * `unknown_shadow`, `not_ready` (409, nothing written).
+ */
+export type ActionName = "inject" | "propose";
+export type ShadowMark = "useful" | "noise";
+
+/** The five criteria and their figures; `ready` is the AND of exactly the five booleans. */
+export interface PromotionReport {
+  action_eligible: boolean;
+  wilson_lower: number;
+  n_resolved: number;
+  n_sessions: number;
+  days_covered: number;
+  sample_ok: boolean;
+  hit_rate: number | null;
+  mean_hit_cost_ms: number | null;
+  shadow_approved: boolean;
+  avoidable_now: number | null;
+  avoidable_prev: number | null;
+  regression_ok: boolean;
+  human_marks: number;
+  human_rate: number | null;
+  human_ok: boolean;
+  ready: boolean;
+  median_hit_cost_ms: number | null;
+  suppress_rate: number | null;
+  ignored: number;
+}
+
+export interface ActionPair {
+  action: ActionName;
+  rule_id: string;
+  /** The effective mode: `shadow` when the pair has no stored row. */
+  mode: "shadow" | "live";
+  since: string | null;
+  changed_by: string | null;
+  report: PromotionReport;
+}
+export interface ActionPairs { pairs: ActionPair[] }
+
+export interface ShadowItem {
+  id: number;
+  action: ActionName;
+  rule_id: string;
+  project_id: string;
+  decision: "fire" | "suppress";
+  suppress_reason: string | null;
+  template_id: string;
+  /** The stored JSON object, parsed (`{}` when it did not parse). */
+  params: Record<string, unknown>;
+  decided_at: string;
+  outcome_state: string;
+  outcome: string | null;
+  human_verdict: ShadowMark | null;
+}
+export interface ShadowPage { items: ShadowItem[]; next_cursor: string | null }
+
+export const SHADOW_PAGE = 50;
+/** `rule` filters by rule id; `cursor` is the opaque hex the previous page answered. */
+export interface ShadowQuery { action?: ActionName; rule?: string; cursor?: string }
+
+export const DEVTIME_ACTIONS_PATH = "/analytics/devtime/actions";
+
+export function devtimeShadowPath(query: ShadowQuery): string {
+  void query;
+  return "";
+}
+
+export function devtimeShadowVerdictPath(id: number): string {
+  void id;
+  return "";
+}
+
+export function devtimeActionPromotePath(action: ActionName, rule: string): string {
+  void action;
+  void rule;
+  return "";
+}
+
+// The hooks below are RED stubs: idle queries and mutations that do nothing.
+
+export function useDevtimeActions() {
+  return useQuery({
+    queryKey: keys.analytics.devtimeActions(),
+    queryFn: () => apiFetch<ActionPairs>(DEVTIME_ACTIONS_PATH),
+    enabled: false,
+  });
+}
+
+export function useDevtimeShadow(query: ShadowQuery, enabled = true) {
+  return useQuery({
+    queryKey: keys.analytics.devtimeShadow(query.action ?? "", query.rule ?? "", query.cursor ?? ""),
+    queryFn: () => apiFetch<ShadowPage>(devtimeShadowPath(query)),
+    enabled: false && enabled,
+  });
+}
+
+export function useMarkShadow() {
+  return useMutation({
+    mutationFn: async (_vars: { id: number; verdict: ShadowMark }) => undefined as unknown as ShadowItem,
+    retry: false,
+  });
+}
+
+export function usePromoteAction() {
+  return useMutation({
+    mutationFn: async (_vars: { action: ActionName; rule: string }) => undefined as unknown as ActionPair,
+    retry: false,
+  });
+}
+
 export function useDevtime(projectId: string | undefined, days: AnalyticsDays) {
   return useQuery({
     queryKey: projectId === undefined ? keys.analytics.devtime(days) : keys.projects.devtime(projectId, days),
