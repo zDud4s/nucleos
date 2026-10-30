@@ -125,6 +125,8 @@ pub async fn get_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Optio
 ///
 /// Not an error path: this is what a turn that read third-party text is supposed to leave behind.
 pub async fn forget_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
+    // The fresh session raises the untrusted-read notice afresh.
+    crate::hooks::forget_untrusted_session(chat_id);
     sqlx::query("DELETE FROM assistant_sessions WHERE chat_id = ?")
         .bind(chat_id)
         .execute(pool)
