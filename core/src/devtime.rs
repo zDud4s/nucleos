@@ -29,6 +29,7 @@ pub mod store;
 pub mod unexplained;
 
 use crate::config::DevtimeConfig;
+use crate::devtime::actions as devtime_actions;
 use crate::devtime::lanes as devtime_lanes;
 use crate::devtime::map as devtime_map;
 use crate::devtime::parse::{
@@ -979,6 +980,17 @@ pub async fn ingest_cycle(
             families_panicked = pass.families_panicked,
             "devtime: rules pass"
         );
+        // The automatic actions record their decisions for each session the rules just ran for.
+        if cfg.actions.enabled {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for session in touched.iter().filter(|s| !lanes_failed.contains(*s)) {
+                if let Err(error) =
+                    devtime_actions::run_for_session(pool, cfg, session, now_ms).await
+                {
+                    tracing::warn!(%error, session = %session, "devtime: actions step failed");
+                }
+            }
+        }
     }
     stats
 }

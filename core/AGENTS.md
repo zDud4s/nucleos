@@ -490,6 +490,10 @@ the contract, not a snapshot.
 | `devtime/rules/pass.rs` | The per-cycle development-time rules pass. |
 | `devtime/rules/project.rs` | Projection of findings onto spans and attempts. |
 | `devtime/precision.rs` | Per-rule precision from feedback marks, phase-2 eligibility, base rates, and the mark API (endpoint in SP4). |
+| `devtime/actions.rs` | Parent of `devtime/actions/`. The automatic actions' decision step: `Decision`, the pure `decide_inject`, `apply_cap_and_cooldown`, `ACTION_VERSION`, and `run_for_session`, which wires it into the ingest cycle and writes `devtime_shadow`. Carries ids, counts and milliseconds only, never message text. |
+| `devtime/actions/inject.rs` | Fixtures for the `inject` decision (D3 search bursts, D6 long foreground commands); the function itself is `decide_inject` in the parent. Tests only. |
+| `devtime/actions/propose.rs` | The pure `propose` decision (`decide_propose`) for cross-session findings F1 and F2, with its `CrossCandidate` and `ProposeState` inputs. |
+| `devtime/store/shadow.rs` | The SQL of `devtime_shadow` (what each action decided, why, and the human's outcome) and `devtime_action_state` (per-action, per-rule mode), plus their closed vocabularies. No message text. |
 | `devtime/unexplained.rs` | PURE per-turn active/explained time and the listing of slow turns no rule explains. |
 | `devtime/rules/fixture.rs` | Tests only: compact session-script DSL that builds devtime rows, spans and rule facts. |
 | `consolidate.rs` | In `nucleos-app`. The periodic consolidation pass measures each project's gate history and refused-action history, then writes only episodic measurements from its two fixed-template generators. It skips any project with a live job or running run. Detection stays in SQL and the body is a template; no model interprets the histories. |

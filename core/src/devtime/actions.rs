@@ -193,8 +193,254 @@ pub async fn run_for_session(
     session_id: &str,
     now_ms: i64,
 ) -> sqlx::Result<usize> {
-    let _ = (pool, cfg, session_id, now_ms);
-    todo!("2.4 GREEN: run_for_session")
+    use crate::devtime::store as st;
+    let acfg = &cfg.actions;
+    if !acfg.enabled {
+        return Ok(0);
+    }
+    let head: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT project_id, ended_at, started_at FROM devtime_sessions WHERE session_id = ?",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((project_id, ended_at, started_at)) = head else {
+        return Ok(0);
+    };
+    let last_ms = ended_at
+        .as_deref()
+        .and_then(parse_ms)
+        .or_else(|| parse_ms(&started_at))
+        .unwrap_or(now_ms);
+    let decided_at = ms_text(now_ms);
+    let precisions = crate::devtime::precision::rule_report(pool, &cfg.rules, None).await?;
+    let mut written = 0_usize;
+
+    // ---- inject: one candidate per inject-pair rule with a finding in this session ----
+    let session_findings: Vec<st::FindingRow> = sqlx::query_as(
+        "SELECT * FROM devtime_findings WHERE session_id = ? AND scope <> 'cross' ORDER BY finding_key",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    let since = ms_text(
+        now_ms.saturating_sub(i64::from(acfg.inject_window_days).saturating_mul(86_400_000)),
+    );
+    let recent: Vec<RecentFinding> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT rule_id, cost_ms FROM devtime_findings WHERE project_id = ? AND scope <> 'cross' \
+         AND started_at >= ?",
+    )
+    .bind(&project_id)
+    .bind(&since)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(rule_id, cost_ms)| RecentFinding { rule_id, cost_ms })
+    .collect();
+    let inject_window_end =
+        ms_text(last_ms.saturating_add(i64::try_from(cfg.idle_minutes).unwrap_or(0) * 60_000));
+    let mut candidates: Vec<(Decision, String)> = Vec::new();
+    let mut prior: Vec<PriorFire> = Vec::new();
+    for rule_id in acfg.pairs.get("inject").map(Vec::as_slice).unwrap_or(&[]) {
+        let Some(finding) = session_findings.iter().find(|f| &f.rule_id == rule_id) else {
+            continue;
+        };
+        let Some(mode) = pair_mode(pool, "inject", rule_id).await? else {
+            continue;
+        };
+        let state = ProjectState {
+            project_id: project_id.clone(),
+            session_id: Some(session_id.to_string()),
+            mode: mode.clone(),
+            recent: recent.clone(),
+            precisions: precisions.clone(),
+        };
+        candidates.push((
+            decide_inject(&state, rule_id, acfg, ACTION_VERSION),
+            finding.rules_version.clone(),
+        ));
+        for row in st::decisions_for(pool, "inject", rule_id, &mode, &[ACTION_VERSION]).await? {
+            // This session's own earlier row must not cool down its recompute.
+            if row.decision == "fire" && row.session_id.as_deref() != Some(session_id) {
+                prior.push(PriorFire {
+                    rule_id: row.rule_id,
+                    project_id: row.project_id,
+                    mode: row.mode,
+                    action_version: row.action_version,
+                    at_ms: parse_ms(&row.decided_at).unwrap_or(0),
+                });
+            }
+        }
+    }
+    let decided = apply_cap_and_cooldown(
+        candidates.iter().map(|(d, _)| d.clone()).collect(),
+        &prior,
+        now_ms,
+        acfg,
+    );
+    for d in decided {
+        let rules_version = candidates
+            .iter()
+            .find(|(c, _)| c.rule_id == d.rule_id)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default();
+        if write_decision(
+            pool,
+            acfg,
+            &d,
+            rules_version,
+            &decided_at,
+            &inject_window_end,
+        )
+        .await?
+        {
+            written += 1;
+        }
+    }
+
+    // ---- propose: cross findings of propose-pair rules whose sessions include this one ----
+    let cross: Vec<st::FindingRow> = sqlx::query_as(
+        "SELECT * FROM devtime_findings WHERE project_id = ? AND scope = 'cross' ORDER BY finding_key",
+    )
+    .bind(&project_id)
+    .fetch_all(pool)
+    .await?;
+    let mut open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devtime_shadow WHERE action = 'propose' AND project_id = ? \
+         AND decision = 'fire' AND outcome_state = 'pending'",
+    )
+    .bind(&project_id)
+    .fetch_one(pool)
+    .await?;
+    let mut already: Vec<String> = sqlx::query_scalar(
+        "SELECT subject_key FROM devtime_shadow WHERE action = 'propose' AND project_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_all(pool)
+    .await?;
+    let propose_window_end = ms_text(
+        last_ms.saturating_add(i64::from(acfg.propose_window_days).saturating_mul(86_400_000)),
+    );
+    for rule_id in acfg.pairs.get("propose").map(Vec::as_slice).unwrap_or(&[]) {
+        let Some(mode) = pair_mode(pool, "propose", rule_id).await? else {
+            continue;
+        };
+        for f in cross.iter().filter(|f| &f.rule_id == rule_id) {
+            let sessions: Vec<String> = serde_json::from_str(&f.sessions).unwrap_or_default();
+            if !sessions.iter().any(|s| s == session_id) {
+                continue;
+            }
+            let state = propose::ProposeState {
+                project_id: project_id.clone(),
+                mode: mode.clone(),
+                candidates: Vec::new(),
+                open_proposals: open,
+                already_proposed: already.clone(),
+                precisions: precisions.clone(),
+            };
+            let candidate = propose::CrossCandidate {
+                finding_key: f.finding_key.clone(),
+                rule_id: f.rule_id.clone(),
+                sessions: i64::try_from(sessions.len()).unwrap_or(i64::MAX),
+                cost_ms: f.cost_ms,
+                count: f.count,
+            };
+            let d = propose::decide_propose(&state, &candidate, acfg, ACTION_VERSION);
+            if write_decision(
+                pool,
+                acfg,
+                &d,
+                &f.rules_version,
+                &decided_at,
+                &propose_window_end,
+            )
+            .await?
+            {
+                written += 1;
+            }
+            if d.decision == "fire" {
+                open += 1;
+            }
+            already.push(f.finding_key.clone());
+        }
+    }
+    Ok(written)
+}
+
+/// The mode a pair decides under: `None` when the owner turned it `off`; no row means `shadow`.
+async fn pair_mode(
+    pool: &sqlx::SqlitePool,
+    action: &str,
+    rule_id: &str,
+) -> sqlx::Result<Option<String>> {
+    let state = crate::devtime::store::get_action_state(pool, action, rule_id).await?;
+    Ok(match state {
+        Some(row) if row.mode == "off" => None,
+        Some(row) => Some(row.mode),
+        None => Some("shadow".to_string()),
+    })
+}
+
+/// Stores one decision as a `pending` row, suppressed ones included. True when a row was written.
+async fn write_decision(
+    pool: &sqlx::SqlitePool,
+    cfg: &crate::config::DevtimeActionsConfig,
+    d: &Decision,
+    rules_version: &str,
+    decided_at: &str,
+    window_end_at: &str,
+) -> sqlx::Result<bool> {
+    use crate::devtime::store as st;
+    let template_id = match (d.action.as_str(), d.rule_id.as_str()) {
+        ("inject", "D3") => "inject.d3.v1",
+        ("inject", "D6") => "inject.d6.v1",
+        ("propose", "F1") => "propose.f1.v1",
+        ("propose", "F2") => "propose.f2.v1",
+        // No template in the closed catalogue: nothing to record.
+        _ => return Ok(false),
+    };
+    st::insert_decision(
+        pool,
+        &st::ShadowRow {
+            action: d.action.clone(),
+            rule_id: d.rule_id.clone(),
+            project_id: d.project_id.clone(),
+            session_id: d.session_id.clone(),
+            subject_key: d.subject_key.clone(),
+            mode: d.mode.clone(),
+            decision: d.decision.clone(),
+            suppress_reason: d.suppress_reason.clone(),
+            template_id: template_id.to_string(),
+            basis_precision: d.basis_precision,
+            basis_cases: d.basis_cases,
+            basis_recent_count: d.basis_recent_count,
+            basis_recent_cost_ms: d.basis_recent_cost_ms,
+            expected_saving_ms: d.expected_saving_ms,
+            rule_version: d.rule_version,
+            action_version: d.action_version,
+            thresholds_hash: st::thresholds_hash(cfg, &d.action, &d.rule_id),
+            rules_version: rules_version.to_string(),
+            decided_at: decided_at.to_string(),
+            window_end_at: window_end_at.to_string(),
+            outcome_state: "pending".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Unix milliseconds to the `%Y-%m-%dT%H:%M:%S%.3fZ` text the devtime tables store.
+fn ms_text(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap_or_default()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+fn parse_ms(text: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|t| t.timestamp_millis())
 }
 
 /// Median of `values` (sorted in place); the mean of the two middle ones for an even count.
