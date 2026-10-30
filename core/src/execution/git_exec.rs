@@ -887,6 +887,61 @@ gate_command: git --version
         assert_eq!(sha_of(&repo, "master"), before, "master moved");
     }
 
+    /// Stored rules the queue cannot read are not "no rules": whether this repository wanted its merges
+    /// measured is unknown, and publishing unmeasured is the failure the key exists to end. The merge is
+    /// refused, with the reason in the row, and `master` does not move. No rules file exists anywhere:
+    /// the document is stored in the settings snapshot, and the machine root holds nothing.
+    #[tokio::test]
+    async fn rules_that_cannot_be_read_refuse_the_merge_and_publish_nothing() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-unreadable-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let _home = crate::project::rules::testing::Home::new();
+        crate::project::rules::testing::publish_unreadable(
+            "alpha",
+            "autopilot",
+            "gate_before_publish: invalid type: string \"yes\", expected a boolean",
+        );
+        let before = sha_of(&repo, "master");
+
+        match land_ordinarily(&repo, container.path()).await {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("could not be read"), "{reason}");
+                assert!(reason.contains("nothing was published"), "{reason}");
+                assert!(reason.contains("expected a boolean"), "the reason is passed on: {reason}");
+            }
+            other => panic!("unreadable rules must refuse the merge, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
+    /// The gate is read from the stored rules at the moment of the merge, not from a file: a red gate
+    /// that is only stored in the snapshot refuses the merge, and `master` does not move.
+    #[tokio::test]
+    async fn a_gate_stored_in_the_snapshot_refuses_a_red_merge() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-stored-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let _home = crate::project::rules::testing::Home::new();
+        crate::project::rules::testing::publish_rules(
+            "alpha",
+            "gate_before_publish: true
+gate_command: git rev-parse --verify nao-existe
+",
+        );
+        let before = sha_of(&repo, "master");
+
+        let outcome = land_ordinarily(&repo, container.path()).await;
+
+        assert!(
+            matches!(outcome, Outcome::Failed { .. }),
+            "a stored red gate must refuse the merge, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
     /// Writes project `alpha`'s rules where the queue reads them: `<machine_root>/projects/alpha/`,
     /// with `machine_root` a temporary directory standing in for `~/.nucleos`.
     fn write_autopilot_rules(machine_root: &Path, contents: &str) {
@@ -904,6 +959,9 @@ gate_command: git --version
     /// An ordinary landing of `feat/x` into `master`, through the real executor.
     async fn land_ordinarily(repo: &Path, machine_root: &Path) -> Outcome {
         use crate::execution::vcs::VcsExecutor;
+        // Reads the project's rules from the settings snapshot: hold the shared side of the rules gate
+        // (a no-op when the test already published and so holds the exclusive side).
+        crate::project::rules::testing::hold_shared();
         GitExecutor {
             machine_root: Some(machine_root.to_path_buf()),
             ..GitExecutor::default()
@@ -989,6 +1047,7 @@ gate_command: git --version
         id: i64,
     ) -> Outcome {
         use crate::execution::vcs::VcsExecutor;
+        crate::project::rules::testing::hold_shared();
         GitExecutor {
             machine_root: Some(machine_root.to_path_buf()),
             pool,

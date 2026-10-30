@@ -604,6 +604,27 @@ mod tests {
         crate::testdb::fresh_pool().await
     }
 
+    /// A project's disk cap comes from its stored rules, not from a file under the machine root; an
+    /// unreadable document or none at all falls back to the default cap. The stand-in home holds only
+    /// the warm directories: no `autopilot.yaml` is written anywhere.
+    #[test]
+    fn the_sweep_reads_each_projects_cap_from_its_stored_rules() {
+        use crate::project::rules::testing::{Home, publish_rules, publish_unreadable};
+        let home = Home::new();
+        for project in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir_all(home.path().join("warm").join(project)).unwrap();
+        }
+        publish_rules("alpha", "verify_disk_cap_gb: 7
+");
+        publish_unreadable("beta", "autopilot", "unknown field");
+
+        let caps = sweep_caps(home.path(), home.path(), &VerifyConfig::default());
+
+        assert_eq!(caps.project_bytes["alpha"], 7 * GIB, "the stored cap is read");
+        assert_eq!(caps.project_bytes["beta"], DEFAULT_PROJECT_DISK_CAP_GB * GIB);
+        assert_eq!(caps.project_bytes["gamma"], DEFAULT_PROJECT_DISK_CAP_GB * GIB);
+    }
+
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
     }

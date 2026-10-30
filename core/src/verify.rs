@@ -1271,6 +1271,9 @@ tests:
     /// whose machine root holds `alpha`'s `autopilot.yaml` when `gate` is given. The worker loop
     /// runs only when `run` is set.
     async fn fixture(map: Option<&str>, gate: Option<&str>, run: bool) -> Fixture {
+        // The executor reads the project's rules from the settings snapshot: hold the shared side of
+        // the rules gate; the tests that publish upgrade to the exclusive side themselves.
+        crate::project::rules::testing::hold_shared();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
         std::fs::create_dir_all(root.join("core")).unwrap();
@@ -1910,6 +1913,32 @@ tests:
         assert_eq!(ticket.note.as_deref(), Some(NO_MAP_OWN_NOTE));
         assert_eq!(ticket.base, None);
         assert_eq!(count(&f.pool, "verify_runs").await, 0);
+    }
+
+    /// The gate command is read from the stored rules at the moment of the request, not when the
+    /// executor was built: a project with none is refused, and the same request is planned once a gate
+    /// is stored. The fixture writes no file; the second request can only see the snapshot.
+    #[tokio::test]
+    async fn a_gate_command_stored_after_a_refusal_is_planned_on_the_next_request() {
+        let f = fixture(None, None, true).await;
+        let request = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, None);
+
+        let refused = submit(&f.ex, Caller::Owner, &request).await.unwrap_err();
+        assert!(
+            matches!(&refused, VerifyError::Unprocessable(message) if message.contains("no gate_command")),
+            "{refused:?}"
+        );
+
+        crate::project::rules::testing::publish_rules("alpha", "gate_command: \"git --version\"
+");
+        let second = submit(&f.ex, Caller::Owner, &request).await;
+        assert!(
+            second.is_ok(),
+            "a gate stored after the refusal must be planned: {second:?}"
+        );
+        let (ticket, _) = finished(&f.pool, second.unwrap()).await;
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+        assert_eq!(ticket.units[0].why, "gate_command");
     }
 
     #[tokio::test]

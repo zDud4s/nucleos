@@ -1212,6 +1212,9 @@ mod tests {
     /// `autopilot.yaml` holds `rules` when given. The executor loop is NOT running.
     async fn fixture(rules: Option<&str>) -> Fixture {
         let lock = crate::execution::worktree::test_env_lock();
+        // The worker reads the project's rules from the settings snapshot: hold the shared side of the
+        // rules gate (after the env lock, never before it); a test that publishes upgrades itself.
+        crate::project::rules::testing::hold_shared();
         let repo = space_free_tempdir("nucleos-postgate-");
         let root = repo.path().to_path_buf();
         git_in(&root, &["init", "-q", "-b", "main"]);
@@ -2717,6 +2720,60 @@ mod tests {
         );
         tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
         assert_eq!(queue_rows(&f.pool).await.len(), 1);
+    }
+
+    /// The stored form of the held revert: the project's `autopilot` document is stored but no longer
+    /// fits its type (nothing on disk says so), and the revert is HELD with the reason in the feed line,
+    /// not started and not dropped.
+    #[tokio::test]
+    async fn a_pending_revert_is_held_when_the_stored_rules_cannot_be_read() {
+        let f = fixture(Some(REVERT_ON)).await;
+        let (c3, c4) = confirmed_culprit(&f).await;
+
+        crate::project::rules::testing::publish_unreadable(
+            "alpha",
+            "autopilot",
+            "revert_on_red: invalid type: sequence, expected a boolean",
+        );
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .unwrap();
+        let step = revert_step(&f.ex, "alpha", &f.root, &state).await;
+        assert!(
+            matches!(step, Step::Waiting { ref sha } if *sha == c3),
+            "{step:?}"
+        );
+
+        assert!(queue_rows(&f.pool).await.is_empty(), "nothing is queued");
+        let lines = feed_summaries(&f.pool).await;
+        let last = lines.last().expect("the owner is told");
+        assert!(last.contains("could not be read"), "{last}");
+        assert!(last.contains("expected a boolean"), "the reason is in the line: {last}");
+        assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
+    }
+
+    /// A pass skips a project whose stored rules cannot be read: nothing is started on rules nobody
+    /// can read. The fixture's file stays readable, so only the snapshot can say otherwise.
+    #[tokio::test]
+    async fn a_pass_skips_a_project_whose_stored_rules_cannot_be_read() {
+        let f = fixture(Some("gate_command: \"git --version\"
+gate_after_land: true
+")).await;
+        crate::project::rules::testing::publish_rules(
+            "alpha",
+            "gate_command: \"git --version\"
+gate_after_land: true
+",
+        );
+        assert!(step_of(&f).await.is_some(), "readable rules are ticked");
+
+        crate::project::rules::testing::publish_unreadable("alpha", "autopilot", "unknown field");
+
+        assert!(
+            step_of(&f).await.is_none(),
+            "an unreadable stored document skips the project"
+        );
     }
 
     /// A crash between the submit and the store of the ticket leaves a queued revert with no id in

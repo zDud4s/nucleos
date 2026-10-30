@@ -1657,6 +1657,9 @@ mod tests {
     use std::time::Instant;
 
     fn asked(run_id: i64, shadow: Option<i64>, command: &str) -> Asked {
+        // These tests read the project's rules through `prepare`: hold the shared side of the rules
+        // gate; the ones that publish take the exclusive side themselves.
+        crate::project::rules::testing::hold_shared();
         Asked {
             run_id,
             shadow_decision_id: shadow,
@@ -1996,6 +1999,61 @@ mod tests {
         assert_eq!(judge.calls(), 0);
         let (.., error, _, _) = verdicts(&pool, 1).await.remove(0);
         assert!(error.unwrap().starts_with("config:"));
+    }
+
+    /// D7/D10: a project whose STORED rules cannot be read is not judged with defaults that may be
+    /// looser than what it wrote down. (The call carries no `machine_root`: the rules are not files.)
+    #[tokio::test]
+    async fn an_unreadable_rules_document_falls_back_to_the_classifier() {
+        let pool = pool().await;
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "judge: unknown field `allow`",
+        );
+        let run_id = running_run(&pool).await;
+        let judge = ScriptedJudge::answering(0.99, 0.99);
+        let call = asked(run_id, None, "cargo test --workspace | tee t.log");
+
+        judge_call(
+            &pool,
+            &JudgeRuntime::with(judge.clone()),
+            &call,
+            JudgeMode::Observe,
+        )
+        .await;
+
+        assert_eq!(judge.calls(), 0, "an unreadable document must not reach the judge");
+        let (.., error, _, _) = verdicts(&pool, 1).await.remove(0);
+        let error = error.expect("the verdict row names the config error");
+        assert!(error.starts_with("config:"), "{error}");
+        assert!(error.contains("judge: unknown field `allow`"), "{error}");
+    }
+
+    /// The thresholds are read when the call is decided: a change to the stored rules is seen by the
+    /// very next call, in both directions, and removing them brings the defaults back.
+    #[tokio::test]
+    async fn a_change_in_the_stored_thresholds_is_seen_on_the_next_call() {
+        use crate::project::rules::testing::{clear, publish_rules};
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let call = asked(run_id, None, "cargo test --workspace | tee t.log");
+
+        publish_rules("p", "judge:
+  allow_at: 0.97
+");
+        let strict = prepare(&pool, &call).await.unwrap().thresholds;
+        assert_eq!(strict.allow_at, 0.97, "the stored allow_at is read");
+
+        publish_rules("p", "judge:
+  allow_at: 0.91
+");
+        let relaxed = prepare(&pool, &call).await.unwrap().thresholds;
+        assert_eq!(relaxed.allow_at, 0.91, "a republished value is seen");
+
+        clear("p", "autopilot");
+        let defaults = prepare(&pool, &call).await.unwrap().thresholds;
+        assert_eq!(defaults, Thresholds::default());
     }
 
     /// The key never travels in an error: every variant's text is built from a status, a name or

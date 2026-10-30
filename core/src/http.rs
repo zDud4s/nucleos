@@ -1533,6 +1533,9 @@ mod tests {
     }
 
     pub(crate) async fn test_state() -> AppState {
+        // Handlers read project rules from the settings snapshot: hold the shared side of the rules
+        // gate; a test that publishes upgrades to the exclusive side itself.
+        crate::project::rules::testing::hold_shared();
         let pool = crate::testdb::fresh_pool().await;
         AppState {
             startup_config: Default::default(),
@@ -4315,6 +4318,83 @@ mod tests {
         assert_eq!(body["rules_file"], "unreadable");
         assert!(body["rules_error"].as_str().unwrap().contains("schedule"));
         assert_eq!(body["schedules"].as_array().unwrap().len(), 0);
+    }
+
+    /// The stored `autopilot` document that cannot be read is reported by name, not read as no rules at
+    /// all. The fixture stores NOTHING on disk: the route answers from the settings snapshot.
+    #[tokio::test]
+    async fn a_stored_document_that_cannot_be_read_is_reported_as_unreadable() {
+        let state = test_state().await;
+        let _home = crate::project::rules::testing::Home::new();
+        let _dir = project_with_rules(&state, "alpha", "").await;
+        crate::project::rules::testing::publish_unreadable(
+            "alpha",
+            "autopilot",
+            "schedule: unknown field `schedule`",
+        );
+
+        let (_, body) = read_rules(state, "alpha").await;
+        assert_eq!(body["rules_file"], "unreadable", "{body}");
+        assert!(
+            body["rules_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unknown field `schedule`")),
+            "{body}"
+        );
+    }
+
+    /// Reading the rules shows the stored document of the moment: a change is seen by the next read,
+    /// and removing the document reads as absent again. No file is written anywhere.
+    #[tokio::test]
+    async fn a_change_in_the_stored_rules_is_seen_by_the_next_read() {
+        use crate::project::rules::testing::{Home, clear, publish_rules};
+        let state = test_state().await;
+        let _home = Home::new();
+        let _dir = project_with_rules(&state, "alpha", "").await;
+        publish_rules("alpha", "gate_command: cargo test
+");
+
+        let (_, first) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(first["rules_file"], "present", "{first}");
+        assert_eq!(first["gate_command"], "cargo test", "{first}");
+
+        publish_rules("alpha", "gate_command: cargo clippy
+");
+        let (_, second) = read_rules(state.clone(), "alpha").await;
+        assert_eq!(second["gate_command"], "cargo clippy", "{second}");
+
+        clear("alpha", "autopilot");
+        let (_, third) = read_rules(state, "alpha").await;
+        assert_eq!(third["rules_file"], "absent", "{third}");
+        assert!(third["gate_command"].is_null(), "{third}");
+    }
+
+    /// The onboarding view names the gate the project has STORED, read from the settings snapshot (the
+    /// view still needs a machine root for the onboarding marker, which stays a file).
+    #[tokio::test]
+    async fn the_onboarding_view_reports_the_stored_gate() {
+        let mut state = test_state().await;
+        let home = crate::project::rules::testing::Home::new();
+        state.machine_config_root = Some(home.path().to_path_buf());
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join("package.json"),
+            r#"{"scripts": {"test": "vitest run"}}"#,
+        )
+        .unwrap();
+        let root = folder.path().to_string_lossy().into_owned();
+        crate::project::rules::testing::publish_rules("alpha", "gate_command: npm run test
+");
+
+        let (status, view) = workflow_call(
+            state,
+            "GET",
+            &format!("/projects/alpha/onboard?root={}", urlencoding(&root)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["configured_gate"], "npm run test", "{view}");
     }
 
     /// A project with no root has no file to read. That is what `off` looks like, not a fault.
@@ -8637,6 +8717,32 @@ mod tests {
         assert_eq!(
             (status, body["refusal"].as_str()),
             (StatusCode::CONFLICT, Some("not_ready"))
+        );
+    }
+
+    /// Review item G, stored form: rules the judge cannot read leave the judge without effect for that
+    /// project, and the panel names the reason. The state has no machine root and no file exists: the
+    /// route reads the settings snapshot.
+    #[tokio::test]
+    async fn a_projects_unreadable_stored_rules_are_named_beside_its_judge() {
+        let state = test_state().await;
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "judge: invalid type: sequence, expected struct JudgeConfig",
+        );
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) =
+            workflow_call(state, "GET", "/autopilot/judge?project_id=p", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["rules_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("expected struct JudgeConfig")),
+            "{body}"
         );
     }
 

@@ -1011,6 +1011,8 @@ mod tests {
     }
 
     fn asked(run_id: i64, event: Event, command: &str, class: &'static str) -> Asked {
+        // The tests here read the project's rules; the ones that publish take the exclusive side.
+        crate::project::rules::testing::hold_shared();
         Asked {
             run_id,
             lineage_root_id: run_id,
@@ -1366,6 +1368,56 @@ mod tests {
         let row = ask(&pool, &runtime, &lowered).await;
         assert_eq!(row.error, None);
         assert_eq!(row.judge_outcome, Some(Outcome::Stop));
+    }
+
+    /// D4/D1: stored rules that cannot be read may be looser than what the project wrote down, so the
+    /// call gives today's outcome and says it was the config. (No `machine_root`: rules are not files.)
+    #[tokio::test]
+    async fn invalid_stored_rules_give_the_default_outcome_and_a_config_error() {
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "judge_resolve: unknown field `offtask`",
+        );
+        let judge = ScriptedJudge::answering_keys(&[("off_task", 0.1), ("needed", 0.1)]);
+        let runtime = JudgeRuntime::with(judge.clone());
+        let question = asked(run_id, Event::HardDeny, "rm -rf x", "destructive");
+        let row = ask(&pool, &runtime, &question).await;
+        assert_eq!(row.judge_outcome, None, "an unreadable document must not reach the judge");
+        assert_eq!(row.final_outcome, Event::HardDeny.default_outcome());
+        let error = row.error.expect("the row names the config error");
+        assert!(error.starts_with("config:"), "{error}");
+        assert_eq!(judge.calls(), 0);
+    }
+
+    /// D4: the project's stored thresholds, read at decision time, move the judge's opinion, and a
+    /// change to them is seen by the next call.
+    #[tokio::test]
+    async fn a_projects_stored_threshold_changes_the_opinion_and_a_change_is_seen() {
+        use crate::project::rules::testing::{clear, publish_rules};
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let answers = [("off_task", 0.5), ("needed", 0.1)];
+        let question = asked(run_id, Event::HardDeny, "rm -rf x", "destructive");
+
+        let runtime = JudgeRuntime::with(ScriptedJudge::answering_keys(&answers));
+        let defaults = ask(&pool, &runtime, &question).await;
+        assert_eq!(defaults.judge_outcome, Some(Outcome::Deny));
+
+        publish_rules("p", "judge_resolve:
+  off_task_at: 0.4
+");
+        let runtime = JudgeRuntime::with(ScriptedJudge::answering_keys(&answers));
+        let row = ask(&pool, &runtime, &question).await;
+        assert_eq!(row.error, None);
+        assert_eq!(row.judge_outcome, Some(Outcome::Stop), "the stored threshold is read");
+
+        clear("p", "autopilot");
+        let runtime = JudgeRuntime::with(ScriptedJudge::answering_keys(&answers));
+        let back = ask(&pool, &runtime, &question).await;
+        assert_eq!(back.judge_outcome, Some(Outcome::Deny), "removing the document restores defaults");
     }
 
     async fn recorded_runs(pool: &sqlx::SqlitePool) -> Vec<i64> {
