@@ -206,6 +206,33 @@ def the_smoke_script_checks_the_install_and_the_daemon():
         assert binary in body, f"smoke-bundle.sh does not check {binary}"
 
 
+def releasing_documents_the_identifier_change():
+    text = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    heading = re.search(r"^(#{1,6})[ \t]+.*Identifier change.*$", text, re.M | re.I)
+    assert heading, "RELEASING.md has no 'Identifier change' section"
+    rest = text[heading.end() :]
+    # The section ends at the next heading of the same or a higher level.
+    nxt = re.search(rf"^#{{1,{len(heading.group(1))}}}[ \t]+\S", rest, re.M)
+    section = (rest[: nxt.start()] if nxt else rest).lower()
+    for needle in (
+        "com.pc-multimedia.shell",
+        "com.nucleos.app",
+        "microphone",
+        "accessibility",
+        ".rpm",
+        "gnome-keyring",
+        "package manager",
+    ):
+        assert needle in section, f"'Identifier change' section lacks {needle!r}"
+
+
+def the_nsis_preinstall_hook_still_stops_the_daemon():
+    text = (ROOT / "shell" / "src-tauri" / "windows" / "hooks.nsh").read_text(encoding="utf-8")
+    m = re.search(r"!macro NSIS_HOOK_PREINSTALL\b(.*?)!macroend", text, re.S)
+    assert m, "hooks.nsh has no NSIS_HOOK_PREINSTALL macro"
+    assert "NUCLEOS_STOP_DAEMON" in m.group(1), "NSIS_HOOK_PREINSTALL no longer stops the daemon"
+
+
 CASES = [
     verify_accepts_a_complete_release_and_names_what_is_missing,
     a_foreign_version_in_a_versioned_name_is_refused,
@@ -217,6 +244,8 @@ CASES = [
     macos_is_signed_with_the_stable_certificate_or_not_at_all,
     the_smoke_job_gates_the_publish,
     the_smoke_script_checks_the_install_and_the_daemon,
+    releasing_documents_the_identifier_change,
+    the_nsis_preinstall_hook_still_stops_the_daemon,
 ]
 
 if __name__ == "__main__":
