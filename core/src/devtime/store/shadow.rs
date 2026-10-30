@@ -301,28 +301,45 @@ pub struct SessionFinding {
     pub cost_ms: i64,
 }
 
-/// Contract (3.1 GREEN): the `devtime_findings` rows of `session_id` whose `scope <> 'cross'`, every
-/// rule and every `rule_version`, ordered by `finding_key`.
+/// The `devtime_findings` rows of `session_id` whose `scope <> 'cross'`, every rule and every
+/// `rule_version`, ordered by `finding_key`.
 pub async fn session_findings(
-    _pool: &SqlitePool,
-    _session_id: &str,
+    pool: &SqlitePool,
+    session_id: &str,
 ) -> sqlx::Result<Vec<SessionFinding>> {
-    todo!("3.1 GREEN: read the session's non-cross findings")
+    sqlx::query_as::<_, SessionFinding>(
+        "SELECT rule_id, finding_key, rule_version, cost_ms FROM devtime_findings \
+         WHERE session_id = ? AND scope <> 'cross' ORDER BY finding_key",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
 }
 
-/// Contract (3.1 GREEN): the `verified` value of every `devtime_attempt_marks` row of `session_id`
-/// (`passed` | `failed` | `not_measured`), in any order; empty when the session has no marks.
+/// The `verified` value of every `devtime_attempt_marks` row of `session_id` (`passed` | `failed` |
+/// `not_measured`), in any order; empty when the session has no marks.
 pub async fn session_attempt_verified(
-    _pool: &SqlitePool,
-    _session_id: &str,
+    pool: &SqlitePool,
+    session_id: &str,
 ) -> sqlx::Result<Vec<String>> {
-    todo!("3.1 GREEN: read the session's attempt marks")
+    sqlx::query_scalar("SELECT verified FROM devtime_attempt_marks WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
 }
 
-/// Contract (3.1 GREEN): sets `outcome_state = 'void'` and `resolved_at = now` on row `id` only when
-/// it is still `pending` (a resolved row is never touched here). True when the row changed.
-pub async fn void_pending(_pool: &SqlitePool, _id: i64) -> sqlx::Result<bool> {
-    todo!("3.1 GREEN: void one pending row")
+/// Sets `outcome_state = 'void'` and `resolved_at = now` on row `id` only when it is still `pending`
+/// (a resolved row is never touched here). True when the row changed.
+pub async fn void_pending(pool: &SqlitePool, id: i64) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE devtime_shadow SET outcome_state = 'void', resolved_at = ? \
+         WHERE id = ? AND outcome_state = 'pending'",
+    )
+    .bind(super::now())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// The owner's optional `useful` / `noise` mark on a row. Returns true when the row exists.

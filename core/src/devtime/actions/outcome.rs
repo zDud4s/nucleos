@@ -21,6 +21,8 @@
 
 use sqlx::SqlitePool;
 
+use crate::devtime::store;
+
 /// How many rows one call closed, by result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CloseCounts {
@@ -32,14 +34,72 @@ pub struct CloseCounts {
 /// The session's `verified` from its attempt marks: `failed` if any mark failed, else `passed` if any
 /// passed, else `not_measured` (also for no marks at all).
 pub fn aggregate_verified(marks: &[String]) -> &'static str {
-    let _ = marks;
-    todo!("3.1 GREEN: aggregate the attempt marks")
+    if marks.iter().any(|m| m == "failed") {
+        "failed"
+    } else if marks.iter().any(|m| m == "passed") {
+        "passed"
+    } else {
+        "not_measured"
+    }
 }
 
 /// Closes every due pending `inject` row at `now_ms` (unix milliseconds). See the module contract.
 pub async fn close_inject_outcomes(pool: &SqlitePool, now_ms: i64) -> sqlx::Result<CloseCounts> {
-    let _ = (pool, now_ms);
-    todo!("3.1 GREEN: close the due inject rows")
+    let now = super::ms_text(now_ms);
+    let mut counts = CloseCounts::default();
+    for row in store::pending_due(pool, &now).await? {
+        if row.action != "inject" {
+            continue;
+        }
+        let Some(session_id) = row.session_id.as_deref() else {
+            counts.void += changed_count(store::void_pending(pool, row.id).await?);
+            continue;
+        };
+        let findings = store::session_findings(pool, session_id).await?;
+        let of_rule: Vec<&store::SessionFinding> = findings
+            .iter()
+            .filter(|f| f.rule_id == row.rule_id)
+            .collect();
+        let same_version: Vec<&store::SessionFinding> = of_rule
+            .iter()
+            .copied()
+            .filter(|f| f.rule_version == row.rule_version)
+            .collect();
+        if same_version.is_empty() && !of_rule.is_empty() {
+            counts.void += changed_count(store::void_pending(pool, row.id).await?);
+            continue;
+        }
+        // Findings arrive ordered by key, so the first of equal costs is the smallest key.
+        let mut costliest: Option<&store::SessionFinding> = None;
+        for f in same_version.iter().copied() {
+            if costliest.is_none_or(|best| f.cost_ms > best.cost_ms) {
+                costliest = Some(f);
+            }
+        }
+        let marks = store::session_attempt_verified(pool, session_id).await?;
+        let hit = costliest.is_some();
+        let outcome = store::ShadowOutcome {
+            state: "resolved".into(),
+            outcome: Some(if hit { "hit" } else { "miss" }.into()),
+            finding_key: costliest.map(|f| f.finding_key.clone()),
+            cost_ms: Some(same_version.iter().map(|f| f.cost_ms).sum()),
+            verified: Some(aggregate_verified(&marks).into()),
+            proposal_id: None,
+            resolved_at: now.clone(),
+        };
+        if store::resolve(pool, row.id, &outcome).await? {
+            if hit {
+                counts.hit += 1;
+            } else {
+                counts.miss += 1;
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn changed_count(changed: bool) -> usize {
+    usize::from(changed)
 }
 
 #[cfg(test)]
