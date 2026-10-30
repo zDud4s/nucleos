@@ -102,6 +102,26 @@ fn changed_count(changed: bool) -> usize {
     usize::from(changed)
 }
 
+/// How many `propose` rows one call closed, by result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProposeCloseCounts {
+    pub hit: usize,
+    pub miss: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub ignored: usize,
+    pub expired: usize,
+}
+
+/// Closes every due pending `propose` row at `now_ms`. RED stub: the contract is pinned by the
+/// `propose_close_` tests below.
+pub async fn close_propose_outcomes(
+    _pool: &SqlitePool,
+    _now_ms: i64,
+) -> sqlx::Result<ProposeCloseCounts> {
+    todo!("step 3.2: close propose outcomes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +328,220 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(propose_state, "pending");
+    }
+
+    // ---- 3.2 propose ------------------------------------------------------------------------
+    //
+    // Contract of `close_propose_outcomes` (rows with `action = 'propose'`, `outcome_state =
+    // 'pending'`, `window_end_at <= ms_text(now_ms)`; inject rows and rows not yet due untouched):
+    // - a human verdict prevails in every mode: `useful` -> `resolved`/`accepted`, `noise` ->
+    //   `resolved`/`rejected`; the verdict itself is never touched;
+    // - shadow, no verdict: a cross finding with `finding_key == subject_key` whose `ended_at` is
+    //   inside (decided_at, window_end_at] -> `resolved`/`hit` (+ `outcome_finding_key`); else `miss`;
+    // - live, no verdict: the row's `proposal_id` points at `proposals`: `approved` -> `accepted`,
+    //   `rejected` -> `rejected`, still `pending` -> `ignored`; no `proposal_id` at all (no signal)
+    //   -> state `expired`, no outcome;
+    // - `resolved_at = ms_text(now_ms)`; closing is idempotent.
+
+    /// `2026-10-19T10:30:00.000Z`: 14 days after the decision.
+    const PROPOSE_END_MS: i64 = WINDOW_END_MS + 14 * 86_400_000;
+
+    async fn propose_row(
+        pool: &SqlitePool,
+        key: &str,
+        mode: &str,
+        proposal_id: Option<i64>,
+        human_verdict: Option<&str>,
+    ) -> i64 {
+        let row = st::ShadowRow {
+            action: "propose".into(),
+            rule_id: "F1".into(),
+            project_id: "p1".into(),
+            session_id: None,
+            subject_key: key.into(),
+            mode: mode.into(),
+            decision: "fire".into(),
+            template_id: "propose.f1.v1".into(),
+            rule_version: 1,
+            action_version: 1,
+            thresholds_hash: "th".into(),
+            rules_version: "rv".into(),
+            decided_at: "2026-10-05T10:30:00.000Z".into(),
+            window_end_at: "2026-10-19T10:30:00.000Z".into(),
+            outcome_state: "pending".into(),
+            proposal_id,
+            human_verdict: human_verdict.map(Into::into),
+            ..st::ShadowRow::default()
+        };
+        assert!(st::insert_decision(pool, &row).await.unwrap());
+        sqlx::query_scalar("SELECT id FROM devtime_shadow WHERE action = 'propose' AND subject_key = ?")
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn cross_finding(pool: &SqlitePool, key: &str, ended_at: &str) {
+        sqlx::query(
+            "INSERT INTO devtime_findings (finding_key, project_id, session_id, scope, rule_id, \
+             rule_version, level, waste, lever, confidence, lane, started_at, ended_at, cost_ms, \
+             count, sessions, rules_version, parser_version) VALUES (?, 'p1', 's-x', 'cross', 'F1', \
+             1, 'base', 'rework', 'x', 'exact', 'main', '2026-10-01T10:00:00.000Z', ?, 90000, 3, \
+             '[]', 'rv', 1)",
+        )
+        .bind(key)
+        .bind(ended_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn proposal(pool: &SqlitePool, status: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO proposals (kind, status, project_id, reasoning, created_at) \
+             VALUES ('devtime', ?, 'p1', 'r', '2026-10-05T10:30:00.000Z') RETURNING id",
+        )
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn propose_close_shadow_reappearance_in_the_window_is_a_hit() {
+        let pool = pool().await;
+        let id = propose_row(&pool, "F1-k", "shadow", None, None).await;
+        cross_finding(&pool, "F1-k", "2026-10-12T09:00:00.000Z").await;
+
+        let counts = close_propose_outcomes(&pool, PROPOSE_END_MS).await.unwrap();
+        assert_eq!(
+            counts,
+            ProposeCloseCounts {
+                hit: 1,
+                ..ProposeCloseCounts::default()
+            }
+        );
+        let got = row(&pool, id).await;
+        assert_eq!(got.outcome_state, "resolved");
+        assert_eq!(got.outcome.as_deref(), Some("hit"));
+        assert_eq!(got.outcome_finding_key.as_deref(), Some("F1-k"));
+        assert_eq!(
+            got.resolved_at.as_deref(),
+            Some(crate::devtime::actions::ms_text(PROPOSE_END_MS).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_close_shadow_without_reappearance_in_the_window_is_a_miss() {
+        let pool = pool().await;
+        let before = propose_row(&pool, "F1-old", "shadow", None, None).await;
+        let after = propose_row(&pool, "F1-late", "shadow", None, None).await;
+        // The finding that raised the proposal (before the decision) does not count, nor does one
+        // that only recurs after the window.
+        cross_finding(&pool, "F1-old", "2026-10-04T09:00:00.000Z").await;
+        cross_finding(&pool, "F1-late", "2026-10-20T09:00:00.000Z").await;
+
+        let counts = close_propose_outcomes(&pool, PROPOSE_END_MS).await.unwrap();
+        assert_eq!(counts.miss, 2);
+        assert_eq!(counts.hit, 0);
+        for id in [before, after] {
+            let got = row(&pool, id).await;
+            assert_eq!(got.outcome_state, "resolved");
+            assert_eq!(got.outcome.as_deref(), Some("miss"));
+            assert_eq!(got.outcome_finding_key, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn propose_close_human_mark_prevails_over_the_automatic_signal() {
+        let pool = pool().await;
+        // Reappeared (auto would be hit) but marked noise; did not reappear (auto miss) but useful.
+        let noise = propose_row(&pool, "F1-n", "shadow", None, Some("noise")).await;
+        let useful = propose_row(&pool, "F1-u", "shadow", None, Some("useful")).await;
+        cross_finding(&pool, "F1-n", "2026-10-12T09:00:00.000Z").await;
+
+        let counts = close_propose_outcomes(&pool, PROPOSE_END_MS).await.unwrap();
+        assert_eq!(counts.rejected, 1);
+        assert_eq!(counts.accepted, 1);
+        assert_eq!(counts.hit + counts.miss, 0);
+        let n = row(&pool, noise).await;
+        assert_eq!(n.outcome_state, "resolved");
+        assert_eq!(n.outcome.as_deref(), Some("rejected"));
+        assert_eq!(n.human_verdict.as_deref(), Some("noise"));
+        let u = row(&pool, useful).await;
+        assert_eq!(u.outcome.as_deref(), Some("accepted"));
+        assert_eq!(u.human_verdict.as_deref(), Some("useful"));
+    }
+
+    #[tokio::test]
+    async fn propose_close_live_maps_the_proposal_status() {
+        let pool = pool().await;
+        let ok = proposal(&pool, "approved").await;
+        let no = proposal(&pool, "rejected").await;
+        let open = proposal(&pool, "pending").await;
+        let a = propose_row(&pool, "F1-a", "live", Some(ok), None).await;
+        let r = propose_row(&pool, "F1-r", "live", Some(no), None).await;
+        let i = propose_row(&pool, "F1-i", "live", Some(open), None).await;
+
+        let counts = close_propose_outcomes(&pool, PROPOSE_END_MS).await.unwrap();
+        assert_eq!(
+            counts,
+            ProposeCloseCounts {
+                accepted: 1,
+                rejected: 1,
+                ignored: 1,
+                ..ProposeCloseCounts::default()
+            }
+        );
+        for (id, want) in [(a, "accepted"), (r, "rejected"), (i, "ignored")] {
+            let got = row(&pool, id).await;
+            assert_eq!(got.outcome_state, "resolved");
+            assert_eq!(got.outcome.as_deref(), Some(want));
+        }
+        assert_eq!(row(&pool, a).await.proposal_id, Some(ok));
+    }
+
+    #[tokio::test]
+    async fn propose_close_live_without_any_signal_expires() {
+        let pool = pool().await;
+        let id = propose_row(&pool, "F1-none", "live", None, None).await;
+
+        let counts = close_propose_outcomes(&pool, PROPOSE_END_MS).await.unwrap();
+        assert_eq!(
+            counts,
+            ProposeCloseCounts {
+                expired: 1,
+                ..ProposeCloseCounts::default()
+            }
+        );
+        let got = row(&pool, id).await;
+        assert_eq!(got.outcome_state, "expired");
+        assert_eq!(got.outcome, None);
+        assert!(got.resolved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn propose_close_leaves_not_due_and_inject_rows_and_is_idempotent() {
+        let pool = pool().await;
+        let id = propose_row(&pool, "F1-k", "shadow", None, None).await;
+        let inject = pending_row(&pool, "D3", 1).await;
+        cross_finding(&pool, "F1-k", "2026-10-12T09:00:00.000Z").await;
+
+        let early = close_propose_outcomes(&pool, PROPOSE_END_MS - 1)
+            .await
+            .unwrap();
+        assert_eq!(early, ProposeCloseCounts::default());
+        assert_eq!(row(&pool, id).await.outcome_state, "pending");
+
+        let first = close_propose_outcomes(&pool, PROPOSE_END_MS).await.unwrap();
+        assert_eq!(first.hit, 1);
+        let resolved = row(&pool, id).await;
+        let second = close_propose_outcomes(&pool, PROPOSE_END_MS + 5_000)
+            .await
+            .unwrap();
+        assert_eq!(second, ProposeCloseCounts::default());
+        assert_eq!(row(&pool, id).await, resolved);
+        // The inject row is due too, but belongs to close_inject_outcomes.
+        assert_eq!(row(&pool, inject).await.outcome_state, "pending");
     }
 }
