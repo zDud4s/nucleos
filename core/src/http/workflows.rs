@@ -137,7 +137,7 @@ pub(super) async fn get_project_workflows(
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .map(Json)
-        // The parser's own words, the same as `POST /write`'s `invalid`: a pins file that will not
+        // The parser's own words: a pins file that will not
         // load is a file somebody has to fix, and "unprocessable entity" does not say which line.
         // Prefixed with where the file is, because that is no longer the project's folder and the
         // page should not have to know where the daemon keeps it.
@@ -222,7 +222,7 @@ pub(super) fn bundle_or_refusal(
 }
 
 /// Every route below writes this project's pins (the `workflow_pins` document in the settings store), so every one of them asks the same two questions
-/// first, in the same order, for the reasons `POST /write` sets out at length.
+/// first, in the same order.
 ///
 /// **The kill switch first.** These write the project's `workflow_pins`, and one of them copies a
 /// whole bundle into `.nucleos/workflows/` — bytes in the project's folder, which §7.5 says must go
@@ -1086,8 +1086,8 @@ pub(super) async fn get_project_workflow_materialize(
 /// `workflows/materialize.rs` — and the answer lists every file left alone and why.
 ///
 /// **The stop first**, through `workflow_write_root` like every workflow write: these are files
-/// that govern what an agent does, the same class of write `POST /write` refuses while the kill
-/// switch is engaged.
+/// that govern what an agent does, the same class of write `PUT /settings/{scope}/{name}` refuses
+/// while the kill switch is engaged.
 pub(super) async fn post_project_workflow_materialize(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
@@ -1292,7 +1292,7 @@ pub(super) async fn post_workflow_sync(
 
 /// One feed line, after the fact and loudly on failure.
 ///
-/// The same rule `POST /write` follows: a line about a change that then failed claims something
+/// A line about a change that then failed claims something
 /// that did not happen, and a change whose line was lost is recoverable from the log.
 pub(super) async fn workflow_feed(state: &AppState, project_id: &str, said: &str) {
     if let Err(error) = feed::append(

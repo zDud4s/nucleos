@@ -184,23 +184,6 @@ pub(super) fn project_state_dir(
         .ok_or_else(|| refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id"))
 }
 
-/// Where a claimed file actually is, for the read route and the write route alike.
-///
-/// A state row is joined onto the state directory, a project row onto the project root — and in
-/// both cases it is the REGISTRY's string that is joined, never the caller's, for the reason
-/// `post_project_write` gives.
-pub(super) fn claim_home(
-    state: &AppState,
-    id: &str,
-    root: &std::path::Path,
-    claim: &crate::ownership::Claim,
-) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
-    match claim.home {
-        crate::ownership::Home::State => project_state_dir(state, id),
-        crate::ownership::Home::Project => Ok(root.to_path_buf()),
-    }
-}
-
 /// The fence in force in one project, read off the disk on the thread pool.
 ///
 /// `spawn_blocking`, because assembling it reads the stored pins and walks whatever bundles are
@@ -228,14 +211,7 @@ pub(super) async fn claims_for_project(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-#[derive(Deserialize)]
-pub(super) struct WriteRequest {
-    /// A claim's identity, forward slashes. Only ever compared — never joined; see below.
-    pub(super) path: String,
-    pub(super) contents: String,
-}
-
-/// A refusal with its reason beside its name — the shape `POST /write` uses for `invalid`.
+/// A refusal with its reason beside its name — the shape a refusal with a reason uses.
 pub(super) fn refusal_with_detail(
     status: StatusCode,
     name: &'static str,

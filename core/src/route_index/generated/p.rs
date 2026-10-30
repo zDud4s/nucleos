@@ -411,15 +411,8 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
-        path: "/projects/{id}/owned",
-        purpose: "Get project owned.",
-        body: Body::None,
-        handler: "get_project_owned",
-    },
-    RouteEntry {
-        method: "GET",
         path: "/projects/{id}/ownership",
-        purpose: "The write boundary, read and exercised.",
+        purpose: "The write boundary, read.",
         body: Body::None,
         handler: "get_project_ownership",
     },
@@ -604,13 +597,6 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "Get project worktree.",
         body: Body::None,
         handler: "get_project_worktree",
-    },
-    RouteEntry {
-        method: "POST",
-        path: "/projects/{id}/write",
-        purpose: "Post project write.",
-        body: Body::Shapeless("WriteRequest"),
-        handler: "post_project_write",
     },
     RouteEntry {
         method: "GET",

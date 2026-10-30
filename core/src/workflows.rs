@@ -472,11 +472,9 @@ pub fn parse_pins(contents: &str) -> Result<Pins, String> {
 
 /// Serialise the pins back, with a line saying who writes the file.
 ///
-/// **Re-serialising destroys comments, and here that is correct** — which is the opposite of the
-/// call `OwnedFiles` makes about `autopilot.yaml`. That file is a person's, and commenting
-/// `gate_command:` out is how a gate is switched off, so the app edits it as raw text. This file is
-/// the app's own bookkeeping: every field in it is written by an install, an eject or an update.
-/// The header says so, so that somebody who types a comment into it learns where it went.
+/// **Re-serialising destroys comments, and here that is correct.** Unlike the `autopilot` settings
+/// document, which a person edits, this is the app's own bookkeeping: every field in it is written
+/// by an install, an eject or an update. The header says so, so that somebody who types a comment into it learns where it went.
 pub fn render_pins(pins: &Pins) -> String {
     let body = serde_yaml::to_string(pins).unwrap_or_else(|_| "workflows: []\n".to_string());
     format!(

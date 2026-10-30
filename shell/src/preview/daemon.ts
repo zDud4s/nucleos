@@ -18,7 +18,7 @@ import type {
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { ChannelNotifyPolicy, FeedEntry, FeedSeen, FeedTimeline, NotifyPolicy, PendingNotification } from "../data/feed";
 import type { ChannelIdentities, ChannelsReadout, PairingCode, PairingStatus } from "../data/channels";
-import type { MachineConfig, MachineSecret } from "../data/machine-config";
+import type { MachineSecret } from "../data/secrets";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { AnalyticsDays, AnalyticsReport, QuotaHistory } from "../data/analytics";
@@ -3311,7 +3311,26 @@ const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["models", "Which model each phase uses.", null],
 ];
 
-const MACHINE_CONFIG: MachineConfig = {
+/** What the `/config/machine` fixture answers. It goes with the fixture, when `answerSettings` replaces it. */
+export interface PreviewMachineConfig {
+  root: string;
+  root_display: string;
+  settings: {
+    path: string;
+    display: string;
+    area: string;
+    what: string;
+    takes_effect: string;
+    exists: boolean;
+    valid: boolean;
+    problem: string | null;
+    at_startup: { valid: boolean; problem: string | null };
+    contents: string | null;
+    resolved: string;
+  }[];
+}
+
+const MACHINE_CONFIG: PreviewMachineConfig = {
   root: "C:/Users/owner/.nucleos",
   root_display: "~/.nucleos",
   settings: MACHINE_AREAS.map(([area, what, contents]) => ({

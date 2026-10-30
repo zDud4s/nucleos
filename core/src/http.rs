@@ -4852,7 +4852,7 @@ mod tests {
     }
 
     /// The stop refuses onboarding before either of its two writes, the same way it refuses
-    /// `POST /write` and `PUT /settings/{scope}/{name}`: 423, `kill_switch`, and nothing written.
+    /// `PUT /settings/{scope}/{name}`: 423, `kill_switch`, and nothing written.
     #[tokio::test]
     async fn the_kill_switch_stops_onboarding() {
         let mut state = test_state().await;
@@ -4901,190 +4901,50 @@ mod tests {
 
     /* ------------------------------------------------ the write boundary -- */
 
-    async fn write_file(
-        state: AppState,
-        id: &str,
-        path: &str,
-        contents: &str,
-    ) -> (StatusCode, serde_json::Value) {
-        let response = build_router(state)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/projects/{id}/write"))
-                    .header("Authorization", "Bearer test-token")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({ "path": path, "contents": contents }).to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let parsed = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        (status, parsed)
-    }
-
-    /// The nucleo's own state files are in the settings store now, so `POST /write` no longer
-    /// claims them: the rules are changed through the settings route, and this one refuses by name.
+    /// The app writes a project's rules through `PUT /settings/project:<id>/...` now. A second door
+    /// to the same documents would be a door without their version check or their history.
     #[tokio::test]
-    async fn a_rules_file_is_no_longer_written_through_the_write_route() {
-        let _settings = crate::project::rules::testing::Home::new();
+    async fn the_retired_file_routes_are_gone() {
         let mut state = test_state().await;
-        let home = with_project_home(&mut state);
-        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-        crate::project::rules::testing::publish_rules("alpha", "gate_command: cargo test\n");
-
-        for path in ["autopilot.yaml", "workflows.yaml"] {
-            let (status, body) =
-                write_file(state.clone(), "alpha", path, "gate_command: cargo clippy\n").await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
-            assert_eq!(body["refusal"], "not_ours", "{path}");
-        }
-
-        assert_eq!(
-            crate::project::rules::autopilot("alpha")
-                .unwrap()
-                .gate_command
-                .as_deref(),
-            Some("cargo test"),
-            "the stored rules were not touched"
-        );
-        assert!(!home.path().join("projects").join("alpha").exists());
-        let (feed,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM feed WHERE project_id = 'alpha' AND kind = 'config_written'",
+        let _home = with_project_home(&mut state);
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('alpha', 'shadow', ?)",
         )
-        .fetch_one(&state.pool)
+        .bind(dir.path().to_string_lossy().to_string())
+        .execute(&state.pool)
         .await
         .unwrap();
-        assert_eq!(feed, 0, "a refused write leaves no feed line");
-    }
 
-    /// Everything the registry does not name is refused, and the refusal is named so the page can
-    /// say *why* rather than "no".
-    ///
-    /// The traversal is in this list rather than in a path-guard test on purpose: the app answers
-    /// about names it owns, and `..` is not one — so it is turned away before the filesystem is
-    /// touched at all.
-    #[tokio::test]
-    async fn a_file_the_app_does_not_own_is_refused_before_anything_is_touched() {
-        let mut state = test_state().await;
-        let home = with_project_home(&mut state);
-        let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-
-        for path in [
-            // The nucleo's former state rows: they live in the settings store now.
-            "autopilot.yaml",
-            "workflows.yaml",
-            // Layer 2: read, plus a door to an editor. Never written from here.
-            "core/src/http.rs",
-            "README.md",
-            // The `.ai/` workflow harness's own config, which a `.ai/*.yaml` glob would have swept
-            // in and which the núcleo has never opened.
-            ".ai/models.yaml",
-            // This machine's settings, which are not any project's however the URL is spelled.
-            "~/.nucleos/github.yaml",
-            // Where the rules used to be. That file is no longer read, so it is not the app's.
-            ".ai/autopilot.yaml",
-            "../escape.yaml",
-            ".ai/../../escape.yaml",
-        ] {
-            let (status, body) = write_file(state.clone(), "alpha", path, "x: 1\n").await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
-            assert_eq!(body["refusal"], "not_ours", "{path}");
-        }
-
-        // Nothing was created anywhere, including one level up from the project.
-        assert!(!dir.path().join("core").exists());
-        assert!(!dir.path().join("README.md").exists());
-        assert!(!dir.path().join(".ai").join("models.yaml").exists());
-        assert!(!dir.path().parent().unwrap().join("escape.yaml").exists());
-        assert!(!dir.path().join(".ai").join("autopilot.yaml").exists());
-        // The stand-in home was never written to.
-        assert!(!home.path().join("projects").join("alpha").exists());
-    }
-
-    /// The emergency stop holds the app's write too, which is the promise that the shell is not a
-    /// door with privileges an agent lacks.
-    ///
-    /// Both brakes, because a project held on its own is held for this as well — and the scoped one
-    /// is the likelier of the two to be forgotten, since it is the only one that names the project
-    /// this route already has in its path.
-    #[tokio::test]
-    async fn the_emergency_stop_holds_a_write_from_the_app() {
-        let mut state = test_state().await;
-        let home = with_project_home(&mut state);
-        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-
-        crate::governance::autopilot::set_kill_switch(&state.pool, true)
-            .await
-            .unwrap();
-        let (status, body) = write_file(
+        let (status, body) = workflow_call(
             state.clone(),
-            "alpha",
-            "autopilot.yaml",
-            "gate_command: x\n",
+            "POST",
+            "/projects/alpha/write",
+            Some(serde_json::json!({ "path": "workflows.yaml", "contents": "workflows: []\n" })),
         )
         .await;
-        assert_eq!(status, StatusCode::LOCKED);
-        assert_eq!(body["refusal"], "kill_switch");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["refusal"].is_null(), "no handler answered: {body}");
 
-        crate::governance::autopilot::set_kill_switch(&state.pool, false)
-            .await
-            .unwrap();
-        crate::governance::autopilot::set_scoped_kill(&state.pool, "project", "alpha", true)
-            .await
-            .unwrap();
-        let (status, body) = write_file(
-            state.clone(),
-            "alpha",
-            "autopilot.yaml",
-            "gate_command: x\n",
+        let (status, body) = workflow_call(
+            state,
+            "GET",
+            "/projects/alpha/owned?path=workflows.yaml",
+            None,
         )
         .await;
-        assert_eq!(status, StatusCode::LOCKED);
-        assert_eq!(body["refusal"], "kill_switch");
-
-        assert!(
-            !home.path().join("projects").join("alpha").exists(),
-            "nothing is written while the stop is engaged"
-        );
-
-        // Released, the same request is answered by the registry instead of the brake: the stop
-        // runs first, and `autopilot.yaml` is not a row any more.
-        crate::governance::autopilot::set_scoped_kill(&state.pool, "project", "alpha", false)
-            .await
-            .unwrap();
-        let (status, body) =
-            write_file(state, "alpha", "autopilot.yaml", "gate_command: x\n").await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["refusal"], "not_ours");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["refusal"].is_null(), "no handler answered: {body}");
     }
 
-    /// A project the daemon has no folder for has no file to write, and no fence to draw either.
-    /// Both routes fail in the same place, so the page cannot end up showing an editor that cannot
-    /// save.
+    /// A project the daemon has no folder for has no fence to draw.
     #[tokio::test]
-    async fn a_project_with_no_folder_has_no_file_and_no_fence() {
+    async fn a_project_with_no_folder_has_no_fence() {
         let state = test_state().await;
         sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('rootless', 'off')")
             .execute(&state.pool)
             .await
             .unwrap();
-
-        let (status, body) = write_file(
-            state.clone(),
-            "rootless",
-            "autopilot.yaml",
-            "gate_command: x\n",
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(body["refusal"], "no_project_root");
 
         let response = build_router(state)
             .oneshot(
@@ -5131,68 +4991,6 @@ mod tests {
             "the state files are in the settings store, so the project fence names none: {claims:?}"
         );
         drop(home);
-    }
-
-    /// The editor reads a claimed file from where the registry says it lives — the project's state
-    /// directory for the núcleo's own rows — and a file not there yet is `absent`, not an error.
-    #[tokio::test]
-    async fn a_claimed_file_is_read_from_its_home_and_absent_is_its_own_answer() {
-        let mut state = test_state().await;
-        let _home = with_project_home(&mut state);
-        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-
-        for path in ["autopilot.yaml", "workflows.yaml"] {
-            let (status, text) = owned_text(state.clone(), "alpha", path).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
-            assert!(text.contains("not_ours"), "{text}");
-        }
-
-        // Not in the table is refused, as the write route refuses it — `cat` is the door for the
-        // repository's own files.
-        let (status, text) = owned_text(state, "alpha", "README.md").await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(text.contains("not_ours"), "{text}");
-    }
-
-    /// A project id that would name some other directory has no state directory, and the write
-    /// route says so by name instead of writing somewhere it did not mean.
-    #[tokio::test]
-    async fn an_id_that_cannot_name_a_directory_is_refused_by_name() {
-        let mut state = test_state().await;
-        let home = with_project_home(&mut state);
-        let dir = tempfile::tempdir().unwrap();
-        sqlx::query(
-            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('a:b', 'shadow', ?)",
-        )
-        .bind(dir.path().to_string_lossy().to_string())
-        .execute(&state.pool)
-        .await
-        .unwrap();
-
-        let (status, body) = write_file(state, "a:b", "autopilot.yaml", "gate_command: x\n").await;
-        // The claim check comes before the state directory is resolved, and no state file is
-        // claimed any more (the registry owns them), so the route stops at `not_ours`.
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["refusal"], "not_ours");
-        assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
-    }
-
-    async fn owned_text(state: AppState, id: &str, path: &str) -> (StatusCode, String) {
-        let response = build_router(state)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/projects/{id}/owned?path={path}"))
-                    .header("Authorization", "Bearer test-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (status, String::from_utf8(bytes.to_vec()).unwrap())
     }
 
     /// The map of a project, derived from the tree on the spot.
@@ -9291,15 +9089,12 @@ mod tests {
         }
     }
 
-    /// An installed workflow's declared file is in the fence and cannot be written from here.
+    /// An installed workflow's declared file is in the fence and is not the app's to write.
     ///
-    /// §12's middle state, end to end: `writable: false` on the row, and `another_author` rather
-    /// than `not_ours` from the write route. The two refusals send somebody to two different
-    /// places — one file has nobody this app writes as, the other has an author standing right
-    /// there — so collapsing them would be the page telling somebody to give up on a file that has
-    /// an owner they can go and edit.
+    /// §12's middle state: `writable: false` on the row, which names its owner, because the exit for
+    /// that file is its author and not a text box in this app.
     #[tokio::test]
-    async fn a_workflows_own_file_is_shown_in_the_fence_and_refused_by_the_write_route() {
+    async fn a_workflows_own_file_is_shown_in_the_fence_and_not_writable() {
         let mut state = test_state().await;
         let (_lib, library) = library_with(&[(
             "harness",
@@ -9318,8 +9113,7 @@ mod tests {
         )
         .await;
 
-        let (_, claims) =
-            workflow_call(state.clone(), "GET", "/projects/alpha/ownership", None).await;
+        let (_, claims) = workflow_call(state, "GET", "/projects/alpha/ownership", None).await;
         let claims = claims.as_array().unwrap();
         // Only the workflow's own file: the two state-file claims moved to the settings registry.
         assert_eq!(claims.len(), 1);
@@ -9329,29 +9123,6 @@ mod tests {
             .expect("an installed workflow's file must be in the fence");
         assert_eq!(theirs["owner"], "harness");
         assert_eq!(theirs["writable"], false);
-
-        let (status, body) = workflow_call(
-            state.clone(),
-            "POST",
-            "/projects/alpha/write",
-            Some(serde_json::json!({ "path": ".ai/models.yaml", "contents": "plan: opus\n" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["refusal"], "another_author");
-        assert!(body["detail"].as_str().unwrap().contains("harness"));
-
-        // `workflows.yaml` is no longer a claimed file (the registry stores it), so it is
-        // `not_ours`, a different refusal from the `another_author` above.
-        let (status, body) = workflow_call(
-            state,
-            "POST",
-            "/projects/alpha/write",
-            Some(serde_json::json!({ "path": "workflows.yaml", "contents": "workflows: []\n" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["refusal"], "not_ours");
     }
 
     /// Ejecting is a one-way door, and pressing it twice does not walk back through it.

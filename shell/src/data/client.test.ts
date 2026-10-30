@@ -74,14 +74,26 @@ describe("apiFetch refusals", () => {
     expect(refusal.code).toBe("kill_switch");
   });
 
+  it("carries the parsed body so a page can read the fields beside the sentence", async () => {
+    const { apiFetch } = await freshClient();
+    fetchMock.mockResolvedValue(
+      jsonResponse(422, { error: "invalid", field: "/hotkey", message: "expected a chord" }),
+    );
+    const error = (await apiFetch("/x", { method: "PUT", body: "{}" }).catch(
+      (e: unknown) => e,
+    )) as InstanceType<ClientModule["ApiRefusal"]>;
+    expect(error.status).toBe(422);
+    expect(error.body).toEqual({ error: "invalid", field: "/hotkey", message: "expected a chord" });
+  });
+
   it("keeps the name AND the sentence when a route sends both", async () => {
     const { apiFetch } = await freshClient();
-    // How `POST /projects/{id}/write` refuses YAML the daemon could not read.
+    // A route refusing a document it could not read, with the place it broke.
     fetchMock.mockResolvedValue(
       jsonResponse(422, { refusal: "invalid", detail: "unknown field `gate_commmand` at line 1 column 1" }),
     );
 
-    const error = (await apiFetch("/projects/alpha/write", { method: "POST", body: "{}" }).catch(
+    const error = (await apiFetch("/settings/machine/email", { method: "PUT", body: "{}" }).catch(
       (e: unknown) => e,
     )) as InstanceType<ClientModule["ApiRefusal"]>;
 
@@ -96,7 +108,7 @@ describe("apiFetch refusals", () => {
     const { apiFetch } = await freshClient();
     fetchMock.mockResolvedValue(jsonResponse(403, { refusal: "not_ours" }));
 
-    const error = (await apiFetch("/projects/alpha/write", { method: "POST", body: "{}" }).catch(
+    const error = (await apiFetch("/settings/machine/email", { method: "PUT", body: "{}" }).catch(
       (e: unknown) => e,
     )) as InstanceType<ClientModule["ApiRefusal"]>;
 

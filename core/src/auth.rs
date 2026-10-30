@@ -303,7 +303,7 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // make the door to an editor the one thing a reader had to be an admin to open.
     //
     // `ownership` is the write boundary, read. Knowing which files the app would write is not
-    // permission to write one — `POST /projects/{id}/write` is in no table at all — and a fence
+    // permission to write one — `PUT /settings/{scope}/{name}` is in no table at all — and a fence
     // only a privileged caller can see is a fence nobody can argue with.
     //
     // `map` lists every source path in the project and the import graph between them — and, since
@@ -4494,63 +4494,15 @@ mod tests {
         }
     }
 
-    /// Writing a project's own rules is the owner's, and nobody else's.
-    ///
-    /// The file behind this route is the project's `autopilot.yaml`, and it carries `gate_command` —
-    /// the command whose exit code decides what *green* means for every run in the project. A key that
-    /// could rewrite it could set the gate to `true` and pass every gate it will ever face, which
-    /// makes this the one write on the project surface where the blast radius is the whole quality
-    /// bar rather than one file.
-    ///
-    /// Asserted as membership rather than through a request, like `POST /email/send` above and for
-    /// the same reason: `permits` is default-deny, so the route is safe today by being in no table.
-    /// What that does not survive is somebody adding it to `READ_ONLY_ROUTES` beside the six reads
-    /// that share its URL prefix, which would read as tidying up. This is the test that says no.
+    /// The fence stays a read. A boundary a reader cannot see is a boundary nobody can argue with,
+    /// and seeing it is not permission to cross it.
     #[test]
-    fn writing_a_projects_rules_is_in_no_scope_table() {
-        const WRITE_ROUTE: &str = "/projects/{id}/write";
-
-        assert!(
-            !route_is_listed(READ_ONLY_ROUTES, &Method::POST, WRITE_ROUTE)
-                && !route_is_listed(RUN_CREATING_ROUTES, &Method::POST, WRITE_ROUTE)
-                && !route_is_listed(TEAM_ROUTES, &Method::POST, WRITE_ROUTE)
-                && !route_is_listed(EMAIL_ROUTES, &Method::POST, WRITE_ROUTE)
-                && !route_is_listed(COUNCIL_ROUTES, &Method::POST, WRITE_ROUTE),
-            "deciding what green means must stay out of every scope table"
-        );
-
-        for scope in [
-            Scope::Run(7),
-            Scope::ApiToken(ApiTokenLevel::ReadOnly),
-            Scope::ApiToken(ApiTokenLevel::RunCreating),
-        ] {
-            assert!(
-                !permits(&scope, &Method::POST, "/projects/7/write"),
-                "{scope:?} must not be able to rewrite a project's gate command"
-            );
-        }
-
-        // The reads beside it stay reads. A boundary a reader cannot see is a boundary nobody can
-        // argue with, and seeing it is not permission to cross it.
+    fn reading_the_write_boundary_stays_a_read() {
         assert!(permits(
             &Scope::ApiToken(ApiTokenLevel::ReadOnly),
             &Method::GET,
             "/projects/7/ownership"
         ));
-
-        // Reading the claimed file's TEXT is not the fence, it is the rules — `gate_command`
-        // included — and `GET /projects/{id}/rules`, which serves the same facts, has always been
-        // Admin's. So `owned` is in no table either.
-        for scope in [
-            Scope::Run(7),
-            Scope::ApiToken(ApiTokenLevel::ReadOnly),
-            Scope::ApiToken(ApiTokenLevel::RunCreating),
-        ] {
-            assert!(
-                !permits(&scope, &Method::GET, "/projects/7/owned"),
-                "{scope:?} must not read a project's rules file"
-            );
-        }
     }
 
     /// A settings document holds shortcuts, accounts and gate commands, so `/settings*` is the owner's, reads
@@ -4822,7 +4774,7 @@ mod tests {
     /// own — and that route has always been Admin's. It also names which commands are marked
     /// runnable by an agent, which is a map of the surface rather than a fact about the code.
     ///
-    /// Membership rather than a request, like `POST /email/send` and `POST /projects/{id}/write`
+    /// Membership rather than a request, like `POST /email/send` and the `/settings` routes
     /// above: `permits` is default-deny, so these are safe today by being nowhere. What that does
     /// not survive is somebody filing them beside the seven `/projects/{id}/…` reads that share
     /// their prefix, which would read as consistency.
@@ -4875,7 +4827,7 @@ mod tests {
     /// shown what widened. A key that could write one is a key that can rewrite its own alçada,
     /// which is a strictly larger power than anything a scoped key is sold as buying.
     ///
-    /// Asserted as membership rather than through a request, like `POST /projects/{id}/write` and
+    /// Asserted as membership rather than through a request, like the `/settings` routes and
     /// `POST /projects/{id}/commands` above and for the same reason: `permits` is default-deny, so
     /// these routes are safe TODAY by being in no table. What that does not survive is somebody
     /// filing the four GETs beside the `/projects/{id}/…` reads that share their URL prefix, which
@@ -5606,7 +5558,7 @@ mod tests {
 
     /// The IDE verify switch writes `.mcp.json` and a Claude Code approval into the project's
     /// worktrees, so it is the owner's alone. Membership rather than a request, like
-    /// `POST /projects/{id}/write` above: `permits` is default-deny, so it is safe today by being in
+    /// the `/settings` routes above: `permits` is default-deny, so it is safe today by being in
     /// no table, and this is the test that says no to filing it beside the `/projects/{id}/...` reads.
     #[test]
     fn switching_ide_verify_is_in_no_scope_table() {

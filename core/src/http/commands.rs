@@ -491,9 +491,10 @@ pub(super) struct DeclareRequest {
 
 /// Declares one of this project's own commands, replacing any of the same name.
 ///
-/// **No kill-switch check here, and the asymmetry with `POST /write` is deliberate.** That one puts
-/// bytes in the project's own folder, which §7.5 says must go the way an agent's write goes. This
-/// writes a database row, like `POST /wip-limit` beside it, and neither of those starts anything.
+/// **No kill-switch check here, and the asymmetry with `PUT /settings/{scope}/{name}` is
+/// deliberate.** That one changes what governs a project's agents, which §7.5 says must go the way
+/// an agent's write goes. This records a command, like `POST /wip-limit` beside it, and neither of
+/// those starts anything.
 /// The stop belongs on the route that spawns a process, which is the next one down.
 pub(super) async fn post_project_command(
     State(state): State<AppState>,

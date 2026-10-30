@@ -99,7 +99,7 @@ fn renamed(path: &Path) -> Option<PathBuf> {
 }
 
 /// One line in the scope's feed. A lost line is logged and let go: the import itself already happened (or was refused).
-async fn say(pool: &SqlitePool, scope: &Scope, summary: &str) {
+async fn feed_line(pool: &SqlitePool, scope: &Scope, summary: &str) {
     if let Err(error) = feed::append(
         pool,
         scope.project_id(),
@@ -122,7 +122,7 @@ async fn refuse(
     outcome: &mut Outcome,
 ) {
     tracing::warn!(document = ty.name, %scope, %why, "settings file not imported; nothing is stored, so readers use the defaults and an opt-in pillar stays off");
-    say(
+    feed_line(
         pool,
         scope,
         &format!(
@@ -201,7 +201,7 @@ async fn import_document(
         },
         None => "the file is no longer read".to_string(),
     };
-    say(
+    feed_line(
         pool,
         scope,
         &format!("{} imported into the database; {kept}", shown(scope, ty)),
