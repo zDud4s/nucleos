@@ -46,8 +46,14 @@ async fn main() {
         return;
     }
 
-    let dirs = directories::ProjectDirs::from("dev", "nucleos", "NucleOS")
-        .expect("could not resolve local app data directory");
+    // The offline recovery commands (`--settings-reset`, `--settings-rollback`) are answered here and exit: they
+    // must not start a daemon, take the instance lock or open a port. See `settings_cli::dispatch`.
+    if let Some(code) = settings_cli::dispatch(&std::env::args().collect::<Vec<_>>()).await {
+        std::process::exit(code);
+    }
+
+    let default_dir =
+        data_dir::default_data_dir().expect("could not resolve local app data directory");
 
     // Whether this process is the machine's daemon or a second one somebody is testing with, and
     // where its database and logs go. Resolved HERE, before the first thing that acts on either,
@@ -62,10 +68,7 @@ async fn main() {
     let data_dir_override = std::env::var(daemon_client::DATA_DIR_VAR).ok();
     let is_primary =
         daemon_client::is_primary(port_override.as_deref(), data_dir_override.as_deref());
-    let data_dir = match data_dir_override.as_deref().filter(|dir| !dir.is_empty()) {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => dirs.data_local_dir().to_path_buf(),
-    };
+    let data_dir = data_dir::data_dir_from(data_dir_override.as_deref(), &default_dir);
     if !is_primary {
         eprintln!(
             "nucleos-core: secondary instance — data in {}, no autostart, no sidecars",
@@ -93,7 +96,7 @@ async fn main() {
         }
     }
 
-    let db_path = data_dir.join("nucleos.db");
+    let db_path = data_dir::db_path(&data_dir);
     match backup::apply_pending_restore(&db_path).await {
         Ok(Some(applied)) => tracing::warn!(
             "applied pending database restore from {}; safety backup at {}",
@@ -270,7 +273,7 @@ async fn main() {
     let email_config: config::EmailConfig = machine_doc();
     // Built whether or not the pillar is enabled: it is two small files, and having it always in a
     // known state means enabling email later is a config edit rather than a fresh directory.
-    let triage_sandbox = dirs.data_local_dir().join("triage-sandbox");
+    let triage_sandbox = default_dir.join("triage-sandbox");
     if let Err(error) = governance::triage::ensure_sandbox(&triage_sandbox) {
         tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
     }
@@ -280,7 +283,7 @@ async fn main() {
     // reason as the sandbox: a directory that always exists is one less thing to go wrong the day
     // email is switched on, and this one is reachable from its own tab with the pillar off. `None`
     // means every route under it refuses, which is the right answer when it could not be made.
-    let files_root = match files::ensure_root(dirs.data_local_dir()) {
+    let files_root = match files::ensure_root(&default_dir) {
         Ok(root) => Some(root),
         Err(error) => {
             tracing::warn!(%error, "could not create the files folder — the Files tab will be unavailable");
@@ -291,7 +294,7 @@ async fn main() {
     // in it (`files::trash_for`). The retention sweep runs here once, off the startup path because
     // an expired folder can be a large tree, and again on every delete; nothing else keeps a timer
     // for it. `None` means a delete refuses rather than removing for good.
-    let files_trash = match files::ensure_trash(dirs.data_local_dir()) {
+    let files_trash = match files::ensure_trash(&default_dir) {
         Ok(trash) => {
             let sweep = trash.clone();
             tokio::task::spawn_blocking(move || {
