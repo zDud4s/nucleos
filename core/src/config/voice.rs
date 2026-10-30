@@ -210,7 +210,7 @@ pub fn parse_voice_config(contents: &str) -> Result<VoiceConfig, String> {
 
 /// Reads `~/.nucleos/voice.yaml`. Absent, unreadable or malformed → defaults, with a warning; never an error.
 ///
-/// This follows `load_email_config` rather than `load_schedule_rules`, and the choice matters in two
+/// This follows `load_email_config` rather than `parse_schedule_rules`, and the choice matters in two
 /// directions: a typo in a dictation aid must not stop the daemon from starting, and "off" is the
 /// inert state for a file holding a command the daemon spawns.
 pub fn load_voice_config(path: &Path) -> VoiceConfig {

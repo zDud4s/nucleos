@@ -183,7 +183,7 @@ pub struct GraphConfig {
     /// whatever the file writes here can only ever tighten what this job is allowed to spend. There
     /// is no number a rule could put in this key that buys it more than the daemon already allows.
     ///
-    /// The value must be a finite, non-negative number; `load_schedule_rules` refuses the rest
+    /// The value must be a finite, non-negative number; `parse_schedule_rules` refuses the rest
     /// rather than clamping, for the reasons written at `validate_rules`.
     #[serde(default)]
     pub budget_usd: Option<f64>,
@@ -373,7 +373,7 @@ pub struct AutopilotRules {
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
-    /// `Some(true)`: `load_schedule_rules` returns `AutopilotRules::default()` for a project with
+    /// `Some(true)`: the rules reader returns `AutopilotRules::default()` for a project with
     /// no rules file at all, and a plain `bool` would have made that derived default `false` — a
     /// brake that switched itself off on every project that never configured anything. The zero
     /// value therefore means "not configured", and `attention_brake()` below supplies the answer.
@@ -465,100 +465,9 @@ impl AutopilotRules {
     }
 }
 
-/// A project's rules, from `~/.nucleos/projects/<project_id>/autopilot.yaml`.
-///
-/// Keyed by the project's id and not by a folder, which is the whole of `project/state.rs`'s
-/// argument: the same file is found from the main checkout and from every worktree the daemon opens
-/// of it, and it does not move when the project's folder does. `machine_root` is
-/// `AppState::machine_config_root` in production and a temporary directory in a test.
-///
-/// No root, or an id that cannot name a directory, reads as a project with no file — the ordinary
-/// state, answered with `AutopilotRules::default()`. The file is named once, as
-/// [`crate::project::state::AUTOPILOT_FILE`], because two things have to agree about it: this loader
-/// and `ownership.rs`, which declares it writable by the app.
-pub fn load_schedule_rules(
-    machine_root: Option<&Path>,
-    project_id: &str,
-) -> std::io::Result<AutopilotRules> {
-    match crate::project::state::file(
-        machine_root,
-        project_id,
-        crate::project::state::AUTOPILOT_FILE,
-    ) {
-        Some(path) => load_schedule_rules_from(&path),
-        None => Ok(AutopilotRules::default()),
-    }
-}
-
-/// The same rules, from one file. Absent is `AutopilotRules::default()`.
-///
-/// Callers poll this every 30s per project from async tasks, so a successful parse is cached per path
-/// and keyed by the file's `(len, mtime)`: an unchanged file costs one `metadata` call and a clone,
-/// not a read, a YAML parse and a validation. Known limit: two writes inside one mtime tick that
-/// leave the length identical are not told apart; the next change that moves either value is picked
-/// up. Errors are never cached, so a bad file is reported on every call exactly as before, and a
-/// vanished file drops its entry.
-pub fn load_schedule_rules_from(path: &Path) -> std::io::Result<AutopilotRules> {
-    let Some(meta) = std::fs::metadata(path).ok() else {
-        schedule_rules_cache()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(path);
-        return Ok(AutopilotRules::default());
-    };
-    let (len, mtime) = (meta.len(), meta.modified().ok());
-    let cached = schedule_rules_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(path)
-        .filter(|entry| cache_hit(entry, len, mtime))
-        .map(|entry| entry.rules.clone());
-    if let Some(rules) = cached {
-        return Ok(rules);
-    }
-    let rules = parse_schedule_rules(&std::fs::read_to_string(path)?)?;
-    schedule_rules_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            path.to_path_buf(),
-            RulesCacheEntry {
-                len,
-                mtime,
-                rules: rules.clone(),
-            },
-        );
-    Ok(rules)
-}
-
-struct RulesCacheEntry {
-    len: u64,
-    mtime: Option<std::time::SystemTime>,
-    rules: AutopilotRules,
-}
-
-type RulesCache = std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, RulesCacheEntry>>;
-
-fn schedule_rules_cache() -> &'static RulesCache {
-    static CACHE: std::sync::OnceLock<RulesCache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
-}
-
-/// Whether a cached parse still describes the file. An unreadable mtime never hits: with only the
-/// length to go on, a same-length edit would be served stale.
-fn cache_hit(entry: &RulesCacheEntry, len: u64, mtime: Option<std::time::SystemTime>) -> bool {
-    mtime.is_some() && entry.len == len && entry.mtime == mtime
-}
-
-/// The same rules, from text that is not on disk yet.
-///
-/// Split out of [`load_schedule_rules`] so that the app can hold a candidate to exactly the standard
-/// the daemon will hold the file to, BEFORE writing it. Without this the only validator was "read it
-/// back afterwards", which is a check that happens after the damage.
-///
-/// The two must not drift, and the shape here is what stops them: the loader reads bytes and then
-/// calls this, so there is one parser and one range check rather than a second pair kept in step by
-/// hand.
+/// A project's rules, from the text of an `autopilot.yaml`. Used by the one-time importer
+/// (`settings/import.rs`) and by the settings registry's decoder; the daemon reads the stored
+/// `autopilot` document from the settings snapshot, not from this file.
 pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
     // A file with no YAML document in it -- empty, or nothing but comments -- is a fourth state, and
     // it must land with "absent" rather than with "unreadable". serde_yaml returns EndOfStream here,
@@ -577,7 +486,7 @@ pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
 /// Refuses the values that parse as numbers but that no rule could have meant.
 ///
 /// Here rather than in a `Deserialize` detail on purpose: serde's job is the shape of the file, and
-/// this is a range check on a value whose shape was fine. `load_schedule_rules` is already the place
+/// this is a range check on a value whose shape was fine. this is already the place
 /// where "the file says something impossible" becomes `InvalidData`, so it stays the one place a
 /// caller has to look, and a hand-built `GraphConfig` in a test is not silently held to a rule that
 /// only the file-reading path enforces.
@@ -1465,14 +1374,7 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
     use super::*;
 
     fn rules_from(yaml: &str) -> std::io::Result<AutopilotRules> {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
-        std::fs::write(
-            dir.path().join("projects").join("p").join("autopilot.yaml"),
-            yaml,
-        )
-        .unwrap();
-        load_schedule_rules(Some(dir.path()), "p")
+        parse_schedule_rules(yaml)
     }
 
     #[test]
@@ -2338,7 +2240,7 @@ resolve_effort: \"  \"
     /// Absent and malformed must reach the SAME inert state, and neither may be an error.
     ///
     /// Written in the negative because the failure this guards is a daemon that will not start: this
-    /// reader deliberately follows `load_email_config`, not `load_schedule_rules`, so a typo in a
+    /// reader deliberately follows `load_email_config`, not `parse_schedule_rules`, so a typo in a
     /// dictation aid cannot take down mail, autopilot and the API with it. The malformed case also has
     /// to land on `armed() == false` rather than merely on defaults — the file holds a command the
     /// daemon spawns, and "off" is the only safe reading of a file it could not understand.
@@ -2522,15 +2424,6 @@ resolve_effort: \"  \"
         assert!(load_models_config(&path).is_err());
     }
 
-    #[test]
-    fn schedule_rules_missing_file_returns_default() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            load_schedule_rules(Some(dir.path()), "p").unwrap(),
-            AutopilotRules::default()
-        );
-    }
-
     /// Spec A D7: a project's judge thresholds are read, pulled to the measured limits, and a
     /// misspelt key is a startup error like every other key in this file.
     #[test]
@@ -2576,67 +2469,11 @@ resolve_effort: \"  \"
         assert!(parse_schedule_rules("judge_resolve:\n  offtask: 0.7\n").is_err());
     }
 
-    #[test]
-    fn cache_hit_needs_equal_len_and_a_known_equal_mtime() {
-        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5);
-        let entry = RulesCacheEntry {
-            len: 10,
-            mtime: Some(t),
-            rules: AutopilotRules::default(),
-        };
-        assert!(cache_hit(&entry, 10, Some(t)));
-        assert!(!cache_hit(&entry, 11, Some(t)));
-        assert!(!cache_hit(
-            &entry,
-            10,
-            Some(t + std::time::Duration::from_secs(1))
-        ));
-        assert!(!cache_hit(&entry, 10, None));
-    }
-
-    #[test]
-    fn a_cached_rules_file_follows_edits_and_deletion() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("autopilot.yaml");
-        std::fs::write(&path, "verify_disk_cap_gb: 3\n").unwrap();
-        let first = load_schedule_rules_from(&path).unwrap();
-        assert_eq!(first.verify_disk_cap_gb, Some(3));
-        // Unchanged file: the cached parse comes back equal.
-        assert_eq!(load_schedule_rules_from(&path).unwrap(), first);
-        // A different length is a different file, whatever the mtime tick says.
-        std::fs::write(&path, "verify_disk_cap_gb: 120\n").unwrap();
-        assert_eq!(
-            load_schedule_rules_from(&path).unwrap().verify_disk_cap_gb,
-            Some(120)
-        );
-        // A bad edit is an error on every call, never a stale success.
-        std::fs::write(&path, "verify_disk_cap_gb: 0\n").unwrap();
-        assert!(load_schedule_rules_from(&path).is_err());
-        assert!(load_schedule_rules_from(&path).is_err());
-        // Deleted: the missing-file answer, not the old content.
-        std::fs::write(&path, "verify_disk_cap_gb: 7\n").unwrap();
-        assert_eq!(
-            load_schedule_rules_from(&path).unwrap().verify_disk_cap_gb,
-            Some(7)
-        );
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(
-            load_schedule_rules_from(&path).unwrap(),
-            AutopilotRules::default()
-        );
-    }
-
     /// The brake a project never configured is ON, and the derived `Default` is exactly why this
     /// is worth an assertion of its own: `attention_brake` is the one field here whose zero value
     /// would otherwise have meant "off", on every project that has no rules file at all.
     #[test]
     fn a_project_that_configured_nothing_keeps_the_attention_brake() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            load_schedule_rules(Some(dir.path()), "p")
-                .unwrap()
-                .attention_brake()
-        );
         assert!(AutopilotRules::default().attention_brake());
     }
 
@@ -2656,22 +2493,16 @@ resolve_effort: \"  \"
 
     #[test]
     fn the_attention_brake_is_switched_off_by_name_and_back_on_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
-        let path = dir.path().join("projects").join("p").join("autopilot.yaml");
-
-        std::fs::write(&path, "attention_brake: false\n").unwrap();
         assert!(
-            !load_schedule_rules(Some(dir.path()), "p")
+            !parse_schedule_rules("attention_brake: false\n")
                 .unwrap()
                 .attention_brake()
         );
 
         // Spelled out rather than left to the test above: "absent" and "present and true" are
         // different inputs that must reach the same answer, and only one of them is the default.
-        std::fs::write(&path, "attention_brake: true\n").unwrap();
         assert!(
-            load_schedule_rules(Some(dir.path()), "p")
+            parse_schedule_rules("attention_brake: true\n")
                 .unwrap()
                 .attention_brake()
         );
@@ -2679,22 +2510,15 @@ resolve_effort: \"  \"
 
     #[test]
     fn schedule_rules_parses_two_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
-        std::fs::write(
-            dir.path().join("projects").join("p").join("autopilot.yaml"),
-            "schedules:\n\
+        let text = "schedules:\n\
              \x20\x20- name: nightly-build\n\
              \x20\x20\x20\x20cron: \"0 2 * * *\"\n\
              \x20\x20\x20\x20prompt: \"run the nightly build\"\n\
              \x20\x20\x20\x20cwd: /repo\n\
              \x20\x20- name: morning-report\n\
              \x20\x20\x20\x20cron: \"0 8 * * *\"\n\
-             \x20\x20\x20\x20prompt: \"summarize overnight activity\"\n",
-        )
-        .unwrap();
-
-        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
+             \x20\x20\x20\x20prompt: \"summarize overnight activity\"\n";
+        let rules = parse_schedule_rules(text).unwrap();
         assert_eq!(rules.schedules.len(), 2);
 
         assert_eq!(rules.schedules[0].name, "nightly-build");
@@ -2709,18 +2533,11 @@ resolve_effort: \"  \"
 
     #[test]
     fn schedule_rules_entry_without_cwd_is_none() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
-        std::fs::write(
-            dir.path().join("projects").join("p").join("autopilot.yaml"),
-            "schedules:\n\
+        let text = "schedules:\n\
              \x20\x20- name: morning-report\n\
              \x20\x20\x20\x20cron: \"0 8 * * *\"\n\
-             \x20\x20\x20\x20prompt: \"summarize overnight activity\"\n",
-        )
-        .unwrap();
-
-        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
+             \x20\x20\x20\x20prompt: \"summarize overnight activity\"\n";
+        let rules = parse_schedule_rules(text).unwrap();
         assert_eq!(rules.schedules[0].cwd, None);
     }
 
@@ -2808,15 +2625,7 @@ resolve_effort: \"  \"
     #[test]
     fn schedule_rules_with_no_yaml_document_is_not_a_gate_rather_than_an_error() {
         for contents in ["", "   \n\n", "# just a comment\n# and another\n"] {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
-            std::fs::write(
-                dir.path().join("projects").join("p").join("autopilot.yaml"),
-                contents,
-            )
-            .unwrap();
-
-            let rules = load_schedule_rules(Some(dir.path()), "p")
+            let rules = parse_schedule_rules(contents)
                 .unwrap_or_else(|e| panic!("{contents:?} must not be an error, got {e}"));
             assert_eq!(rules.gate_command, None);
             assert!(
@@ -2926,31 +2735,17 @@ resolve_effort: \"  \"
 
     #[test]
     fn schedule_rules_malformed_yaml_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
-        std::fs::write(
-            dir.path().join("projects").join("p").join("autopilot.yaml"),
-            "schedules: [not, valid, for this struct",
-        )
-        .unwrap();
-
-        assert!(load_schedule_rules(Some(dir.path()), "p").is_err());
+        let text = "schedules: [not, valid, for this struct";
+        assert!(parse_schedule_rules(text).is_err());
     }
 
     #[test]
     fn repo_triggers_parse_and_default_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("projects").join("p")).unwrap();
-        std::fs::write(
-            dir.path().join("projects").join("p").join("autopilot.yaml"),
-            "repo_triggers:\n\
+        let text = "repo_triggers:\n\
              \x20\x20- name: review-main\n\
              \x20\x20\x20\x20branch: main\n\
-             \x20\x20\x20\x20prompt: \"review new commits on main\"\n",
-        )
-        .unwrap();
-
-        let rules = load_schedule_rules(Some(dir.path()), "p").unwrap();
+             \x20\x20\x20\x20prompt: \"review new commits on main\"\n";
+        let rules = parse_schedule_rules(text).unwrap();
         assert!(rules.schedules.is_empty());
         assert_eq!(rules.repo_triggers.len(), 1);
         assert_eq!(rules.repo_triggers[0].name, "review-main");

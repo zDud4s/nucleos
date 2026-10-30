@@ -1,6 +1,6 @@
 //! What a project's `autopilot` and `workflow_pins` documents say, read from the settings snapshot.
 //!
-//! This replaces `config::load_schedule_rules` and `workflows::read_pins` as the READERS of the two project
+//! This replaced the removed `config::load_schedule_rules` and `workflows::read_pins` as the READERS of the two project
 //! documents. The old loaders read a file on every call and failed with an `io::Error` when the file did not
 //! parse; this one reads the in-memory snapshot (no I/O) and fails with [`DocumentUnreadable`] when the stored
 //! document no longer fits its type. The contract callers rely on is unchanged: nothing stored is the default,

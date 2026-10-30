@@ -618,21 +618,15 @@ pub(super) async fn onboarding_view(
     state: &AppState,
     id: &str,
     root: PathBuf,
-    just_confirmed: Option<&str>,
 ) -> Result<OnboardingView, (StatusCode, Json<serde_json::Value>)> {
     let machine_root = machine_config_root(state)?;
     let project_id = id.to_string();
-    let just_confirmed = just_confirmed.map(str::to_owned);
     tokio::task::spawn_blocking(move || {
         let found = crate::detect::inspect_folder(&root);
         // Stored rules that cannot be read have no gate this can name; the POST refuses them by name.
-        // A gate the caller has just confirmed is the configured gate, stored or about to be seen
-        // (the onboarding writer still stores a file until it publishes the document).
-        let configured_gate = just_confirmed.or_else(|| {
-            crate::project::rules::autopilot(&project_id)
-                .ok()
-                .and_then(|rules| rules.gate_command)
-        });
+        let configured_gate = crate::project::rules::autopilot(&project_id)
+            .ok()
+            .and_then(|rules| rules.gate_command);
         OnboardingView {
             onboarded: crate::onboarding::read_marker(Some(&machine_root), &project_id),
             marker_path: crate::project::state::display_path(
@@ -663,7 +657,7 @@ pub(super) async fn get_project_onboarding(
 ) -> Result<Json<OnboardingView>, (StatusCode, Json<serde_json::Value>)> {
     project_state_dir(&state, &id)?;
     let root = onboarding_root(&state, &id, query.root).await?;
-    onboarding_view(&state, &id, root, None).await.map(Json)
+    onboarding_view(&state, &id, root).await.map(Json)
 }
 
 /// Onboards a project to NucleOS, with the gate command a person confirmed. Idempotent.
@@ -671,7 +665,7 @@ pub(super) async fn get_project_onboarding(
 /// The one thing activation now asks of a project besides the classifier hook (`autopilot.rs`),
 /// and the act is `onboarding::onboard`'s: check the gate, detect the harnesses, install the hook
 /// with the same `wire_classifier_hook` every other door uses, store the gate as `gate_command` in
-/// the project's `autopilot.yaml` — where the gate already lives — and write the marker last.
+/// the project's `autopilot` settings document — where the gate already lives — and write the marker last.
 ///
 /// **In no table in `auth.rs`, so Admin's by default-deny**, for `POST /projects/{id}/write`'s
 /// reason and a second one: it sets what *green* means, and it writes an executable hook into a
@@ -680,7 +674,7 @@ pub(super) async fn get_project_onboarding(
 /// yet, and naming one is what `GET /projects/detect` already lets this same key do.
 ///
 /// **Kill-switch checked first, like `POST /write` and `POST /config/machine`.** Onboarding writes
-/// `gate_command` into the project's `autopilot.yaml` and installs an executable classifier hook —
+/// `gate_command` into the project's `autopilot` settings document and installs an executable classifier hook —
 /// the same shape of governance write those two routes already refuse the stop for — so a stop
 /// engaged here must refuse before either lands. The shell's new-project wizard used to lean on
 /// this route succeeding while the stop was engaged, because registering a project runs onboarding
@@ -726,19 +720,16 @@ pub(super) async fn post_project_onboard(
         .map(|command| command.trim().to_string())
         .filter(|command| !command.is_empty());
 
-    let (project_id, project_root, confirmed) = (id.clone(), root.clone(), gate.clone());
     let now = chrono::Utc::now().to_rfc3339();
-    tokio::task::spawn_blocking(move || {
-        crate::onboarding::onboard(
-            &machine_root,
-            &project_id,
-            &project_root,
-            confirmed.as_deref(),
-            &now,
-        )
-    })
+    crate::onboarding::onboard(
+        &state.pool,
+        &machine_root,
+        &id,
+        &root,
+        gate.as_deref(),
+        &now,
+    )
     .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
     .map_err(|error| match error {
         crate::onboarding::OnboardError::BadId => {
             refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id")
@@ -791,9 +782,7 @@ pub(super) async fn post_project_onboard(
         pin_default_workflow(&state, &id, &root, home, library).await;
     }
 
-    onboarding_view(&state, &id, root, gate.as_deref())
-        .await
-        .map(Json)
+    onboarding_view(&state, &id, root).await.map(Json)
 }
 
 /// Pin the default workflow for a project being brought in, place its files in the project, and

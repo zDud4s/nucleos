@@ -455,6 +455,8 @@ pub struct Pins {
 
 /// A blank file, a file of nothing but comments, and a file that says `workflows: []` are one fact:
 /// this project pins nothing. A parse error is a different fact and stays one.
+///
+/// Importer only (`settings/import.rs`, and the fixtures of tests): removed with chunk 6's last task.
 pub fn parse_pins(contents: &str) -> Result<Pins, String> {
     let pins: Pins = match serde_yaml::from_str::<Option<Pins>>(contents) {
         Ok(Some(pins)) => pins,
@@ -480,21 +482,6 @@ pub fn render_pins(pins: &Pins) -> String {
          # this project overrides on their nodes. Values survive; comments do not — the app\n\
          # rewrites this file whole on every install, eject and update.\n{body}"
     )
-}
-
-/// The validator [`crate::ownership`] needs to let this file be written through the app.
-pub fn validate_pins(contents: &str) -> Result<(), String> {
-    parse_pins(contents).map(|_| ())
-}
-
-/// Read a project's pins from `pins`, the file — `~/.nucleos/projects/<id>/workflows.yaml` in
-/// production. A project with no file pins nothing.
-pub fn read_pins(pins: &Path) -> Result<Pins, String> {
-    match std::fs::read_to_string(pins) {
-        Ok(text) => parse_pins(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Pins::default()),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 /* -------------------------------------------------------------- standings -- */
@@ -1707,6 +1694,32 @@ mod tests {
             matches!(outcome, Err(crate::settings::SettingsError::Stale { .. })),
             "a put with the old version must be stale, got {outcome:?}"
         );
+    }
+
+    /// Spec 11: an internal write is a write like any other, so the history carries it, attributed
+    /// to the daemon's workflows module and not marked as a deletion.
+    #[tokio::test]
+    async fn an_internal_write_bumps_the_version_and_appears_in_history() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project_id = "install-history-project";
+        let scope = crate::settings::Scope::project(project_id);
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[("g.yaml", "a")]);
+
+        let (_, before) = crate::project::rules::pins_versioned(project_id).unwrap();
+        install(&pool, project_id, &bundle_at(&root, "harness", "1.0"))
+            .await
+            .unwrap();
+        let (_, after) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert!(after > before, "the internal write bumped the version");
+
+        let history = crate::settings::history(&pool, &scope, "workflow_pins")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one write, one history row");
+        assert_eq!(history[0].written_by, "daemon:workflows");
+        assert!(!history[0].deleted(), "an install is not a deletion");
     }
 
     #[tokio::test]

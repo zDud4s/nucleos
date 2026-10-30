@@ -14,12 +14,13 @@
 //! # What onboarding does, in order
 //!
 //! 1. **Checks the confirmed gate command before touching anything.** A command that could not be
-//!    stored, or a rules file this cannot edit, is refused while nothing has been written yet.
+//!    stored is refused while nothing has been written yet.
 //! 2. **Detects** the harnesses already in the folder (`detect.rs`), to record what was there.
 //! 3. **Installs the classifier hook** with the same `autopilot::wire_classifier_hook` every other
 //!    door uses, so there is one hook and one way of wiring it.
-//! 4. **Stores the confirmed gate** as `gate_command` in `autopilot.yaml` — the one place the gate
-//!    already lives, beside the schedules and triggers, whose lines are all kept.
+//! 4. **Stores the confirmed gate** as `gate_command` in the project's `autopilot` settings
+//!    document (`settings::update`, written by `daemon:onboarding`), whose other rules are kept. A
+//!    stored document this cannot decode is refused as [`OnboardError::Rules`].
 //! 5. **Writes the marker**, last, so it never claims a step that did not happen.
 //!
 //! Idempotent: a second onboarding re-wires a hook that is already there (a no-op), sets the same
@@ -28,7 +29,7 @@
 //! # What the marker is not
 //!
 //! Configuration. Nothing reads it but the activation check and the page that shows it; the gate
-//! is `autopilot.yaml`'s, and editing `gate_command` there later does not make the marker wrong —
+//! is the `autopilot` document's, and editing `gate_command` there later does not make the marker wrong —
 //! the marker records what was confirmed WHEN the project was onboarded.
 
 use std::path::Path;
@@ -54,7 +55,7 @@ pub struct Marker {
     /// its state directory — and so this marker — moves with its id, not with its folder.
     pub project_root: String,
     /// The gate command a person confirmed, or `None` when none was. Not the gate itself, which is
-    /// `autopilot.yaml`'s; see the module header.
+    /// the `autopilot` settings document's; see the module header.
     #[serde(default)]
     pub gate_command: Option<String>,
     /// The harness folders detection found (`.claude`, `.agents`, ...), relative to the root.
@@ -71,14 +72,15 @@ pub struct Marker {
     pub migrated: bool,
 }
 
-/// Why onboarding stopped. Every variant but `Io` is raised before anything is written.
+/// Why onboarding stopped. `BadId` and `Gate` are raised before anything is written; `Rules` after the hook
+/// is wired (a hook is idempotent) and before the marker.
 #[derive(Debug)]
 pub enum OnboardError {
     /// The project id cannot name a state directory (`project_state::valid_id`).
     BadId,
     /// The confirmed gate command cannot be stored as one.
     Gate(String),
-    /// The project's existing `autopilot.yaml` cannot be read or edited without losing something.
+    /// The project's stored `autopilot` document cannot be decoded or edited.
     Rules(String),
     /// The classifier hook could not be installed — usually a `.claude/settings.json` this daemon
     /// cannot parse, which it leaves alone.
@@ -119,7 +121,7 @@ fn render(marker: &Marker) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(format!(
         "# Written by NucleOS: this project was onboarded, and what was confirmed then. The gate \
-         itself is gate_command in autopilot.yaml beside this file.\n{body}"
+         itself is gate_command in the project's autopilot settings document.\n{body}"
     ))
 }
 
@@ -141,56 +143,14 @@ pub fn validate_gate(command: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `existing` rules text with its `gate_command` set to `command`, every other line kept.
-///
-/// Edited as text rather than parsed and re-serialised, because the file is a person's: a
-/// round-trip through a YAML value would drop every comment in it. A top-level `gate_command:` line
-/// (and any indented continuation under it) is taken out and the new one appended; the result is
-/// then held to [`crate::config::parse_schedule_rules`] and must read back as exactly `command`,
-/// so an edit this got wrong is refused rather than written.
-pub fn with_gate_command(existing: &str, command: &str) -> Result<String, String> {
-    let mut kept = Vec::new();
-    let mut in_gate = false;
-    for line in existing.lines() {
-        if in_gate && line.starts_with([' ', '\t']) && !line.trim().is_empty() {
-            continue;
-        }
-        in_gate = line.starts_with("gate_command:");
-        if !in_gate {
-            kept.push(line);
-        }
-    }
-
-    // `serde_yaml` decides the quoting: a command that opens with a quote, as Git's bash by its
-    // absolute path does, is not a plain scalar.
-    let scalar = serde_yaml::to_string(command)
-        .map_err(|error| format!("the gate command cannot be written as YAML: {error}"))?;
-    let mut text = kept.join("\n");
-    if !text.is_empty() {
-        text.push('\n');
-    }
-    text.push_str("gate_command: ");
-    text.push_str(scalar.trim_end());
-    text.push('\n');
-
-    let rules = crate::config::parse_schedule_rules(&text).map_err(|error| {
-        format!("setting the gate would leave autopilot.yaml unreadable: {error}")
-    })?;
-    if rules.gate_command.as_deref() != Some(command) {
-        return Err(
-            "autopilot.yaml would not read back the confirmed gate command; it was left alone"
-                .to_string(),
-        );
-    }
-    Ok(text)
-}
-
 /// Onboards `project_id`, rooted at `project_root`, with the gate command a person confirmed.
 ///
-/// `gate_command: None` means nobody confirmed one, and leaves `autopilot.yaml` exactly as it was —
-/// it never removes a gate somebody set elsewhere. `now` is the timestamp to record, an argument so
-/// a test can pin it. See the module header for the order, which is the design.
-pub fn onboard(
+/// `gate_command: None` means nobody confirmed one, and leaves the stored `autopilot` document
+/// exactly as it was — it never removes a gate somebody set elsewhere. `now` is the timestamp to
+/// record, an argument so a test can pin it. See the module header for the order, which is the
+/// design.
+pub async fn onboard(
+    pool: &sqlx::SqlitePool,
     machine_root: &Path,
     project_id: &str,
     project_root: &Path,
@@ -198,29 +158,10 @@ pub fn onboard(
     now: &str,
 ) -> Result<Marker, OnboardError> {
     let dir = crate::project::state::dir(machine_root, project_id).ok_or(OnboardError::BadId)?;
-    let rules_path = dir.join(crate::project::state::AUTOPILOT_FILE);
 
-    let rules = match gate_command {
-        Some(command) => {
-            validate_gate(command).map_err(OnboardError::Gate)?;
-            let existing = match std::fs::read_to_string(&rules_path) {
-                Ok(text) => text,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => return Err(OnboardError::Io(error)),
-            };
-            crate::config::parse_schedule_rules(&existing).map_err(|error| {
-                OnboardError::Rules(format!(
-                    "{} is unreadable ({error}); fix it before onboarding sets a gate in it",
-                    crate::project::state::display_path(
-                        project_id,
-                        crate::project::state::AUTOPILOT_FILE
-                    )
-                ))
-            })?;
-            Some(with_gate_command(&existing, command).map_err(OnboardError::Rules)?)
-        }
-        None => None,
-    };
+    if let Some(command) = gate_command {
+        validate_gate(command).map_err(OnboardError::Gate)?;
+    }
 
     let harnesses = crate::detect::inspect_folder(project_root)
         .harnesses
@@ -230,8 +171,23 @@ pub fn onboard(
 
     crate::governance::autopilot::wire_classifier_hook(project_root).map_err(OnboardError::Hook)?;
 
-    if let Some(text) = rules {
-        crate::project::state::write_atomically(&rules_path, &text).map_err(OnboardError::Io)?;
+    if let Some(command) = gate_command {
+        let command = command.to_string();
+        crate::settings::update(
+            pool,
+            &crate::settings::Scope::project(project_id),
+            "daemon:onboarding",
+            |rules: &mut crate::config::AutopilotRules| rules.gate_command = Some(command),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::settings::SettingsError::Database(error) => {
+                OnboardError::Io(std::io::Error::other(error))
+            }
+            other => OnboardError::Rules(format!(
+                "the project's autopilot rules cannot be edited ({other}); fix them before                  onboarding sets a gate in them"
+            )),
+        })?;
     }
 
     let marker = Marker {
@@ -383,12 +339,6 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
-    fn rules_path(home: &Path, id: &str) -> PathBuf {
-        home.join("projects")
-            .join(id)
-            .join(crate::project::state::AUTOPILOT_FILE)
-    }
-
     /// No marker, or one that is not a marker, is "not onboarded" — never an error.
     #[test]
     fn a_missing_or_unreadable_marker_is_not_onboarded() {
@@ -400,38 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_line_is_set_and_every_other_line_is_kept() {
-        let existing = "# the owner's note\nschedules: []\ngate_command: old\nrepo_triggers: []\n";
-        let text = with_gate_command(existing, "cargo test").unwrap();
-        assert!(text.contains("# the owner's note"), "{text}");
-        assert!(text.contains("schedules: []") && text.contains("repo_triggers: []"));
-        assert!(!text.contains("gate_command: old"), "{text}");
-        assert_eq!(
-            crate::config::parse_schedule_rules(&text)
-                .unwrap()
-                .gate_command
-                .as_deref(),
-            Some("cargo test")
-        );
-
-        // From nothing, and with a command that has to be quoted to survive as YAML.
-        let quoted = r#""C:/Program Files/Git/bin/bash.exe" scripts/gates.sh core"#;
-        let text = with_gate_command("", quoted).unwrap();
-        assert_eq!(
-            crate::config::parse_schedule_rules(&text)
-                .unwrap()
-                .gate_command
-                .as_deref(),
-            Some(quoted)
-        );
-
-        // A folded gate spread over indented lines is taken out whole, not left dangling.
-        let folded = "gate_command: >\n  cargo\n  test\nschedules: []\n";
-        let text = with_gate_command(folded, "make check").unwrap();
-        assert_eq!(text, "schedules: []\ngate_command: make check\n");
-    }
-
-    #[test]
     fn a_gate_that_cannot_be_one_is_refused() {
         assert!(validate_gate("").is_err());
         assert!(validate_gate("  ").is_err());
@@ -440,22 +358,25 @@ mod tests {
         assert!(validate_gate("cargo test").is_ok());
     }
 
-    /// The whole act on injected directories: hook wired, gate stored beside what was there, the
-    /// marker last — and a second run is the same state, not a second copy of anything.
-    #[test]
-    fn onboarding_installs_the_hook_stores_the_gate_and_writes_the_marker() {
-        let home = tempfile::tempdir().unwrap();
+    /// The whole act on injected directories: hook wired, gate stored in the settings store, the
+    /// marker last, and a second run is the same state rather than a second copy of anything.
+    #[tokio::test]
+    async fn onboarding_installs_the_hook_stores_the_gate_and_writes_the_marker() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".claude")).unwrap();
-        write(&rules_path(home.path(), "alpha"), "schedules: []\n");
+        let id = "onboard-whole-act";
 
         let marker = onboard(
+            &pool,
             home.path(),
-            "alpha",
+            id,
             project.path(),
             Some("cargo test"),
             NOW,
         )
+        .await
         .unwrap();
 
         assert!(crate::governance::autopilot::classifier_hook_is_wired(
@@ -463,94 +384,277 @@ mod tests {
         ));
         assert_eq!(marker.harnesses, vec![".claude".to_string()]);
         assert!(marker.hook_installed && !marker.migrated);
-        assert_eq!(read_marker(Some(home.path()), "alpha"), Some(marker));
-        let rules = std::fs::read_to_string(rules_path(home.path(), "alpha")).unwrap();
-        assert_eq!(rules, "schedules: []\ngate_command: cargo test\n");
+        assert_eq!(read_marker(Some(home.path()), id), Some(marker));
+        let rules = crate::project::rules::autopilot(id).unwrap();
+        assert_eq!(rules.gate_command.as_deref(), Some("cargo test"));
 
         onboard(
+            &pool,
             home.path(),
-            "alpha",
+            id,
             project.path(),
             Some("cargo test"),
             NOW,
         )
+        .await
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(rules_path(home.path(), "alpha")).unwrap(),
-            rules,
+            crate::project::rules::autopilot(id)
+                .unwrap()
+                .gate_command
+                .as_deref(),
+            Some("cargo test"),
             "onboarding again is the same state"
         );
-        assert!(is_onboarded(Some(home.path()), "alpha"));
+        assert!(is_onboarded(Some(home.path()), id));
     }
 
-    /// Nobody confirmed a gate: the rules file is not touched, and a gate set elsewhere survives.
-    #[test]
-    fn no_confirmed_gate_leaves_the_rules_alone() {
-        let home = tempfile::tempdir().unwrap();
+    #[tokio::test]
+    async fn onboard_stores_the_gate_command_in_the_autopilot_document() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();
-        write(&rules_path(home.path(), "alpha"), "gate_command: make ci\n");
+        let id = "onboard-gate-doc";
+        let scope = crate::settings::Scope::project(id);
 
-        let marker = onboard(home.path(), "alpha", project.path(), None, NOW).unwrap();
+        onboard(
+            &pool,
+            home.path(),
+            id,
+            project.path(),
+            Some("cargo test"),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::project::rules::autopilot(id)
+                .unwrap()
+                .gate_command
+                .as_deref(),
+            Some("cargo test")
+        );
+        let history = crate::settings::history(&pool, &scope, "autopilot")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one write, one history row");
+        assert_eq!(history[0].written_by, "daemon:onboarding");
+    }
+
+    /// Nobody confirmed a gate: the stored rules are not touched, and a gate set elsewhere survives.
+    #[tokio::test]
+    async fn no_confirmed_gate_leaves_the_rules_alone() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let id = "onboard-no-gate";
+        crate::project::rules::testing::publish_rules(id, "gate_command: make ci\n");
+
+        let marker = onboard(&pool, home.path(), id, project.path(), None, NOW)
+            .await
+            .unwrap();
 
         assert_eq!(marker.gate_command, None);
         assert_eq!(
-            std::fs::read_to_string(rules_path(home.path(), "alpha")).unwrap(),
-            "gate_command: make ci\n"
+            crate::project::rules::autopilot(id)
+                .unwrap()
+                .gate_command
+                .as_deref(),
+            Some("make ci")
         );
-        assert!(is_onboarded(Some(home.path()), "alpha"));
+        assert!(is_onboarded(Some(home.path()), id));
     }
 
-    /// A refusal on the gate or the rules happens before the hook is installed or anything written.
-    #[test]
-    fn a_refused_gate_or_unreadable_rules_writes_nothing() {
-        let home = tempfile::tempdir().unwrap();
+    /// A bad gate is refused first: nothing is written to the store, the hook or the marker.
+    #[tokio::test]
+    async fn onboard_with_a_bad_gate_writes_nothing() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();
+        let id = "onboard-bad-gate";
+        let scope = crate::settings::Scope::project(id);
 
-        assert!(matches!(
-            onboard(home.path(), "alpha", project.path(), Some("a\nb"), NOW),
-            Err(OnboardError::Gate(_))
-        ));
-        write(&rules_path(home.path(), "alpha"), "schedules: [unclosed\n");
-        assert!(matches!(
-            onboard(
-                home.path(),
-                "alpha",
-                project.path(),
-                Some("cargo test"),
-                NOW
-            ),
-            Err(OnboardError::Rules(_))
-        ));
-        assert!(matches!(
-            onboard(home.path(), "../escape", project.path(), None, NOW),
-            Err(OnboardError::BadId)
-        ));
+        let outcome = onboard(&pool, home.path(), id, project.path(), Some("a\nb"), NOW).await;
 
+        assert!(matches!(outcome, Err(OnboardError::Gate(_))), "{outcome:?}");
+        assert!(!crate::project::rules::is_stored(id, "autopilot"));
+        assert!(
+            crate::settings::history(&pool, &scope, "autopilot")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             !project.path().join(".claude").exists(),
             "no hook was installed"
         );
-        assert!(!is_onboarded(Some(home.path()), "alpha"));
+        assert!(!is_onboarded(Some(home.path()), id));
+    }
+
+    #[tokio::test]
+    async fn onboard_keeps_every_other_rule_when_the_document_exists() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let id = "onboard-keeps-rules";
+        crate::project::rules::testing::publish_rules(
+            id,
+            "max_turns: 7\nhealth_breach_intent: true\ngate_command: old\n",
+        );
+
+        onboard(
+            &pool,
+            home.path(),
+            id,
+            project.path(),
+            Some("cargo test"),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let rules = crate::project::rules::autopilot(id).unwrap();
+        assert_eq!(rules.gate_command.as_deref(), Some("cargo test"));
+        assert_eq!(rules.max_turns, Some(7));
+        assert!(rules.health_breach_intent);
+    }
+
+    /// An unreadable stored document, or an id that cannot name a state directory, is refused.
+    #[tokio::test]
+    async fn a_refused_gate_or_unreadable_rules_writes_nothing() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let id = "onboard-unreadable";
+
+        crate::project::rules::testing::publish_unreadable(id, "autopilot", "schedules: [unclosed");
+        assert!(matches!(
+            onboard(
+                &pool,
+                home.path(),
+                id,
+                project.path(),
+                Some("cargo test"),
+                NOW
+            )
+            .await,
+            Err(OnboardError::Rules(_))
+        ));
+        assert!(matches!(
+            onboard(&pool, home.path(), "../escape", project.path(), None, NOW).await,
+            Err(OnboardError::BadId)
+        ));
+        assert!(!is_onboarded(Some(home.path()), id));
     }
 
     /// A settings file this daemon cannot parse is the project saying no; nothing is marked.
-    #[test]
-    fn a_hook_that_cannot_be_installed_leaves_the_project_not_onboarded() {
-        let home = tempfile::tempdir().unwrap();
+    #[tokio::test]
+    async fn a_hook_that_cannot_be_installed_leaves_the_project_not_onboarded() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();
+        let id = "onboard-bad-hook";
         write(&project.path().join(".claude/settings.json"), "{ not json");
 
         assert!(matches!(
             onboard(
+                &pool,
                 home.path(),
-                "alpha",
+                id,
                 project.path(),
                 Some("cargo test"),
                 NOW
-            ),
+            )
+            .await,
             Err(OnboardError::Hook(_))
         ));
-        assert!(!is_onboarded(Some(home.path()), "alpha"));
-        assert!(!rules_path(home.path(), "alpha").exists());
+        assert!(!is_onboarded(Some(home.path()), id));
+        assert!(!crate::project::rules::is_stored(id, "autopilot"));
+    }
+
+    #[tokio::test]
+    async fn pin_default_workflow_skips_when_a_pins_document_is_stored() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let temp = tempfile::tempdir().unwrap();
+        let library = library_with(temp.path(), &["2.0.0"]);
+        let home = temp.path().join("home");
+        let id = "pin-skips-stored";
+        crate::project::rules::testing::publish_pins(id, "workflows: []\n");
+
+        let pinned = pin_default_workflow(&pool, &home, &library, id)
+            .await
+            .unwrap();
+
+        assert!(pinned.is_none());
+        assert!(
+            crate::project::rules::pins(id)
+                .unwrap()
+                .workflows
+                .is_empty(),
+            "the stored choice is left alone"
+        );
+        let scope = crate::settings::Scope::project(id);
+        assert!(
+            crate::settings::history(&pool, &scope, "workflow_pins")
+                .await
+                .unwrap()
+                .is_empty(),
+            "and nothing was written"
+        );
+    }
+
+    /// Spec 11, the gate variant: the onboarding write bumped the version, so an editor that read
+    /// the document before it is stale.
+    #[tokio::test]
+    async fn a_put_carrying_the_pre_internal_write_version_is_stale() {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let id = "onboard-stale-put";
+        let scope = crate::settings::Scope::project(id);
+        // Stored through the real write path: a snapshot-only fixture has no database row, so the
+        // onboarding write would land as version 1 and not exceed the fixture's version 1.
+        let before = crate::settings::put(
+            &pool,
+            &scope,
+            "autopilot",
+            &serde_json::json!({ "max_turns": 3 }),
+            "test",
+            Some(0),
+        )
+        .await
+        .expect("the fixture is stored");
+
+        onboard(
+            &pool,
+            home.path(),
+            id,
+            project.path(),
+            Some("cargo test"),
+            NOW,
+        )
+        .await
+        .unwrap();
+        let after = crate::settings::global()
+            .snapshot()
+            .version(&scope, "autopilot")
+            .unwrap();
+        assert!(after > before, "the internal write bumped the version");
+
+        let outcome = crate::settings::put(
+            &pool,
+            &scope,
+            "autopilot",
+            &serde_json::json!({ "max_turns": 9 }),
+            "test",
+            Some(before),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(crate::settings::SettingsError::Stale { .. })),
+            "a put with the old version must be stale, got {outcome:?}"
+        );
     }
 }
