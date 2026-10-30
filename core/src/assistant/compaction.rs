@@ -128,7 +128,8 @@ const AUTO_BACKOFF_TURNS: i64 = 3;
 /// Files an automatic compaction after a completed turn when the guards allow it. Never fails.
 ///
 /// Reads the guards cheapest first and stops at the first that settles the question. `run_id` is
-/// the turn that just ended and `fill` its measured context fill.
+/// the turn that just ended and `fill` its context fill: measured on the CLI path, estimated on the
+/// local one.
 pub(super) async fn maybe_auto_compact(
     state: &AppState,
     chat_id: &str,
@@ -1153,6 +1154,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    async fn compaction_rows(pool: &SqlitePool, chat: &str, auto: Option<i64>) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_compactions WHERE chat_id = ? AND (? IS NULL OR auto = ?)",
+        )
+        .bind(chat)
+        .bind(auto)
+        .bind(auto)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A state whose summarising engine answers, and a chat with auto-compact on and one exchange.
+    async fn auto_chat(on: bool) -> (crate::state::AppState, String, i64) {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = crate::channels::testkit::state().await;
+        state.runner = fake.clone();
+        let c = chat(&state.pool).await;
+        chats::set_auto_compact(&state.pool, &c, on).await.unwrap();
+        let run = exchange(&state.pool, &c, "q", "a").await;
+        *fake.canned.lock().unwrap() = Some(answer("HANDOFF"));
+        (state, c, run)
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_over_soft_with_auto_compact_on_files_an_automatic_compaction() {
+        let (state, c, run) = auto_chat(true).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_with_auto_compact_off_files_no_compaction() {
+        let (state, c, run) = auto_chat(false).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_compaction_turn_triggers_no_further_compaction() {
+        let (state, c, _) = auto_chat(true).await;
+        let compact_run = compaction(&state.pool, &c, "HANDOFF").await;
+        let before = compaction_rows(&state.pool, &c, None).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            compact_run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_without_a_measured_fill_never_compacts() {
+        let (state, c, run) = auto_chat(true).await;
+
+        super::super::turn::after_local_turn(&state, &c, run, None).await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
     }
 
     #[test]
