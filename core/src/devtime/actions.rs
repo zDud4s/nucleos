@@ -7,6 +7,7 @@
 pub mod inject;
 pub mod outcome;
 pub mod propose;
+pub mod report;
 
 use crate::devtime::precision::{RulePrecision, action_eligible};
 
