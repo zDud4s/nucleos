@@ -58,9 +58,34 @@ pub async fn insert_pending(
     model: Option<&str>,
     focus: Option<&str>,
 ) -> sqlx::Result<i64> {
+    insert_pending_as(
+        pool,
+        chat_id,
+        run_id,
+        prompt_version,
+        engine,
+        model,
+        focus,
+        false,
+    )
+    .await
+}
+
+/// [`insert_pending`] that also records whether the daemon, not the user, started the compaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_pending_as(
+    pool: &SqlitePool,
+    chat_id: &str,
+    run_id: i64,
+    prompt_version: &str,
+    engine: &str,
+    model: Option<&str>,
+    focus: Option<&str>,
+    auto: bool,
+) -> sqlx::Result<i64> {
     Ok(sqlx::query(
-        "INSERT INTO chat_compactions (chat_id, run_id, status, prompt_version, engine, model, focus)
-         VALUES (?, ?, 'pending', ?, ?, ?, ?)",
+        "INSERT INTO chat_compactions (chat_id, run_id, status, prompt_version, engine, model, focus, auto)
+         VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)",
     )
     .bind(chat_id)
     .bind(run_id)
@@ -68,9 +93,45 @@ pub async fn insert_pending(
     .bind(engine)
     .bind(model)
     .bind(focus)
+    .bind(i64::from(auto))
     .execute(pool)
     .await?
     .last_insert_rowid())
+}
+
+/// The chat's newest automatic compaction as `(run_id, status)`; manual rows are never counted.
+pub async fn latest_auto(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Option<(i64, Status)>> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT run_id, status FROM chat_compactions
+          WHERE chat_id = ? AND auto = 1
+          ORDER BY run_id DESC
+          LIMIT 1",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(run_id, status)| (run_id, Status::from_wire(&status).unwrap_or(Status::Failed))))
+}
+
+/// Whether the chat has a compaction still `pending`.
+pub async fn has_pending(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM chat_compactions WHERE chat_id = ? AND status = 'pending')",
+    )
+    .bind(chat_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Whether the compaction filed for `run_id` was started by the daemon (`auto = 1`).
+pub async fn is_auto(pool: &SqlitePool, run_id: i64) -> sqlx::Result<bool> {
+    let auto: Option<i64> = sqlx::query_scalar(
+        "SELECT auto FROM chat_compactions WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(auto == Some(1))
 }
 
 /// Whether there is anything to compact: an answered assistant turn after the last `/clear`.
@@ -543,5 +604,121 @@ mod tests {
             assert_eq!(Status::from_wire(s.as_str()), Some(s));
         }
         assert_eq!(Status::from_wire("archived"), None);
+    }
+
+    async fn auto_of(pool: &SqlitePool, run: i64) -> i64 {
+        sqlx::query_scalar("SELECT auto FROM chat_compactions WHERE run_id = ?")
+            .bind(run)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn pending_as(pool: &SqlitePool, chat: &str, run: i64, auto: bool) {
+        insert_pending_as(
+            pool,
+            chat,
+            run,
+            "nucleos-compact v1",
+            "claude",
+            Some("sonnet"),
+            None,
+            auto,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn insert_pending_leaves_auto_off() {
+        let pool = crate::testdb::fresh_pool().await;
+        let c = chat(&pool).await;
+        let run = seed_turn(&pool, &c, "running", None).await;
+        pending(&pool, &c, run).await;
+        assert_eq!(auto_of(&pool, run).await, 0);
+    }
+
+    #[tokio::test]
+    async fn insert_pending_auto_marks_the_row_auto() {
+        let pool = crate::testdb::fresh_pool().await;
+        let c = chat(&pool).await;
+        let run = seed_turn(&pool, &c, "running", None).await;
+        pending_as(&pool, &c, run, true).await;
+        assert_eq!(auto_of(&pool, run).await, 1);
+        assert_eq!(status_of(&pool, run).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn settle_and_active_ignore_the_auto_mark() {
+        let pool = crate::testdb::fresh_pool().await;
+        let text = "# Handoff
+body";
+        let mut seen = Vec::new();
+        for auto in [false, true] {
+            let c = chat(&pool).await;
+            let run = seed_turn(&pool, &c, "running", None).await;
+            pending_as(&pool, &c, run, auto).await;
+            set_run(&pool, run, "completed", Some(text)).await;
+            let settled = settle(&pool, run).await.unwrap();
+            assert_eq!(
+                settled,
+                Settled::Done {
+                    chat_id: c.clone(),
+                    summary_chars: text.chars().count() as i64
+                }
+            );
+            let in_force = active(&pool, &c).await.unwrap().unwrap();
+            assert_eq!(in_force.run_id, run);
+            assert_eq!(in_force.summary, text);
+            seen.push(auto);
+        }
+        assert_eq!(seen, vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn latest_auto_compaction_reports_status_and_run() {
+        let pool = crate::testdb::fresh_pool().await;
+        let c = chat(&pool).await;
+        let manual = seed_turn(&pool, &c, "completed", Some("a")).await;
+        pending_as(&pool, &c, manual, false).await;
+        assert_eq!(latest_auto(&pool, &c).await.unwrap(), None);
+
+        let first = seed_turn(&pool, &c, "completed", Some("a")).await;
+        pending_as(&pool, &c, first, true).await;
+        let second = seed_turn(&pool, &c, "completed", Some("a")).await;
+        pending_as(&pool, &c, second, true).await;
+        let later_manual = seed_turn(&pool, &c, "completed", Some("a")).await;
+        pending_as(&pool, &c, later_manual, false).await;
+        sqlx::query("UPDATE chat_compactions SET status = 'failed' WHERE run_id = ?")
+            .bind(second)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            latest_auto(&pool, &c).await.unwrap(),
+            Some((second, Status::Failed))
+        );
+    }
+
+    #[tokio::test]
+    async fn has_pending_is_true_only_for_a_pending_row_of_that_chat() {
+        let pool = crate::testdb::fresh_pool().await;
+        let c = chat(&pool).await;
+        let other = chat(&pool).await;
+        assert!(!has_pending(&pool, &c).await.unwrap());
+        let run = seed_turn(&pool, &c, "running", None).await;
+        pending(&pool, &c, run).await;
+        assert!(has_pending(&pool, &c).await.unwrap());
+        assert!(!has_pending(&pool, &other).await.unwrap());
+        for status in ["done", "failed", "cleared"] {
+            sqlx::query("UPDATE chat_compactions SET status = ? WHERE run_id = ?")
+                .bind(status)
+                .bind(run)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(!has_pending(&pool, &c).await.unwrap(), "{status}");
+        }
     }
 }
