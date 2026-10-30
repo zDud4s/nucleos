@@ -247,6 +247,9 @@ pub(super) struct AssistantTurnOut {
 /// erasure from where the person is standing.
 #[derive(serde::Serialize)]
 pub(super) struct TranscriptOut {
+    /// Set only the first time a `ReadsUntrusted` MCP tool is called in the chat's current session.
+    /// A non-blocking notice: the shell shows that the end of the turn will rotate the session.
+    pub(super) untrusted_first_call: Option<UntrustedFirstCall>,
     /// The exchanges this conversation was handed, oldest first. Empty for an ordinary chat, which
     /// is most of them, and empty rather than absent so a reader never has to branch on missing.
     pub(super) handed: Vec<(String, String)>,
@@ -278,6 +281,12 @@ pub(super) struct TranscriptOut {
     /// turn's shape would mean inventing a prompt nobody typed. The window interleaves the two by
     /// `created_at`, which is the only place the two orders have to meet.
     pub(super) notices: Vec<crate::chats::notices::ChatNotice>,
+}
+
+/// The tool whose first untrusted read this session raised the notice.
+#[derive(serde::Serialize)]
+pub(super) struct UntrustedFirstCall {
+    pub(super) tool: String,
 }
 
 /// Which slice of a conversation to read back.
@@ -906,6 +915,8 @@ pub(super) async fn get_assistant_chat(
         .await
         .unwrap_or_default();
     Ok(Json(TranscriptOut {
+        untrusted_first_call: crate::hooks::untrusted_first_call_for(&chat_id)
+            .map(|tool| UntrustedFirstCall { tool }),
         handed,
         queued,
         asks: crate::hooks::asks_for(&chat_id),
@@ -1211,4 +1222,45 @@ pub(super) async fn delete_chat(
         .await
         .map_err(failed)?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod untrusted_notice_tests {
+    use super::*;
+
+    /// The transcript carries `untrusted_first_call: {"tool": ...}` once the hook has seen the
+    /// session's first `ReadsUntrusted` call, and `null` otherwise.
+    #[tokio::test]
+    async fn transcript_carries_untrusted_first_call_or_null() {
+        let state = super::super::tests::test_state().await;
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let read = |state: AppState, chat_id: String| async move {
+            let Json(out) = get_assistant_chat(
+                State(state),
+                Path(chat_id),
+                Query(serde_json::from_value(serde_json::json!({})).unwrap()),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            serde_json::to_value(&out).unwrap()
+        };
+
+        let before = read(state.clone(), chat_id.clone()).await;
+        assert!(
+            before
+                .get("untrusted_first_call")
+                .is_some_and(|v| v.is_null()),
+            "no untrusted call yet, so the key must be present and null: {before}"
+        );
+
+        crate::hooks::note_untrusted_call(&chat_id, "get_email");
+        let after = read(state, chat_id).await;
+        assert_eq!(
+            after["untrusted_first_call"],
+            serde_json::json!({ "tool": "get_email" })
+        );
+    }
 }
