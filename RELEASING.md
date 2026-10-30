@@ -89,6 +89,21 @@ the escape is `NUCLEOS_ALLOW_DIRECT_GIT=1 git push origin vX.Y.Z`.
 macOS minutes bill at ten times while the repository is private, which is why this workflow runs
 only on a tag.
 
+## Identifier change
+
+The app identifier changed from `com.nucleos.app` to `com.pc-multimedia.shell`, so every OS sees
+a new app rather than an update of the old one.
+
+- **macOS:** the microphone and accessibility permissions (TCC) are tied to the identifier, so
+  they must be granted again. The keychain entries (stored secrets) and the app data directories
+  kept under `com.nucleos.app` are not migrated automatically.
+- **Linux:** the `.deb` and `.rpm` packages are installed by the system package manager, and the
+  in-app updater does not replace them; a system-package install only shows an update notice.
+  Secrets stored through the Secret Service need `gnome-keyring` (or another Secret Service
+  provider) running.
+- **Windows:** the installer treats it as a new app. The NSIS pre-install hook still stops the
+  daemon before installing.
+
 ## Installing a release
 
 The scripts are attached to every release, so the `latest` URLs always match the newest one. Both
