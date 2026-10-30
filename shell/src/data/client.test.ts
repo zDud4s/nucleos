@@ -74,6 +74,18 @@ describe("apiFetch refusals", () => {
     expect(refusal.code).toBe("kill_switch");
   });
 
+  it("carries the parsed body so a page can read the fields beside the sentence", async () => {
+    const { apiFetch } = await freshClient();
+    fetchMock.mockResolvedValue(
+      jsonResponse(422, { error: "invalid", field: "/hotkey", message: "expected a chord" }),
+    );
+    const error = (await apiFetch("/x", { method: "PUT", body: "{}" }).catch(
+      (e: unknown) => e,
+    )) as InstanceType<ClientModule["ApiRefusal"]>;
+    expect(error.status).toBe(422);
+    expect(error.body).toEqual({ error: "invalid", field: "/hotkey", message: "expected a chord" });
+  });
+
   it("keeps the name AND the sentence when a route sends both", async () => {
     const { apiFetch } = await freshClient();
     // How `POST /projects/{id}/write` refuses YAML the daemon could not read.
