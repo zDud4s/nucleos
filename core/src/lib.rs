@@ -38,6 +38,7 @@ pub mod config;
 pub mod context_refs;
 pub mod council;
 pub mod daemon_client;
+pub mod data_dir;
 pub mod detect;
 pub mod distill;
 pub mod door;
@@ -89,6 +90,7 @@ pub use nucleos_base::secrets;
 pub mod seed;
 pub mod sessions;
 pub mod settings;
+pub mod settings_cli;
 pub mod shutdown;
 pub mod sidecar;
 #[cfg(any(test, feature = "testkit"))]
