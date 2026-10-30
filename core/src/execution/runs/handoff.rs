@@ -638,6 +638,14 @@ pub(super) enum GateConfig {
     Unreadable(String),
 }
 
+impl GateConfig {
+    /// RED stub: the GREEN reads the settings snapshot (see the chunk-3 plan, Task 3.4, Step 3).
+    #[allow(dead_code)]
+    pub(super) fn of_project(_project_id: &str, _project_root: &str) -> GateConfig {
+        unimplemented!()
+    }
+}
+
 /// The gate of a finished run. With `scoped_final`, a running executor and a map the worktree has
 /// not rewritten, the run is measured by `verify scope` over its diff, in its own name; a scope
 /// that cannot be submitted measures nothing and falls through to the full gate, which is also

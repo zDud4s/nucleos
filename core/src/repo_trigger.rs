@@ -634,6 +634,7 @@ mod tests {
     /// A state whose `machine_config_root` is a temporary directory standing in for `~/.nucleos`,
     /// returned beside it so the directory lives exactly as long as the test that holds it.
     async fn test_state() -> (crate::state::AppState, tempfile::TempDir) {
+        crate::project::rules::testing::hold_shared();
         let home = tempfile::tempdir().expect("create a stand-in home");
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex};
@@ -675,13 +676,8 @@ mod tests {
 
     async fn seed_due_repo_project(state: &crate::state::AppState, project_id: &str, repo: &Path) {
         let branch = git_stdout(repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        crate::project::state::write_for_test(
-            state
-                .machine_config_root
-                .as_deref()
-                .expect("the test state has a stand-in home"),
+        crate::project::rules::testing::publish_rules(
             project_id,
-            crate::project::state::AUTOPILOT_FILE,
             &format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
         );
 
@@ -775,13 +771,8 @@ mod tests {
         let repo = init_repo();
         let branch = git_stdout(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
         let (state, _home) = test_state().await;
-        crate::project::state::write_for_test(
-            state
-                .machine_config_root
-                .as_deref()
-                .expect("the test state has a stand-in home"),
+        crate::project::rules::testing::publish_rules(
             "proj",
-            crate::project::state::AUTOPILOT_FILE,
             &format!("repo_triggers:\n  - name: t1\n    branch: {branch}\n    prompt: \"go\"\n"),
         );
         sqlx::query(
@@ -832,6 +823,62 @@ mod tests {
                 .unwrap()
                 .get("t1"),
             Some(&head2)
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_skips_a_project_whose_stored_rules_are_unreadable() {
+        let repo = init_repo();
+        let (state, _home) = test_state().await;
+        seed_due_repo_project(&state, "proj", repo.path()).await;
+        crate::project::rules::testing::publish_unreadable(
+            "proj",
+            "autopilot",
+            "invalid type: map",
+        );
+
+        poll_tick(&state, ts("2026-07-20T10:00:00Z")).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn a_trigger_published_after_an_unreadable_poll_fires_on_the_next_one() {
+        let repo = init_repo();
+        let branch = git_stdout(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let (state, _home) = test_state().await;
+        seed_due_repo_project(&state, "proj", repo.path()).await;
+        let now = ts("2026-07-20T10:00:00Z");
+        crate::project::rules::testing::publish_unreadable(
+            "proj",
+            "autopilot",
+            "invalid type: map",
+        );
+        poll_tick(&state, now).await;
+
+        crate::project::rules::testing::publish_rules(
+            "proj",
+            &format!(
+                "repo_triggers:
+  - name: t1
+    branch: {branch}
+    prompt: \"go\"
+"
+            ),
+        );
+        poll_tick(&state, now).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_count, 1,
+            "the repaired rules fire the trigger that was due"
         );
     }
 }

@@ -4,4 +4,5 @@
 pub mod commands;
 pub mod policy;
 pub mod readings;
+pub mod rules;
 pub mod state;

@@ -212,6 +212,7 @@ mod tests {
     /// A state whose `machine_config_root` is a temporary directory standing in for `~/.nucleos`,
     /// returned beside it so the directory lives exactly as long as the test that holds it.
     async fn test_state() -> (AppState, tempfile::TempDir) {
+        crate::project::rules::testing::hold_shared();
         let home = tempfile::tempdir().expect("create a stand-in home");
         let pool = crate::testdb::fresh_pool().await;
         let state = AppState {
@@ -251,13 +252,8 @@ mod tests {
 
     async fn configured_project(state: &AppState) -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
-        crate::project::state::write_for_test(
-            state
-                .machine_config_root
-                .as_deref()
-                .expect("the test state has a stand-in home"),
+        crate::project::rules::testing::publish_rules(
             "configured",
-            crate::project::state::AUTOPILOT_FILE,
             "repo_triggers:\n  - name: pushed-main\n    branch: main\n    prompt: \"review the push\"\n",
         );
         sqlx::query(
@@ -392,10 +388,8 @@ mod tests {
     async fn a_trigger_that_already_fired_for_the_sha_is_skipped() {
         let (state, _home) = test_state().await;
         let _project = configured_project(&state).await;
-        crate::project::state::write_for_test(
-            state.machine_config_root.as_deref().unwrap(),
+        crate::project::rules::testing::publish_rules(
             "configured",
-            crate::project::state::AUTOPILOT_FILE,
             "repo_triggers:
   - name: first
     branch: main
@@ -441,6 +435,55 @@ mod tests {
             Err(DeliveryError::Unconfigured)
         ));
         assert_eq!(run_count(&state).await, 0);
+    }
+
+    /// The rules of a project that cannot be read refuse the delivery as a configuration error, never as
+    /// "unconfigured" (which would read as the operator having configured nothing).
+    #[tokio::test]
+    async fn an_unreadable_rules_document_refuses_a_delivery_as_a_config_error() {
+        let (state, _home) = test_state().await;
+        let _project = configured_project(&state).await;
+        crate::project::rules::testing::publish_unreadable("configured", "autopilot", "broken");
+
+        let outcome = deliver(&state, delivery("unreadable"), now()).await;
+
+        assert!(
+            matches!(outcome, Err(DeliveryError::Config(_))),
+            "got {outcome:?}"
+        );
+        assert_eq!(run_count(&state).await, 0);
+    }
+
+    /// The rules are read per delivery: a trigger published after a refusal is honoured by the next one.
+    #[tokio::test]
+    async fn a_trigger_published_after_a_refusal_is_honoured_by_the_next_delivery() {
+        let (state, _home) = test_state().await;
+        let _project = configured_project(&state).await;
+        crate::project::rules::testing::publish_rules(
+            "configured",
+            "gate_command: cargo test
+",
+        );
+        assert!(matches!(
+            deliver(&state, delivery("again"), now()).await,
+            Err(DeliveryError::Unconfigured)
+        ));
+
+        crate::project::rules::testing::publish_rules(
+            "configured",
+            "repo_triggers:
+  - name: pushed-main
+    branch: main
+    prompt: \"review the push\"
+",
+        );
+
+        let outcome = deliver(&state, delivery("again"), now()).await.unwrap();
+        assert!(
+            matches!(outcome, DeliveryOutcome::Fired { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(run_count(&state).await, 1);
     }
 
     #[tokio::test]
