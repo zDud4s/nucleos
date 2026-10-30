@@ -144,9 +144,11 @@ fn task_xml(exe_path: &Path) -> String {
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
     <RestartOnFailure>
       <Interval>PT1M</Interval>
-      <Count>3</Count>
+      <Count>99</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
@@ -469,6 +471,20 @@ mod tests {
         assert!(xml.contains("<RestartOnFailure>"));
         assert!(xml.contains("<LogonTrigger>"));
         assert!(xml.contains(r"<WorkingDirectory>C:\Projects\nucleos</WorkingDirectory>"));
+    }
+
+    /// The daemon is a long-lived process: the task must never be killed by the default 72h limit,
+    /// must not show a window, and must keep restarting after a crash (every minute, 99 times).
+    #[test]
+    fn task_xml_has_no_time_limit_is_hidden_and_restarts_up_to_99_times() {
+        let xml = task_xml(Path::new(
+            r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe",
+        ));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<Hidden>true</Hidden>"));
+        assert!(xml.contains(
+            "<RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>99</Count>\n    </RestartOnFailure>"
+        ));
     }
 
     #[cfg(unix)]
